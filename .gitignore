@@ -1,0 +1,9 @@
+/target
+app/node_modules
+app/dist
+app/src-tauri/target
+app/src-tauri/gen
+app/src-tauri/binaries/*
+app/src-tauri/resources/yi-agentd/*
+!app/src-tauri/binaries/README.md
+!app/src-tauri/resources/yi-agentd/README.md

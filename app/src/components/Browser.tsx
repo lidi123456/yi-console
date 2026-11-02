@@ -1,0 +1,265 @@
+import { useEffect, useRef, useState } from 'react';
+import { tr } from '../i18n';
+import { toast, useStore } from '../store';
+import { hubCall, isTauri, rpc } from '../transport';
+import { writeClipboard } from '../clipboard';
+import { Icon } from './Icon';
+import { forwardPort, openUrlExternal } from './PortsView';
+
+// 文件面板里的浏览器标签（iframe）。
+// - 远程主机上的 localhost 地址先经端口转发接到本机，再在 iframe 里打开；
+// - 主机上的 HTML 文件经 ahfs 协议（yi-web 是 /fsv/）按目录取，相对路径的资源都能加载；
+// - 不加载和应用同源的地址，HTML 预览放进不带 allow-same-origin 的 sandbox，页面碰不到应用的接口。
+// 跨域页面里点链接跳转后拿不到新地址，地址栏不跟着变；不允许被嵌入的网站会显示空白，提供「用系统浏览器打开」。
+
+/** 标签的键：web:<地址>，地址为空是新标签；file:<绝对路径> 是主机上的 HTML 文件 */
+export const WEB_PREFIX = 'web:';
+export const isWebTab = (t: string) => t.startsWith(WEB_PREFIX);
+export const webTabUrl = (t: string) => t.slice(WEB_PREFIX.length);
+export const webTabFile = (t: string) => (webTabUrl(t).startsWith('file:') ? webTabUrl(t).slice(5) : null);
+
+/** 标签上显示的名字 */
+export function webTabTitle(t: string): string {
+  const u = webTabUrl(t);
+  if (!u) return tr('新标签', 'New tab');
+  const f = webTabFile(t);
+  if (f) return f.slice(Math.max(f.lastIndexOf('/'), f.lastIndexOf('\\')) + 1);
+  try {
+    const x = new URL(u);
+    return x.host + (x.pathname !== '/' ? x.pathname : '');
+  } catch {
+    return u;
+  }
+}
+
+/** 用户输入 -> 完整地址：3000、localhost:3000、example.com 都可以 */
+export function normalizeUrl(s: string): string {
+  const v = s.trim();
+  if (!v) return '';
+  if (/^\d{1,5}(\/.*)?$/.test(v)) return `http://localhost:${v}`;
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(v)) return v;
+  if (/^(localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])(:\d+)?(\/.*)?$/i.test(v)) return `http://${v}`;
+  return `https://${v}`;
+}
+
+const LOOPBACK = new Set(['localhost', '127.0.0.1', '0.0.0.0', '[::1]', '::1']);
+
+const tokens = new Map<string, Promise<string>>();
+/** 主机上某个目录里的文件的预览地址 */
+export async function previewUrl(hostId: string, root: string, abs: string): Promise<string> {
+  const k = `${hostId}\n${root}`;
+  let t = tokens.get(k);
+  if (!t) {
+    t = hubCall<{ token: string }>('preview.root', { id: hostId, root }).then((r) => r.token);
+    tokens.set(k, t);
+    t.catch(() => tokens.delete(k));
+  }
+  const token = await t;
+  const norm = (p: string) => p.replace(/\\/g, '/').replace(/\/+$/, '');
+  const r = norm(root);
+  const a = norm(abs);
+  if (a !== r && !a.toLowerCase().startsWith(r.toLowerCase() + '/')) throw new Error(tr('只能预览工作目录里的文件', 'Only files inside the workspace can be previewed'));
+  const rel = a.slice(r.length + 1).split('/').map(encodeURIComponent).join('/');
+  let base = `${location.origin}/fsv/`;
+  if (isTauri) {
+    const { convertFileSrc } = await import('@tauri-apps/api/core');
+    base = convertFileSrc('', 'ahfs').replace(/\/?$/, '/');
+  }
+  return `${base}${token}/${rel}`;
+}
+
+type Resolved = { src: string; sandboxed: boolean; via?: string } | { error: string };
+
+export function BrowserPane({
+  hostId,
+  root,
+  tab,
+  reload,
+  onNavigate,
+}: {
+  hostId: string;
+  root: string;
+  /** 标签的键（web:…） */
+  tab: string;
+  /** 变了就重新加载（比如 HTML 文件保存后） */
+  reload?: number;
+  /** 地址栏里换了地址：换成新的标签键 */
+  onNavigate: (tab: string) => void;
+}) {
+  const host = useStore((s) => s.hosts.find((h) => h.config.id === hostId));
+  const isLocal = host?.config.kind === 'local';
+  const url = webTabUrl(tab);
+  const file = webTabFile(tab);
+  const [input, setInput] = useState(file ?? url);
+  const [res, setRes] = useState<Resolved | null>(null);
+  const [n, setN] = useState(0);
+  const [loading, setLoading] = useState(false);
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => setInput(file ?? url), [tab]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    let alive = true;
+    setRes(null);
+    if (!url) {
+      inputRef.current?.focus();
+      return;
+    }
+    (async (): Promise<Resolved> => {
+      if (file) return { src: await previewUrl(hostId, root, file), sandboxed: true };
+      let u: URL;
+      try {
+        u = new URL(url);
+      } catch {
+        return { error: tr('地址格式不对', 'Invalid address') };
+      }
+      if (!/^https?:$/.test(u.protocol)) return { error: tr('只能打开 http / https 地址', 'Only http and https addresses can be opened') };
+      // 远程主机上的 localhost 是那台机器自己，先转发到本机
+      if (!isLocal && LOOPBACK.has(u.hostname)) {
+        const port = Number(u.port || (u.protocol === 'https:' ? 443 : 80));
+        const f = await forwardPort(hostId, port);
+        const remote = tr(`${host?.config.name ?? '主机'} 的 ${port} 端口`, `${host?.config.name ?? 'host'} port ${port}`);
+        u.hostname = 'localhost';
+        u.port = String(f.localPort);
+        return { src: u.toString(), sandboxed: false, via: `${remote} → localhost:${f.localPort}` };
+      }
+      // 和应用同源的页面能直接调应用的接口，不在这里打开
+      if (u.origin === location.origin) return { error: tr('这个地址是 Yi Console 自己，不能在标签里打开', 'This address is Yi Console itself and cannot be opened in a tab') };
+      return { src: u.toString(), sandboxed: false };
+    })()
+      .then((r) => alive && (setRes(r), setLoading(!('error' in r))))
+      .catch((e) => alive && setRes({ error: String(e?.message ?? e) }));
+    return () => {
+      alive = false;
+    };
+  }, [tab, hostId, root, isLocal]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    if (reload) setN((x) => x + 1);
+  }, [reload]);
+
+  const go = () => {
+    const v = input.trim();
+    if (file && v === file) return setN((x) => x + 1);
+    const next = WEB_PREFIX + normalizeUrl(v);
+    if (next === tab) setN((x) => x + 1);
+    else onNavigate(next);
+  };
+  const src = res && 'src' in res ? res.src : '';
+  const external = res && 'src' in res && !res.sandboxed ? res.src : '';
+  const remoteHint = !file && url && !LOOPBACK.has(safeHost(url));
+
+  return (
+    <div className="wb">
+      <div className="wb-bar">
+        <button className="icon-btn" title={tr('重新加载', 'Reload')} disabled={!src} onClick={() => setN((x) => x + 1)}>
+          <Icon name="refresh" size={14} />
+        </button>
+        <form
+          className="wb-addr"
+          onSubmit={(e) => {
+            e.preventDefault();
+            go();
+          }}
+        >
+          {loading && <span className="spinner" />}
+          <input
+            ref={inputRef}
+            value={input}
+            onChange={(e) => setInput(e.target.value)}
+            onFocus={(e) => e.target.select()}
+            placeholder={isLocal ? tr('输入地址或端口号，如 3000', 'Address or port, e.g. 3000') : tr(`输入地址或端口号，localhost 指 ${host?.config.name ?? '主机'}`, `Address or port. localhost means ${host?.config.name ?? 'the host'}`)}
+            aria-label={tr('地址', 'Address')}
+            spellCheck={false}
+          />
+        </form>
+        {res && 'via' in res && res.via && (
+          <span className="wb-via truncate" title={tr(`已经端口转发：${res.via}`, `Forwarded: ${res.via}`)}>
+            <Icon name="forward" size={11} /> {tr('已转发', 'Forwarded')}
+          </span>
+        )}
+        <button className="icon-btn" title={tr('复制地址', 'Copy address')} disabled={!external} onClick={() => writeClipboard(external).then(() => toast(tr('已复制', 'Copied')))}>
+          <Icon name="copy" size={14} />
+        </button>
+        <button className="icon-btn" title={tr('用系统浏览器打开', 'Open in system browser')} disabled={!external} onClick={() => openUrlExternal(external)}>
+          <Icon name="external" size={14} />
+        </button>
+      </div>
+      {remoteHint && src && (
+        <div className="wb-tip">
+          {tr('页面空白？有的网站不允许被嵌入，', 'Blank page? Some sites refuse to be embedded. ')}
+          <button className="link-btn" onClick={() => openUrlExternal(src)}>
+            {tr('用系统浏览器打开', 'Open in system browser')}
+          </button>
+        </div>
+      )}
+      <div className="wb-body">
+        {!url ? (
+          <StartPage hostId={hostId} isLocal={isLocal} onOpen={(u) => onNavigate(WEB_PREFIX + u)} />
+        ) : res && 'error' in res ? (
+          <div className="wp-empty">
+            <div className="wp-empty-title">{tr('打不开这个地址', 'Cannot open this address')}</div>
+            <div className="muted small">{res.error}</div>
+          </div>
+        ) : src ? (
+          <iframe
+            key={`${src}#${n}`}
+            className="wb-frame"
+            src={src}
+            title={webTabTitle(tab)}
+            // 远程网页有自己的源，可以用 Cookie、localStorage；主机上的 HTML 文件不给同源权限
+            sandbox={
+              res && 'sandboxed' in res && res.sandboxed
+                ? 'allow-scripts allow-forms allow-modals allow-popups allow-downloads'
+                : 'allow-scripts allow-same-origin allow-forms allow-modals allow-popups allow-popups-to-escape-sandbox allow-downloads'
+            }
+            allow="clipboard-read; clipboard-write; fullscreen"
+            onLoad={() => setLoading(false)}
+          />
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
+function safeHost(u: string) {
+  try {
+    return new URL(u).hostname;
+  } catch {
+    return '';
+  }
+}
+
+/** 新标签：列出主机上正在监听的端口，点一下打开 */
+function StartPage({ hostId, isLocal, onOpen }: { hostId: string; isLocal: boolean; onOpen: (url: string) => void }) {
+  const [ports, setPorts] = useState<{ port: number; process?: string | null }[] | null>(null);
+  useEffect(() => {
+    rpc<{ ports: { port: number; process?: string | null }[] }>(hostId, 'ports.list')
+      .then((r) => setPorts(r.ports))
+      .catch(() => setPorts([]));
+  }, [hostId]);
+  return (
+    <div className="wb-start">
+      <div className="wb-start-title">{tr('打开网页', 'Open a page')}</div>
+      <div className="muted small">
+        {tr('在上面输入地址或端口号。', 'Enter an address or port above. ')}
+        {isLocal ? '' : tr('localhost 指的是这台主机，会自动转发到本机。', 'localhost means this host and is forwarded automatically. ')}
+        {tr('主机上的 HTML 文件可以在文件树里右键「在浏览器标签中打开」。', 'Right-click an HTML file in the tree and choose Open in browser tab.')}
+      </div>
+      {ports && ports.length > 0 && (
+        <>
+          <div className="section-title">{tr('主机上正在监听的端口', 'Ports listening on the host')}</div>
+          <div className="wb-ports">
+            {ports.map((p) => (
+              <button key={p.port} className="wb-port" onClick={() => onOpen(`http://localhost:${p.port}/`)}>
+                <span className="mono">{p.port}</span>
+                <span className="muted truncate">{p.process || ''}</span>
+              </button>
+            ))}
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+

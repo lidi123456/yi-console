@@ -1,0 +1,23 @@
+[package]
+name = "yi-client"
+version.workspace = true
+edition.workspace = true
+description = "Yi Console 客户端核心：主机管理、SSH/中继连接、自动部署 yi-agentd、断线重连"
+
+[dependencies]
+yi-proto = { path = "../proto" }
+yi-link = { path = "../link" }
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+base64.workspace = true
+dirs.workspace = true
+gethostname = "1"
+# ring 比 aws-lc-rs 好交叉编译（Android 不用装 cmake）
+russh = { version = "0.55", default-features = false, features = ["ring", "flate2", "rsa"] }
+russh-sftp = "2"
+
+[dev-dependencies]
+tempfile = "3"

@@ -1,0 +1,229 @@
+name: build
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      only_daemons:
+        description: 只编译 yi-agentd / yi-relay（不出安装包，省额度）
+        type: boolean
+        default: false
+      windows_only:
+        description: 只打 Windows 安装包（跳过 macOS、Linux 桌面和 Android；安装包里不带 macOS 的 yi-agentd）
+        type: boolean
+        default: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # 算出要编哪些平台：只打 Windows 时去掉 macOS 的 yi-agentd 和 Windows 以外的桌面包
+  # （matrix 的 exclude 去不掉 include 里的条目，只能这样先算好再传给 matrix）
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      daemons: ${{ steps.m.outputs.daemons }}
+      desktop: ${{ steps.m.outputs.desktop }}
+    steps:
+      - id: m
+        env:
+          WINDOWS_ONLY: ${{ inputs.windows_only && 'true' || 'false' }}
+        run: |
+          daemons='[
+            {"os":"ubuntu-latest","target":"x86_64-unknown-linux-musl","name":"linux-x86_64","cross":true},
+            {"os":"ubuntu-latest","target":"aarch64-unknown-linux-musl","name":"linux-aarch64","cross":true},
+            {"os":"macos-latest","target":"x86_64-apple-darwin","name":"macos-x86_64"},
+            {"os":"macos-latest","target":"aarch64-apple-darwin","name":"macos-aarch64"},
+            {"os":"windows-latest","target":"x86_64-pc-windows-msvc","name":"windows-x86_64","ext":".exe"}
+          ]'
+          desktop='[
+            {"os":"ubuntu-22.04","target":"x86_64-unknown-linux-gnu","daemon":"linux-x86_64"},
+            {"os":"macos-latest","target":"aarch64-apple-darwin","daemon":"macos-aarch64"},
+            {"os":"macos-latest","target":"x86_64-apple-darwin","daemon":"macos-x86_64"},
+            {"os":"windows-latest","target":"x86_64-pc-windows-msvc","daemon":"windows-x86_64","ext":".exe"}
+          ]'
+          if [ "$WINDOWS_ONLY" = true ]; then
+            # Linux 的 yi-agentd 留着，Windows 版要靠它给 SSH 主机部署
+            daemons=$(jq -c 'map(select(.os != "macos-latest"))' <<<"$daemons")
+            desktop=$(jq -c 'map(select(.os == "windows-latest"))' <<<"$desktop")
+          fi
+          echo "daemons=$(jq -c . <<<"$daemons")" >> "$GITHUB_OUTPUT"
+          echo "desktop=$(jq -c . <<<"$desktop")" >> "$GITHUB_OUTPUT"
+
+  # 各平台 yi-agentd（和 Linux 上的 yi-relay）。桌面安装包会把它们全部带上，用来给 SSH 主机自动部署。
+  daemons:
+    needs: plan
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.daemons) }}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      # 版本号里的提交号和构建时间：所有平台用同一个值（客户端连上 yi-agentd 时两者都要一致，不然一直提示升级）
+      - name: build stamp
+        shell: bash
+        run: echo "YI_CONSOLE_BUILD_TIME=$(git log -1 --format=%ct)" >> "$GITHUB_ENV"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: build (cross)
+        if: matrix.cross
+        run: |
+          cargo install cross --locked
+          cross build --release --target ${{ matrix.target }} -p yi-agentd -p yi-relay
+      - name: build
+        if: ${{ !matrix.cross }}
+        run: cargo build --release --target ${{ matrix.target }} -p yi-agentd
+      - name: collect
+        shell: bash
+        run: |
+          mkdir -p out
+          cp target/${{ matrix.target }}/release/yi-agentd${{ matrix.ext }} out/yi-agentd-${{ matrix.name }}${{ matrix.ext }}
+          if [ -f target/${{ matrix.target }}/release/yi-relay ]; then
+            cp target/${{ matrix.target }}/release/yi-relay out/yi-relay-${{ matrix.name }}
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: daemon-${{ matrix.name }}
+          path: out/*
+
+  desktop:
+    needs: [plan, daemons]
+    if: ${{ !inputs.only_daemons }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.desktop) }}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      # 版本号里的提交号和构建时间：所有平台用同一个值（客户端连上 yi-agentd 时两者都要一致，不然一直提示升级）
+      - name: build stamp
+        shell: bash
+        run: echo "YI_CONSOLE_BUILD_TIME=$(git log -1 --format=%ct)" >> "$GITHUB_ENV"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: app/src-tauri
+          key: ${{ matrix.target }}
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+      - name: linux deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: daemon-*
+          merge-multiple: true
+          path: daemons
+      - name: place yi-agentd
+        shell: bash
+        run: |
+          mkdir -p app/src-tauri/resources/yi-agentd app/src-tauri/binaries
+          cp daemons/yi-agentd-* app/src-tauri/resources/yi-agentd/
+          # 本机 sidecar 复用同平台那一份
+          cp daemons/yi-agentd-${{ matrix.daemon }}${{ matrix.ext }} app/src-tauri/binaries/yi-agentd-${{ matrix.target }}${{ matrix.ext }}
+          chmod +x app/src-tauri/binaries/* app/src-tauri/resources/yi-agentd/* || true
+      - run: npm ci
+        working-directory: app
+      - run: npx tauri build --target ${{ matrix.target }}
+        working-directory: app
+      - uses: actions/upload-artifact@v4
+        with:
+          name: desktop-${{ matrix.target }}
+          path: |
+            app/src-tauri/target/${{ matrix.target }}/release/bundle/**/*.deb
+            app/src-tauri/target/${{ matrix.target }}/release/bundle/**/*.AppImage
+            app/src-tauri/target/${{ matrix.target }}/release/bundle/**/*.rpm
+            app/src-tauri/target/${{ matrix.target }}/release/bundle/**/*.dmg
+            app/src-tauri/target/${{ matrix.target }}/release/bundle/**/*.msi
+            app/src-tauri/target/${{ matrix.target }}/release/bundle/**/*-setup.exe
+
+  android:
+    if: ${{ !inputs.only_daemons && !inputs.windows_only }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      # 版本号里的提交号和构建时间：所有平台用同一个值（客户端连上 yi-agentd 时两者都要一致，不然一直提示升级）
+      - name: build stamp
+        shell: bash
+        run: echo "YI_CONSOLE_BUILD_TIME=$(git log -1 --format=%ct)" >> "$GITHUB_ENV"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: app/src-tauri
+          key: android
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 17
+      # runner 自带 Android SDK（$ANDROID_HOME），只补装 NDK
+      - name: ndk
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;27.2.12479018" > /dev/null
+          echo "NDK_HOME=$ANDROID_HOME/ndk/27.2.12479018" >> "$GITHUB_ENV"
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+      - run: npm ci
+        working-directory: app
+      - name: build apk
+        working-directory: app
+        run: |
+          npx tauri android init --ci
+          # 换上自己的 MainActivity（输入法弹出时让出键盘高度），见 app/src-tauri/android/MainActivity.kt
+          cp src-tauri/android/MainActivity.kt src-tauri/gen/android/app/src/main/java/dev/yiconsole/app/MainActivity.kt
+          npx tauri android build --apk --target aarch64 --target armv7 --target x86_64
+      - name: sign
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+        run: |
+          # 没配签名密钥时临时生成一个：能装，但每次签名不同，升级前要先卸载旧版
+          if [ -n "$KEYSTORE_B64" ]; then
+            echo "$KEYSTORE_B64" | base64 -d > release.jks
+            pass="$KEYSTORE_PASSWORD"
+          else
+            pass=ephemeral
+            keytool -genkeypair -keystore release.jks -storepass $pass -keypass $pass -alias app \
+              -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Yi Console"
+          fi
+          apk=$(find app/src-tauri/gen/android -name '*-release-unsigned.apk' | head -1)
+          bt=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+          "$bt/zipalign" -f 4 "$apk" aligned.apk
+          "$bt/apksigner" sign --ks release.jks --ks-pass pass:$pass --ks-key-alias app --out yi-console.apk aligned.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-apk
+          path: yi-console.apk
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [daemons, desktop, android]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/**/*

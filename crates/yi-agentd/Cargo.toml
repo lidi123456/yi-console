@@ -1,0 +1,33 @@
+[package]
+name = "yi-agentd"
+version.workspace = true
+edition.workspace = true
+description = "Yi Console 守护进程：托管 AI coding 工具会话"
+
+[dependencies]
+yi-proto = { path = "../proto" }
+yi-link = { path = "../link" }
+yi-client = { path = "../client" }
+qrcode = { version = "0.14", default-features = false }
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+base64.workspace = true
+dirs.workspace = true
+rusqlite = { version = "0.37", features = ["bundled"] }
+portable-pty = "0.9"
+ureq = "3"
+gethostname = "1"
+md5 = "0.7"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+# 命名管道的访问权限（按用户 SID 授权，管理员和普通权限的进程能互通）
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Console", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
+
+[dev-dependencies]
+tempfile = "3"

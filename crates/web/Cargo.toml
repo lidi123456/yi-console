@@ -1,0 +1,15 @@
+[package]
+name = "yi-web"
+version.workspace = true
+edition.workspace = true
+description = "Yi Console Web 模式：在浏览器里使用（开发调试 / 无法安装桌面端时）"
+
+[dependencies]
+yi-client = { path = "../client" }
+yi-link = { path = "../link" }
+anyhow.workspace = true
+tokio.workspace = true
+serde_json.workspace = true
+dirs.workspace = true
+tokio-tungstenite = "0.28"
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }

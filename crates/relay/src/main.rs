@@ -1,0 +1,379 @@
+//! yi-relay：极简 WebSocket 中继，设计见 `docs/relay-security-v2.md`。
+//!
+//! - `/v1/agent`   yi-agentd 的控制连接（长连）
+//! - `/v1/client`  客户端连接；中继让 yi-agentd 开一条数据流后对接
+//! - `/v1/stream`  yi-agentd 为某个客户端开的数据流
+//!
+//! URL 里不带任何密钥：升级后中继发随机数，对端用 Ed25519 签名证明身份。
+//! yi-agentd 要先凭一次性邀请码登记（`yi-relay invite` 生成），之后只靠自己的密钥；
+//! 客户端要在设备推来的白名单里，或者持有设备发的一次性配对票据。
+//! 中继不持有任何端到端密钥，数据流里是 Noise 加密的密文。
+//!
+//! 对公网的防护：TLS；升级和鉴权各限时 10 秒；全局和单 IP 连接数有上限；同一 IP 失败过多会被暂时拉黑。
+//! 放在反向代理后面时用 `--trusted-proxy` 取真实客户端 IP。
+
+mod hub;
+mod limits;
+mod store;
+
+use anyhow::{anyhow, Context, Result};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
+use store::{parse_ttl, Store};
+use tokio::net::TcpListener;
+
+/// 运营者生成的邀请默认 24 小时、1 次
+const ADMIN_INVITE_TTL: &str = "24h";
+
+struct Args {
+    listen: String,
+    data: PathBuf,
+    tls_cert: Option<PathBuf>,
+    tls_key: Option<PathBuf>,
+    self_signed: bool,
+    public_url: String,
+    open: bool,
+    device_invites: bool,
+    trusted: Vec<limits::Cidr>,
+    max_conns: usize,
+    max_per_ip: usize,
+}
+
+const HELP: &str = "yi-relay [--listen 0.0.0.0:7878] [--data 数据目录]
+          [--tls-cert cert.pem --tls-key key.pem | --self-signed]
+          [--public-url wss://relay.example.com] [--trusted-proxy 127.0.0.1]...
+          [--device-invites] [--open] [--max-conns 1000] [--max-per-ip 32]
+
+yi-relay invite  [--data 目录] [--ttl 24h] [--uses 1] [--note 备注]   生成邀请链接，给一台电脑登记
+yi-relay invites [--data 目录] [--revoke <邀请 id>]                  列出 / 作废邀请
+yi-relay devices [--data 目录]                                       列出已登记的电脑
+yi-relay revoke  <设备 id> [--cascade] [--data 目录]                 移除电脑（在线的立刻断开）
+
+--data            数据目录（登记的设备、邀请、自签名证书），默认当前目录
+--self-signed     没有域名时用，首次启动在数据目录生成证书，日志里打印指纹；指纹会写进邀请链接
+                  （同时配了 --trusted-proxy 时不写，客户端看到的是代理的证书）
+--public-url      对外地址，生成邀请链接时用（放在反向代理后面时填代理的 wss:// 地址）
+--trusted-proxy   反向代理的 IP 或网段（可写多次）。只有来自这些地址的连接才读 X-Forwarded-For
+--device-invites  允许已登记的电脑代发一次性邀请（App 里的「一键复用中继」），默认关闭
+--open            任何人都能直接登记，不需要邀请（公共中继用），默认关闭
+也可以不配 TLS，放在 Caddy/Nginx 等反向代理后面对外提供 wss://";
+
+fn parse_args(argv: &[String]) -> Result<Args> {
+    let mut a = Args {
+        listen: "0.0.0.0:7878".into(),
+        data: PathBuf::from("."),
+        tls_cert: None,
+        tls_key: None,
+        self_signed: false,
+        public_url: String::new(),
+        open: false,
+        device_invites: false,
+        trusted: Vec::new(),
+        max_conns: 1000,
+        max_per_ip: 32,
+    };
+    let mut it = argv.iter();
+    while let Some(k) = it.next() {
+        let mut v = || it.next().cloned().ok_or_else(|| anyhow!("{k} 缺少取值"));
+        match k.as_str() {
+            "--listen" => a.listen = v()?,
+            "--data" => a.data = PathBuf::from(v()?),
+            "--tls-cert" => a.tls_cert = Some(PathBuf::from(v()?)),
+            "--tls-key" => a.tls_key = Some(PathBuf::from(v()?)),
+            "--self-signed" => a.self_signed = true,
+            "--public-url" => a.public_url = v()?.trim_end_matches('/').to_string(),
+            "--open" => a.open = true,
+            "--device-invites" => a.device_invites = true,
+            "--trusted-proxy" => {
+                let s = v()?;
+                a.trusted.push(limits::Cidr::parse(&s).ok_or_else(|| anyhow!("--trusted-proxy 格式错误：{s}"))?);
+            }
+            "--max-conns" => a.max_conns = v()?.parse().context("--max-conns 要是数字")?,
+            "--max-per-ip" => a.max_per_ip = v()?.parse().context("--max-per-ip 要是数字")?,
+            "--token" => return Err(anyhow!("--token 已经去掉：电脑改用一次性邀请登记（yi-relay invite），手机不需要令牌")),
+            "-h" | "--help" => {
+                println!("{HELP}");
+                std::process::exit(0);
+            }
+            "--version" => {
+                println!("yi-relay {}", env!("CARGO_PKG_VERSION"));
+                std::process::exit(0);
+            }
+            _ => return Err(anyhow!("未知参数 {k}（yi-relay --help 查看用法）")),
+        }
+    }
+    if a.public_url.is_empty() {
+        if let Ok(u) = std::env::var("HUB_RELAY_PUBLIC_URL") {
+            a.public_url = u;
+        }
+    }
+    Ok(a)
+}
+
+/// 没有就生成一张自签名证书（有效期很长，指纹不变客户端就不用重新配置）
+fn ensure_self_signed(dir: &Path) -> Result<(PathBuf, PathBuf)> {
+    let cert = dir.join("relay-cert.pem");
+    let key = dir.join("relay-key.pem");
+    if cert.is_file() && key.is_file() {
+        return Ok((cert, key));
+    }
+    let mut params = rcgen::CertificateParams::new(vec!["yi-relay".to_string()])?;
+    params.not_before = rcgen::date_time_ymd(2024, 1, 1);
+    params.not_after = rcgen::date_time_ymd(2124, 1, 1);
+    let kp = rcgen::KeyPair::generate()?;
+    let c = params.self_signed(&kp)?;
+    std::fs::create_dir_all(dir)?;
+    std::fs::write(&key, kp.serialize_pem())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600))?;
+    }
+    std::fs::write(&cert, c.pem())?;
+    eprintln!("已生成自签名证书：{}", cert.display());
+    Ok((cert, key))
+}
+
+fn tls_acceptor(cert: &PathBuf, key: &PathBuf) -> Result<(tokio_rustls::TlsAcceptor, String)> {
+    use tokio_rustls::rustls;
+    let certs = rustls_pemfile::certs(&mut std::io::BufReader::new(std::fs::File::open(cert).context("读取证书失败")?))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let key = rustls_pemfile::private_key(&mut std::io::BufReader::new(std::fs::File::open(key).context("读取私钥失败")?))?
+        .ok_or_else(|| anyhow!("私钥文件里没有私钥"))?;
+    let fp = yi_link::cert_fp(certs.first().ok_or_else(|| anyhow!("证书文件里没有证书"))?.as_ref());
+    let cfg = rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+        .with_safe_default_protocol_versions()?
+        .with_no_client_auth()
+        .with_single_cert(certs, key)?;
+    Ok((tokio_rustls::TlsAcceptor::from(Arc::new(cfg)), fp))
+}
+
+fn fmt_time(t: u64) -> String {
+    if t == 0 {
+        return "-".into();
+    }
+    let ago = store::now().saturating_sub(t);
+    match ago {
+        0..=59 => "刚刚".into(),
+        60..=3599 => format!("{} 分钟前", ago / 60),
+        3600..=86399 => format!("{} 小时前", ago / 3600),
+        _ => format!("{} 天前", ago / 86400),
+    }
+}
+
+fn fmt_left(t: u64) -> String {
+    let left = t.saturating_sub(store::now());
+    if left >= 3600 {
+        format!("{} 小时后过期", left / 3600)
+    } else {
+        format!("{} 分钟后过期", left.div_ceil(60))
+    }
+}
+
+/// 邀请链接：地址和指纹取自运行中的中继写下的 relay-meta.json
+fn invite_link(store: &Store, code: &str) -> Option<String> {
+    let m = store.meta();
+    if m.public_url.is_empty() {
+        return None;
+    }
+    Some(yi_link::RelayAccess { url: m.public_url, fp: m.fp, invite: code.to_string() }.to_uri())
+}
+
+fn print_invite(store: &Store, rec: &store::InviteRec, code: &str) {
+    println!("邀请 {}（可用 {} 次，{}）", rec.id, rec.uses_left, fmt_left(rec.expires_at));
+    match invite_link(store, code) {
+        Some(link) => {
+            println!("\n把这条接入链接粘贴到电脑上 Yi Console「让其他设备连接这台电脑」第 1 步，");
+            println!("或在电脑上运行 yi-agentd relay setup '<链接>'：\n\n{link}\n");
+        }
+        None => {
+            println!("\n邀请码：{code}");
+            println!("（中继没有配置 --public-url，生成不了完整链接。在电脑上运行：");
+            println!("  yi-agentd relay setup wss://<中继地址> --invite {code} [--fp <证书指纹>]）\n");
+        }
+    }
+}
+
+fn opt(argv: &[String], name: &str) -> Option<String> {
+    argv.iter().position(|a| a == name).and_then(|i| argv.get(i + 1)).cloned()
+}
+
+fn data_dir(argv: &[String]) -> PathBuf {
+    opt(argv, "--data").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// 管理子命令：直接读写数据目录里的文件，运行中的中继 5 秒内生效
+fn admin(cmd: &str, argv: &[String]) -> Result<()> {
+    let store = Store::new(&data_dir(argv))?;
+    match cmd {
+        "invite" => {
+            let ttl = parse_ttl(&opt(argv, "--ttl").unwrap_or_else(|| ADMIN_INVITE_TTL.into()))?;
+            let uses: u32 = opt(argv, "--uses").map(|s| s.parse()).transpose().context("--uses 要是数字")?.unwrap_or(1);
+            let note = opt(argv, "--note").unwrap_or_default();
+            let (rec, code) = store.create_invite(ttl, uses, &note, "admin")?;
+            print_invite(&store, &rec, &code);
+        }
+        "invites" => {
+            if let Some(id) = opt(argv, "--revoke") {
+                if store.revoke_invite(&id)? {
+                    println!("已作废邀请 {id}");
+                } else {
+                    println!("没有这个邀请：{id}");
+                }
+                return Ok(());
+            }
+            let list = store.invites();
+            if list.is_empty() {
+                println!("没有有效的邀请");
+            }
+            for r in list {
+                let by = if r.by == "admin" { "服务器".to_string() } else { format!("设备 {}", r.by) };
+                println!("{}  剩 {} 次  {}  来自{}  {}", r.id, r.uses_left, fmt_left(r.expires_at), by, r.note);
+            }
+        }
+        "devices" => {
+            let list = store.devices();
+            if list.is_empty() {
+                println!("还没有登记的电脑");
+            }
+            for (id, d) in list {
+                let by = if d.invited_by.is_empty() { String::new() } else { format!("  由 {} 邀请", d.invited_by) };
+                println!("{id}  登记于 {}  最近在线 {}  {}{by}  {}", fmt_time(d.admitted_at), fmt_time(d.last_seen), d.via, d.note);
+            }
+        }
+        "revoke" => {
+            let id = argv.iter().find(|a| !a.starts_with("--") && Some(*a) != opt(argv, "--data").as_ref())
+                .ok_or_else(|| anyhow!("用法：yi-relay revoke <设备 id> [--cascade]"))?;
+            let gone = store.revoke(id, argv.iter().any(|a| a == "--cascade"))?;
+            println!("已移除：{}（在线的会在 5 秒内断开）", gone.join(", "));
+        }
+        _ => unreachable!(),
+    }
+    Ok(())
+}
+
+/// 写进邀请链接的证书指纹。只有自签名证书才需要客户端固定指纹；正式证书按系统 CA 校验。
+/// 配了 `--trusted-proxy` 说明前面有终结 TLS 的反向代理，手机和电脑看到的是代理的证书，
+/// 写中继自己的指纹反而一定对不上，所以不写，并提醒代理要用正规证书。
+fn link_pin(args: &Args, fp: String) -> String {
+    if !args.self_signed {
+        return String::new();
+    }
+    if !args.trusted.is_empty() {
+        eprintln!(
+            "警告：同时用了 --self-signed 和 --trusted-proxy。客户端连的是反向代理，看到的是代理的证书，\n\
+             中继自己的证书指纹不会写进邀请链接，客户端改按系统 CA 校验，代理需要配正规证书（如 Let's Encrypt）。\n\
+             代理只做四层透传（TCP 转发、不解 TLS）时不要配 --trusted-proxy，指纹才会写进链接。"
+        );
+        return String::new();
+    }
+    fp
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(cmd) = argv.first().filter(|c| ["invite", "invites", "devices", "revoke"].contains(&c.as_str())) {
+        return admin(cmd, &argv[1..]);
+    }
+    let args = parse_args(&argv)?;
+    let store = Store::new(&args.data)?;
+    let files = match (&args.tls_cert, &args.tls_key, args.self_signed) {
+        (Some(c), Some(k), false) => Some((c.clone(), k.clone())),
+        (None, None, true) => Some(ensure_self_signed(&args.data)?),
+        (None, None, false) => None,
+        (_, _, true) => return Err(anyhow!("--self-signed 不能和 --tls-cert/--tls-key 同时用")),
+        _ => return Err(anyhow!("--tls-cert 和 --tls-key 要一起给")),
+    };
+    let (tls, fp) = match &files {
+        Some((c, k)) => {
+            let (acc, fp) = tls_acceptor(c, k)?;
+            eprintln!("证书指纹（SHA-256）：{fp}");
+            (Some(acc), fp)
+        }
+        None => (None, String::new()),
+    };
+    let pin = link_pin(&args, fp);
+    let mut meta = store.meta();
+    if !args.public_url.is_empty() {
+        meta.public_url = args.public_url.clone();
+    }
+    meta.fp = pin;
+    store.save_meta(&meta)?;
+
+    // 第一次启动：还没有任何电脑和邀请时，先生成一个，免得没有入口
+    if !args.open && store.devices().is_empty() && store.invites().is_empty() {
+        let (rec, code) = store.create_invite(parse_ttl(ADMIN_INVITE_TTL)?, 1, "首次启动自动生成", "admin")?;
+        eprintln!("还没有登记的电脑，已生成一个邀请：");
+        print_invite(&store, &rec, &code);
+    }
+
+    let state = hub::State::new(
+        hub::Config { open: args.open, device_invites: args.device_invites, trusted: args.trusted.clone() },
+        store,
+    );
+    tokio::spawn(hub::watch_store(state.clone()));
+    let limits = limits::Limits::new(args.max_conns, args.max_per_ip);
+    let listener = TcpListener::bind(&args.listen).await?;
+    eprintln!(
+        "yi-relay {} listening on {}{}{}{}",
+        env!("CARGO_PKG_VERSION"),
+        if tls.is_some() { "wss://" } else { "ws://" },
+        args.listen,
+        if args.open { "（开放模式：任何人都能登记电脑）" } else { "" },
+        if args.device_invites { "（允许电脑代发邀请）" } else { "" },
+    );
+    loop {
+        let (tcp, peer) = match listener.accept().await {
+            Ok(v) => v,
+            // fd 用完之类的错误：歇一下再接，不要让进程退出
+            Err(e) => {
+                eprintln!("accept: {e}");
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                continue;
+            }
+        };
+        let ip = peer.ip().to_canonical();
+        // 直连的按 TCP 对端算单 IP 名额；来自可信代理的要等读到 X-Forwarded-For
+        let direct = (!limits::trusted(&args.trusted, ip)).then_some(ip);
+        let Some(slot) = limits.acquire(direct) else {
+            drop(tcp);
+            continue;
+        };
+        let _ = tcp.set_nodelay(true);
+        let (state, tls, limits) = (state.clone(), tls.clone(), limits.clone());
+        tokio::spawn(async move {
+            let io: hub::BoxIo = match tls {
+                Some(acc) => match tokio::time::timeout(hub::HANDSHAKE_TIMEOUT, acc.accept(tcp)).await {
+                    Ok(Ok(s)) => Box::new(s),
+                    _ => {
+                        if direct.is_some() {
+                            limits.record_fail(ip);
+                        }
+                        return;
+                    }
+                },
+                None => Box::new(tcp),
+            };
+            hub::handle(state, limits, slot, io, ip).await;
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(s: &str) -> Args {
+        parse_args(&s.split_whitespace().map(str::to_string).collect::<Vec<_>>()).unwrap()
+    }
+
+    #[test]
+    fn pin_only_for_direct_self_signed() {
+        assert_eq!(link_pin(&args("--self-signed"), "ab".into()), "ab");
+        assert_eq!(link_pin(&args("--self-signed --trusted-proxy 127.0.0.1"), "ab".into()), "");
+        assert_eq!(link_pin(&args("--tls-cert c.pem --tls-key k.pem"), "ab".into()), "");
+        assert_eq!(link_pin(&args("--trusted-proxy 127.0.0.1"), "ab".into()), "");
+    }
+}

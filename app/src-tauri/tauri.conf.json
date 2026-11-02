@@ -1,0 +1,49 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Yi Console",
+  "version": "0.1.0",
+  "identifier": "dev.yiconsole.app",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Yi Console",
+        "width": 1320,
+        "height": 800,
+        "center": true,
+        "minWidth": 360,
+        "minHeight": 480,
+        "decorations": false,
+        "shadow": true,
+        "dragDropEnabled": false
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "externalBin": [
+      "binaries/yi-agentd"
+    ],
+    "resources": {
+      "resources/yi-agentd/": "yi-agentd-dist/"
+    },
+    "category": "DeveloperTool",
+    "shortDescription": "统一管理多个 AI 编程工具的会话"
+  }
+}

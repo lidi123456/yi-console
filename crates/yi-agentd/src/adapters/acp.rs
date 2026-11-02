@@ -1,0 +1,1080 @@
+//! ACP（Agent Client Protocol）适配器，用于 `cursor-agent acp`、`kiro-cli acp`、`qodercli --acp`、`codebuddy --acp`。
+//! 协议：JSON-RPC 2.0 over stdio；session/update 通知推送内容，session/request_permission 请求审批。
+
+use super::{AdapterCmd, JsonProc, Prompt, StartSpec};
+use crate::hub::Emitter;
+use yi_proto::*;
+use serde_json::{json, Value};
+use std::collections::HashMap;
+use tokio::sync::mpsc;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Pending {
+    Init,
+    Auth,
+    Session,
+    /// session/load：工具里找不到这个会话时改成 session/new
+    Load,
+    Prompt,
+    SetModel,
+    Other,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Seg {
+    Agent,
+    Thought,
+    User,
+}
+
+#[derive(Default, Clone)]
+struct ToolState {
+    name: String,
+    title: String,
+    input: Value,
+    diffs: Vec<FileDiff>,
+    done: bool,
+}
+
+#[derive(Default)]
+struct State {
+    next_id: u64,
+    pending: HashMap<u64, Pending>,
+    session_id: Option<String>,
+    prompting: bool,
+    queue: Vec<Prompt>,
+    /// initialize 里声明了支持图片输入
+    image_ok: bool,
+    /// 会话建好之前收到的切换模型请求
+    want_model: Option<String>,
+    /// 正在切换的模型，成功后再记到会话上
+    switching: Option<String>,
+    seg: Option<(Seg, String, String)>,
+    seg_n: u64,
+    tools: HashMap<String, ToolState>,
+    perms: HashMap<String, Value>,
+    /// session/load 回放期间
+    loading: bool,
+    record_replay: bool,
+    /// 回放时跳过前面这么多条用户消息，以及回放到第几条了
+    replay_skip: usize,
+    replay_users: usize,
+    plan_mode: Option<String>,
+    /// 工具建会话时的模式（不是 plan 的那个），退出只读规划时切回去
+    base_mode: Option<String>,
+    /// 当前审批模式，会话中可以切换
+    perm: String,
+    turn_credits: f64,
+    /// Cursor 的 cursor/ask_question 请求：请求 id -> (JSON-RPC id)
+    asks: HashMap<String, Value>,
+    /// initialize 返回的登录方式。先不调 authenticate（cursor_login 会去开浏览器，
+    /// 而配了 CURSOR_API_KEY 时根本不需要），建会话被拒时再用它登录并重试一次。
+    auth_method: Option<String>,
+    auth_tried: bool,
+    /// 这次是接着已有会话（发了 session/load），不是新开的；load 失败改成新开后置回 false
+    resumed: bool,
+}
+
+impl State {
+    fn req(&mut self, kind: Pending, method: &str, params: Value) -> Value {
+        self.next_id += 1;
+        self.pending.insert(self.next_id, kind);
+        json!({"jsonrpc":"2.0","id": self.next_id, "method": method, "params": params})
+    }
+
+    /// 回放历史且不需要记录时，丢弃内容类事件
+    fn muted(&self) -> bool {
+        self.loading && (!self.record_replay || (self.replay_skip > 0 && self.replay_users <= self.replay_skip))
+    }
+}
+
+/// 进 ACP 模式的参数：Cursor、Kiro 是子命令，Qoder、CodeBuddy 是开关
+pub fn acp_arg(tool: ToolKind) -> &'static str {
+    match tool {
+        ToolKind::Qoder | ToolKind::Codebuddy => "--acp",
+        _ => "acp",
+    }
+}
+
+pub fn build_args(spec: &StartSpec) -> Vec<String> {
+    let mut a = vec![acp_arg(spec.tool).to_string()];
+    if spec.tool == ToolKind::Kiro {
+        if spec.permission_mode == "bypass" {
+            a.push("--trust-all-tools".into());
+        }
+        if let Some(m) = spec.model.as_ref().filter(|m| !m.is_empty()) {
+            a.push("--model".into());
+            a.push(m.clone());
+        }
+    }
+    a.extend(spec.extra_args.iter().cloned());
+    a
+}
+
+pub async fn run(spec: StartSpec, em: Emitter, mut rx: mpsc::UnboundedReceiver<AdapterCmd>) {
+    let args = build_args(&spec);
+    let mut p = match JsonProc::spawn(&spec.program, &args, &spec.cwd) {
+        Ok(p) => p,
+        Err(e) => return em.exited(Some(format!("启动 {} 失败: {e}", spec.tool.as_str()))),
+    };
+    let mut st = State {
+        perm: spec.permission_mode.clone(),
+        ..Default::default()
+    };
+    let init = st.req(
+        Pending::Init,
+        "initialize",
+        json!({"protocolVersion":1,
+               "clientCapabilities":{"fs":{"readTextFile":false,"writeTextFile":false},"terminal":false},
+               "clientInfo":{"name":"yi-console","version":DAEMON_VERSION}}),
+    );
+    let _ = p.send(&init).await;
+
+    let mut killed = false;
+    let mut fatal: Option<String> = None;
+    loop {
+        tokio::select! {
+            line = p.stdout.next_line() => {
+                let Ok(Some(line)) = line else { break };
+                let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
+                match handle(&mut st, &spec, &v, &em) {
+                    Ok(outs) => for out in outs { let _ = p.send(&out).await; },
+                    Err(msg) => { fatal = Some(msg); killed = true; break; }
+                }
+                if st.session_id.is_some() && !st.prompting && !st.loading && !st.queue.is_empty() {
+                    let next = st.queue.remove(0);
+                    let m = prompt(&mut st, &em, &next);
+                    let _ = p.send(&m).await;
+                }
+            }
+            cmd = rx.recv() => match cmd {
+                Some(AdapterCmd::Send(next)) => {
+                    em.status(SessionStatus::Running, None);
+                    if st.session_id.is_some() && !st.prompting && !st.loading {
+                        let m = prompt(&mut st, &em, &next);
+                        let _ = p.send(&m).await;
+                    } else {
+                        st.queue.push(next);
+                    }
+                }
+                Some(AdapterCmd::SetModel(model)) => {
+                    if st.session_id.is_some() {
+                        let m = set_model(&mut st, &model);
+                        let _ = p.send(&m).await;
+                    } else {
+                        st.want_model = Some(model);
+                    }
+                }
+                Some(AdapterCmd::SetPermissionMode(mode)) => {
+                    let was_plan = st.perm == "plan";
+                    st.perm = mode;
+                    if let Some(m) = apply_mode(&mut st, was_plan) {
+                        let _ = p.send(&m).await;
+                    }
+                }
+                Some(AdapterCmd::Interrupt) => {
+                    if let Some(sid) = st.session_id.clone() {
+                        for (rid, rpc_id) in st.perms.drain().chain(st.asks.drain()) {
+                            let _ = p.send(&json!({"jsonrpc":"2.0","id":rpc_id,
+                                "result":{"outcome":{"outcome":"cancelled"}}})).await;
+                            em.event(EventBody::PermissionResolved { request_id: rid, option_id: "cancelled".into(), answers: vec![] });
+                        }
+                        let _ = p.send(&json!({"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":sid}})).await;
+                    }
+                }
+                Some(AdapterCmd::Permission { request_id, option_id, answers }) => {
+                    if let Some(rpc_id) = st.asks.remove(&request_id) {
+                        let outcome = match option_id.as_str() {
+                            QUESTION_ANSWER => json!({"outcome":"answered","answers":answers.iter()
+                                .filter(|a| !a.selected.is_empty())
+                                .map(|a| json!({"questionId":a.question_id,"selectedOptionIds":a.selected}))
+                                .collect::<Vec<_>>()}),
+                            "cancelled" => json!({"outcome":"cancelled"}),
+                            _ => json!({"outcome":"skipped","reason":"User skipped questions"}),
+                        };
+                        let _ = p.send(&json!({"jsonrpc":"2.0","id":rpc_id,"result":{"outcome":outcome}})).await;
+                        em.event(EventBody::PermissionResolved { request_id, option_id, answers });
+                    } else if let Some(rpc_id) = st.perms.remove(&request_id) {
+                        let outcome = if option_id == "cancelled" {
+                            json!({"outcome":"cancelled"})
+                        } else {
+                            json!({"outcome":"selected","optionId":option_id})
+                        };
+                        let _ = p.send(&json!({"jsonrpc":"2.0","id":rpc_id,"result":{"outcome":outcome}})).await;
+                        em.event(EventBody::PermissionResolved { request_id, option_id, answers: vec![] });
+                    }
+                }
+                Some(AdapterCmd::Kill) | None => { killed = true; break; }
+                Some(_) => {}
+            }
+        }
+    }
+    flush(&mut st, &em);
+    let msg = p.finish(killed).await;
+    em.exited(fatal.or(msg));
+}
+
+fn prompt(st: &mut State, em: &Emitter, p: &Prompt) -> Value {
+    st.prompting = true;
+    st.turn_credits = 0.0;
+    let sid = st.session_id.clone().unwrap_or_default();
+    let mut blocks = vec![];
+    if !p.images.is_empty() {
+        if st.image_ok {
+            for i in &p.images {
+                blocks.push(json!({"type":"image","mimeType":i.mime_type,"data":i.data}));
+            }
+        } else {
+            em.event(EventBody::Error {
+                message: "这个工具不支持图片输入，图片没有发送".into(),
+            });
+        }
+    }
+    if !p.text.trim().is_empty() || blocks.is_empty() {
+        blocks.push(json!({"type":"text","text":p.text}));
+    }
+    st.req(
+        Pending::Prompt,
+        "session/prompt",
+        json!({"sessionId":sid,"prompt":blocks}),
+    )
+}
+
+/// 审批模式里只有"只读规划"要工具配合（ACP 的 session mode），其余在审批请求时由我们处理
+fn apply_mode(st: &mut State, was_plan: bool) -> Option<Value> {
+    let sid = st.session_id.clone()?;
+    let target = if st.perm == "plan" {
+        st.plan_mode.clone()?
+    } else if was_plan {
+        st.base_mode.clone()?
+    } else {
+        return None;
+    };
+    Some(st.req(Pending::Other, "session/set_mode", json!({"sessionId":sid,"modeId":target})))
+}
+
+fn set_model(st: &mut State, model: &str) -> Value {
+    let sid = st.session_id.clone().unwrap_or_default();
+    st.switching = Some(model.to_string());
+    st.req(
+        Pending::SetModel,
+        "session/set_model",
+        json!({"sessionId":sid,"modelId":model}),
+    )
+}
+
+fn flush(st: &mut State, em: &Emitter) {
+    let Some((seg, id, text)) = st.seg.take() else {
+        return;
+    };
+    if st.loading && seg == Seg::User && !text.trim().is_empty() {
+        st.replay_users += 1;
+    }
+    if text.trim().is_empty() || st.muted() {
+        return;
+    }
+    em.event(match seg {
+        Seg::Agent => EventBody::AssistantText { id, text },
+        Seg::Thought => EventBody::Thinking { id, text },
+        Seg::User => EventBody::UserMessage { text, images: vec![] },
+    });
+}
+
+fn chunk(st: &mut State, em: &Emitter, seg: Seg, text: &str) {
+    let same = matches!(&st.seg, Some((s, _, _)) if *s == seg);
+    if !same {
+        flush(st, em);
+        st.seg_n += 1;
+        st.seg = Some((seg, format!("{}-{}", em.session_id(), st.seg_n), String::new()));
+    }
+    if let Some((_, id, buf)) = st.seg.as_mut() {
+        buf.push_str(text);
+        if !st.loading {
+            match seg {
+                Seg::Agent => em.event(EventBody::AssistantDelta {
+                    id: id.clone(),
+                    delta: text.to_string(),
+                }),
+                Seg::Thought => em.event(EventBody::ThinkingDelta {
+                    id: id.clone(),
+                    delta: text.to_string(),
+                }),
+                Seg::User => {}
+            }
+        }
+    }
+}
+
+fn content_text(c: &Value) -> String {
+    if let Some(t) = c["text"].as_str() {
+        return t.to_string();
+    }
+    String::new()
+}
+
+/// cursor-agent 新建文件时把 diff 头塞进了正文：oldText 是 "-- /dev/null"，
+/// newText 第一行是 "++ b/<路径>"。去掉这些，按新建文件处理。
+fn clean_diff_texts(old: Option<&str>, new: Option<&str>) -> (Option<String>, Option<String>) {
+    let is_header = |l: &str| l.starts_with("++ b/") || l.starts_with("+++ b/") || l.starts_with("+++ /");
+    let old = old.filter(|o| !matches!(o.trim(), "-- /dev/null" | "--- /dev/null"));
+    let new = new.map(|n| match n.split_once('\n') {
+        Some((first, rest)) if old.is_none() && is_header(first) => rest,
+        None if old.is_none() && is_header(n) => "",
+        _ => n,
+    });
+    (old.map(str::to_string), new.map(str::to_string))
+}
+
+fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Result<Vec<Value>, String> {
+    let mut out = vec![];
+    let method = v["method"].as_str();
+
+    // 响应
+    if method.is_none() {
+        let Some(id) = v["id"].as_u64() else {
+            return Ok(out);
+        };
+        let kind = st.pending.remove(&id).unwrap_or(Pending::Other);
+        if let Some(err) = v.get("error") {
+            let msg = err["data"]["message"]
+                .as_str()
+                .or(err["message"].as_str())
+                .unwrap_or("ACP 错误")
+                .to_string();
+            // Kiro 不让两个进程同时打开一个会话，被占用时 load 只报 "Internal error"：查它的锁文件说清楚
+            if matches!(kind, Pending::Load) && spec.tool == ToolKind::Kiro {
+                if let Some(pid) = spec.resume.as_deref().and_then(kiro_lock_holder) {
+                    return Err(format!(
+                        "这个会话正在另一个 Kiro 里打开（进程 {pid}），Kiro 不允许同时打开同一个会话。\
+                         先退出那个 Kiro（比如关掉运行 kiro-cli 的终端窗口），再恢复会话"
+                    ));
+                }
+            }
+            return match kind {
+                // 会话建了但没说过话就没了进程时，有的工具（Cursor）没存这个会话，load 报 not found。
+                // 旧会话本来就没有内容，直接新开；不要当成没登录
+                Pending::Load if is_missing_session(&msg) => {
+                    st.loading = false;
+                    st.resumed = false;
+                    out.push(new_session(st, spec));
+                    Ok(out)
+                }
+                Pending::Session | Pending::Load if !st.auth_tried && st.auth_method.is_some() => {
+                    st.auth_tried = true;
+                    let mid = st.auth_method.clone().unwrap_or_default();
+                    out.push(st.req(Pending::Auth, "authenticate", json!({"methodId": mid})));
+                    Ok(out)
+                }
+                Pending::Auth | Pending::Session | Pending::Load | Pending::Init => Err(login_hint(spec, &msg)),
+                Pending::Prompt => {
+                    st.prompting = false;
+                    flush(st, em);
+                    em.event(EventBody::Error { message: msg });
+                    em.event(EventBody::TurnEnd {
+                        stop_reason: Some("error".into()),
+                        model: None,
+                    });
+                    Ok(out)
+                }
+                Pending::SetModel => {
+                    st.switching = None;
+                    em.event(EventBody::Error {
+                        message: format!("切换模型失败: {msg}"),
+                    });
+                    Ok(out)
+                }
+                Pending::Other => Ok(out),
+            };
+        }
+        let r = &v["result"];
+        match kind {
+            Pending::Init => {
+                st.image_ok = r["agentCapabilities"]["promptCapabilities"]["image"]
+                    .as_bool()
+                    .unwrap_or(false);
+                st.auth_method = r["authMethods"]
+                    .as_array()
+                    .and_then(|a| a.first())
+                    .and_then(|m| m["id"].as_str())
+                    .map(str::to_string);
+                out.push(new_or_load(st, spec));
+            }
+            Pending::Auth => out.push(new_or_load(st, spec)),
+            Pending::Session | Pending::Load => {
+                if let Some(sid) = r["sessionId"].as_str() {
+                    st.session_id = Some(sid.to_string());
+                    em.external_id(sid);
+                } else if let (true, Some(sid)) = (st.resumed, &spec.resume) {
+                    st.session_id = Some(sid.clone());
+                }
+                flush(st, em);
+                st.loading = false;
+                if st.resumed {
+                    let ctx = match spec.tool {
+                        ToolKind::Cursor => st.session_id.as_deref().and_then(cursor_context),
+                        ToolKind::Qoder => st.session_id.as_deref().and_then(qoder_context),
+                        _ => None,
+                    };
+                    if let Some(p) = ctx {
+                        em.context(p);
+                    }
+                }
+                let models = parse_models(r);
+                let current = r["models"]["currentModelId"].as_str().map(str::to_string);
+                // 会话上记的模型（新建时选的或之前切换过的）和工具当前的不一致就切过去
+                let want = st
+                    .want_model
+                    .take()
+                    .or(spec.model.clone())
+                    .filter(|m| !m.is_empty() && models.iter().any(|o| &o.id == m));
+                match (want, &current) {
+                    (Some(w), c) if c.as_deref() != Some(w.as_str()) => out.push(set_model(st, &w)),
+                    (_, Some(c)) => em.model(c),
+                    _ => {}
+                }
+                em.models(models);
+                let modes = r["modes"]["availableModes"].as_array().cloned().unwrap_or_default();
+                st.plan_mode = modes
+                    .iter()
+                    .filter_map(|m| m["id"].as_str())
+                    .find(|id| id.contains("plan"))
+                    .map(str::to_string);
+                st.base_mode = r["modes"]["currentModeId"]
+                    .as_str()
+                    .filter(|m| !m.contains("plan"))
+                    .map(str::to_string)
+                    .or_else(|| {
+                        modes
+                            .iter()
+                            .filter_map(|m| m["id"].as_str())
+                            .find(|id| !id.contains("plan"))
+                            .map(str::to_string)
+                    });
+                if st.perm == "plan" {
+                    if let Some(m) = apply_mode(st, false) {
+                        out.push(m);
+                    }
+                }
+                if st.queue.is_empty() {
+                    em.status(SessionStatus::Idle, None);
+                }
+            }
+            Pending::Prompt => {
+                st.prompting = false;
+                flush(st, em);
+                if let Some(msg) = meta_error(r) {
+                    em.event(EventBody::Error { message: login_hint(spec, &msg) });
+                }
+                if st.turn_credits > 0.0 {
+                    em.event(EventBody::Usage {
+                        usage: Usage {
+                            credits: st.turn_credits,
+                            ..Default::default()
+                        },
+                    });
+                    st.turn_credits = 0.0;
+                }
+                let ctx = match spec.tool {
+                    ToolKind::Cursor => st.session_id.as_deref().and_then(cursor_context),
+                    ToolKind::Qoder => st.session_id.as_deref().and_then(qoder_context),
+                    _ => None,
+                };
+                if let Some(p) = ctx {
+                    em.context(p);
+                }
+                em.event(EventBody::TurnEnd {
+                    stop_reason: r["stopReason"].as_str().map(str::to_string),
+                    model: None,
+                });
+            }
+            Pending::SetModel => {
+                if let Some(m) = st.switching.take() {
+                    em.model(&m);
+                }
+            }
+            Pending::Other => {}
+        }
+        return Ok(out);
+    }
+
+    let method = method.unwrap_or("");
+    let params = &v["params"];
+
+    // agent -> client 请求
+    if !v["id"].is_null() {
+        if method == "session/request_permission" {
+            flush(st, em);
+            let rid = v["id"].to_string();
+            let tc = &params["toolCall"];
+            let tc_id = tc["toolCallId"].as_str().unwrap_or("");
+            let known = st.tools.get(tc_id).cloned().unwrap_or_default();
+            let title = tc["title"]
+                .as_str()
+                .map(str::to_string)
+                .unwrap_or(known.title.clone());
+            let options: Vec<PermissionOption> = params["options"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|o| PermissionOption {
+                    id: o["optionId"].as_str().unwrap_or("").to_string(),
+                    label: o["name"].as_str().unwrap_or("").to_string(),
+                    kind: o["kind"].as_str().unwrap_or("").to_string(),
+                })
+                .collect();
+            // 全部放行，或者自动接受编辑且这是改文件
+            let is_edit = tc["kind"] == "edit" || known.name == "edit" || !known.diffs.is_empty();
+            if st.perm == "bypass" || (st.perm == "acceptEdits" && is_edit) {
+                // 优先选「只允许这一次」：Qoder 选「本会话都允许」会顺手把自己切到自动接受编辑
+                let once = options.iter().find(|o| o.kind == "allow_once");
+                if let Some(o) = once.or_else(|| options.iter().find(|o| o.kind.starts_with("allow"))) {
+                    out.push(json!({"jsonrpc":"2.0","id":v["id"],
+                        "result":{"outcome":{"outcome":"selected","optionId":o.id}}}));
+                    return Ok(out);
+                }
+            }
+            st.perms.insert(rid.clone(), v["id"].clone());
+            em.event(EventBody::PermissionRequest {
+                request_id: rid,
+                tool_name: if known.name.is_empty() {
+                    "tool".into()
+                } else {
+                    known.name
+                },
+                title,
+                input: tc["rawInput"].clone(),
+                options,
+                questions: vec![],
+            });
+        } else if method == "cursor/ask_question" {
+            // Cursor 的提问扩展：{toolCallId, title, questions: [{id, prompt, options: [{id, label}], allowMultiple}]}，
+            // 只能选选项、不能自己填。不支持这个方法时它会退回成逐题的 request_permission
+            flush(st, em);
+            let rid = v["id"].to_string();
+            let questions: Vec<Question> = params["questions"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|q| Question {
+                    id: q["id"].as_str().unwrap_or("").to_string(),
+                    header: String::new(),
+                    question: q["prompt"].as_str().unwrap_or("").to_string(),
+                    options: q["options"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .map(|o| QuestionOption {
+                            id: o["id"].as_str().unwrap_or("").to_string(),
+                            label: o["label"].as_str().unwrap_or("").to_string(),
+                            description: String::new(),
+                        })
+                        .collect(),
+                    multi_select: q["allowMultiple"].as_bool().unwrap_or(false),
+                    allow_other: false,
+                    secret: false,
+                })
+                .collect();
+            st.asks.insert(rid.clone(), v["id"].clone());
+            em.event(EventBody::PermissionRequest {
+                request_id: rid,
+                tool_name: "ask_question".into(),
+                title: params["title"].as_str().filter(|t| !t.is_empty()).unwrap_or("Cursor 有问题想问你").to_string(),
+                input: params.clone(),
+                options: super::question_options(),
+                questions,
+            });
+        } else {
+            out.push(json!({"jsonrpc":"2.0","id":v["id"],
+                "error":{"code":-32601,"message":"not supported by yi-console"}}));
+        }
+        return Ok(out);
+    }
+
+    // 通知
+    match method {
+        "session/update" => update(st, em, &params["update"]),
+        "_kiro.dev/metadata" => {
+            if let Some(p) = params["contextUsagePercentage"].as_f64() {
+                em.context(p);
+            }
+            for m in params["meteringUsage"].as_array().into_iter().flatten() {
+                if m["unit"] == "credit" {
+                    st.turn_credits += m["value"].as_f64().unwrap_or(0.0);
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(out)
+}
+
+fn new_or_load(st: &mut State, spec: &StartSpec) -> Value {
+    let cwd = spec.cwd.display().to_string();
+    match &spec.resume {
+        Some(sid) => {
+            st.loading = true;
+            st.record_replay = spec.replay;
+            st.replay_skip = spec.replay_skip;
+            st.replay_users = 0;
+            st.resumed = true;
+            st.req(
+                Pending::Load,
+                "session/load",
+                json!({"sessionId":sid,"cwd":cwd,"mcpServers":[]}),
+            )
+        }
+        None => new_session(st, spec),
+    }
+}
+
+fn new_session(st: &mut State, spec: &StartSpec) -> Value {
+    let cwd = spec.cwd.display().to_string();
+    st.req(Pending::Session, "session/new", json!({"cwd":cwd,"mcpServers":[]}))
+}
+
+/// Kiro 打开会话时写 ~/.kiro/sessions/cli/<id>.lock（{"pid":..,"started_at":..}），退出时删掉。
+/// 锁住这个会话的 Kiro 进程还活着就返回它的 pid
+fn kiro_lock_holder(sid: &str) -> Option<u32> {
+    if sid.is_empty() || sid.contains(['/', '\\', '.']) {
+        return None;
+    }
+    let path = crate::paths::home().join(".kiro").join("sessions").join("cli").join(format!("{sid}.lock"));
+    let v: Value = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+    let pid = u32::try_from(v["pid"].as_u64()?).ok()?;
+    (pid != std::process::id() && kiro_alive(pid)).then_some(pid)
+}
+
+/// 进程还在，而且是 Kiro（pid 可能被别的程序复用了）
+#[cfg(windows)]
+fn kiro_alive(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
+        PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    const STILL_ACTIVE: u32 = 259;
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if h.is_null() {
+            return false;
+        }
+        let mut code = 0u32;
+        let running = GetExitCodeProcess(h, &mut code) != 0 && code == STILL_ACTIVE;
+        let mut buf = [0u16; 1024];
+        let mut len = buf.len() as u32;
+        let name = if QueryFullProcessImageNameW(h, PROCESS_NAME_WIN32, buf.as_mut_ptr(), &mut len) != 0 {
+            String::from_utf16_lossy(&buf[..len as usize]).to_lowercase()
+        } else {
+            String::new()
+        };
+        CloseHandle(h);
+        running && name.contains("kiro")
+    }
+}
+
+#[cfg(unix)]
+fn kiro_alive(pid: u32) -> bool {
+    let Ok(p) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    // kill(pid, 0)：进程存在（没权限发信号也算存在）
+    let exists = unsafe { libc::kill(p, 0) == 0 } || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+    if !exists {
+        return false;
+    }
+    // Linux 上再核对一下程序名；其他系统拿不到就认为是
+    match std::fs::read_to_string(format!("/proc/{pid}/comm")) {
+        Ok(c) => c.to_lowercase().contains("kiro"),
+        Err(_) => !std::path::Path::new("/proc/self").exists(),
+    }
+}
+
+/// session/load 报会话不存在（Cursor: `Session "<id>" not found`）
+fn is_missing_session(msg: &str) -> bool {
+    let m = msg.to_lowercase();
+    m.contains("no such session") || (m.contains("session") && (m.contains("not found") || m.contains("does not exist")))
+}
+
+/// session/new、session/load 结果里的 models
+pub fn parse_models(r: &Value) -> Vec<ModelOption> {
+    r["models"]["availableModels"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|m| {
+            let id = m["modelId"].as_str()?.to_string();
+            Some(ModelOption {
+                name: m["name"].as_str().unwrap_or(&id).to_string(),
+                description: m["description"].as_str().unwrap_or("").to_string(),
+                resolved: String::new(),
+                efforts: vec![],
+                default_effort: String::new(),
+                id,
+            })
+        })
+        .collect()
+}
+
+/// CodeBuddy 的回合失败不走 JSON-RPC error：stopReason 是 refusal，错误放在 `_meta["codebuddy.ai/errorMessage"]`（JSON 字符串）
+fn meta_error(r: &Value) -> Option<String> {
+    let raw = r["_meta"].as_object()?.iter().find(|(k, _)| k.ends_with("errorMessage"))?.1.as_str()?;
+    let Ok(v) = serde_json::from_str::<Value>(raw) else {
+        return Some(raw.to_string());
+    };
+    let msg = v["data"]["details"].as_str().or(v["message"].as_str()).unwrap_or(raw);
+    Some(msg.to_string())
+}
+
+/// 工具原本的工具名（Bash、Write…）：Kiro、Qoder 放在 `_meta.<工具>.toolName`
+fn meta_tool_name(u: &Value) -> Option<&str> {
+    let m = u["_meta"].as_object()?;
+    m.values().find_map(|v| v["toolName"].as_str()).or_else(|| {
+        m.iter().find(|(k, _)| k.ends_with("toolName")).and_then(|(_, v)| v.as_str())
+    })
+}
+
+fn login_hint(spec: &StartSpec, msg: &str) -> String {
+    let lower = msg.to_lowercase();
+    if lower.contains("auth") || lower.contains("login") || msg.contains("401") {
+        let cmd = match spec.tool {
+            ToolKind::Cursor => "cursor-agent login",
+            ToolKind::Kiro => "kiro-cli login",
+            ToolKind::Qoder => "qodercli login",
+            ToolKind::Codebuddy => "codebuddy`，在里面输入 `/login",
+            _ => "登录命令",
+        };
+        format!("{msg}\n请先在这台机器上执行 `{cmd}` 完成登录")
+    } else {
+        msg.to_string()
+    }
+}
+
+fn update(st: &mut State, em: &Emitter, u: &Value) {
+    match u["sessionUpdate"].as_str().unwrap_or("") {
+        "available_commands_update" => {
+            let list = u["availableCommands"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|c| {
+                    Some(SlashCommand {
+                        name: c["name"].as_str()?.trim_start_matches('/').to_string(),
+                        description: crate::util::truncate(c["description"].as_str().unwrap_or(""), 200),
+                        hint: c["input"]["hint"].as_str().unwrap_or("").to_string(),
+                    })
+                })
+                .collect();
+            em.commands(list);
+        }
+        "current_mode_update" => {
+            // 工具自己切了模式（比如规划完退出 plan）
+            if let Some(m) = u["currentModeId"].as_str() {
+                let plan = m.contains("plan");
+                if plan != (st.perm == "plan") {
+                    st.perm = if plan { "plan".into() } else { "default".into() };
+                    em.permission_mode(&st.perm);
+                }
+            }
+        }
+        // ACP 标准的上下文占用（CodeBuddy 会发，同时在 cost.amount 里带本轮积分消耗）
+        "usage_update" => {
+            if let (Some(used), Some(size)) = (u["used"].as_f64(), u["size"].as_f64().filter(|s| *s > 0.0)) {
+                if used > 0.0 {
+                    em.context(used / size * 100.0);
+                }
+            }
+            if !st.loading {
+                if let Some(c) = u["cost"]["amount"].as_f64().filter(|c| *c > 0.0) {
+                    st.turn_credits += c;
+                }
+            }
+        }
+        "agent_message_chunk" => chunk(st, em, Seg::Agent, &content_text(&u["content"])),
+        "agent_thought_chunk" => chunk(st, em, Seg::Thought, &content_text(&u["content"])),
+        "user_message_chunk" => chunk(st, em, Seg::User, &content_text(&u["content"])),
+        "tool_call" | "tool_call_update" => {
+            flush(st, em);
+            if st.muted() {
+                return;
+            }
+            let id = u["toolCallId"].as_str().unwrap_or("").to_string();
+            let mut t = st.tools.get(&id).cloned().unwrap_or_default();
+            let before = (t.title.clone(), t.diffs.len(), t.input.clone());
+            if let Some(title) = u["title"].as_str() {
+                t.title = title.to_string();
+            }
+            if t.name.is_empty() {
+                t.name = meta_tool_name(u)
+                    .or(u["kind"].as_str())
+                    .unwrap_or("tool")
+                    .to_string();
+            }
+            if !u["rawInput"].is_null() {
+                t.input = u["rawInput"].clone();
+            }
+            let mut texts = vec![];
+            for c in u["content"].as_array().into_iter().flatten() {
+                match c["type"].as_str().unwrap_or("") {
+                    "diff" => {
+                        let (old_text, new_text) = clean_diff_texts(
+                            c["oldText"].as_str(),
+                            c["newText"].as_str(),
+                        );
+                        let d = FileDiff {
+                            path: c["path"].as_str().unwrap_or("").to_string(),
+                            old_text,
+                            new_text,
+                            unified: None,
+                        };
+                        if !t.diffs.contains(&d) {
+                            t.diffs.push(d);
+                        }
+                    }
+                    "content" => texts.push(content_text(&c["content"])),
+                    _ => {}
+                }
+            }
+            let after = (t.title.clone(), t.diffs.len(), t.input.clone());
+            if u["sessionUpdate"] == "tool_call" || before != after {
+                em.event(EventBody::ToolCall {
+                    id: id.clone(),
+                    name: t.name.clone(),
+                    title: t.title.clone(),
+                    input: t.input.clone(),
+                    diffs: t.diffs.clone(),
+                });
+            }
+            let status = u["status"].as_str().unwrap_or("");
+            if (status == "completed" || status == "failed") && !t.done {
+                t.done = true;
+                let mut output = texts.join("\n");
+                if output.is_empty() && !u["rawOutput"].is_null() {
+                    output = raw_output_text(&u["rawOutput"]);
+                }
+                em.event(EventBody::ToolResult {
+                    id: id.clone(),
+                    output: crate::util::truncate(&output, 64 * 1024),
+                    is_error: status == "failed",
+                });
+            }
+            st.tools.insert(id, t);
+        }
+        "plan" => {
+            flush(st, em);
+            if st.muted() {
+                return;
+            }
+            let entries = u["entries"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|e| PlanEntry {
+                    content: e["content"].as_str().unwrap_or("").to_string(),
+                    status: e["status"].as_str().unwrap_or("pending").to_string(),
+                })
+                .collect();
+            em.event(EventBody::Plan { entries });
+        }
+        _ => {}
+    }
+}
+
+/// Kiro 的 rawOutput 形如 {"items":[{"Json":{"stdout":..,"stderr":..}}]}，尽量抽出可读文本
+fn raw_output_text(v: &Value) -> String {
+    if let Some(s) = v.as_str() {
+        return s.to_string();
+    }
+    // CodeBuddy：{"type":"text","text":"Command: dir\nStdout: …\nStderr: …\nExit Code: 0\nSignal: (none)"}
+    if let Some(t) = v["text"].as_str() {
+        return codebuddy_bash_text(t).unwrap_or_else(|| t.to_string());
+    }
+    let mut parts = vec![];
+    for item in v["items"].as_array().into_iter().flatten() {
+        let j = if item["Json"].is_null() { item } else { &item["Json"] };
+        for k in ["stdout", "stderr"] {
+            if let Some(s) = j[k].as_str().filter(|s| !s.is_empty()) {
+                parts.push(s.to_string());
+            }
+        }
+        if let Some(s) = item["Text"].as_str() {
+            parts.push(s.to_string());
+        }
+        if parts.is_empty() {
+            if let Some(s) = j["exit_status"].as_str() {
+                parts.push(s.to_string());
+            }
+        }
+    }
+    if parts.is_empty() {
+        v.to_string()
+    } else {
+        parts.join("\n")
+    }
+}
+
+/// CodeBuddy 的命令结果是一段「Command / Stdout / Stderr / Exit Code / Signal」文本，只留输出；
+/// 退出码不是 0 时补一行 exit code: N（前端据此标成失败）
+fn codebuddy_bash_text(t: &str) -> Option<String> {
+    if !t.starts_with("Command:") {
+        return None;
+    }
+    let field = |name: &str, next: &[&str]| -> Option<String> {
+        let i = t.find(&format!("\n{name}:"))? + name.len() + 2;
+        let rest = &t[i..];
+        let end = next.iter().filter_map(|n| rest.find(&format!("\n{n}:"))).min().unwrap_or(rest.len());
+        let v = rest[..end].trim();
+        (!v.is_empty() && v != "(empty)" && v != "(none)").then(|| v.to_string())
+    };
+    let tail = ["Stderr", "Exit Code", "Signal", "Error", "Background PIDs", "Process Group PGID"];
+    let mut parts: Vec<String> = [field("Stdout", &tail), field("Stderr", &tail[1..])].into_iter().flatten().collect();
+    if let Some(c) = field("Exit Code", &tail[2..]).filter(|c| c != "0") {
+        parts.push(format!("exit code: {c}"));
+    }
+    Some(parts.join("\n"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::clean_diff_texts;
+
+    #[test]
+    fn codebuddy_bash() {
+        let ok = serde_json::json!({"type":"text","text":"Command: dir\nStdout: a.txt\nb.txt\nStderr: (empty)\nExit Code: 0\nSignal: (none)"});
+        assert_eq!(super::raw_output_text(&ok), "a.txt\nb.txt");
+        let bad = serde_json::json!({"type":"text","text":"Command: x\nStdout: (empty)\nStderr: not found\nExit Code: 1\nSignal: (none)"});
+        assert_eq!(super::raw_output_text(&bad), "not found\nexit code: 1");
+    }
+
+    #[test]
+    fn cursor_new_file_diff() {
+        let (o, n) = clean_diff_texts(Some("-- /dev/null"), Some("++ b//tmp/x/b.txt\nnew"));
+        assert_eq!((o, n.as_deref()), (None, Some("new")));
+        let (o, n) = clean_diff_texts(Some("a\n"), Some("++ b/not-a-header\n"));
+        assert_eq!((o.as_deref(), n.as_deref()), (Some("a\n"), Some("++ b/not-a-header\n")));
+    }
+}
+
+/// Qoder 的 ACP 不推 usage_update，从会话 jsonl 最后一条带 context_usage_ratio 的记录取上下文占比
+fn qoder_context(sid: &str) -> Option<f64> {
+    let path = crate::history::find_qoder_file(sid)?;
+    let text = std::fs::read_to_string(path).ok()?;
+    for line in text.lines().rev() {
+        if !line.contains("\"context_usage_ratio\"") {
+            continue;
+        }
+        let v: Value = serde_json::from_str(line).ok()?;
+        if let Some(r) = v["message"]["usage"]["context_usage_ratio"].as_f64().filter(|r| *r > 0.0) {
+            return Some(r * 100.0);
+        }
+    }
+    None
+}
+
+/// Cursor 的 ACP 不回传 token 用量，上下文占比只能读它本地的会话库：
+/// `~/.cursor/chats/<md5(cwd)>/<sessionId>/store.db`，meta 表里是十六进制的 JSON，
+/// 其中 latestRootBlobId 指向 blobs 表里的根记录（protobuf，未加密），
+/// 根记录的 5 号字段是 token_details { 1: used_tokens, 2: max_tokens }
+fn cursor_context(sid: &str) -> Option<f64> {
+    let chats = crate::paths::home().join(".cursor").join("chats");
+    let db = std::fs::read_dir(chats)
+        .ok()?
+        .flatten()
+        .map(|d| d.path().join(sid).join("store.db"))
+        .find(|p| p.is_file())?;
+    let conn = rusqlite::Connection::open_with_flags(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).ok()?;
+    let meta: String = conn
+        .query_row("SELECT value FROM meta WHERE key = '0'", [], |r| r.get(0))
+        .ok()?;
+    let meta: Value = serde_json::from_slice(&unhex(meta.trim())?).ok()?;
+    let root = meta["latestRootBlobId"].as_str()?;
+    let blob: Vec<u8> = conn
+        .query_row("SELECT data FROM blobs WHERE id = ?1", [root], |r| r.get(0))
+        .ok()?;
+    let details = pb_field(&blob, 5)?;
+    let used = pb_varint(details, 1)? as f64;
+    let max = pb_varint(details, 2)? as f64;
+    (max > 0.0).then(|| used / max * 100.0)
+}
+
+fn unhex(s: &str) -> Option<Vec<u8>> {
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(s.get(i..i + 2)?, 16).ok())
+        .collect()
+}
+
+fn read_varint(b: &[u8], i: &mut usize) -> Option<u64> {
+    let mut x = 0u64;
+    for shift in (0..64).step_by(7) {
+        let c = *b.get(*i)?;
+        *i += 1;
+        x |= u64::from(c & 0x7f) << shift;
+        if c & 0x80 == 0 {
+            return Some(x);
+        }
+    }
+    None
+}
+
+/// 遍历一层 protobuf，对每个字段回调 (字段号, 类型, varint 值, 长度字段内容)
+fn pb_walk<'a>(b: &'a [u8], mut f: impl FnMut(u64, u64, u64, &'a [u8]) -> bool) -> Option<()> {
+    let mut i = 0;
+    while i < b.len() {
+        let tag = read_varint(b, &mut i)?;
+        let (no, wt) = (tag >> 3, tag & 7);
+        let (v, bytes): (u64, &[u8]) = match wt {
+            0 => (read_varint(b, &mut i)?, &[]),
+            1 => {
+                i += 8;
+                (0, &[])
+            }
+            2 => {
+                let len = read_varint(b, &mut i)? as usize;
+                let s = b.get(i..i.checked_add(len)?)?;
+                i += len;
+                (0, s)
+            }
+            5 => {
+                i += 4;
+                (0, &[])
+            }
+            _ => return None,
+        };
+        if f(no, wt, v, bytes) {
+            return Some(());
+        }
+    }
+    Some(())
+}
+
+fn pb_field(b: &[u8], no: u64) -> Option<&[u8]> {
+    let mut out = None;
+    pb_walk(b, |n, wt, _, s| {
+        (n == no && wt == 2).then(|| out = Some(s)).is_some()
+    })?;
+    out
+}
+
+fn pb_varint(b: &[u8], no: u64) -> Option<u64> {
+    let mut out = None;
+    pb_walk(b, |n, wt, v, _| (n == no && wt == 0).then(|| out = Some(v)).is_some())?;
+    out
+}
+
+#[cfg(test)]
+mod cursor_tests {
+    use super::*;
+
+    #[test]
+    fn cursor_token_details() {
+        // 实际会话库里根记录 5 号字段的开头：used=31908，max=256000
+        let details = [0x08, 0xa4, 0xf9, 0x01, 0x10, 0x80, 0xd0, 0x0f];
+        let mut root = vec![0x0a, 0x02, 0xaa, 0xbb, 0x2a, details.len() as u8];
+        root.extend_from_slice(&details);
+        root.extend_from_slice(&[0x50, 0x01]);
+        let d = pb_field(&root, 5).unwrap();
+        assert_eq!(pb_varint(d, 1), Some(31908));
+        assert_eq!(pb_varint(d, 2), Some(256000));
+        assert_eq!(unhex("7b7d"), Some(b"{}".to_vec()));
+    }
+}
