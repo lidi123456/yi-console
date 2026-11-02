@@ -81,13 +81,13 @@ Each machine runs a background service, `yi-agentd`, which starts and hosts the 
 
 - [User guide](docs/guide.en.md): sessions, the input box, terminals, files and changes, shortcuts, notifications, where data lives
 - [Remote access and relay](docs/remote.en.md): SSH hosts, connecting through a relay, deploying a relay server, network proxies
-- [Development guide](docs/development.md): building from source, project layout, packaging and releases
-- [Relay security design](docs/relay-security-v2.md)
-- [Adding a new AI tool](docs/adding-a-tool.md)
+- [Development guide](docs/development.en.md): building from source, project layout, packaging and releases
+- [Relay security design](docs/relay-security.en.md)
+- [Adding a new AI tool](docs/adding-a-tool.en.md)
 
 ## Contributing
 
-Issues and pull requests are welcome. See the [development guide](docs/development.md) to build from source, and read [AGENTS.md](AGENTS.md) before changing code; it records the project layout and conventions.
+Issues and pull requests are welcome. See the [development guide](docs/development.en.md) to build from source, and read [AGENTS.md](AGENTS.md) before changing code; it records the project layout and conventions.
 
 ## License
 

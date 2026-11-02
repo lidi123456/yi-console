@@ -1,4 +1,4 @@
-//! The yi-agentd side of the relay (design in `docs/relay-security-v2.md`):
+//! The yi-agentd side of the relay (design in `docs/relay-security.en.md`):
 //! - keep a control connection to the relay (registering with an invite code the first time), and push the allow list of paired clients and pairing tickets to it;
 //! - on open, start a stream and do the Noise handshake: pairing connections check the one-time pairing code and then add the client to the paired list,
 //!   normal connections only accept paired clients and, once the handshake passes, are handled like any client connection (serve_conn);

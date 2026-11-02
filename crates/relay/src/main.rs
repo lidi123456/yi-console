@@ -1,4 +1,4 @@
-//! yi-relay: a minimal WebSocket relay; see `docs/relay-security-v2.md` for the design.
+//! yi-relay: a minimal WebSocket relay; see `docs/relay-security.en.md` for the design.
 //!
 //! - `/v1/agent`   yi-agentd's control connection (long-lived)
 //! - `/v1/client`  client connections; the relay has yi-agentd open a stream, then splices them

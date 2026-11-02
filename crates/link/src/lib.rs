@@ -1,4 +1,4 @@
-//! Relay link v2; see `docs/relay-security-v2.md` for the design.
+//! Relay link; see `docs/relay-security.en.md` for the design.
 //!
 //! Topology: yi-agentd connects out to the relay's `/v1/agent` (control connection), clients connect to `/v1/client`;
 //! the relay tells yi-agentd to open a `/v1/stream`, then splices the two WebSockets together as is.

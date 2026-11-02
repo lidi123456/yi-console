@@ -12,7 +12,7 @@ On first connect you're shown the host's fingerprint to confirm. After that, the
 
 ## Reaching a computer through a relay (from a phone or another computer)
 
-When a computer is behind NAT and your phone or another computer can't reach it directly, use a relay. Below, the computer being connected to is called the "target computer". For the security design, see [Relay security design](relay-security-v2.md).
+When a computer is behind NAT and your phone or another computer can't reach it directly, use a relay. Below, the computer being connected to is called the "target computer". For the security design, see [Relay security design](relay-security.en.md).
 
 1. Deploy `yi-relay` on a server with a public address (see "Deploying a relay" below). The relay operator runs `yi-relay invite` to create a **relay access link** for each target computer (single-use, valid for 24 hours by default).
 2. In the desktop app on the target computer, open "Hosts" and click "Make this computer reachable" at the top right, then follow the card:

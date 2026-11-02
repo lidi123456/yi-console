@@ -81,13 +81,13 @@ Yi Console 把它们统一管起来：
 
 - [使用手册](docs/guide.md)：会话、对话输入框、终端、文件和改动、快捷键、通知、数据位置
 - [远程连接与中继](docs/remote.md)：SSH 主机、经中继连接、部署中继服务器、网络代理
-- [开发指南](docs/development.md)（英文）：从源码构建、项目结构、打包发布
-- [中继安全设计](docs/relay-security-v2.md)（英文）
-- [接入新的 AI 工具](docs/adding-a-tool.md)（英文）
+- [开发指南](docs/development.md)：从源码构建、项目结构、打包发布
+- [中继安全设计](docs/relay-security.md)
+- [接入新的 AI 工具](docs/adding-a-tool.md)
 
 ## 参与开发
 
-欢迎提交 Issue 和 Pull Request。从源码构建见[开发指南](docs/development.md)；改代码前请先读 [AGENTS.md](AGENTS.md)，里面记录了项目结构和约定。
+欢迎提交 Issue 和 Pull Request。从源码构建见[开发指南](docs/development.md)；改代码前请先读 [AGENTS.md](AGENTS.md)（英文，主要给 AI 编程助手看，也是项目结构和约定的说明）。
 
 ## 开源协议
 
