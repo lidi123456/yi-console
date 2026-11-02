@@ -56,7 +56,7 @@ function stepSession(d: 1 | -1) {
   navigate({ kind: 'session', hostId: n.hostId, sessionId: n.s.id });
 }
 
-/** 全局快捷键，App 挂一次 */
+/** Global shortcuts, mounted once by App */
 export function useShortcuts() {
   useEffect(() => {
     const f = (e: KeyboardEvent) => {
@@ -90,7 +90,7 @@ export function useShortcuts() {
         }
       }
     };
-    // 鼠标侧键后退 / 前进
+    // Mouse side buttons for back / forward
     const m = (e: MouseEvent) => {
       if (e.button === 3 || e.button === 4) {
         e.preventDefault();

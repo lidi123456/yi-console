@@ -1,12 +1,12 @@
-//! 终端模式的会话放在 tmux 里跑：守护进程重启、升级后进程还在，重新接上就能继续。
-//! 只在类 Unix 上、装了 tmux 时启用；用单独的 socket（-L yi-console），不影响用户自己的 tmux。
+//! Terminal-mode sessions run inside tmux: the processes survive daemon restarts and upgrades, and pick up again on reattach.
+//! Only enabled on Unix-likes with tmux installed; uses a separate socket (-L yi-console) so the user's own tmux is unaffected.
 
 use std::path::PathBuf;
 use std::process::Command;
 
 const SOCKET: &str = "yi-console";
 
-/// 要 3.2 以上（new-session -e）；结果缓存，装了新 tmux 要重启守护进程才认
+/// Requires 3.2+ (new-session -e); the result is cached, so a newly installed tmux needs a daemon restart to be detected
 pub fn program() -> Option<PathBuf> {
     static P: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
     P.get_or_init(|| {
@@ -40,8 +40,8 @@ pub fn session_name(sid: &str) -> String {
     format!("ah-{}", sid.chars().filter(|c| c.is_ascii_alphanumeric()).take(12).collect::<String>())
 }
 
-/// 配置文件：不显示状态栏、不抢鼠标（选中复制、滚轮都交给 xterm.js），
-/// 关掉外层的备用屏幕，滚出屏幕的行进 xterm.js 的回滚缓冲，能直接往上翻
+/// Config file: no status bar, no mouse capture (selection, copy and the wheel all go to xterm.js),
+/// and the outer alternate screen disabled, so lines scrolled off screen go into xterm.js's scrollback and can be scrolled back directly
 fn conf() -> PathBuf {
     let p = crate::paths::base_dir().join("tmux.conf");
     let text = "\
@@ -62,7 +62,7 @@ unbind C-b
     p
 }
 
-/// 启动或接上已有会话的命令行：tmux … new-session -A -s 名字 -c 目录 -- 程序 参数…
+/// Command line to start or attach to a session: tmux … new-session -A -s name -c dir -- program args…
 pub fn wrap(tmux: &PathBuf, name: &str, cwd: &str, program: &str, args: &[String], cols: u16, rows: u16) -> (PathBuf, Vec<String>) {
     let mut a: Vec<String> = vec![
         "-L".into(),
@@ -99,9 +99,9 @@ pub fn alive(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// 翻 tmux 自己的历史（输出快时 tmux 会整屏重画，滚出去的行进不了 xterm.js 的回滚缓冲）。
-/// lines > 0 往上翻、< 0 往下翻，翻回底部自动退出翻页；cancel 直接回到底部。
-/// 返回 (离底部的行数, 历史总行数)；会话不在 tmux 里返回 None
+/// Scroll tmux's own history (when output is fast tmux redraws whole screens, so scrolled-off lines never reach xterm.js's scrollback).
+/// lines > 0 scrolls up, < 0 down; reaching the bottom exits copy mode automatically; cancel goes straight back to the bottom.
+/// Returns (lines from the bottom, total history lines); None if the session isn't in tmux
 pub fn scroll(name: &str, lines: i64, cancel: bool) -> Option<(u64, u64)> {
     let t = program()?;
     let target = format!("={name}:");
@@ -115,7 +115,7 @@ pub fn scroll(name: &str, lines: i64, cancel: bool) -> Option<(u64, u64)> {
     if cancel {
         push(&["if-shell", "-F", "-t", &target, "#{pane_in_mode}", &format!("send-keys -t {target} -X cancel")]);
     } else if lines > 0 {
-        // -e：翻回底部时自动退出翻页模式
+        // -e: exit copy mode automatically when scrolled back to the bottom
         push(&["copy-mode", "-e", "-t", &target]);
         push(&["send-keys", "-t", &target, "-X", "-N", &lines.to_string(), "scroll-up"]);
     } else if lines < 0 {
@@ -130,7 +130,7 @@ pub fn scroll(name: &str, lines: i64, cancel: bool) -> Option<(u64, u64)> {
     parse_scroll(&String::from_utf8_lossy(&out.stdout))
 }
 
-/// "1 120 5000" -> (120, 5000)；不在翻页模式时 scroll_position 为空或无意义，按 0 算
+/// "1 120 5000" -> (120, 5000); outside copy mode scroll_position is empty or meaningless, treated as 0
 fn parse_scroll(s: &str) -> Option<(u64, u64)> {
     let line = s.lines().last()?.trim().to_string();
     let parts: Vec<&str> = line.split_whitespace().collect();
@@ -142,7 +142,7 @@ fn parse_scroll(s: &str) -> Option<(u64, u64)> {
     Some((if in_mode { pos } else { 0 }, hist))
 }
 
-/// 窗格里直接跑的程序的进程号
+/// PID of the program running directly in the pane
 fn pane_pid(name: &str) -> Option<i32> {
     let out = Command::new(program()?)
         .args(["-L", SOCKET, "display-message", "-p", "-t", &format!("={name}:"), "#{pane_pid}"])
@@ -153,9 +153,9 @@ fn pane_pid(name: &str) -> Option<i32> {
     String::from_utf8_lossy(&out.stdout).trim().parse().ok().filter(|p| *p > 0)
 }
 
-/// 结束 tmux 会话，并等里面的程序真正退出。kill-session 只发 SIGHUP，程序收尾要一会儿，
-/// 这期间工具会话还被它占着（Codex 会拒绝另一个进程接续），所以要等。
-/// 3 秒还没退就连同它的子进程一起强杀。会话不存在返回 false
+/// End the tmux session and wait for the program inside to actually exit. kill-session only sends SIGHUP and the program takes a while to wrap up,
+/// during which it still holds the tool session (Codex refuses to let another process continue it), so we wait.
+/// If it hasn't exited after 3 seconds, kill it along with its children. Returns false if the session doesn't exist
 pub async fn kill_and_wait(name: &str) -> bool {
     let pid = pane_pid(name);
     kill(name);
@@ -167,7 +167,7 @@ pub async fn kill_and_wait(name: &str) -> bool {
                 break;
             }
             if i == 30 {
-                // 窗格里的程序是进程组组长，按组杀掉 npm 包装脚本起的子进程
+                // The program in the pane is the process group leader; kill by group to get children started by npm wrapper scripts
                 unsafe { libc::kill(-pid, libc::SIGKILL) };
             }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;

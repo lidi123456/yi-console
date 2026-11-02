@@ -12,7 +12,7 @@ import { lsGet, lsSet, toB64 } from '../util';
 import { openMenu } from './Overlay';
 import { isAppDark, onThemeChange, useTheme } from '../theme';
 
-// 配色取自 Windows Terminal：暗色 One Half Dark，亮色 One Half Light
+// Color schemes from Windows Terminal: One Half Dark for dark, One Half Light for light
 const DARK: ITheme = {
   background: '#1e1f22',
   foreground: '#dcdfe4',
@@ -88,12 +88,12 @@ export function useTermPrefs() {
   return p;
 }
 
-/** auto 跟随界面主题（界面主题又可以跟随系统） */
+/** auto follows the UI theme (which may in turn follow the system) */
 function isDark(scheme: TermScheme) {
   return scheme === 'dark' || (scheme === 'auto' && isAppDark());
 }
 
-// 手机上没有 Ctrl/Esc/方向键，补一排快捷键
+// Phones have no Ctrl/Esc/arrow keys, so add a row of shortcut keys
 const KEYS: [string, string][] = [
   ['Esc', '\x1b'],
   ['Tab', '\t'],
@@ -109,7 +109,7 @@ const KEYS: [string, string][] = [
   ['Enter', '\r'],
 ];
 
-/** 终端配色、字号按钮，放在终端下面的状态栏右侧 */
+/** Terminal color scheme and font size buttons, on the right of the status bar under the terminal */
 export function TermTools() {
   const prefs = useTermPrefs();
   useTheme();
@@ -137,13 +137,13 @@ export function TerminalView({ hostId, sessionId, running }: { hostId: string; s
   const dark = isDark(prefs.scheme);
   const fitRef = useRef<() => void>(() => {});
 
-  // tmux 里的会话：翻的是 tmux 自己的历史。position 是离底部的行数，history 是历史总行数
+  // Sessions in tmux scroll tmux's own history. position is the number of lines from the bottom, history is the total history lines
   const [scroll, setScroll] = useState<{ inTmux: boolean; position: number; history: number }>({ inTmux: false, position: 0, history: 0 });
   const scrollRef = useRef(scroll);
   scrollRef.current = scroll;
 
-  // 每次调用在后端是并发处理的，逐键发送会乱序：同一时刻只发一个请求，期间的操作攒到下一次。
-  // 翻页和输入走同一个队列：翻页中一打字，先退出翻页再发输入
+  // Each call is handled concurrently on the backend, so sending key by key would reorder them: only one request in flight at a time, and actions meanwhile are batched into the next.
+  // Scrolling and input share one queue: typing while scrolled back first exits scroll mode, then sends the input
   type Op = { kind: 'input'; data: string } | { kind: 'scroll'; lines: number } | { kind: 'cancel' };
   const queue = useRef<{ ops: Op[]; inflight: boolean }>({ ops: [], inflight: false });
   const enqueue = (op: Op) => {
@@ -169,7 +169,7 @@ export function TerminalView({ hostId, sessionId, running }: { hostId: string; s
               cancel: next.kind === 'cancel',
             }).then((r) => {
               if (!r.inTmux) return;
-              // 翻回了底部（tmux 自动退出翻页）
+              // Scrolled back to the bottom (tmux exits copy mode automatically)
               if (!r.position) paging.current = false;
               setScroll({ inTmux: true, position: r.position ?? 0, history: r.history ?? 0 });
             });
@@ -177,8 +177,8 @@ export function TerminalView({ hostId, sessionId, running }: { hostId: string; s
     };
     flush();
   };
-  // 挂载时问的那一次常常早于 tmux 会话建好（程序要等第一个 pty.resize 才启动），回答「不在 tmux」后就再也不问，
-  // 滚动条一直不出来：确认在 tmux 之前每 3 秒再问，最多问 20 次。确认之后历史增长由输出触发更新
+  // The query on mount often comes before the tmux session exists (the program waits for the first pty.resize before starting); after a "not in tmux" answer we'd never ask again,
+  // and the scrollbar would never appear: until tmux is confirmed, ask again every 3 s, at most 20 times. After that, history growth is driven by output
   useEffect(() => {
     let n = 0;
     const ask = () => {
@@ -190,7 +190,7 @@ export function TerminalView({ hostId, sessionId, running }: { hostId: string; s
     const t = setInterval(ask, 3000);
     return () => clearInterval(t);
   }, [hostId, sessionId]); // eslint-disable-line react-hooks/exhaustive-deps
-  // 发出往上翻的请求就算进入翻页，不等后端返回：否则请求还在路上时打字，就不会先退出翻页
+  // Sending a scroll-up request counts as entering scroll mode without waiting for the backend; otherwise typing while the request is in flight wouldn't exit scroll mode first
   const paging = useRef(false);
   const send = (data: string) => {
     if (paging.current || scrollRef.current.position > 0) {
@@ -209,7 +209,7 @@ export function TerminalView({ hostId, sessionId, running }: { hostId: string; s
   useEffect(() => {
     const p = termPrefs();
     const term = new Terminal({
-      // 和 Windows Terminal 一样优先用 Cascadia Mono，中文回退到雅黑 / 苹方
+      // Like Windows Terminal, prefer Cascadia Mono, with CJK falling back to YaHei / PingFang
       fontFamily:
         '"Cascadia Mono", "Cascadia Code", Consolas, "SF Mono", Menlo, "JetBrains Mono", "Microsoft YaHei UI", "PingFang SC", monospace',
       fontSize: p.fontSize,
@@ -225,24 +225,24 @@ export function TerminalView({ hostId, sessionId, running }: { hostId: string; s
     });
     const fit = new FitAddon();
     term.loadAddon(fit);
-    // 中文、emoji 按两格宽算，光标不会错位
+    // CJK and emoji count as two cells wide so the cursor doesn't drift
     term.loadAddon(new Unicode11Addon());
     term.unicode.activeVersion = '11';
     term.open(el.current!);
-    // GPU 渲染：字更清晰、滚动更顺；不支持时用默认的 DOM 渲染
+    // GPU rendering: crisper text and smoother scrolling; falls back to the default DOM renderer when unsupported
     try {
       const gl = new WebglAddon();
       gl.onContextLoss(() => gl.dispose());
       term.loadAddon(gl);
     } catch {
-      /* 不支持 WebGL */
+      /* WebGL not supported */
     }
     termRef.current = term;
     const stopIme = imeFollowFakeCursor(term);
     const key = skey(hostId, sessionId);
     const d = getSession(key);
-    // 回放历史输出时，里面程序当年发的终端查询（光标位置、终端型号等）不能再回答一次：
-    // 回答会被当成键盘输入打进 shell（比如 tmux 的 ESC[>c 变成提示符后面的 0;276;0c）
+    // When replaying past output, terminal queries the program sent back then (cursor position, terminal type, etc.) must not be answered again:
+    // the answers would be typed into the shell as keyboard input (e.g. tmux's ESC[>c turning into 0;276;0c after the prompt)
     let replaying = 0;
     const swallow = () => replaying > 0;
     const hooks = [
@@ -260,7 +260,7 @@ export function TerminalView({ hostId, sessionId, running }: { hostId: string; s
     };
     for (const chunk of d.termBacklog) replay(chunk);
     d.termBacklog = [];
-    // 之前打开过：上次的终端内容随着组件一起销毁了，重新订阅拿一份屏幕快照
+    // Opened before: the old terminal content was destroyed with the component, so resubscribe to get a screen snapshot
     if (d.loaded) loadSession(hostId, sessionId, true).catch(() => {});
     d.term = (data, reset) => {
       if (reset) {
@@ -280,20 +280,20 @@ export function TerminalView({ hostId, sessionId, running }: { hostId: string; s
       } catch {
         return;
       }
-      // 尺寸变了 xterm 会把视口停在最上面：原来在底部就回到底部，否则回到原来那行
+      // When the size changes xterm parks the viewport at the top: go back to the bottom if we were there, otherwise back to the original line
       requestAnimationFrame(() => (atBottom ? term.scrollToBottom() : term.scrollToLine(top)));
       const size = `${term.cols}x${term.rows}`;
       if (size === lastSize) return;
       const first = !lastSize;
       lastSize = size;
-      // 第一次马上发（yi-agentd 等这个尺寸才启动程序）；之后等尺寸停下来再发，拖窗口时全屏程序不用重画几十次
+      // Send the first one immediately (yi-agentd waits for this size before starting the program); after that wait until the size settles, so full-screen programs don't redraw dozens of times while dragging the window
       clearTimeout(resizeTimer);
       const push = () => rpc(hostId, 'pty.resize', { sessionId, cols: term.cols, rows: term.rows }).catch(() => {});
       if (first) push();
       else resizeTimer = setTimeout(push, 200);
     };
     fitRef.current = doFit;
-    // 和 Windows Terminal 一样：有选中时 Ctrl+C 复制，Ctrl+Shift+C / V 复制粘贴，Ctrl+V 粘贴
+    // Like Windows Terminal: Ctrl+C copies when there's a selection, Ctrl+Shift+C / V copy and paste, Ctrl+V pastes
     term.attachCustomKeyEventHandler((e) => {
       if (e.type !== 'keydown') return true;
       const k = e.key.toLowerCase();
@@ -314,7 +314,7 @@ export function TerminalView({ hostId, sessionId, running }: { hostId: string; s
       }
       return true;
     });
-    // 滚轮：tmux 里的会话翻 tmux 的历史；按像素累计，满一行发一次
+    // Wheel: sessions in tmux scroll tmux's history; accumulate pixels and send once per full line
     let wheelAcc = 0;
     const cellHeight = () => (term.element?.querySelector('.xterm-screen')?.clientHeight ?? 0) / term.rows || 18;
     term.attachCustomWheelEventHandler((e) => {
@@ -329,7 +329,7 @@ export function TerminalView({ hostId, sessionId, running }: { hostId: string; s
       e.preventDefault();
       return false;
     });
-    // 手机触摸上下滑：tmux 里同样翻 tmux 历史（手指往下划看更早的行，往上划回到底部）
+    // Touch swipes on mobile: also scroll tmux history in tmux (swipe down for older lines, swipe up to return to the bottom)
     let touchY: number | null = null;
     let touchAcc = 0;
     const boxEl = el.current!;
@@ -402,7 +402,7 @@ export function TerminalView({ hostId, sessionId, running }: { hostId: string; s
     if (scroll.inTmux && termRef.current) termRef.current.options.scrollback = 0;
   }, [scroll.inTmux]);
 
-  // 设置改了：换配色、字号
+  // Settings changed: switch color scheme and font size
   useEffect(() => {
     const t = termRef.current;
     if (!t) return;
@@ -482,9 +482,9 @@ export function TerminalView({ hostId, sessionId, running }: { hostId: string; s
 }
 
 /**
- * 全屏 TUI（Kiro、Claude Code 等）会把真实光标藏起来停在角落，自己用反色字符画一个光标。
- * xterm 按真实光标摆放接收输入法的隐藏输入框，输入法候选框就跟着跑到角落去了。
- * 真实光标隐藏时，把输入框和组字预览挪到屏幕上那个单独的反色格子上；找不到就不动。
+ * Full-screen TUIs (Kiro, Claude Code, etc.) hide the real cursor in a corner and draw their own with an inverted cell.
+ * xterm positions the hidden IME textarea at the real cursor, so the IME candidate window ends up in the corner too.
+ * While the real cursor is hidden, move the textarea and the composition preview onto that lone inverted cell on screen; if none is found, leave them alone.
  */
 function imeFollowFakeCursor(term: Terminal): () => void {
   const root = term.element;
@@ -493,7 +493,7 @@ function imeFollowFakeCursor(term: Terminal): () => void {
   const comp = root.querySelector<HTMLElement>('.composition-view');
   const screen = root.querySelector<HTMLElement>('.xterm-screen');
 
-  /** 从下往上找左右都不是反色的单个反色格子 */
+  /** Search bottom-up for a single inverted cell whose left and right neighbors aren't inverted */
   const find = () => {
     const buf = term.buffer.active;
     const tmp = buf.getNullCell();
@@ -512,7 +512,7 @@ function imeFollowFakeCursor(term: Terminal): () => void {
 
   const apply = () => {
     if (document.activeElement !== ta || !screen) return;
-    // 私有字段，取不到时当作隐藏处理（找不到反色格子也不会动）
+    // Private field; if unavailable, treat the cursor as hidden (nothing moves if no inverted cell is found anyway)
     const hidden = (term as any)._core?.coreService?.isCursorHidden;
     if (hidden === false) return;
     const p = find();
@@ -527,7 +527,7 @@ function imeFollowFakeCursor(term: Terminal): () => void {
     }
   };
 
-  // xterm 每次渲染、组字时都会按真实光标重设位置，改完再挪回来；自己改的位置相同就不再触发
+  // xterm resets the position to the real cursor on every render and composition, so move it back afterwards; skip if the position we set is unchanged
   const mo = new MutationObserver(apply);
   mo.observe(ta, { attributes: true, attributeFilter: ['style'] });
   if (comp) mo.observe(comp, { attributes: true, attributeFilter: ['style'] });
@@ -542,7 +542,7 @@ function imeFollowFakeCursor(term: Terminal): () => void {
   };
 }
 
-/** tmux 历史的滚动条：拖动滑块、点轨道翻页；翻页中右下角显示"回到底部" */
+/** Scrollbar for tmux history: drag the thumb, click the track to page; shows "back to bottom" at the bottom right while scrolled back */
 function TmuxScrollbar({
   position,
   history,
@@ -559,7 +559,7 @@ function TmuxScrollbar({
   const track = useRef<HTMLDivElement>(null);
   const total = history + rows;
   const thumbH = Math.max(24, (rows / total) * 100);
-  // 滑块顶部在第几行：最上面是历史第一行
+  // Which line the top of the thumb is at: the very top is the first history line
   const topLine = history - position;
   const thumbTop = (topLine / total) * 100;
   const drag = useRef<{ y: number; pos: number } | null>(null);
@@ -572,7 +572,7 @@ function TmuxScrollbar({
         ref={track}
         onPointerDown={(e) => {
           if (e.target !== track.current) return;
-          // 点轨道：往点的方向翻一页
+          // Clicking the track: page one screen toward the click
           const r = track.current!.getBoundingClientRect();
           const clickLine = ((e.clientY - r.top) / r.height) * total;
           onScroll((clickLine < topLine ? 1 : -1) * Math.max(1, rows - 2));

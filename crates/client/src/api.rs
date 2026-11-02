@@ -1,11 +1,11 @@
-//! ClientHub：前端唯一的入口。Tauri 命令和 Web 模式的 WebSocket 都转到 `call`，
-//! 事件经 `Sink` 推给前端。
+//! ClientHub: the frontend's single entry point. Tauri commands and the web mode's WebSocket all go to `call`,
+//! and events are pushed to the frontend through `Sink`.
 //!
-//! 推给前端的事件：
+//! Events pushed to the frontend:
 //! - `{"type":"host.status","hostId","status":"connecting|connected|disconnected|error","error"?,"code"?,"hello"?,"versionMismatch"?}`
-//! - `{"type":"deploy","hostId","message"}` 部署进度
-//! - `{"type":"notification","hostId","method","params"}` yi-agentd 的通知原样转发；
-//!   重连后补发的积压以 method = "session.backlog" 推送（params 同 session.subscribe 的返回值 + sessionId）
+//! - `{"type":"deploy","hostId","message"}` deployment progress
+//! - `{"type":"notification","hostId","method","params"}` yi-agentd notifications forwarded as is;
+//!   the backlog replayed after a reconnect is pushed with method = "session.backlog" (params = the session.subscribe result + sessionId)
 
 use crate::deploy;
 use crate::forward::{self, Forward};
@@ -49,21 +49,21 @@ pub struct ClientHub {
     store: Mutex<HostStore>,
     conns: Mutex<HashMap<String, Arc<HostConn>>>,
     known: Arc<KnownHosts>,
-    /// 手机等没有本机 yi-agentd 的平台
+    /// Platforms without a local yi-agentd, such as phones
     local_supported: bool,
-    /// 正在升级的主机：重连后版本对上了才算完成
+    /// Hosts being upgraded: only done once the version matches after reconnecting
     upgrading: Mutex<HashSet<String>>,
-    /// 这次启动里已经自动升级过的主机，升级后仍不一致就不再重试，免得来回重启
+    /// Hosts already auto-upgraded during this run; if they still mismatch afterwards, don't retry, to avoid restart loops
     auto_tried: Mutex<HashSet<String>>,
-    /// 端口转发，键是 `<主机 id>/<主机上的端口>`
+    /// Port forwards, keyed by `<host id>/<port on the host>`
     forwards: Mutex<HashMap<String, Arc<Forward>>>,
-    /// 浏览器标签预览 HTML 用的文件服务（见 preview.rs）
+    /// File server for previewing HTML in browser tabs (see preview.rs)
     previews: crate::preview::Previews,
 }
 
-/// 不重试的错误（需要用户处理）
+/// Errors not worth retrying (they need the user to act)
 fn fatal_code(e: &str) -> Option<&'static str> {
-    // 中继或电脑明确拒绝了这台设备（被移除、重置过配对、身份不符）：重连也没用，不要一直重试
+    // The relay or the computer explicitly rejected this device (removed, pairings reset, identity mismatch): reconnecting won't help, so don't keep retrying
     if ["（4403）", "（4410）", "请重新配对", "设备身份校验失败", "还没完成配对", "旧版本"].iter().any(|k| e.contains(k)) {
         return Some("PAIRING_INVALID");
     }
@@ -163,7 +163,7 @@ impl ClientHub {
             .ok_or_else(|| anyhow!("主机不存在: {id}"))
     }
 
-    /// 已经和设备 `device` 配对过的中继主机，连同它的配对凭据；有几条时优先正在编辑的 `prefer`
+    /// Relay hosts already paired with device `device`, together with their pairing credentials; if there are several, prefer `prefer`, the one being edited
     fn paired_with(&self, device: &str, prefer: &str) -> Option<(HostConfig, yi_link::Credential)> {
         let st = self.store.lock().unwrap();
         let mut found: Vec<(HostConfig, yi_link::Credential)> = st
@@ -204,7 +204,7 @@ impl ClientHub {
             }
             "hosts.save" => {
                 let mut h: HostConfig = serde_json::from_value(args["host"].clone())?;
-                // 前端拿到的是脱敏后的配置，没改密码就沿用旧值
+                // The frontend gets a redacted config; if the password wasn't changed, keep the old value
                 if let Ok(old) = self.host(&h.id) {
                     if let (Some(new), Some(old)) = (h.ssh.as_mut(), old.ssh.as_ref()) {
                         for (n, o) in [
@@ -223,11 +223,11 @@ impl ClientHub {
                 }
                 if h.kind == HostKind::Relay {
                     let uri = h.pairing.clone().unwrap_or_default();
-                    // 新粘贴 / 扫到的配对链接：先完成配对，保存的是配对凭据（含这台设备自己的私钥）
+                    // A freshly pasted / scanned pairing link: complete pairing first; what's saved is the pairing credential (including this device's own private key)
                     let cred = if uri.trim().starts_with("yiconsole://pair?") {
                         let offer = yi_link::PairOffer::parse(&uri)?;
                         let me = args["clientName"].as_str().map(str::to_string).filter(|s| !s.trim().is_empty()).unwrap_or_else(device_name);
-                        // 和这台电脑配对过：沿用原来的身份和主机条目，重新配对等于更新，两边都不会多出一条
+                        // Already paired with this computer: keep the existing identity and host entry; re-pairing is an update, so neither side gets a duplicate
                         let prev = self.paired_with(&offer.device, &h.id);
                         let cred = yi_link::client_pair(&offer, &me, prev.as_ref().map(|(_, c)| c.me.clone())).await?;
                         if let Some((old, _)) = prev {
@@ -285,7 +285,7 @@ impl ClientHub {
                 tokio::spawn(self.clone().sync_proxy_hosts());
                 Value::Null
             }
-            // 识别用户粘贴的链接，给界面做预览；不返回密钥和令牌
+            // Recognize a link pasted by the user and preview it in the UI; keys and tokens are never returned
             "relay.parseLink" => {
                 let uri = args["uri"].as_str().unwrap_or("").trim();
                 if uri.starts_with("yiconsole://pair?") {
@@ -296,7 +296,7 @@ impl ClientHub {
                     json!({ "kind": "relay", "url": a.url, "pinned": !a.fp.is_empty(), "hasInvite": !a.invite.is_empty() })
                 }
             }
-            // 已保存的中继设备用到的中继服务器（去重），给"本机开启中继"一键复用
+            // Relay servers used by saved relay devices (deduplicated), for one-click reuse in "enable relay on this machine"
             "relay.known" => {
                 let hosts = self.store.lock().unwrap().hosts.clone();
                 let mut seen = std::collections::HashSet::new();
@@ -309,8 +309,8 @@ impl ClientHub {
                     .collect();
                 json!(list)
             }
-            // 给目标主机开启和某台已保存的中继设备同一个中继：请那台电脑向中继要一个一次性邀请
-            // （中继要开启 --device-invites），邀请链接只在这里转一手，不经过界面
+            // Enable the same relay on the target host as a saved relay device: ask that computer to get a one-time invite from the relay
+            // (the relay must have --device-invites); the invite link only passes through here and never reaches the UI
             "relay.reuse" => {
                 let target = id()?;
                 let from = args["fromHostId"].as_str().ok_or_else(|| anyhow!("缺少 fromHostId"))?;
@@ -323,8 +323,8 @@ impl ClientHub {
                 let rpc = rpc.ok_or_else(|| anyhow!("主机未连接"))?;
                 rpc.call("relay.configure", json!({ "link": link, "enabled": true })).await?
             }
-            // ---------- 端口转发 ----------
-            // {id, port, localPort?, label?} -> ForwardInfo；已经在转发就直接返回
+            // ---------- Port forwarding ----------
+            // {id, port, localPort?, label?} -> ForwardInfo; returned directly if already forwarding
             "ports.forward" => {
                 let id = id()?;
                 let port = args["port"].as_u64().filter(|p| (1..=65535).contains(p)).ok_or_else(|| anyhow!("端口无效"))? as u16;
@@ -362,7 +362,7 @@ impl ClientHub {
                 self.emit(json!({"type": "ports.changed"}));
                 Value::Null
             }
-            // {id?} -> [ForwardInfo]：不带 id 列出全部
+            // {id?} -> [ForwardInfo]: lists all without id
             "ports.forwards" => {
                 let only = args["id"].as_str().or(args["hostId"].as_str()).map(str::to_string);
                 let mut v: Vec<_> = self
@@ -376,13 +376,13 @@ impl ClientHub {
                 v.sort_by(|a, b| (&a.host_id, a.port).cmp(&(&b.host_id, b.port)));
                 json!(v)
             }
-            // {id, root} -> {token}：给浏览器标签预览这个目录里的网页
+            // {id, root} -> {token}: lets browser tabs preview web pages in this directory
             "preview.root" => {
                 let id = id()?;
                 let root = args["root"].as_str().filter(|s| !s.is_empty()).ok_or_else(|| anyhow!("缺少 root"))?;
                 json!({ "token": self.previews.token(&id, root) })
             }
-            // 用系统默认浏览器打开网址（只接受 http / https）
+            // Open a URL in the system default browser (http / https only)
             "url.open" => {
                 let url = args["url"].as_str().unwrap_or("");
                 if !(url.starts_with("http://") || url.starts_with("https://")) {
@@ -465,7 +465,7 @@ impl ClientHub {
                 json!({ "settings": s, "detectedProxy": yi_link::proxy::describe() })
             }
             "client.setSettings" => {
-                // 只改传进来的部分（比如只传 proxy），其余沿用现有设置
+                // Only change the parts passed in (e.g. just proxy); keep the rest of the current settings
                 let mut cur = serde_json::to_value(self.settings.lock().unwrap().clone())?;
                 if let (Some(cur), Some(new)) = (cur.as_object_mut(), args["settings"].as_object()) {
                     for (k, v) in new {
@@ -476,7 +476,7 @@ impl ClientHub {
                 s.apply()?;
                 s.save(&self.data_dir)?;
                 *self.settings.lock().unwrap() = s.clone();
-                // 只影响之后新建的连接；已连上的不打断
+                // Only affects connections made later; existing ones aren't interrupted
                 json!({ "settings": s, "detectedProxy": yi_link::proxy::describe() })
             }
             "pairing.parse" => {
@@ -606,7 +606,7 @@ impl ClientHub {
         );
         let hello = rpc.call("hello", json!({"client": "yi-console"})).await?;
         *c.rpc.lock().unwrap() = Some(rpc.clone());
-        // 版本号相同也可能是两次不同的构建（拷源码构建都是 +dev，未提交的改动提交号也不变），所以连构建时间一起比
+        // The same version string can still be two different builds (builds from copied sources are all +dev, and uncommitted changes keep the commit hash), so compare the build time too
         let mismatch = hello["daemonVersion"].as_str() != Some(DAEMON_VERSION)
             || hello["buildTime"].as_u64().unwrap_or(0) != yi_proto::build_time();
         match h.kind {
@@ -638,7 +638,7 @@ impl ClientHub {
         Ok((rpc, status))
     }
 
-    /// 把可共享的主机（及其跳板机）和信任过的主机指纹同步给本机 yi-agentd，供已配对的设备经本机转发
+    /// Sync shareable hosts (and their jump hosts) and trusted host fingerprints to the local yi-agentd, so paired devices can be forwarded through this machine
     async fn sync_proxy_hosts(self: Arc<Self>) {
         let Some(local) = self.store.lock().unwrap().hosts.iter().find(|h| h.kind == HostKind::Local).map(|h| h.id.clone()) else {
             return;
@@ -667,9 +667,9 @@ impl ClientHub {
             .await;
     }
 
-    /// 中继主机（电脑）共享了哪些主机：同步成本机的转发主机，id 为 `<中继主机 id>~<那边的主机 id>`
+    /// Which hosts a relay host (computer) shares: synced as local forwarded hosts with id `<relay host id>~<host id over there>`
     async fn discover_proxies(self: Arc<Self>, via: String) {
-        // 旧版 yi-agentd 没有 proxy.list，不支持转发
+        // Older yi-agentd has no proxy.list and doesn't support forwarding
         let Ok(list) = self.rpc(&via, yi_proto::methods::PROXY_LIST, json!({})).await else {
             return;
         };
@@ -741,13 +741,13 @@ impl ClientHub {
         }
     }
 
-    /// 升级进度：phase 为 waiting（等回合结束）/ uploading / restarting / done / error
+    /// Upgrade progress: phase is waiting (for turns to end) / uploading / restarting / done / error
     fn upgrade_event(&self, id: &str, phase: &str, message: &str, progress: Option<f64>) {
         self.emit(json!({"type":"upgrade","hostId":id,"phase":phase,"message":message,"progress":progress}));
     }
 
-    /// 本机：二进制就是安装包自带的，版本不一致就该重启。
-    /// SSH：只在客户端比守护进程新时升级，避免两台不同版本的电脑来回覆盖。中继传不了文件，只提示
+    /// Local: the binary is the one shipped in the installer, so a version mismatch means restart.
+    /// SSH: only upgrade when the client is newer than the daemon, so two computers on different versions don't keep overwriting each other. Relays can't transfer files, so just notify
     fn should_auto_upgrade(&self, h: &HostConfig, hello: &Value) -> bool {
         match h.kind {
             HostKind::Local => true,
@@ -756,10 +756,10 @@ impl ClientHub {
         }
     }
 
-    /// 自动升级：有回合在跑就等它们结束（期间照常使用），再升级
+    /// Auto-upgrade: if turns are running, wait for them to finish (usable as normal meanwhile), then upgrade
     async fn auto_upgrade(self: Arc<Self>, id: String) {
         loop {
-            // 期间用户点了"立即升级"、或者别的客户端已经换好了：版本对上就不用再动
+            // Meanwhile the user clicked "Upgrade now", or another client already swapped it: nothing to do once versions match
             let st = self.conn(&id).status.lock().unwrap().clone();
             if st["status"] != "connected" || st["versionMismatch"] != json!(true) {
                 return;
@@ -769,7 +769,7 @@ impl ClientHub {
                     .as_array()
                     .map(|a| a.iter().filter(|s| matches!(s["status"].as_str(), Some("running" | "waiting-permission"))).count())
                     .unwrap_or(0),
-                // 连接断了：重连后会重新判断
+                // Connection lost: it will be re-evaluated after reconnecting
                 Err(_) => return,
             };
             if self.upgrading.lock().unwrap().contains(&id) {
@@ -786,7 +786,7 @@ impl ClientHub {
         }
     }
 
-    /// 换上新的 yi-agentd 并让旧进程退出；bridge / 系统服务会用新二进制重新拉起，重连后在 attempt 里确认版本
+    /// Swap in the new yi-agentd and make the old process exit; bridge / the system service restart it with the new binary, and attempt confirms the version after reconnecting
     async fn upgrade(self: &Arc<Self>, id: &str) -> Result<()> {
         let h = self.host(id)?;
         if matches!(h.kind, HostKind::Relay | HostKind::Proxy) {
@@ -797,7 +797,7 @@ impl ClientHub {
         }
         let r = async {
             if h.kind == HostKind::Local {
-                // 连接时已同步过，这里再确认一次
+                // Already synced on connect; confirm once more here
                 self.upgrade_event(id, "uploading", "正在准备新版 yi-agentd…", Some(1.0));
                 self.local_yi_agentd()?;
             }
@@ -811,7 +811,7 @@ impl ClientHub {
                 let hid = id.to_string();
                 let last = std::sync::atomic::AtomicU64::new(0);
                 deploy::upload(&s, &p, &bin, move |sent, total| {
-                    // 每 5% 报一次，免得刷屏
+                    // Report every 5% to avoid flooding
                     let pct = sent * 100 / total.max(1);
                     if pct >= last.load(Ordering::Relaxed) + 5 || sent == total {
                         last.store(pct, Ordering::Relaxed);
@@ -833,7 +833,7 @@ impl ClientHub {
         if r.is_err() {
             self.upgrading.lock().unwrap().remove(id);
         } else {
-            // 重连超时兜底：1 分钟还没接上就报错，别让界面一直挡着
+            // Reconnect timeout fallback: report an error if not reconnected within a minute, so the UI isn't blocked forever
             let me = self.clone();
             let hid = id.to_string();
             tokio::spawn(async move {
@@ -846,7 +846,7 @@ impl ClientHub {
         r
     }
 
-    /// 重连后按各会话已收到的最大 seq 补拉事件
+    /// After reconnecting, catch up events from the largest seq received for each session
     async fn resubscribe(&self, id: &str, c: &HostConn, rpc: &RpcConn) {
         let subs: Vec<(String, i64)> = c
             .subs
@@ -904,11 +904,11 @@ impl ClientHub {
         self.emit(json!({"type":"notification","hostId":id,"method":n.method,"params":n.params}));
     }
 
-    /// 本机守护进程用的 yi-agentd：先把安装包自带的同步到 `~/.yi-console/bin`，再用那份
+    /// The yi-agentd used by the local daemon: first sync the one bundled in the installer to `~/.yi-console/bin`, then use that copy
     fn local_yi_agentd(&self) -> Result<PathBuf> {
         let bundled = self.bundled_yi_agentd()?;
         crate::localbin::sync(&bundled).or_else(|e| {
-            // 主目录不可写之类的情况，退回直接用自带的
+            // If the home directory isn't writable or similar, fall back to the bundled one
             eprintln!("同步本机 yi-agentd 失败，直接使用安装包里的: {e:#}");
             Ok(bundled)
         })
@@ -927,7 +927,7 @@ impl ClientHub {
         if let Some(d) = &self.yi_agentd_dir {
             cands.push(d.join(exe));
         }
-        // Tauri sidecar 放在主程序旁边
+        // Tauri sidecars sit next to the main executable
         if let Ok(me) = std::env::current_exe() {
             if let Some(d) = me.parent() {
                 cands.push(d.join(exe));
@@ -956,7 +956,7 @@ impl ClientHub {
         Ok(Arc::new(ssh::connect(&t, jump.as_ref(), self.known.clone()).await?))
     }
 
-    /// 预览文件：`<令牌>/<相对路径>` -> (内容, MIME)。Tauri 的 ahfs 协议和 yi-web 的 /fsv/ 都走这里
+    /// Preview files: `<token>/<relative path>` -> (content, MIME). Both Tauri's ahfs protocol and yi-web's /fsv/ go through here
     pub async fn serve_preview(&self, url_path: &str) -> Result<(Vec<u8>, &'static str)> {
         use base64::Engine;
         let (host, root, path) = self.previews.resolve(url_path)?;
@@ -966,7 +966,7 @@ impl ClientHub {
         Ok((data, crate::preview::mime(&path)))
     }
 
-    /// 端口转发的一条连接：接到主机上的 127.0.0.1:port
+    /// One port-forward connection: connects to 127.0.0.1:port on the host
     async fn open_port(&self, id: &str, port: u16) -> Result<(BoxR, BoxW)> {
         let h = self.host(id)?;
         let req = json!({"id": 0, "method": yi_proto::methods::PORT_CONNECT, "params": {"port": port}});
@@ -977,7 +977,7 @@ impl ClientHub {
                 Ok((Box::new(r), Box::new(w)))
             }
             HostKind::Ssh => {
-                // 复用会话的 SSH 连接；没连上就先连主机
+                // Reuse the session's SSH connection; connect to the host first if not connected
                 let s = self.conn(id).ssh.lock().unwrap().clone().filter(|s| !s.is_closed());
                 let s = match s {
                     Some(s) => s,
@@ -988,7 +988,7 @@ impl ClientHub {
                         let (r, w) = tokio::io::split(st);
                         Ok((Box::new(r), Box::new(w)))
                     }
-                    // sshd 不允许 TCP 转发时，经 yi-agentd bridge 转
+                    // When sshd doesn't allow TCP forwarding, go through yi-agentd bridge
                     Err(_) => {
                         let p = deploy::detect(&s).await?;
                         let st = s.exec_stream(&p.command("bridge")).await?;
@@ -998,7 +998,7 @@ impl ClientHub {
                 }
             }
             HostKind::Relay | HostKind::Proxy => {
-                // 新开一条到 yi-agentd 的连接（经电脑转发的主机先过 proxy.connect），第一条消息说要连哪个端口
+                // Open a new connection to yi-agentd (hosts forwarded through a computer go through proxy.connect first); the first message says which port to connect to
                 let c = HostConn::default();
                 let (r, w) = self.open_transport(&h, &c).await?;
                 handshake(r, w, &req, &h.name).await
@@ -1014,7 +1014,7 @@ impl ClientHub {
                 }
                 let exe = self.local_yi_agentd()?;
                 let mut cmd = tokio::process::Command::new(exe);
-                // --local：告诉守护进程这是本机客户端（SSH 远程起的 bridge 不带，只限本机的方法不让调）
+                // --local: tells the daemon this is a local client (bridges started remotely over SSH don't pass it, so local-only methods are refused)
                 cmd.args(["bridge", "--local"])
                     .stdin(std::process::Stdio::piped())
                     .stdout(std::process::Stdio::piped())
@@ -1029,7 +1029,7 @@ impl ClientHub {
                 Ok((Box::new(r), Box::new(w)))
             }
             HostKind::Proxy => {
-                // 经那台电脑的 yi-agentd 转发：新开一条中继连接，第一条消息说要连哪台，之后就是目标 yi-agentd 本身
+                // Forwarded through that computer's yi-agentd: open a new relay connection whose first message says which host to reach; after that it's the target yi-agentd itself
                 let via = self.host(h.via_host_id.as_deref().unwrap_or(""))?;
                 let c = yi_link::Credential::parse(via.pairing.as_deref().unwrap_or(""))?;
                 let d = yi_link::client_connect(&c).await?;
@@ -1098,7 +1098,7 @@ impl ClientHub {
     }
 }
 
-/// 发第一条消息，读一行回复；成功后这条连接就是透传
+/// Send the first message and read one line of reply; on success the connection becomes a passthrough
 async fn handshake(r: BoxR, mut w: BoxW, req: &Value, name: &str) -> Result<(BoxR, BoxW)> {
     w.write_all(format!("{req}\n").as_bytes()).await?;
     w.flush().await?;
@@ -1117,12 +1117,12 @@ async fn handshake(r: BoxR, mut w: BoxW, req: &Value, name: &str) -> Result<(Box
     Ok((Box::new(br), w))
 }
 
-/// 用系统默认程序打开网址
+/// Open a URL with the system default program
 fn open_url(url: &str) -> Result<()> {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        // 不经 cmd：网址里的 & 会被 cmd 当成命令分隔符
+        // Don't go through cmd: it treats & in URLs as a command separator
         std::process::Command::new("rundll32").args(["url.dll,FileProtocolHandler", url]).creation_flags(0x0800_0000).spawn()?;
     }
     #[cfg(target_os = "macos")]
@@ -1137,7 +1137,7 @@ fn open_url(url: &str) -> Result<()> {
 
 const REDACTED: &str = "********";
 
-/// 发给前端的配置不带明文密码/私钥/配对密钥
+/// Config sent to the frontend carries no plaintext passwords / private keys / pairing keys
 fn redact(h: &HostConfig) -> HostConfig {
     let mut h = h.clone();
     if let Some(s) = h.ssh.as_mut() {
@@ -1153,7 +1153,7 @@ fn redact(h: &HostConfig) -> HostConfig {
     h
 }
 
-/// 配对时报给电脑的本机名字，显示在电脑的「已配对设备」里
+/// This machine's name reported to the computer when pairing, shown in its "Paired devices"
 fn device_name() -> String {
     if cfg!(target_os = "android") {
         return "Android 手机".into();

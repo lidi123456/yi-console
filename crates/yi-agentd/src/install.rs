@@ -1,7 +1,7 @@
-//! 把 yi-agentd 注册成开机/登录自启的用户级服务。
-//! - Linux：systemd --user（并尝试 enable-linger，退出登录也不停）；没有 systemd 时退回 crontab @reboot
-//! - macOS：launchd LaunchAgent
-//! - Windows：HKCU Run 注册表项（不需要管理员），并经 WMI 立即启动（脱离 SSH 会话的 job）
+//! Register yi-agentd as a user-level service that starts at boot/login.
+//! - Linux: systemd --user (and try enable-linger so it keeps running after logout); falls back to crontab @reboot without systemd
+//! - macOS: launchd LaunchAgent
+//! - Windows: HKCU Run registry entry (no admin needed), and start it right away via WMI (outside the SSH session's job)
 
 use anyhow::{anyhow, Result};
 use std::path::{Path, PathBuf};
@@ -59,7 +59,7 @@ fn platform_install(exe: &Path) -> Result<String> {
 
     let (ok, out) = run(Command::new("systemctl").args(["--user", "daemon-reload"]));
     if ok {
-        // 如果已经有一个非 systemd 拉起的实例在跑，先停掉，让 systemd 接管
+        // If an instance not started by systemd is already running, stop it first and let systemd take over
         stop_running();
         let (ok, out2) = run(Command::new("systemctl").args(["--user", "enable", "--now", UNIT]));
         if !ok {
@@ -76,7 +76,7 @@ fn platform_install(exe: &Path) -> Result<String> {
         return Ok(msg);
     }
 
-    // 没有 systemd 用户实例：crontab @reboot + 立即后台启动
+    // No systemd user instance: crontab @reboot + start in the background right away
     let line = format!("@reboot {} serve >/dev/null 2>&1", exe.display());
     let (_, current) = run(Command::new("crontab").arg("-l"));
     if !current.contains(&line) {
@@ -155,7 +155,7 @@ fn platform_install(exe: &Path) -> Result<String> {
     stop_running();
     let (ok, out) = run(Command::new("launchctl").args(["bootstrap", &target, &plist.display().to_string()]));
     if !ok {
-        // SSH 登录没有 gui 域时退回 user 域
+        // SSH logins have no gui domain; fall back to the user domain
         let target = format!("user/{uid}");
         let (ok2, out2) =
             run(Command::new("launchctl").args(["bootstrap", &target, &plist.display().to_string()]));
@@ -222,7 +222,7 @@ fn platform_uninstall() -> Result<String> {
     Ok(String::new())
 }
 
-/// 请正在运行的实例退出（经 IPC 发 daemon.shutdown）
+/// Ask the running instance to exit (sends daemon.shutdown over IPC)
 pub fn stop_running() {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()

@@ -5,14 +5,14 @@ import { useBack } from '../back';
 import { tr } from '../i18n';
 import { Icon } from './Icon';
 
-// 网页里自己扫二维码：getUserMedia 开后置相机，定时把画面缩小画到 canvas 上交给 jsQR 识别。
-// 不用原生扫码插件：Tauri 官方插件靠 Google Play 服务里的 ML Kit，国内手机上开相机就闪退。
-// Android 上 WebView 要相机时由 wry 的 RustWebChromeClient 向系统申请 CAMERA 权限，清单在 src-tauri/build.rs 里加。
+// QR scanning in the page itself: getUserMedia opens the rear camera, and frames are periodically scaled down onto a canvas for jsQR to decode.
+// No native scanner plugin: Tauri's official plugin relies on ML Kit from Google Play services, which crashes on opening the camera on phones in mainland China.
+// On Android, when the WebView needs the camera, wry's RustWebChromeClient requests the CAMERA permission; the manifest entry is added in src-tauri/build.rs.
 
-/** 当前环境能不能在网页里开相机（非安全上下文的网页没有 mediaDevices） */
+/** Whether the camera can be opened in the page in this environment (pages in insecure contexts have no mediaDevices) */
 export const canScanQr = () => !!navigator.mediaDevices?.getUserMedia;
 
-// 识别时画面最长边缩到这么大：二维码在取景框里占得不小，够用，手机上一帧几十毫秒以内
+// Scale frames so the longest side is this size for decoding: the QR code fills a good part of the viewfinder, so it's enough, and a frame takes well under a few dozen ms on a phone
 const MAX_SIDE = 720;
 const INTERVAL = 150;
 
@@ -52,7 +52,7 @@ export function QrScanner({ onResult, onClose }: { onResult: (text: string) => v
           canvas.height = h;
         }
         ctx.drawImage(v, 0, 0, w, h);
-        // 配对二维码在暗色主题下也是浅底深码，但别人截图、反色显示的也要能认，所以两种都试
+        // Pairing QR codes are dark-on-light even in the dark theme, but screenshots or inverted displays should still work, so try both
         const r = jsQR(ctx.getImageData(0, 0, w, h).data, w, h, { inversionAttempts: 'attemptBoth' });
         if (r?.data) {
           stopped = true;
@@ -84,7 +84,7 @@ export function QrScanner({ onResult, onClose }: { onResult: (text: string) => v
     return () => {
       stopped = true;
       clearTimeout(timer);
-      // 关掉相机：不停掉轨道的话，相机指示灯一直亮着，其他应用也用不了
+      // Turn the camera off: unless the tracks are stopped, the camera indicator stays on and other apps can't use it
       stream?.getTracks().forEach((t) => t.stop());
       if (video.current) video.current.srcObject = null;
     };

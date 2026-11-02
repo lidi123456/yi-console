@@ -1,23 +1,23 @@
-// 任务清单：把各家工具的任务列表统一成 { title, entries }。
-// - Claude TodoWrite、Codex turn/plan/updated、ACP plan：yi-agentd 已转成 plan 事件，直接用
-// - Kiro 的 todo_list 工具：每次调用的结果是完整列表（只有完成 / 未完成），全部完成后会清空
-// - 新版 Claude 的 TaskCreate / TaskUpdate：创建时结果给编号（"Task #N created successfully: …"），之后按编号改状态
+// Task lists: normalize every tool's task list into { title, entries }.
+// - Claude TodoWrite, Codex turn/plan/updated, ACP plan: yi-agentd already turns these into plan events, use them directly
+// - Kiro's todo_list tool: each call's result is the full list (only done / not done), and it's cleared once everything is done
+// - Newer Claude TaskCreate / TaskUpdate: creation returns a number in the result ("Task #N created successfully: …"), later updates change status by number
 import type { HubEvent, PlanEntry } from './types';
 
 export interface PlanState {
   title?: string;
   entries: PlanEntry[];
-  /** 工具本身没有「进行中」（Kiro）：回合运行时把第一个没完成的当作进行中 */
+  /** The tool itself has no "in progress" (Kiro): while the turn runs, treat the first unfinished item as in progress */
   infer?: boolean;
 }
 
-/** 这些工具调用由任务清单代替显示（出错的照常显示） */
+/** These tool calls are shown by the task list instead (failed ones are shown as usual) */
 export const PLAN_TOOLS = new Set(['TodoWrite', 'todo_list', 'TaskCreate', 'TaskUpdate']);
 
 type Rec = Record<string, unknown>;
 const str = (v: unknown) => (typeof v === 'string' ? v : v == null ? '' : String(v));
 
-/** Kiro todo_list 的结果：{"items":[{"Json":{description, tasks:[{id, task_description, completed}]}}]}，可能多包一层字符串 */
+/** Kiro todo_list result: {"items":[{"Json":{description, tasks:[{id, task_description, completed}]}}]}, possibly wrapped in another string */
 function kiroList(raw: string): { title: string; tasks: { done: boolean; text: string }[] } | null {
   let v: unknown = raw;
   for (let i = 0; i < 2 && typeof v === 'string'; i++) {
@@ -41,10 +41,10 @@ function kiroList(raw: string): { title: string; tasks: { done: boolean; text: s
 export class PlanTracker {
   plan: PlanState | null = null;
   private calls = new Map<string, { name: string; input: Rec }>();
-  /** Claude TaskCreate 建的任务，按编号，保持创建顺序 */
+  /** Tasks created by Claude TaskCreate, keyed by number, in creation order */
   private tasks = new Map<string, PlanEntry>();
 
-  /** 处理一条事件，任务清单有变化时返回 true */
+  /** Process one event; returns true if the task list changed */
   feed(e: HubEvent): boolean {
     switch (e.kind) {
       case 'cleared':
@@ -60,7 +60,7 @@ export class PlanTracker {
         const input = (e.input && typeof e.input === 'object' ? e.input : {}) as Rec;
         this.calls.set(e.id, { name: e.name, input });
         if (e.name !== 'TaskUpdate') return false;
-        // 改状态不用等结果：编号不存在时结果是 "Task #N not found"，这里也找不到，自然忽略
+        // Status updates don't wait for the result: for a missing number the result is "Task #N not found", and it isn't found here either, so it's naturally ignored
         const t = this.tasks.get(str(input.taskId));
         if (!t) return false;
         const status = str(input.status);
@@ -84,7 +84,7 @@ export class PlanTracker {
           const l = kiroList(e.output);
           if (!l) return false;
           if (!l.tasks.length) {
-            // 全部完成后 Kiro 会清空列表：沿用上一份，全部打勾
+            // Kiro clears the list once everything is done: reuse the previous one with every item checked
             if (str(c.input.command) === 'complete' && this.plan?.entries.length) {
               this.plan = { ...this.plan, entries: this.plan.entries.map((x) => ({ ...x, status: 'completed' })) };
               return true;
@@ -111,21 +111,21 @@ export class PlanTracker {
   }
 }
 
-/** 会话当前的任务清单（输入框上方那条用） */
+/** The session's current task list (for the bar above the input box) */
 export function latestPlan(events: HubEvent[]): PlanState | null {
   const t = new PlanTracker();
   for (const e of events) t.feed(e);
   return t.plan;
 }
 
-/** 显示用的状态：infer 时回合运行中把第一个没完成的当作进行中 */
+/** Status for display: with infer, while the turn runs, the first unfinished item counts as in progress */
 export function viewEntries(p: PlanState, busy: boolean): PlanEntry[] {
   if (!p.infer || !busy) return p.entries;
   const i = p.entries.findIndex((x) => x.status !== 'completed');
   return i < 0 ? p.entries : p.entries.map((x, j) => (j === i ? { ...x, status: 'in_progress' } : x));
 }
 
-/** 正在做的（或下一项）任务 */
+/** The task in progress (or the next one) */
 export function currentEntry(entries: PlanEntry[]): { entry: PlanEntry; active: boolean } | null {
   const a = entries.find((x) => x.status === 'in_progress');
   if (a) return { entry: a, active: true };

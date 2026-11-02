@@ -1,4 +1,4 @@
-// 与 crates/proto 对应的类型
+// Types mirroring crates/proto
 
 export type ToolKind = 'claude' | 'codex' | 'cursor' | 'kiro' | 'qoder' | 'codebuddy' | 'shell';
 export type SessionMode = 'structured' | 'terminal';
@@ -28,30 +28,30 @@ export interface SessionInfo {
   usage: Usage;
   model?: string | null;
   command?: string | null;
-  /** 上下文窗口已用百分比 */
+  /** Percentage of the context window used */
   contextPercent?: number | null;
   /** default / acceptEdits / plan / bypass */
   permissionMode?: string | null;
-  /** 思考等级，空表示工具默认 */
+  /** Thinking level; empty means the tool's default */
   effort?: string | null;
   pinned?: boolean;
-  /** 等这一轮结束再发的消息 */
+  /** Messages to send after this turn ends */
   queued?: QueuedMessage[];
-  /** 工具在后台跑着的任务（Claude 的后台 shell、子代理） */
+  /** Tasks the tool runs in the background (Claude's background shells, subagents) */
   backgroundTasks?: BackgroundTask[];
-  /** 会话页底部终端面板里开的终端：所属对话会话；不在侧边栏等列表里单独显示 */
+  /** Terminal opened in the session page's bottom panel: the chat session it belongs to; not listed separately in the sidebar etc. */
   parentId?: string;
-  /** 从对话切到终端时工具会话里已有的用户消息数（切回对话时只导入之后的） */
+  /** Number of user messages already in the tool session when switching from chat to terminal (switching back only imports the ones after) */
   syncedUsers?: number;
 }
 
 export interface BackgroundTask {
   id: string;
-  /** local_bash、local_agent 等 */
+  /** local_bash, local_agent, etc. */
   kind: string;
   description: string;
   startedAt: number;
-  /** 输出文件在主机上的路径 */
+  /** Path of the output file on the host */
   outputFile?: string;
 }
 
@@ -85,7 +85,7 @@ export interface SearchHit {
 
 export interface GitFile {
   path: string;
-  /** git status 代码（M、A、D…），未跟踪的新文件是 new */
+  /** git status code (M, A, D…); untracked new files are new */
   status: string;
   diff: string;
 }
@@ -94,9 +94,9 @@ export interface ModelOption {
   id: string;
   name: string;
   description?: string;
-  /** 别名实际对应的模型 */
+  /** The model an alias actually maps to */
   resolved?: string;
-  /** 支持的思考等级 */
+  /** Supported thinking levels */
   efforts?: string[];
   defaultEffort?: string;
 }
@@ -109,7 +109,7 @@ export interface ImageRef {
 export interface QuotaWindow {
   label: string;
   usedPercent: number | null;
-  /** 毫秒时间戳或 ISO 字符串 */
+  /** Millisecond timestamp or ISO string */
   resetsAt?: number | string | null;
   detail?: string;
 }
@@ -135,7 +135,7 @@ export interface PermissionOption {
   kind: string;
 }
 
-/** AI 向用户提的问题，跟审批走同一条路：permission_request 带 questions */
+/** A question the AI asks the user, sent the same way as approvals: permission_request carries questions */
 export interface QuestionOption {
   id: string;
   label: string;
@@ -148,7 +148,7 @@ export interface Question {
   question: string;
   options: QuestionOption[];
   multiSelect?: boolean;
-  /** 可以不选选项、自己填 */
+  /** The user may skip the options and write their own answer */
   allowOther?: boolean;
   secret?: boolean;
 }
@@ -188,7 +188,7 @@ export type EventBody =
   | { kind: 'usage'; usage: Usage }
   | { kind: 'error'; message: string }
   | { kind: 'system'; text: string }
-  /** /clear：这条之前的事件都已在 yi-agentd 上删除 */
+  /** /clear: all events before this one have been deleted on yi-agentd */
   | { kind: 'cleared' }
   | {
       kind: 'compact';
@@ -219,7 +219,7 @@ export interface Hello {
   tools: ToolInfo[];
 }
 
-/** proxy：经已配对电脑的 yi-agentd 转发到那台电脑上配的主机 */
+/** proxy: forwarded through a paired computer's yi-agentd to a host configured on that computer */
 export type HostKind = 'local' | 'ssh' | 'relay' | 'proxy';
 
 export interface SshTarget {
@@ -244,7 +244,7 @@ export interface HostConfig {
   installService: boolean;
   remoteOs?: string | null;
   remoteArch?: string | null;
-  /** 允许已配对的设备经本机访问这台主机 */
+  /** Allow paired devices to reach this host through this machine */
   relayShare?: boolean;
   viaHostId?: string | null;
   targetId?: string | null;
@@ -288,11 +288,11 @@ export interface DaemonSettings {
   tools: Record<string, { command: string; extraArgs: string[] }>;
   statusLine: StatusLineSettings;
   snippets: Snippet[];
-  /** 闲置多少分钟后结束工具进程，不填按 30，0 不释放 */
+  /** Minutes idle before the tool process is ended; 30 if unset, 0 never releases */
   idleReleaseMinutes?: number;
-  /** 对话模式的工具进程最多同时开几个，不填按 5，0 不限 */
+  /** Max concurrent chat-mode tool processes; 5 if unset, 0 means unlimited */
   maxLiveProcesses?: number;
-  /** 终端会话放进 tmux，不填按开启 */
+  /** Run terminal sessions in tmux; on if unset */
   terminalTmux?: boolean;
 }
 
@@ -320,7 +320,7 @@ export interface NotifyPrefs {
   enabled: boolean;
   onTurnEnd: boolean;
   onPermission: boolean;
-  /** away：窗口不在前台或看的不是这个会话时才通知；always：总是通知 */
+  /** away: notify only when the window isn't in front or another session is being viewed; always: always notify */
   when: 'away' | 'always';
 }
 

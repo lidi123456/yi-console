@@ -8,7 +8,7 @@ import { MOD } from './Palette';
 const ua = navigator.userAgent;
 const isMobileOS = /Android|iPhone|iPad/.test(ua);
 const isMac = /Mac/.test(navigator.platform);
-/** 桌面 App 去掉了系统标题栏（macOS 保留红绿灯），窗口按钮自己画 */
+/** The desktop app drops the system title bar (macOS keeps the traffic lights) and draws its own window buttons */
 export const customFrame = isTauri && !isMobileOS;
 
 async function win() {
@@ -40,7 +40,7 @@ function WindowButtons() {
   );
 }
 
-/** 顶部一行：收起侧边栏、后退、前进；空白处可以拖动窗口、双击最大化 */
+/** Top row: collapse sidebar, back, forward; empty space drags the window, double-click maximizes */
 export function TitleBar() {
   const canBack = useStore((s) => s.canBack);
   const canForward = useStore((s) => s.canForward);

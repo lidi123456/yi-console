@@ -1,10 +1,10 @@
-//! 网页预览的文件服务：浏览器标签里预览主机上的 HTML 时，页面和它用相对路径引用的 css、js、图片
-//! 都要能按 URL 取到。前端先用 `preview.root` 给一个目录换一个随机令牌，之后
-//! `<令牌>/<相对路径>` 就映射到主机上这个目录里的文件，经 `fs.read`（raw）读出来。
+//! File server for web previews: when a browser tab previews HTML on a host, the page and the css, js and images it references by relative path
+//! must all be fetchable by URL. The frontend first uses `preview.root` to exchange a directory for a random token; after that
+//! `<token>/<relative path>` maps to files in that directory on the host, read through `fs.read` (raw).
 //!
-//! Tauri 里挂在自定义协议 `ahfs` 上，yi-web 里挂在 `/fsv/` 下。令牌只能读它那个目录（不允许 ..，
-//! 指到目录外的符号链接由 yi-agentd 拒绝），
-//! 预览页放在没有 allow-same-origin 的 sandbox iframe 里，碰不到应用本身。
+//! In Tauri it's served on the custom protocol `ahfs`, in yi-web under `/fsv/`. A token can only read its own directory (no ..;
+//! symlinks pointing outside are rejected by yi-agentd),
+//! and the preview page sits in a sandboxed iframe without allow-same-origin, so it can't touch the app itself.
 
 use anyhow::{anyhow, bail, Result};
 use std::collections::HashMap;
@@ -12,12 +12,12 @@ use std::sync::Mutex;
 
 #[derive(Default)]
 pub struct Previews {
-    /// 令牌 -> (主机 id, 根目录)
+    /// token -> (host id, root directory)
     roots: Mutex<HashMap<String, (String, String)>>,
 }
 
 impl Previews {
-    /// 同一个主机 + 目录复用同一个令牌，地址稳定，浏览器缓存也能用上
+    /// The same host + directory reuses one token, so URLs are stable and the browser cache works
     pub fn token(&self, host: &str, root: &str) -> String {
         let mut m = self.roots.lock().unwrap();
         if let Some((t, _)) = m.iter().find(|(_, v)| v.0 == host && v.1 == root) {
@@ -28,8 +28,8 @@ impl Previews {
         t
     }
 
-    /// `<令牌>/<相对路径>`（URL 编码过）-> (主机 id, 根目录, 文件绝对路径)。
-    /// 这里只能挡住 ..，符号链接要到主机上才看得出指向哪里，由 yi-agentd 读的时候按根目录检查
+    /// `<token>/<relative path>` (URL-encoded) -> (host id, root directory, absolute file path).
+    /// Only .. can be blocked here; where a symlink points is only known on the host, so yi-agentd checks against the root when reading
     pub fn resolve(&self, url_path: &str) -> Result<(String, String, String)> {
         let p = url_path.split(['?', '#']).next().unwrap_or("").trim_start_matches('/');
         let (tok, rest) = p.split_once('/').unwrap_or((p, ""));
@@ -55,13 +55,13 @@ impl Previews {
     }
 }
 
-/// %xx 解码（不把 + 当空格，路径里 + 就是 +）
+/// %xx decoding (+ is not a space; in paths + is just +)
 pub fn pct_decode(s: &str) -> String {
     let b = s.as_bytes();
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
     while i < b.len() {
-        // 按字节取两位十六进制，不切 &str（后面是多字节字符时会 panic）
+        // Take two hex digits byte-wise rather than slicing &str (which would panic before a multi-byte character)
         if b[i] == b'%' {
             if let Some(v) = b.get(i + 1..i + 3).and_then(yi_link::hex_byte) {
                 out.push(v);
@@ -125,7 +125,7 @@ mod tests {
         let w = p.token("h", r"C:\site");
         assert_eq!(p.resolve(&format!("{w}/js/app.js")).unwrap().2, r"C:\site\js\app.js");
         assert!(p.resolve(&format!("{w}/C%3A/x")).is_err());
-        // % 后面跟中文不能 panic
+        // % followed by multi-byte (CJK) characters must not panic
         assert_eq!(pct_decode("%a中"), "%a中");
         assert!(p.resolve(&format!("{t}/%中.html")).is_ok());
     }

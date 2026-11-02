@@ -1,15 +1,15 @@
-//! 中继链路 v2，设计见 `docs/relay-security-v2.md`。
+//! Relay link v2; see `docs/relay-security-v2.md` for the design.
 //!
-//! 拓扑：yi-agentd 主动连中继的 `/v1/agent`（控制连接），客户端连 `/v1/client`；
-//! 中继通知 yi-agentd 开一条 `/v1/stream`，然后把两条 WebSocket 原样对接。
+//! Topology: yi-agentd connects out to the relay's `/v1/agent` (control connection), clients connect to `/v1/client`;
+//! the relay tells yi-agentd to open a `/v1/stream`, then splices the two WebSockets together as is.
 //!
-//! 两层鉴权：
-//! - 中继层（[`auth`]）：WebSocket 升级后中继发随机数，对端用 Ed25519 签名证明身份。
-//!   yi-agentd 靠中继上登记过的设备公钥（首次靠邀请码登记）；客户端靠 yi-agentd 推给中继的白名单，
-//!   首次配对靠一次性配对票据。URL 里不带任何密钥。
-//! - 端到端（[`e2e`]）：Noise IK（配对时 IKpsk2），双向认证、前向保密，中继只转发密文。
+//! Two layers of authentication:
+//! - Relay layer ([`auth`]): after the WebSocket upgrade the relay sends a nonce, and the peer proves its identity with an Ed25519 signature.
+//!   yi-agentd relies on the device public key registered on the relay (registered the first time with an invite code); clients rely on the allow list yi-agentd pushes to the relay,
+//!   and on a one-time pairing ticket for the first pairing. URLs never carry any keys.
+//! - End to end ([`e2e`]): Noise IK (IKpsk2 when pairing), mutual authentication, forward secrecy; the relay only forwards ciphertext.
 //!
-//! 传输层：中继没有域名时用自签名证书，链接里带证书的 SHA-256 指纹（`fp`），连接时只认这张证书。
+//! Transport: when the relay has no domain it uses a self-signed certificate; links carry the certificate's SHA-256 fingerprint (`fp`), and only that certificate is accepted.
 
 use anyhow::{anyhow, bail, Context, Result};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
@@ -25,7 +25,7 @@ mod wire;
 pub use e2e::{agent_accept, client_connect, client_pair, Hello};
 pub use wire::{agent_control, next_control, send_control, ws_connect, AgentLink, Control, OpenReq, Ws};
 
-// ---------------- 工具函数 ----------------
+// ---------------- Helpers ----------------
 
 pub fn random_bytes<const N: usize>() -> [u8; N] {
     let mut b = [0u8; N];
@@ -45,7 +45,7 @@ pub fn b64(b: &[u8]) -> String {
     B64.encode(b)
 }
 
-/// base64url（不带填充）解出 32 字节
+/// Decode 32 bytes from base64url (unpadded)
 pub fn unb64_32(s: &str) -> Result<[u8; 32]> {
     let raw = B64.decode(s.trim().as_bytes()).context("base64 格式错误")?;
     raw.try_into().map_err(|_| anyhow!("长度应为 32 字节"))
@@ -67,7 +67,7 @@ pub fn sha256_hex(s: &str) -> String {
     hex(&sha256(&[s.as_bytes()]))
 }
 
-/// 常数时间比较，比较令牌、票据用
+/// Constant-time comparison, for tokens and tickets
 pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     use subtle::ConstantTimeEq;
     a.len() == b.len() && bool::from(a.ct_eq(b))
@@ -90,7 +90,7 @@ pub fn unpct(s: &str) -> String {
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
     while i < b.len() {
-        // 按字节取 %xx 后面两位，不能切 &str：后面跟的是多字节字符时会切在字符中间 panic
+        // Take the two characters after % byte-wise, not by slicing &str: a following multi-byte character would be split in the middle and panic
         if b[i] == b'%' {
             if let Some(v) = b.get(i + 1..i + 3).and_then(hex_byte) {
                 out.push(v);
@@ -104,7 +104,7 @@ pub fn unpct(s: &str) -> String {
     String::from_utf8_lossy(&out).to_string()
 }
 
-/// 两个十六进制字符 -> 一个字节
+/// Two hex characters -> one byte
 pub fn hex_byte(h: &[u8]) -> Option<u8> {
     let d = |c: u8| (c as char).to_digit(16);
     match h {
@@ -113,7 +113,7 @@ pub fn hex_byte(h: &[u8]) -> Option<u8> {
     }
 }
 
-/// 指纹统一成小写十六进制、不带冒号；格式不对时报错
+/// Normalize fingerprints to lowercase hex without colons; errors on bad format
 pub fn normalize_fp(s: &str) -> Result<String> {
     let s = s.trim().to_lowercase();
     let s = s.strip_prefix("sha256:").unwrap_or(&s).replace(':', "");
@@ -126,15 +126,15 @@ pub fn normalize_fp(s: &str) -> Result<String> {
     Ok(s)
 }
 
-/// 证书（DER）的 SHA-256 指纹
+/// SHA-256 fingerprint of a certificate (DER)
 pub fn cert_fp(der: &[u8]) -> String {
     hex(&sha256(&[der]))
 }
 
-// ---------------- 身份密钥 ----------------
+// ---------------- Identity keys ----------------
 
-/// 一方（yi-agentd 或某个客户端）的长期身份：Ed25519 签名密钥（对中继证明身份）
-/// 和 X25519 静态密钥（Noise 端到端握手）。私钥只留在自己机器上。
+/// A party's (yi-agentd's or a client's) long-term identity: an Ed25519 signing key (proves identity to the relay)
+/// and an X25519 static key (Noise end-to-end handshake). Private keys never leave their own machine.
 #[derive(Clone, PartialEq)]
 pub struct Identity {
     pub sign: [u8; 32],
@@ -165,7 +165,7 @@ impl Identity {
         ed25519_dalek::SigningKey::from_bytes(&self.sign).sign(msg).to_bytes()
     }
 
-    /// 序列化成 `<签名私钥>.<Noise 私钥>`（base64url）
+    /// Serialize as `<signing private key>.<Noise private key>` (base64url)
     pub fn encode(&self) -> String {
         format!("{}.{}", b64(&self.sign), b64(&self.noise))
     }
@@ -176,17 +176,17 @@ impl Identity {
     }
 }
 
-/// 设备 id 由签名公钥算出，中继拿到公钥自己算一遍就能确认 id 属于谁
+/// The device id is derived from the signing public key, so the relay can recompute it from the key to confirm whose id it is
 pub fn device_id_of(sign_pub: &[u8; 32]) -> String {
     hex(&sha256(&[sign_pub])[..16])
 }
 
-/// 客户端 id：给界面和吊销用的短标识
+/// Client id: a short identifier for the UI and revocation
 pub fn client_id_of(sign_pub: &[u8; 32]) -> String {
     hex(&sha256(&[sign_pub])[..8])
 }
 
-// ---------------- 链接 ----------------
+// ---------------- Links ----------------
 
 const LINK_VERSION: &str = "2";
 
@@ -221,16 +221,16 @@ fn check_relay_url(u: &str) -> Result<()> {
     Ok(())
 }
 
-/// 配对二维码 / 配对链接：设备公钥 + 一次性配对码，没有长期密钥。
+/// Pairing QR code / pairing link: device public key + one-time pairing code, no long-term secrets.
 /// `yiconsole://pair?v=2&relay=&fp=&device=&apk=&code=&name=`
 #[derive(Debug, Clone, PartialEq)]
 pub struct PairOffer {
     pub relay: String,
     pub fp: String,
     pub device: String,
-    /// yi-agentd 的 Noise 静态公钥
+    /// yi-agentd's Noise static public key
     pub apk: [u8; 32],
-    /// 一次性配对码
+    /// One-time pairing code
     pub code: [u8; 32],
     pub name: String,
 }
@@ -270,7 +270,7 @@ impl PairOffer {
     }
 }
 
-/// 配对成功后客户端保存的凭据（含客户端私钥，不要外传）。
+/// Credentials the client saves after pairing (includes the client private key; never share).
 /// `yiconsole://paired?v=2&relay=&fp=&device=&apk=&name=&me=`
 #[derive(Debug, Clone, PartialEq)]
 pub struct Credential {
@@ -320,7 +320,7 @@ impl Credential {
     }
 }
 
-/// 给电脑开启中继用的接入链接：地址、证书指纹、一次性邀请码（登记用，可以为空）。
+/// Access link for enabling the relay on a computer: address, certificate fingerprint, one-time invite code (for registration, may be empty).
 /// `yiconsole://relay?v=2&url=&fp=&invite=`
 #[derive(Debug, Clone, PartialEq)]
 pub struct RelayAccess {
@@ -341,7 +341,7 @@ impl RelayAccess {
         u
     }
 
-    /// 接受 `yiconsole://relay?...` 接入链接，也接受配对链接（只取地址和指纹，没有邀请码）
+    /// Accepts `yiconsole://relay?...` access links, and pairing links too (only the address and fingerprint are used; there's no invite code)
     pub fn parse(uri: &str) -> Result<RelayAccess> {
         let uri = uri.trim();
         if uri.starts_with("yiconsole://pair?") {
@@ -366,7 +366,7 @@ mod tests {
 
     #[test]
     fn unpct_handles_non_ascii_after_percent() {
-        // 以前按 &str 切 %xx，后面是中文时切在字符中间 panic
+        // We used to slice %xx by &str, which panicked mid-character when followed by CJK text
         assert_eq!(unpct("%a电脑"), "%a电脑");
         assert_eq!(unpct("%电"), "%电");
         assert_eq!(unpct("%E4%B8%AD+x%2"), "中 x%2");
@@ -387,7 +387,7 @@ mod tests {
 
     #[test]
     fn noise_pub_matches_snow() {
-        // 自己算的 X25519 公钥要和 snow 握手时用的一致
+        // The X25519 public key we compute must match the one snow uses in the handshake
         let b = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap());
         let kp = b.generate_keypair().unwrap();
         let id = Identity { sign: [1; 32], noise: kp.private.clone().try_into().unwrap() };

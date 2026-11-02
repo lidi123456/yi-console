@@ -1,5 +1,5 @@
-//! 本机 IPC：unix 上是 ~/.yi-console/yi-agentd.sock（0600），Windows 上是命名管道。
-//! yi-agentd 不监听任何 TCP 端口；远程访问走 SSH exec `yi-agentd bridge` 或中继。
+//! Local IPC: ~/.yi-console/yi-agentd.sock (0600) on Unix, a named pipe on Windows.
+//! yi-agentd listens on no TCP ports; remote access goes through SSH exec `yi-agentd bridge` or the relay.
 
 use crate::hub::Hub;
 use anyhow::Result;
@@ -21,7 +21,7 @@ pub async fn connect() -> std::io::Result<impl Duplex> {
     for _ in 0..20 {
         match ClientOptions::new().open(&name) {
             Ok(c) => return Ok(c),
-            // 所有实例都忙，稍等
+            // All instances busy; wait a moment
             Err(e) if e.raw_os_error() == Some(231) => {
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await
             }
@@ -38,8 +38,8 @@ pub async fn connect() -> std::io::Result<impl Duplex> {
     ClientOptions::new().open(&name)
 }
 
-/// 管道只给当前用户（按 SID，与是否以管理员身份运行无关）和 SYSTEM 访问；
-/// 完整性级别标成 Medium，管理员权限的守护进程也能被普通权限的 App 连上
+/// The pipe is accessible only to the current user (by SID, regardless of running as admin) and SYSTEM;
+/// the integrity level is set to Medium, so a daemon running as admin can still be reached by a normally privileged app
 #[cfg(windows)]
 mod pipe_sec {
     use std::ffi::c_void;
@@ -57,7 +57,7 @@ mod pipe_sec {
         pub attrs: SECURITY_ATTRIBUTES,
     }
 
-    // 安全描述符创建后只读，跨线程使用没有问题
+    // The security descriptor is read-only after creation, so using it across threads is fine
     unsafe impl Send for PipeSecurity {}
     unsafe impl Sync for PipeSecurity {}
 
@@ -119,7 +119,7 @@ pub async fn listen(hub: Arc<Hub>) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     let path = crate::paths::socket_path();
     if path.exists() {
-        // 能连上说明已有实例在跑；连不上就是残留文件
+        // If we can connect, an instance is already running; if not, it's a leftover file
         if tokio::net::UnixStream::connect(&path).await.is_ok() {
             anyhow::bail!("yi-agentd 已在运行");
         }
@@ -149,7 +149,7 @@ pub async fn listen(hub: Arc<Hub>) -> Result<()> {
     let sec = pipe_sec::new()?;
     let create = |first: bool| {
         let mut attrs = sec.attrs;
-        // Safety: attrs 指向的安全描述符在 sec 存活期间有效，create 内部只读取它
+        // Safety: the security descriptor attrs points to is valid while sec lives, and create only reads it
         unsafe {
             ServerOptions::new()
                 .first_pipe_instance(first)

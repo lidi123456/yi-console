@@ -28,7 +28,7 @@ export function SessionView({ hostId, sessionId, seq }: { hostId: string; sessio
   );
   const home = hostStatus(hostId).hello?.home;
   const style = useChatStyle();
-  // 文件侧栏开没开：每个会话各记各的（同底部终端），在一个会话里打开不会让别的会话也打开
+  // Whether the file panel is open: remembered per session (like the bottom terminal), so opening it in one session doesn't open it in others
   const filesKey = `file-panel-${key}`;
   const [files, setFiles] = useState(() => lsGet(filesKey, false));
   const toggleFiles = () => {
@@ -37,7 +37,7 @@ export function SessionView({ hostId, sessionId, seq }: { hostId: string; sessio
     setFileOpen(false);
     setFull(false);
   };
-  // 「查看改动」：打开文件面板（面板自己切到「改动」）
+  // "View changes": open the file panel (which switches itself to "Changes")
   useEffect(() => {
     const on = (e: Event) => {
       const d = (e as CustomEvent<{ hostId: string; sessionId: string }>).detail;
@@ -49,7 +49,7 @@ export function SessionView({ hostId, sessionId, seq }: { hostId: string; sessio
     window.addEventListener(OPEN_CHANGES, on);
     return () => window.removeEventListener(OPEN_CHANGES, on);
   }, [hostId, sessionId, filesKey]);
-  // 底部终端面板：每个会话各记各的开关，在一个会话里打开不会让别的会话也弹出终端
+  // Bottom terminal panel: toggle remembered per session, so opening it in one session doesn't pop up a terminal in others
   const termKey = `term-panel-${key}`;
   const [, bumpTerm] = useState(0);
   const term = lsGet(termKey, false);
@@ -57,13 +57,13 @@ export function SessionView({ hostId, sessionId, seq }: { hostId: string; sessio
     lsSet(termKey, !term);
     bumpTerm((n) => n + 1);
   };
-  // 手机返回键：先收起文件面板、底部终端（后打开的先关）
+  // Mobile back key: collapse the file panel and the bottom terminal first (last opened closes first)
   useBack(files, toggleFiles);
   useBack(term, toggleTerm);
-  // 工作区文件面板的宽度（拖左边缘调整）和全屏
+  // Width of the workspace file panel (drag the left edge) and full screen
   const [panelW, setPanelW] = useState(() => lsGet('file-panel-w', 640));
   const [full, setFull] = useState(false);
-  // 面板里打开了文件：变宽、可以拖宽度；只有文件树时是窄的一栏
+  // A file is open in the panel: wider and resizable; with only the tree it's a narrow column
   const [fileOpen, setFileOpen] = useState(false);
   const [switching, setSwitching] = useState(false);
   const [usage, setUsage] = useState(false);
@@ -90,7 +90,7 @@ export function SessionView({ hostId, sessionId, seq }: { hostId: string; sessio
     window.addEventListener('pointerup', up);
   };
 
-  // 会话已退出时，一开始打字就先把工具进程拉起来（恢复要 1～4 秒），等发送时基本已经就绪
+  // When the session has exited, start the tool process as soon as the user starts typing (resuming takes 1–4 s), so it's mostly ready by send time
   const warmed = useRef('');
   useEffect(() => {
     if (info?.status !== 'exited' && info?.status !== 'error') warmed.current = '';
@@ -106,7 +106,7 @@ export function SessionView({ hostId, sessionId, seq }: { hostId: string; sessio
 
   useEffect(() => {
     if (connected) loadSession(hostId, sessionId).catch(errorToast);
-    // data.loaded：补拉失败被标成未加载时，正在看的会话也重新加载
+    // data.loaded: when a catch-up fetch failed and was marked unloaded, reload the session being viewed too
   }, [hostId, sessionId, connected, data.loaded]);
 
   const pending = useMemo(() => {
@@ -159,7 +159,7 @@ export function SessionView({ hostId, sessionId, seq }: { hostId: string; sessio
 
   const rename = () => renameSession(hostId, info);
 
-  // 工具进程异常退出（被杀、崩溃）后手动恢复：接着原来的工具会话重新拉起，不发消息
+  // Manual recovery after the tool process exited abnormally (killed, crashed): restart it on the original tool session without sending a message
   const recover = async () => {
     setRecovering(true);
     try {
@@ -258,7 +258,7 @@ export function SessionView({ hostId, sessionId, seq }: { hostId: string; sessio
         <button className={`icon-btn ${files ? 'active' : ''}`} title={tr('工作目录文件', 'Workspace Files')} onClick={toggleFiles}>
           <Icon name="folder" size={17} />
         </button>
-        {/* 手机上这个位置放「用量」（顶栏的用量按钮在手机上隐藏），底部终端面板挪进「更多」菜单 */}
+        {/* On mobile this spot holds "Usage" (the top-bar usage button is hidden on mobile), and the bottom terminal panel moves into the "More" menu */}
         {info.tool !== 'shell' && (
           <button
             className="icon-btn show-mobile"

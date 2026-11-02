@@ -6,8 +6,8 @@ import { writeClipboard } from '../clipboard';
 import { Icon } from './Icon';
 import { errText } from './StatsView';
 
-// 端口转发：把主机上的端口接到本机 127.0.0.1，远程机器上跑的开发服务器在本机浏览器里打开。
-// SSH 主机走 SSH 自带的端口转发，中继主机经中继通道由 yi-agentd 去连本机端口（yi-agentd 自己不监听端口）。
+// Port forwarding: connect a port on the host to 127.0.0.1 on this machine so dev servers on remote machines open in the local browser.
+// SSH hosts use SSH's own port forwarding; relay hosts go through a relay channel, with yi-agentd connecting to its local port (yi-agentd itself listens on no ports).
 
 export interface ForwardInfo {
   hostId: string;
@@ -28,15 +28,15 @@ interface Listening {
 
 export const isMobileApp = isTauri && /Android|iPhone|iPad/i.test(navigator.userAgent);
 
-/** 打开网址：桌面用系统浏览器，手机 App 用应用内浏览器（Android Custom Tabs，右上角菜单里还能换到别的浏览器），浏览器版开新标签 */
+/** Open a URL: the system browser on desktop, the in-app browser in the mobile app (Android Custom Tabs, whose menu can switch to another browser), a new tab in the browser build */
 export function openUrl(url: string) {
-  // 手机上 ClientHub 开不了系统浏览器，交给 opener 插件
+  // On mobile ClientHub can't open the system browser, so hand it to the opener plugin
   if (isMobileApp) import('@tauri-apps/plugin-opener').then((m) => m.openUrl(url, 'inAppBrowser')).catch(errorToast);
   else if (isTauri) hubCall('url.open', { url }).catch(errorToast);
   else window.open(url, '_blank', 'noopener');
 }
 
-/** 手机上用别的浏览器打开：Android 弹系统的应用选择框（MainActivity 注入的 YiConsoleAndroid），没有就交给默认浏览器 */
+/** Open in another browser on mobile: Android shows the system app chooser (YiConsoleAndroid injected by MainActivity), otherwise the default browser */
 export function openUrlExternal(url: string) {
   const native = (window as { YiConsoleAndroid?: { openExternal(u: string): void } }).YiConsoleAndroid;
   if (isMobileApp && native) native.openExternal(url);
@@ -46,7 +46,7 @@ export function openUrlExternal(url: string) {
 
 export const forwardUrl = (f: ForwardInfo) => `http://localhost:${f.localPort}/`;
 
-/** 转发主机上的端口（本机主机不用转发，返回的就是原端口） */
+/** Forward a port on the host (the local host needs no forwarding and gets the original port back) */
 export async function forwardPort(hostId: string, port: number, localPort?: number): Promise<ForwardInfo> {
   return hubCall<ForwardInfo>('ports.forward', { id: hostId, port, ...(localPort ? { localPort } : {}) });
 }
@@ -77,7 +77,7 @@ export function PortsView({ hostId }: { hostId: string }) {
   useEffect(() => {
     loadForwards();
     const off = onHubEvent((ev) => ev.type === 'ports.changed' && loadForwards());
-    // 连接数、错误在客户端里变，事件里不带，开着页面时定时刷新
+    // Connection counts and errors change in the client and aren't in events; refresh periodically while the page is open
     const t = setInterval(loadForwards, 3000);
     return () => {
       off();

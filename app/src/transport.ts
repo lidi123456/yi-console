@@ -1,4 +1,4 @@
-// 前端与 ClientHub 之间的通道：Tauri 里走 invoke/事件，浏览器里走 yi-web 的 WebSocket。
+// Channel between the frontend and ClientHub: invoke/events in Tauri, yi-web's WebSocket in the browser.
 import { tr } from './i18n';
 
 type Listener = (ev: any) => void;
@@ -67,7 +67,7 @@ function connectWeb(): Promise<void> {
       for (const [, p] of pending) p.rej(new Error(tr('连接已断开', 'Connection closed')));
       pending.clear();
       dispatch({ type: 'transport', status: 'closed' });
-      // 页面服务重启时自动重连
+      // Reconnect automatically when the page server restarts
       setTimeout(() => connectWeb().catch(() => {}), 2000);
     };
     sock.onmessage = (m) => {
@@ -106,7 +106,7 @@ export async function hubCall<T = any>(cmd: string, args: Record<string, unknown
   });
 }
 
-/** 调远程 yi-agentd 的方法 */
+/** Call a method on a remote yi-agentd */
 export function rpc<T = any>(hostId: string, method: string, params: Record<string, unknown> = {}): Promise<T> {
   return hubCall<T>('rpc', { hostId, method, params });
 }

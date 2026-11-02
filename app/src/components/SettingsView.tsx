@@ -14,7 +14,7 @@ export function SettingsView({ hostId }: { hostId: string }) {
   useEffect(() => {
     rpc<DaemonSettings>(hostId, 'settings.get')
       .then((v) =>
-        // 先带上全部字段（闲置释放、tmux 等），否则保存时会被重置成默认值
+        // Include every field first (idle release, tmux, etc.), otherwise saving resets them to defaults
         setS({
           ...v,
           tools: v.tools ?? {},
@@ -33,7 +33,7 @@ export function SettingsView({ hostId }: { hostId: string }) {
   const save = async () => {
     setSaving(true);
     try {
-      // 清掉空的工具覆盖
+      // Drop empty tool overrides
       const tools = Object.fromEntries(
         Object.entries(s.tools).filter(([, v]) => v.command.trim() || v.extraArgs.length),
       );
@@ -156,7 +156,7 @@ function StatusLineCard({ v, onChange }: { v: StatusLineSettings; onChange: (v: 
     [a[i], a[j]] = [a[j], a[i]];
     onChange({ ...v, items: a });
   };
-  // 已选的按顺序排在前面，没选的跟在后面
+  // Selected fields first in order, unselected ones after
   const statusFields = getStatusFields();
   const fields = [
     ...v.items.map((id) => statusFields.find((f) => f[0] === id)).filter(Boolean),

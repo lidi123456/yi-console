@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/mobile-schema.json",
   "identifier": "mobile",
-  "description": "手机上用系统浏览器打开链接",
+  "description": "Open links in the system browser on mobile",
   "windows": ["main"],
   "platforms": ["android", "iOS"],
   "permissions": ["opener:allow-open-url", "opener:allow-default-urls"]

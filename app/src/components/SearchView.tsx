@@ -16,7 +16,7 @@ interface Group {
   hits: SearchHit[];
 }
 
-/** 命中的词加粗；先转义再拼，避免把消息内容当 HTML */
+/** Bold the matched words; escape first, then join, so message content is never treated as HTML */
 function Highlight({ text, q }: { text: string; q: string }) {
   if (!q) return <>{text}</>;
   const parts: ReactNode[] = [];
@@ -74,7 +74,7 @@ export function SearchView({ initial }: { initial?: string }) {
         g.hits.push(hit);
       }
     }
-    // 最近命中的会话在前
+    // Sessions with the most recent matches first
     setGroups([...map.values()].sort((a, b) => b.hits[0].ts - a.hits[0].ts));
     setErrors(errs);
     setBusy(false);

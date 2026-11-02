@@ -1,4 +1,4 @@
-//! 极简文件日志：追加写 ~/.yi-console/yi-agentd.log，超过 5MB 轮转一份。
+//! Minimal file logging: appends to ~/.yi-console/yi-agentd.log, rotating once past 5MB.
 
 use std::io::Write;
 use std::sync::Mutex;

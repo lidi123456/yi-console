@@ -2,7 +2,8 @@
 name = "yi-web"
 version.workspace = true
 edition.workspace = true
-description = "Yi Console Web 模式：在浏览器里使用（开发调试 / 无法安装桌面端时）"
+license.workspace = true
+description = "Yi Console web mode: use it from a browser (for development, or where the desktop app can't be installed)"
 
 [dependencies]
 yi-client = { path = "../client" }

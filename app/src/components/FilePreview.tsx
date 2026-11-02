@@ -6,9 +6,9 @@ import { rpc } from '../transport';
 import { Icon } from './Icon';
 import { openImage } from './Lightbox';
 
-// 文件面板里的 PDF、CSV、Markdown 预览
+// PDF, CSV and Markdown previews in the file panel
 
-/** 按 RFC 4180 解析：引号里可以有分隔符、换行，"" 表示一个引号 */
+/** Parse per RFC 4180: quoted fields may contain separators and newlines, "" means one quote */
 export function parseCsv(text: string, sep: string, maxRows: number): { rows: string[][]; more: boolean } {
   const rows: string[][] = [];
   let row: string[] = [];
@@ -104,7 +104,7 @@ export function CsvView({ text, tsv }: { text: string; tsv: boolean }) {
   );
 }
 
-/** PDF 用浏览器内核自带的阅读器（WebView2 / Chromium 有；不支持的系统显示下载按钮） */
+/** PDFs use the browser engine's built-in viewer (WebView2 / Chromium have one; unsupported systems show a download button) */
 export function PdfView({ base64, onDownload }: { base64: string; onDownload: () => void }) {
   const url = useMemo(() => {
     const bin = atob(base64);
@@ -139,7 +139,7 @@ const IMG_MIME: Record<string, string> = {
   ico: 'image/x-icon',
 };
 
-/** 按顶层块渲染，每块前面插一个带源码行号的空锚点：分栏时据此对齐滚动，按大纲跳到标题 */
+/** Render top-level blocks, inserting an empty anchor with the source line number before each: used to sync scrolling in split view and to jump to headings from the outline */
 export function renderMdLines(src: string): string {
   const tokens = marked.lexer(src);
   let line = 1;
@@ -152,13 +152,13 @@ export function renderMdLines(src: string): string {
     }
     line += (t.raw.match(/\n/g) ?? []).length;
   }
-  // 相对路径的图片先不让浏览器去加载，由组件经 yi-agentd 读出来再填上
+  // Don't let the browser load relative-path images; the component reads them via yi-agentd and fills them in
   return DOMPurify.sanitize(html).replace(/<img([^>]*?) src="(?![a-zA-Z][a-zA-Z0-9+.-]*:|\/\/|#)([^"]*)"/g, '<img$1 data-src="$2"');
 }
 
 const isAbs = (p: string) => /^([a-zA-Z]:)?[\\/]/.test(p);
 
-/** 相对 dir 解析路径，处理 . 和 ..；沿用 dir 的分隔符 */
+/** Resolve a path relative to dir, handling . and ..; keeps dir's separator */
 export function resolvePath(dir: string, rel: string): string {
   const sep = dir.includes('\\') && !dir.includes('/') ? '\\' : '/';
   const parts = (isAbs(rel) ? rel : `${dir}/${rel}`).split(/[\\/]+/);
@@ -181,7 +181,7 @@ const slug = (s: string) =>
 
 type Anchor = { line: number; top: number };
 
-/** 源码行（line + frac）和预览里纵向位置的互相换算，按相邻两个锚点线性插值 */
+/** Convert between a source line (line + frac) and a vertical position in the preview by linear interpolation between neighboring anchors */
 function lineToTop(as: Anchor[], L: number, end: number): number {
   if (!as.length) return 0;
   let i = 0;
@@ -213,16 +213,16 @@ export function MdPreview({
   goto,
 }: {
   hostId: string;
-  /** 这个 Markdown 文件的绝对路径，相对链接和图片按它所在目录解析 */
+  /** Absolute path of this Markdown file; relative links and images resolve against its directory */
   path: string;
   text: string;
-  /** 点了指向工作区文件的相对链接 */
+  /** A relative link to a workspace file was clicked */
   onOpen: (abs: string) => void;
-  /** 预览滚动时报告对应的源码行（分栏时编辑器跟着滚） */
+  /** Report the matching source line as the preview scrolls (the editor follows in split view) */
   onTopLine?: (line: number, frac: number) => void;
-  /** 编辑器滚到哪一行，预览跟着对齐；n 变了就再滚 */
+  /** Line the editor scrolled to; the preview aligns to it, and scrolls again whenever n changes */
   syncTo?: { line: number; frac: number; n: number } | null;
-  /** 跳到某一行所在的块（大纲） */
+  /** Jump to the block containing a line (outline) */
   goto?: { line: number; n: number } | null;
 }) {
   const box = useRef<HTMLDivElement>(null);
@@ -253,7 +253,7 @@ export function MdPreview({
       try {
         rel = decodeURI(rel);
       } catch {
-        /* 保持原样 */
+        /* keep as is */
       }
       const abs = resolvePath(dir, rel);
       const mime = IMG_MIME[rel.slice(rel.lastIndexOf('.') + 1).toLowerCase()];
@@ -277,7 +277,7 @@ export function MdPreview({
     }
   }, [html]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // 宽度变了（拖面板、换行）重新量锚点
+  // Width changed (panel dragged, rewrapped): re-measure the anchors
   useEffect(() => {
     const el = box.current;
     if (!el) return;
@@ -328,7 +328,7 @@ export function MdPreview({
     try {
       rel = decodeURI(rel);
     } catch {
-      /* 保持原样 */
+      /* keep as is */
     }
     if (rel) onOpen(resolvePath(dir, rel));
   };
@@ -336,16 +336,16 @@ export function MdPreview({
   return <div ref={box} className="wp-md md" onScroll={onScroll} onClick={onClick} dangerouslySetInnerHTML={{ __html: html }} />;
 }
 
-// ---------- 图片 ----------
+// ---------- Images ----------
 
 const clampScale = (v: number) => Math.min(16, Math.max(0.05, v));
 
-/** 图片预览：适应窗口 / 1:1、缩放（按钮、滚轮、双指）、拖动、左右旋转、水平翻转 */
+/** Image preview: fit / 1:1, zoom (buttons, wheel, pinch), pan, rotate left/right, flip horizontally */
 export function ImageView({ src, name, size }: { src: string; name: string; size: string }) {
   const box = useRef<HTMLDivElement>(null);
   const [nat, setNat] = useState<{ w: number; h: number } | null>(null);
   const [boxSize, setBoxSize] = useState({ w: 0, h: 0 });
-  // scale 为 null 表示「适应窗口」，跟着面板大小变
+  // A null scale means "fit to window" and follows the panel size
   const [scale, setScale] = useState<number | null>(null);
   const [rot, setRot] = useState(0);
   const [flip, setFlip] = useState(false);
@@ -365,7 +365,7 @@ export function ImageView({ src, name, size }: { src: string; name: string; size
   const fitScale = nat && boxSize.w ? Math.min(1, (boxSize.w - 48) / (side ? nat.h : nat.w), (boxSize.h - 48) / (side ? nat.w : nat.h)) : 1;
   const s = scale ?? fitScale;
 
-  /** 以 (cx, cy)（相对容器中心）为中心缩放到 next */
+  /** Zoom to next, centered on (cx, cy) (relative to the container center) */
   const zoomTo = (next: number, cx = 0, cy = 0) => {
     const n = clampScale(next);
     const k = n / s;
@@ -420,7 +420,7 @@ export function ImageView({ src, name, size }: { src: string; name: string; size
     gesture.current = ps.length ? { x: ps[0].x, y: ps[0].y, px: pos.x, py: pos.y, dist: 0, s } : null;
   };
 
-  // 快捷键：焦点在图片区域时生效
+  // Shortcuts: active while focus is in the image area
   const onKey = (e: React.KeyboardEvent) => {
     if (e.key === '+' || e.key === '=') zoomTo(s * 1.25);
     else if (e.key === '-') zoomTo(s / 1.25);

@@ -3,8 +3,8 @@ import { isEn, tr } from '../i18n';
 import type { Question, QuestionAnswer } from '../types';
 import { Icon } from './Icon';
 
-// AI 提问的卡片：一道或几道题，每题点选项（单选 / 多选），允许的话还能自己填；提交或跳过。
-// Claude、Codex、Cursor 的提问请求和 Kiro 正文里的编号选项都用它
+// Card for questions from the AI: one or more questions, each answered by clicking options (single / multiple choice), with free text if allowed; submit or skip.
+// Used for question requests from Claude, Codex and Cursor, and for numbered options in Kiro's reply text
 
 type Draft = Record<string, { selected: string[]; text: string }>;
 
@@ -19,7 +19,7 @@ export function QuestionCard({
 }: {
   title: string;
   questions: Question[];
-  /** 已回答：optionId 是 answer / skip / cancelled */
+  /** Answered: optionId is answer / skip / cancelled */
   resolved?: { optionId: string; answers: QuestionAnswer[] };
   onSubmit?: (answers: QuestionAnswer[]) => Promise<void> | void;
   onSkip?: () => Promise<void> | void;
@@ -37,7 +37,7 @@ export function QuestionCard({
   const pick = (q: Question, id: string) => {
     const cur = get(q);
     if (q.multiSelect) set(q, { ...cur, selected: cur.selected.includes(id) ? cur.selected.filter((x) => x !== id) : [...cur.selected, id] });
-    // 单选：选项和自己填的二选一
+    // Single choice: either an option or free text
     else set(q, { selected: cur.selected[0] === id ? [] : [id], text: '' });
   };
   const answered = (q: Question) => get(q).selected.length > 0 || !!get(q).text.trim();
@@ -148,7 +148,7 @@ export function QuestionCard({
   );
 }
 
-/** 一道题的回答写成文字 */
+/** Write one question's answer as text */
 export function answerLabel(q: Question, a?: QuestionAnswer) {
   if (!a) return '';
   return [...a.selected.map((id) => q.options.find((o) => o.id === id)?.label ?? id), a.text?.trim() ?? '']
@@ -180,8 +180,8 @@ function Resolved({ title, questions, resolved }: { title: string; questions: Qu
 }
 
 /**
- * Kiro 没有提问工具，需要用户选择时在正文里列编号问题和 a) b) c) 选项，并让用户按 "1=a, 2=b" 回复。
- * 从正文里把这种结构认出来，回答时拼成同样格式的一条消息
+ * Kiro has no question tool; when it needs the user to choose, it lists numbered questions with a) b) c) options in its reply and asks for a "1=a, 2=b" reply.
+ * Recognize that structure in the reply text, and send answers as one message in the same format
  */
 export function parseTextQuestions(text: string): Question[] {
   const clean = (s: string) => s.replace(/\*\*|__|`/g, '').trim();
@@ -193,7 +193,7 @@ export function parseTextQuestions(text: string): Question[] {
     const num = /^\s*(?:[-*]\s+)?(?:\*\*)?(\d{1,2})[.)、]\s*(.+)$/.exec(line);
     if (opt) {
       let q = qs[qs.length - 1];
-      // 没有编号的单个问题：选项前面那一行就是问题
+      // A single question without a number: the line before the options is the question
       if (!q) {
         q = { id: '1', question: clean(lastLine) || tr('请选择', 'Please select'), options: [], allowOther: true };
         qs.push(q);
@@ -206,13 +206,13 @@ export function parseTextQuestions(text: string): Question[] {
     } else if (line.trim()) lastLine = line;
   }
   const good = qs.filter((q) => q.options.length >= 2);
-  // 要有像样的选项结构，并且只认结尾附近的提问（避免把普通的编号列表当成问题）
+  // Require a proper option structure, and only accept questions near the end (so ordinary numbered lists aren't mistaken for questions)
   if (!good.length) return [];
   const hint = /reply with your choices|1\s*=\s*a|请回复|回复.*选择/i.test(text);
   return hint || good.length === qs.length ? good : [];
 }
 
-/** 把回答拼成 "1=a, 2=b, 3=自己的话" */
+/** Join answers as "1=a, 2=b, 3=free text" */
 export function textAnswer(questions: Question[], answers: QuestionAnswer[]) {
   return questions
     .map((q) => {

@@ -6,19 +6,19 @@ import { writeClipboard } from '../clipboard';
 import { Icon } from './Icon';
 import { forwardPort, openUrlExternal } from './PortsView';
 
-// 文件面板里的浏览器标签（iframe）。
-// - 远程主机上的 localhost 地址先经端口转发接到本机，再在 iframe 里打开；
-// - 主机上的 HTML 文件经 ahfs 协议（yi-web 是 /fsv/）按目录取，相对路径的资源都能加载；
-// - 不加载和应用同源的地址，HTML 预览放进不带 allow-same-origin 的 sandbox，页面碰不到应用的接口。
-// 跨域页面里点链接跳转后拿不到新地址，地址栏不跟着变；不允许被嵌入的网站会显示空白，提供「用系统浏览器打开」。
+// Browser tab (iframe) in the file panel.
+// - localhost addresses on a remote host are first port-forwarded to this machine, then opened in the iframe;
+// - HTML files on the host are fetched by directory via the ahfs protocol (/fsv/ in yi-web), so relative resources load too;
+// - addresses on the app's own origin are never loaded, and HTML previews go into a sandbox without allow-same-origin, so pages can't touch the app's APIs.
+// After navigating via a link in a cross-origin page we can't read the new URL, so the address bar doesn't follow; sites that forbid embedding show blank, and we offer "Open in system browser".
 
-/** 标签的键：web:<地址>，地址为空是新标签；file:<绝对路径> 是主机上的 HTML 文件 */
+/** Tab key: web:<url>, an empty url is a new tab; file:<absolute path> is an HTML file on the host */
 export const WEB_PREFIX = 'web:';
 export const isWebTab = (t: string) => t.startsWith(WEB_PREFIX);
 export const webTabUrl = (t: string) => t.slice(WEB_PREFIX.length);
 export const webTabFile = (t: string) => (webTabUrl(t).startsWith('file:') ? webTabUrl(t).slice(5) : null);
 
-/** 标签上显示的名字 */
+/** Name shown on the tab */
 export function webTabTitle(t: string): string {
   const u = webTabUrl(t);
   if (!u) return tr('新标签', 'New tab');
@@ -32,7 +32,7 @@ export function webTabTitle(t: string): string {
   }
 }
 
-/** 用户输入 -> 完整地址：3000、localhost:3000、example.com 都可以 */
+/** User input -> full URL: 3000, localhost:3000 and example.com all work */
 export function normalizeUrl(s: string): string {
   const v = s.trim();
   if (!v) return '';
@@ -45,7 +45,7 @@ export function normalizeUrl(s: string): string {
 const LOOPBACK = new Set(['localhost', '127.0.0.1', '0.0.0.0', '[::1]', '::1']);
 
 const tokens = new Map<string, Promise<string>>();
-/** 主机上某个目录里的文件的预览地址 */
+/** Preview URL for a file in a directory on the host */
 export async function previewUrl(hostId: string, root: string, abs: string): Promise<string> {
   const k = `${hostId}\n${root}`;
   let t = tokens.get(k);
@@ -79,11 +79,11 @@ export function BrowserPane({
 }: {
   hostId: string;
   root: string;
-  /** 标签的键（web:…） */
+  /** Tab key (web:…) */
   tab: string;
-  /** 变了就重新加载（比如 HTML 文件保存后） */
+  /** Reload when this changes (e.g. after saving an HTML file) */
   reload?: number;
-  /** 地址栏里换了地址：换成新的标签键 */
+  /** The address bar changed the URL: switch to the new tab key */
   onNavigate: (tab: string) => void;
 }) {
   const host = useStore((s) => s.hosts.find((h) => h.config.id === hostId));
@@ -114,7 +114,7 @@ export function BrowserPane({
         return { error: tr('地址格式不对', 'Invalid address') };
       }
       if (!/^https?:$/.test(u.protocol)) return { error: tr('只能打开 http / https 地址', 'Only http and https addresses can be opened') };
-      // 远程主机上的 localhost 是那台机器自己，先转发到本机
+      // localhost on a remote host is that machine itself, so forward it to this machine first
       if (!isLocal && LOOPBACK.has(u.hostname)) {
         const port = Number(u.port || (u.protocol === 'https:' ? 443 : 80));
         const f = await forwardPort(hostId, port);
@@ -123,7 +123,7 @@ export function BrowserPane({
         u.port = String(f.localPort);
         return { src: u.toString(), sandboxed: false, via: `${remote} → localhost:${f.localPort}` };
       }
-      // 和应用同源的页面能直接调应用的接口，不在这里打开
+      // Pages on the app's own origin could call the app's APIs directly; don't open them here
       if (u.origin === location.origin) return { error: tr('这个地址是 Yi Console 自己，不能在标签里打开', 'This address is Yi Console itself and cannot be opened in a tab') };
       return { src: u.toString(), sandboxed: false };
     })()
@@ -207,7 +207,7 @@ export function BrowserPane({
             className="wb-frame"
             src={src}
             title={webTabTitle(tab)}
-            // 远程网页有自己的源，可以用 Cookie、localStorage；主机上的 HTML 文件不给同源权限
+            // Remote pages have their own origin and may use cookies and localStorage; HTML files on the host get no same-origin rights
             sandbox={
               res && 'sandboxed' in res && res.sandboxed
                 ? 'allow-scripts allow-forms allow-modals allow-popups allow-downloads'
@@ -230,7 +230,7 @@ function safeHost(u: string) {
   }
 }
 
-/** 新标签：列出主机上正在监听的端口，点一下打开 */
+/** New tab: list the ports listening on the host; click one to open it */
 function StartPage({ hostId, isLocal, onOpen }: { hostId: string; isLocal: boolean; onOpen: (url: string) => void }) {
   const [ports, setPorts] = useState<{ port: number; process?: string | null }[] | null>(null);
   useEffect(() => {

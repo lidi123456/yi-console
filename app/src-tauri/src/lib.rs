@@ -1,5 +1,5 @@
-//! Tauri 外壳：前端经 `hub_call` 调 ClientHub，ClientHub 的事件以 `hub-event` 推给前端。
-//! 浏览器模式（yi-web）走的是同一套 ClientHub.call，两边行为一致。
+//! Tauri shell: the frontend calls ClientHub through `hub_call`, and ClientHub events are pushed to the frontend as `hub-event`.
+//! Browser mode (yi-web) goes through the same ClientHub.call, so both behave the same.
 
 mod clipfiles;
 
@@ -17,7 +17,7 @@ async fn hub_call(hub: State<'_, Hub>, cmd: String, args: Value) -> Result<Value
     hub.call(&cmd, args).await.map_err(|e| format!("{e:#}"))
 }
 
-/// 弹系统的"另存为"对话框，把 base64 内容写到选中的位置；用户取消返回 false
+/// Show the system "Save as" dialog and write the base64 content to the chosen location; returns false if the user cancels
 #[tauri::command]
 async fn save_file(app: tauri::AppHandle, name: String, data: String) -> Result<bool, String> {
     #[cfg(desktop)]
@@ -45,7 +45,7 @@ async fn save_file(app: tauri::AppHandle, name: String, data: String) -> Result<
     }
 }
 
-/// 默认窗口 1320×800；屏幕放不下（比如 1366×768 的笔记本）时缩到工作区的 92% 并居中
+/// Default window is 1320×800; if the screen can't fit it (e.g. a 1366×768 laptop), shrink to 92% of the work area and center
 #[cfg(desktop)]
 fn fit_to_screen(w: &tauri::WebviewWindow) {
     let (Ok(Some(m)), Ok(size)) = (w.current_monitor(), w.outer_size()) else { return };
@@ -58,7 +58,7 @@ fn fit_to_screen(w: &tauri::WebviewWindow) {
     }
 }
 
-/// 手机上没有本机 yi-agentd，只能连 SSH 主机或经中继连电脑
+/// There's no local yi-agentd on mobile; it can only connect to SSH hosts or to computers via a relay
 const LOCAL_SUPPORTED: bool = cfg!(not(any(target_os = "android", target_os = "ios")));
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -71,10 +71,10 @@ pub fn run() {
     #[cfg(desktop)]
     let builder = builder
         .plugin(tauri_plugin_dialog::init())
-        // 记住窗口大小和位置，下次按上次的打开
+        // Remember window size and position and reopen with them next time
         .plugin(tauri_plugin_window_state::Builder::default().build());
     builder
-        // 浏览器标签预览主机上的网页：ahfs://localhost/<令牌>/<相对路径>（Windows / Android 上是 http://ahfs.localhost/…）
+        // Browser tabs previewing web pages on the host: ahfs://localhost/<token>/<relative path> (http://ahfs.localhost/… on Windows / Android)
         .register_asynchronous_uri_scheme_protocol("ahfs", |ctx, req, responder| {
             let hub = ctx.app_handle().state::<Hub>().0.clone();
             let path = req.uri().path().to_string();
@@ -99,7 +99,7 @@ pub fn run() {
                 fit_to_screen(&w);
             }
             let data_dir = app.path().app_data_dir()?;
-            // 打包进安装包的各平台 yi-agentd，给 SSH 主机自动部署用；手机上不带
+            // yi-agentd builds for every platform bundled in the installer, for automatic deployment to SSH hosts; not shipped on mobile
             let yi_agentd_dir = if LOCAL_SUPPORTED {
                 app.path().resource_dir().ok().map(|d| d.join("yi-agentd-dist"))
             } else {
@@ -109,7 +109,7 @@ pub fn run() {
             let sink = Arc::new(move |v: Value| {
                 let _ = handle.emit("hub-event", v);
             });
-            // ClientHub::new 会为自动连接的主机起后台任务，需要在 tokio 运行时里调用
+            // ClientHub::new spawns background tasks for auto-connecting hosts, so it must be called inside the tokio runtime
             let hub = tauri::async_runtime::block_on(async move {
                 ClientHub::new(data_dir, yi_agentd_dir, LOCAL_SUPPORTED, sink)
             });

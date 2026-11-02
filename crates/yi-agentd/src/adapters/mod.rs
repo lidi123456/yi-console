@@ -1,5 +1,5 @@
-//! 各 AI coding 工具的适配器。每个适配器是一个 tokio 任务，独占工具子进程，
-//! 从 `rx` 收命令，把工具输出翻译成统一事件交给 `Emitter`。
+//! Adapters for each AI coding tool. Each adapter is a tokio task that owns the tool's child process,
+//! receives commands on `rx`, and translates tool output into unified events for the `Emitter`.
 
 pub mod acp;
 pub mod claude;
@@ -16,14 +16,14 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::mpsc;
 
-/// 对话模式下告诉模型怎么给用户看图片：Yi Console 会把回复里引用主机本地文件的 Markdown 图片显示出来。
-/// Claude 用 `--append-system-prompt`，Codex 用 `developerInstructions`；ACP 没有系统提示词入口，不加
+/// Tells the model in chat mode how to show the user images: Yi Console displays Markdown images in replies that reference local files on the host.
+/// Claude gets it via `--append-system-prompt`, Codex via `developerInstructions`; ACP has no system prompt entry point, so it's not added
 pub const IMAGE_HINT: &str = "Your replies are shown in the Yi Console app, which renders Markdown. \
 To show the user an image file on this machine (a screenshot, chart or generated picture), embed it with \
 Markdown image syntax and its absolute path, e.g. ![chart](/abs/path/chart.png); wrap a path containing \
 spaces in angle brackets: ![chart](</abs/path/my chart.png>).";
 
-/// 一条用户输入
+/// One piece of user input
 #[derive(Debug, Clone)]
 pub struct Prompt {
     pub text: String,
@@ -33,25 +33,25 @@ pub struct Prompt {
 #[derive(Debug, Clone)]
 pub struct PromptImage {
     pub mime_type: String,
-    /// 已存到 yi-agentd 数据目录的文件（Codex 按路径读）
+    /// File already saved in yi-agentd's data directory (Codex reads it by path)
     pub path: PathBuf,
-    /// base64（Claude、ACP 直接内联）
+    /// base64 (inlined directly for Claude and ACP)
     pub data: String,
 }
 
 #[derive(Debug)]
 pub enum AdapterCmd {
     Send(Prompt),
-    /// 切换模型，下一轮生效
+    /// Switch model, effective next turn
     SetModel(String),
-    /// 思考等级，空串表示恢复工具默认
+    /// Thinking level; an empty string restores the tool's default
     SetEffort(String),
-    /// 切换审批模式（default / acceptEdits / plan / bypass）
+    /// Switch permission mode (default / acceptEdits / plan / bypass)
     SetPermissionMode(String),
     Interrupt,
-    /// 停止一个后台任务
+    /// Stop a background task
     StopTask(String),
-    /// 回答审批；提问类请求 option_id 是 answer / skip，回答内容在 answers 里
+    /// Answer an approval; for question requests option_id is answer / skip and the content is in answers
     Permission { request_id: String, option_id: String, answers: Vec<QuestionAnswer> },
     Kill,
     PtyInput(Vec<u8>),
@@ -63,11 +63,11 @@ pub struct StartSpec {
     pub tool: ToolKind,
     pub mode: SessionMode,
     pub cwd: PathBuf,
-    /// 工具侧会话 id，有值时走 resume
+    /// Tool-side session id; resumes when set
     pub resume: Option<String>,
-    /// resume 时工具回放的历史是否要记进事件日志（导入历史时为 true）
+    /// Whether history replayed by the tool on resume is recorded in the event log (true when importing history)
     pub replay: bool,
-    /// replay 时先跳过这么多条用户消息（连同回复）再开始记：切回对话模式时只记在终端里新聊的
+    /// During replay, skip this many user messages (with their replies) before recording: switching back to chat only records what was said in the terminal
     pub replay_skip: usize,
     pub model: Option<String>,
     pub effort: Option<String>,
@@ -78,9 +78,9 @@ pub struct StartSpec {
     pub extra_args: Vec<String>,
     pub cols: u16,
     pub rows: u16,
-    /// 终端模式放进这个 tmux 会话里跑（守护进程重启后还能接上）
+    /// Run terminal mode inside this tmux session (so it survives daemon restarts)
     pub tmux: Option<String>,
-    /// 终端模式新开 Claude 会话时预先指定的会话 id（--session-id），之后重启据此 --resume
+    /// Session id preassigned (--session-id) when terminal mode starts a new Claude session; later restarts --resume it
     pub session_id: Option<String>,
 }
 
@@ -99,7 +99,7 @@ pub fn start(spec: StartSpec, em: Emitter, rx: mpsc::UnboundedReceiver<AdapterCm
     }
 }
 
-/// Windows 上 npm 装的工具是 .cmd 脚本，不能直接 CreateProcess，要经 cmd /c
+/// On Windows, npm-installed tools are .cmd scripts that can't be launched with CreateProcess directly and must go through cmd /c
 pub fn std_command(program: &Path, args: &[String]) -> std::process::Command {
     let is_script = program
         .extension()
@@ -117,7 +117,7 @@ pub fn std_command(program: &Path, args: &[String]) -> std::process::Command {
     c
 }
 
-/// 以按行 JSON 方式通信的子进程
+/// A child process that talks line-delimited JSON
 pub struct JsonProc {
     pub child: Child,
     pub stdin: ChildStdin,
@@ -135,7 +135,7 @@ impl JsonProc {
             .kill_on_drop(true);
         #[cfg(windows)]
         {
-            // CREATE_NO_WINDOW，避免服务模式下弹出控制台窗口
+            // CREATE_NO_WINDOW, so no console window pops up in service mode
             cmd.creation_flags(0x0800_0000);
         }
         let mut child = cmd.spawn()?;
@@ -169,7 +169,7 @@ impl JsonProc {
         self.stdin.flush().await
     }
 
-    /// 等待进程结束，返回给用户看的错误信息（正常退出返回 None）
+    /// Wait for the process to exit; returns an error message for the user (None on a normal exit)
     pub async fn finish(mut self, killed: bool) -> Option<String> {
         if killed {
             let _ = self.child.start_kill();
@@ -206,7 +206,7 @@ impl JsonProc {
     }
 }
 
-/// 把工具调用的输入压缩成一行标题
+/// Compress a tool call's input into a one-line title
 pub fn summarize_input(name: &str, input: &serde_json::Value) -> String {
     let s = |k: &str| input.get(k).and_then(|v| v.as_str()).map(str::to_string);
     let t = match name {
@@ -230,7 +230,7 @@ pub fn summarize_input(name: &str, input: &serde_json::Value) -> String {
     crate::util::truncate(&t.replace('\n', " "), 200)
 }
 
-/// 提问类请求的两个按钮：kind 不用 allow_* / reject_*，手机通知上就不会出"允许 / 拒绝"
+/// The two buttons of a question request: kind isn't allow_* / reject_*, so phone notifications don't show "Allow / Deny"
 pub fn question_options() -> Vec<yi_proto::PermissionOption> {
     vec![
         yi_proto::PermissionOption {
@@ -246,7 +246,7 @@ pub fn question_options() -> Vec<yi_proto::PermissionOption> {
     ]
 }
 
-/// 一道题的回答写成一段文字：选中的选项名，加上自己填的内容
+/// Write one question's answer as text: the selected option names plus any free text
 pub fn answer_text(q: &yi_proto::Question, answers: &[QuestionAnswer]) -> String {
     let Some(a) = answers.iter().find(|a| a.question_id == q.id) else {
         return String::new();

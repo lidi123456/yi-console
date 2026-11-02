@@ -18,7 +18,7 @@ function kindLabel(k: string) {
   }
 }
 
-/** 多行命令（heredoc 等）压成一行显示，完整内容放在 title 里 */
+/** Collapse multi-line commands (heredocs etc.) into one line for display; the full text goes in the title */
 function oneLine(s: string) {
   return s.replace(/\s+/g, ' ').trim();
 }
@@ -30,7 +30,7 @@ function fmtElapsed(ms: number) {
   return `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m`;
 }
 
-/** 后台任务的输出：读输出文件的最后一段，开着时每 2 秒刷新 */
+/** Background task output: read the tail of the output file, refreshing every 2 s while open */
 function TaskOutput({ hostId, path }: { hostId: string; path: string }) {
   const [text, setText] = useState<string | null>(null);
   useEffect(() => {
@@ -49,7 +49,7 @@ function TaskOutput({ hostId, path }: { hostId: string; path: string }) {
   return <pre className="mono bg-output">{text === null ? tr('读取中…', 'Loading…') : text || tr('（还没有输出）', '(no output yet)')}</pre>;
 }
 
-/** 输入框上方的后台任务条：平时一行，点开列出每个任务，可以看输出、停止 */
+/** Background task bar above the input box: one line normally, expands to list each task, with output and stop */
 export function BgTasks({ hostId, info }: { hostId: string; info: SessionInfo }) {
   const tasks = info.backgroundTasks ?? [];
   const [open, setOpen] = useState(false);

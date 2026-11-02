@@ -1,8 +1,8 @@
-//! 本机 yi-agentd 的固定位置：`~/.yi-console/bin/yi-agentd`（和 SSH 主机上一样）。
+//! Fixed location of the local yi-agentd: `~/.yi-console/bin/yi-agentd` (same as on SSH hosts).
 //!
-//! 不直接运行安装包里那份：常驻的守护进程会占住安装目录里的文件，Windows 上升级 App 会因此失败；
-//! macOS 从 DMG 或"下载"里运行时路径是随机的，注册成自启服务下次就找不到了。
-//! 所以每次连接前把安装包自带的 yi-agentd 同步过来，守护进程、bridge 和自启服务都用这份。
+//! We don't run the copy in the installer directly: a resident daemon would lock files in the install directory and make app upgrades fail on Windows;
+//! on macOS, running from a DMG or Downloads gives a randomized path, so a registered autostart service wouldn't find it next time.
+//! So before each connection the yi-agentd shipped in the installer is synced here, and the daemon, bridge and autostart service all use this copy.
 
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
@@ -15,7 +15,7 @@ fn exe_name() -> &'static str {
     }
 }
 
-/// 和 yi-agentd 的 `paths::base_dir` 保持一致
+/// Keep in sync with yi-agentd's `paths::base_dir`
 pub fn base_dir() -> PathBuf {
     if let Ok(p) = std::env::var("YI_CONSOLE_HOME") {
         return PathBuf::from(p);
@@ -29,18 +29,18 @@ pub fn installed_path() -> PathBuf {
     base_dir().join("bin").join(exe_name())
 }
 
-/// 把 `bundled` 同步到固定位置，返回固定位置的路径。内容相同就什么都不做。
+/// Sync `bundled` to the fixed location and return that path. Does nothing if the contents are identical.
 ///
-/// 正在运行的旧守护进程不受影响：Unix 上改名覆盖不影响已打开的文件；
-/// Windows 上运行中的 exe 不能覆盖，但可以改名，所以先把它挪成 `.old` 再放新的。
-/// 新版本要等守护进程重启后才生效（界面上会提示版本不一致）。
+/// A running old daemon is unaffected: on Unix, replacing by rename doesn't affect files already open;
+/// on Windows a running exe can't be overwritten but can be renamed, so move it aside as `.old` before placing the new one.
+/// The new version only takes effect after the daemon restarts (the UI shows a version mismatch notice).
 pub fn sync(bundled: &Path) -> Result<PathBuf> {
     sync_to(bundled, &installed_path())
 }
 
 fn sync_to(bundled: &Path, target: &Path) -> Result<PathBuf> {
     let old = target.with_extension("old");
-    // 上次替换留下的旧文件，进程退出后就能删掉
+    // Old file left by the last replacement; can be deleted once its process has exited
     let _ = std::fs::remove_file(&old);
     if same_content(bundled, target) {
         return Ok(target.to_path_buf());
@@ -55,7 +55,7 @@ fn sync_to(bundled: &Path, target: &Path) -> Result<PathBuf> {
         std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))?;
     }
     if std::fs::rename(&tmp, target).is_err() {
-        // Windows：目标正在运行，先挪开
+        // Windows: the target is running, move it aside first
         std::fs::rename(target, &old).context("替换 yi-agentd 失败：旧文件被占用")?;
         std::fs::rename(&tmp, target)?;
     }

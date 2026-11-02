@@ -1,9 +1,9 @@
-//! 用量统计：按天、按工具聚合。
+//! Usage statistics: aggregated by day and by tool.
 //!
-//! Claude Code 和 Codex 自己会把每次请求的 token 记在本地日志里（`~/.claude/projects`、
-//! `~/.codex/sessions`），直接在终端里用的也在，所以这两个工具的 token 以日志为准；
-//! 经 Yi Console 跑的会话也会写这些日志，不再重复算。Cursor / Kiro 没有本地记录，用 Yi Console 自己的 usage_log。
-//! 费用只有 Claude Code 在 Yi Console 会话里上报，来自 usage_log。
+//! Claude Code and Codex log the tokens of every request locally (`~/.claude/projects`,
+//! `~/.codex/sessions`), including direct terminal use, so for these two tools the logs are authoritative;
+//! sessions run through Yi Console write those logs too and aren't counted twice. Cursor / Kiro keep no local records, so Yi Console's own usage_log is used.
+//! Only Claude Code reports cost in Yi Console sessions, taken from usage_log.
 
 use crate::store::Store;
 use crate::util::{day_of, now_ms, parse_iso};
@@ -14,17 +14,17 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
-/// 日志里的一次请求
+/// One request from the logs
 #[derive(Clone)]
 struct Rec {
     ts: i64,
     model: String,
     usage: Usage,
-    /// Claude 同一条消息会按内容块重复写多行，按 message.id + requestId 去重
+    /// Claude writes the same message as several lines, one per content block; dedupe by message.id + requestId
     key: Option<String>,
 }
 
-/// 解析过的日志文件：(修改时间, 大小, 记录)，文件没变就不再读
+/// Parsed log files: (mtime, size, records); not reread if the file hasn't changed
 type Cache = HashMap<PathBuf, (SystemTime, u64, Arc<Vec<Rec>>)>;
 static CACHE: Mutex<Option<Cache>> = Mutex::new(None);
 
@@ -57,7 +57,7 @@ fn u(v: &Value) -> u64 {
 fn parse_claude(text: &str) -> Vec<Rec> {
     let mut out = vec![];
     for line in text.lines() {
-        // 先粗筛，整行 JSON 解析比较慢
+        // Coarse filter first; full-line JSON parsing is slow
         if !line.contains("\"usage\"") || !line.contains("\"assistant\"") {
             continue;
         }
@@ -72,7 +72,7 @@ fn parse_claude(text: &str) -> Vec<Rec> {
         }
         let Some(ts) = v["timestamp"].as_str().and_then(parse_iso) else { continue };
         let model = m["model"].as_str().unwrap_or("").to_string();
-        // 本地合成的消息（报错提示等）不算
+        // Locally synthesized messages (error notices etc.) don't count
         if model == "<synthetic>" {
             continue;
         }
@@ -98,7 +98,7 @@ fn parse_claude(text: &str) -> Vec<Rec> {
     out
 }
 
-/// Codex 的 token_count 事件带累计值，相邻两次的差就是这次请求的用量
+/// Codex token_count events carry cumulative totals; the difference between consecutive ones is this request's usage
 fn parse_codex(text: &str) -> Vec<Rec> {
     let mut out = vec![];
     let mut model = String::new();
@@ -126,7 +126,7 @@ fn parse_codex(text: &str) -> Vec<Rec> {
         let Some(ts) = v["timestamp"].as_str().and_then(parse_iso) else { continue };
         let cur = (u(&t["input_tokens"]), u(&t["cached_input_tokens"]), u(&t["output_tokens"]));
         let base = match prev {
-            // 累计值变小说明换了线程（压缩上下文等），从头算
+            // A smaller total means a different thread (context compaction etc.), so start over
             Some(b) if cur.0 >= b.0 && cur.2 >= b.2 => b,
             _ => (0, 0, 0),
         };
@@ -140,7 +140,7 @@ fn parse_codex(text: &str) -> Vec<Rec> {
             model: model.clone(),
             key: None,
             usage: Usage {
-                // OpenAI 的 input_tokens 包含缓存命中的部分
+                // OpenAI's input_tokens includes the cached part
                 input_tokens: input.saturating_sub(cached),
                 output_tokens: output,
                 cache_read_tokens: cached,
@@ -178,7 +178,7 @@ fn qoder_model_name(m: &str) -> &str {
     }
 }
 
-/// Qoder 的会话日志和 Claude 同格式，但内置模型的 token 字段全置 0，用量记在 credits 里
+/// Qoder session logs share Claude's format, but token fields are all 0 for built-in models; usage is recorded in credits
 fn parse_qoder(text: &str) -> Vec<Rec> {
     let mut out = vec![];
     for line in text.lines() {
@@ -238,7 +238,7 @@ fn parse_qoder(text: &str) -> Vec<Rec> {
     out
 }
 
-/// CodeBuddy 的会话日志：assistant 消息的 providerData.rawUsage 里同时记了 token 和 credit
+/// CodeBuddy session logs: providerData.rawUsage of assistant messages records both tokens and credits
 fn parse_codebuddy(text: &str) -> Vec<Rec> {
     let mut out = vec![];
     for line in text.lines() {
@@ -299,7 +299,7 @@ fn parse_codebuddy(text: &str) -> Vec<Rec> {
             &ru["cacheCreationInputTokens"],
             &ru["prompt_cache_write_tokens"],
         ]);
-        // prompt_tokens 包含缓存部分（同 OpenAI 格式）
+        // prompt_tokens includes the cached part (same as the OpenAI format)
         let has_prompt = ru.get("prompt_tokens").is_some()
             || ru.get("prompt_tokens_details").is_some()
             || ru.get("prompt_cache_hit_tokens").is_some();
@@ -335,7 +335,7 @@ fn parse_codebuddy(text: &str) -> Vec<Rec> {
     out
 }
 
-/// 修改时间早于 since 的文件里不会有这段时间的记录
+/// Files modified before since can't contain records from that period
 fn recent_files(root: &Path, since: i64) -> Vec<PathBuf> {
     let mut v = vec![];
     crate::history::walk_jsonl(root, &mut v, 0);
@@ -408,7 +408,7 @@ pub fn usage(store: &Store, days: i64, tz_offset_min: i64) -> anyhow::Result<Val
         }
     }
 
-    // Yi Console 自己记的：日志里有的工具已包含 token 和积分，只取费用（Claude），其余全取
+    // Yi Console's own records: for tools whose logs already include tokens and credits, take only cost (Claude); take everything for the rest
     for (ts, tool, mut us) in store.usage_rows(since)? {
         if from_logs.contains(&tool.as_str()) {
             us = Usage {

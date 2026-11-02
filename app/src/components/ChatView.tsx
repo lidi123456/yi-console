@@ -55,14 +55,14 @@ type Item =
       text: string;
     };
 
-/** hideCompactCmd：工具会报压缩进度（Claude、Codex）时，不再显示用户发的「/compact」气泡 */
+/** hideCompactCmd: when the tool reports compaction progress (Claude, Codex), don't show the user's "/compact" bubble */
 function buildItems(events: HubEvent[], hideCompactCmd = false): Item[] {
   const items: Item[] = [];
   const tools = new Map<string, Item & { k: 'tool' }>();
   const perms = new Map<string, Item & { k: 'perm' }>();
   let planIdx = -1;
   const planner = new PlanTracker();
-  // 当前这一轮：从上一轮结束后的第一条用户消息算起
+  // The current turn: starts at the first user message after the previous turn ended
   let turnStart: number | null = null;
   let turnUsage: Usage | null = null;
   let turnTools = 0;
@@ -70,7 +70,7 @@ function buildItems(events: HubEvent[], hideCompactCmd = false): Item[] {
   let exitNote: Extract<Item, { k: 'note' }> | null = null;
   for (const e of events) {
     const key = `e${e.seq}`;
-    // 任务清单只保留最新的一份，位置跟着最后一次更新走；清单被清空时留着上一份
+    // Keep only the latest task list, positioned at its last update; if the list is cleared, keep the previous one
     if (planner.feed(e) && planner.plan) {
       if (planIdx >= 0) items.splice(planIdx, 1);
       items.push({ k: 'plan', key: `p${e.seq}`, plan: planner.plan });
@@ -144,7 +144,7 @@ function buildItems(events: HubEvent[], hideCompactCmd = false): Item[] {
         items.push({ k: 'note', key, text: e.message, tone: 'err' });
         break;
       case 'system': {
-        // yi-agentd 把 Claude 的 task_notification 记成「后台任务完成：<命令>」，单独画成一行
+        // yi-agentd records Claude's task_notification as "后台任务完成：<command>"; draw it as a single line
         const bg = /^后台任务(完成|失败|已停止|\s*\S+?)：([\s\S]*)$/.exec(e.text.trim());
         if (bg) {
           const s = bg[1] === '完成' ? 'done' : bg[1] === '失败' ? 'failed' : bg[1] === '已停止' ? 'stopped' : 'other';
@@ -158,21 +158,21 @@ function buildItems(events: HubEvent[], hideCompactCmd = false): Item[] {
         break;
       }
       case 'compact': {
-        // 结束时替换掉「正在压缩」那一行，原地变成结果
+        // On completion, replace the "compacting" line in place with the result
         let last: Item | undefined;
         let lastIdx = -1;
         for (let i = items.length - 1; i >= 0 && !last; i--) if (items[i].k === 'compact') { last = items[i]; lastIdx = i; }
-        // 旧版 yi-agentd 会把 Claude 压缩期间重复发的 compacting 都记成 start：同一轮里还没结束的就不再加一行
+        // Older yi-agentd recorded every repeated compacting event from Claude as a start: skip it if one in the same turn hasn't finished yet
         if (e.phase === 'start' && last?.k === 'compact' && last.ev.phase === 'start' && !items.slice(lastIdx + 1).some((x) => x.k === 'turn' || x.k === 'user')) break;
         if (e.phase !== 'start' && last?.k === 'compact' && last.ev.phase === 'start') {
-          // 工具没报耗时（Codex）就用开始到结束的时间差
+        // If the tool didn't report a duration (Codex), use the time between start and end
           last.ev = e.durationMs == null ? { ...e, durationMs: e.ts - last.ev.ts } : e;
         }
         else items.push({ k: 'compact', key, ev: e });
         break;
       }
       case 'status':
-        // 进程异常退出那条错误：之后进程又拉起来了（恢复会话、发消息自动恢复），改成灰色的「已恢复」，不再标红
+        // The error for an abnormal process exit: if the process was started again afterwards (session resumed, or auto-restarted on send), turn it into a grey "recovered" line instead of red
         if (e.status === 'error') {
           const last = items[items.length - 1];
           exitNote = last?.k === 'note' && last.tone === 'err' ? last : null;
@@ -218,7 +218,7 @@ function buildItems(events: HubEvent[], hideCompactCmd = false): Item[] {
 
 const NORMAL_END = ['end_turn', 'completed', 'stop_sequence'];
 
-/** 回复的显示风格：简约（过程折叠成一组，默认）、Claude Code（左侧圆点时间线）。只存在这台设备上 */
+/** Reply display style: compact (steps folded into a group, default) or Claude Code (dot timeline on the left). Stored on this device only */
 export type ChatStyle = 'modern' | 'claude';
 const STYLE_EVENT = 'yi-console:chat-style';
 
@@ -248,7 +248,7 @@ function fmtMs(ms: number) {
   return isEn() ? `${m}m ${s}s` : `${m} 分 ${s} 秒`;
 }
 
-/** 每轮回复下面的一行：耗时、token、费用、工具调用次数、模型，外加复制整轮回复 */
+/** The line under each reply: duration, tokens, cost, tool call count, model, plus copying the whole turn */
 function TurnFooter({ it }: { it: Item & { k: 'turn' } }) {
   const u = it.usage;
   const parts: string[] = [];
@@ -293,7 +293,7 @@ function reasonText(r: string) {
   return map[r] ?? r;
 }
 
-/** 回复里的图片按哪台主机、哪个目录取（chatImages.ts） */
+/** Which host and directory images in replies are loaded from (chatImages.ts) */
 const ImgContext = createContext<ImgCtx | null>(null);
 
 const Markdown = memo(function Markdown({ text }: { text: string }) {
@@ -306,7 +306,7 @@ const Markdown = memo(function Markdown({ text }: { text: string }) {
   return <div ref={ref} className="md" dangerouslySetInnerHTML={{ __html: html }} />;
 });
 
-/** 用户在这个元素里选中文字（或正按着鼠标拖选） */
+/** The user is selecting text in this element (or is dragging with the mouse down) */
 function selectingIn(el: HTMLElement | null, mouseDown: boolean) {
   if (!el) return false;
   if (mouseDown) return true;
@@ -314,7 +314,7 @@ function selectingIn(el: HTMLElement | null, mouseDown: boolean) {
   return !!s && !s.isCollapsed && !!s.anchorNode && el.contains(s.anchorNode);
 }
 
-/** 流式输出的正文：用户正在选中文字时先不刷新，不然每来一段内容整块重绘，选区就没了 */
+/** Streaming body: don't refresh while the user is selecting text, otherwise each new chunk redraws the block and the selection is lost */
 function LiveMarkdown({ text }: { text: string }) {
   const ref = useRef<HTMLDivElement>(null);
   const latest = useRef(text);
@@ -351,7 +351,7 @@ function LiveMarkdown({ text }: { text: string }) {
   );
 }
 
-/** 工具显示名：尽量用 Claude Code 的叫法，各家工具统一成一套 */
+/** Tool display names: use Claude Code's names where possible so every tool shares one set */
 function toolName(name: string) {
   const n = name.toLowerCase();
   if (n === 'powershell') return 'PowerShell';
@@ -382,19 +382,19 @@ function toolKind(shown: string, it: Item & { k: 'tool' }): ToolKind {
   return 'other';
 }
 
-/** 括号里的关键参数：路径相对工作目录；Cursor 的标题自带 "Read xxx" 这类前缀，去掉免得重复 */
+/** Key argument in parentheses: paths relative to the working directory; Cursor titles carry prefixes like "Read xxx", strip them to avoid repetition */
 const ARG_KEYS = ['command', 'pattern', 'query', 'file_path', 'notebook_path', 'path', 'url', 'description', 'skill', 'prompt'];
 
-/** 括号里的关键参数：优先取输入里的常见字段（Cursor 的标题一开始只有 "Read File""Terminal"），
- *  再退回标题；标题是整段 JSON 时取第一个短字符串 */
+/** Key argument in parentheses: prefer common fields from the input (Cursor titles start out as just "Read File" / "Terminal"),
+ *  then fall back to the title; if the title is a JSON blob, take the first short string */
 function toolArg(it: Item & { k: 'tool' }, shown: string, cwd?: string) {
   const input = it.input && typeof it.input === 'object' ? (it.input as Record<string, unknown>) : {};
-  // 改文件的工具先看路径：Kiro 的 write 把操作类型（strReplace / create）也放在 command 里
+  // File-editing tools check the path first: Kiro's write also puts the operation type (strReplace / create) in command
   const keys = shown === 'Update' || shown === 'Write' ? ['file_path', 'notebook_path', 'path', ...ARG_KEYS] : ARG_KEYS;
   const key = keys.find((k) => typeof input[k] === 'string' && input[k]);
   const opPath = Array.isArray(input.operations) ? (input.operations[0] as { path?: string } | undefined)?.path : undefined;
   let t = key ? String(input[key]) : opPath || it.title || it.diffs[0]?.path || '';
-  // Codex 的命令带着 /bin/bash -lc '…' 外壳，标题是剥掉外壳的版本
+  // Codex commands come wrapped in /bin/bash -lc '…'; the title is the unwrapped version
   const bare = it.title.replace(/^`(.*)`$/s, '$1');
   if (key === 'command' && bare && !bare.startsWith('{') && t !== bare && t.includes(bare)) t = bare;
   if (!key && t.startsWith('{')) t = (Object.values(input).find((v) => typeof v === 'string' && v.length < 200) as string) ?? t;
@@ -411,7 +411,7 @@ function toolArg(it: Item & { k: 'tool' }, shown: string, cwd?: string) {
   return t;
 }
 
-/** 统一工具输出：Cursor 把结果包成 JSON（有时还多套一层字符串），拆成文本、退出码、命中数 */
+/** Normalize tool output: Cursor wraps results in JSON (sometimes inside another string); split into text, exit code and match count */
 interface ParsedOut {
   text: string;
   exitCode?: number;
@@ -429,17 +429,17 @@ function parseOutput(raw: string): ParsedOut {
     }
   }
   if (typeof v === 'string') {
-    // Kiro 的命令失败只回一行 "exit code: N"
+    // A failed Kiro command only returns one line, "exit code: N"
     const ec = /^exit code: (\d+)\s*/.exec(v);
     if (ec) return { text: v.slice(ec[0].length), exitCode: +ec[1] };
-    // Claude 的 Grep / Glob：没有结果、或者 files_with_matches 模式开头的 "Found N files"
+    // Claude's Grep / Glob: no results, or "Found N files" at the start in files_with_matches mode
     if (/^No (files|matches) found/i.test(v)) return { text: v, count: 0 };
     const m = /^Found (\d+) (files?|matches?|lines?)/i.exec(v);
     return { text: v, count: m ? +m[1] : undefined };
   }
   if (!v || typeof v !== 'object') return { text: raw };
   let o = v as Record<string, unknown>;
-  // Kiro：{"items":[{"Json":{…}}]} 或 {"items":[{"Text":"…"}]}
+  // Kiro: {"items":[{"Json":{…}}]} or {"items":[{"Text":"…"}]}
   const first = Array.isArray(o.items) ? (o.items[0] as Record<string, unknown> | undefined) : undefined;
   if (first && typeof first.Text === 'string') return parseOutput(first.Text);
   if (first?.Json && typeof first.Json === 'object') o = first.Json as Record<string, unknown>;
@@ -463,7 +463,7 @@ const nonEmptyLines = (s: string) => {
   return ls.length === 1 && !ls[0] ? [] : ls;
 };
 
-/** 编辑类工具的小 diff：只看第一段改动，最多 10 行，带行号 */
+/** Small diff for editing tools: only the first hunk, at most 10 lines, with line numbers */
 function MiniDiff({ diff }: { diff: FileDiff }) {
   const lines = useMemo(() => diffLines(diff).filter((l) => l.t !== 'hunk'), [diff]);
   const first = lines.findIndex((l) => l.t !== 'ctx');
@@ -481,14 +481,14 @@ function MiniDiff({ diff }: { diff: FileDiff }) {
   );
 }
 
-/** 一次工具调用：● 工具名(关键参数)，下面 ⎿ 一段结果摘要，点开看完整输入输出 */
+/** One tool call: ● ToolName(key argument), with a ⎿ result summary below; click to see the full input and output */
 const ToolLine = memo(function ToolLine({ it, active, cwd }: { it: Item & { k: 'tool' }; active: boolean; cwd?: string }) {
   useLang();
   const [open, setOpen] = useState(false);
   const [full, setFull] = useState(false);
   const generic = (it.name === 'other' || it.name === 'think') && !!it.title;
   let shown = generic ? it.title : toolName(it.name);
-  // 改的是已有内容就叫 Update，和 Claude Code 一致
+  // Changing existing content is called Update, same as Claude Code
   if (shown === 'Write' && it.diffs.some((d) => d.oldText)) shown = 'Update';
   const kind = toolKind(shown, it);
   const arg = generic || shown === tr('任务清单', 'Todo') ? '' : toolArg(it, shown, cwd);
@@ -585,10 +585,10 @@ const ToolLine = memo(function ToolLine({ it, active, cwd }: { it: Item & { k: '
   );
 });
 
-/** 零宽字符：模型偶尔会输出一长串，看不见，不能当成"已经有回复了" */
+/** Zero-width characters: models occasionally emit a long run of them; invisible, so they don't count as "a reply has arrived" */
 const INVISIBLE = /[\u200b-\u200d\u2060\ufeff]/g;
 
-/** 回合进行中但一直没有新内容时，显示已经等了多久 */
+/** While a turn is running with no new content, show how long we've been waiting */
 function Waiting({ since, starting }: { since: number; starting?: boolean }) {
   const [now, setNow] = useState(Date.now());
   useEffect(() => {
@@ -611,10 +611,10 @@ function Waiting({ since, starting }: { since: number; starting?: boolean }) {
   );
 }
 
-/** 思考：折成一行"✻ 思考"，点开看全文；流式中显示最后几行 */
+/** Thinking: folded into one "✻ Thinking" line, click to see it all; shows the last few lines while streaming */
 const ktok = (n: number) => (n >= 1000 ? `${(n / 1000).toFixed(n >= 10000 ? 0 : 1)}k` : String(n));
 
-/** 上下文压缩：进行中转圈，结束后原地换成结果（自动/手动、前后 token、耗时） */
+/** Context compaction: a spinner while running, replaced in place with the result when done (auto/manual, tokens before/after, duration) */
 function CompactNote({ ev, live }: { ev: HubEvent & { kind: 'compact' }; live: boolean }) {
   if (ev.phase === 'start') {
     return (
@@ -658,7 +658,7 @@ function Thinking({ text, live }: { text: string; live?: boolean }) {
 type RunItem = Item & ({ k: 'tool' } | { k: 'thinking' });
 type Block = Item | { k: 'fold'; key: string; items: RunItem[] };
 
-/** 连续超过 8 次工具调用时，只留开头 2 个和最后 4 个，中间收成一行 */
+/** More than 8 tool calls in a row: keep the first 2 and the last 4, collapse the middle into one line */
 function foldRuns(items: Item[]): Block[] {
   const out: Block[] = [];
   let run: RunItem[] = [];
@@ -690,7 +690,7 @@ function Fold({ items, render }: { items: RunItem[]; render: (it: RunItem) => Re
   );
 }
 
-/** 图片按需取回并缓存，同一张图只请求一次 */
+/** Fetch images on demand and cache them; each image is requested only once */
 const imageCache = new Map<string, Promise<string>>();
 
 function loadImage(hostId: string, sessionId: string, img: ImageRef) {
@@ -740,7 +740,7 @@ export function PlanList({ entries }: { entries: PlanEntry[] }) {
   );
 }
 
-/** 时间线里的任务清单卡片：全部完成后收成一行，点开看明细 */
+/** Task list card in the timeline: collapses into one line when everything is done; click to see the details */
 function Plan({ plan, busy }: { plan: PlanState; busy: boolean }) {
   const entries = viewEntries(plan, busy);
   const done = entries.filter((e) => e.status === 'completed').length;
@@ -880,9 +880,9 @@ function PermissionBody({
   );
 }
 
-// ---------- 简约风格：连续的思考和工具调用收成一组，标题一行概括，点开看每一步 ----------
+// ---------- Compact style: consecutive thinking and tool calls fold into a group with a one-line summary title; click to see each step ----------
 
-/** 工具的界面叫法（简约风格用） */
+/** UI names for tools (used by the compact style) */
 function toolUiLabel(shown: string): string {
   const en: Record<string, string> = {
     Bash: 'Command',
@@ -923,7 +923,7 @@ const KIND_ICON: Record<ToolKind, string> = { bash: 'terminal', read: 'file', ed
 
 const baseName = (p: string) => p.replace(/[\\/]+$/, '').split(/[\\/]/).pop() || p;
 
-/** 一次工具调用要显示的东西，两种风格共用的解析放在这里 */
+/** What to show for one tool call; parsing shared by both styles lives here */
 function toolView(it: Item & { k: 'tool' }, cwd?: string) {
   const generic = (it.name === 'other' || it.name === 'think') && !!it.title;
   let shown = generic ? it.title : toolName(it.name);
@@ -941,7 +941,7 @@ function fmtDur(ms: number) {
   return s < 60 ? `${s}秒` : `${Math.floor(s / 60)}分${String(s % 60).padStart(2, '0')}秒`;
 }
 
-/** 每秒刷新一次的当前时间，只在需要计时的时候开 */
+/** Current time refreshed every second, only enabled when something needs a timer */
 function useNow(on: boolean) {
   const [now, setNow] = useState(Date.now());
   useEffect(() => {
@@ -952,7 +952,7 @@ function useNow(on: boolean) {
   return now;
 }
 
-/** 组里的一次工具调用：图标 + 中文名 + 关键参数，点开看输入输出 */
+/** One tool call in a group: icon + localized name + key argument; click to see input and output */
 const ModernTool = memo(function ModernTool({ it, active, cwd }: { it: Item & { k: 'tool' }; active: boolean; cwd?: string }) {
   useLang();
   const [open, setOpen] = useState(false);
@@ -1015,7 +1015,7 @@ const ModernTool = memo(function ModernTool({ it, active, cwd }: { it: Item & { 
   );
 });
 
-/** 组里的一段思考：转圈或对勾 + 已思考 · 开头一句，点开看全文 */
+/** One thinking block in a group: spinner or check + "thought" · first sentence; click to see it all */
 function ModernThinking({ text, live }: { text: string; live?: boolean }) {
   const [open, setOpen] = useState(false);
   const has = !!text.trim();
@@ -1039,7 +1039,7 @@ function ModernThinking({ text, live }: { text: string; live?: boolean }) {
   );
 }
 
-/** 一组过程：标题一行（步数框 + 概括 + 耗时），进行中自动展开，结束后收起 */
+/** A group of steps: one title line (step-count box + summary + duration); expands automatically while running, collapses when done */
 function ActGroup({
   items,
   running,
@@ -1049,7 +1049,7 @@ function ActGroup({
 }: {
   items: RunItem[];
   running: boolean;
-  /** 这组后面第一条内容的时间，算耗时用 */
+  /** Time of the first item after this group, used to compute the duration */
   end: number | null;
   liveThought?: string;
   cwd?: string;
@@ -1102,7 +1102,7 @@ function ActGroup({
 
 type MBlock = Item | { k: 'group'; key: string; items: RunItem[]; end: number | null };
 
-/** 简约风格：相邻的思考和工具调用合成一组，组的结束时间取后面第一条带时间的内容 */
+/** Compact style: merge adjacent thinking and tool calls into groups; a group ends at the time of the next item that has a timestamp */
 function groupRuns(items: Item[]): MBlock[] {
   const out: MBlock[] = [];
   let run: RunItem[] = [];
@@ -1126,7 +1126,7 @@ function groupRuns(items: Item[]): MBlock[] {
 const PHRASES_ZH = ['正在思考', '琢磨一下', '整理思路', '马上就好', '稍等片刻', '推敲中', '连点成线', '酝酿中'];
 const PHRASES_EN = ['Thinking', 'Working on it', 'Putting it together', 'Almost there', 'One moment', 'Considering', 'Connecting the dots', 'Mulling it over'];
 
-/** 简约风格的等待提示：点阵动画 + 轮换的短句 + 已等待秒数 */
+/** Compact-style waiting indicator: dot animation + rotating short phrases + seconds waited */
 function ModernWaiting({ since, starting }: { since: number; starting?: boolean }) {
   const phrases = isEn() ? PHRASES_EN : PHRASES_ZH;
   const now = useNow(true);
@@ -1162,7 +1162,7 @@ function fullTime(ms: number) {
   return `${t.getFullYear()}-${p(t.getMonth() + 1)}-${p(t.getDate())} ${p(t.getHours())}:${p(t.getMinutes())}`;
 }
 
-/** 简约风格每轮回复下面的操作行：复制、耗时和用量，时间在鼠标移上去时显示 */
+/** Compact-style action row under each reply: copy, duration and usage; the time shows on hover */
 function ModernTurnFooter({ it, latest }: { it: Item & { k: 'turn' }; latest: boolean }) {
   const u = it.usage;
   const parts: string[] = [];
@@ -1221,20 +1221,20 @@ export function ChatView({
   live: Map<string, string>;
   liveThinking?: Map<string, string>;
   info?: SessionInfo;
-  /** 有它才能显示用户消息里的图片 */
+  /** Needed to show images in user messages */
   hostId?: string;
   onAnswer: (requestId: string, optionId: string, answers?: QuestionAnswer[]) => void | Promise<void>;
-  /** Kiro 正文里的提问，回答拼成一条消息发出去 */
+  /** Questions in Kiro's reply text; the answers are joined into one message and sent */
   onSendText?: (text: string) => Promise<void>;
-  /** yi-agentd 上还有更早的事件没取 */
+  /** yi-agentd still has older events we haven't fetched */
   hasMore?: boolean;
   loadingOlder?: boolean;
-  /** 正在从主机取会话记录（第一次打开、重新加载） */
+  /** Fetching the session log from the host (first open, reload) */
   loading?: boolean;
   onLoadOlder?: () => void;
-  /** 滚到这条消息并高亮（全局搜索跳过来） */
+  /** Scroll to this message and highlight it (jumped here from global search) */
   focusSeq?: number;
-  /** 未处理的授权请求已经在别处（输入框上方）显示 */
+  /** Pending permission requests are already shown elsewhere (above the input box) */
   pendingOutside?: boolean;
 }) {
   const hideCompactCmd = info?.tool === 'claude' || info?.tool === 'codex';
@@ -1247,15 +1247,15 @@ export function ChatView({
   const shown = items.slice(Math.max(0, items.length - limit));
   const modern = useChatStyle() === 'modern';
   const blocks: (Block | MBlock)[] = useMemo(() => {
-    // 任务类工具的调用由任务清单代替显示，出错的照常显示
+    // Task-type tool calls are shown by the task list instead; failed ones are shown as usual
     const list = shown.filter((x) => !(x.k === 'tool' && PLAN_TOOLS.has(x.name) && !x.result?.isError));
     return modern ? groupRuns(list) : foldRuns(list);
   }, [items, limit, modern]);
-  // 最后一轮（还没有 turn 结尾）里的工具才可能在运行
+  // Only tools in the last turn (which has no turn end yet) can still be running
   const lastTurnEnd = useMemo(() => shown.map((x) => x.k).lastIndexOf('turn'), [shown]);
   const liveKeys = useMemo(() => new Set(shown.slice(lastTurnEnd + 1).map((x) => x.key)), [shown, lastTurnEnd]);
   const busy = info && (info.status === 'running' || info.status === 'starting');
-  // 最近一次有新内容的时间（按本机时间算，不受主机时钟偏差影响）
+  // When new content last arrived (in local time, unaffected by the host's clock skew)
   const lastChange = useRef(Date.now());
   const changeKey = `${events.length}:${liveText.length}:${liveThought.length}:${busy}`;
   const prevKey = useRef(changeKey);
@@ -1264,7 +1264,7 @@ export function ChatView({
     lastChange.current = Date.now();
   }
 
-  // 往前翻时记下翻之前的内容高度，插入更早的消息后把滚动位置补回来，不让画面跳
+  // When paging back, remember the content height before, and restore the scroll position after inserting older messages so the view doesn't jump
   const keepFrom = useRef<number | null>(null);
   const older = () => {
     const el = ref.current;
@@ -1303,7 +1303,7 @@ export function ChatView({
     } else if (stick.current && !selectingIn(el, false)) el.scrollTop = el.scrollHeight;
   });
 
-  // 对话区变矮（手机弹出输入法、输入框长高）时，原来在底部的继续贴着底部
+  // When the chat area gets shorter (mobile IME opens, input box grows), stay pinned to the bottom if we were there
   useEffect(() => {
     const el = ref.current;
     if (!el) return;
@@ -1314,7 +1314,7 @@ export function ChatView({
     return () => ro.disconnect();
   }, []);
 
-  // 自己刚发出的消息：不管现在翻到哪里，都回到底部
+  // A message we just sent: go back to the bottom wherever we are
   const lastUser = useMemo(() => {
     for (let i = items.length - 1; i >= 0; i--) if (items[i].k === 'user') return items[i].key;
     return '';
@@ -1330,7 +1330,7 @@ export function ChatView({
     setLimit(PAGE);
   }, [info?.id]);
 
-  // 跳到指定消息：还没加载到就继续往前取，直到取到或到头
+  // Jump to a given message: if it isn't loaded yet, keep fetching older ones until we find it or reach the start
   const focused = useRef<number | null>(null);
   useEffect(() => {
     if (focusSeq == null || focused.current === focusSeq) return;
@@ -1350,7 +1350,7 @@ export function ChatView({
     } else if (items.length > shown.length) setLimit(Infinity);
   });
 
-  // 简约风格：最后一组还在本轮里、正文还没开始输出时，算进行中（展开、计时）
+  // Compact style: the last group counts as running (expanded, timed) while it's in this turn and the reply body hasn't started
   const lastBlock = blocks[blocks.length - 1];
   const tailGroup = modern && lastBlock?.k === 'group' && !!busy && !liveText.trim() && liveKeys.has(lastBlock.items[0].key) ? lastBlock : null;
   const lastTurnKey = useMemo(() => {
@@ -1358,7 +1358,7 @@ export function ChatView({
     return '';
   }, [blocks]);
 
-  // Kiro 没有提问工具：最后一条回复里列了编号问题和 a) b) 选项、并且之后没再发消息时，给一张可以点选的卡片
+  // Kiro has no question tool: if the last reply lists numbered questions with a) b) options and nothing was sent after it, show a card the user can click through
   const [dismissedAsk, setDismissedAsk] = useState('');
   const textAsk = useMemo(() => {
     if (info?.tool !== 'kiro' || busy || !onSendText) return null;
@@ -1395,7 +1395,7 @@ export function ChatView({
       ref={ref}
       onScroll={onScroll}
       onClick={(e) => {
-        // 回复里的图片点一下放大
+        // Click an image in a reply to enlarge it
         const t = e.target as HTMLElement;
         if (t.tagName === 'IMG' && t.closest('.md')) openImage((t as HTMLImageElement).src);
       }}
@@ -1471,7 +1471,7 @@ export function ChatView({
                 </div>
               );
             case 'perm':
-              // 还没处理的授权由外面固定在输入框上方显示，这里不再重复
+              // Pending permissions are pinned above the input box by the parent; don't repeat them here
               if (!it.resolved && pendingOutside) return null;
               return <PermissionCard key={it.key} it={it} onAnswer={onAnswer} />;
             case 'plan':
@@ -1523,7 +1523,7 @@ export function ChatView({
   );
 }
 
-/** 后台任务结束的提示：图标 + 状态 + 一行命令（放不下省略，点开看全文） */
+/** Background-task finished notice: icon + status + one-line command (ellipsized if too long, click to see it all) */
 function BgTaskNote({ it }: { it: Extract<Item, { k: 'bgdone' }> }) {
   const [open, setOpen] = useState(false);
   const icon = it.status === 'done' ? 'check' : it.status === 'failed' ? 'x' : it.status === 'stopped' ? 'stop' : 'terminal';

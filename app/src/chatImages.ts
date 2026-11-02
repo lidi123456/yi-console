@@ -1,7 +1,7 @@
-// 对话回复里的图片：renderMarkdown 把 ![](…) 渲染成 <span class="md-rimg">，这里按来源填内容。
-// - 主机上的文件：本机主机直接读出来显示；远程主机（SSH / 中继 / 转发）先显示占位，点了问一下大小再下载
-// - 公网链接：一律先显示占位，点了才由当前设备去加载（打开对话不会自动请求第三方）
-// 点开过 / 确认过的图片在本次运行里记住，再出现（流式输出重绘、切走再回来）直接显示。
+// Images in chat replies: renderMarkdown renders ![](…) as <span class="md-rimg">, and this fills in the content based on the source.
+// - Files on the host: the local host reads and shows them directly; remote hosts (SSH / relay / forwarded) show a placeholder first, and on click ask for the size, then download
+// - Public URLs: always show a placeholder first; the current device only loads them on click (opening a chat never requests third parties automatically)
+// Images that were opened / confirmed are remembered for this run and shown directly when they reappear (streaming redraws, switching away and back).
 import { tr } from './i18n';
 import { rpc } from './transport';
 import { askConfirm } from './components/Overlay';
@@ -11,15 +11,15 @@ import { basename, fmtSize } from './util';
 export interface ImgCtx {
   hostId: string;
   hostName: string;
-  /** 本机主机：主机上的图片直接加载 */
+  /** Local host: load images on the host directly */
   local: boolean;
-  /** 会话工作目录，相对路径按它解析 */
+  /** Session working directory; relative paths resolve against it */
   cwd?: string;
 }
 
-/** 主机文件：hostId + 路径 -> data URL */
+/** Host files: hostId + path -> data URL */
 const fileCache = new Map<string, Promise<string>>();
-/** 用户点过加载的公网地址 */
+/** Public URLs the user clicked to load */
 const webAllowed = new Set<string>();
 
 const isAbs = (p: string) => /^([a-zA-Z]:)?[\\/]/.test(p) || p.startsWith('~');
@@ -80,7 +80,7 @@ function showLoading(el: HTMLElement) {
   el.replaceChildren(s);
 }
 
-/** 占位按钮：图标 + 名称 + 来源，点了执行 onClick */
+/** Placeholder button: icon + name + source; runs onClick when clicked */
 function showPlaceholder(el: HTMLElement, label: string, hint: string, onClick: () => void) {
   el.className = 'md-rimg idle';
   const b = document.createElement('button');
@@ -97,7 +97,7 @@ function showPlaceholder(el: HTMLElement, label: string, hint: string, onClick: 
   h.textContent = hint;
   b.append(icon, name, h);
   b.onclick = (e) => {
-    // 图片外面可能套着链接
+    // The image may be wrapped in a link
     e.preventDefault();
     e.stopPropagation();
     onClick();
@@ -155,12 +155,12 @@ function fillWeb(el: HTMLElement, url: string, alt: string) {
   try {
     host = new URL(url).host;
   } catch {
-    /* 留原样 */
+    /* leave as is */
   }
   showPlaceholder(el, alt || tr('图片', 'Image'), `${host} · ${tr('点击加载', 'Click to load')}`, load);
 }
 
-/** 填充 root 里还没处理过的图片占位。Markdown 每次重绘（流式输出）后调用 */
+/** Fill in image placeholders in root that haven't been handled yet. Called after every Markdown redraw (streaming) */
 export function hydrateImages(root: HTMLElement, ctx: ImgCtx | null) {
   for (const el of root.querySelectorAll<HTMLElement>('span.md-rimg:not([data-done])')) {
     el.dataset.done = '1';

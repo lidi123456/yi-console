@@ -62,7 +62,7 @@ function pin(hostId: string, s: SessionInfo) {
   rpc(hostId, 'session.pin', { sessionId: s.id, pinned: !s.pinned }).catch(errorToast);
 }
 
-/** 侧栏右侧的时间：刚刚 / 5 分钟 / 3 小时 / 昨天 / 4 天 / 10/12 */
+/** Time on the right of the sidebar: just now / 5 min / 3 h / yesterday / 4 days / 10/12 */
 function shortAgo(ms: number): string {
   if (!ms) return '';
   const d = (Date.now() - ms) / 1000;
@@ -77,7 +77,7 @@ function shortAgo(ms: number): string {
 
 function SessionRow({ hostId, s, active, showDir }: { hostId: string; s: SessionInfo; active: boolean; showDir?: boolean }) {
   const cls = sessionStatusClass(s);
-  // 只有需要注意的状态才显示：等审批、运行中、出错；其余显示时间
+  // Only show states that need attention: awaiting approval, running, error; otherwise show the time
   const status =
     s.pendingPermissions > 0 ? (
       <span className="pill pill-attn">{s.pendingPermissions}</span>
@@ -134,10 +134,10 @@ function SessionRow({ hostId, s, active, showDir }: { hostId: string; s: Session
   );
 }
 
-/** 超过这么久没动、也没在运行的会话收进"更早" */
+/** Sessions idle longer than this and not running go under "Earlier" */
 const STALE_MS = 3 * 86400_000;
 
-/** 侧边栏目录行的右键菜单 */
+/** Context menu for directory rows in the sidebar */
 function dirMenu(hostId: string, cwd: string, connected: boolean): MenuItem[] {
   return [
     { label: tr('搜索此目录的历史会话', 'Search History in Directory'), icon: 'history', disabled: !connected, run: () => navigate({ kind: 'history', hostId, cwd }) },
@@ -148,7 +148,7 @@ function dirMenu(hostId: string, cwd: string, connected: boolean): MenuItem[] {
   ];
 }
 
-/** 主机行的「…」菜单和右键菜单：原来主机下面那排按钮都收在这里 */
+/** The "…" menu and context menu of host rows: the buttons that used to sit under the host are all here now */
 function hostMenu(h: HostEntry, connect: () => void): (MenuItem | '-')[] {
   const id = h.config.id;
   const connected = h.status.status === 'connected';
@@ -180,7 +180,7 @@ function HostBlock({ h, filter }: { h: HostEntry; filter: string }) {
   const view = useStore((s) => s.view);
   const [collapsed, setCollapsed] = useState<boolean>(() => lsGet(`collapse-${id}`, false));
   const [showOld, setShowOld] = useState(false);
-  // 折叠起来的项目目录，按主机记在本机
+  // Collapsed project directories, remembered locally per host
   const [folded, setFolded] = useState<string[]>(() => lsGet(`fold-dirs-${id}`, []));
   const fold = (cwd: string) => {
     const next = folded.includes(cwd) ? folded.filter((x) => x !== cwd) : [...folded, cwd];
@@ -195,7 +195,7 @@ function HostBlock({ h, filter }: { h: HostEntry; filter: string }) {
     const now = Date.now();
     const pinned = all.filter((s) => s.pinned);
     const rest = all.filter((s) => !s.pinned);
-    // 搜索时不折叠
+    // Don't collapse while searching
     const isOld = (s: SessionInfo) => !q && (s.status === 'exited' || s.status === 'error') && now - s.updatedAt > STALE_MS;
     const m = new Map<string, SessionInfo[]>();
     for (const s of rest.filter((x) => !isOld(x))) {
@@ -291,7 +291,7 @@ function HostBlock({ h, filter }: { h: HostEntry; filter: string }) {
             </div>
           )}
           {groups.map(([cwd, list]) => {
-            // 搜索时全部展开；折叠时仍显示当前打开的会话
+            // Expand everything while searching; when collapsed, still show the currently open session
             const isFolded = !q && folded.includes(cwd);
             const rows = isFolded ? list.filter(isActive) : list;
             const cls = list.map(sessionStatusClass);
@@ -366,9 +366,9 @@ export function Sidebar() {
   const transport = useStore((s) => s.transport);
   const firstConnected = hosts.find((h) => h.status.status === 'connected')?.config.id;
   const [filter, setFilter] = useState('');
-  // 筛选框同时是消息搜索的入口：回车或点下面那行就到「搜索消息」
+  // The filter box is also the entry to message search: Enter or clicking the row below goes to "Search messages"
   const searchMessages = () => navigate({ kind: 'search', q: filter.trim() || undefined });
-  // 宽度可以拖右边缘调整：默认也是最小值 244px，最宽 480px，双击边缘还原；每台设备自己记
+  // Width is adjustable by dragging the right edge: default is also the minimum 244px, max 480px, double-click the edge to reset; remembered per device
   const [sideW, setSideW] = useState(() => clampSide(lsGet<number>('side-w', SIDE_MIN)));
   const dragSide = (e: React.PointerEvent) => {
     e.preventDefault();

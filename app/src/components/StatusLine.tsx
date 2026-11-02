@@ -40,19 +40,19 @@ const STATUS_FIELDS_EN: [string, string, string][] = [
   ['quota', 'Account Quota', 'Tightest quota window usage % (not available for Cursor)'],
 ];
 
-/** 内置字段：id、设置里显示的名字、说明 */
+/** Built-in fields: id, name shown in settings, description */
 export function getStatusFields(): [string, string, string][] {
   return isEn() ? STATUS_FIELDS_EN : STATUS_FIELDS_ZH;
 }
 
 export const STATUS_FIELDS = STATUS_FIELDS_ZH;
 
-/** 模板里能用的变量 */
+/** Variables usable in the template */
 export const TEMPLATE_VARS = ['model', 'context', 'tokens', 'cost', 'lastTurn', 'branch', 'dirty', 'changed', 'ahead', 'behind', 'dir', 'cwd', 'status', 'tool', 'title', 'quota', 'command'];
 
 const GIT_KEYS = ['branch', 'dirty', 'changed', 'ahead', 'behind'];
 
-// ---------- 主机设置缓存：每台主机取一次，设置页保存后失效 ----------
+// ---------- Host settings cache: fetched once per host, invalidated when the settings page saves ----------
 
 const settingsCache = new Map<string, Promise<StatusLineSettings>>();
 const listeners = new Set<() => void>();
@@ -73,7 +73,7 @@ export function invalidateStatusLine(hostId: string) {
   for (const f of listeners) f();
 }
 
-// ---------- ANSI 颜色 ----------
+// ---------- ANSI colors ----------
 
 const ANSI_COLORS = ['#3b3f45', '#d1453b', '#1f9d55', '#b7791f', '#2f6fdb', '#a347ba', '#1b9aa8', '#8b929d'];
 const ANSI_BRIGHT = ['#6b7280', '#ef5f55', '#2fbf71', '#d69e2e', '#4c8dff', '#c26ad6', '#2bb8c6', '#c9ced6'];
@@ -95,11 +95,11 @@ interface Span {
   style: React.CSSProperties;
 }
 
-/** 把带 ANSI SGR 转义的一行拆成带样式的片段；其他转义（光标、OSC 超链接等）直接丢掉 */
+/** Split a line with ANSI SGR escapes into styled segments; other escapes (cursor, OSC hyperlinks, etc.) are dropped */
 export function parseAnsi(s: string): Span[] {
   const out: Span[] = [];
   let style: React.CSSProperties = {};
-  // OSC（如 8 号超链接）：ESC ] ... (BEL | ESC \)
+  // OSC (e.g. 8 for hyperlinks): ESC ] ... (BEL | ESC \)
   s = s.replace(/\x1b\][^\x07\x1b]*(\x07|\x1b\\)/g, '');
   const re = /\x1b\[([0-9;]*)([A-Za-z])/g;
   let last = 0;
@@ -159,7 +159,7 @@ function Ansi({ text }: { text: string }) {
   );
 }
 
-// ---------- 取值 ----------
+// ---------- Values ----------
 
 interface Git {
   branch: string;
@@ -211,7 +211,7 @@ function values(info: SessionInfo, events: HubEvent[], git: Git | null, quota: Q
   return v;
 }
 
-/** 内置字段的显示（分支字段带上改动数和领先/落后） */
+/** Display of built-in fields (the branch field includes change count and ahead/behind) */
 function itemText(id: string, v: Record<string, string>, git: Git | null) {
   if (id === 'branch') {
     if (!git) return '';
@@ -245,7 +245,7 @@ export function StatusLine({ hostId, info, events }: { hostId: string; info: Ses
   const wantQuota = used.includes('quota') && info.tool !== 'shell';
   const wantCmd = !!cfg && (!!cfg.command.trim() || (cfg.useClaude && info.tool === 'claude'));
 
-  // 每 20 秒刷新一次（看得见时），会话有变化（回合结束、用量变化）时 1 秒后刷新
+  // Refresh every 20 s (while visible), and 1 s after the session changes (turn ends, usage changes)
   useEffect(() => {
     const t = setInterval(() => document.visibilityState === 'visible' && setTick((x) => x + 1), 20_000);
     return () => clearInterval(t);
@@ -280,7 +280,7 @@ export function StatusLine({ hostId, info, events }: { hostId: string; info: Ses
     rpc<Quota>(hostId, 'tools.quota', { tool: info.tool })
       .then(setQuota)
       .catch(() => setQuota(null));
-    // 额度在 yi-agentd 那边缓存 60 秒，这里跟着 tick 每 3 次刷新一下就够了
+    // yi-agentd caches quotas for 60 s, so refreshing every 3rd tick here is enough
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [hostId, info.tool, wantQuota, Math.floor(tick / 3)]);
 
@@ -295,7 +295,7 @@ export function StatusLine({ hostId, info, events }: { hostId: string; info: Ses
       .filter(Boolean)
       .join('  ·  ');
   }
-  // 模板里引用了 {command} 就不再单独显示命令输出
+  // If the template references {command}, don't show the command output separately
   const showCmd = cmd?.text && !cfg.template.includes('{command}');
   if (!builtin.trim() && !showCmd && !err) return null;
   return (

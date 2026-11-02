@@ -1,14 +1,14 @@
-// 手机的返回键 / 返回手势：Android 的 MainActivity 拦下后调 window.__yiConsoleBack()，
-// 返回 true 表示这里处理了，false 时 App 退出。
-// 顺序：先关最上面打开的东西（弹窗、菜单、图片查看、文件面板等，后打开的先关），再关命令面板；
-// 开着左侧导航时只收起它；最后回到上一个页面。
+// Mobile back key / back gesture: Android's MainActivity intercepts it and calls window.__yiConsoleBack(),
+// which returns true if it was handled here; on false the app exits.
+// Order: first close the topmost open thing (dialog, menu, image viewer, file panel, etc.; last opened closes first), then the command palette;
+// if the left navigation is open, only collapse it; finally go back to the previous page.
 import { useEffect, useRef } from 'react';
 import { tr } from './i18n';
 import { getState, goBack, setState, toast } from './store';
 
 const stack: (() => void)[] = [];
 
-/** 打开期间登记一个「返回时怎么关掉自己」；active 为 false 时不登记 */
+/** While open, register "how to close me on back"; nothing is registered when active is false */
 export function useBack(active: boolean, close: () => void) {
   const ref = useRef(close);
   ref.current = close;
@@ -30,7 +30,7 @@ export function handleBack(): boolean {
     return true;
   }
   const s = getState();
-  // 命令面板、手机上的左侧导航：只收起，留在原来的页面
+  // Command palette and the left navigation on mobile: just collapse, stay on the current page
   if (s.palette || s.sidebarOpen) {
     setState({ palette: false, sidebarOpen: false });
     return true;
@@ -39,7 +39,7 @@ export function handleBack(): boolean {
     goBack();
     return true;
   }
-  // 已经退无可退：2 秒内再按一次才退出，免得误触
+  // Nowhere left to go back to: require a second press within 2 s to exit, to avoid accidental exits
   const now = Date.now();
   if (now - lastTry < 2000) return false;
   lastTry = now;

@@ -7,7 +7,7 @@ import { fmtTokens } from '../util';
 import { Icon, ToolBadge } from './Icon';
 import { errText, QuotaBody } from './StatsView';
 
-/** 会话页的「用量」：这个会话用了多少，以及这个工具账号的额度还剩多少 */
+/** "Usage" on the session page: how much this session used, and how much quota is left on this tool account */
 export function UsageDialog({ hostId, info, onClose }: { hostId: string; info: SessionInfo; onClose: () => void }) {
   const [quota, setQuota] = useState<Quota | string | undefined>(undefined);
   useBack(true, onClose);

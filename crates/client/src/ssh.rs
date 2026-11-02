@@ -1,4 +1,4 @@
-//! SSH：连接（可经跳板机）、主机密钥校验、认证、exec、SFTP。
+//! SSH: connecting (optionally via jump hosts), host key verification, authentication, exec, SFTP.
 
 use crate::hosts::SshTarget;
 use anyhow::{anyhow, bail, Result};
@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-/// 主机密钥问题：UI 需要据此弹窗让用户确认
+/// Host key problems: the UI shows a dialog asking the user to confirm
 #[derive(Debug, Clone)]
 pub enum HostKeyIssue {
     Unknown { fingerprint: String },
@@ -19,13 +19,13 @@ pub enum HostKeyIssue {
 pub const ERR_HOSTKEY_UNKNOWN: &str = "HOSTKEY_UNKNOWN";
 pub const ERR_HOSTKEY_CHANGED: &str = "HOSTKEY_CHANGED";
 pub const ERR_AUTH: &str = "AUTH_FAILED";
-/// 私钥读不出来（文件不存在、格式不支持、口令错误），重试没有意义
+/// The private key can't be read (missing file, unsupported format, wrong passphrase); retrying is pointless
 pub const ERR_KEY: &str = "KEY_INVALID";
 
 pub struct KnownHosts {
-    /// 客户端自己的 known_hosts（与 OpenSSH 同格式）
+    /// The client's own known_hosts (same format as OpenSSH)
     pub app_file: PathBuf,
-    /// 用户刚在弹窗里确认过的指纹：host:port -> fingerprint
+    /// Fingerprints the user just confirmed in the dialog: host:port -> fingerprint
     pub approved: Mutex<std::collections::HashMap<String, String>>,
 }
 
@@ -41,7 +41,7 @@ impl client::Handler for H {
 
     async fn check_server_key(&mut self, key: &PublicKey) -> Result<bool, Self::Error> {
         let fp = key.fingerprint(HashAlg::Sha256).to_string();
-        // 1) 用户自己的 ~/.ssh/known_hosts（桌面端有）
+        // 1) The user's own ~/.ssh/known_hosts (on desktop)
         match keys::check_known_hosts(&self.host, self.port, key) {
             Ok(true) => return Ok(true),
             Err(keys::Error::KeyChanged { .. }) => {
@@ -50,7 +50,7 @@ impl client::Handler for H {
             }
             _ => {}
         }
-        // 2) 客户端自己的 known_hosts
+        // 2) The client's own known_hosts
         match keys::check_known_hosts_path(&self.host, self.port, key, &self.known.app_file) {
             Ok(true) => return Ok(true),
             Err(keys::Error::KeyChanged { .. }) => {
@@ -59,7 +59,7 @@ impl client::Handler for H {
             }
             _ => {}
         }
-        // 3) 用户刚确认过这个指纹
+        // 3) The user just confirmed this fingerprint
         let id = format!("{}:{}", self.host, self.port);
         let approved = self.known.approved.lock().unwrap().get(&id).cloned();
         if approved.as_deref() == Some(fp.as_str()) {
@@ -81,7 +81,7 @@ impl client::Handler for H {
 
 pub struct SshSession {
     handle: Handle<H>,
-    /// 经跳板机时持有跳板会话，保证隧道不被释放
+    /// Holds the jump session when going through a jump host, so the tunnel isn't dropped
     _jump: Option<Box<SshSession>>,
 }
 
@@ -90,7 +90,7 @@ fn config() -> Arc<client::Config> {
         keepalive_interval: Some(Duration::from_secs(15)),
         keepalive_max: 3,
         inactivity_timeout: None,
-        // 流式回复是一连串小包，开着 Nagle 会攒着等对端确认再发
+        // Streaming replies are a series of small packets; with Nagle on they'd be held back waiting for the peer's ACK
         nodelay: true,
         ..Default::default()
     })
@@ -120,18 +120,18 @@ pub async fn connect(
             (r, Some(Box::new(js)))
         }
         None => {
-            // 自动模式下公网地址会经代理（CONNECT 隧道），内网地址直连
+            // In auto mode public addresses go through the proxy (CONNECT tunnel); internal addresses connect directly
             let r = tokio::time::timeout(Duration::from_secs(20), async {
                 match yi_link::proxy::proxy_for_host(&t.host, true) {
                     Some(p) => {
-                        // 公司代理常只放行 443，隧道建不起来时退回直连
+                        // Corporate proxies often only allow 443; fall back to a direct connection if the tunnel can't be established
                         let tcp = match yi_link::proxy::connect(&p, &t.host, t.port).await {
                             Ok(s) => s,
                             Err(pe) => tokio::net::TcpStream::connect((t.host.as_str(), t.port))
                                 .await
                                 .map_err(|e| anyhow!("{pe:#}；直连也失败: {e}"))?,
                         };
-                        // connect_stream 不会替我们设 nodelay
+                        // connect_stream doesn't set nodelay for us
                         let _ = tcp.set_nodelay(true);
                         Ok(client::connect_stream(config(), tcp, handler).await)
                     }
@@ -217,7 +217,7 @@ async fn auth_agent(h: &mut Handle<H>, user: &str) -> Result<bool> {
 
 #[cfg(windows)]
 async fn auth_agent(h: &mut Handle<H>, user: &str) -> Result<bool> {
-    // Windows 自带 OpenSSH 的 ssh-agent 走命名管道
+    // The ssh-agent of Windows' built-in OpenSSH uses a named pipe
     let Ok(mut agent) =
         keys::agent::client::AgentClient::connect_named_pipe(r"\\.\pipe\openssh-ssh-agent").await
     else {
@@ -243,7 +243,7 @@ async fn auth_agent(_h: &mut Handle<H>, _user: &str) -> Result<bool> {
     Ok(false)
 }
 
-/// 没有 agent 时，像 OpenSSH 一样试默认私钥（无口令的）
+/// Without an agent, try the default private keys (without passphrase) like OpenSSH does
 async fn auth_default_keys(h: &mut Handle<H>, user: &str) -> Result<bool> {
     let Some(home) = dirs::home_dir() else {
         return Ok(false);
@@ -268,8 +268,8 @@ async fn auth_default_keys(h: &mut Handle<H>, user: &str) -> Result<bool> {
     Ok(false)
 }
 
-/// 解析私钥。Windows 上 ssh-keygen 生成的密钥，注释（默认是"用户名@计算机名"）可能是 GBK 编码，
-/// 解析库要求注释是 UTF-8 会直接报错；注释登录时用不到，遇到这种情况去掉注释再解析
+/// Parse a private key. On Windows, keys generated by ssh-keygen may have a GBK-encoded comment (default "user@computer"),
+/// and the parser requires UTF-8 comments and errors out; the comment isn't needed for login, so strip it and parse again in that case
 fn decode_key(text: &str, pass: Option<&str>) -> Result<keys::PrivateKey, keys::Error> {
     match keys::decode_secret_key(text, pass) {
         Err(e) if format!("{e:?}").contains("CharacterEncoding") => {
@@ -282,7 +282,7 @@ fn decode_key(text: &str, pass: Option<&str>) -> Result<keys::PrivateKey, keys::
     }
 }
 
-/// 把未加密的 OpenSSH 私钥（openssh-key-v1）里的注释换成空串。加密的私钥注释也在密文里，处理不了
+/// Replace the comment in an unencrypted OpenSSH private key (openssh-key-v1) with an empty string. Encrypted keys keep the comment inside the ciphertext and can't be handled
 fn strip_openssh_comment(text: &str) -> Option<String> {
     use base64::engine::general_purpose::STANDARD;
     use base64::Engine;
@@ -319,11 +319,11 @@ fn strip_openssh_comment(text: &str) -> Option<String> {
     if r.u32()? != 1 {
         return None;
     }
-    r.bytes()?; // 公钥
+    r.bytes()?; // public key
     let head_end = r.1;
     let private = r.bytes()?;
 
-    let mut p = R(private, 8); // 两个 checkint
+    let mut p = R(private, 8); // two checkints
     let kind = p.bytes()?;
     let fields = match kind {
         b"ssh-rsa" => 6,
@@ -335,7 +335,7 @@ fn strip_openssh_comment(text: &str) -> Option<String> {
         p.bytes()?;
     }
     let mut block = private[..p.1].to_vec();
-    block.extend_from_slice(&0u32.to_be_bytes()); // 空注释
+    block.extend_from_slice(&0u32.to_be_bytes()); // empty comment
     let mut pad = 1u8;
     while block.len() % 8 != 0 {
         block.push(pad);
@@ -393,7 +393,7 @@ impl SshSession {
         })
     }
 
-    /// exec 一个长期运行的命令，返回其 stdin/stdout 字节流
+    /// exec a long-running command and return its stdin/stdout byte stream
     pub async fn exec_stream(
         &self,
         cmd: &str,
@@ -403,7 +403,7 @@ impl SshSession {
         Ok(ch.into_stream())
     }
 
-    /// 经 SSH 连远程机器上的 127.0.0.1:port（端口转发；sshd 关了 AllowTcpForwarding 时会失败）
+    /// Connect over SSH to 127.0.0.1:port on the remote machine (port forwarding; fails when sshd has AllowTcpForwarding off)
     pub async fn direct_tcpip(&self, port: u16) -> Result<russh::ChannelStream<client::Msg>> {
         let ch = self
             .handle
@@ -428,7 +428,7 @@ impl SshSession {
 mod tests {
     use super::*;
 
-    /// 测试专用密钥（ssh-keygen -t ed25519 -C <GBK 编码的"测试@电脑">），不对应任何主机
+    /// Test-only key (ssh-keygen -t ed25519 -C <a GBK-encoded Chinese comment>), not tied to any host
     const GBK_COMMENT_KEY: &str = "\
 -----BEGIN OPENSSH PRIVATE KEY-----\n\
 b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW\n\
@@ -445,8 +445,8 @@ PZJFJNZSyPwAeBgCJlULAAAACbLiytRAtefE1AECAwQ=\n\
         assert_eq!(k.algorithm().to_string(), "ssh-ed25519");
     }
 
-    /// 手动跑：AH_SSH_TEST=host:port:user:私钥路径:要转发的远程端口 cargo test -p yi-client direct_tcpip -- --ignored
-    /// 连上后经 direct-tcpip 读远程端口的第一段数据（转发到对方的 sshd 时应该读到 SSH- 开头的握手）
+    /// Run manually: AH_SSH_TEST=host:port:user:key-path:remote-port-to-forward cargo test -p yi-client direct_tcpip -- --ignored
+    /// After connecting, read the first chunk from the remote port via direct-tcpip (forwarding to the peer's sshd should give a handshake starting with SSH-)
     #[tokio::test]
     #[ignore]
     async fn direct_tcpip_live() {

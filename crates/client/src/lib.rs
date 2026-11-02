@@ -1,4 +1,4 @@
-//! Yi Console 客户端核心，供 Tauri 应用和 Web 模式共用。
+//! Yi Console client core, shared by the Tauri app and the web mode.
 
 pub mod api;
 pub mod deploy;

@@ -1,11 +1,11 @@
-//! yi-web：用浏览器访问 Yi Console。
+//! yi-web: use Yi Console from a browser.
 //!
-//!   yi-web [--listen 127.0.0.1:3001] [--dist app/dist] [--data 数据目录] [--yi-agentd-dir 目录] [--token 令牌]
+//!   yi-web [--listen 127.0.0.1:3001] [--dist app/dist] [--data <data dir>] [--yi-agentd-dir <dir>] [--token <token>]
 //!
-//! 静态文件直接返回；`/ws?token=` 是前端与 ClientHub 之间的通道：
-//!   前端 -> {"id":1,"cmd":"hosts.list","args":{}}
-//!   后端 -> {"id":1,"result":...} / {"id":1,"error":"..."} / {"event":{...}}
-//! 只建议监听在 127.0.0.1；令牌防止同机其他网页乱连。
+//! Static files are served directly; `/ws?token=` is the channel between the frontend and ClientHub:
+//!   frontend -> {"id":1,"cmd":"hosts.list","args":{}}
+//!   backend -> {"id":1,"result":...} / {"id":1,"error":"..."} / {"event":{...}}
+//! Only listening on 127.0.0.1 is recommended; the token keeps other web pages on the same machine from connecting.
 
 use anyhow::{anyhow, Result};
 use futures_util::{SinkExt, StreamExt};
@@ -96,7 +96,7 @@ async fn handle(
         }
         return ws(s, hub, tx).await;
     }
-    // 浏览器标签预览主机上的网页（令牌就是凭证，见 yi_client::preview）
+    // Browser tabs previewing web pages on the host (the token is the credential, see yi_client::preview)
     if let Some(rest) = path.strip_prefix("/fsv/") {
         let mut s = s;
         let mut buf = vec![0u8; 8192];
@@ -181,7 +181,7 @@ fn mime(p: &Path) -> &'static str {
 }
 
 async fn serve_file(mut s: TcpStream, dist: &Path, path: &str) -> Result<()> {
-    // 读掉请求头
+    // Consume the request headers
     let mut buf = vec![0u8; 8192];
     let _ = s.read(&mut buf).await?;
     let clean = path.split('?').next().unwrap_or("/");
@@ -191,7 +191,7 @@ async fn serve_file(mut s: TcpStream, dist: &Path, path: &str) -> Result<()> {
     }
     let mut file = dist.join(if rel.is_empty() { "index.html" } else { rel });
     if !file.is_file() {
-        // 前端是单页应用，未知路径都回 index.html
+        // The frontend is a single-page app; unknown paths all return index.html
         file = dist.join("index.html");
     }
     match tokio::fs::read(&file).await {

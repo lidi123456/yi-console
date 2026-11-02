@@ -16,43 +16,43 @@ import { QuickOpen, type QuickMode } from './QuickOpen';
 import { OPEN_CHANGES } from './SessionActions';
 import { BrowserPane, isWebTab, WEB_PREFIX, webTabFile, webTabTitle } from './Browser';
 
-// 会话页右侧的「工作区文件」，参照 VS Code / Cursor 的资源管理器：
-// - 没打开文件时只有一栏文件树（窄），不占对话区；打开文件后变宽，左边编辑器、右边文件树（可收起）
-// - 文件树标出 git 改动（M / U / D），可以切到「改动」只看这个工作区改过的文件，打开改过的文件能看 diff
-// - 编辑器上方是打开过的文件标签，再下面是可点的路径，点目录弹出该目录的文件树
-// - 侧栏三个视图：全部文件 / 改动 / 搜索（文件内容）；Ctrl+P 快速打开，@ 符号、: 跳行
-// - 文件可以拖进输入框（插入 @路径），系统里的文件拖进文件树就上传到那个目录
-// - 可以在右侧再开一个文件并排看，或拿两个文件比较；diff 可选左右并排或上下
+// The "workspace files" panel on the right of the session page, modeled on the VS Code / Cursor explorer:
+// - with no file open it's a single narrow file tree that doesn't take space from the chat; opening a file widens it, editor on the left, tree on the right (collapsible)
+// - the tree marks git changes (M / U / D); the "Changes" view lists only files changed in this workspace, and opening a changed file shows its diff
+// - above the editor are tabs for opened files, then a clickable path; clicking a directory pops up that directory's tree
+// - three sidebar views: all files / changes / search (file contents); Ctrl+P quick open, @ for symbols, : to go to a line
+// - files can be dragged into the input box (inserts @path), and system files dropped on the tree are uploaded to that directory
+// - another file can be opened side by side on the right, or two files compared; diffs can be side by side or unified
 
 interface OpenFile {
   path: string;
   content: string;
-  /** 编辑中的内容 */
+  /** Content being edited */
   draft: string;
   binary: boolean;
   truncated: boolean;
   size: number;
   modified: number;
-  /** 图片：data URL */
+  /** Image: data URL */
   image?: string;
-  /** 每次读盘加一，编辑器据此重建 */
+  /** Incremented on every read from disk; the editor rebuilds when it changes */
   rev: number;
-  /** git 里已删除的文件：只能看 diff */
+  /** File deleted in git: only the diff can be viewed */
   deleted?: boolean;
-  /** PDF：base64 */
+  /** PDF: base64 */
   pdf?: string;
-  /** 浏览器标签（path 是 web:地址） */
+  /** Browser tab (path is web:url) */
   web?: boolean;
 }
 
-/** 文件面板里拖文件到输入框：值是「@相对路径 」 */
+/** Dragging a file from the file panel to the input box: the value is "@relative-path " */
 export const DRAG_REF = 'application/x-yi-console-ref';
-/** 拖进文件树能上传的单个文件上限（和 yi-agentd 一致） */
+/** Per-file size limit for uploads dropped onto the file tree (same as yi-agentd) */
 const UPLOAD_MAX = 50 * 1024 * 1024;
 
 /**
- * 文件面板里「复制」的文件：剪贴板里放相对路径（粘到别处就是路径），同时记下来；
- * 在输入框里粘贴的正好是这段文字时，换成 @引用（同拖进输入框）
+ * Files "copied" in the file panel: put the relative path on the clipboard (pasting elsewhere gives the path) and remember it;
+ * when exactly that text is pasted into the input box, turn it into an @reference (same as dragging into the input box)
  */
 export let copiedRef: { plain: string; ref: string } | null = null;
 
@@ -66,11 +66,11 @@ export function toB64(buf: ArrayBuffer): string {
 const isCsv = (p: string) => ['csv', 'tsv'].includes(extOf(p));
 const isHtml = (p: string) => ['html', 'htm'].includes(extOf(p));
 
-/** git 改动：键是规范化后的绝对路径 */
-/** added / deleted：相对 HEAD 的增删行数，二进制等算不出时为 null，旧版 yi-agentd 没有这两个字段 */
+/** git changes: keyed by normalized absolute path */
+/** added / deleted: lines added/removed relative to HEAD; null when not computable (binary etc.); older yi-agentd doesn't send these fields */
 type GitFile = { status: string; diff: string; path: string; rel: string; added?: number | null; deleted?: number | null };
 
-/** 「+12 −3」：只有改动视图里显示 */
+/** "+12 −3": shown only in the Changes view */
 function LineStat({ a, d }: { a?: number | null; d?: number | null }) {
   if (a == null && d == null) return null;
   return (
@@ -84,22 +84,22 @@ function LineStat({ a, d }: { a?: number | null; d?: number | null }) {
 interface GitInfo {
   repo: string;
   branch: string;
-  /** 键是 norm(绝对路径)；rel 是相对仓库根目录的路径（git 操作用） */
+  /** Keyed by norm(absolute path); rel is the path relative to the repo root (used for git operations) */
   files: Map<string, GitFile>;
-  /** 含有改动的目录 */
+  /** Directories containing changes */
   dirs: Set<string>;
 }
 
-/** 旧版 yi-agentd 在 Windows 上返回的子项路径带 \\?\ 前缀（存进了标签记录），统一去掉 */
+/** Older yi-agentd on Windows returned child paths with a \\?\ prefix (and they got stored in tab records); strip it everywhere */
 const unverbatim = (p: string) => (/^\\\\\?\\[a-z]:/i.test(p) ? p.slice(4) : p);
 
-/** 比较路径用：统一成 /，Windows 盘符路径不分大小写 */
+/** For comparing paths: use / everywhere; Windows drive paths are case-insensitive */
 const norm = (p: string) => {
   const s = p.replace(/\\/g, '/').replace(/\/+$/, '');
   return /^[a-z]:/i.test(s) ? s.toLowerCase() : s;
 };
 
-/** porcelain 状态码 -> 显示的字母和颜色 */
+/** porcelain status code -> letter and color to display */
 function gitMark(status: string): [string, string] {
   if (status === 'new' || status === '??') return ['U', 'g-new'];
   if (status.includes('U')) return ['!', 'g-del'];
@@ -129,7 +129,7 @@ function saveStateText(state: string): string {
   return state;
 }
 
-/** 往会话输入框里插一段文字（Composer 监听） */
+/** Insert text into the session input box (Composer listens for it) */
 export const INSERT_COMPOSER = 'yi-console:insert-composer';
 
 const sepOf = (p: string) => (p.includes('\\') && !p.includes('/') ? '\\' : '/');
@@ -157,7 +157,7 @@ const IMAGE_MIME: Record<string, string> = {
 };
 const isMarkdown = (p: string) => ['md', 'markdown', 'mdx'].includes(extOf(p));
 
-// ---------- 文件图标：按扩展名换图形和颜色 ----------
+// ---------- File icons: shape and color by extension ----------
 
 type Glyph = 'doc' | 'code' | 'term' | 'json' | 'image' | 'md' | 'gear' | 'table' | 'pdf';
 const GLYPH: Record<Glyph, string> = {
@@ -220,11 +220,11 @@ export function FileIcon({ name, size = 14 }: { name: string; size?: number }) {
   );
 }
 
-// ---------- 文件树的一行 ----------
+// ---------- One row of the file tree ----------
 
 interface TreeRow {
   key: string;
-  /** 绝对路径 */
+  /** Absolute path */
   path: string;
   name: string;
   depth: number;
@@ -246,15 +246,15 @@ function Rows({
   stats,
 }: {
   rows: TreeRow[];
-  /** 改动视图：文件行右边显示增删行数 */
+  /** Changes view: show lines added/removed to the right of file rows */
   stats?: boolean;
   selected?: string;
   git?: GitInfo | null;
-  /** 开始拖一行（拖进输入框插入引用） */
+  /** Start dragging a row (dropping into the input box inserts a reference) */
   onDragRow?: (e: React.DragEvent, r: TreeRow) => void;
-  /** 正在往哪个目录上传（高亮） */
+  /** Directory currently being uploaded to (highlighted) */
   dropDir?: string | null;
-  /** 系统文件拖到某一行上：目录行就是那个目录，文件行是它所在目录 */
+  /** System files dragged over a row: a directory row means that directory, a file row means its parent directory */
   onDropOver?: (dir: string) => void;
   onToggle: (r: TreeRow) => void;
   onOpen: (r: TreeRow) => void;
@@ -294,7 +294,7 @@ function Rows({
           onClick={() => (r.isDir ? onToggle(r) : onOpen(r))}
           onContextMenu={onMenu ? (e) => (e.stopPropagation(), onMenu(e, r)) : undefined}
         >
-          {/* 和 VS Code 默认图标主题一样：文件图标占箭头那一列，同一层的目录名和文件名左边对齐 */}
+          {/* Same as VS Code's default icon theme: file icons sit in the chevron column, so directory and file names at the same level line up on the left */}
           <span className="wp-twist">
             {r.isDir ? (
               <span className={`chev ${r.expanded ? 'open' : ''}`}>
@@ -328,7 +328,7 @@ function Rows({
   );
 }
 
-/** 按 kids 展开成行 */
+/** Flatten into rows following kids */
 function flatten(dir: string, depth: number, kids: Record<string, DirEntry[]>, expanded: Set<string>, out: TreeRow[] = []) {
   for (const e of kids[dir] ?? []) {
     const open = e.isDir && expanded.has(e.path);
@@ -346,7 +346,7 @@ interface SearchNode {
   files: string[];
 }
 
-/** 搜索结果（相对路径）排成树：只有一个子目录的目录合并成 a/b/c */
+/** Arrange search results (relative paths) into a tree: directories with a single subdirectory are merged into a/b/c */
 function searchRows(root: string, paths: string[], collapsed: Set<string>): TreeRow[] {
   const top: SearchNode = { dirs: new Map(), files: [] };
   for (const p of paths) {
@@ -397,12 +397,12 @@ export function FilePanel({
   hostId: string;
   cwd: string;
   sessionId: string;
-  /** 会话状态：回合结束时刷新文件树和打开的文件 */
+  /** Session status: refresh the tree and open files when a turn ends */
   status: string;
   fullscreen: boolean;
   onFullscreen: () => void;
   onClose: () => void;
-  /** 打开 / 关掉文件时通知外面：面板宽度不一样（只有文件树时窄） */
+  /** Notify the parent when files are opened / closed: the panel width differs (narrow with only the tree) */
   onFileOpen?: (open: boolean) => void;
 }) {
   const [, lang] = useLang();
@@ -415,37 +415,37 @@ export function FilePanel({
   const [saveError, setSaveError] = useState('');
   const [wrap, setWrap] = useState(() => lsGet('wp-wrap', false));
   const [preview, setPreview] = useState(false);
-  // Markdown 分栏：左边编辑、右边预览，两边滚动对齐；editorAt / previewAt 是另一边要滚到的行
+  // Markdown split view: edit on the left, preview on the right, scrolling kept in sync; editorAt / previewAt is the line the other side should scroll to
   const [mdSplit, setMdSplit] = useState(false);
   const [editorAt, setEditorAt] = useState<{ line: number; frac: number; n: number } | null>(null);
   const [previewAt, setPreviewAt] = useState<{ line: number; frac: number; n: number } | null>(null);
   const [mdGoto, setMdGoto] = useState<{ line: number; n: number } | null>(null);
-  // 分栏时谁在带着滚：鼠标 / 手指在哪边就听哪边的，免得两边互相触发
+  // Which side drives the scrolling in split view: follow the side the mouse / finger is on, so the two don't trigger each other
   const syncFrom = useRef<'editor' | 'preview'>('editor');
   const [treeOpen, setTreeOpen] = useState(() => lsGet('wp-tree', true));
   const [treeW, setTreeW] = useState(() => lsGet('wp-tree-w', 300));
   const [filter, setFilter] = useState('');
   const [search, setSearch] = useState<{ q: string; paths: string[]; truncated: boolean; error?: boolean } | null>(null);
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
-  // 打开过的文件（标签），当前文件是 file
+  // Opened files (tabs); the current file is file
   const [tabs, setTabs] = useState<string[]>([]);
   const [git, setGit] = useState<GitInfo | null>(null);
   const [view, setView] = useState<'all' | 'changes' | 'search'>(() => lsGet('wp-view', 'all'));
   const [showDiff, setShowDiff] = useState(false);
   const [diffLayout, setDiffLayout] = useState<'split' | 'unified'>(() => lsGet('wp-diff-layout', 'split'));
-  // 编辑器跳到某行（搜索结果、大纲、: 行号）
+  // Make the editor jump to a line (search results, outline, : line number)
   const [goto, setGoto] = useState<{ line: number; col?: number; len?: number; n: number } | null>(null);
   const [quick, setQuick] = useState<QuickMode | null>(null);
-  // 右侧再开一个文件并排看（只读）；compare 是拿当前文件和另一个比较
+  // Another file opened side by side on the right (read-only); compare diffs the current file against another
   const [second, setSecond] = useState<OpenFile | null>(null);
   const [compare, setCompare] = useState<{ path: string; text: string } | null>(null);
   const [dropDir, setDropDir] = useState<string | null>(null);
   const [uploading, setUploading] = useState(0);
   const isLocal = useStore((st) => st.hosts.find((h) => h.config.id === hostId)?.config.kind === 'local');
-  // 「改动」：只看这个会话改的
+  // "Changes": only what this session changed
   const [onlyMine, setOnlyMine] = useState(true);
   const sdata = useSessionData(skey(hostId, sessionId));
-  // 会话里工具改过的文件：norm(绝对路径) -> 这个文件的各次修改
+  // Files changed by tools in this session: norm(absolute path) -> each edit made to that file
   const touched = useMemo(() => {
     const m = new Map<string, FileDiff[]>();
     for (const e of sdata.events) {
@@ -479,7 +479,7 @@ export function FilePanel({
     [hostId, hidden],
   );
 
-  // 根目录：fs.list 会把 ~ 和相对写法规范成绝对路径
+  // Root directory: fs.list normalizes ~ and relative forms into absolute paths
   useEffect(() => {
     setKids({});
     setExpanded(new Set());
@@ -491,15 +491,15 @@ export function FilePanel({
       .catch(errorToast);
   }, [hostId, cwd, hidden]);
 
-  // git 状态读回来之前不知道是不是仓库：这时不能拿会话里记下的片段当 diff 显示
+  // Until git status comes back we don't know whether this is a repo, so the snippets recorded in the session can't be shown as a diff yet
   const [gitReady, setGitReady] = useState(false);
-  // 单个文件的 diff（git.changes 只列状态，打开文件时再取），键是 norm(绝对路径)
+  // Diff of a single file (git.changes only lists statuses; the diff is fetched when the file is opened), keyed by norm(absolute path)
   const [fileDiffs, setFileDiffs] = useState<Record<string, string | null>>({});
-  // 上次 git 状态的摘要：定时刷新时没变化就不动界面，免得打开的 diff 闪一下
+  // Summary of the last git status: periodic refreshes leave the UI alone if nothing changed, so an open diff doesn't flicker
   const gitSig = useRef('');
-  /** quiet：定时 / 回到窗口时的后台刷新，状态没变就只悄悄重取当前文件的 diff */
+  /** quiet: background refresh (timer / window refocus); if the status didn't change, just quietly refetch the current file's diff */
   const loadGit = useCallback((quiet = false) => {
-    // 不带 diff：大仓库里改动文件多时逐个 git diff 要很久，打开哪个文件再取哪个
+    // Without diffs: in a big repo with many changed files, running git diff for each takes ages, so fetch only the file that gets opened
     rpc<{ repo: string | null; branch?: string; files: { path: string; status: string; diff: string; added?: number | null; deleted?: number | null }[] }>(hostId, 'git.changes', { cwd, diff: false })
       .then((r) => {
         setGitReady(true);
@@ -525,7 +525,7 @@ export function FilePanel({
   }, [hostId, cwd]);
   const refreshCurDiff = useRef(() => {});
   useEffect(() => loadGit(), [loadGit]);
-  // AI 在终端里提交、别的程序改了文件，回合结束的刷新抓不到：窗口重新获得焦点时和每 10 秒（窗口可见时）再看一次
+  // Commits made by the AI in a terminal or files changed by other programs aren't caught by the end-of-turn refresh: check again when the window regains focus and every 10 s (while visible)
   useEffect(() => {
     const tick = () => document.visibilityState === 'visible' && loadGit(true);
     const t = setInterval(tick, 10000);
@@ -542,7 +542,7 @@ export function FilePanel({
     loadGit();
   };
 
-  // ---------- 筛选：停手 160ms 后在整个项目里找 ----------
+  // ---------- Filter: search the whole project 160 ms after typing stops ----------
   const q = filter.trim();
   useEffect(() => {
     if (!q || !root) {
@@ -555,7 +555,7 @@ export function FilePanel({
         .then((r) => {
           if (!alive) return;
           const files = r.filter((x) => !x.isDir).map((x) => x.path);
-          // 优先按包含关系筛；一个都不包含时退回模糊匹配
+          // Prefer substring filtering; if nothing contains the text, fall back to fuzzy matching
           const ql = q.toLowerCase();
           const exact = files.filter((p) => p.toLowerCase().includes(ql));
           setSearch({ q, paths: exact.length ? exact : files, truncated: r.length >= SEARCH_LIMIT });
@@ -579,7 +579,7 @@ export function FilePanel({
     setExpanded(next);
   };
 
-  // ---------- 打开、保存文件 ----------
+  // ---------- Opening and saving files ----------
 
   const readFile = async (path: string, quiet = false): Promise<OpenFile | null> => {
     if (isWebTab(path)) return { path, content: '', draft: '', binary: true, truncated: false, size: 0, modified: 0, rev: Date.now(), web: true };
@@ -611,19 +611,19 @@ export function FilePanel({
     }));
 
   const gitOf = (path: string) => git?.files.get(norm(path));
-  /** 这个文件的改动：git 仓库看工作区和上次提交的差别；不是 git 仓库时用会话里工具记下的修改 */
+  /** Changes to this file: in a git repo, the working tree vs the last commit; otherwise the edits recorded by tools in the session */
   const diffOf = (path: string): FileDiff | null => {
     const g = gitOf(path);
     const d = g?.diff || fileDiffs[norm(path)];
     if (g && d) return { path: g.rel, unified: d.slice(Math.max(0, d.indexOf('@@'))) };
     return null;
   };
-  /** 不是 git 仓库时，会话里工具对这个文件做过的各次修改（每次是一段片段，分开显示） */
+  /** Outside a git repo, each edit tools made to this file in the session (each is a snippet, shown separately) */
   const sessionDiffsOf = (path: string): FileDiff[] => (gitReady && !git ? touched.get(norm(path)) ?? [] : []);
-  /** 这个文件有没有改动可看（diff 可能还没取回来） */
+  /** Whether this file has changes to view (the diff may not have arrived yet) */
   const hasChange = (path: string) => !!gitOf(path) || sessionDiffsOf(path).length > 0;
 
-  // 打开改过的文件时取它的 diff
+  // Fetch the diff when a changed file is opened
   const curKey = file && !file.web ? norm(file.path) : '';
   const curGit = file ? gitOf(file.path) : undefined;
   useEffect(() => {
@@ -633,7 +633,7 @@ export function FilePanel({
       .then((r) => setFileDiffs((m) => ({ ...m, [k]: r.files.find((f) => f.path === curGit.rel)?.diff ?? '' })))
       .catch(() => setFileDiffs((m) => ({ ...m, [k]: '' })));
   }, [curKey, curGit, fileDiffs]); // eslint-disable-line react-hooks/exhaustive-deps
-  // 状态没变但内容可能又改了：后台重取当前文件的 diff，取回来再替换，不显示「正在读取」
+  // Status unchanged but the content may have changed again: refetch the current file's diff in the background and swap it in when it arrives, without showing "loading"
   refreshCurDiff.current = () => {
     if (!curKey || !curGit || !(curKey in fileDiffs)) return;
     const k = curKey;
@@ -644,12 +644,12 @@ export function FilePanel({
       })
       .catch(() => {});
   };
-  // 文件已经没有改动了（比如刚提交）：还停在「改动」就切回文件
+  // The file no longer has changes (e.g. just committed): if we're still on "Changes", switch back to the file
   useEffect(() => {
     if (showDiff && file && !file.deleted && gitReady && !hasChange(file.path)) setShowDiff(false);
   }, [git, showDiff, file?.path]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  /** 打开文件时预览开不开：CSV 默认表格；Markdown 沿用上次选的源码 / 分栏 / 预览，要跳到某行时不只看预览 */
+  /** Whether to open the preview when opening a file: CSV defaults to the table; Markdown reuses the last choice of source / split / preview, and isn't preview-only when jumping to a line */
   const previewFor = (path: string, at?: unknown) => {
     if (isCsv(path)) return setPreview(!at), setMdSplit(false);
     if (isHtml(path)) return setPreview(false), setMdSplit(false);
@@ -664,7 +664,7 @@ export function FilePanel({
     setPreview(m === 'preview');
   };
 
-  /** diff：打开改动列表里的文件时默认看 diff；line：打开后跳到这一行 */
+  /** diff: files opened from the changes list show the diff by default; line: jump to this line after opening */
   const openFile = async (path0: string, diff = false, at?: { line: number; col?: number; len?: number }) => {
     const path = unverbatim(path0);
     const jump = () => at && setGoto({ ...at, n: Date.now() });
@@ -696,14 +696,14 @@ export function FilePanel({
     if (window.matchMedia('(max-width: 760px)').matches) setTreeOpen(false);
   };
 
-  // ---------- 标签栏放不下时：当前标签滚进可见区，右边出一个列出全部标签的下拉（同 VS Code） ----------
+  // ---------- When the tab bar overflows: scroll the current tab into view and add a dropdown on the right listing all tabs (like VS Code) ----------
   const tabsRef = useRef<HTMLDivElement>(null);
   const [tabsOverflow, setTabsOverflow] = useState(false);
   const measureTabs = () => {
     const el = tabsRef.current;
     setTabsOverflow(!!el && el.scrollWidth > el.clientWidth + 1);
   };
-  // 当前标签滚进可见区：只改标签栏自己的 scrollLeft（scrollIntoView 会连带滚动外层）
+  // Scroll the current tab into view: only change the tab bar's own scrollLeft (scrollIntoView would scroll outer containers too)
   const revealActiveTab = () => {
     const bar = tabsRef.current;
     const tab = bar?.querySelector<HTMLElement>('.wp-ftab.active');
@@ -718,7 +718,7 @@ export function FilePanel({
   useEffect(() => {
     const el = tabsRef.current;
     if (!el) return;
-    // 面板变窄 / 拖动大小时，当前文件的标签始终留在可见区
+    // When the panel narrows / is resized, keep the current file's tab visible
     const ro = new ResizeObserver(() => {
       measureTabs();
       revealActiveTab();
@@ -744,9 +744,9 @@ export function FilePanel({
     );
   };
 
-  /** 新开浏览器标签；url 为空是新标签页（列出主机上的端口） */
+  /** Open a new browser tab; an empty url means a new tab page (lists ports on the host) */
   const openWeb = (url = '') => openFile(WEB_PREFIX + url);
-  /** 浏览器标签里换了地址：原地换掉标签键 */
+  /** The browser tab changed its URL: replace the tab key in place */
   const navigateWeb = (from: string, to: string) => {
     setTabs((t) => {
       const rest = t.filter((x) => x !== to);
@@ -755,7 +755,7 @@ export function FilePanel({
     setFile((cur) => (cur && cur.path === from ? { ...cur, path: to, rev: Date.now() } : cur));
   };
 
-  /** 关标签：关的是当前文件就切到旁边那个，都关了回到只有文件树 */
+  /** Close a tab: if it's the current file, switch to its neighbor; once all are closed, go back to tree only */
   const closeTab = async (path: string) => {
     const i = tabs.indexOf(path);
     const rest = tabs.filter((t) => t !== path);
@@ -773,7 +773,7 @@ export function FilePanel({
     setSaveState(null);
   };
 
-  /** 只留下 keep 里的标签；当前文件被关掉时切到右键的那个标签 t（同 VS Code） */
+  /** Keep only the tabs in keep; if the current file gets closed, switch to the right-clicked tab t (like VS Code) */
   const keepTabs = async (t: string, keep: string[]) => {
     if (!file || keep.includes(file.path)) return setTabs(keep);
     if (!(await confirmDiscard())) return;
@@ -796,7 +796,7 @@ export function FilePanel({
 
   useEffect(() => onFileOpen?.(!!file), [!!file]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // 记住打开过的文件（按主机 + 工作目录），下次打开面板时恢复标签和当前文件
+  // Remember opened files (per host + working directory) and restore the tabs and current file next time the panel opens
   const tabsKey = `wp-open-${hostId}/${cwd}`;
   const restored = useRef(false);
   const restoring = useRef(false);
@@ -813,7 +813,7 @@ export function FilePanel({
     restoring.current = true;
     readFile(cur, true).then((f) => {
       restoring.current = false;
-      // 恢复期间用户已经自己打开了文件，就不覆盖
+      // If the user already opened a file while restoring, don't overwrite it
       if (fileRef.current) return;
       if (!f) return setTabs(keep.filter((t) => t !== cur));
       setTabs(keep);
@@ -859,7 +859,7 @@ export function FilePanel({
     }
   };
 
-  // 回合结束：刷新文件树；打开的文件没改过就重新读，agent 改了能马上看到
+  // Turn ended: refresh the tree; reread open files that have no local edits so the agent's changes show up immediately
   const prevStatus = useRef(status);
   useEffect(() => {
     const was = prevStatus.current;
@@ -882,7 +882,7 @@ export function FilePanel({
     if (await confirmDiscard()) onClose();
   };
 
-  // ---------- 新建、改名、删除 ----------
+  // ---------- New, rename, delete ----------
 
   const create = async (dir: string, kind: 'file' | 'dir') => {
     const name = await askText({ title: kind === 'file' ? tr('新建文件', 'New file') : tr('新建文件夹', 'New folder'), label: dir, placeholder: tr('名称', 'Name') });
@@ -943,7 +943,7 @@ export function FilePanel({
     copiedRef = { plain: r, ref: `@${r} ` };
     toast(tr('已复制，在输入框里粘贴就是引用这个文件', 'Copied. Paste in the input to reference this file'));
   };
-  // 文件树里点过 / 右键过的那一行，Ctrl+C 复制它
+  // The row last clicked / right-clicked in the tree; Ctrl+C copies it
   const lastRow = useRef<{ path: string; isDir: boolean } | null>(null);
   const addToChat = (path: string, isDir: boolean) => {
     window.dispatchEvent(new CustomEvent(INSERT_COMPOSER, { detail: { sessionId, text: `@${rel(path)}${isDir ? '/' : ''} ` } }));
@@ -953,7 +953,7 @@ export function FilePanel({
     }
   };
 
-  // ---------- 下载、系统里打开 ----------
+  // ---------- Download, open in the system ----------
   const download = async (path: string) => {
     try {
       const r = await rpc<{ base64: string }>(hostId, 'fs.read', { path, raw: true });
@@ -964,7 +964,7 @@ export function FilePanel({
           if (await invoke<boolean>('save_file', { name, data: r.base64 })) toast(tr(`已保存 ${name}`, `Saved ${name}`));
           return;
         } catch {
-          // 手机上没有保存对话框，退回浏览器下载
+          // No save dialog on mobile, fall back to a browser download
         }
       }
       const a = document.createElement('a');
@@ -989,7 +989,7 @@ export function FilePanel({
         ]
       : [];
 
-  // ---------- 并排、比较 ----------
+  // ---------- Side by side, compare ----------
   const wide = () => !window.matchMedia('(max-width: 900px)').matches;
   const openSecond = async (path: string) => {
     if (!file) return openFile(path);
@@ -997,7 +997,7 @@ export function FilePanel({
     const f = await readFile(path);
     if (!f) return;
     setSecond(f);
-    // 三栏太挤：先收起文件树（不记到设置里），右上角按钮能再打开
+    // Three columns is too cramped: collapse the tree first (not saved in settings); the top-right button reopens it
     setTreeOpen(false);
   };
   const compareWith = async (path: string) => {
@@ -1010,7 +1010,7 @@ export function FilePanel({
     setShowDiff(false);
   };
 
-  // ---------- 拖拽 ----------
+  // ---------- Drag and drop ----------
   const dragRow = (e: React.DragEvent, r: TreeRow) => {
     e.dataTransfer.setData(DRAG_REF, `@${rel(r.path)}${r.isDir ? '/' : ''} `);
     e.dataTransfer.setData('text/plain', r.path);
@@ -1129,7 +1129,7 @@ export function FilePanel({
     openMenu({ clientX: r.right - 220, clientY: r.bottom + 4 }, items);
   };
 
-  // ---------- 快捷键：Ctrl+P 快速打开，Ctrl+Shift+O 符号，Ctrl+G 跳行 ----------
+  // ---------- Shortcuts: Ctrl+P quick open, Ctrl+Shift+O symbols, Ctrl+G go to line ----------
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (!(e.ctrlKey || e.metaKey) || e.altKey) return;
@@ -1151,7 +1151,7 @@ export function FilePanel({
     ]);
   };
 
-  // ---------- 拖动调整文件树宽度 ----------
+  // ---------- Drag to resize the file tree ----------
   const dragTree = (e: React.PointerEvent) => {
     e.preventDefault();
     const x0 = e.clientX;
@@ -1174,8 +1174,8 @@ export function FilePanel({
 
   const rows = useMemo(() => (root ? flatten(root, 0, kids, expanded) : []), [root, kids, expanded, lang]);
   const sRows = useMemo(() => (root && search ? searchRows(root, search.paths, collapsed) : []), [root, search, collapsed]);
-  // 「改动」：这个工作目录下改过的文件，按目录排成树
-  // 会话里记录到改过文件时，默认只列这些（ChangesView 原来的「只看这个会话改的文件」）
+  // "Changes": files changed under this working directory, arranged as a tree by directory
+  // When the session recorded changed files, list only those by default (what ChangesView used to call "only files changed in this session")
   const mineFilter = onlyMine && touched.size > 0;
   const allChanged = useMemo(() => {
     if (!root) return [];
@@ -1190,7 +1190,7 @@ export function FilePanel({
     return changedKeys.map((k) => k.slice(r.length + 1));
   }, [changedKeys, root]);
   const otherCount = allChanged.length - changedKeys.length;
-  // 改动视图顶上的合计：列出来的这些文件一共增删多少行（算不出的文件不计）
+  // Totals at the top of the Changes view: lines added/removed across the listed files (files that can't be computed are skipped)
   const totals = useMemo(() => {
     let a = 0, d = 0, any = false;
     for (const k of changedKeys) {
@@ -1215,7 +1215,7 @@ export function FilePanel({
     setView(v);
     setCollapsed(new Set());
   };
-  // 会话菜单的「查看改动」
+  // "View changes" from the session menu
   useEffect(() => {
     const on = (e: Event) => {
       const d = (e as CustomEvent<{ hostId: string; sessionId: string }>).detail;
@@ -1228,7 +1228,7 @@ export function FilePanel({
     return () => window.removeEventListener(OPEN_CHANGES, on);
   }, [hostId, sessionId, loadGit]);
   const showTree = treeOpen || !file;
-  // 手机上从文件树点开文件后，按返回先回到文件树，再按才关整个文件面板
+  // On mobile, after opening a file from the tree, back returns to the tree first; pressing again closes the whole file panel
   useBack(!!file && !treeOpen && window.matchMedia('(max-width: 760px)').matches, () => setTreeOpen(true));
   useBack(quick !== null, () => setQuick(null));
   const fileDiff = file ? diffOf(file.path) : null;
@@ -1475,7 +1475,7 @@ export function FilePanel({
     />
   );
 
-  // 编辑区一栏的内容：文件 / 改动 / 比较
+  // Content of the editor column: file / changes / compare
   const mainView = !file ? null : file.web ? (
     <BrowserPane hostId={hostId} root={root ?? cwd} tab={file.path} onNavigate={(t) => navigateWeb(file.path, t)} />
   ) : html && preview && viewing === 'file' ? (
@@ -1624,7 +1624,7 @@ export function FilePanel({
             aria-label={tr('打开的文件', 'Open files')}
             ref={tabsRef}
             onScroll={measureTabs}
-            // 和 VS Code 一样：竖着滚滚轮就横着滚标签
+            // Like VS Code: vertical wheel scrolling scrolls the tabs horizontally
             onWheel={(e) => {
               if (Math.abs(e.deltaY) > Math.abs(e.deltaX)) e.currentTarget.scrollLeft += e.deltaY;
             }}
@@ -1851,7 +1851,7 @@ export function FilePanel({
           onGoto={(line) => {
             setShowDiff(false);
             setCompare(null);
-            // Markdown 预览里按大纲跳：只滚预览，不切回源码
+            // Jumping via the outline in the Markdown preview: only scroll the preview, don't switch back to source
             if (md && preview) return setMdGoto({ line, n: Date.now() });
             if (md && mdSplit) setMdGoto({ line, n: Date.now() });
             setPreview(false);
@@ -1864,7 +1864,7 @@ export function FilePanel({
   );
 }
 
-// ---------- 编辑器上方的路径：点目录弹出那一层的文件树 ----------
+// ---------- Path above the editor: clicking a directory pops up the tree at that level ----------
 
 function Breadcrumbs({
   hostId,
@@ -1887,7 +1887,7 @@ function Breadcrumbs({
   const inRoot = path.startsWith(root);
   const segs = (inRoot ? path.slice(root.length) : path).split(/[\\/]/).filter(Boolean);
   const rootLabel = inRoot ? baseName(root) || root : '';
-  // 路径太长时滚到最右，让文件名始终可见
+  // When the path is too long, scroll to the far right so the file name stays visible
   useLayoutEffect(() => {
     if (box.current) box.current.scrollLeft = box.current.scrollWidth;
   }, [path]);

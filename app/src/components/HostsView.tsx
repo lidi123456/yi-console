@@ -51,7 +51,7 @@ function HostKeyPrompt({ h, onDone }: { h: HostEntry; onDone: () => void }) {
       await hubCall('hosts.connect', { id: h.config.id });
       onDone();
     } catch (e) {
-      // 跳板机也可能是未知主机，再走一遍
+      // The jump host may also be unknown; go through it again
       errorToast(e);
       refreshHosts();
     }
@@ -122,7 +122,7 @@ function ago(t: number) {
   return tr(`${Math.floor(s / 86400)} 天前`, `${Math.floor(s / 86400)} d ago`);
 }
 
-/** 本机"让其他设备连接这台电脑"：① 连上中继（首次凭邀请登记）→ ② 生成一次性配对二维码 → 已配对设备管理 */
+/** On this machine, "let other devices connect to this computer": ① connect to a relay (register with an invite the first time) → ② generate a one-time pairing QR code → manage paired devices */
 function RelayPanel({ hostId }: { hostId: string }) {
   const [info, setInfo] = useState<RelayInfo | null>(null);
   const [known, setKnown] = useState<{ hostId: string; name: string; url: string }[]>([]);
@@ -151,7 +151,7 @@ function RelayPanel({ hostId }: { hostId: string }) {
     rpc<PairedClient[]>(hostId, 'relay.clients', {})
       .then((list) => {
         setClients((old) => {
-          // 二维码显示期间多了一台，或已配对的设备重新配对了一次（配对时间变了）：配对成功
+          // A device was added while the QR code was shown, or a paired device paired again (pairing time changed): pairing succeeded
           const added = list.find((c) => !old.some((o) => o.id === c.id && o.createdAt === c.createdAt));
           if (offer && added) {
             toast(tr(`已配对 ${added?.name ?? ''}`, `Paired ${added?.name ?? ''}`));
@@ -166,14 +166,14 @@ function RelayPanel({ hostId }: { hostId: string }) {
     loadClients();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [hostId]);
-  // 已保存的中继设备变了（刚配对了一台）就重新列出可复用的中继
+  // When saved relay devices change (one just paired), list the reusable relays again
   const relayHosts = useStore((s) => s.hosts.filter((h) => h.config.kind === 'relay').map((h) => h.config.id).join(','));
   useEffect(() => {
     hubCall<{ hostId: string; name: string; url: string }[]>('relay.known').then(setKnown).catch(() => {});
   }, [relayHosts]);
 
   const active = !!(info?.configured && info.enabled);
-  // 刚开启、还没连上时每 2 秒刷新一次状态，连上或出错就停
+  // Just enabled and not yet connected: refresh the status every 2 s, stop once connected or on error
   useEffect(() => {
     if (!active || info?.online || info?.error) return;
     const t = setTimeout(load, 2000);
@@ -181,7 +181,7 @@ function RelayPanel({ hostId }: { hostId: string }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [active, info]);
 
-  // 二维码显示期间：倒计时，并每 3 秒看一下有没有配对成功
+  // While the QR code is shown: count down, and check every 3 s whether pairing succeeded
   useEffect(() => {
     if (!offer) return;
     const t = setInterval(() => setNow(Date.now() / 1000), 1000);
@@ -520,7 +520,7 @@ function HostForm({ initial, hosts, onSaved, onCancel }: { initial: HostConfig; 
   const [pairInfo, setPairInfo] = useState<LinkInfo | string | null>(null);
   const isNewRelay = h.kind === 'relay' && !h.id;
 
-  // 新建中继设备时，剪贴板里正好是配对链接就直接填上（另一台电脑上刚点过"复制配对链接"）
+  // When adding a relay device, if the clipboard holds a pairing link, fill it in (the other computer just clicked "Copy pairing link")
   useEffect(() => {
     if (!isNewRelay) return;
     readClipboard().then((c) => {
@@ -554,7 +554,7 @@ function HostForm({ initial, hosts, onSaved, onCancel }: { initial: HostConfig; 
   const save = async () => {
     setSaving(true);
     try {
-      // 配对链接要先经中继完成配对，可能要几秒
+      // A pairing link has to complete pairing through the relay first, which can take a few seconds
       const saved = await hubCall<HostConfig>('hosts.save', { host: h });
       await refreshHosts();
       onSaved(saved);
@@ -911,14 +911,14 @@ export function HostsView({ editId }: { editId?: string }) {
   }, []);
   useEffect(() => {
     if (editId) {
-      // 主机密钥待确认时留在卡片上处理，其他错误（认证失败、私钥读不出等）直接打开编辑
+      // If a host key needs confirming, handle it on the card; other errors (auth failed, private key unreadable, etc.) open the editor directly
       const h = hosts.find((x) => x.config.id === editId);
       if (h && !h.status.code?.startsWith('HOSTKEY')) setEditing(h.config);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [editId]);
 
-  // 编辑表单就地替换对应主机的卡片，新建的放在列表上方
+  // The edit form replaces the host's card in place; new ones go at the top of the list
   const form = (initial: HostConfig) => (
     <HostForm
       key={initial.id || 'new'}
@@ -930,7 +930,7 @@ export function HostsView({ editId }: { editId?: string }) {
         try {
           await hubCall('hosts.connect', { id: h.id });
         } catch {
-          /* 错误显示在卡片上 */
+          /* the error is shown on the card */
         }
         refreshHosts();
       }}

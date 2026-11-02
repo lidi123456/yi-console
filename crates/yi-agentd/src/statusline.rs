@@ -1,10 +1,10 @@
-//! 会话状态栏里需要在主机上算的部分：git 分支和改动数、自定义命令的输出。
+//! Parts of the session status line computed on the host: git branch and change count, custom command output.
 //!
-//! 自定义命令的约定和 Claude Code 的 `statusLine` 一样：stdin 收到一段 JSON，
-//! 输出的第一行显示出来（可以带 ANSI 颜色）。所以给 Claude Code 写的脚本可以直接用；
-//! 没配命令时，Claude 会话会沿用 `~/.claude/settings.json` 里的 statusLine；项目里的 `.claude/settings*.json`
-//! 只在这个目录被 Claude Code 信任过时才用（仓库里的配置可能是别人写的，不能打开就执行）。
-//! 我们自己的字段放在 `yi_console` 下面。
+//! Custom commands follow the same convention as Claude Code's `statusLine`: they receive JSON on stdin,
+//! and the first line of output is shown (ANSI colors allowed). So scripts written for Claude Code work as is;
+//! without a configured command, Claude sessions reuse the statusLine from `~/.claude/settings.json`; a project's `.claude/settings*.json`
+//! is only used if Claude Code has trusted the directory (config in a repo may have been written by someone else and mustn't run just by opening it).
+//! Our own fields go under `yi_console`.
 
 use crate::hub::Hub;
 use anyhow::Result;
@@ -17,13 +17,13 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
 
-/// 多个客户端同时看同一个会话时，2 秒内复用上次的结果
+/// When several clients view the same session, reuse the last result within 2 seconds
 const CACHE_TTL: Duration = Duration::from_secs(2);
 const CMD_TIMEOUT: Duration = Duration::from_secs(3);
 const GIT_TIMEOUT: Duration = Duration::from_secs(2);
 
 static CACHE: Mutex<Option<HashMap<String, (Instant, Value)>>> = Mutex::new(None);
-/// 同时最多跑几条状态栏命令，避免一堆会话一起刷新时把机器拖慢
+/// Max status line commands running at once, so many sessions refreshing together don't bog down the machine
 static SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
 
 pub async fn query(hub: &Arc<Hub>, sid: &str, want_git: bool) -> Result<Value> {
@@ -63,7 +63,7 @@ pub async fn query(hub: &Arc<Hub>, sid: &str, want_git: bool) -> Result<Value> {
     Ok(out)
 }
 
-/// 一次 `git status --porcelain -b` 拿到分支、领先/落后和改动文件数
+/// One `git status --porcelain -b` gives the branch, ahead/behind and changed file count
 async fn git_info(cwd: &str) -> Option<Value> {
     if cwd.is_empty() || !Path::new(cwd).is_dir() {
         return None;
@@ -87,7 +87,7 @@ fn parse_git(s: &str) -> Option<Value> {
     let mut lines = s.lines();
     let head = lines.next()?.strip_prefix("## ")?;
     let changed = lines.filter(|l| !l.trim().is_empty()).count();
-    // "main...origin/main [ahead 1, behind 2]"、"No commits yet on main"、"HEAD (no branch)"
+    // "main...origin/main [ahead 1, behind 2]", "No commits yet on main", "HEAD (no branch)"
     let (name, rest) = head.split_once(' ').unwrap_or((head, ""));
     let branch = if let Some(b) = head.strip_prefix("No commits yet on ") {
         b.to_string()
@@ -104,9 +104,9 @@ fn parse_git(s: &str) -> Option<Value> {
     Some(json!({ "branch": branch, "ahead": num("ahead"), "behind": num("behind"), "changed": changed }))
 }
 
-/// 按 Claude Code 的优先级找 statusLine 命令：项目 local > 项目 > 用户。
-/// 项目里的配置随仓库而来，可能是别人写的：和 Claude Code 一样，只有这个目录（或它的上级）
-/// 在 Claude Code 里点过「信任」才用，否则只看用户自己的配置
+/// Find the statusLine command with Claude Code's precedence: project local > project > user.
+/// Project config comes with the repo and may be written by someone else: like Claude Code, it's only used if this directory (or a parent)
+/// was marked "trusted" in Claude Code; otherwise only the user's own config is considered
 fn claude_command(cwd: &str) -> Option<String> {
     let user = claude_config_dir();
     let proj = Path::new(cwd).join(".claude");
@@ -129,8 +129,8 @@ fn claude_config_dir() -> PathBuf {
         .unwrap_or_else(|_| crate::paths::home().join(".claude"))
 }
 
-/// Claude Code 把信任过的目录记在 `~/.claude.json`（设了 CLAUDE_CONFIG_DIR 时在那个目录里）的
-/// `projects.<路径>.hasTrustDialogAccepted`；信任上级目录也算
+/// Claude Code records trusted directories in `~/.claude.json` (in that directory if CLAUDE_CONFIG_DIR is set) under
+/// `projects.<path>.hasTrustDialogAccepted`; trusting a parent directory counts too
 fn claude_trusted(cwd: &str) -> bool {
     let file = match std::env::var("CLAUDE_CONFIG_DIR") {
         Ok(d) => PathBuf::from(d).join(".claude.json"),
@@ -176,7 +176,7 @@ fn claude_transcript(info: &SessionInfo) -> Option<PathBuf> {
         .find(|p| p.is_file())
 }
 
-/// 字段名沿用 Claude Code statusLine 的输入格式，我们多出来的放在 yi_console 里
+/// Field names follow Claude Code's statusLine input format; our extras go under yi_console
 fn payload(info: &SessionInfo, git: Option<&Value>) -> Value {
     let u = &info.usage;
     let model = info.model.clone().unwrap_or_default();
@@ -215,7 +215,7 @@ fn payload(info: &SessionInfo, git: Option<&Value>) -> Value {
     })
 }
 
-/// Windows 上 Claude 的 statusLine 命令按 Claude Code 的习惯用 Git Bash 跑；我们自己的命令用 cmd
+/// On Windows, Claude's statusLine command runs in Git Bash as Claude Code does; our own commands use cmd
 fn shell(cmd: &str, bash: bool) -> tokio::process::Command {
     if cfg!(windows) {
         if let Some(b) = bash.then(git_bash).flatten() {
@@ -225,7 +225,7 @@ fn shell(cmd: &str, bash: bool) -> tokio::process::Command {
         }
         #[allow(unused_mut)]
         let mut c = tokio::process::Command::new("cmd");
-        // 原样交给 cmd，不让 Rust 按 C 运行时规则给引号加反斜杠（cmd 不认）
+        // Pass it to cmd as is, without Rust adding backslashes to quotes per C runtime rules (cmd doesn't understand them)
         #[cfg(windows)]
         c.raw_arg(format!("/D /S /C \"{cmd}\""));
         c
@@ -236,7 +236,7 @@ fn shell(cmd: &str, bash: bool) -> tokio::process::Command {
     }
 }
 
-/// Git for Windows 自带的 bash（不要用 System32 里的 WSL bash）
+/// The bash that ships with Git for Windows (not the WSL bash in System32)
 fn git_bash() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("CLAUDE_CODE_GIT_BASH_PATH") {
         return Some(PathBuf::from(p));
@@ -262,7 +262,7 @@ async fn run(cmd: &str, cwd: &str, payload: &Value, bash: bool) -> Result<String
     let mut child = c.spawn()?;
     if let Some(mut stdin) = child.stdin.take() {
         let data = serde_json::to_vec(payload)?;
-        // 命令不读 stdin 也没关系，写失败就忽略
+        // Fine if the command doesn't read stdin; ignore write failures
         let _ = stdin.write_all(&data).await;
     }
     let o = tokio::time::timeout(CMD_TIMEOUT, child.wait_with_output())

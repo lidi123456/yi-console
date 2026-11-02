@@ -2,9 +2,9 @@ import { tr } from './i18n';
 import { TOOL_LABEL, type SessionInfo, type ToolKind } from './types';
 import { lsGet, lsSet } from './util';
 
-// 换个工具继续：把原会话的记录文件告诉新工具，第一轮只让它读完后汇报，不接着做
+// Continue with another tool: tell the new tool where the original session's log is; in the first turn it only reads it and reports back, without continuing the work
 
-/** 各工具会话文件的格式说明，省得新工具先花时间猜格式 */
+/** Format notes for each tool's session files, so the new tool doesn't waste time guessing the format */
 function formatHint(tool: ToolKind): string {
   switch (tool) {
     case 'claude':
@@ -33,7 +33,7 @@ function formatHint(tool: ToolKind): string {
   }
 }
 
-/** 模板里能用的占位符，系统设置里照这个列表给用户看说明 */
+/** Placeholders usable in the template; system settings shows this list to the user as help */
 export const HANDOFF_VARS: [string, () => string][] = [
   ['{tool}', () => tr('原会话的工具名，如 Claude Code', 'Tool of the original session, e.g. Claude Code')],
   ['{title}', () => tr('原会话的标题', 'Title of the original session')],
@@ -42,7 +42,7 @@ export const HANDOFF_VARS: [string, () => string][] = [
   ['{format}', () => tr('这个记录文件的格式说明（按工具自动给出）', 'Description of the record file format (filled in per tool)')],
 ];
 
-/** 默认模板跟着界面语言走；用户改过的存在本机 localStorage，留空就恢复默认 */
+/** The default template follows the UI language; a user-edited one is stored in local localStorage, and leaving it empty restores the default */
 const TEMPLATE_KEY = 'handoff-template';
 
 export function defaultHandoffTemplate(): string {
@@ -74,19 +74,19 @@ In this turn, only report back. Do not modify any files and do not continue the 
   );
 }
 
-/** 用户自己的模板，没改过返回 null */
+/** The user's own template; null if never edited */
 export function customHandoffTemplate(): string | null {
   const v = lsGet<string>(TEMPLATE_KEY, '');
   return v.trim() ? v : null;
 }
 
-/** 存模板；和默认一样或为空就删掉，之后跟着界面语言用默认模板 */
+/** Save the template; if it equals the default or is empty, delete it and use the default template for the UI language from then on */
 export function setHandoffTemplate(v: string | null) {
   if (!v || !v.trim() || v === defaultHandoffTemplate()) localStorage.removeItem(TEMPLATE_KEY);
   else lsSet(TEMPLATE_KEY, v);
 }
 
-/** 第一条消息。exported 表示没有工具自己的记录文件，path 是 Yi Console 导出的 Markdown */
+/** The first message. exported means the tool has no log file of its own, and path is the Markdown exported by Yi Console */
 export function handoffPrompt(info: SessionInfo, path: string, exported: boolean): string {
   const fmt = exported
     ? tr(
@@ -101,6 +101,6 @@ export function handoffPrompt(info: SessionInfo, path: string, exported: boolean
     path,
     format: fmt,
   };
-  // 认不出的 {xxx} 原样保留，用户模板里写的花括号不会被吞掉
+  // Unrecognized {xxx} are left as is, so braces in the user's template aren't swallowed
   return (customHandoffTemplate() ?? defaultHandoffTemplate()).replace(/\{(tool|title|cwd|path|format)\}/g, (_, k: string) => vars[k]);
 }

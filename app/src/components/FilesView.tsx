@@ -13,7 +13,7 @@ interface Listing {
   entries: DirEntry[];
 }
 
-/** Windows 主机的盘符列表（C:\\、D:\\…），其他系统返回空 */
+/** Drive list on Windows hosts (C:\\, D:\\…); empty on other systems */
 export function useDrives(hostId: string) {
   const isWin = useStore((s) => s.hosts.find((h) => h.config.id === hostId)?.status.hello?.os === 'windows');
   const [drives, setDrives] = useState<string[]>([]);

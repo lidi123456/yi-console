@@ -1,4 +1,4 @@
-//! 主机配置：本机 / SSH / 中继，存成 JSON 文件（含密码等敏感信息，权限 0600）。
+//! Host config: local / SSH / relay, stored as a JSON file (contains secrets such as passwords, mode 0600).
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -10,7 +10,7 @@ pub enum HostKind {
     Local,
     Ssh,
     Relay,
-    /// 经某台中继主机（电脑）的 yi-agentd 转发到它配的 SSH 主机，手机连内网服务器用
+    /// Forwarded through a relay host's (computer's) yi-agentd to an SSH host configured there; lets phones reach servers on an internal network
     Proxy,
 }
 
@@ -24,17 +24,17 @@ pub struct SshTarget {
     /// agent / key / password
     #[serde(default = "default_auth")]
     pub auth: String,
-    /// 私钥文件路径（桌面端）
+    /// Private key file path (desktop)
     #[serde(default)]
     pub key_path: String,
-    /// 私钥内容（手机上没有文件系统可选时直接粘贴）
+    /// Private key content (pasted directly on phones, where there's no file system to pick from)
     #[serde(default)]
     pub key_text: String,
     #[serde(default)]
     pub passphrase: String,
     #[serde(default)]
     pub password: String,
-    /// 跳板机：引用另一台 SSH 主机的 id
+    /// Jump host: references another SSH host by id
     #[serde(default)]
     pub jump_host_id: String,
 }
@@ -56,23 +56,23 @@ pub struct HostConfig {
     pub kind: HostKind,
     #[serde(default)]
     pub ssh: Option<SshTarget>,
-    /// 中继配对链接 yiconsole://pair?...
+    /// Relay pairing link yiconsole://pair?...
     #[serde(default)]
     pub pairing: Option<String>,
     #[serde(default)]
     pub auto_connect: bool,
-    /// 首次部署后注册成自启服务
+    /// Register as an autostart service after the first deployment
     #[serde(default = "yes")]
     pub install_service: bool,
-    /// 探测到的远程平台，缓存下来省一次往返
+    /// Detected remote platform, cached to save a round trip
     #[serde(default)]
     pub remote_os: Option<String>,
     #[serde(default)]
     pub remote_arch: Option<String>,
-    /// SSH 主机：允许已配对的设备（手机）经本机 yi-agentd 访问
+    /// SSH host: allow paired devices (phones) to reach it through the local yi-agentd
     #[serde(default = "yes")]
     pub relay_share: bool,
-    /// 转发主机：经哪台中继主机，以及它在那台电脑上的主机 id
+    /// Forwarded host: which relay host it goes through, and its host id on that computer
     #[serde(default)]
     pub via_host_id: Option<String>,
     #[serde(default)]

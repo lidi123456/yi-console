@@ -15,7 +15,7 @@ import { copiedRef, DRAG_REF, INSERT_COMPOSER, toB64 } from './FilePanel';
 import { getPermModesList, permModes } from './NewSession';
 import { ModelPicker, OPEN_MODEL } from './ModelPicker';
 
-/** / 命令的匹配：命令名前缀 > 名里的单词开头 > 名里包含 > 说明里包含 > 名的字母顺序匹配；说明不做模糊匹配，免得什么都沾边 */
+/** Matching for / commands: name prefix > word start in name > name contains > description contains > name subsequence; descriptions aren't fuzzy-matched, or everything would match */
 function cmdScore(label: string, desc: string, q: string) {
   const name = label.toLowerCase();
   const query = q.toLowerCase();
@@ -37,11 +37,11 @@ interface Attached {
   name: string;
 }
 
-/** 粘贴 / 拖进来的普通文件上限（和 yi-agentd 的 fs.upload 一致） */
+/** Size limit for pasted / dropped regular files (same as yi-agentd's fs.upload) */
 const FILE_MAX = 50 * 1024 * 1024;
-/** 上传条目的编号（React key） */
+/** Upload item counter (React key) */
 let uploadSeq = 0;
-/** 分块上传每块的大小：块与块之间可以取消，也能显示进度 */
+/** Chunk size for chunked uploads: allows cancelling between chunks and showing progress */
 const CHUNK = 1024 * 1024;
 const CANCELLED = new Error('cancelled');
 
@@ -52,13 +52,13 @@ interface Upload {
   total: number;
 }
 
-/** @引用：路径带空格时加引号 */
+/** @-reference: quote paths that contain spaces */
 const refOf = (path: string) => (/\s/.test(path) ? `@"${path}" ` : `@${path} `);
 const baseName = (p: string) => p.split(/[\\/]/).pop() ?? p;
 
 /**
- * 桌面版里粘贴的是本机的文件（资源管理器 / 访达里复制的）：从系统剪贴板读出它们的路径，
- * 按文件名对上 `files` 里的每一个才算数，对不上（剪贴板变了、读不到）返回 null，照常上传
+ * In the desktop app, pasted files are local files (copied in Explorer / Finder): read their paths from the system clipboard;
+ * they only count if each one matches an entry in `files` by name; otherwise (clipboard changed, can't read) return null and upload as usual
  */
 async function localPaths(files: File[]): Promise<string[] | null> {
   if (!isTauri || isMobile() || !files.length) return null;
@@ -102,7 +102,7 @@ function readImage(f: File): Promise<Attached> {
   });
 }
 
-/** / 和 @ 菜单里的一项 */
+/** An item in the / and @ menus */
 interface PopItem {
   key: string;
   label: string;
@@ -113,7 +113,7 @@ interface PopItem {
 }
 
 
-/** 工具自己切到我们不认识的模式（比如 Claude 的 dontAsk）时，照原名显示 */
+/** When the tool switches itself to a mode we don't know (e.g. Claude's dontAsk), show its raw name */
 export function permLabel(mode?: string | null) {
   return getPermModesList().find((m) => m[0] === (mode || 'default'))?.[1] ?? mode!;
 }
@@ -216,18 +216,18 @@ export function Composer({
   const key = `${hostId}::${info.id}`;
   const [, lang] = useLang();
   const [text, setText] = useState('');
-  /** 正在发送的是哪个会话的消息：发送中切到别的会话，那边的输入框不该转圈，回来后也要按发送结果处理 */
+  /** Which session's message is being sent: if we switch sessions mid-send, the other input box shouldn't spin, and coming back must still handle the result */
   const [sendingKey, setSendingKey] = useState<string | null>(null);
   const sending = sendingKey === key;
-  /** 正在传到主机上的文件（session.attachFile 还没回来），输入框上方显示进度，发送要等它们传完 */
+  /** Files being sent to the host (session.attachFile hasn't returned); progress is shown above the input box and sending waits for them */
   const [uploads, setUploads] = useState<Upload[]>([]);
   const pendingUploads = useRef(new Set<Promise<void>>());
-  /** 点了取消的上传：传完手上这一块就停下，删掉主机上已经传的部分 */
+  /** Uploads that were cancelled: stop after the current chunk and delete what was already uploaded to the host */
   const cancelledUploads = useRef(new Set<number>());
-  /** 上传任务（含取消了还在收尾的）结束时加一，让等着发送的 effect 重新检查 */
+  /** Incremented when an upload task (including cancelled ones still cleaning up) finishes, so the effect waiting to send re-checks */
   const [uploadsDone, setUploadsDone] = useState(0);
   const hostKind = useStore((s) => s.hosts.find((h) => h.config.id === hostId)?.config.kind);
-  /** 上传期间按了发送：传完自动发 */
+  /** Send was pressed during upload: send automatically once uploads finish */
   const [waitSend, setWaitSend] = useState(false);
   const [imgs, setImgs] = useState<Attached[]>([]);
   const [drag, setDrag] = useState(false);
@@ -240,23 +240,23 @@ export function Composer({
   const [files, setFiles] = useState<{ path: string; isDir: boolean }[] | null>(null);
   const ta = useRef<HTMLTextAreaElement>(null);
   const fileInput = useRef<HTMLInputElement>(null);
-  // 手机上「+」先问要图片还是文件：accept=image/* 时系统打开相册（照片选择器），不带 accept 才进文件管理
+  // On mobile, "+" first asks image or file: with accept=image/* the system opens the photo picker; only without accept does it open the file manager
   const imageInput = useRef<HTMLInputElement>(null);
 
   const running = info.status === 'running' || info.status === 'starting' || info.status === 'waiting-permission';
   const busy = info.status === 'running' || info.status === 'waiting-permission';
   const queued = info.queued ?? [];
-  // Claude、Codex 回复中发的消息直接交给工具，它在下一次工具调用后就会读到；其他工具等本轮结束
+  // For Claude and Codex, messages sent mid-reply go straight to the tool, which reads them after its next tool call; other tools wait for the turn to end
   const steer = (info.tool === 'claude' || info.tool === 'codex') && queued.length === 0;
 
   useEffect(() => {
     setImgs([]);
     setWaitSend(false);
   }, [key]);
-  /** 当前显示的是哪个会话（异步回调里判断用户是不是已经切走了） */
+  /** Which session is currently shown (lets async callbacks tell whether the user has switched away) */
   const keyRef = useRef<string | null>(key);
   keyRef.current = key;
-  // 切会话时整个会话页可能重新挂载：卸载后旧实例的回调也要知道「已经不在这个会话了」
+  // Switching sessions may remount the whole session page: callbacks from the unmounted instance also need to know they're "no longer on this session"
   useEffect(() => {
     keyRef.current = key;
     return () => {
@@ -275,11 +275,11 @@ export function Composer({
       if (v) sessionStorage.setItem(`draft-${k}`, v);
       else sessionStorage.removeItem(`draft-${k}`);
     } catch {
-      /* 忽略 */
+      /* ignore */
     }
   };
 
-  // 草稿按会话保存
+  // Drafts are saved per session
   const draftKey = `draft-${key}`;
   useEffect(() => {
     try {
@@ -288,7 +288,7 @@ export function Composer({
       setText('');
     }
   }, [draftKey]);
-  // 刚切换会话的这一次 text 还是上一个会话的，不能存到新会话名下；等读出新草稿的那次渲染再存
+  // Right after switching sessions, text still belongs to the previous session and mustn't be saved under the new one; save from the render that loaded the new draft
   const savedFor = useRef(draftKey);
   useEffect(() => {
     if (savedFor.current !== draftKey) {
@@ -299,7 +299,7 @@ export function Composer({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [text, draftKey]);
 
-  // 工作区文件里「添加到对话」：把 @路径 接到草稿末尾
+  // "Add to chat" from the workspace files: append @path to the end of the draft
   useEffect(() => {
     const onInsert = (e: Event) => {
       const d = (e as CustomEvent<{ sessionId: string; text: string }>).detail;
@@ -317,7 +317,7 @@ export function Composer({
     return () => window.removeEventListener(INSERT_COMPOSER, onInsert);
   }, [info.id]);
 
-  // ---------- / 和 @ 弹出菜单 ----------
+  // ---------- / and @ popup menus ----------
   const before = text.slice(0, caret);
   const slash = /^\/(\S*)$/.exec(before);
   const at = slash ? null : /(?:^|\s)@([^\s@]*)$/.exec(before);
@@ -325,7 +325,7 @@ export function Composer({
   const popOpen = !!trigger && trigger !== dismissed && connected;
   useBack(popOpen, () => setDismissed(trigger));
 
-  // 工具的斜杠命令和片段：打出 / 时取一次
+  // The tool's slash commands and snippets: fetched once when / is typed
   useEffect(() => {
     if (!slash) return;
     rpc<SlashCommand[]>(hostId, 'session.commands', { sessionId: info.id })
@@ -335,7 +335,7 @@ export function Composer({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [!!slash, hostId, info.id]);
 
-  // @ 文件：防抖后在会话目录里找
+  // @ files: search the session directory after a debounce
   const atQuery = at?.[1];
   useEffect(() => {
     if (atQuery === undefined) return;
@@ -351,7 +351,7 @@ export function Composer({
     };
   }, [atQuery, hostId, info.cwd]);
 
-  /** 把光标前的触发词换成 rep */
+  /** Replace the trigger word before the cursor with rep */
   const replaceTrigger = (rep: string, keepOpen = false) => {
     const start = caret - trigger.length;
     const next = text.slice(0, start) + rep + text.slice(caret);
@@ -451,8 +451,8 @@ export function Composer({
     listRef.current?.querySelector('.active')?.scrollIntoView({ block: 'nearest' });
   }, [sel]);
 
-  // ---------- 发送 ----------
-  /** 在光标处插入文字（前后补空格） */
+  // ---------- Sending ----------
+  /** Insert text at the cursor (padding with spaces on both sides) */
   const insertAtCaret = (s: string) => {
     const el = ta.current;
     const a = el?.selectionStart ?? text.length;
@@ -467,7 +467,7 @@ export function Composer({
       setCaret(pos);
     });
   };
-  /** 图片作为图片发；其他文件存到主机上这个会话的上传目录，插入 @绝对路径 引用 */
+  /** Images are sent as images; other files are saved to this session's upload directory on the host and inserted as an @absolute-path reference */
   const attach = (fs: Iterable<File>) => {
     const job = attachNow(Array.from(fs));
     pendingUploads.current.add(job);
@@ -476,7 +476,7 @@ export function Composer({
       setUploadsDone((n) => n + 1);
     });
   };
-  /** 分块传一个文件，返回主机上的路径；取消了返回 null。中途取消或出错都删掉已经传上去的部分 */
+  /** Upload one file in chunks and return its path on the host; returns null if cancelled. On cancel or error, delete whatever was already uploaded */
   const uploadFile = async (f: File, up: Upload): Promise<string | null> => {
     const sid = info.id;
     let path = '';
@@ -502,14 +502,14 @@ export function Composer({
   const cancelUpload = (id: number) => {
     cancelledUploads.current.add(id);
     setUploads((l) => l.filter((x) => x.id !== id));
-    // 之前按了发送在等上传：取消后不自动发，剩下的内容让用户自己决定
+    // Send was pressed earlier and is waiting for uploads: after a cancel, don't send automatically; let the user decide about what's left
     setWaitSend(false);
   };
   const attachNow = async (fs: File[], local?: (string | undefined)[]) => {
     const from = key;
     const refs: string[] = [];
     for (const [i, f] of fs.entries()) {
-      // 本机文件：直接引用原文件，不用传
+      // Local file: reference the original directly, no upload needed
       const at = local?.[i];
       if (at) {
         refs.push(refOf(at));
@@ -536,12 +536,12 @@ export function Composer({
     if (!refs.length) return;
     if (keyRef.current === from) insertAtCaret(refs.join(''));
     else {
-      // 传的过程中切到了别的会话：引用接到原会话的草稿末尾
+      // Switched to another session during upload: append the reference to the original session's draft
       const d = draftOf(from);
       setDraftOf(from, d + (d && !/\s$/.test(d) ? ' ' : '') + refs.join(''));
     }
   };
-  /** 粘贴文件：本机会话里，剪贴板上本机文件的非图片部分直接引用路径，其他照常处理 */
+  /** Pasting files: in a local session, non-image local files on the clipboard are referenced by path; everything else is handled as usual */
   const pasteFiles = (fs: File[]) => {
     const job = (async () => {
       const others = fs.filter((f) => !IMAGE_TYPES.includes(f.type));
@@ -557,14 +557,14 @@ export function Composer({
   };
 
   const send = async () => {
-    // 还有文件在传：先转圈，传完（引用插进输入框后）由下面的 effect 再调 send
+    // Files still uploading: spin for now; once done (and the references are in the input box) the effect below calls send again
     if (pendingUploads.current.size) {
       setWaitSend(true);
       return;
     }
     const t = text.trim();
     if ((!t && imgs.length === 0) || sending) return;
-    // 直接打 /clear 回车（没从菜单里选）也走 Yi Console 的清空，不发给工具
+    // Typing /clear and pressing Enter (without picking from the menu) also uses Yi Console's clear, not sent to the tool
     if (t === '/clear' && imgs.length === 0 && info.mode !== 'terminal') {
       setText('');
       clearSession(hostId, info);
@@ -577,10 +577,10 @@ export function Composer({
         sessionId: info.id,
         text: t,
         images: imgs.map((i) => ({ mimeType: i.mimeType, data: i.data })),
-        // 这一轮还没结束时：Claude、Codex 由工具在下一步读到，其他工具排队到本轮结束
+        // Turn still running: Claude and Codex read it at their next step; other tools queue it until the turn ends
         queue: true,
       });
-      // 发出去了才清空。发送中切到了别的会话：只清原会话的草稿，不动现在这个会话的输入框
+      // Only clear once sent. If we switched sessions mid-send, only clear the original session's draft and leave the current input box alone
       if (keyRef.current === from) {
         setText((cur) => (cur.trim() === t ? '' : cur));
         setImgs([]);
@@ -596,7 +596,7 @@ export function Composer({
 
   useEffect(() => {
     if (!waitSend || uploads.length || pendingUploads.current.size) return;
-    // 等 attach 把引用插进 text 的那次渲染之后再发
+    // Send in the render after attach has inserted the references into text
     const h = requestAnimationFrame(() => {
       setWaitSend(false);
       send();
@@ -609,7 +609,7 @@ export function Composer({
     try {
       const r = await rpc<{ text: string }>(hostId, 'session.queue', { sessionId: info.id, id, action });
       if (action === 'remove') {
-        // 撤回的放回输入框，方便改了再发
+        // Recalled messages go back into the input box so they can be edited and resent
         setText((t) => (t.trim() ? `${t}\n${r.text}` : r.text));
         ta.current?.focus();
       }
@@ -658,7 +658,7 @@ export function Composer({
       cyclePerm();
       return;
     }
-    // 输入框是空的时按 ↑：把最后一条排队的消息撤回来改
+    // ↑ in an empty input box: recall the last queued message for editing
     if (e.key === 'ArrowUp' && !text && queued.length > 0) {
       e.preventDefault();
       queueAction(queued[queued.length - 1].id, 'remove');
@@ -670,7 +670,7 @@ export function Composer({
     }
   };
 
-  // 手机上按实际排版的行数长高（长句自动折行也算），最多 6 行、也不超过可见高度的 35%（弹出输入法时更矮），再多就在框里滚动
+  // On mobile, grow with the actual number of laid-out lines (including wrapped long lines), up to 6 lines and at most 35% of the visible height (less when the IME is open); beyond that, scroll inside the box
   const [mobH, setMobH] = useState(0);
   useLayoutEffect(() => {
     const el = ta.current;
@@ -719,7 +719,7 @@ export function Composer({
         onDrop={(e) => {
           e.preventDefault();
           setDrag(false);
-          // 从文件面板拖进来的：插入 @相对路径
+          // Dragged in from the file panel: insert @relative-path
           const ref = e.dataTransfer.getData(DRAG_REF);
           if (ref) {
             window.dispatchEvent(new CustomEvent(INSERT_COMPOSER, { detail: { sessionId: info.id, text: ref } }));
@@ -806,14 +806,14 @@ export function Composer({
             onBlur={() => setTimeout(() => setDismissed(trigger), 150)}
             onFocus={() => setDismissed('')}
             onPaste={(e) => {
-              // 系统里复制的文件（资源管理器 Ctrl+C）、截图：图片附上，其他文件引用
+              // Files copied in the system (Ctrl+C in Explorer) and screenshots: attach images, reference other files
               const fs = Array.from(e.clipboardData.files);
               if (fs.length) {
                 e.preventDefault();
                 pasteFiles(fs);
                 return;
               }
-              // 文件面板里「复制」的文件：粘贴成 @引用
+              // Files copied from the file panel: paste as an @reference
               const plain = e.clipboardData.getData('text/plain');
               if (copiedRef && plain === copiedRef.plain) {
                 e.preventDefault();

@@ -1,4 +1,4 @@
-//! 文件浏览：列目录、读文件，以及会话侧栏里的写文件、新建、重命名、删除。
+//! File browsing: list directories, read files, plus writing, creating, renaming and deleting from the session's file panel.
 
 use anyhow::{bail, Result};
 use yi_proto::DirEntry;
@@ -6,12 +6,12 @@ use serde_json::{json, Value};
 use std::io::{Read, Seek, SeekFrom};
 
 const MAX_READ: u64 = 1024 * 1024;
-/// 文件侧栏预览图片的上限
+/// Size limit for image previews in the file panel
 const MAX_IMAGE: u64 = 10 * 1024 * 1024;
 
 pub fn list(path: &str, show_hidden: bool) -> Result<Value> {
     let dir = crate::paths::expand(path);
-    // 去掉 canonicalize 加的 \\?\ 前缀再列，否则子项路径都带前缀，前端和根目录、git 路径对不上
+    // Strip the \\?\ prefix canonicalize adds before listing, otherwise every child path carries it and the frontend can't match it against the root and git paths
     let dir = dir.canonicalize().map(|p| std::path::PathBuf::from(strip_verbatim(&p.display().to_string()))).unwrap_or(dir);
     let mut entries = vec![];
     for e in std::fs::read_dir(&dir)?.flatten() {
@@ -23,7 +23,7 @@ pub fn list(path: &str, show_hidden: bool) -> Result<Value> {
             Ok(m) => m,
             Err(_) => continue,
         };
-        // 跟随符号链接判断是否目录
+        // Follow symlinks to decide whether it's a directory
         let is_dir = std::fs::metadata(e.path()).map(|m| m.is_dir()).unwrap_or(meta.is_dir());
         entries.push(DirEntry {
             path: e.path().display().to_string(),
@@ -51,7 +51,7 @@ pub fn list(path: &str, show_hidden: bool) -> Result<Value> {
     }))
 }
 
-/// 读文件；tail 为 true 时文件太大就读最后一段（看日志用）
+/// Read a file; with tail true, read only the last part of files that are too large (for viewing logs)
 pub fn read(path: &str, tail: bool) -> Result<Value> {
     let p = crate::paths::expand(path);
     let meta = std::fs::metadata(&p)?;
@@ -75,10 +75,10 @@ pub fn read(path: &str, tail: bool) -> Result<Value> {
     }))
 }
 
-/// 读图片：整个文件转 base64，超过 10MB 不读。
-/// `strict`（对话回复里引用的图片）按文件头确认真是图片，不是就拒绝：
-/// 路径来自模型输出，免得回复里写个 `![](~/.ssh/id_rsa)` 就把私钥读走。
-/// `probe` 只回大小和类型、不读内容，远程主机下载前给用户确认用
+/// Read an image: the whole file as base64, refusing anything over 10MB.
+/// `strict` (images referenced in chat replies) checks the file header to confirm it really is an image and refuses otherwise:
+/// the path comes from model output, and a reply containing `![](~/.ssh/id_rsa)` mustn't be able to read the private key.
+/// `probe` only returns size and type without reading the content, for asking the user before downloading from a remote host
 pub fn read_image(path: &str, strict: bool, probe: bool) -> Result<Value> {
     use base64::Engine;
     let p = crate::paths::expand(path);
@@ -119,7 +119,7 @@ pub fn read_image(path: &str, strict: bool, probe: bool) -> Result<Value> {
     }))
 }
 
-/// 按文件头认图片格式：PNG / JPEG / GIF / WebP / BMP / ICO / SVG
+/// Recognize image formats by file header: PNG / JPEG / GIF / WebP / BMP / ICO / SVG
 fn sniff_image(h: &[u8]) -> Option<&'static str> {
     if h.starts_with(b"\x89PNG\r\n\x1a\n") {
         return Some("image/png");
@@ -139,7 +139,7 @@ fn sniff_image(h: &[u8]) -> Option<&'static str> {
     if h.starts_with(&[0, 0, 1, 0]) && h.len() >= 6 {
         return Some("image/x-icon");
     }
-    // SVG 是文本：去掉 BOM 和空白后，开头是 <svg，或者 <?xml / 注释 / DOCTYPE 后面跟着 <svg
+    // SVG is text: after stripping BOM and whitespace it starts with <svg, or with <?xml / a comment / DOCTYPE followed by <svg
     let t = String::from_utf8_lossy(h);
     let t = t.trim_start_matches('\u{feff}').trim_start();
     if t.starts_with("<svg") || ((t.starts_with("<?xml") || t.starts_with("<!--") || t.starts_with("<!DOCTYPE svg")) && t.contains("<svg")) {
@@ -148,12 +148,12 @@ fn sniff_image(h: &[u8]) -> Option<&'static str> {
     None
 }
 
-/// 下载、PDF 预览这类要原样拿到文件内容的，上限 50MB（base64 后 JSON 里约 67MB）
+/// Limit for things that need the raw file content, like downloads and PDF previews: 50MB (about 67MB in JSON after base64)
 pub(crate) const MAX_RAW: u64 = 50 * 1024 * 1024;
 
-/// 原样读整个文件，返回 base64（下载、PDF 预览）。
-/// 带 root 时（网页预览）只许读 root 里的文件：解析完符号链接再比，
-/// 免得仓库里放一个指向 ~/.ssh 的链接，预览页的脚本就能把它读走
+/// Read a whole file as is and return base64 (downloads, PDF previews).
+/// With root (web previews), only files inside root may be read: compare after resolving symlinks,
+/// so a link to ~/.ssh placed in a repo can't be read by the preview page's scripts
 pub fn read_raw(path: &str, root: Option<&str>) -> Result<Value> {
     use base64::Engine;
     let mut p = crate::paths::expand(path);
@@ -163,7 +163,7 @@ pub fn read_raw(path: &str, root: Option<&str>) -> Result<Value> {
         if !real.starts_with(&root) {
             bail!("不能读取预览目录以外的文件");
         }
-        // 读解析后的路径，检查完之后链接再被换掉也没用
+        // Read the resolved path, so swapping the link after the check doesn't help
         p = real;
     }
     let meta = std::fs::metadata(&p)?;
@@ -182,7 +182,7 @@ pub fn read_raw(path: &str, root: Option<&str>) -> Result<Value> {
     }))
 }
 
-/// 上传：把 base64 内容写成文件（拖文件进文件树）。已存在且 overwrite 为 false 时拒绝
+/// Upload: write base64 content to a file (files dropped onto the file tree). Refuses if it exists and overwrite is false
 pub fn upload(path: &str, data: &str, overwrite: bool) -> Result<Value> {
     use base64::Engine;
     let p = crate::paths::expand(path);
@@ -208,7 +208,7 @@ pub fn upload(path: &str, data: &str, overwrite: bool) -> Result<Value> {
     Ok(json!({ "path": p.display().to_string(), "size": m.len(), "modified": mtime(&m) }))
 }
 
-/// 用系统默认程序打开，或在文件管理器里显示（只给本机客户端用）
+/// Open with the system default program, or reveal in the file manager (local clients only)
 pub fn open_native(path: &str, reveal: bool) -> Result<Value> {
     let p = crate::paths::expand(path);
     if !p.exists() {
@@ -222,7 +222,7 @@ pub fn open_native(path: &str, reveal: bool) -> Result<Value> {
             cmd = std::process::Command::new("explorer");
             cmd.arg(format!("/select,{}", p.display()));
         } else {
-            // start 的第一个带引号参数是窗口标题，所以先给个空标题
+            // start treats its first quoted argument as the window title, so pass an empty title first
             cmd = std::process::Command::new("cmd");
             cmd.args(["/c", "start", ""]).arg(&p);
             cmd.creation_flags(0x0800_0000);
@@ -248,8 +248,8 @@ pub fn open_native(path: &str, reveal: bool) -> Result<Value> {
     Ok(Value::Null)
 }
 
-/// 内容搜索：在 root 下（git 仓库按 git ls-files）逐个文件找包含 query 的行。
-/// 跳过二进制和超过 2MB 的文件；每行只取前 300 个字符，最多 limit 条
+/// Content search: under root (git ls-files in a git repo), find lines containing query file by file.
+/// Skips binaries and files over 2MB; keeps only the first 300 characters of each line, at most limit hits
 pub fn grep(root: &str, query: &str, case_sensitive: bool, whole_word: bool, limit: usize) -> Result<Value> {
     let dir = crate::paths::expand(root);
     if !dir.is_dir() {
@@ -266,7 +266,7 @@ pub fn grep(root: &str, query: &str, case_sensitive: bool, whole_word: bool, lim
     let mut matched_files = 0usize;
     let mut truncated = false;
     'files: for rel in files.iter() {
-        // 文件很多时别让一次搜索卡太久
+        // Don't let a single search hang for too long when there are many files
         if started.elapsed() > std::time::Duration::from_secs(8) {
             truncated = true;
             break;
@@ -303,11 +303,11 @@ pub fn grep(root: &str, query: &str, case_sensitive: bool, whole_word: bool, lim
                 }
             }
             let Some(at) = col else { continue };
-            // 列号按字符算，前端按字符高亮；to_lowercase 可能改变字节长度，所以在原行里按字符位置换算
+            // Columns are counted in characters and the frontend highlights by character; to_lowercase may change byte lengths, so convert by character position in the original line
             let ch = hay[..at].chars().count();
             let qlen = q.chars().count();
             let chars: Vec<char> = line.chars().collect();
-            // 命中处太靠后时截掉前面一段，保证命中词能显示出来
+            // When the match is far into the line, cut off the beginning so the match stays visible
             let start = ch.saturating_sub(60);
             let shown: String = chars[start..].iter().take(300).collect();
             hits.push(json!({
@@ -340,8 +340,8 @@ fn mtime(meta: &std::fs::Metadata) -> i64 {
         .unwrap_or(0)
 }
 
-/// 写文件。expect_modified / expect_size 是读的时候拿到的修改时间和大小：任一对不上说明期间被别人
-/// （比如 agent）改过，拒绝覆盖。只比修改时间会漏掉同一毫秒内的改动、或被工具保留了 mtime 的改动
+/// Write a file. expect_modified / expect_size are the modification time and size seen when reading: if either differs, someone
+/// (e.g. the agent) changed it in between, so refuse to overwrite. Comparing mtime alone misses changes within the same millisecond, or changes where a tool preserved mtime
 pub fn write(
     path: &str,
     content: &str,
@@ -385,7 +385,7 @@ pub fn rename(from: &str, to: &str) -> Result<Value> {
     Ok(json!({ "path": b.display().to_string() }))
 }
 
-/// 删除文件或空文件夹；非空文件夹不删，免得误操作丢一大片
+/// Delete a file or empty folder; non-empty folders are refused, so a slip can't wipe out a whole tree
 pub fn delete(path: &str) -> Result<Value> {
     let p = crate::paths::expand(path);
     let m = std::fs::symlink_metadata(&p)?;
@@ -400,7 +400,7 @@ pub fn delete(path: &str) -> Result<Value> {
     Ok(Value::Null)
 }
 
-/// 可浏览的根：Windows 上是存在的盘符，其他系统只有 /
+/// Browsable roots: existing drive letters on Windows, just / elsewhere
 pub fn roots() -> Value {
     #[cfg(windows)]
     {
@@ -414,24 +414,24 @@ pub fn roots() -> Value {
     json!(["/"])
 }
 
-/// Windows canonicalize 会加 `\\?\` 前缀，展示时去掉
+/// Windows canonicalize adds a `\\?\` prefix; strip it for display
 fn strip_verbatim(s: &str) -> String {
     match s.strip_prefix(r"\\?\") {
-        // 只去掉盘符路径的前缀；\\?\UNC\server\share 改回 \\server\share
+        // Only strip the prefix from drive-letter paths; \\?\UNC\server\share becomes \\server\share again
         Some(r) if r.as_bytes().get(1) == Some(&b':') => r.to_string(),
         Some(r) if r.starts_with(r"UNC\") => format!(r"\\{}", &r[4..]),
         _ => s.to_string(),
     }
 }
 
-/// 目录下的文件列表缓存：(根目录, 取的时间, 相对路径列表)
+/// Cache of file lists under a directory: (root, time fetched, relative paths)
 static FILE_CACHE: std::sync::Mutex<Option<(String, std::time::Instant, std::sync::Arc<Vec<String>>)>> =
     std::sync::Mutex::new(None);
 
 const SKIP_DIRS: [&str; 9] = [".git", "node_modules", "target", "dist", "build", ".venv", "__pycache__", ".next", ".gradle"];
 const MAX_FILES: usize = 50_000;
 
-/// 列出 root 下的文件（相对路径，/ 分隔）。git 仓库用 git ls-files（遵守 .gitignore），否则自己遍历
+/// List files under root (relative paths, /-separated). git repos use git ls-files (respecting .gitignore); otherwise walk the tree ourselves
 fn file_list(root: &std::path::Path) -> std::sync::Arc<Vec<String>> {
     let key = root.display().to_string();
     if let Some((k, t, v)) = FILE_CACHE.lock().unwrap().as_ref() {
@@ -490,7 +490,7 @@ fn walk_files(root: &std::path::Path) -> Vec<String> {
     out
 }
 
-/// 模糊匹配打分：文件名包含 > 路径包含 > 按顺序出现的字符；越短越靠前。不匹配返回 None
+/// Fuzzy match score: file name contains > path contains > characters in order; shorter ranks higher. None on no match
 fn score(path: &str, q: &str) -> Option<i64> {
     let p = path.to_lowercase();
     let name = p.rsplit('/').next().unwrap_or(&p);
@@ -511,7 +511,7 @@ fn score(path: &str, q: &str) -> Option<i64> {
     Some(1000 - len)
 }
 
-/// 输入框 @ 文件：在 root 下按名字模糊找文件和目录
+/// @ files in the input box: fuzzy-find files and directories by name under root
 pub fn search(root: &str, query: &str, limit: usize) -> Result<Value> {
     let dir = crate::paths::expand(root);
     if !dir.is_dir() {
@@ -519,7 +519,7 @@ pub fn search(root: &str, query: &str, limit: usize) -> Result<Value> {
     }
     let files = file_list(&dir);
     let q = query.trim().to_lowercase().replace('\\', "/");
-    // 目录从文件路径里推出来
+    // Directories are derived from the file paths
     let mut dirs: std::collections::BTreeSet<&str> = Default::default();
     for f in files.iter() {
         let mut p = f.as_str();
@@ -532,7 +532,7 @@ pub fn search(root: &str, query: &str, limit: usize) -> Result<Value> {
     }
     let mut hits: Vec<(i64, &str, bool)> = vec![];
     if q.is_empty() {
-        // 没输入时给顶层的目录和文件
+        // With no input, return top-level directories and files
         hits.extend(dirs.iter().filter(|d| !d.contains('/')).map(|d| (0, *d, true)));
         hits.extend(files.iter().filter(|f| !f.contains('/')).map(|f| (0, f.as_str(), false)));
     } else {
@@ -580,7 +580,7 @@ mod tests {
         assert!(r["base64"].as_str().unwrap().len() > 0);
         assert!(read_image(key.to_str().unwrap(), true, false).is_err());
         assert!(read_image(key.to_str().unwrap(), true, true).is_err());
-        // 文件面板原来的调用不校验
+        // The file panel's original calls aren't checked
         assert!(read_image(key.to_str().unwrap(), false, false).is_ok());
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -599,7 +599,7 @@ mod tests {
         let p = f.to_str().unwrap();
         let r = write(p, "abc", None, None, false).unwrap();
         let (t, n) = (r["modified"].as_i64().unwrap(), r["size"].as_u64().unwrap());
-        // 修改时间一样、大小变了（同一毫秒内被改，或改动保留了 mtime）也要拦下
+        // Same mtime but a different size (changed within the same millisecond, or the change preserved mtime) must be stopped too
         std::fs::write(&f, "abcdef").unwrap();
         let mtime_now = mtime(&std::fs::metadata(&f).unwrap());
         assert!(write(p, "x", Some(mtime_now), Some(n), false).is_err());
@@ -638,13 +638,13 @@ mod tests {
         let root = site.to_str().unwrap();
         let rd = |rel: &str| read_raw(site.join(rel).to_str().unwrap(), Some(root));
         assert!(rd("css/a.css").is_ok());
-        // 指向目录里面的链接可以
+        // Links pointing inside the directory are fine
         assert!(rd("b.css").is_ok());
-        // 指到外面的文件、经过指到外面的目录，都拒绝
+        // Files pointing outside, or paths through directories pointing outside, are refused
         assert!(rd("x.txt").is_err());
         assert!(rd("up/secret.txt").is_err());
         assert!(read_raw(secret.to_str().unwrap(), Some(root)).is_err());
-        // 根目录本身是链接也照常
+        // The root itself being a link works as usual
         let link_root = d.path().join("site-link");
         std::os::unix::fs::symlink(&site, &link_root).unwrap();
         let p = link_root.join("css/a.css");

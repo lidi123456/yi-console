@@ -1,4 +1,4 @@
-//! 与 yi-agentd 的 JSON-RPC 连接（按行 JSON），与具体传输（stdio / SSH channel / 中继）无关。
+//! JSON-RPC connection to yi-agentd (line-delimited JSON), independent of the transport (stdio / SSH channel / relay).
 
 use anyhow::{anyhow, Result};
 use yi_proto::{Message, Notification, Request};
@@ -58,7 +58,7 @@ impl RpcConn {
                     _ => {}
                 }
             }
-            // 连接断了：所有等待中的请求都失败
+            // Connection lost: fail every pending request
             for (_, tx) in p2.lock().unwrap().drain() {
                 let _ = tx.send(Err("连接已断开".into()));
             }

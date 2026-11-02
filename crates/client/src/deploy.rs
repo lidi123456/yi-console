@@ -1,4 +1,4 @@
-//! 远程部署 yi-agentd：探测平台 → SFTP 上传对应二进制 → 可选注册自启服务。
+//! Remote deployment of yi-agentd: detect platform → upload the matching binary over SFTP → optionally register an autostart service.
 
 use crate::ssh::SshSession;
 use anyhow::{anyhow, bail, Result};
@@ -19,7 +19,7 @@ impl Platform {
         self.os == "windows"
     }
 
-    /// 远程 yi-agentd 的路径（相对家目录，SFTP 默认就在家目录）
+    /// Path of the remote yi-agentd (relative to home; SFTP starts in the home directory)
     pub fn rel_path(&self) -> &'static str {
         if self.is_windows() {
             ".yi-console/bin/yi-agentd.exe"
@@ -59,7 +59,7 @@ pub async fn detect(s: &SshSession) -> Result<Platform> {
             yi_agentd_present: out.stdout.contains("YI_AGENTD_OK"),
         });
     }
-    // Windows OpenSSH 默认 shell 是 cmd
+    // The default shell of Windows OpenSSH is cmd
     let out = s
         .exec(r#"echo WIN %PROCESSOR_ARCHITECTURE% & if exist "%USERPROFILE%\.yi-console\bin\yi-agentd.exe" echo YI_AGENTD_OK"#)
         .await?;
@@ -79,7 +79,7 @@ pub async fn detect(s: &SshSession) -> Result<Platform> {
     bail!("无法识别远程系统（uname 输出：{first}）")
 }
 
-/// 客户端随附的 yi-agentd 二进制：<dir>/yi-agentd-<os>-<arch>[.exe]
+/// yi-agentd binaries shipped with the client: <dir>/yi-agentd-<os>-<arch>[.exe]
 pub fn local_binary(dir: Option<&Path>, os: &str, arch: &str) -> Option<PathBuf> {
     let name = format!(
         "yi-agentd-{os}-{arch}{}",
@@ -95,7 +95,7 @@ pub fn local_binary(dir: Option<&Path>, os: &str, arch: &str) -> Option<PathBuf>
     cands.into_iter().find(|p| p.is_file())
 }
 
-/// 上传（或升级）yi-agentd。先写临时文件再改名，运行中的旧进程不受影响。
+/// Upload (or upgrade) yi-agentd. Writes a temp file and renames it, so a running old process is unaffected.
 pub async fn upload(s: &SshSession, p: &Platform, local: &Path, progress: impl Fn(u64, u64)) -> Result<()> {
     let data = tokio::fs::read(local).await?;
     let sftp = s.sftp().await?;
@@ -124,7 +124,7 @@ pub async fn upload(s: &SshSession, p: &Platform, local: &Path, progress: impl F
         sftp.set_metadata(&tmp, attrs).await?;
     }
     if sftp.try_exists(target).await.unwrap_or(false) {
-        // Windows 不能覆盖运行中的 exe，但可以改名
+        // Windows can't overwrite a running exe, but can rename it
         let old = format!("{target}.old");
         let _ = sftp.remove_file(&old).await;
         sftp.rename(target, &old).await?;

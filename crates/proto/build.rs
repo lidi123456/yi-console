@@ -1,4 +1,4 @@
-//! 版本号带上提交号：同一个 0.1.0 下守护进程和客户端不是同一次构建时也能看出来，提示重启
+//! Include the commit hash in the version: even under the same 0.1.0, it shows when the daemon and client come from different builds, prompting a restart
 
 use std::path::Path;
 use std::process::Command;
@@ -14,9 +14,9 @@ fn main() {
     });
     let build = sha.map(|s| s.chars().take(7).collect()).unwrap_or_else(|| "dev".to_string());
     println!("cargo:rustc-env=YI_CONSOLE_BUILD={build}");
-    // 构建时间：用来判断两端谁更新（提交号比不出先后），同一份源码编出的客户端和各平台 yi-agentd 必须一致。
-    // 干净的 git 工作区用提交时间；有未提交改动或没有 git（拷源码构建）时用 crates 下源码最新的修改时间，
-    // 不能用编译时的当前时间：客户端和各平台 yi-agentd 分几次编译，时间各不相同，升级完也对不上
+    // Build time: used to tell which side is newer (commit hashes have no order); the client and every platform's yi-agentd built from the same sources must agree.
+    // A clean git working tree uses the commit time; with uncommitted changes or no git (building from copied sources), use the latest modification time of sources under crates.
+    // The current time at compile time won't do: the client and each platform's yi-agentd are compiled separately at different times and would never match after an upgrade
     let dirty = Command::new("git")
         .args(["status", "--porcelain", "--untracked-files=no"])
         .output()
@@ -31,8 +31,8 @@ fn main() {
         let t = String::from_utf8_lossy(&o.stdout).trim().to_string();
         (o.status.success() && !t.is_empty()).then_some(t)
     };
-    // CI 显式给出（提交时间）：Linux 的 yi-agentd 在 cross 的容器里编译，容器里不一定能跑 git，
-    // 退回源码修改时间就会和其他平台的构建对不上
+    // Given explicitly by CI (commit time): the Linux yi-agentd is compiled in a cross container where git may not run,
+    // and falling back to source modification times wouldn't match the other platforms' builds
     println!("cargo:rerun-if-env-changed=YI_CONSOLE_BUILD_TIME");
     let time = std::env::var("YI_CONSOLE_BUILD_TIME")
         .ok()
@@ -42,7 +42,7 @@ fn main() {
     println!("cargo:rustc-env=YI_CONSOLE_BUILD_TIME={time}");
 }
 
-/// 目录下 .rs / .toml 文件最新的修改时间（秒），跳过 target
+/// Latest modification time (seconds) of .rs / .toml files under a directory, skipping target
 fn newest_mtime(dir: &Path) -> u64 {
     let Ok(rd) = std::fs::read_dir(dir) else { return 0 };
     rd.flatten()

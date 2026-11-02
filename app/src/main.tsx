@@ -11,9 +11,9 @@ import { openMenu } from './components/Overlay';
 import { writeClipboard } from './clipboard';
 import { tr } from './i18n';
 
-// 页面里的链接（AI 回复、Markdown 预览等）一律不在应用窗口里跳转：外部网址用系统浏览器打开，
-// 其他（相对路径、file: 等）直接拦下，否则整个应用会被换成那个页面。
-// 组件自己处理了的点击（preventDefault 过，比如 Markdown 预览里的相对链接）不管；带 download 的是下载
+// Links in the page (AI replies, Markdown preview, etc.) never navigate inside the app window: external URLs open in the system browser,
+// anything else (relative paths, file:, etc.) is blocked, otherwise the whole app would be replaced by that page.
+// Clicks components already handled (preventDefault, e.g. relative links in the Markdown preview) are left alone; links with download are downloads
 function guardLink(e: MouseEvent) {
   if (e.defaultPrevented || (e.type === 'auxclick' && e.button !== 1)) return;
   const a = (e.target as Element | null)?.closest?.('a[href]') as HTMLAnchorElement | null;
@@ -26,7 +26,7 @@ function guardLink(e: MouseEvent) {
 document.addEventListener('click', guardLink);
 document.addEventListener('auxclick', guardLink);
 
-// 链接上右键（手机上是长按）：打开、换别的浏览器打开、复制链接。先于全局的编辑菜单处理
+// Right-click on a link (long press on mobile): open, open in another browser, copy link. Handled before the global edit menu
 function linkMenu(e: MouseEvent) {
   if (e.defaultPrevented) return;
   const a = (e.target as Element | null)?.closest?.('a[href]') as HTMLAnchorElement | null;

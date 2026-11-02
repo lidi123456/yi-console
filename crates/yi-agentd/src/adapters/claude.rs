@@ -1,5 +1,5 @@
-//! Claude Code 适配器：`claude -p --input-format stream-json --output-format stream-json`
-//! 加 `--permission-prompt-tool stdio`，权限请求以 control_request(can_use_tool) 的形式回到 stdin/stdout。
+//! Claude Code adapter: `claude -p --input-format stream-json --output-format stream-json`
+//! plus `--permission-prompt-tool stdio`, so permission requests come back over stdin/stdout as control_request(can_use_tool).
 
 use super::{summarize_input, AdapterCmd, JsonProc, Prompt, StartSpec};
 use crate::hub::Emitter;
@@ -40,7 +40,7 @@ pub fn build_args(spec: &StartSpec) -> Vec<String> {
         a.push("--permission-mode".into());
         a.push(pm.into());
     }
-    // 用户自己在额外参数里配了就不加，免得两个同名参数谁覆盖谁说不清
+    // Don't add it if the user already set it in extra args, otherwise it's unclear which of two identical flags wins
     if !spec.extra_args.iter().any(|x| x == "--append-system-prompt" || x.starts_with("--append-system-prompt=")) {
         a.push("--append-system-prompt".into());
         a.push(super::IMAGE_HINT.into());
@@ -49,8 +49,8 @@ pub fn build_args(spec: &StartSpec) -> Vec<String> {
     a
 }
 
-/// 我们的模式名 -> Claude 的；default 不传参数。
-/// Claude 自己切过去、我们不认识的模式（如 dontAsk）原样带回去，恢复会话时不丢
+/// Our mode names -> Claude's; default passes no argument.
+/// Modes Claude switched to itself that we don't know (e.g. dontAsk) are passed back as is, so they survive a resume
 fn permission_mode(m: &str) -> Option<&str> {
     match m {
         "" | "default" => None,
@@ -67,7 +67,7 @@ fn from_claude_mode(m: &str) -> &str {
     }
 }
 
-/// initialize 返回的 commands：[{name, description, argumentHint}]
+/// commands returned by initialize: [{name, description, argumentHint}]
 fn parse_commands(r: &Value) -> Vec<SlashCommand> {
     r["commands"]
         .as_array()
@@ -87,13 +87,13 @@ fn parse_commands(r: &Value) -> Vec<SlashCommand> {
 struct PendingPerm {
     input: Value,
     suggestions: Value,
-    /// AskUserQuestion 的问题，回答时按问题原文填 answers
+    /// AskUserQuestion questions; answers are filled in keyed by the question text
     questions: Vec<Question>,
 }
 
 #[derive(Default)]
 struct State {
-    /// 正在压缩：Claude 压缩期间每 30 秒左右重发一次 status=compacting，只记第一次
+    /// Compacting: Claude resends status=compacting about every 30 s while compacting; only record the first
     compacting: bool,
     ready: bool,
     queue: Vec<Prompt>,
@@ -102,11 +102,11 @@ struct State {
     perms: HashMap<String, PendingPerm>,
     last_cost: f64,
     req_n: u64,
-    /// 用户点了中断：这一轮的 error_during_execution 不当成错误显示
+    /// The user clicked interrupt: this turn's error_during_execution isn't shown as an error
     interrupting: bool,
-    /// 正在一轮里（发出消息到 result 之间）
+    /// Inside a turn (between sending a message and the result)
     in_turn: bool,
-    /// 后台任务，以 background_tasks_changed 给的列表为准
+    /// Background tasks, per the list from background_tasks_changed
     tasks: Vec<BackgroundTask>,
 }
 
@@ -148,7 +148,7 @@ pub async fn run(spec: StartSpec, em: Emitter, mut rx: mpsc::UnboundedReceiver<A
                         "request":{"subtype":"set_model","model":model}})).await;
                 }
                 Some(AdapterCmd::SetEffort(effort)) => {
-                    // 运行中改设置，下一次请求就用新的等级；null 表示回到默认
+                    // Change settings while running; the next request uses the new level; null means back to default
                     st.req_n += 1;
                     let lvl = if effort.is_empty() { Value::Null } else { json!(effort) };
                     let _ = p.send(&json!({"type":"control_request","request_id":format!("effort{}", st.req_n),
@@ -206,7 +206,7 @@ fn user_msg(p: &Prompt) -> Value {
 fn permission_response(st: &mut State, request_id: &str, option_id: &str, answers: &[QuestionAnswer]) -> Option<Value> {
     let pp = st.perms.remove(request_id)?;
     let response = match option_id {
-        // AskUserQuestion：把回答按"问题原文 -> 答案"填进 answers，工具结果里模型就能看到
+        // AskUserQuestion: fill answers as "question text -> answer", so the model sees them in the tool result
         QUESTION_ANSWER if !pp.questions.is_empty() => {
             let mut map = serde_json::Map::new();
             for q in &pp.questions {
@@ -229,13 +229,13 @@ fn permission_response(st: &mut State, request_id: &str, option_id: &str, answer
         "subtype":"success","request_id":request_id,"response":response}}))
 }
 
-/// 处理一行输出，返回需要写回 stdin 的消息
+/// Handle one line of output; returns messages to write back to stdin
 fn handle(st: &mut State, v: &Value, em: &Emitter) -> Vec<Value> {
     let mut out = vec![];
     match v["type"].as_str().unwrap_or("") {
         "system" => {
             if v["subtype"] == "init" {
-                // 后台任务结束后 Claude 会自己开一轮去处理结果，没有用户消息
+                // After a background task ends, Claude starts a turn on its own to handle the result, with no user message
                 if !st.in_turn {
                     st.in_turn = true;
                     em.status(SessionStatus::Running, None);
@@ -264,7 +264,7 @@ fn handle(st: &mut State, v: &Value, em: &Emitter) -> Vec<Value> {
                     st.compacting = false;
                     em.event(compact_done(&v["compact_metadata"]))
                 }
-                // 压缩开始、失败只在 status 里报（compacting / compact_result）
+                // Compaction start and failure are only reported in status (compacting / compact_result)
                 "status" if v["status"] == "compacting" => {
                     if !std::mem::replace(&mut st.compacting, true) {
                         em.event(compact_event("start"))
@@ -276,7 +276,7 @@ fn handle(st: &mut State, v: &Value, em: &Emitter) -> Vec<Value> {
                 }
                 _ => {}
             }
-            // 审批模式变了（我们切的，或者 Claude 规划完自己退出 plan）
+            // Permission mode changed (switched by us, or Claude leaving plan after planning)
             if let Some(m) = v["permissionMode"].as_str() {
                 em.permission_mode(from_claude_mode(m));
             }
@@ -342,7 +342,7 @@ fn handle(st: &mut State, v: &Value, em: &Emitter) -> Vec<Value> {
             }
         }
         "assistant" => {
-            // 子代理（Task）内部的消息带 parent_tool_use_id，先不展开，避免刷屏
+            // Messages inside a subagent (Task) carry parent_tool_use_id; not expanded for now, to avoid flooding
             if !v["parent_tool_use_id"].is_null() {
                 return out;
             }
@@ -438,7 +438,7 @@ fn handle(st: &mut State, v: &Value, em: &Emitter) -> Vec<Value> {
                     });
                 }
                 _ => {
-                    // hook_callback / mcp_message 等我们没有注册的能力，回空成功
+                    // Capabilities we didn't register (hook_callback / mcp_message, etc.): reply with an empty success
                     out.push(json!({"type":"control_response","response":{
                         "subtype":"success","request_id":rid,"response":{}}}));
                 }
@@ -448,7 +448,7 @@ fn handle(st: &mut State, v: &Value, em: &Emitter) -> Vec<Value> {
             st.in_turn = false;
             let u = &v["usage"];
             let total = v["total_cost_usd"].as_f64().unwrap_or(0.0);
-            // total_cost_usd 是本进程内的累计值，换算成本轮增量
+            // total_cost_usd is cumulative within the process; convert to this turn's increment
             let cost = if total >= st.last_cost {
                 total - st.last_cost
             } else {
@@ -482,7 +482,7 @@ fn handle(st: &mut State, v: &Value, em: &Emitter) -> Vec<Value> {
                 },
                 model: None,
             });
-            // 回合结束后问一下上下文占用
+            // Ask for context usage after the turn ends
             st.req_n += 1;
             out.push(json!({"type":"control_request","request_id":format!("ctx{}", st.req_n),
                 "request":{"subtype":"get_context_usage"}}));
@@ -492,7 +492,7 @@ fn handle(st: &mut State, v: &Value, em: &Emitter) -> Vec<Value> {
     out
 }
 
-/// initialize 响应里的 models
+/// models in the initialize response
 pub fn parse_models(r: &Value) -> Vec<ModelOption> {
     r["models"]
         .as_array()
@@ -523,14 +523,14 @@ fn strings(v: &Value) -> Vec<String> {
         .collect()
 }
 
-/// 空白或只有零宽字符（模型偶尔会输出一长串，界面上就是一条空消息）
+/// Blank or only zero-width characters (models occasionally emit a long run, which shows as an empty message)
 fn is_blank(s: &str) -> bool {
     s.chars()
         .all(|c| c.is_whitespace() || matches!(c, '\u{200b}'..='\u{200d}' | '\u{2060}' | '\u{feff}'))
 }
 
-/// Claude Code 自己的提示：回复被安全机制中断后重试、请求失败重试等。
-/// 不显示的话，界面上只能看到一直在转
+/// Claude Code's own notices: retrying after a reply was interrupted by safety mechanisms, retrying failed requests, etc.
+/// Without showing them, the UI just spins forever
 fn system_notice(v: &Value) -> Option<String> {
     match v["subtype"].as_str()? {
         "informational" => {
@@ -557,7 +557,7 @@ fn compact_event(phase: &str) -> EventBody {
     EventBody::Compact { phase: phase.into(), trigger: None, pre_tokens: None, post_tokens: None, duration_ms: None }
 }
 
-/// compact_boundary 的 compact_metadata：trigger、压缩前后 token 数、耗时
+/// compact_metadata of compact_boundary: trigger, tokens before/after, duration
 fn compact_done(m: &Value) -> EventBody {
     EventBody::Compact {
         phase: "done".into(),
@@ -568,7 +568,7 @@ fn compact_done(m: &Value) -> EventBody {
     }
 }
 
-/// background_tasks_changed 的 tasks 是当前全部后台任务；已有的保留发现时间和输出文件
+/// tasks in background_tasks_changed are all current background tasks; existing ones keep their discovery time and output file
 fn merge_tasks(old: &[BackgroundTask], tasks: &Value, now: i64) -> Vec<BackgroundTask> {
     tasks
         .as_array()
@@ -588,7 +588,7 @@ fn merge_tasks(old: &[BackgroundTask], tasks: &Value, now: i64) -> Vec<Backgroun
         .collect()
 }
 
-/// 后台命令的 tool_result 里写着输出文件：
+/// The tool_result of a background command names the output file:
 /// "Command running in background with ID: xxx. Output is being written to: /path/xxx.output. ..."
 fn set_output_files(tasks: &mut [BackgroundTask], content: &Value) -> bool {
     let mut changed = false;
@@ -615,7 +615,7 @@ fn set_output_files(tasks: &mut [BackgroundTask], content: &Value) -> bool {
     changed
 }
 
-/// 后台任务结束时在对话里留一行
+/// Leave a line in the chat when a background task ends
 fn task_notice(tasks: &[BackgroundTask], v: &Value) -> Option<String> {
     let id = v["task_id"].as_str()?;
     let what = tasks
@@ -634,7 +634,7 @@ fn task_notice(tasks: &[BackgroundTask], v: &Value) -> Option<String> {
     Some(format!("{status}：{what}"))
 }
 
-/// assistant 消息里的一个 content block -> 统一事件（历史导入也复用）
+/// One content block in an assistant message -> unified events (also reused by history import)
 pub fn blocks_to_events(block: &Value, bid: &str) -> Vec<EventBody> {
     match block["type"].as_str().unwrap_or("") {
         "text" => {
@@ -688,7 +688,7 @@ pub fn blocks_to_events(block: &Value, bid: &str) -> Vec<EventBody> {
     }
 }
 
-/// user 消息内容 -> 用户文本 / 工具结果
+/// User message content -> user text / tool results
 pub fn user_content_events(content: &Value) -> Vec<EventBody> {
     if let Some(s) = content.as_str() {
         return vec![EventBody::UserMessage {
@@ -765,7 +765,7 @@ mod tests {
 
     #[test]
     fn background_tasks() {
-        // 实测 stream-json 的格式
+        // Format observed from real stream-json
         let changed = json!([{"task_id":"bheoe6moo","run_id":"r","task_type":"local_bash","description":"Sleep 4 seconds"}]);
         let mut tasks = merge_tasks(&[], &changed, 100);
         assert_eq!(tasks.len(), 1);
@@ -776,7 +776,7 @@ mod tests {
         assert_eq!(tasks[0].output_file.as_deref(), Some("/tmp/claude-0/x/tasks/bheoe6moo.output"));
         assert!(!set_output_files(&mut tasks, &content));
 
-        // 再来一次列表变化：发现时间和输出文件保留
+        // Another list change: discovery time and output file are kept
         let again = merge_tasks(&tasks, &changed, 999);
         assert_eq!(again[0].started_at, 100);
         assert!(again[0].output_file.is_some());
@@ -800,8 +800,8 @@ mod tests {
     }
 }
 
-/// AskUserQuestion 的输入：{questions: [{question, header, options: [{label, description}], multiSelect}]}。
-/// Claude 的界面里每道题都可以选"其他"自己填，这里同样允许
+/// AskUserQuestion input: {questions: [{question, header, options: [{label, description}], multiSelect}]}.
+/// Claude's UI lets every question pick "Other" and type an answer, so allow that here too
 fn ask_questions(input: &Value) -> Vec<Question> {
     input["questions"]
         .as_array()

@@ -1,5 +1,5 @@
-//! ACP（Agent Client Protocol）适配器，用于 `cursor-agent acp`、`kiro-cli acp`、`qodercli --acp`、`codebuddy --acp`。
-//! 协议：JSON-RPC 2.0 over stdio；session/update 通知推送内容，session/request_permission 请求审批。
+//! ACP (Agent Client Protocol) adapter, for `cursor-agent acp`, `kiro-cli acp`, `qodercli --acp`, `codebuddy --acp`.
+//! Protocol: JSON-RPC 2.0 over stdio; session/update notifications push content, session/request_permission asks for approval.
 
 use super::{AdapterCmd, JsonProc, Prompt, StartSpec};
 use crate::hub::Emitter;
@@ -13,7 +13,7 @@ enum Pending {
     Init,
     Auth,
     Session,
-    /// session/load：工具里找不到这个会话时改成 session/new
+    /// session/load: switch to session/new when the tool can't find this session
     Load,
     Prompt,
     SetModel,
@@ -43,35 +43,35 @@ struct State {
     session_id: Option<String>,
     prompting: bool,
     queue: Vec<Prompt>,
-    /// initialize 里声明了支持图片输入
+    /// initialize declared support for image input
     image_ok: bool,
-    /// 会话建好之前收到的切换模型请求
+    /// Model switch requested before the session was created
     want_model: Option<String>,
-    /// 正在切换的模型，成功后再记到会话上
+    /// Model being switched to; recorded on the session once it succeeds
     switching: Option<String>,
     seg: Option<(Seg, String, String)>,
     seg_n: u64,
     tools: HashMap<String, ToolState>,
     perms: HashMap<String, Value>,
-    /// session/load 回放期间
+    /// During session/load replay
     loading: bool,
     record_replay: bool,
-    /// 回放时跳过前面这么多条用户消息，以及回放到第几条了
+    /// During replay, skip this many leading user messages, and how far the replay has got
     replay_skip: usize,
     replay_users: usize,
     plan_mode: Option<String>,
-    /// 工具建会话时的模式（不是 plan 的那个），退出只读规划时切回去
+    /// The tool's mode when the session was created (not the plan one); switched back to when leaving read-only planning
     base_mode: Option<String>,
-    /// 当前审批模式，会话中可以切换
+    /// Current permission mode; can change during the session
     perm: String,
     turn_credits: f64,
-    /// Cursor 的 cursor/ask_question 请求：请求 id -> (JSON-RPC id)
+    /// Cursor's cursor/ask_question requests: request id -> (JSON-RPC id)
     asks: HashMap<String, Value>,
-    /// initialize 返回的登录方式。先不调 authenticate（cursor_login 会去开浏览器，
-    /// 而配了 CURSOR_API_KEY 时根本不需要），建会话被拒时再用它登录并重试一次。
+    /// Auth methods returned by initialize. We don't call authenticate up front (cursor_login opens a browser,
+    /// and with CURSOR_API_KEY set it isn't needed at all); only when session creation is refused do we log in with it and retry once.
     auth_method: Option<String>,
     auth_tried: bool,
-    /// 这次是接着已有会话（发了 session/load），不是新开的；load 失败改成新开后置回 false
+    /// This run continues an existing session (session/load was sent) rather than a new one; reset to false when load fails and we fall back to a new session
     resumed: bool,
 }
 
@@ -82,13 +82,13 @@ impl State {
         json!({"jsonrpc":"2.0","id": self.next_id, "method": method, "params": params})
     }
 
-    /// 回放历史且不需要记录时，丢弃内容类事件
+    /// When replaying history that doesn't need recording, drop content events
     fn muted(&self) -> bool {
         self.loading && (!self.record_replay || (self.replay_skip > 0 && self.replay_users <= self.replay_skip))
     }
 }
 
-/// 进 ACP 模式的参数：Cursor、Kiro 是子命令，Qoder、CodeBuddy 是开关
+/// Arguments for entering ACP mode: a subcommand for Cursor and Kiro, a flag for Qoder and CodeBuddy
 pub fn acp_arg(tool: ToolKind) -> &'static str {
     match tool {
         ToolKind::Qoder | ToolKind::Codebuddy => "--acp",
@@ -240,7 +240,7 @@ fn prompt(st: &mut State, em: &Emitter, p: &Prompt) -> Value {
     )
 }
 
-/// 审批模式里只有"只读规划"要工具配合（ACP 的 session mode），其余在审批请求时由我们处理
+/// Of the permission modes, only read-only planning needs the tool's cooperation (ACP session mode); the rest we handle at approval time
 fn apply_mode(st: &mut State, was_plan: bool) -> Option<Value> {
     let sid = st.session_id.clone()?;
     let target = if st.perm == "plan" {
@@ -312,8 +312,8 @@ fn content_text(c: &Value) -> String {
     String::new()
 }
 
-/// cursor-agent 新建文件时把 diff 头塞进了正文：oldText 是 "-- /dev/null"，
-/// newText 第一行是 "++ b/<路径>"。去掉这些，按新建文件处理。
+/// When cursor-agent creates a file it stuffs the diff header into the body: oldText is "-- /dev/null",
+/// and the first line of newText is "++ b/<path>". Strip these and treat it as a new file.
 fn clean_diff_texts(old: Option<&str>, new: Option<&str>) -> (Option<String>, Option<String>) {
     let is_header = |l: &str| l.starts_with("++ b/") || l.starts_with("+++ b/") || l.starts_with("+++ /");
     let old = old.filter(|o| !matches!(o.trim(), "-- /dev/null" | "--- /dev/null"));
@@ -329,7 +329,7 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Result<V
     let mut out = vec![];
     let method = v["method"].as_str();
 
-    // 响应
+    // Responses
     if method.is_none() {
         let Some(id) = v["id"].as_u64() else {
             return Ok(out);
@@ -341,7 +341,7 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Result<V
                 .or(err["message"].as_str())
                 .unwrap_or("ACP 错误")
                 .to_string();
-            // Kiro 不让两个进程同时打开一个会话，被占用时 load 只报 "Internal error"：查它的锁文件说清楚
+            // Kiro won't let two processes open a session at once; when it's taken, load only reports "Internal error", so check its lock file to explain
             if matches!(kind, Pending::Load) && spec.tool == ToolKind::Kiro {
                 if let Some(pid) = spec.resume.as_deref().and_then(kiro_lock_holder) {
                     return Err(format!(
@@ -351,8 +351,8 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Result<V
                 }
             }
             return match kind {
-                // 会话建了但没说过话就没了进程时，有的工具（Cursor）没存这个会话，load 报 not found。
-                // 旧会话本来就没有内容，直接新开；不要当成没登录
+                // If the process went away after the session was created but before anything was said, some tools (Cursor) never saved the session and load reports not found.
+                // The old session had no content anyway, so just start a new one; don't treat it as not logged in
                 Pending::Load if is_missing_session(&msg) => {
                     st.loading = false;
                     st.resumed = false;
@@ -421,7 +421,7 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Result<V
                 }
                 let models = parse_models(r);
                 let current = r["models"]["currentModelId"].as_str().map(str::to_string);
-                // 会话上记的模型（新建时选的或之前切换过的）和工具当前的不一致就切过去
+                // If the model recorded on the session (picked at creation or switched later) differs from the tool's current one, switch to it
                 let want = st
                     .want_model
                     .take()
@@ -500,7 +500,7 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Result<V
     let method = method.unwrap_or("");
     let params = &v["params"];
 
-    // agent -> client 请求
+    // agent -> client requests
     if !v["id"].is_null() {
         if method == "session/request_permission" {
             flush(st, em);
@@ -522,10 +522,10 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Result<V
                     kind: o["kind"].as_str().unwrap_or("").to_string(),
                 })
                 .collect();
-            // 全部放行，或者自动接受编辑且这是改文件
+            // Allow everything, or accept-edits mode and this is a file edit
             let is_edit = tc["kind"] == "edit" || known.name == "edit" || !known.diffs.is_empty();
             if st.perm == "bypass" || (st.perm == "acceptEdits" && is_edit) {
-                // 优先选「只允许这一次」：Qoder 选「本会话都允许」会顺手把自己切到自动接受编辑
+                // Prefer "allow once": choosing "allow for this session" in Qoder also switches it into accept-edits mode
                 let once = options.iter().find(|o| o.kind == "allow_once");
                 if let Some(o) = once.or_else(|| options.iter().find(|o| o.kind.starts_with("allow"))) {
                     out.push(json!({"jsonrpc":"2.0","id":v["id"],
@@ -547,8 +547,8 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Result<V
                 questions: vec![],
             });
         } else if method == "cursor/ask_question" {
-            // Cursor 的提问扩展：{toolCallId, title, questions: [{id, prompt, options: [{id, label}], allowMultiple}]}，
-            // 只能选选项、不能自己填。不支持这个方法时它会退回成逐题的 request_permission
+            // Cursor's question extension: {toolCallId, title, questions: [{id, prompt, options: [{id, label}], allowMultiple}]},
+            // options only, no free text. When this method isn't supported, it falls back to one request_permission per question
             flush(st, em);
             let rid = v["id"].to_string();
             let questions: Vec<Question> = params["questions"]
@@ -590,7 +590,7 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Result<V
         return Ok(out);
     }
 
-    // 通知
+    // Notifications
     match method {
         "session/update" => update(st, em, &params["update"]),
         "_kiro.dev/metadata" => {
@@ -632,8 +632,8 @@ fn new_session(st: &mut State, spec: &StartSpec) -> Value {
     st.req(Pending::Session, "session/new", json!({"cwd":cwd,"mcpServers":[]}))
 }
 
-/// Kiro 打开会话时写 ~/.kiro/sessions/cli/<id>.lock（{"pid":..,"started_at":..}），退出时删掉。
-/// 锁住这个会话的 Kiro 进程还活着就返回它的 pid
+/// Kiro writes ~/.kiro/sessions/cli/<id>.lock ({"pid":..,"started_at":..}) when it opens a session and deletes it on exit.
+/// Returns the pid of the Kiro process holding this session's lock if it's still alive
 fn kiro_lock_holder(sid: &str) -> Option<u32> {
     if sid.is_empty() || sid.contains(['/', '\\', '.']) {
         return None;
@@ -644,7 +644,7 @@ fn kiro_lock_holder(sid: &str) -> Option<u32> {
     (pid != std::process::id() && kiro_alive(pid)).then_some(pid)
 }
 
-/// 进程还在，而且是 Kiro（pid 可能被别的程序复用了）
+/// The process still exists and is Kiro (the pid may have been reused by another program)
 #[cfg(windows)]
 fn kiro_alive(pid: u32) -> bool {
     use windows_sys::Win32::Foundation::CloseHandle;
@@ -677,25 +677,25 @@ fn kiro_alive(pid: u32) -> bool {
     let Ok(p) = libc::pid_t::try_from(pid) else {
         return false;
     };
-    // kill(pid, 0)：进程存在（没权限发信号也算存在）
+    // kill(pid, 0): the process exists (lacking permission to signal also counts as existing)
     let exists = unsafe { libc::kill(p, 0) == 0 } || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
     if !exists {
         return false;
     }
-    // Linux 上再核对一下程序名；其他系统拿不到就认为是
+    // On Linux also check the program name; on other systems, where it's unavailable, assume it is
     match std::fs::read_to_string(format!("/proc/{pid}/comm")) {
         Ok(c) => c.to_lowercase().contains("kiro"),
         Err(_) => !std::path::Path::new("/proc/self").exists(),
     }
 }
 
-/// session/load 报会话不存在（Cursor: `Session "<id>" not found`）
+/// session/load reports the session doesn't exist (Cursor: `Session "<id>" not found`)
 fn is_missing_session(msg: &str) -> bool {
     let m = msg.to_lowercase();
     m.contains("no such session") || (m.contains("session") && (m.contains("not found") || m.contains("does not exist")))
 }
 
-/// session/new、session/load 结果里的 models
+/// models in the session/new and session/load results
 pub fn parse_models(r: &Value) -> Vec<ModelOption> {
     r["models"]["availableModels"]
         .as_array()
@@ -715,7 +715,7 @@ pub fn parse_models(r: &Value) -> Vec<ModelOption> {
         .collect()
 }
 
-/// CodeBuddy 的回合失败不走 JSON-RPC error：stopReason 是 refusal，错误放在 `_meta["codebuddy.ai/errorMessage"]`（JSON 字符串）
+/// CodeBuddy turn failures don't use JSON-RPC errors: stopReason is refusal and the error goes in `_meta["codebuddy.ai/errorMessage"]` (a JSON string)
 fn meta_error(r: &Value) -> Option<String> {
     let raw = r["_meta"].as_object()?.iter().find(|(k, _)| k.ends_with("errorMessage"))?.1.as_str()?;
     let Ok(v) = serde_json::from_str::<Value>(raw) else {
@@ -725,7 +725,7 @@ fn meta_error(r: &Value) -> Option<String> {
     Some(msg.to_string())
 }
 
-/// 工具原本的工具名（Bash、Write…）：Kiro、Qoder 放在 `_meta.<工具>.toolName`
+/// The tool's original tool name (Bash, Write…): Kiro and Qoder put it in `_meta.<tool>.toolName`
 fn meta_tool_name(u: &Value) -> Option<&str> {
     let m = u["_meta"].as_object()?;
     m.values().find_map(|v| v["toolName"].as_str()).or_else(|| {
@@ -767,7 +767,7 @@ fn update(st: &mut State, em: &Emitter, u: &Value) {
             em.commands(list);
         }
         "current_mode_update" => {
-            // 工具自己切了模式（比如规划完退出 plan）
+            // The tool switched modes itself (e.g. leaving plan after planning)
             if let Some(m) = u["currentModeId"].as_str() {
                 let plan = m.contains("plan");
                 if plan != (st.perm == "plan") {
@@ -776,7 +776,7 @@ fn update(st: &mut State, em: &Emitter, u: &Value) {
                 }
             }
         }
-        // ACP 标准的上下文占用（CodeBuddy 会发，同时在 cost.amount 里带本轮积分消耗）
+        // Standard ACP context usage (CodeBuddy sends it, with this turn's credit cost in cost.amount)
         "usage_update" => {
             if let (Some(used), Some(size)) = (u["used"].as_f64(), u["size"].as_f64().filter(|s| *s > 0.0)) {
                 if used > 0.0 {
@@ -879,12 +879,12 @@ fn update(st: &mut State, em: &Emitter, u: &Value) {
     }
 }
 
-/// Kiro 的 rawOutput 形如 {"items":[{"Json":{"stdout":..,"stderr":..}}]}，尽量抽出可读文本
+/// Kiro's rawOutput looks like {"items":[{"Json":{"stdout":..,"stderr":..}}]}; extract readable text where possible
 fn raw_output_text(v: &Value) -> String {
     if let Some(s) = v.as_str() {
         return s.to_string();
     }
-    // CodeBuddy：{"type":"text","text":"Command: dir\nStdout: …\nStderr: …\nExit Code: 0\nSignal: (none)"}
+    // CodeBuddy: {"type":"text","text":"Command: dir\nStdout: …\nStderr: …\nExit Code: 0\nSignal: (none)"}
     if let Some(t) = v["text"].as_str() {
         return codebuddy_bash_text(t).unwrap_or_else(|| t.to_string());
     }
@@ -912,8 +912,8 @@ fn raw_output_text(v: &Value) -> String {
     }
 }
 
-/// CodeBuddy 的命令结果是一段「Command / Stdout / Stderr / Exit Code / Signal」文本，只留输出；
-/// 退出码不是 0 时补一行 exit code: N（前端据此标成失败）
+/// CodeBuddy command results are a "Command / Stdout / Stderr / Exit Code / Signal" text block; keep only the output,
+/// and add an "exit code: N" line when the exit code isn't 0 (the frontend marks it failed based on that)
 fn codebuddy_bash_text(t: &str) -> Option<String> {
     if !t.starts_with("Command:") {
         return None;
@@ -954,7 +954,7 @@ mod tests {
     }
 }
 
-/// Qoder 的 ACP 不推 usage_update，从会话 jsonl 最后一条带 context_usage_ratio 的记录取上下文占比
+/// Qoder's ACP doesn't push usage_update; take the context ratio from the last record with context_usage_ratio in the session jsonl
 fn qoder_context(sid: &str) -> Option<f64> {
     let path = crate::history::find_qoder_file(sid)?;
     let text = std::fs::read_to_string(path).ok()?;
@@ -970,10 +970,10 @@ fn qoder_context(sid: &str) -> Option<f64> {
     None
 }
 
-/// Cursor 的 ACP 不回传 token 用量，上下文占比只能读它本地的会话库：
-/// `~/.cursor/chats/<md5(cwd)>/<sessionId>/store.db`，meta 表里是十六进制的 JSON，
-/// 其中 latestRootBlobId 指向 blobs 表里的根记录（protobuf，未加密），
-/// 根记录的 5 号字段是 token_details { 1: used_tokens, 2: max_tokens }
+/// Cursor's ACP doesn't report token usage, so the context ratio can only be read from its local session store:
+/// `~/.cursor/chats/<md5(cwd)>/<sessionId>/store.db`, whose meta table holds hex-encoded JSON;
+/// its latestRootBlobId points to the root record in the blobs table (protobuf, unencrypted),
+/// and field 5 of the root record is token_details { 1: used_tokens, 2: max_tokens }
 fn cursor_context(sid: &str) -> Option<f64> {
     let chats = crate::paths::home().join(".cursor").join("chats");
     let db = std::fs::read_dir(chats)
@@ -1016,7 +1016,7 @@ fn read_varint(b: &[u8], i: &mut usize) -> Option<u64> {
     None
 }
 
-/// 遍历一层 protobuf，对每个字段回调 (字段号, 类型, varint 值, 长度字段内容)
+/// Walk one level of protobuf, calling back for each field with (field number, wire type, varint value, length-delimited content)
 fn pb_walk<'a>(b: &'a [u8], mut f: impl FnMut(u64, u64, u64, &'a [u8]) -> bool) -> Option<()> {
     let mut i = 0;
     while i < b.len() {
@@ -1067,7 +1067,7 @@ mod cursor_tests {
 
     #[test]
     fn cursor_token_details() {
-        // 实际会话库里根记录 5 号字段的开头：used=31908，max=256000
+        // Start of field 5 of a root record from a real session store: used=31908, max=256000
         let details = [0x08, 0xa4, 0xf9, 0x01, 0x10, 0x80, 0xd0, 0x0f];
         let mut root = vec![0x0a, 0x02, 0xaa, 0xbb, 0x2a, details.len() as u8];
         root.extend_from_slice(&details);

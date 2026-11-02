@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { lsGet, lsSet } from './util';
 
-// 界面语言：跟随系统 / 中文 / English，存在本机 localStorage。
+// UI language: follow system / Chinese / English, stored in local localStorage.
 
 export type LangPref = 'auto' | 'zh' | 'en';
 export type Lang = 'zh' | 'en';
@@ -45,7 +45,7 @@ export function initLang() {
   }
 }
 
-/** 语言设置变化时重新渲染；返回 [设置值, 实际语言] */
+/** Re-render when the language setting changes; returns [setting, effective language] */
 export function useLang(): [LangPref, Lang] {
   const [, bump] = useState(0);
   useEffect(() => {
@@ -61,7 +61,7 @@ export function onLangChange(f: () => void): () => void {
   return () => window.removeEventListener(EVENT, f);
 }
 
-/** 双语取值：根据当前语言返回中文或英文 */
+/** Bilingual value: returns the Chinese or English text for the current language */
 export function tr<T = string>(zh: T, en: T): T {
   return isEn() ? en : zh;
 }
@@ -80,7 +80,7 @@ const ERR_PATTERNS: [RegExp, string | ((...m: string[]) => string)][] = [
   [/超时/, 'Timed out'],
 ];
 
-/** 翻译后端或运行时的中文错误消息（英文界面下生效） */
+/** Translate Chinese error messages from the backend or runtime (applies in the English UI) */
 export function trErr(msg: string): string {
   if (!isEn() || !msg) return msg;
   for (const [re, rep] of ERR_PATTERNS) {

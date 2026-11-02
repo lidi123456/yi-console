@@ -1,7 +1,7 @@
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
 
-// Tauri 开发时固定端口；TAURI_DEV_HOST 用于手机真机调试
+// Fixed port during Tauri development; TAURI_DEV_HOST is for debugging on a real phone
 const host = process.env.TAURI_DEV_HOST;
 
 export default defineConfig({

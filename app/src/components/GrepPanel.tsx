@@ -5,16 +5,16 @@ import { lsGet, lsSet } from '../util';
 import { FileIcon } from './FilePanel';
 import { Icon } from './Icon';
 
-// 文件面板的「搜索」：在工作目录的文件内容里找（yi-agentd 的 fs.grep，git 仓库遵守 .gitignore），
-// 结果按文件分组，点一行跳到编辑器里那一行并选中命中的词
+// The file panel's "Search": searches file contents in the working directory (yi-agentd's fs.grep; git repos respect .gitignore),
+// results grouped by file; clicking a row jumps to that line in the editor and selects the match
 
 interface Hit {
   path: string;
   line: number;
-  /** 命中处在 text 里的字符位置 */
+  /** Character positions of the matches within text */
   col: number;
   len: number;
-  /** text 是从原行第几个字符截起的 */
+  /** Character offset in the original line where text starts */
   offset: number;
   text: string;
 }
@@ -175,7 +175,7 @@ export function GrepPanel({
               {!closed &&
                 hits.map((h) => {
                   const chars = [...h.text];
-                  // 命中词前面只留一小段，窄栏里也能看到命中的词
+                  // Keep only a short lead-in before the match so it stays visible in a narrow panel
                   const head = chars.slice(0, h.col).join('').replace(/^\s+/, '');
                   const pre = head.length > 16 ? '…' + head.slice(-14) : head;
                   const mid = chars.slice(h.col, h.col + h.len).join('');

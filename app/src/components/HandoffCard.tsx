@@ -4,11 +4,11 @@ import { tr, useLang } from '../i18n';
 import { toast } from '../store';
 import { Icon } from './Icon';
 
-/** 系统设置里的「换个工具继续」：改第一条消息的模板 */
+/** "Continue with another tool" in system settings: edit the template for the first message */
 export function HandoffCard() {
   useLang();
   const [custom, setCustom] = useState(() => customHandoffTemplate());
-  // 没改过时显示默认模板（跟着界面语言变）
+  // Show the default template (which follows the UI language) until it's edited
   const [text, setText] = useState<string | null>(null);
   const value = text ?? custom ?? defaultHandoffTemplate();
   const dirty = text !== null && text !== (custom ?? defaultHandoffTemplate());

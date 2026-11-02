@@ -16,10 +16,10 @@ import { highlightSelectionMatches, searchKeymap } from '@codemirror/search';
 import { languages } from '@codemirror/language-data';
 import { tags as t } from '@lezer/highlight';
 
-// 文件侧栏的代码编辑器（CodeMirror 6）：语法高亮、行号、当前行、查找替换、Ctrl+S 保存。
-// 语言包按文件名懒加载，不进主包
+// Code editor in the file panel (CodeMirror 6): syntax highlighting, line numbers, current line, find/replace, Ctrl+S to save.
+// Language packs are lazy-loaded by file name and stay out of the main bundle
 
-/** 颜色走 CSS 变量，深色模式在 styles.css 里换一套 */
+/** Colors use CSS variables; dark mode swaps them in styles.css */
 const highlight = HighlightStyle.define([
   { tag: [t.keyword, t.controlKeyword, t.moduleKeyword, t.operatorKeyword, t.modifier], color: 'var(--hl-keyword)' },
   { tag: [t.string, t.special(t.string), t.regexp, t.character], color: 'var(--hl-string)' },
@@ -54,7 +54,7 @@ const theme = EditorView.theme({
   '.cm-searchMatch.cm-searchMatch-selected': { backgroundColor: 'var(--cm-find-cur)' },
   '.cm-panels': { backgroundColor: 'var(--bg-2)', color: 'var(--text)', borderColor: 'var(--border)' },
   '.cm-panels.cm-panels-top': { borderBottom: '1px solid var(--border)' },
-  // 全局的 input { width: 100% } 会把查找框、复选框都撑满一行（复选框和文字被挤开），这里改回按内容宽
+  // The global input { width: 100% } stretches the search box and checkboxes to a full row (pushing checkboxes away from their labels); size them to content here
   '.cm-panel.cm-search': { padding: '6px 30px 6px 10px', fontSize: '12px', lineHeight: '28px' },
   '.cm-panel.cm-search input, .cm-panel.cm-search button': { fontSize: '12px' },
   '.cm-textfield': {
@@ -126,7 +126,7 @@ export function CodeEditor({
   onTopLine,
   scrollLine,
 }: {
-  /** 换文件（或重新读盘）时变，编辑器整个重建 */
+  /** Changes when switching files (or re-reading from disk); the editor is rebuilt from scratch */
   docKey: string;
   value: string;
   filename: string;
@@ -134,18 +134,18 @@ export function CodeEditor({
   wrap: boolean;
   onChange: (v: string) => void;
   onSave: () => void;
-  /** 跳到某行（col、len 是行内字符位置，用来选中命中的词）；n 变了就再跳一次 */
+  /** Jump to a line (col and len are character positions in the line, used to select the matched word); jumps again whenever n changes */
   goto?: { line: number; col?: number; len?: number; n: number } | null;
-  /** 滚动时报告最上面一行（frac 是这一行露出了多少，0~1），Markdown 分栏预览跟着滚 */
+  /** Reports the top line while scrolling (frac is how much of that line is visible, 0–1); the Markdown split preview follows it */
   onTopLine?: (line: number, frac: number) => void;
-  /** 把某一行滚到顶部（不改选区）；n 变了就再滚一次 */
+  /** Scroll a line to the top (without changing the selection); scrolls again whenever n changes */
   scrollLine?: { line: number; frac: number; n: number } | null;
 }) {
   const host = useRef<HTMLDivElement>(null);
   const [, lang] = useLang();
   const view = useRef<EditorView | null>(null);
   const comp = useRef({ lang: new Compartment(), ro: new Compartment(), wrap: new Compartment(), phrases: new Compartment() });
-  // 回调用 ref 转一层，编辑器不用跟着重建
+  // Callbacks go through a ref so the editor doesn't need rebuilding
   const cb = useRef({ onChange, onSave, onTopLine });
   cb.current = { onChange, onSave, onTopLine };
 
@@ -204,7 +204,7 @@ export function CodeEditor({
       v.destroy();
       view.current = null;
     };
-    // 只在换文档时重建；value 之后由编辑器自己维护
+    // Only rebuild when the document changes; after that the editor maintains value itself
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [docKey]);
 
@@ -222,7 +222,7 @@ export function CodeEditor({
     view.current?.dispatch({ effects: comp.current.phrases.reconfigure(searchPhrases()) });
   }, [lang]);
 
-  // 跳转：编辑器刚建好时也要跳，所以依赖 docKey
+  // Jumping: must also jump right after the editor is created, hence the docKey dependency
   useEffect(() => {
     const v = view.current;
     if (!v || !goto) return;

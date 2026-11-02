@@ -1,11 +1,11 @@
-//! 连接数和失败次数的记账，以及反向代理后面取真实客户端 IP。
+//! Accounting for connection counts and failures, and getting the real client IP behind a reverse proxy.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-/// 统计窗口内失败这么多次就拉黑
+/// Ban after this many failures within the counting window
 const MAX_FAILS: u32 = 10;
 const FAIL_WINDOW: Duration = Duration::from_secs(600);
 const BAN_TIME: Duration = Duration::from_secs(600);
@@ -20,11 +20,11 @@ pub struct Limits {
 struct LimitState {
     total: usize,
     per_ip: HashMap<IpAddr, usize>,
-    /// ip -> (窗口开始时间, 失败次数, 拉黑到期时间)
+    /// ip -> (window start, failure count, ban expiry)
     fails: HashMap<IpAddr, (Instant, u32, Option<Instant>)>,
 }
 
-/// 连接存活期间占着名额，drop 时归还。先占全局名额，知道真实 IP 后再 [`ConnSlot::bind`] 占单 IP 名额
+/// Holds a slot while the connection lives and returns it on drop. Takes a global slot first, then a per-IP slot via [`ConnSlot::bind`] once the real IP is known
 pub struct ConnSlot {
     limits: Arc<Limits>,
     ip: Option<IpAddr>,
@@ -46,7 +46,7 @@ impl Drop for ConnSlot {
 }
 
 impl ConnSlot {
-    /// 按真实 IP 占名额；被拉黑或超过单 IP 上限时返回 false
+    /// Take a slot for the real IP; returns false if banned or over the per-IP limit
     pub fn bind(&mut self, ip: IpAddr) -> bool {
         let mut st = self.limits.inner.lock().unwrap();
         if banned(&mut st, ip) {
@@ -77,7 +77,7 @@ impl Limits {
         Arc::new(Limits { max_conns, max_per_ip, inner: Mutex::new(LimitState::default()) })
     }
 
-    /// 占一个全局名额；`ip` 已知（直连）时同时占单 IP 名额
+    /// Take a global slot; when `ip` is known (direct connection), take the per-IP slot too
     pub fn acquire(self: &Arc<Self>, ip: Option<IpAddr>) -> Option<ConnSlot> {
         {
             let mut st = self.inner.lock().unwrap();
@@ -98,7 +98,7 @@ impl Limits {
     pub fn record_fail(&self, ip: IpAddr) {
         let mut st = self.inner.lock().unwrap();
         let now = Instant::now();
-        // 顺手清掉过期记录，防止表无限增长
+        // Clean out expired records along the way so the table doesn't grow forever
         if st.fails.len() > 10_000 {
             st.fails.retain(|_, (start, _, until)| {
                 until.map(|u| u > now).unwrap_or(false) || now.duration_since(*start) < FAIL_WINDOW
@@ -116,7 +116,7 @@ impl Limits {
     }
 }
 
-/// IP 或网段，`--trusted-proxy` 用
+/// An IP or subnet, for `--trusted-proxy`
 #[derive(Debug, Clone, PartialEq)]
 pub struct Cidr {
     net: IpAddr,
@@ -154,7 +154,7 @@ pub fn trusted(list: &[Cidr], ip: IpAddr) -> bool {
     list.iter().any(|c| c.contains(ip))
 }
 
-/// TCP 对端是可信代理时，从 X-Forwarded-For 里从右往左取第一个不可信的地址；否则就是 TCP 对端
+/// When the TCP peer is a trusted proxy, take the first untrusted address from X-Forwarded-For, right to left; otherwise it's the TCP peer
 pub fn real_ip(list: &[Cidr], peer: IpAddr, xff: Option<&str>) -> IpAddr {
     if !trusted(list, peer) {
         return peer;
@@ -191,9 +191,9 @@ mod tests {
     #[test]
     fn xff_only_from_trusted_peer() {
         let t = vec![Cidr::parse("127.0.0.1").unwrap()];
-        // 直连的人伪造 XFF 无效
+        // A forged XFF from a direct connection has no effect
         assert_eq!(real_ip(&t, ip("8.8.8.8"), Some("1.1.1.1")), ip("8.8.8.8"));
-        // 经代理：取最右边不可信的
+        // Through a proxy: take the rightmost untrusted address
         assert_eq!(real_ip(&t, ip("127.0.0.1"), Some("6.6.6.6, 5.5.5.5")), ip("5.5.5.5"));
         assert_eq!(real_ip(&t, ip("127.0.0.1"), None), ip("127.0.0.1"));
         assert_eq!(real_ip(&[], ip("127.0.0.1"), Some("5.5.5.5")), ip("127.0.0.1"));

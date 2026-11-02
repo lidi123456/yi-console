@@ -1,8 +1,8 @@
-//! 导入各工具自己保存的历史会话。
-//! - Claude Code：~/.claude/projects/*/<id>.jsonl，可离线读取
-//! - Codex：~/.codex/sessions/**/rollout-*.jsonl，可离线读取
-//! - Cursor：ACP session/list（失败时退回扫描 ~/.cursor/chats），内容需 resume 后由 session/load 回放
-//! - Kiro：`kiro-cli chat --list-sessions --all-cwds -f json`，同样 resume 后回放
+//! Import history sessions saved by each tool.
+//! - Claude Code: ~/.claude/projects/*/<id>.jsonl, readable offline
+//! - Codex: ~/.codex/sessions/**/rollout-*.jsonl, readable offline
+//! - Cursor: ACP session/list (falls back to scanning ~/.cursor/chats on failure); content is replayed by session/load after resuming
+//! - Kiro: `kiro-cli chat --list-sessions --all-cwds -f json`, likewise replayed after resuming
 
 use crate::adapters::{claude, codex};
 use crate::util::{parse_iso, truncate};
@@ -111,7 +111,7 @@ fn claude_files() -> Vec<PathBuf> {
     jsonl_files(&claude_root())
 }
 
-/// `<root>/<目录>/*.jsonl`
+/// `<root>/<dir>/*.jsonl`
 fn jsonl_files(root: &Path) -> Vec<PathBuf> {
     let mut v = vec![];
     let Ok(dirs) = std::fs::read_dir(root) else {
@@ -130,13 +130,13 @@ fn jsonl_files(root: &Path) -> Vec<PathBuf> {
     v
 }
 
-/// Claude 会话记录在不在（终端里开了没说话就退出时不会生成）
+/// Whether the Claude session log exists (it isn't created if the terminal was opened and closed without saying anything)
 pub fn claude_session_exists(id: &str) -> bool {
     find_claude_file(id).is_some()
 }
 
-/// 终端里开了工具但没说话就退出时，工具不会留下会话记录，这时不能 --resume，要用同一个 id 新开。
-/// Claude、Qoder、CodeBuddy 都把会话存成 `<配置目录>/projects/<目录>/<id>.jsonl`
+/// If a tool was opened in the terminal and exited without anything said, it leaves no session record, so --resume won't work and a new session must be started with the same id.
+/// Claude, Qoder and CodeBuddy all store sessions as `<config dir>/projects/<dir>/<id>.jsonl`
 pub fn tool_session_exists(tool: ToolKind, id: &str) -> bool {
     let dir = match tool {
         ToolKind::Claude => return claude_session_exists(id),
@@ -165,7 +165,7 @@ pub(crate) fn codebuddy_root() -> PathBuf {
     projects_root(".codebuddy")
 }
 
-/// Qoder 的会话文件和 Claude 的格式一样，直接用 Claude 的解析
+/// Qoder session files have the same format as Claude's, so reuse the Claude parser
 pub(crate) fn find_qoder_file(id: &str) -> Option<PathBuf> {
     jsonl_files(&qoder_root())
         .into_iter()
@@ -190,8 +190,8 @@ fn list_codebuddy() -> Vec<HistoryEntry> {
         .collect()
 }
 
-/// CodeBuddy 的会话文件：每行 {type:"message", role, content:[{type:"input_text"|"output_text", text}], sessionId, cwd, timestamp(毫秒)}，
-/// 另有 {type:"ai-title", aiTitle}。只列出来，内容要「继续会话」后经 ACP 回放
+/// CodeBuddy session files: each line is {type:"message", role, content:[{type:"input_text"|"output_text", text}], sessionId, cwd, timestamp(ms)},
+/// plus {type:"ai-title", aiTitle}. Only listed here; content is replayed through ACP after "continue session"
 fn scan_codebuddy(p: &Path, mtime: i64) -> Option<HistoryEntry> {
     let f = std::fs::File::open(p).ok()?;
     let mut id = p.file_stem()?.to_str()?.to_string();
@@ -228,7 +228,7 @@ fn scan_codebuddy(p: &Path, mtime: i64) -> Option<HistoryEntry> {
             .collect::<Vec<_>>()
             .join("\n");
         match v["role"].as_str() {
-            // 命令回显、系统提醒都包在 <xxx> 里，不算用户消息
+            // Command echoes and system reminders are wrapped in <xxx> and don't count as user messages
             Some("user") if !v["providerData"]["skipRun"].as_bool().unwrap_or(false) && !text.trim_start().starts_with('<') => {
                 if text.trim().is_empty() {
                     continue;
@@ -254,9 +254,9 @@ fn scan_codebuddy(p: &Path, mtime: i64) -> Option<HistoryEntry> {
     })
 }
 
-/// 换个工具继续用：工具自己记的会话文件（新工具直接读），没有可读文件的工具（Cursor）返回 None
+/// For "continue with another tool": the session file the tool keeps itself (the new tool reads it directly); None for tools without a readable file (Cursor)
 pub fn session_file(tool: ToolKind, id: &str) -> Option<PathBuf> {
-    // id 来自工具自己，拼路径前还是挡一下路径分隔符和 ..
+    // The id comes from the tool itself, but still block path separators and .. before building a path
     if id.is_empty() || id.contains(['/', '\\']) || id.contains("..") {
         return None;
     }
@@ -270,7 +270,7 @@ pub fn session_file(tool: ToolKind, id: &str) -> Option<PathBuf> {
         ToolKind::Codex => find_codex_file(id),
         ToolKind::Qoder => find_qoder_file(id),
         ToolKind::Codebuddy => by_stem(codebuddy_root()),
-        // Kiro 的对话（ACP）和终端界面都记在 ~/.kiro/sessions/cli/<id>.jsonl
+        // Kiro's chat (ACP) and terminal UI both log to ~/.kiro/sessions/cli/<id>.jsonl
         ToolKind::Kiro => {
             let p = crate::paths::home().join(".kiro").join("sessions").join("cli").join(format!("{id}.jsonl"));
             p.is_file().then_some(p)
@@ -279,7 +279,7 @@ pub fn session_file(tool: ToolKind, id: &str) -> Option<PathBuf> {
     }
 }
 
-/// 终端模式下第一次启动就用 --session-id 指定会话 id 的工具
+/// Tools whose session id is set with --session-id on the first terminal-mode launch
 pub fn pins_session_id(tool: ToolKind) -> bool {
     matches!(tool, ToolKind::Claude | ToolKind::Qoder | ToolKind::Codebuddy)
 }
@@ -297,7 +297,7 @@ fn list_claude() -> Vec<HistoryEntry> {
         .collect()
 }
 
-/// 用户真正输入的文本（排除命令回显、系统注入的 <xxx> 块）
+/// Text the user actually typed (excluding command echoes and system-injected <xxx> blocks)
 fn claude_user_text(v: &Value) -> Option<String> {
     if v["isMeta"].as_bool().unwrap_or(false) {
         return None;
@@ -329,7 +329,7 @@ fn scan_claude(p: &Path, mtime: i64) -> Option<HistoryEntry> {
     let mut count = 0u64;
     let mut last_ts = 0i64;
     for line in BufReader::new(f).lines().map_while(Result::ok) {
-        // 只解析可能有用的行，大文件里 tool 输出很多
+        // Only parse lines that may be useful; big files contain lots of tool output
         let is_msg = line.contains("\"type\":\"user\"") || line.contains("\"type\":\"assistant\"");
         let is_title = line.contains("\"type\":\"ai-title\"");
         if !is_msg && !is_title {
@@ -470,7 +470,7 @@ fn list_codex() -> Vec<HistoryEntry> {
         .collect()
 }
 
-/// 新版 rollout 用 event_msg/item_completed，旧版是 event_msg/user_message
+/// Newer rollouts use event_msg/item_completed, older ones event_msg/user_message
 fn codex_user_text(p: &Value) -> Option<String> {
     let t = match p["type"].as_str()? {
         "user_message" => p["message"].as_str()?.to_string(),
@@ -536,8 +536,8 @@ fn scan_codex(p: &Path, mtime: i64) -> Option<HistoryEntry> {
     })
 }
 
-/// rollout 里 item_completed 的 item 是 PascalCase type + snake_case 字段，
-/// 转成 app-server ThreadItem 的形状后复用 codex::item_events
+/// item_completed items in a rollout have a PascalCase type + snake_case fields;
+/// convert them to the shape of app-server ThreadItems and reuse codex::item_events
 fn rollout_item_to_thread_item(item: &Value) -> Value {
     let t = item["type"].as_str().unwrap_or("");
     let mut out = json!({ "id": item["id"] });
@@ -675,7 +675,7 @@ async fn list_kiro(program: &Path) -> Result<Vec<HistoryEntry>> {
 
 // ---------------- Cursor ----------------
 
-/// 起一个短命的 `cursor-agent acp` 调 session/list
+/// Start a short-lived `cursor-agent acp` to call session/list
 async fn list_cursor_acp(program: &Path) -> Result<Vec<HistoryEntry>> {
     let home = crate::paths::home();
     let mut p = crate::adapters::JsonProc::spawn(program, &["acp".into()], &home)?;
@@ -739,10 +739,10 @@ async fn list_cursor_acp(program: &Path) -> Result<Vec<HistoryEntry>> {
     Ok(res??)
 }
 
-/// Cursor 的对话模式（ACP）和终端界面各存一份会话：ACP 在 `~/.cursor/acp-sessions/<id>/`，
-/// 终端界面在 `~/.cursor/chats/<md5(cwd)>/<id>/`，都是同样格式的 store.db。
-/// 切换模式时（两边的进程都已结束）把当前这份拷到另一边，工具才接得上前面聊的。
-/// 另一边的那份比这边新（比如在别处接着聊过）就不覆盖
+/// Cursor keeps separate session copies for chat mode (ACP) and the terminal UI: ACP in `~/.cursor/acp-sessions/<id>/`,
+/// the terminal UI in `~/.cursor/chats/<md5(cwd)>/<id>/`, both store.db in the same format.
+/// When switching modes (with both processes ended), copy the current one to the other side so the tool can pick up the earlier conversation.
+/// Don't overwrite if the other side's copy is newer (e.g. continued elsewhere)
 pub fn cursor_handoff(id: &str, cwd: &str, to_terminal: bool) -> Result<()> {
     if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
         anyhow::bail!("Cursor 会话 id 无效: {id}");
@@ -773,7 +773,7 @@ pub fn cursor_handoff(id: &str, cwd: &str, to_terminal: bool) -> Result<()> {
     for f in ["store.db", "store.db-wal", "store.db-shm"] {
         let _ = std::fs::remove_file(dst.join(f));
     }
-    // shm 是 sqlite 自己的索引，打开时会重建
+    // shm is sqlite's own index and gets rebuilt on open
     for f in ["store.db", "store.db-wal"] {
         if src.join(f).is_file() {
             std::fs::copy(src.join(f), dst.join(f))?;
@@ -796,7 +796,7 @@ pub fn cursor_handoff(id: &str, cwd: &str, to_terminal: bool) -> Result<()> {
     Ok(())
 }
 
-/// 退路：~/.cursor/chats/<workspace-hash>/<chatId>/ 目录
+/// Fallback: ~/.cursor/chats/<workspace-hash>/<chatId>/ directories
 fn list_cursor_dirs() -> Vec<HistoryEntry> {
     let mut v = vec![];
     let root = crate::paths::home().join(".cursor").join("chats");

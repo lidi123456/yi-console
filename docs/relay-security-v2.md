@@ -1,349 +1,350 @@
-# 中继鉴权与端到端加密 v2 方案
+# Relay authentication and end-to-end encryption, v2
 
-状态：已实现　｜　日期：2026-11-02　｜　不兼容旧版本，升级后所有设备需要重新配对
+Status: implemented　|　Date: 2026-11-02　|　Not compatible with v1; all devices must re-pair after upgrading
 
-## 1. 为什么要改
+## 1. Why the change
 
-v1 的做法（`crates/link/src/lib.rs`、`crates/relay/src/main.rs`）：
+How v1 worked (`crates/link/src/lib.rs`, `crates/relay/src/main.rs`):
 
-| 层 | v1 用的凭证 | 问题 |
+| Layer | v1 credential | Problem |
 |---|---|---|
-| 连中继 | 一个所有人共用的 `--token` | 写在每份配对链接里，没法只吊销某一台设备；没配置时谁都能用 |
-| yi-agentd 在中继上的身份 | 设备 id + `device_token`，首次连接时记下（TOFU） | 每次连接都把令牌原样发给中继 |
-| 客户端在中继上的身份 | 无（只有共用令牌 + 设备 id） | 拿到令牌和设备 id 的人可以反复请求开数据流，占满设备 32 个名额 |
-| 端到端 | 所有客户端共享一个配对密钥 K，用 HMAC 做双向挑战，再派生 ChaCha20-Poly1305 密钥 | 没有前向保密：K 一旦泄露，之前录下的流量都能解密；无法单独吊销某个客户端 |
-| 传输 | `token`、`auth`、`stream` 放在 URL query 里 | 会被反向代理写进访问日志 |
+| Connecting to the relay | One `--token` shared by everyone | Written into every pairing link, so a single device can't be revoked; without it configured, anyone could use the relay |
+| yi-agentd's identity on the relay | Device id + `device_token`, recorded on first connection (TOFU) | The token is sent to the relay in the clear on every connection |
+| Client's identity on the relay | None (just the shared token + device id) | Anyone with the token and device id could keep requesting streams and use up the device's 32 slots |
+| End to end | All clients share one pairing key K; HMAC mutual challenge, then derived ChaCha20-Poly1305 keys | No forward secrecy: once K leaks, all recorded traffic can be decrypted; individual clients can't be revoked |
+| Transport | `token`, `auth` and `stream` in the URL query | Ends up in reverse proxy access logs |
 
-v2 的目标：
+Goals for v2:
 
-1. URL 里不放任何密钥（v1 问题第 5 行）。
-2. 中继在对接两端之前，先确认客户端是这台设备授权过的（问题第 3 行）。
-3. 设备和客户端都用公钥做身份，中继只保存公钥，不保存任何能直接拿来用的密钥（问题第 2 行）。
-4. 每个客户端有自己的密钥，可以单独吊销；配对二维码里不再放长期密钥；端到端握手提供前向保密（问题第 1、4 行）。
+1. No secrets in URLs (row 5 above).
+2. Before splicing two ends together, the relay confirms the client was authorized by this device (row 3).
+3. Devices and clients are identified by public keys; the relay stores only public keys and nothing that could be used directly as a secret (row 2).
+4. Each client has its own keys and can be revoked individually; pairing QR codes no longer carry long-term secrets; the end-to-end handshake provides forward secrecy (rows 1 and 4).
 
-## 2. 总体设计
+## 2. Overall design
 
-### 2.1 角色与密钥
+### 2.1 Roles and keys
 
-| 谁 | 密钥 | 用途 | 存在哪 |
+| Who | Key | Purpose | Stored in |
 |---|---|---|---|
-| yi-agentd（设备） | Ed25519 签名密钥 `agent_sign` | 向中继证明自己是这台设备 | `relay.json`（0600） |
-| yi-agentd | X25519 静态密钥 `agent_noise` | 端到端 Noise 握手，客户端靠它的公钥识别设备 | `relay.json` |
-| 每个客户端 | Ed25519 签名密钥 `client_sign` | 向中继证明自己是某个已授权的客户端 | 客户端的主机配置（`HostConfig.pairing`，界面上隐藏） |
-| 每个客户端 | X25519 静态密钥 `client_noise` | 端到端 Noise 握手，yi-agentd 靠它识别客户端 | 同上 |
-| 中继运营者 | 一次性邀请码 `invite`（取代固定的 `--token`） | 让一台新电脑在中继上登记自己的公钥，用完或过期即作废，**客户端不需要它** | 中继只存哈希（`relay-invites.json`）；yi-agentd 用完即丢 |
-| 中继 | 已登记设备列表（设备公钥） | 判断哪些 yi-agentd 可以挂到这个中继上，可以单独吊销 | `relay-devices.json`（只有公钥） |
-| 中继 | TLS 证书 | 传输层加密；自签名时客户端按指纹固定 | 中继数据目录 |
-| 临时 | 一次性配对码 `code`（32 字节） | 新客户端第一次配对时用，10 分钟有效，用过即作废 | 只在 yi-agentd 内存里和二维码里 |
+| yi-agentd (device) | Ed25519 signing key `agent_sign` | Proves to the relay that it is this device | `relay.json` (0600) |
+| yi-agentd | X25519 static key `agent_noise` | End-to-end Noise handshake; clients recognize the device by its public key | `relay.json` |
+| Each client | Ed25519 signing key `client_sign` | Proves to the relay that it is an authorized client | The client's host config (`HostConfig.pairing`, hidden in the UI) |
+| Each client | X25519 static key `client_noise` | End-to-end Noise handshake; yi-agentd recognizes the client by it | Same as above |
+| Relay operator | One-time invite code `invite` (replaces the fixed `--token`) | Lets a new computer register its public key with the relay; void once used or expired. **Clients don't need it** | The relay stores only a hash (`relay-invites.json`); yi-agentd discards it after use |
+| Relay | List of registered devices (device public keys) | Decides which yi-agentd instances may attach to this relay; individually revocable | `relay-devices.json` (public keys only) |
+| Relay | TLS certificate | Transport encryption; clients pin it by fingerprint when self-signed | Relay data directory |
+| Ephemeral | One-time pairing code `code` (32 bytes) | Used for a new client's first pairing; valid for 10 minutes, void once used | Only in yi-agentd's memory and the QR code |
 
-签名用 Ed25519，加密用 X25519，按惯例分成两对密钥，不做互相转换。
+Ed25519 for signing and X25519 for encryption, kept as two separate key pairs by convention, without converting between them.
 
-**设备 id 由公钥算出来**：`device = hex(SHA-256(agent_sign 公钥)[0..16])`。中继拿到公钥后自己算一遍就能确认设备 id 属于谁，不再需要 v1 那种“谁先注册谁占用”（TOFU）的令牌注册表。`relay-devices.json` 保留，但内容改为经邀请登记过的设备公钥（见 3.3）。客户端 id 也一样：`client_id = hex(SHA-256(client_sign 公钥)[0..8])`。
+**The device id is derived from the public key**: `device = hex(SHA-256(agent_sign public key)[0..16])`. Given the public key, the relay can recompute the id to confirm whose it is, so v1's "first to register owns it" (TOFU) token registry is no longer needed. `relay-devices.json` is kept, but now holds the public keys of devices registered through invites (see 3.3). Client ids work the same way: `client_id = hex(SHA-256(client_sign public key)[0..8])`.
 
-### 2.2 两层鉴权各管什么
-
-```
- 客户端 ──TLS──▶ 中继 ◀──TLS── yi-agentd
-   │   ①中继层鉴权：挑战-签名，  │
-   │     中继按设备推来的白名单判断 │
-   │                            │
-   └────── ②端到端 Noise IK ─────┘
-          中继只转发密文
-```
-
-- **① 中继层**：决定“能不能让你通过中继”。中继验证签名、核对白名单，**看不到**消息内容。
-- **② 端到端**：决定“能不能和这台设备说话”，同时负责加密。即使中继被攻破、白名单被篡改，没有正确的 Noise 密钥也连不上 yi-agentd。
-
-两层互相独立。① 主要防滥用和资源耗尽，② 保证安全。
-
-## 3. 中继层鉴权（对应改进 1、2、3）
-
-### 3.1 URL 里不再放密钥
-
-三个端点 `/v1/agent`、`/v1/client`、`/v1/stream` 的 URL 不带任何参数。WebSocket 升级完成后，**第一组消息就是鉴权**：
+### 2.2 What each of the two authentication layers covers
 
 ```
-中继 → 对端   {"type":"challenge","v":2,"nonce":"<32 字节随机数, b64>"}
-对端 → 中继   {"type":"auth", ...见下表... , "sig":"<Ed25519 签名, b64>"}
-中继 → 对端   {"type":"ok"}             或关闭连接（4401 未授权 / 4403 被拒 / 4004 设备不在线）
+ client ──TLS──▶ relay ◀──TLS── yi-agentd
+   │   ① relay layer: challenge-signature;   │
+   │     the relay checks the device's       │
+   │     pushed allow list                   │
+   │                                         │
+   └────── ② end-to-end Noise IK ────────────┘
+          the relay only forwards ciphertext
 ```
 
-被签名的内容（各字段按长度前缀拼接，防止歧义）：
+- **① Relay layer**: decides "may you pass through the relay". The relay verifies signatures and checks allow lists, and **cannot see** message contents.
+- **② End to end**: decides "may you talk to this device", and handles encryption. Even if the relay is compromised and its allow lists tampered with, nobody without the right Noise keys can reach yi-agentd.
+
+The two layers are independent. ① mainly prevents abuse and resource exhaustion; ② provides security.
+
+## 3. Relay-layer authentication (goals 1, 2, 3)
+
+### 3.1 No secrets in URLs
+
+The URLs of the three endpoints `/v1/agent`, `/v1/client` and `/v1/stream` take no parameters. After the WebSocket upgrade, **the first messages are authentication**:
+
+```
+relay → peer   {"type":"challenge","v":2,"nonce":"<32 random bytes, b64>"}
+peer → relay   {"type":"auth", ...see table below... , "sig":"<Ed25519 signature, b64>"}
+relay → peer   {"type":"ok"}             or close (4401 unauthorized / 4403 refused / 4004 device offline)
+```
+
+What is signed (fields concatenated with length prefixes to avoid ambiguity):
 
 ```
 "yi-console relay auth v2" ‖ role ‖ device ‖ stream ‖ nonce
 ```
 
-| role | 端点 | auth 消息里的字段 | 中继怎么判断 |
+| role | Endpoint | Fields in the auth message | How the relay decides |
 |---|---|---|---|
-| `agent` | `/v1/agent` | `device`、`pub`（agent_sign 公钥）、`sig`；首次登记时另带 `invite` | 设备 id 等于 hash(pub)；签名有效；pub 在已登记设备列表里，或者 `invite` 有效（此时完成登记，见 3.3） |
-| `stream` | `/v1/stream` | `device`、`pub`、`stream`（中继下发的数据流 id）、`sig` | 设备已登记、签名有效，并且 `stream` 必须是这台设备正在等的数据流 |
-| `client` | `/v1/client` | `device`、`pub`（client_sign 公钥）、`sig`；首次配对时另带 `ticket` | 签名有效，**并且** pub 在该设备的客户端白名单里，或者 `ticket` 在该设备的有效配对票据里 |
+| `agent` | `/v1/agent` | `device`, `pub` (agent_sign public key), `sig`; plus `invite` on first registration | device id equals hash(pub); the signature is valid; pub is in the registered device list, or `invite` is valid (registration then completes, see 3.3) |
+| `stream` | `/v1/stream` | `device`, `pub`, `stream` (stream id issued by the relay), `sig` | the device is registered, the signature is valid, and `stream` is a stream this device is expected to open |
+| `client` | `/v1/client` | `device`, `pub` (client_sign public key), `sig`; plus `ticket` on first pairing | the signature is valid **and** pub is in the device's client allow list, or `ticket` is among the device's valid pairing tickets |
 
-为什么用握手后的消息，而不是 HTTP 头：
+Why messages after the handshake rather than HTTP headers:
 
-- 不会出现在 URL、Referer 或反向代理的访问日志里（大部分代理默认只记录请求行，但很多人会顺手把头也记下来）。
-- 中继每次连接都发一个新随机数，签名只对这一次连接有效，被截获也不能重放。
-- 浏览器和 Android 的 WebSocket API 对自定义头支持不一，放在消息里各端实现都一样。
+- They never appear in URLs, Referers or reverse proxy access logs (most proxies only log the request line by default, but many people log headers too).
+- The relay sends a fresh nonce for every connection, so a signature is only valid for that connection and can't be replayed if intercepted.
+- Browser and Android WebSocket APIs differ in their support for custom headers; messages work the same everywhere.
 
-鉴权单独限时 10 秒。失败分两类：签名错、格式错、超时、猜错邀请码或配对票据，**计入该 IP 的失败次数**（`Limits::record_fail`），连续失败会被拉黑；身份已经证明、只是没有权限的（被移除的设备、未登记的电脑、设备离线）**不计入**。被移除的设备会自动重连，它常和其他设备在同一个 NAT 后面，计入的话会把同一 IP 下的设备一起拉黑（端到端测试里实际遇到过）。客户端遇到这类拒绝也会停止自动重连。
+Authentication has its own 10-second limit. Failures come in two kinds: bad signatures, malformed messages, timeouts, and wrong guesses of invite codes or pairing tickets **count toward the IP's failures** (`Limits::record_fail`), and repeated failures get the IP banned; a proven identity without permission (a removed device, an unregistered computer, a device offline) **doesn't count**. A removed device keeps auto-reconnecting and often sits behind the same NAT as other devices; counting it would ban every device on that IP (this actually happened in end-to-end testing). Clients that hit such a refusal also stop auto-reconnecting.
 
-### 3.2 中继上的客户端白名单（ACL）
+### 3.2 Client allow list (ACL) on the relay
 
-yi-agentd 通过已经鉴权过的控制连接，把这台设备的白名单推给中继：
+Over its authenticated control connection, yi-agentd pushes this device's allow list to the relay:
 
 ```json
 {"type":"acl",
- "clients":["<client_sign 公钥 b64>", "..."],
+ "clients":["<client_sign public key b64>", "..."],
  "tickets":[{"hash":"<b64>","exp":1762070400}]}
 ```
 
-- 控制连接每次建立时推一次全量；配对、吊销、配对码过期时再推一次全量。
-- 中继**只放在内存里**，不写盘。设备离线时客户端本来就连不上；中继重启后 yi-agentd 会重连并重新推送。
-- 中继收到新的 ACL 后，**立即断开**已经不在名单里的客户端的数据流（中继记得每条对接属于哪个客户端公钥）。
+- The full list is pushed every time the control connection is established, and again on pairing, revocation and pairing code expiry.
+- The relay keeps it **in memory only**, never on disk. When the device is offline, clients can't connect anyway; after a relay restart, yi-agentd reconnects and pushes again.
+- On receiving a new ACL, the relay **immediately drops** streams of clients no longer on the list (it remembers which client public key each splice belongs to).
 
-中继能看到的只有公钥，公钥本身不是秘密。
+All the relay sees are public keys, which aren't secrets.
 
-### 3.3 谁能把电脑挂到中继上：邀请登记，取代固定的 `--token`
+### 3.3 Who may attach a computer to the relay: invite registration instead of a fixed `--token`
 
-先明确一点：**客户端（手机）已经不能随意连中继了**。中继只放行设备白名单（3.2）里的客户端公钥，或者持有有效配对票据的客户端；这两样都只能由已登记的 yi-agentd 发放。所以中继自己要管的准入问题只剩一个：**哪些 yi-agentd 可以登记到这个中继上**。
+First, note that **clients (phones) can no longer connect to the relay at will**. The relay only admits client public keys on the device's allow list (3.2), or clients holding a valid pairing ticket, and only a registered yi-agentd can issue either. So the only admission question left for the relay itself is: **which yi-agentd instances may register with this relay**.
 
-v1 用一个固定的 `--token` 管这件事，问题是：它永远有效；所有设备共用，泄露后只能整体更换，而且所有电脑都要重新设置；也没法吊销某一台。v2 改成和 Tailscale auth key、NetBird setup key 一样的模式：**一次性邀请码只负责登记，登记之后靠设备自己的密钥**。
+v1 handled this with a fixed `--token`, which was valid forever, shared by all devices (a leak meant replacing it everywhere and reconfiguring every computer), and couldn't revoke a single device. v2 follows the same model as Tailscale auth keys and NetBird setup keys: **a one-time invite code is only for registration; after that the device relies on its own key**.
 
-**邀请码**
+**Invite codes**
 
-- 由运营者在中继服务器上生成：`yi-relay invite [--ttl 24h] [--uses 1] [--note 备注]`。默认只能用 1 次、24 小时后过期。
-- 输出一条接入链接 `yiconsole://relay?v=2&url=<中继地址>&fp=<证书指纹>&invite=<邀请码>`，同时打印二维码。中继启动参数新增 `--public-url`，用来填链接里的地址；没配时只打印邀请码。
-- 中继只保存邀请码的 SHA-256（`relay-invites.json`），比较哈希时用常数时间比较。
-- 中继第一次启动、还没有任何设备和邀请时，自动生成一个 24 小时有效的一次性邀请，打印到启动日志里。这个做法类似 RustDesk 首次启动时打印公钥，或 Jenkins 首次启动时打印初始管理员密码。
+- Generated by the operator on the relay server: `yi-relay invite [--ttl 24h] [--uses 1] [--note <note>]`. By default single-use, expiring after 24 hours.
+- Outputs an access link `yiconsole://relay?v=2&url=<relay address>&fp=<cert fingerprint>&invite=<invite code>` and prints a QR code. The relay's new `--public-url` option provides the address in the link; without it, only the invite code is printed.
+- The relay stores only the SHA-256 of invite codes (`relay-invites.json`) and compares hashes in constant time.
+- On the relay's first start, with no devices and no invites yet, it automatically generates a single-use invite valid for 24 hours and prints it in the startup log, much like RustDesk printing its public key or Jenkins printing the initial admin password on first start.
 
-**登记流程**
+**Registration flow**
 
-1. 在电脑上粘贴接入链接（或用 `yi-agentd relay setup <链接>`）。
-2. yi-agentd 连上中继，收到 challenge 后，在 `auth` 消息里带上 `invite` 和自己的签名。
-3. 中继验证签名，确认邀请码有效，然后把 `{device, pub, 备注, 登记时间, 来源邀请}` 写进 `relay-devices.json`，并把邀请码的剩余次数减 1。
-4. yi-agentd 丢弃邀请码。之后每次连接都只用签名，不再带任何共享密钥。
+1. Paste the access link on the computer (or run `yi-agentd relay setup <link>`).
+2. yi-agentd connects to the relay and, after receiving the challenge, includes `invite` and its signature in the `auth` message.
+3. The relay verifies the signature, confirms the invite is valid, writes `{device, pub, note, registration time, source invite}` to `relay-devices.json`, and decrements the invite's remaining uses.
+4. yi-agentd discards the invite code. Every later connection uses only its signature, with no shared secret.
 
-**设备代发邀请（给自己的另一台电脑开中继）**
+**Device-issued invites (enabling the relay for another of your computers)**
 
-- 已登记的 yi-agentd 可以通过控制连接向中继要一个一次性、10 分钟有效的邀请：`{"type":"invite"}` → `{"type":"invite","code":"..."}`。
-- “一键复用中继”（`relay.reuse`）就用这个功能（见第 8 节）。
-- **默认关闭**，运营者用 `--device-invites` 打开。关闭时只有在服务器上能发邀请，界面上的“一键复用中继”会提示去中继服务器上执行 `yi-relay invite`。
-- 中继会记下这个邀请是哪台设备发的。
+- A registered yi-agentd can ask the relay over its control connection for a single-use invite valid for 10 minutes: `{"type":"invite"}` → `{"type":"invite","code":"..."}`.
+- "One-click relay reuse" (`relay.reuse`) uses this (see section 8).
+- **Off by default**; the operator enables it with `--device-invites`. When off, invites can only be issued on the server, and the UI's "one-click relay reuse" tells the user to run `yi-relay invite` on the relay server.
+- The relay records which device issued each invite.
 
-**管理命令**（在中继服务器上执行，直接读写数据目录里的 JSON 文件；运行中的中继每 5 秒检查一次文件是否有变化，登记时也会重新读取）
+**Admin commands** (run on the relay server; they read and write the JSON files in the data directory directly; a running relay checks the files for changes every 5 seconds and also rereads them on registration)
 
-- `yi-relay devices`：列出已登记设备（设备 id、备注、登记时间、来源、最近在线）
-- `yi-relay revoke <设备 id> [--cascade]`：吊销设备。正在线的会被立刻断开（控制连接和所有数据流），之后再也连不上。加 `--cascade` 时，由它代发邀请登记的设备一起吊销
-- `yi-relay invites [--revoke <id>]`：列出或作废邀请码
+- `yi-relay devices`: list registered devices (device id, note, registration time, source, last seen)
+- `yi-relay revoke <device id> [--cascade]`: revoke a device. If online it's disconnected immediately (control connection and all streams) and can never connect again. With `--cascade`, devices registered through invites it issued are revoked too
+- `yi-relay invites [--revoke <id>]`: list or void invite codes
 
-**开放模式**
+**Open mode**
 
-- `--open`：任何人都能直接登记，不需要邀请。适合像 Syncthing 公共中继那样对外开放的场景，启动日志会给出警告。
-- 默认是关闭的。v1 那种“没配 `--token` 就悄悄对所有人开放”的行为去掉。
+- `--open`: anyone can register directly without an invite. Meant for publicly open relays like Syncthing's public relays; the startup log shows a warning.
+- Off by default. v1's behavior of "silently open to everyone when `--token` isn't configured" is gone.
 
-**`--token` 和 `HUB_RELAY_TOKEN` 删除。** yi-agentd 的 `relay.json` 里也不再保存任何中继令牌。
+**`--token` and `HUB_RELAY_TOKEN` are removed.** yi-agentd's `relay.json` no longer stores any relay token either.
 
-**仍然无法避免的部分**：任何人都能完成 TCP、TLS 和 WebSocket 升级，并拿到一个 challenge。对此的防护是：鉴权必须在 10 秒内完成；失败计入该 IP 的失败次数，达到阈值拉黑；全局和单 IP 都有连接数上限。这些防护对未登记的连接都生效。
+**What still can't be avoided**: anyone can complete TCP, TLS and the WebSocket upgrade and receive a challenge. The defenses: authentication must complete within 10 seconds; failures count toward the IP and get it banned past a threshold; there are global and per-IP connection caps. All of these apply to unregistered connections.
 
-**考虑过、没有采用的方案**
+**Alternatives considered and not adopted**
 
-| 方案 | 代表产品 | 不采用的原因 |
+| Approach | Example | Why not |
 |---|---|---|
-| 固定共享令牌 | frp `auth.token`、v1 的 `--token` | 这次要解决的正是它的问题 |
-| 限时 HMAC 凭证：中继和签发方共享一个密钥，凭证 = HMAC(密钥, 过期时间:用户) | TURN REST API（coturn `use-auth-secret`） | 需要一个在线的签发服务，而且签发密钥本身又是一个固定的共享密钥 |
-| 签名凭证链：中继只信任运营者公钥，由运营者离线签发设备凭证 | NATS operator / JWT 模式 | 中继不用存设备列表，但吊销要另外维护黑名单，凭证和签发工具也要自己做；对自建的个人中继来说太重 |
-| 外部准入回调或 OIDC | Tailscale `--verify-client-url`、frp OIDC | 要额外部署身份服务；可以以后作为扩展再加 |
+| Fixed shared token | frp `auth.token`, v1's `--token` | Its problems are exactly what this change fixes |
+| Time-limited HMAC credentials: the relay and an issuer share a key, credential = HMAC(key, expiry:user) | TURN REST API (coturn `use-auth-secret`) | Needs an online issuing service, and the issuing key is itself another fixed shared secret |
+| Signed credential chains: the relay trusts only the operator's public key, and the operator signs device credentials offline | NATS operator / JWT mode | The relay needn't store a device list, but revocation needs a separate blocklist, and credentials and signing tools would have to be built; too heavy for a self-hosted personal relay |
+| External admission callback or OIDC | Tailscale `--verify-client-url`, frp OIDC | Requires deploying an extra identity service; could be added later as an extension |
 
-### 3.4 资源限制
+### 3.4 Resource limits
 
-- 每台设备同时最多 32 条数据流（不变），**每个客户端公钥最多 8 条**，单个客户端占不满整台设备的名额。
-- 用配对票据发起的连接，每台设备同时最多 2 条。
-- 现有的全局连接上限、单 IP 连接上限和拉黑机制保持不变。
+- At most 32 concurrent streams per device (unchanged), and **at most 8 per client public key**, so a single client can't use up a whole device's slots.
+- At most 2 concurrent connections per device that came in with a pairing ticket.
+- The existing global connection cap, per-IP cap and banning stay as they were.
 
-### 3.5 放在 Nginx / Caddy 等反向代理后面
+### 3.5 Behind Nginx / Caddy or another reverse proxy
 
-中继对外就是普通的 HTTP/1.1 WebSocket（`/v1/agent`、`/v1/client`、`/v1/stream`），可以放在反向代理后面，由代理负责正式证书的 TLS。中继监听 `127.0.0.1`，不配 TLS。v2 的鉴权全部在 WebSocket 消息里，代理的访问日志里不会出现任何密钥。
+To the outside, the relay is plain HTTP/1.1 WebSocket (`/v1/agent`, `/v1/client`, `/v1/stream`), so it can sit behind a reverse proxy that handles TLS with a real certificate, with the relay listening on `127.0.0.1` without TLS. All v2 authentication happens inside WebSocket messages, so no secrets appear in the proxy's access logs.
 
-**必须解决的问题：真实客户端 IP。** 中继按 `peer.ip()` 做单 IP 连接上限和失败拉黑。放在代理后面时，所有连接看起来都来自 `127.0.0.1`，结果是：
+**The problem that must be solved: the real client IP.** The relay applies the per-IP connection cap and failure bans by `peer.ip()`. Behind a proxy, every connection appears to come from `127.0.0.1`, so:
 
-- 单 IP 上限（默认 32）变成了全局上限；
-- 任何一个人连续鉴权失败，就会把**所有人**一起拉黑。
+- the per-IP cap (default 32) becomes a global cap;
+- one person's repeated authentication failures get **everyone** banned.
 
-改法：新增 `--trusted-proxy <IP 或网段，可多次>`（例如 `127.0.0.1`、`::1`）。只有当 TCP 对端在这个列表里时，中继才读取请求头里的 `X-Forwarded-For`，取最右边那个不在可信列表里的地址，作为客户端 IP；否则忽略这个头，防止有人直连时伪造 IP。没有配置 `--trusted-proxy` 时，行为和现在一样。
+The fix: a new `--trusted-proxy <IP or subnet, repeatable>` option (e.g. `127.0.0.1`, `::1`). Only when the TCP peer is on this list does the relay read the `X-Forwarded-For` request header and take the rightmost address not on the trusted list as the client IP; otherwise the header is ignored, so direct connections can't forge their IP. Without `--trusted-proxy`, behavior is unchanged.
 
-因此限流和拉黑都要等 WebSocket 升级、拿到请求头以后才知道真实 IP：
-- TCP 建连时只按 TCP 对端做全局计数；
-- 升级完成后按真实 IP 做单 IP 计数和拉黑检查。
+As a consequence, rate limiting and banning only know the real IP after the WebSocket upgrade, once the request headers are available:
+- at TCP connect, only the global count by TCP peer applies;
+- after the upgrade, the per-IP count and ban check use the real IP.
 
-代理侧的要求（README 给出 Nginx 和 Caddy 示例）：
-- 转发 `Upgrade` / `Connection` 头，Nginx 要设置 `proxy_http_version 1.1`；
-- 读写超时要大于 90 秒（控制连接的心跳超时），建议 1 小时；
-- 关闭响应缓冲；
-- 设置 `X-Forwarded-For`。Caddy 的 `reverse_proxy` 默认就会设置。
+Requirements on the proxy side (the README gives Nginx and Caddy examples):
+- forward the `Upgrade` / `Connection` headers; Nginx needs `proxy_http_version 1.1`;
+- read/write timeouts longer than 90 seconds (the control connection's heartbeat timeout); 1 hour is recommended;
+- disable response buffering;
+- set `X-Forwarded-For`. Caddy's `reverse_proxy` does this by default.
 
-用正式 CA 证书时，配对信息里的 `fp` 留空，客户端按系统 CA 校验。中继地址可以带路径前缀，比如 `wss://example.com/hub`，代理把前缀去掉后再转给中继即可，客户端在地址后面拼 `/v1/...`。
+With a real CA certificate, `fp` in the pairing info is left empty and clients verify against the system CAs. The relay address may include a path prefix, such as `wss://example.com/hub`; the proxy strips the prefix before forwarding to the relay, and clients append `/v1/...` to the address.
 
-## 4. 端到端加密：Noise IK（对应改进 4 和前向保密）
+## 4. End-to-end encryption: Noise IK (goal 4 and forward secrecy)
 
-改用 [Noise Protocol Framework](https://noiseprotocol.org/noise.html) 的 `Noise_IK_25519_ChaChaPoly_SHA256`，实现用 `snow` crate，不再自己设计握手。
+Switch to `Noise_IK_25519_ChaChaPoly_SHA256` from the [Noise Protocol Framework](https://noiseprotocol.org/noise.html), implemented with the `snow` crate, instead of a home-grown handshake.
 
-- **IK** 表示：客户端事先知道设备的静态公钥（I = 第一条消息就带上客户端静态公钥，K = 已知对方静态公钥）。一个往返就能完成握手。
-- prologue 为 `"yi-console e2e v2" ‖ device`，把握手绑定到这台设备。
-
-```
-客户端                                                  yi-agentd
-  │ -> e, es, s, ss   [payload: 客户端名称、client_sign 公钥] │
-  │ ───────────────────────────────────────────────────▶ │  检查客户端静态公钥是否在已配对列表里
-  │ <- e, ee, se                                         │
-  │ ◀─────────────────────────────────────────────────── │
-  │            之后每个 WebSocket 二进制帧 = 一条 Noise 传输消息        │
-```
-
-得到的安全性质：
-
-- **双向认证**：客户端用二维码里的 `agent_noise` 公钥确认对方是这台设备；yi-agentd 用已配对列表确认客户端。
-- **前向保密**：每次连接双方都生成临时密钥 `e`，会话密钥依赖 `ee` 的 DH 结果。日后就算长期密钥泄露，之前录下的流量也解不开。
-- **客户端身份对中继保密**：客户端的 Noise 静态公钥在第一条消息里就是加密的。
-- **顺序和完整性**：Noise 传输消息带递增 nonce，被篡改、重放或调换顺序都会解密失败，然后断开连接。
-
-一条 Noise 消息最大 65535 字节，`pump()` 的分块从 64 KiB 改成 60 KiB。
-
-yi-agentd 还会核对 payload 里的 `client_sign` 公钥和中继在 `open` 消息里报告的公钥是否属于同一个已配对客户端，保证中继的白名单和端到端身份对得上。
-
-## 5. 配对流程
-
-v1 的二维码里有长期密钥 K。v2 的二维码里**只有设备公钥和一次性配对码**：
+- **IK** means the client knows the device's static public key in advance (I = the client's static key is sent in the first message, K = the peer's static key is known). The handshake completes in one round trip.
+- The prologue is `"yi-console e2e v2" ‖ device`, binding the handshake to this device.
 
 ```
-yiconsole://pair?v=2&relay=<wss://...>&fp=<证书指纹>&device=<设备 id>
-               &apk=<agent_noise 公钥 b64>&code=<一次性配对码 b64>&name=<设备名>
+client                                                    yi-agentd
+  │ -> e, es, s, ss   [payload: client name, client_sign public key] │
+  │ ───────────────────────────────────────────────────────────▶ │  check that the client static key is in the paired list
+  │ <- e, ee, se                                                 │
+  │ ◀─────────────────────────────────────────────────────────── │
+  │        afterwards each WebSocket binary frame = one Noise transport message      │
+```
+
+Resulting security properties:
+
+- **Mutual authentication**: the client confirms the peer is this device using the `agent_noise` public key from the QR code; yi-agentd confirms the client using its paired list.
+- **Forward secrecy**: both sides generate ephemeral keys `e` for every connection, and the session keys depend on the `ee` DH result. Even if long-term keys leak later, previously recorded traffic can't be decrypted.
+- **Client identity hidden from the relay**: the client's Noise static public key is already encrypted in the first message.
+- **Ordering and integrity**: Noise transport messages carry incrementing nonces; tampering, replay or reordering all fail to decrypt, and the connection is dropped.
+
+A Noise message is at most 65535 bytes, so `pump()` chunks at 60 KiB instead of 64 KiB.
+
+yi-agentd also checks that the `client_sign` public key in the payload and the public key the relay reported in the `open` message belong to the same paired client, so the relay's allow list and the end-to-end identity agree.
+
+## 5. Pairing flow
+
+v1's QR code contained the long-term key K. v2's QR code contains **only the device public key and a one-time pairing code**:
+
+```
+yiconsole://pair?v=2&relay=<wss://...>&fp=<cert fingerprint>&device=<device id>
+               &apk=<agent_noise public key b64>&code=<one-time pairing code b64>&name=<device name>
 ```
 
 ```mermaid
 sequenceDiagram
-    participant U as 用户（电脑上）
+    participant U as User (on the computer)
     participant A as yi-agentd
-    participant R as 中继
-    participant C as 手机
-    U->>A: 点「添加设备」
-    A->>A: 生成 code（10 分钟有效）
-    A->>R: acl 推送：tickets += SHA256("ticket"‖code)
-    A-->>U: 显示二维码
-    C->>C: 扫码，生成自己的 client_sign / client_noise
-    C->>R: /v1/client，auth（role=client, pub, ticket, sig）
-    R->>R: ticket 哈希匹配且未过期 → 放行
+    participant R as Relay
+    participant C as Phone
+    U->>A: Click "Add device"
+    A->>A: Generate code (valid 10 minutes)
+    A->>R: acl push: tickets += SHA256("ticket"‖code)
+    A-->>U: Show QR code
+    C->>C: Scan; generate its own client_sign / client_noise
+    C->>R: /v1/client, auth (role=client, pub, ticket, sig)
+    R->>R: ticket hash matches and not expired → admit
     R->>A: {"type":"open","stream":sid,"client":pub,"pairing":true}
-    A->>R: /v1/stream，auth
-    R-->>C: 两端对接
-    C->>A: Noise IKpsk1（psk = HKDF(code, "psk")）
-    A->>A: 握手成功 = 证明持有 code → 记下客户端，作废 code
-    A->>R: acl 推送：clients += pub，tickets -= 这张票
-    Note over C,A: 之后都用 Noise IK，不再需要 code
+    A->>R: /v1/stream, auth
+    R-->>C: Splice both ends
+    C->>A: Noise IKpsk1 (psk = HKDF(code, "psk"))
+    A->>A: Handshake succeeds = proof of holding code → record client, void code
+    A->>R: acl push: clients += pub, tickets -= this ticket
+    Note over C,A: From then on Noise IK only; code no longer needed
 ```
 
-要点：
+Key points:
 
-- **中继只知道 `SHA256("ticket"‖code)`**，从它推不出 Noise 用的 psk，所以中继没法冒充 yi-agentd 完成配对，也没法自己配对一个客户端。
-- 配对用 `IKpsk1`，即在 IK 第一条消息末尾混入 psk。选 psk1 而不是 psk2，是为了让 yi-agentd 读第一条消息时就能确认对方持有配对码，确认之后才把它加进已配对列表；psk2 要到第二条消息才校验，yi-agentd 会先把没验证过的客户端加进去。没有 code 的人握手会失败；没有 `agent_noise` 私钥的人也假冒不了 yi-agentd。
-- code 只能用一次，10 分钟后过期，只存在 yi-agentd 内存里，yi-agentd 重启后作废。**二维码用过以后就算泄露也没关系。**
-- 配对成功后，客户端把下面这些信息保存为一条 `yiconsole://paired?v=2&...` 凭据：relay、fp、device、apk、name，以及自己的两个私钥。这条凭据含私钥，界面上照旧隐藏（`REDACTED`）。
+- **The relay only knows `SHA256("ticket"‖code)`**, from which the Noise psk can't be derived, so the relay can neither impersonate yi-agentd to complete pairing nor pair a client of its own.
+- Pairing uses `IKpsk1`, mixing the psk in at the end of the first IK message. psk1 rather than psk2 lets yi-agentd confirm the peer holds the pairing code as soon as it reads the first message, and only then add it to the paired list; psk2 would only verify on the second message, after yi-agentd had already added an unverified client. Without the code the handshake fails; without the `agent_noise` private key nobody can impersonate yi-agentd.
+- The code is single-use, expires after 10 minutes, lives only in yi-agentd's memory, and is voided when yi-agentd restarts. **A used QR code is harmless even if leaked.**
+- After pairing, the client saves the following as a `yiconsole://paired?v=2&...` credential: relay, fp, device, apk, name, and its own two private keys. The credential contains private keys and stays hidden in the UI (`REDACTED`).
 
-## 6. 吊销与轮换
+## 6. Revocation and rotation
 
-| 操作 | 做法 | 影响 |
+| Action | How | Impact |
 |---|---|---|
-| 吊销一台手机 | yi-agentd 从已配对列表删掉它 → 推送新 ACL → 中继断开它的数据流；yi-agentd 同时关闭它在本机的连接 | 只影响这一台 |
-| 重置所有配对 | `yi-agentd relay reset` / 界面「更多 → 重置所有配对」：清空已配对列表、作废未用的配对码、更换 `agent_noise` | 所有客户端都要重新配对；`agent_sign`（设备 id）不变，不用重新到中继登记 |
-| 中继吊销一台电脑 | 运营者执行 `yi-relay revoke <设备 id>`，在线的会被立刻断开 | 只影响这台电脑（加 `--cascade` 时连同它邀请登记的电脑） |
-| 邀请码泄露 | `yi-relay invites --revoke <id>`；已经用它登记的设备逐台 revoke | 不影响其他设备 |
-| 中继证书更换 | 照旧：重新设置指纹 | 需要更新配对信息里的 fp |
+| Revoke one phone | yi-agentd removes it from the paired list → pushes a new ACL → the relay drops its streams; yi-agentd also closes its connections on this machine | That phone only |
+| Reset all pairings | `yi-agentd relay reset` / "More → Reset all pairings" in the UI: clear the paired list, void unused pairing codes, rotate `agent_noise` | All clients must re-pair; `agent_sign` (the device id) stays, so no re-registration with the relay is needed |
+| Relay revokes a computer | The operator runs `yi-relay revoke <device id>`; if online it's disconnected immediately | That computer only (plus computers registered through its invites with `--cascade`) |
+| Invite code leaked | `yi-relay invites --revoke <id>`; revoke any devices already registered with it one by one | No other devices affected |
+| Relay certificate replaced | As before: set the new fingerprint | The fp in pairing info must be updated |
 
-新增 RPC 和 CLI：
+New RPCs and CLI:
 
-- `relay.pairStart` → `{uri, expiresAt}`，界面上显示二维码和倒计时
+- `relay.pairStart` → `{uri, expiresAt}`; the UI shows the QR code and a countdown
 - `relay.clients` → `[{id, name, createdAt, lastSeen, online}]`
-- `relay.revoke {id}`、`relay.renameClient {id, name}`
+- `relay.revoke {id}`, `relay.renameClient {id, name}`
 - `relay.reset`
-- CLI：`yi-agentd relay pair`（打印一次性二维码）、`yi-agentd relay clients`、`yi-agentd relay revoke <id>`、`yi-agentd relay reset`（取代 `--reset-key`）
+- CLI: `yi-agentd relay pair` (prints a one-time QR code), `yi-agentd relay clients`, `yi-agentd relay revoke <id>`, `yi-agentd relay reset` (replaces `--reset-key`)
 
-## 7. 中继能看到 / 能做什么
+## 7. What the relay can see / do
 
 | | v1 | v2 |
 |---|---|---|
-| 消息内容 | 看不到 | 看不到 |
-| 长期密钥 | 看得到共用令牌和设备令牌 | 只有公钥；邀请码只存哈希，用完即作废 |
-| 录下流量、日后拿到长期密钥再解密 | 可以 | 不行（前向保密） |
-| 冒充设备或客户端 | 不行（没有 K） | 不行（没有私钥） |
-| 知道是哪个客户端在连 | 不知道 | 知道 client_sign 公钥（一个随机标识，与真实身份无关） |
-| 元数据（IP、时间、流量大小） | 看得到 | 看得到（不在本方案范围内） |
-| 断开或拒绝服务 | 可以 | 可以（中继天然能做到） |
+| Message contents | No | No |
+| Long-term secrets | Sees the shared token and device tokens | Public keys only; invite codes stored as hashes and void after use |
+| Record traffic and decrypt later with long-term keys | Yes | No (forward secrecy) |
+| Impersonate a device or client | No (no K) | No (no private keys) |
+| Know which client is connecting | No | Knows the client_sign public key (a random identifier unrelated to real identity) |
+| Metadata (IP, timing, traffic volume) | Yes | Yes (out of scope for this design) |
+| Disconnect or deny service | Yes | Yes (inherent to any relay) |
 
-## 8. 影响到的“经电脑转发”和“一键复用中继”
+## 8. Effects on "forwarding through a computer" and "one-click relay reuse"
 
-- **经电脑转发**（`proxy.setHosts`）：电脑上的客户端把自己的 v2 凭据（含私钥）交给本机 yi-agentd，由 yi-agentd 代表这个客户端去连目标设备。这和 v1 交出 K 一样，都只在本机传递。目标设备会把它当成那台电脑的客户端，吊销那台电脑就会一起失效。
-- **一键复用中继**（`relay.reuse`）：客户端调用来源主机新增的 RPC `relay.invite`（只有已授权的客户端能调用）。来源 yi-agentd 向中继要一个一次性邀请，拼成接入链接返回，客户端再把它交给目标主机的 `relay.configure`。因此来源主机必须在线，并且中继开启了 `--device-invites`（默认关闭）。
-- **`relay.known`**：从凭据里取 url 和 fp 去重。
-- `relay.pairing` 返回的信息里去掉 `accessUri`，因为已经没有可以复用的长期接入链接了。
+- **Forwarding through a computer** (`proxy.setHosts`): the client on the computer hands its v2 credential (with private keys) to the local yi-agentd, which connects to the target device on the client's behalf. Like handing over K in v1, this only happens locally. The target device treats it as that computer's client, and revoking that computer revokes this too.
+- **One-click relay reuse** (`relay.reuse`): the client calls the new RPC `relay.invite` on the source host (only authorized clients can call it). The source yi-agentd asks the relay for a single-use invite and returns it as an access link, which the client passes to the target host's `relay.configure`. So the source host must be online and the relay must have `--device-invites` enabled (off by default).
+- **`relay.known`**: deduplicates url and fp taken from credentials.
+- `relay.pairing` no longer returns `accessUri`, since there's no reusable long-term access link anymore.
 
-## 9. 改动清单
+## 9. Change list
 
 **`crates/link`**
-- 依赖：新增 `snow`、`ed25519-dalek`、`subtle`；去掉 `hmac`（`hkdf` 保留给 psk 派生）。
-- `Pairing` 拆成两种：`PairOffer`（二维码，`yiconsole://pair?v=2`）和 `ClientCredential`（配对后保存，`yiconsole://paired?v=2`）。
-- 新增 `AgentKeys` / `ClientKeys`（生成、序列化）、`device_id_of(pub)`。
-- 中继层：`relay_auth(ws, role, ...)`：收 challenge、签名、等 ok；URL 不再带参数。
-- 端到端：删掉 `handshake_client` / `handshake_agent` / `Cipher`，换成基于 `snow` 的 `noise_initiator` / `noise_responder`（IK 和 IKpsk1）；`pump()` 改用 Noise 传输状态，分块改为 60 KiB。
-- `client_connect(cred)`、`client_pair(offer, name) -> ClientCredential`、`agent_control`、`agent_accept`（返回对端 client_sign 公钥，供 yi-agentd 核对）。
-- 控制连接：`next_control` 解析新的 `open` 消息（带 `client`、`pairing`）；新增 `send_acl`。
+- Dependencies: add `snow`, `ed25519-dalek`, `subtle`; remove `hmac` (`hkdf` stays for psk derivation).
+- Split `Pairing` into `PairOffer` (QR code, `yiconsole://pair?v=2`) and `ClientCredential` (saved after pairing, `yiconsole://paired?v=2`).
+- Add `AgentKeys` / `ClientKeys` (generation, serialization) and `device_id_of(pub)`.
+- Relay layer: `relay_auth(ws, role, ...)`: receive the challenge, sign, wait for ok; URLs carry no parameters.
+- End to end: remove `handshake_client` / `handshake_agent` / `Cipher`, replaced by `snow`-based `noise_initiator` / `noise_responder` (IK and IKpsk1); `pump()` uses the Noise transport state and 60 KiB chunks.
+- `client_connect(cred)`, `client_pair(offer, name) -> ClientCredential`, `agent_control`, `agent_accept` (returns the peer's client_sign public key for yi-agentd to check).
+- Control connection: `next_control` parses the new `open` message (with `client`, `pairing`); add `send_acl`.
 
 **`crates/relay`**
-- 去掉 URL query 鉴权和 `relay-devices.json` 注册表。
-- `accept_ws` 只负责升级；升级后 `authenticate()` 发 challenge、验签，按 role 校验；失败调用 `record_fail`。
-- `Device` 增加 `acl: HashSet<公钥>`、`tickets: Vec<(hash, exp)>`，以及每个客户端的活跃流计数；`splice` 记录每条对接属于哪个客户端，ACL 更新时断开被移除的客户端。
-- `open` 消息带上 `client` 和 `pairing`。
-- 删除 `--token` / `HUB_RELAY_TOKEN`，新增 `--public-url`、`--open`、`--device-invites`、`--trusted-proxy`。
-- 单 IP 限流和拉黑改为在 WebSocket 升级后按真实客户端 IP 判断（见 3.5）。
-- 新增 `relay-devices.json`（设备公钥）、`relay-invites.json`（邀请码哈希、过期时间、剩余次数、来源）；运行时每 5 秒检查一次文件变化，被吊销的在线设备立即断开。
-- 子命令：`invite`、`invites`、`devices`、`revoke`；首次启动时自动生成邀请。
-- 控制连接上处理 `{"type":"invite"}`。
+- Remove URL query authentication and the old `relay-devices.json` registry.
+- `accept_ws` only upgrades; afterwards `authenticate()` sends the challenge, verifies the signature and checks by role; failures call `record_fail`.
+- `Device` gains `acl: HashSet<public key>`, `tickets: Vec<(hash, exp)>` and per-client active stream counts; `splice` records which client each splice belongs to and drops removed clients on ACL updates.
+- The `open` message carries `client` and `pairing`.
+- Remove `--token` / `HUB_RELAY_TOKEN`; add `--public-url`, `--open`, `--device-invites`, `--trusted-proxy`.
+- Per-IP rate limiting and banning use the real client IP after the WebSocket upgrade (see 3.5).
+- Add `relay-devices.json` (device public keys) and `relay-invites.json` (invite hashes, expiry, remaining uses, source); at runtime the files are checked for changes every 5 seconds, and revoked online devices are disconnected immediately.
+- Subcommands: `invite`, `invites`, `devices`, `revoke`; an invite is generated automatically on first start.
+- Handle `{"type":"invite"}` on the control connection.
 
 **`crates/yi-agentd`**
-- `relay.rs`：`RelayConfig` 改为 `{enabled, url, relay_fp, name, sign_key, noise_key, clients: [PairedClient]}`（没有中继令牌）；`setup` 接收带邀请码的接入链接，邀请码只在内存里用于首次登记；新增 `relay.invite`；内存里保存待用的配对码；控制连接建立后、以及列表变化时推送 ACL；`agent_accept` 后按 IK 或 IKpsk1 处理，配对成功就写入 `clients`；每个连接记下 client_id，`relay.revoke` 时关闭对应连接；更新 `lastSeen`。
-- `server.rs`：新增第 6 节列出的 RPC。
-- `main.rs`：CLI 子命令按第 6 节调整。
-- `proxy.rs`：读 `ClientCredential`，不再读 `Pairing`。
+- `relay.rs`: `RelayConfig` becomes `{enabled, url, relay_fp, name, sign_key, noise_key, clients: [PairedClient]}` (no relay token); `setup` accepts an access link with an invite code, which is only kept in memory for the first registration; add `relay.invite`; keep pending pairing codes in memory; push the ACL after the control connection is established and whenever the lists change; after `agent_accept`, handle IK or IKpsk1 and write successful pairings to `clients`; remember the client_id of each connection and close the matching connections on `relay.revoke`; update `lastSeen`.
+- `server.rs`: add the RPCs listed in section 6.
+- `main.rs`: adjust CLI subcommands per section 6.
+- `proxy.rs`: read `ClientCredential` instead of `Pairing`.
 
 **`crates/client`**
-- `api.rs`：添加中继主机改为“扫码 / 粘贴配对链接 → `client_pair` → 保存凭据”；`relay.parseLink` 识别 v2；`relay.known` 和 `relay.reuse` 按第 8 节修改；`client_connect` 改为使用凭据。
-- `hosts.rs`：`pairing` 字段改存 `ClientCredential` 链接（字段名不变，照旧隐藏）。
+- `api.rs`: adding a relay host becomes "scan / paste pairing link → `client_pair` → save credential"; `relay.parseLink` recognizes v2; `relay.known` and `relay.reuse` change per section 8; `client_connect` uses the credential.
+- `hosts.rs`: the `pairing` field stores the `ClientCredential` link (same field name, still hidden).
 
 **`app`**
-- `HostsView.tsx`：中继区域加入「添加设备」（一次性二维码 + 倒计时）、「已配对设备」列表（名称、最近在线、吊销、改名）、「重置设备身份」；去掉旧的“重置密钥”。
-- 添加中继主机时提示“配对码 10 分钟内有效，只能用一次”。
+- `HostsView.tsx`: the relay area gains "Add device" (one-time QR code + countdown), a "Paired devices" list (name, last seen, revoke, rename) and "Reset device identity"; the old "Reset key" is removed.
+- When adding a relay host, note that "the pairing code is valid for 10 minutes and can only be used once".
 
-**文档**：更新 `AGENTS.md` 中继相关条目和 `README.md` 的中继部署说明（`--token` 删除，改为邀请登记）。
+**Docs**: update the relay entries in `AGENTS.md` and the relay deployment instructions in the README (`--token` removed, replaced by invite registration).
 
-## 10. 测试计划
+## 10. Test plan
 
-- `link` 单元测试：凭据和配对链接往返解析；设备 id 由公钥算出；IK 和 IKpsk1 握手成功；用错 psk、错的设备公钥、未授权的客户端时失败；被篡改、重放的帧解密失败。
-- `relay` 集成测试（进程内起中继 + 模拟 yi-agentd + 模拟客户端）：
-  - URL 里没有任何参数也能完成全流程；
-  - 未授权的客户端公钥被拒绝，且计入失败次数，达到阈值后被拉黑；
-  - 票据过期或不对时拒绝；
-  - 推送新 ACL 后，被吊销客户端的连接被断开；
-  - 没有邀请的 yi-agentd 无法登记；邀请码用完或过期后作废；登记后不带邀请也能连；
-  - `yi-relay revoke` 后，在线设备被断开，之后也连不上；`--cascade` 生效；
-  - 默认拒绝设备代发邀请，开启 `--device-invites` 后可用；`--open` 模式下不需要邀请；
-  - 每个客户端的流数上限生效；
-  - 配了 `--trusted-proxy` 时按 `X-Forwarded-For` 限流和拉黑，不在可信列表里的连接伪造这个头无效；
-  - 在 Nginx 后面跑通全流程（连接空闲超过 2 分钟后仍然在线）。
-- 端到端（按惯例在 Windows 上做）：桌面开中继 → 手机扫码配对 → 对话 → 吊销 → 手机连不上；再配对一台；经电脑转发；端口转发；yi-agentd 和中继分别重启后自动恢复。
+- `link` unit tests: round-trip parsing of credentials and pairing links; device id derived from the public key; IK and IKpsk1 handshakes succeed; failures with a wrong psk, wrong device public key or unauthorized client; tampered and replayed frames fail to decrypt.
+- `relay` integration tests (in-process relay + simulated yi-agentd + simulated client):
+  - the full flow works with no parameters in any URL;
+  - unauthorized client public keys are refused, count as failures, and get banned past the threshold;
+  - expired or wrong tickets are refused;
+  - after a new ACL is pushed, revoked clients' connections are dropped;
+  - yi-agentd can't register without an invite; invites are void once used up or expired; after registering, it connects without an invite;
+  - after `yi-relay revoke`, the online device is disconnected and can't connect again; `--cascade` works;
+  - device-issued invites are refused by default and work with `--device-invites`; `--open` needs no invite;
+  - the per-client stream cap works;
+  - with `--trusted-proxy`, rate limiting and banning follow `X-Forwarded-For`, and connections not on the trusted list can't forge it;
+  - the full flow works behind Nginx (connections stay up after more than 2 minutes idle).
+- End to end (done on Windows as usual): enable the relay on the desktop → pair a phone by scanning → chat → revoke → the phone can't connect; pair another one; forwarding through a computer; port forwarding; automatic recovery after restarting yi-agentd and the relay separately.
 
-## 11. 不兼容说明
+## 11. Compatibility notes
 
-- 中继、yi-agentd、客户端必须一起升级，v1 和 v2 不能互连。
-- 升级后 yi-agentd 会生成新的设备身份，设备 id 随之改变；所有中继主机要重新扫码配对。
-- 旧的 `relay.json` 里 `device_id`、`device_token`、`key`、`relay_token` 字段丢弃；旧格式的 `relay-devices.json` 需要删除（新格式同名，内容不同）。
-- 中继去掉 `--token`；升级后每台电脑要用 `yi-relay invite` 生成的邀请重新登记。
-- `README.md` 里的中继部署说明要按新的登记方式重写。
+- The relay, yi-agentd and clients must be upgraded together; v1 and v2 can't talk to each other.
+- After upgrading, yi-agentd generates a new device identity and the device id changes; every relay host must be paired again by scanning.
+- The `device_id`, `device_token`, `key` and `relay_token` fields in the old `relay.json` are dropped; an old-format `relay-devices.json` must be deleted (the new format uses the same name with different content).
+- The relay drops `--token`; after upgrading, each computer must re-register with an invite generated by `yi-relay invite`.
+- The relay deployment instructions in the README must be rewritten for the new registration method.

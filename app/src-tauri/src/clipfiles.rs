@@ -1,10 +1,10 @@
-//! 读系统剪贴板里"复制的文件"的路径（资源管理器 / 访达 / 文件管理器里 Ctrl+C）。
-//! WebView 的粘贴事件只给文件内容不给路径；本机会话里有了路径就直接 @引用原文件，不用上传一份。
-//! 读不到时返回空列表，前端照常上传。
+//! Reads the paths of "copied files" from the system clipboard (Ctrl+C in Explorer / Finder / a file manager).
+//! The WebView paste event only gives file contents, not paths; with the path, a local session can @-reference the original file instead of uploading a copy.
+//! Returns an empty list when nothing can be read, and the frontend uploads as usual.
 
 use std::path::Path;
 
-/// 剪贴板里复制的文件（只要存在的普通文件）
+/// Files copied to the clipboard (existing regular files only)
 #[tauri::command]
 pub fn clipboard_files() -> Vec<String> {
     read().into_iter().filter(|p| Path::new(p).is_file()).collect()
@@ -12,13 +12,13 @@ pub fn clipboard_files() -> Vec<String> {
 
 #[cfg(windows)]
 fn read() -> Vec<String> {
-    // CF_HDROP：资源管理器复制文件时放的文件列表
+    // CF_HDROP: the file list Explorer puts on the clipboard when copying files
     clipboard_win::get_clipboard::<Vec<String>, _>(clipboard_win::formats::FileList).unwrap_or_default()
 }
 
 #[cfg(target_os = "macos")]
 fn read() -> Vec<String> {
-    // 访达复制文件时剪贴板里有 NSFilenamesPboardType（路径数组）
+    // When Finder copies files the clipboard holds NSFilenamesPboardType (an array of paths)
     let script = "ObjC.import('AppKit');\
         var r = ObjC.deepUnwrap($.NSPasteboard.generalPasteboard.propertyListForType('NSFilenamesPboardType'));\
         Array.isArray(r) ? r.join('\\n') : ''";
@@ -33,7 +33,7 @@ fn read() -> Vec<String> {
 
 #[cfg(all(unix, not(target_os = "macos"), not(target_os = "android"), not(target_os = "ios")))]
 fn read() -> Vec<String> {
-    // 文件管理器复制文件时放 text/uri-list（file:// 链接，一行一个）
+    // File managers put text/uri-list (file:// links, one per line) when copying files
     let tries: [(&str, &[&str]); 2] = [
         ("wl-paste", &["--no-newline", "--type", "text/uri-list"]),
         ("xclip", &["-selection", "clipboard", "-t", "text/uri-list", "-o"]),
@@ -63,7 +63,7 @@ fn read() -> Vec<String> {
     vec![]
 }
 
-/// file:// 链接里的 %XX 转回原字符
+/// Decode %XX escapes in a file:// link
 #[allow(dead_code)]
 fn unpct(s: &str) -> String {
     let b = s.as_bytes();
@@ -85,7 +85,7 @@ fn unpct(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    /// 手动验证：先在系统里复制几个文件，再 cargo test -- --ignored --nocapture clipboard_now
+    /// Manual check: copy a few files in the system first, then cargo test -- --ignored --nocapture clipboard_now
     #[test]
     #[ignore]
     fn clipboard_now() {

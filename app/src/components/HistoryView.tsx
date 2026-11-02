@@ -11,7 +11,7 @@ import { Icon, ToolBadge } from './Icon';
 const HISTORY_TOOLS: ToolKind[] = ['claude', 'codex', 'cursor', 'kiro', 'qoder', 'codebuddy'];
 const PAGE = 100;
 
-/** 比较目录用：展开 ~、统一斜杠、去掉末尾斜杠，Windows 路径不分大小写 */
+/** For comparing directories: expand ~, normalize slashes, strip the trailing slash; Windows paths are case-insensitive */
 function normDir(p: string, home?: string): string {
   let d = p.trim();
   if (home && (d === '~' || d.startsWith('~/') || d.startsWith('~\\'))) d = home + d.slice(1);
@@ -19,7 +19,7 @@ function normDir(p: string, home?: string): string {
   return /^[a-z]:/i.test(d) ? d.toLowerCase() : d;
 }
 
-/** p 是 dir 本身或在它下面 */
+/** p is dir itself or somewhere under it */
 function underDir(p: string, dir: string): boolean {
   return p === dir || p.startsWith(dir + '/');
 }
@@ -33,14 +33,14 @@ export function HistoryView({ hostId, cwd }: { hostId: string; cwd?: string }) {
   const [preview, setPreview] = useState<HubEvent[] | null>(null);
   const [pending, setPending] = useState<ToolKind[]>([]);
   const [limit, setLimit] = useState(PAGE);
-  // 只看某个目录：从侧边栏目录右键进来时带上
+  // Only one directory: passed in when coming from a directory's context menu in the sidebar
   const [dir, setDir] = useState(cwd ?? '');
   useEffect(() => setDir(cwd ?? ''), [cwd]);
   const hello = hostStatus(hostId).hello;
   const home = hello?.home;
 
-  // 每个工具单独请求、并行跑：Claude/Codex 读本地文件很快，Cursor/Kiro 要起一次 CLI 比较慢，
-  // 先回来的先显示，不用等最慢的那个
+  // One request per tool, run in parallel: Claude/Codex read local files quickly, Cursor/Kiro need to start a CLI and are slower;
+  // show whatever arrives first instead of waiting for the slowest
   const load = () => {
     const tools = HISTORY_TOOLS.filter((k) => !hello || hello.tools.some((t) => t.kind === k && t.available));
     let alive = true;

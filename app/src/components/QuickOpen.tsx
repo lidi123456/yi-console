@@ -6,8 +6,8 @@ import { KIND_LABEL, outline } from '../outline';
 import { FileIcon } from './FilePanel';
 import { Icon } from './Icon';
 
-// 文件面板的快速打开（Ctrl+P），照 VS Code：
-//   直接打字：按文件名模糊找；@ 开头：当前文件里的函数、类、标题；: 开头：跳到第几行
+// Quick open in the file panel (Ctrl+P), following VS Code:
+//   plain text: fuzzy match on file names; starting with @: functions, classes, headings in the current file; starting with :: go to a line
 
 export type QuickMode = '' | '@' | ':';
 
@@ -36,12 +36,12 @@ export function QuickOpen({
 }: {
   hostId: string;
   root: string;
-  /** 打开过的文件（相对路径），没输入时列出来 */
+  /** Opened files (relative paths), listed when nothing is typed */
   recent: string[];
-  /** 当前文件：@ 和 : 用 */
+  /** Current file: used by @ and : */
   current: { name: string; text: string; lines: number } | null;
   initial: QuickMode;
-  /** rel 是相对 root 的路径 */
+  /** rel is the path relative to root */
   onOpen: (rel: string) => void;
   onGoto: (line: number) => void;
   onClose: () => void;
@@ -57,7 +57,7 @@ export function QuickOpen({
 
   useEffect(() => input.current?.focus(), []);
 
-  // 找文件：停手 120ms 再问
+  // Finding files: ask 120 ms after typing stops
   useEffect(() => {
     if (mode || !term) {
       setFiles(null);

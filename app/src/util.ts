@@ -7,23 +7,23 @@ marked.setOptions({ gfm: true, breaks: true });
 
 const escAttr = (s: string) => s.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
-/** 回复里图片地址的分类：web 是公网链接，file 是主机上的路径（绝对、相对 cwd、file://），
- *  data 是内嵌图片；其他协议（javascript: 之类）不显示 */
+/** Classify image URLs in replies: web is a public URL, file is a path on the host (absolute, relative to cwd, file://),
+ *  data is an inline image; other schemes (javascript: and the like) aren't shown */
 export function classifyImageSrc(href: string): { kind: 'web' | 'file' | 'data' | 'other'; src: string } {
   const h = href.trim();
   if (/^https?:\/\//i.test(h)) return { kind: 'web', src: h };
   if (/^data:image\//i.test(h)) return { kind: 'data', src: h };
-  // 先解码再认协议：marked 会把反斜杠编成 %5C（C:%5CUsers%5Ca.png）
+  // Decode before checking the scheme: marked encodes backslashes as %5C (C:%5CUsers%5Ca.png)
   let p = h;
   if (/%[0-9a-fA-F]{2}/.test(p)) {
     try {
       p = decodeURIComponent(p);
     } catch {
-      /* 不是合法的编码就照原样 */
+      /* not valid encoding, keep as is */
     }
   }
   if (/^file:/i.test(p)) {
-    // file:///C:/a.png -> C:/a.png，file:///home/a.png -> /home/a.png
+    // file:///C:/a.png -> C:/a.png, file:///home/a.png -> /home/a.png
     p = p.replace(/^file:(\/\/[^/]*)?/i, '');
     if (/^\/[a-zA-Z]:[\\/]/.test(p)) p = p.slice(1);
   } else if (/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(p) && !/^[a-zA-Z]:[\\/]/.test(p)) {
@@ -32,7 +32,7 @@ export function classifyImageSrc(href: string): { kind: 'web' | 'file' | 'data' 
   return p ? { kind: 'file', src: p } : { kind: 'other', src: h };
 }
 
-/** 对话回复专用：图片先不让浏览器加载，渲染成占位 span，由 ChatView 按主机和来源决定直接显示还是点击加载 */
+/** For chat replies only: images aren't loaded by the browser right away but rendered as placeholder spans; ChatView decides per host and source whether to show them directly or on click */
 const chatMarked = new Marked({
   gfm: true,
   breaks: true,
@@ -57,7 +57,7 @@ export function basename(p: string): string {
   return parts[parts.length - 1] ?? p;
 }
 
-/** 把家目录缩写成 ~ */
+/** Abbreviate the home directory as ~ */
 export function shortPath(p: string, home?: string): string {
   if (home && p.startsWith(home)) return '~' + p.slice(home.length);
   return p;
@@ -151,7 +151,7 @@ export function lsSet(k: string, v: unknown) {
   try {
     localStorage.setItem(k, JSON.stringify(v));
   } catch {
-    /* 忽略 */
+    /* ignore */
   }
 }
 
@@ -162,7 +162,7 @@ function fullTime(ms: number): string {
   return `${t.getFullYear()}-${p(t.getMonth() + 1)}-${p(t.getDate())} ${p(t.getHours())}:${p(t.getMinutes())}`;
 }
 
-/** 会话导出成 Markdown：用户消息、回复正文、工具调用摘要；思考过程和工具输出不导出 */
+/** Export a session as Markdown: user messages, reply text and tool call summaries; thinking and tool output are not exported */
 export function sessionMarkdown(info: SessionInfo, events: HubEvent[], toolLabel: string): string {
   const out: string[] = [`# ${info.title || tr('未命名会话', 'Untitled session')}`, ''];
   out.push(isEn() ? `- Tool: ${toolLabel}${info.model ? ` (${info.model})` : ''}` : `- 工具：${toolLabel}${info.model ? `（${info.model}）` : ''}`);
@@ -194,7 +194,7 @@ export function sessionMarkdown(info: SessionInfo, events: HubEvent[], toolLabel
   return out.join('\n');
 }
 
-/** 浏览器 / 桌面端下载一个文本文件 */
+/** Download a text file in the browser / desktop app */
 export function downloadText(name: string, text: string, type = 'text/markdown') {
   const url = URL.createObjectURL(new Blob([text], { type: `${type};charset=utf-8` }));
   const a = document.createElement('a');
@@ -206,12 +206,12 @@ export function downloadText(name: string, text: string, type = 'text/markdown')
   setTimeout(() => URL.revokeObjectURL(url), 5000);
 }
 
-/** 文件名里不能用的字符换掉 */
+/** Replace characters not allowed in file names */
 export function safeFileName(s: string): string {
   return (s.replace(/[\\/:*?"<>|\r\n]+/g, ' ').trim() || 'session').slice(0, 60);
 }
 
-/** 按顺序出现的字符就算匹配，分数越高越靠前；不匹配返回 -1 */
+/** Matches if the characters appear in order; higher scores rank first; returns -1 on no match */
 export function fuzzyScore(text: string, q: string): number {
   const t = text.toLowerCase();
   const query = q.toLowerCase().trim();

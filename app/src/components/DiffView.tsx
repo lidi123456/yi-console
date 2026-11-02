@@ -7,11 +7,11 @@ import { basename } from '../util';
 interface Line {
   t: 'add' | 'del' | 'ctx' | 'hunk';
   text: string;
-  /** 行号：删除行是旧文件的，其余是新文件的 */
+  /** Line number: from the old file for deleted lines, from the new file for the rest */
   n?: number;
 }
 
-/** 从 @@ 头里取新旧起始行号，再给每行编号 */
+/** Take the old and new start line numbers from the @@ header, then number every line */
 function numbered(raw: Line[]): Line[] {
   let o = 0;
   let nn = 0;
@@ -83,7 +83,7 @@ export const DiffView = memo(function DiffView({ diff }: { diff: FileDiff }) {
   );
 });
 
-// ---------- 文件面板里的整页 diff：上下（unified）或左右并排（split），两边都有行号 ----------
+// ---------- Full-page diff in the file panel: unified or side by side (split), with line numbers on both sides ----------
 
 interface PLine {
   t: 'add' | 'del' | 'ctx' | 'hunk';
@@ -115,7 +115,7 @@ function paneLines(d: FileDiff): PLine[] {
 
 type Cell = { t: PLine['t'] | 'empty'; text: string; num?: number };
 
-/** 并排：上下文两边都放；连续的删除和新增配成一行行左右对照 */
+/** Side by side: context goes on both sides; consecutive deletions and additions are paired row by row */
 function splitRows(lines: PLine[]): [Cell, Cell][] {
   const rows: [Cell, Cell][] = [];
   let i = 0;

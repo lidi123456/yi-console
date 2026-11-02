@@ -1,4 +1,4 @@
-//! 客户端自己的设置（不是 yi-agentd 的），存在数据目录的 `client-settings.json`。
+//! The client's own settings (not yi-agentd's), stored in `client-settings.json` in the data directory.
 
 use anyhow::{bail, Result};
 use yi_link::proxy::{self, Mode};
@@ -8,10 +8,10 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ProxySettings {
-    /// auto（默认：环境变量 → 系统代理）/ off / manual
+    /// auto (default: environment variables → system proxy) / off / manual
     #[serde(default = "auto")]
     pub mode: String,
-    /// manual 时的代理地址，例如 http://127.0.0.1:7897
+    /// Proxy address for manual, e.g. http://127.0.0.1:7897
     #[serde(default)]
     pub url: String,
 }
@@ -20,20 +20,20 @@ fn auto() -> String {
     "auto".into()
 }
 
-/// 系统通知（这台设备上的偏好，和 yi-agentd 的 ntfy 推送是两回事）
+/// System notifications (this device's preference; unrelated to yi-agentd's ntfy push)
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct NotifyPrefs {
-    /// 总开关
+    /// Master switch
     #[serde(default = "yes")]
     pub enabled: bool,
-    /// AI 回复完成
+    /// AI reply finished
     #[serde(default = "yes")]
     pub on_turn_end: bool,
-    /// 等待审批
+    /// Awaiting approval
     #[serde(default = "yes")]
     pub on_permission: bool,
-    /// away：窗口不在前台或者看的不是这个会话时才通知；always：总是通知
+    /// away: notify only when the window isn't in front or another session is being viewed; always: always notify
     #[serde(default = "away")]
     pub when: String,
 }
@@ -78,7 +78,7 @@ impl ClientSettings {
         Ok(())
     }
 
-    /// 校验并让设置在本进程里生效
+    /// Validate and apply the settings in this process
     pub fn apply(&self) -> Result<()> {
         let m = match self.proxy.mode.as_str() {
             "" | "auto" => Mode::Auto,

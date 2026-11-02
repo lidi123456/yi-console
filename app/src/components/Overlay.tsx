@@ -4,7 +4,7 @@ import { readClipboard, writeClipboard } from '../clipboard';
 import { tr } from '../i18n';
 import { Icon } from './Icon';
 
-// 自己画的输入框、确认框和右键菜单，代替浏览器自带的 prompt / confirm / 右键菜单
+// Our own input dialog, confirm dialog and context menu, replacing the browser's prompt / confirm / context menu
 
 interface TextReq {
   kind: 'text';
@@ -31,7 +31,7 @@ export interface MenuItem {
   hint?: string;
   danger?: boolean;
   disabled?: boolean;
-  /** 当前项（高亮） */
+  /** Current item (highlighted) */
   active?: boolean;
   run: () => void;
 }
@@ -149,7 +149,7 @@ function ContextMenu({ m }: { m: MenuReq }) {
   const ref = useRef<HTMLDivElement>(null);
   const [pos, setPos] = useState({ left: m.x, top: m.y });
   useBack(true, closeMenu);
-  // 贴着窗口边缘时往里收
+  // Pull inward when touching the window edge
   useLayoutEffect(() => {
     const el = ref.current;
     if (!el) return;
@@ -192,7 +192,7 @@ function ContextMenu({ m }: { m: MenuReq }) {
               className={`${it.danger ? 'danger' : ''} ${it.active ? 'active' : ''}`}
               title={it.hint ? `${it.label}  ${it.hint}` : undefined}
               disabled={it.disabled}
-              // 不抢焦点：粘贴、剪切要作用在原来的输入框上
+              // Don't steal focus: paste and cut must act on the original input
               onMouseDown={(e) => e.preventDefault()}
               onClick={() => {
                 closeMenu();
@@ -230,7 +230,7 @@ const editable = (el: Element | null): Editable | null =>
     ? el
     : null;
 
-/** 编辑菜单：输入框里剪切 / 复制 / 粘贴 / 全选，其他地方选中了文字就给复制 */
+/** Edit menu: cut / copy / paste / select all in inputs; elsewhere, copy if text is selected */
 export function editMenu(target: Element | null): (MenuItem | '-')[] {
   const ed = editable(target);
   if (ed) {
@@ -277,7 +277,7 @@ export function editMenu(target: Element | null): (MenuItem | '-')[] {
   return [{ label: tr('复制', 'Copy'), icon: 'copy', hint: `${MOD}C`, run: () => writeClipboard(text) }];
 }
 
-/** 全局去掉 WebView 自带的右键菜单；组件自己处理过的（preventDefault）不再管 */
+/** Suppress the WebView's built-in context menu globally; leave alone events components already handled (preventDefault) */
 export function useContextMenu() {
   useEffect(() => {
     const f = (e: MouseEvent) => {

@@ -18,7 +18,7 @@ import { Icon } from './Icon';
 import { setTheme, useTheme, type Theme } from '../theme';
 import { setLangPref, tr, useLang, type LangPref } from '../i18n';
 
-/** 系统设置：这台设备自己的偏好（通知、网络代理），不跟主机走 */
+/** System settings: this device's own preferences (notifications, network proxy), not tied to a host */
 export function PrefsView() {
   useLang();
   return (
@@ -234,7 +234,7 @@ function NotifyCard() {
   const set = async (p: Partial<NotifyPrefs>) => {
     try {
       const next = { ...n, ...p };
-      // 打开通知时顺便申请系统权限
+      // Request the system permission when notifications are turned on
       if (next.enabled && (p.enabled || p.onTurnEnd || p.onPermission)) setPerm(await notifyPermission(true));
       await saveClientSettings({ notify: next });
     } catch (e) {

@@ -14,7 +14,7 @@
   --focus: rgba(31, 35, 40, 0.08);
   --link: #2f6fde;
   --unread: #3b82f6;
-  /* 窗口底色（侧栏、标题栏）：纯色，比内容区略深 */
+  /* Window background (sidebar, title bar): solid, slightly darker than the content area */
   --shell-bg: #f1f2f4;
   --side-hover: rgba(31, 35, 40, 0.05);
   --side-active: rgba(31, 35, 40, 0.08);
@@ -39,8 +39,8 @@
   --shadow: 0 8px 30px rgba(20, 24, 33, 0.12);
   --panel-shadow: 0 0 0 1px rgba(31, 35, 40, 0.06), 0 2px 12px rgba(31, 35, 40, 0.05);
   --radius: 12px;
-  /* 系统界面字体：中文 Windows 上中英文统一用微软雅黑 UI，macOS 是苹方，
-     英文 Windows 上英文 Segoe UI、中文回退到雅黑 UI。不要把 Segoe UI 写在前面，中英文混两套字体不协调 */
+  /* System UI font: on Chinese Windows use Microsoft YaHei UI for both Chinese and English, PingFang on macOS;
+     on English Windows, Segoe UI for English with CJK falling back to YaHei UI. Don't put Segoe UI first, mixing two fonts for CJK and Latin looks uneven */
   --font: system-ui, -apple-system, BlinkMacSystemFont, 'Microsoft YaHei UI', 'PingFang SC', 'Hiragino Sans GB',
     'Noto Sans CJK SC', 'Noto Sans SC', sans-serif;
   --mono: 'Cascadia Mono', 'JetBrains Mono', ui-monospace, 'SF Mono', Menlo, Consolas, 'Microsoft YaHei UI', monospace;
@@ -81,7 +81,7 @@
   }
 }
 
-/* 手动选了暗色（系统是亮色时也生效） */
+/* Dark chosen manually (also applies when the system is light) */
 :root[data-theme='dark'] {
   --bg: #0f1115;
   --bg-2: #15181e;
@@ -223,7 +223,7 @@ textarea {
   flex: none;
 }
 
-/* ---------- 布局 ---------- */
+/* ---------- Layout ---------- */
 
 .app {
   display: flex;
@@ -239,7 +239,7 @@ textarea {
   display: flex;
 }
 
-/* 顶部一行：和侧边栏同一个背景，像一块完整的窗口 */
+/* Top row: same background as the sidebar, so it reads as one window */
 .titlebar {
   height: 38px;
   flex: none;
@@ -303,7 +303,7 @@ textarea {
   color: #fff;
 }
 
-/* 有标题栏时，主面板顶上不用再留空 */
+/* With a title bar, the main panel needs no top padding */
 @media (min-width: 761px) {
   .app .main {
     margin-top: 0;
@@ -538,7 +538,7 @@ textarea {
   border-radius: var(--radius);
   box-shadow: var(--panel-shadow);
   overflow: hidden;
-  /* clip 不允许任何滚动：hidden 的容器仍会被浏览器滚动，终端输入法的隐藏输入框在右边缘时，整个会话区会被推向左边 */
+  /* clip allows no scrolling at all: a hidden container can still be scrolled by the browser, and when the terminal's hidden IME textarea sits at the right edge, the whole session area gets pushed left */
   overflow: clip;
 }
 
@@ -557,9 +557,9 @@ textarea {
   display: none;
 }
 
-/* ---------- 通用组件 ---------- */
+/* ---------- Common components ---------- */
 
-/* 按钮只有两档：常规（页面标题栏、表单底部）和 small（卡片里的操作），字号一样，只差高度 */
+/* Buttons come in two sizes only: regular (page header, form footer) and small (actions inside cards); same font size, different height */
 .btn {
   display: inline-flex;
   align-items: center;
@@ -790,12 +790,12 @@ textarea {
   padding: 60px 0;
 }
 
-/* ---------- 页面 ---------- */
+/* ---------- Pages ---------- */
 
 .page {
   flex: 1;
   overflow-y: auto;
-  /* 内容居中、限宽；滚动条仍在面板右边缘 */
+  /* Content centered with a max width; the scrollbar stays at the panel's right edge */
   padding: 24px max(28px, calc((100% - 880px) / 2)) 40px;
   width: 100%;
 }
@@ -814,7 +814,7 @@ textarea {
   font-size: 19px;
 }
 
-/* 手机上按钮一行放不下时换行，不要溢出屏幕 */
+/* On mobile, wrap buttons that don't fit on one line instead of overflowing the screen */
 .page-head > .row {
   flex-wrap: wrap;
 }
@@ -932,7 +932,7 @@ textarea {
   gap: 6px;
 }
 
-/* 工具按钮统一高 44px：名字不换行（放不下就省略），「未安装」在名字下面一行，也不撑高 */
+/* Tool buttons are all 44px tall: names don't wrap (ellipsized if too long), "not installed" goes on the line below without adding height */
 .tool-opt {
   display: flex;
   align-items: center;
@@ -1044,7 +1044,7 @@ textarea {
   background: var(--accent-soft);
 }
 
-/* 左列表右详情 */
+/* List on the left, details on the right */
 .page.split {
   max-width: none;
   display: flex;
@@ -1115,7 +1115,7 @@ textarea {
   user-select: none;
 }
 
-/* ---------- 统计 ---------- */
+/* ---------- Stats ---------- */
 
 .stat-tiles {
   display: grid;
@@ -1174,7 +1174,7 @@ textarea {
   display: inline-block;
 }
 
-/* ---------- 会话 ---------- */
+/* ---------- Sessions ---------- */
 
 .session-view {
   flex: 1;
@@ -1237,8 +1237,8 @@ textarea {
   color: var(--err);
 }
 
-/* 横向不滚动：只设 overflow-y 时 x 方向会变成 auto，任何一行过宽都会冒出横向滚动条。
-   代码块、表格、diff 各自横向滚动 */
+/* No horizontal scrolling: with only overflow-y set, x becomes auto and any overly wide line brings up a horizontal scrollbar.
+   Code blocks, tables and diffs each scroll horizontally on their own */
 .chat {
   flex: 1;
   overflow-y: auto;
@@ -1379,7 +1379,7 @@ textarea {
   animation: pulse 1s infinite;
 }
 
-/* 时间线：AI 正文、工具调用、思考左侧对齐一列圆点，仿 Claude Code */
+/* Timeline: AI text, tool calls and thinking share a column of dots on the left, like Claude Code */
 .tl {
   display: grid;
   grid-template-columns: 16px minmax(0, 1fr);
@@ -1435,7 +1435,7 @@ textarea {
   color: var(--text);
 }
 
-/* 放不下时先压参数，参数压没了才压工具名（否则 Bash 会被挤成「B..」）；Cursor 那种整句当名字的照样省略 */
+/* When space runs out, shrink the argument first and only then the tool name (otherwise Bash gets squeezed to "B.."); Cursor-style whole-sentence names are ellipsized as usual */
 .tl-name {
   font-weight: 600;
   flex: 0 1 auto;
@@ -1466,7 +1466,7 @@ textarea {
   color: var(--text-2);
 }
 
-/* ⎿ 用边框画：这个字符在不少字体里形状不对 */
+/* Draw ⎿ with borders: the glyph has the wrong shape in many fonts */
 .tl-elbow {
   flex: none;
   width: 9px;
@@ -1852,7 +1852,7 @@ textarea {
   margin: 0 auto;
 }
 
-/* 输入框上方的后台任务条 */
+/* Background task bar above the input box */
 .bg-tasks {
   margin-bottom: 8px;
   border: 1px solid var(--border);
@@ -1985,7 +1985,7 @@ textarea {
   margin-left: -6px;
 }
 
-/* 正在传到主机的文件：输入框上方一行小标签 */
+/* Files being sent to the host: a row of small tags above the input box */
 .upload-row {
   display: flex;
   flex-wrap: wrap;
@@ -2008,7 +2008,7 @@ textarea {
   font-variant-numeric: tabular-nums;
   color: var(--text-3);
 }
-/* 取消上传 */
+/* Cancel upload */
 .upload-x {
   display: inline-flex;
   align-items: center;
@@ -2027,7 +2027,7 @@ textarea {
   background: var(--bg-3);
   color: var(--text);
 }
-/* 发送按钮转圈：等文件传完、或消息（带图片时）还在发 */
+/* Send button spinner: waiting for files to finish uploading, or a message (with images) still sending */
 .send-btn.loading:disabled {
   background: var(--bg-3);
 }
@@ -2307,7 +2307,7 @@ textarea {
   border-top: 1px solid var(--border);
 }
 
-/* ---------- 弹窗与提示 ---------- */
+/* ---------- Dialogs and toasts ---------- */
 
 .modal-bg {
   position: fixed;
@@ -2415,7 +2415,7 @@ textarea {
   display: none;
 }
 
-/* ---------- 手机 ---------- */
+/* ---------- Mobile ---------- */
 
 @media (max-width: 760px) {
   .titlebar:not(.framed) {
@@ -2546,7 +2546,7 @@ textarea {
   }
 }
 
-/* 账号额度 */
+/* Account quota */
 .quota-list {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
@@ -2585,7 +2585,7 @@ textarea {
   margin-bottom: 6px;
 }
 
-/* 中继配对引导 */
+/* Relay pairing guide */
 .pill-ok {
   background: color-mix(in srgb, var(--ok) 14%, transparent);
   color: var(--ok);
@@ -2674,7 +2674,7 @@ textarea {
   flex-direction: column;
   gap: 4px;
 }
-/* 和输入框并排的按钮跟输入框一样高 */
+/* Buttons next to an input are as tall as the input */
 .row:has(> input) > .btn {
   height: auto;
   align-self: stretch;
@@ -2683,7 +2683,7 @@ textarea {
   align-self: flex-start;
 }
 
-/* 每轮回复下面的统计行 */
+/* Stats row under each reply */
 .turn-foot {
   display: flex;
   align-items: center;
@@ -2707,7 +2707,7 @@ textarea {
   color: var(--text);
 }
 
-/* 会话状态栏 */
+/* Session status line */
 .status-line {
   display: flex;
   flex-wrap: wrap;
@@ -2788,7 +2788,7 @@ textarea {
   overflow-x: auto;
 }
 
-/* 系统设置 */
+/* System settings */
 .pref-row {
   display: flex;
   align-items: center;
@@ -2833,7 +2833,7 @@ textarea {
   transform: translateX(16px);
 }
 
-/* ---------- 输入框：/ 命令、@ 文件、审批模式、排队 ---------- */
+/* ---------- Input box: / commands, @ files, permission mode, queue ---------- */
 .composer {
   position: relative;
 }
@@ -2850,7 +2850,7 @@ textarea {
   margin-left: 8px;
 }
 
-/* 模型选择放在输入框工具行右侧 */
+/* Model picker sits on the right of the input box toolbar */
 .composer-tools .model-btn {
   border: none;
   height: 26px;
@@ -2953,7 +2953,7 @@ textarea {
   left: 0;
   right: auto;
 }
-/* 靠右的按钮（模型）往左展开；要写在 .menu-up 后面，否则 left: 0 把它盖掉，菜单伸出窗口右边 */
+/* Right-aligned buttons (model) open toward the left; must come after .menu-up, otherwise left: 0 overrides it and the menu runs off the right of the window */
 .menu.menu-up.menu-up-right {
   left: auto;
   right: 0;
@@ -3059,7 +3059,7 @@ textarea {
   color: var(--text);
 }
 
-/* 全局搜索跳过来的那条消息 */
+/* The message jumped to from global search */
 .flash {
   animation: flash 2.4s ease-out;
   border-radius: 10px;
@@ -3076,7 +3076,7 @@ textarea {
   }
 }
 
-/* ---------- 侧边栏：筛选、置顶 ---------- */
+/* ---------- Sidebar: filter, pinning ---------- */
 .side-search {
   display: flex;
   align-items: center;
@@ -3121,7 +3121,7 @@ textarea {
   color: var(--text-2);
 }
 
-/* ---------- 命令面板 ---------- */
+/* ---------- Command palette ---------- */
 .palette-scrim {
   position: fixed;
   inset: 0;
@@ -3219,7 +3219,7 @@ kbd {
   color: var(--text-2);
 }
 
-/* ---------- 全局搜索 ---------- */
+/* ---------- Global search ---------- */
 .search-box {
   display: flex;
   align-items: center;
@@ -3355,7 +3355,7 @@ kbd {
   font-size: 11px;
 }
 
-/* ---------- 输入框 / 确认框 ---------- */
+/* ---------- Input dialog / confirm dialog ---------- */
 
 .modal-bg.dlg-bg {
   align-items: flex-start;
@@ -3413,9 +3413,9 @@ kbd {
   min-width: 72px;
 }
 
-/* 手机：确认框 / 输入框是居中的小卡片，不套用全屏弹窗那套（铺满高度、去圆角）；两个按钮平分一行 */
+/* Mobile: confirm / input dialogs are small centered cards, not the full-screen dialog style (full height, no rounded corners); the two buttons split the row */
 @media (max-width: 760px) {
-  /* 后面「新建会话」那段把手机上的 .modal-bg 改成了 display: block，这里要改回 flex，否则居中不生效、卡片贴在顶上 */
+  /* The "new session" section below sets .modal-bg to display: block on mobile; switch back to flex here, otherwise centering fails and the card sticks to the top */
   .modal-bg.dlg-bg {
     display: flex;
     align-items: center;
@@ -3474,12 +3474,12 @@ kbd {
   }
 }
 
-/* ---------- 右键菜单 ---------- */
+/* ---------- Context menu ---------- */
 
 .ctx-scrim {
   position: fixed;
   inset: 0;
-  /* 右键菜单在最上层，图片放大页里也能弹 */
+  /* The context menu sits on top of everything, so it also works in the enlarged image view */
   z-index: 1000;
 }
 
@@ -3544,7 +3544,7 @@ kbd {
   margin: 4px 6px;
 }
 
-/* ---------- 聊天：回到底部、图片 ---------- */
+/* ---------- Chat: back to bottom, images ---------- */
 
 button.msg-img {
   padding: 0;
@@ -3555,7 +3555,7 @@ button.msg-img {
   cursor: zoom-in;
 }
 
-/* 回复里引用的图片（chatImages.ts）：主机文件 / 公网链接，没加载前是一个占位按钮 */
+/* Images referenced in replies (chatImages.ts): host files / public URLs, shown as a placeholder button until loaded */
 .md-rimg {
   display: inline-block;
   max-width: 100%;
@@ -3661,7 +3661,7 @@ button.md-rimg-ph:hover {
   animation: pulse 1.2s infinite;
 }
 
-/* ---------- 图片查看 ---------- */
+/* ---------- Image viewer ---------- */
 
 .lightbox {
   position: fixed;
@@ -3728,8 +3728,8 @@ button.md-rimg-ph:hover {
 }
 
 /* ======================================================================
-   排版：正文 14px / 行高 1.75，辅助信息 12px 灰色，小标题只加粗不放大。
-   只调视觉，不动布局结构。放在最后统一覆盖前面的零散设置
+   Typography: body 14px / line height 1.75, secondary info 12px grey, subheadings bold but not larger.
+   Visual tweaks only, no layout changes. Placed last to override the scattered settings above in one place
    ====================================================================== */
 
 :root {
@@ -3755,7 +3755,7 @@ button.md-rimg-ph:hover {
   }
 }
 
-/* 手动选了暗色（系统是亮色时也生效） */
+/* Dark chosen manually (also applies when the system is light) */
 :root[data-theme='dark'] {
   --text: #e6e8ec;
   --text-strong: #eeeeeb;
@@ -3765,7 +3765,7 @@ button.md-rimg-ph:hover {
 }
 
 
-/* ---- 聊天正文 ---- */
+/* ---- Chat body ---- */
 
 .chat-inner {
   padding: 18px 28px 12px;
@@ -3873,7 +3873,7 @@ button.md-rimg-ph:hover {
   padding: 1.5px 5px;
 }
 
-/* 表格：外面一圈圆角边框，里面只留横线 */
+/* Tables: rounded border around the outside, only horizontal lines inside */
 .md table {
   margin: 1em 0;
   font-size: 13px;
@@ -3919,9 +3919,9 @@ button.md-rimg-ph:hover {
 }
 
 
-/* ---- 会话头、状态栏、token 这类辅助信息 ---- */
+/* ---- Secondary info: session header, status line, tokens ---- */
 
-/* 会话头只占一行：标题后面跟灰色的工具、目录、上下文 */
+/* The session header is a single line: title followed by grey tool, directory and context */
 .session-head {
   min-height: 44px;
   padding: 4px 12px 4px 20px;
@@ -3941,7 +3941,7 @@ button.md-rimg-ph:hover {
 }
 
 @media (max-width: 760px) {
-  /* 竖排时要 stretch，否则子元素按内容撑宽，长目录不会截断而是压到右侧按钮上 */
+  /* Needs stretch when stacked vertically, otherwise children size to content and long directories push onto the right-side buttons instead of truncating */
   .session-meta {
     flex-direction: column;
     align-items: stretch;
@@ -3959,7 +3959,7 @@ button.md-rimg-ph:hover {
   color: var(--text-3);
 }
 
-/* 会话头右侧的按钮（用量、中断、终端模式）不要边框，和图标按钮一样悬停才有底色 */
+/* Buttons on the right of the session header (usage, interrupt, terminal mode) have no border; like icon buttons, they only get a background on hover */
 .session-head .btn.small {
   border-color: transparent;
   background: transparent;
@@ -3972,7 +3972,7 @@ button.md-rimg-ph:hover {
   color: var(--text);
 }
 
-/* 状态只在运行中 / 等审批 / 出错时醒目，空闲和已退出只是一行灰字 */
+/* Status only stands out when running / awaiting approval / errored; idle and exited are just grey text */
 .session-head .status-chip.st-idle,
 .session-head .status-chip.st-exited {
   background: transparent;
@@ -3980,7 +3980,7 @@ button.md-rimg-ph:hover {
   padding: 0 4px;
 }
 
-/* ---- 侧边栏：行高、分组间距、层级 ---- */
+/* ---- Sidebar: row height, group spacing, hierarchy ---- */
 
 .nav-item {
   font-size: var(--fs-ui);
@@ -4016,7 +4016,7 @@ button.md-rimg-ph:hover {
   font-size: var(--fs-meta);
 }
 
-/* ---- 输入框：约三行高，字号 14px，工具栏收在框内底部，圆形发送按钮 ---- */
+/* ---- Input box: about three lines tall, 14px text, toolbar inside the bottom of the box, round send button ---- */
 
 .composer {
   padding: 12px 10px 8px 16px;
@@ -4034,7 +4034,7 @@ button.md-rimg-ph:hover {
   gap: 2px;
 }
 
-/* 左组：添加、审批、/、@；右组是模型和发送 */
+/* Left group: add, permissions, /, @; right group is model and send */
 .composer-tools .add-btn {
   width: 28px;
   height: 28px;
@@ -4053,7 +4053,7 @@ button.md-rimg-ph:hover {
   border-radius: 50%;
 }
 
-/* 「全部放行」不再整块红底：文字用中性色，只留盾牌图标是红的 */
+/* "Allow everything" no longer gets a full red background: neutral text, only the shield icon is red */
 .composer-tools .perm-btn.perm-bypass {
   color: var(--text-2);
   background: transparent;
@@ -4072,7 +4072,7 @@ button.md-rimg-ph:hover {
   color: var(--text-3);
 }
 
-/* 每轮回复下面的统计行平时淡一些，鼠标移上去再看清 */
+/* The stats row under each reply is faint until hovered */
 .turn-foot {
   opacity: 0.55;
   transition: opacity 0.15s;
@@ -4089,7 +4089,7 @@ button.md-rimg-ph:hover {
 }
 
 @media (max-width: 760px) {
-  /* 手机上 13px 太小，正文和输入框放大一号 */
+  /* 13px is too small on mobile; bump body text and the input box up a size */
   :root {
     --fs-body: 14.5px;
     --lh-body: 1.75;
@@ -4103,7 +4103,7 @@ button.md-rimg-ph:hover {
     padding: 16px 14px 12px;
   }
 
-  /* 手机上输入框收紧：空着时一行字高，工具按钮小一号，长内容照样自动长高 */
+  /* Tighter input box on mobile: one line tall when empty, smaller tool buttons, still grows with long content */
   .composer {
     padding: 8px 8px 6px 14px;
     gap: 4px;
@@ -4130,7 +4130,7 @@ button.md-rimg-ph:hover {
   }
 }
 
-/* ---- 会话页右侧的文件侧栏 ---- */
+/* ---- File panel on the right of the session page ---- */
 
 .session-split {
   flex: 1;
@@ -4198,7 +4198,7 @@ button.md-rimg-ph:hover {
   --cm-active: rgba(255, 255, 255, 0.04);
 }
 
-/* 全屏：盖住对话区 */
+/* Full screen: covers the chat area */
 .session-split {
   position: relative;
 }
@@ -4211,7 +4211,7 @@ button.md-rimg-ph:hover {
   z-index: 15;
 }
 
-/* 对话区和面板之间的拖动条 */
+/* Drag handle between the chat area and the panel */
 .panel-resizer {
   flex: none;
   width: 1px;
@@ -4238,7 +4238,7 @@ body.resizing {
   user-select: none;
 }
 
-/* 标签栏 */
+/* Tab bar */
 .wp-tabs {
   display: flex;
   align-items: center;
@@ -4278,7 +4278,7 @@ body.resizing {
   color: var(--text);
 }
 
-/* 文件头：路径 + 操作 */
+/* File header: path + actions */
 .wp-head {
   display: flex;
   align-items: center;
@@ -4371,7 +4371,7 @@ button.wp-crumb:hover {
   color: var(--text-2);
 }
 
-/* 主体：编辑器 | 文件树 */
+/* Body: editor | file tree */
 .wp-body {
   flex: 1;
   min-height: 0;
@@ -4501,7 +4501,7 @@ button.wp-crumb:hover {
   padding: 0 6px 8px;
 }
 
-/* 文件树一行：28px 高、12px 字、每层缩进 14px */
+/* File tree row: 28px tall, 12px text, 14px indent per level */
 .wp-row {
   display: flex;
   align-items: center;
@@ -4562,7 +4562,7 @@ button.wp-crumb:hover {
   color: var(--text-3);
 }
 
-/* 路径上点目录弹出的文件树 */
+/* Tree popped up by clicking a directory in the path */
 .wp-pop {
   position: fixed;
   z-index: 60;
@@ -4582,10 +4582,10 @@ button.wp-crumb:hover {
   }
 }
 
-/* 手机上面板铺满会话区，文件树盖在编辑器上 */
+/* On mobile the panel fills the session area and the tree covers the editor */
 @media (max-width: 760px) {
-  /* 面板从屏幕顶上铺下来，盖住了会话头（会话头自己留了状态栏高度），这里也要让出状态栏，
-     否则文件标签和时间、电量图标叠在一起 */
+  /* The panel extends from the top of the screen over the session header (which reserves the status bar height itself), so it must clear the status bar too,
+     otherwise the file tabs overlap the clock and battery icons */
   .file-panel {
     --sa-top: env(safe-area-inset-top, 0px);
     position: absolute;
@@ -4604,7 +4604,7 @@ button.wp-crumb:hover {
   }
 }
 
-/* ---- 会话页底部的终端面板 ---- */
+/* ---- Terminal panel at the bottom of the session page ---- */
 
 .term-panel {
   flex: none;
@@ -4762,7 +4762,7 @@ body.resizing-y {
   }
 }
 
-/* ---- tmux 里的终端会话：翻 tmux 历史的滚动条 ---- */
+/* ---- Terminal sessions in tmux: scrollbar for tmux history ---- */
 
 .tmux-scroll {
   position: absolute;
@@ -4805,7 +4805,7 @@ body.resizing-y {
   box-shadow: var(--shadow);
 }
 
-/* yi-agentd 升级遮罩 */
+/* yi-agentd upgrade overlay */
 .upgrade-bg {
   z-index: 2000;
   align-items: center;
@@ -4883,10 +4883,10 @@ body.resizing-y {
 }
 
 /* ======================================================================
-   侧边栏：放最后，覆盖前面各处的侧栏设置。改侧栏改这一段。
-   结构两层：主机标题（图标块 + 名字 + 连接状态，粗一点）→ 目录小标题（浅灰小字）→ 会话。
-   会话行：原色工具图标、灰色标题（悬停、选中时变深）、右侧时间；只有运行中 / 等审批 / 出错才显示状态，
-   悬停时时间换成置顶和「…」。宽 244px、行高 32px、字号 --fs-side 13px、文字离左边约 14px
+   Sidebar: placed last to override sidebar settings elsewhere. Make sidebar changes here.
+   Two-level structure: host header (icon tile + name + connection status, slightly bolder) → directory subheading (small light-grey text) → sessions.
+   Session row: tool icon in its own color, grey title (darker on hover / selection), time on the right; status only shown when running / awaiting approval / errored,
+   on hover the time is replaced by pin and "…". Width 244px, row height 32px, font --fs-side 13px, text about 14px from the left
    ====================================================================== */
 
 :root {
@@ -4902,7 +4902,7 @@ body.resizing-y {
   }
 }
 
-/* 侧栏右边缘拖动调宽：贴着主面板左边，平时看不见，悬停变色 */
+/* Drag the sidebar's right edge to resize: hugs the main panel's left side, invisible until hovered */
 .side-resizer {
   position: absolute;
   top: 0;
@@ -4978,7 +4978,7 @@ body.resizing .side-resizer::after {
   color: var(--text-3);
 }
 
-/* 侧栏可以滚动，但不显示滚动条（系统滚动条又粗又挡住右侧内容） */
+/* The sidebar scrolls but shows no scrollbar (the system scrollbar is thick and covers content on the right) */
 .hosts-scroll {
   padding: 4px 0 8px;
   scrollbar-width: none;
@@ -4988,7 +4988,7 @@ body.resizing .side-resizer::after {
   display: none;
 }
 
-/* ---- 主机 ---- */
+/* ---- Hosts ---- */
 .host-block {
   margin: 0;
   padding: 6px 0 8px;
@@ -5025,7 +5025,7 @@ body.resizing .side-resizer::after {
   color: var(--text-2);
 }
 
-/* 主机图标放在小方块里，右下角是连接状态 */
+/* Host icon in a small tile, connection status at the bottom right */
 .host-icon {
   position: relative;
   flex: none;
@@ -5085,7 +5085,7 @@ body.resizing .side-resizer::after {
   color: var(--text);
 }
 
-/* 「…」悬停时才出现，「+」一直在 */
+/* "…" only appears on hover, "+" is always there */
 .host-act:last-child {
   display: none;
 }
@@ -5113,7 +5113,7 @@ body.resizing .side-resizer::after {
   font-size: var(--fs-side-aux);
 }
 
-/* ---- 目录小标题 ---- */
+/* ---- Directory subheadings ---- */
 .project-name,
 .project-toggle {
   display: flex;
@@ -5138,7 +5138,7 @@ body.resizing .side-resizer::after {
   font-variant-numeric: tabular-nums;
 }
 
-/* ---- 会话行 ---- */
+/* ---- Session rows ---- */
 .session-row {
   height: var(--side-row-h);
   padding: 0 8px;
@@ -5149,7 +5149,7 @@ body.resizing .side-resizer::after {
   color: var(--text);
 }
 
-/* 标题平时灰色，悬停和选中时变深；工具图标保持原色，右侧照旧显示时间或状态 */
+/* Titles are grey normally and darker on hover and selection; tool icons keep their colors, and the time or status still shows on the right */
 .session-row .session-title {
   color: var(--text-2);
 }
@@ -5167,7 +5167,7 @@ body.resizing .side-resizer::after {
   color: var(--text-3);
 }
 
-/* 工具图标不再随状态变灰；终端模式在右下角加个小角标 */
+/* Tool icons no longer grey out with status; terminal mode adds a small badge at the bottom right */
 .row-badge {
   position: relative;
   display: inline-flex;
@@ -5246,7 +5246,7 @@ body.resizing .side-resizer::after {
   visibility: hidden;
 }
 
-/* 悬停按钮占 46px，标题给它让位 */
+/* Hover buttons take 46px; the title makes room for them */
 .session-row-wrap:hover .session-title {
   margin-right: 30px;
 }
@@ -5273,7 +5273,7 @@ body.resizing .side-resizer::after {
   font-size: var(--fs-side);
 }
 
-/* 目录行右侧的「在这个目录新建会话」：悬停时出现，手机上一直显示 */
+/* "New session in this directory" on the right of directory rows: appears on hover, always shown on mobile */
 .project-head {
   position: relative;
 }
@@ -5343,7 +5343,7 @@ body.resizing .side-resizer::after {
   }
 }
 
-/* 上下文压缩那一行：转圈和文字横排居中 */
+/* Context compaction row: spinner and text side by side, centered */
 .compact-note {
   display: flex;
   align-items: center;
@@ -5356,9 +5356,9 @@ body.resizing .side-resizer::after {
   height: 11px;
 }
 
-/* ---- 对话「简约」风格：过程折叠成组，正文不带时间线圆点 ---- */
+/* ---- Compact chat style: steps folded into groups, no timeline dots on the body ---- */
 .chat.modern .chat-inner {
-  /* 正文栏宽 768px，同 Qoder */
+  /* Body column 768px wide, same as Qoder */
   max-width: calc(768px + 56px);
   gap: 16px;
 }
@@ -5369,8 +5369,8 @@ body.resizing .side-resizer::after {
 .chat.modern .tl-elbow {
   display: none;
 }
-/* 正文排版：14px / 行高 26px，块间距 14px，列表缩进 20px、项间 6px，行内代码 13px 浅灰底，
-   字体用系统 UI 字体（Windows 下中文落到微软雅黑）。微软雅黑在 13px 下笔画挤，所以比 Qoder 的「小」档大一号 */
+/* Body typography: 14px / 26px line height, 14px between blocks, lists indented 20px with 6px between items, inline code 13px on light grey,
+   system UI font (Chinese falls back to Microsoft YaHei on Windows). YaHei strokes get cramped at 13px, so this is one size up from Qoder's "small" setting */
 .chat.modern .msg-assistant {
   --m-fs: 14px;
   --m-lh: 26px;
@@ -5394,7 +5394,7 @@ body.resizing .side-resizer::after {
   font-size: var(--m-fs);
   line-height: var(--m-lh);
 }
-/* 列表、小标题之后多留 4px，大标题之后多留 8px；标题上方按级别 28 / 24 / 20 / 16px */
+/* 4px extra after lists and subheadings, 8px after large headings; space above headings by level is 28 / 24 / 20 / 16px */
 .chat.modern .msg-assistant .md > :is(ul, ol, h4, h5, h6) + * {
   margin-top: calc(var(--m-gap) + 4px);
 }
@@ -5622,14 +5622,14 @@ body.resizing .side-resizer::after {
   display: inline-flex;
   color: var(--ok);
 }
-/* 工具名一般很短，但 Cursor 等会把整句标题当名字（如「Update TODOs: …」）：放不下时省略，不能撑出横向滚动条 */
+/* Tool names are usually short, but Cursor and others use a whole sentence as the name (e.g. "Update TODOs: …"): ellipsize when too long instead of causing a horizontal scrollbar */
 .mt-name {
   flex: 0 1 auto;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
 }
-/* 放不下时先压说明，说明压没了才压工具名（否则「已思考」「终端」会被挤成「已...」或整个消失） */
+/* When space runs out, shrink the description first and only then the tool name (otherwise short labels get squeezed to "..." or vanish) */
 .mt-desc {
   flex: 0 100000 auto;
   min-width: 0;
@@ -5803,7 +5803,7 @@ body.resizing .side-resizer::after {
   }
 }
 
-/* ---- AI 提问卡片 ---- */
+/* ---- AI question card ---- */
 .q-card {
   border: 1px solid var(--border-2);
   background: var(--panel);
@@ -5969,7 +5969,7 @@ body.resizing .side-resizer::after {
   white-space: nowrap;
 }
 
-/* 会话页「用量」弹窗 */
+/* "Usage" dialog on the session page */
 .usage-btn {
   font-variant-numeric: tabular-nums;
 }
@@ -5998,9 +5998,9 @@ body.resizing .side-resizer::after {
 }
 
 /* ======================================================================
-   工作区文件面板（参照 VS Code / Cursor 资源管理器）：
-   没打开文件时只有一栏文件树（--tree-w，默认 300px）；打开文件后是 --panel-w，
-   左编辑器、右文件树。对话区至少留 420px
+   Workspace file panel (modeled on the VS Code / Cursor explorer):
+   with no file open it's a single tree column (--tree-w, 300px by default); with a file open it's --panel-w,
+   editor on the left, tree on the right. The chat area keeps at least 420px
    ====================================================================== */
 @media (min-width: 761px) {
   .file-panel {
@@ -6026,7 +6026,7 @@ body.resizing .side-resizer::after {
   }
 }
 
-/* 顶栏：只有文件树时是目录名 + 分支；打开文件后是文件标签 */
+/* Top bar: directory name + branch when only the tree is shown; file tabs once a file is open */
 .wp-top {
   display: flex;
   align-items: center;
@@ -6096,7 +6096,7 @@ body.resizing .side-resizer::after {
 .wp-ftab.active {
   color: var(--text);
   border-bottom-color: var(--accent);
-  /* 标签栏比当前标签还窄时，当前标签缩到栏宽、文件名省略，保证整个标签看得见 */
+  /* When the tab bar is narrower than the current tab, shrink the tab to the bar width and ellipsize the name so the whole tab stays visible */
   max-width: min(180px, 100%);
 }
 .wp-ftab > svg,
@@ -6124,7 +6124,7 @@ body.resizing .side-resizer::after {
   background: var(--side-active);
   color: var(--text);
 }
-/* 有未保存的修改：关闭按钮平时显示成圆点 */
+/* Unsaved changes: the close button shows as a dot until hovered */
 .wp-ftab-x.dirty svg {
   display: none;
 }
@@ -6142,7 +6142,7 @@ body.resizing .side-resizer::after {
   display: none;
 }
 
-/* 路径行 */
+/* Path row */
 .wp-head {
   height: 34px;
   padding: 0 6px 0 10px;
@@ -6156,7 +6156,7 @@ body.resizing .side-resizer::after {
   gap: 6px;
 }
 
-/* 文件树一栏 */
+/* File tree column */
 .wp-side {
   background: var(--bg);
 }
@@ -6237,7 +6237,7 @@ body.resizing .side-resizer::after {
   flex: 1;
   min-width: 0;
 }
-/* git 改动：文件名上色，右侧字母；收起的目录里有改动显示小点 */
+/* git changes: colored file names with a letter on the right; collapsed directories containing changes show a small dot */
 .wp-git {
   flex: none;
   width: 14px;
@@ -6265,7 +6265,7 @@ body.resizing .side-resizer::after {
 .wp-row.g-ren .wp-git {
   color: var(--link);
 }
-/* 改动视图：文件行右边的「+12 −3」和顶上的合计 */
+/* Changes view: "+12 −3" on the right of file rows and the totals at the top */
 .wp-stat {
   flex: none;
   display: inline-flex;
@@ -6308,7 +6308,7 @@ body.resizing .side-resizer::after {
   padding: 12px;
 }
 
-/* 对话区窄的时候（打开了文件面板）：会话头只留图标，输入框工具栏不换行 */
+/* When the chat area is narrow (file panel open): session header shows icons only, input toolbar doesn't wrap */
 .session-view {
   container-type: inline-size;
 }
@@ -6339,15 +6339,15 @@ body.resizing .side-resizer::after {
     display: none;
   }
 }
-/* 打开文件后文件树最多占面板的 38%，编辑器不会被挤得太窄 */
+/* With a file open, the tree takes at most 38% of the panel so the editor isn't squeezed too narrow */
 @media (min-width: 761px) {
   .file-panel:not(.browse) .wp-side {
     max-width: 38%;
   }
 }
 
-/* ---- 文件面板：搜索、快速打开、diff、并排、预览、拖拽上传 ---- */
-/* 快速打开要盖在面板上；全屏和手机上面板本来就是 absolute，不能覆盖掉 */
+/* ---- File panel: search, quick open, diff, side by side, preview, drag-and-drop upload ---- */
+/* Quick open must cover the panel; in full screen and on mobile the panel is already absolute and mustn't be overridden */
 .file-panel:not(.full) {
   position: relative;
 }
@@ -6360,7 +6360,7 @@ body.resizing .side-resizer::after {
   padding: 0 7px;
 }
 
-/* 内容搜索 */
+/* Content search */
 .grep {
   flex: 1;
   min-height: 0;
@@ -6446,7 +6446,7 @@ body.resizing .side-resizer::after {
   border-radius: 2px;
 }
 
-/* 快速打开（Ctrl+P）：盖在面板上方 */
+/* Quick open (Ctrl+P): covers the top of the panel */
 .qo-scrim {
   position: absolute;
   inset: 0;
@@ -6557,7 +6557,7 @@ body.resizing .side-resizer::after {
   color: var(--text-3);
 }
 
-/* 整页 diff：上下或左右并排 */
+/* Full-page diff: unified or side by side */
 .wp-diff {
   flex: 1;
   min-height: 0;
@@ -6665,7 +6665,7 @@ body.resizing .side-resizer::after {
   color: var(--add-fg);
 }
 
-/* 右侧再开一个文件 */
+/* Another file opened on the right */
 .wp-panes {
   flex: 1;
   min-height: 0;
@@ -6699,7 +6699,7 @@ body.resizing .side-resizer::after {
   color: var(--text-3);
 }
 
-/* PDF、CSV */
+/* PDF, CSV */
 .wp-pdf {
   flex: 1;
   min-height: 0;
@@ -6786,7 +6786,7 @@ body.resizing .side-resizer::after {
   justify-content: center;
 }
 
-/* 拖拽上传 */
+/* Drag-and-drop upload */
 .wp-row.drop,
 .wp-tree.drop {
   background: var(--accent-soft);
@@ -6811,7 +6811,7 @@ body.resizing .side-resizer::after {
   -webkit-user-drag: element;
 }
 
-/* 手机：面板铺满，并排和左右 diff 不出现，快速打开贴顶 */
+/* Mobile: panel fills the screen, no side-by-side view or split diff, quick open sticks to the top */
 @media (max-width: 760px) {
   .qo-scrim {
     padding-top: 8px;
@@ -6847,7 +6847,7 @@ body.resizing .side-resizer::after {
   }
 }
 
-/* 并排 diff 的长行折行显示，不截断 */
+/* Long lines in the split diff wrap instead of being cut off */
 .pd-pair .pd-text {
   white-space: pre-wrap;
   word-break: break-all;
@@ -6858,9 +6858,9 @@ body.resizing .side-resizer::after {
   white-space: nowrap;
 }
 
-/* 对话正文和下面的输入框左右对齐：两边都是 768px 宽、同一个中心。
-   滚动条会让对话区比输入框窄一条、中心偏左，所以两侧都预留滚动条的位置；
-   代码块、表格也不再比正文宽 */
+/* Align the chat body with the input box below: both 768px wide on the same center.
+   The scrollbar makes the chat area one bar narrower and shifts its center left, so reserve scrollbar space on both sides;
+   code blocks and tables are no longer wider than the body */
 .chat {
   scrollbar-gutter: stable both-edges;
 }
@@ -6877,7 +6877,7 @@ body.resizing .side-resizer::after {
   }
 }
 
-/* 手机：文件面板铺满会话区，文件树盖在编辑器上；视图标签不换行 */
+/* Mobile: the file panel fills the session area and the tree covers the editor; view tabs don't wrap */
 @media (max-width: 760px) {
   .file-panel,
   .file-panel.browse {
@@ -6893,7 +6893,7 @@ body.resizing .side-resizer::after {
   }
 }
 
-/* ---------- Markdown 分栏预览 ---------- */
+/* ---------- Markdown split preview ---------- */
 .wp-md-split {
   flex: 1;
   min-height: 0;
@@ -6929,7 +6929,7 @@ body.resizing .side-resizer::after {
   font-size: 12px;
 }
 
-/* ---------- 文件面板「改动」：勾选、只看本会话、提交 ---------- */
+/* ---------- File panel "Changes": checkboxes, this session only, commit ---------- */
 .wp-mine {
   display: flex;
   align-items: center;
@@ -6945,7 +6945,7 @@ body.resizing .side-resizer::after {
   margin: 0;
   accent-color: var(--accent);
 }
-/* 手机上路径行放不下：路径只留文件名一段可横滑，按钮不换行 */
+/* Path row doesn't fit on mobile: only the file name segment stays, scrollable sideways; buttons don't wrap */
 @media (max-width: 760px) {
   .wp-head {
     gap: 4px;
@@ -6956,14 +6956,14 @@ body.resizing .side-resizer::after {
   }
 }
 
-/* 只有文件树时点全屏：铺满会话区（.browse 的窄宽度规则在后面，要盖过去） */
+/* Full screen with only the tree: fill the session area (the narrow .browse width rule comes later and must be overridden) */
 .file-panel.full.browse {
   width: auto;
   min-width: 0;
   max-width: none;
 }
 
-/* 全屏：左边留出一窄条对话区（淡化），点它退出全屏 */
+/* Full screen: leave a narrow (faded) strip of the chat area on the left; clicking it exits full screen */
 @media (min-width: 761px) {
   .file-panel.full,
   .file-panel.full.browse {
@@ -6981,7 +6981,7 @@ body.resizing .side-resizer::after {
   }
 }
 
-/* 文件面板的图片预览：图片绝对定位在中间，靠 transform 缩放、旋转、平移 */
+/* Image preview in the file panel: the image is absolutely centered and zoomed, rotated and panned via transform */
 .wp-image.iv {
   position: relative;
   overflow: hidden;
@@ -7080,7 +7080,7 @@ body.resizing .side-resizer::after {
   }
 }
 
-/* ---------- 端口转发 ---------- */
+/* ---------- Port forwarding ---------- */
 .ports-add .row {
   align-items: flex-end;
   gap: 10px;
@@ -7143,7 +7143,7 @@ body.resizing .side-resizer::after {
   }
 }
 
-/* ---------- 文件面板里的浏览器标签 ---------- */
+/* ---------- Browser tab in the file panel ---------- */
 .wb {
   flex: 1;
   min-height: 0;
@@ -7261,7 +7261,7 @@ body.resizing .side-resizer::after {
   font-weight: 600;
 }
 
-/* 菜单项太长（文件下拉里的路径）：截断，不溢出；项多时菜单内滚动 */
+/* Menu items that are too long (paths in the file dropdown): truncate instead of overflowing; scroll inside the menu when there are many items */
 .ctx-menu {
   max-height: calc(100vh - 8px);
   overflow-y: auto;
@@ -7289,8 +7289,8 @@ body.resizing .side-resizer::after {
   font-weight: 500;
 }
 
-/* 终端留白放在 .xterm 上而不是容器上：全局 border-box 下 FitAddon 读到的容器高度含 padding，
-   会多算一两行，最后一行被下面的状态栏挡住；.xterm 自己的 padding FitAddon 会扣掉 */
+/* Terminal padding goes on .xterm rather than the container: under global border-box, FitAddon reads the container height including padding,
+   overcounts a line or two, and the last line ends up under the status bar; FitAddon does subtract .xterm's own padding */
 .term {
   padding: 0;
 }
@@ -7299,9 +7299,9 @@ body.resizing .side-resizer::after {
   padding: var(--term-pad, 10px 4px 4px 14px);
 }
 
-/* ---------- 移动端与触屏交互增强 ---------- */
+/* ---------- Mobile and touch improvements ---------- */
 
-/* Lightbox 和拖拽滚动条/分隔条禁用浏览器默认手势 */
+/* Disable the browser's default gestures on the lightbox and on draggable scrollbars/dividers */
 .lightbox,
 .tmux-scroll,
 .tmux-thumb,
@@ -7309,7 +7309,7 @@ body.resizing .side-resizer::after {
   touch-action: none;
 }
 
-/* 文件树每行右侧的「更多」操作按钮：桌面悬停出现，触屏/手机常驻，方便「添加到对话」等操作 */
+/* "More" button on the right of each file tree row: appears on hover on desktop, always shown on touch/mobile, for actions like "Add to chat" */
 .wp-row-more {
   flex: none;
   width: 22px;
@@ -7328,7 +7328,7 @@ body.resizing .side-resizer::after {
   display: inline-flex;
 }
 
-/* 待处理的审批/AI 提问卡片折叠按钮 */
+/* Collapse button for pending approval / AI question cards */
 .card-fold-btn {
   width: 24px;
   height: 24px;
@@ -7349,7 +7349,7 @@ body.resizing .side-resizer::after {
   .wp-row-more {
     display: inline-flex;
   }
-  /* 触屏没有 hover，文件未保存时关闭按钮直接显示 × 并标色 */
+  /* Touch screens have no hover, so the close button of an unsaved file shows × in color directly */
   .wp-ftab-x.dirty svg {
     display: block;
     color: var(--warn);
@@ -7360,7 +7360,7 @@ body.resizing .side-resizer::after {
 }
 
 @media (max-width: 760px) {
-  /* 会话页把左侧抽屉按钮合进 .session-head，省去上方单独一行 .mobile-bar */
+  /* The session page merges the left drawer button into .session-head, saving the separate .mobile-bar row above */
   .main:has(.session-head) > .mobile-bar {
     display: none;
   }
@@ -7373,7 +7373,7 @@ body.resizing .side-resizer::after {
     margin-left: -4px;
   }
 
-  /* 触屏热区放大 */
+  /* Larger touch targets */
   .wp-row-more {
     display: inline-flex;
     width: 28px;
@@ -7401,7 +7401,7 @@ body.resizing .side-resizer::after {
     width: 14px;
   }
 
-  /* 底部终端面板上边缘拖拽把手可视化并加大热区 */
+  /* Make the drag handle on the bottom terminal panel's top edge visible, with a larger touch target */
   .term-panel-resizer {
     top: -6px;
     height: 14px;
@@ -7419,10 +7419,10 @@ body.resizing .side-resizer::after {
   }
 }
 
-/* ---------- 手机：新建会话 ----------
-   全屏弹窗的 .modal-bg 是可滚动的 flex 容器，子元素 min-height: 100% 只撑到一屏高，
-   内容更长时背景到不了底，下面会透出侧边栏。改成普通块，弹窗跟着内容变长。
-   标题行吸顶（让出状态栏），取消 / 创建吸底（让出手势条），中间滚动 */
+/* ---------- Mobile: new session ----------
+   The full-screen dialog's .modal-bg is a scrollable flex container, and children with min-height: 100% only stretch to one screen,
+   so with longer content the background doesn't reach the bottom and the sidebar shows through. Make it a plain block so the dialog grows with its content.
+   The title row sticks to the top (clearing the status bar), Cancel / Create stick to the bottom (clearing the gesture bar), and the middle scrolls */
 @media (max-width: 760px) {
   .modal-bg {
     display: block;
@@ -7485,8 +7485,8 @@ body.resizing .side-resizer::after {
   }
 }
 
-/* ---------- 手机：模型选择改成底部弹出面板 ----------
-   原来的下拉菜单 300px 宽、贴着模型按钮右对齐，在手机上右半截出了屏幕，描述被截断 */
+/* ---------- Mobile: model picker becomes a bottom sheet ----------
+   The old dropdown was 300px wide and right-aligned to the model button; on phones its right half went off screen and descriptions were cut off */
 .model-sheet-bg {
   position: fixed;
   inset: 0;
@@ -7580,7 +7580,7 @@ body.resizing .side-resizer::after {
   font-weight: 500;
 }
 
-/* 扫码配对（QrScanner.tsx）：整屏相机画面，中间一个取景框 */
+/* QR pairing (QrScanner.tsx): full-screen camera view with a viewfinder in the middle */
 .qr-scan {
   position: fixed;
   inset: 0;
@@ -7604,7 +7604,7 @@ body.resizing .side-resizer::after {
   transform: translate(-50%, -50%);
   border: 2px solid rgba(255, 255, 255, 0.9);
   border-radius: 16px;
-  /* 框外压暗 */
+  /* Darken outside the frame */
   box-shadow: 0 0 0 100vmax rgba(0, 0, 0, 0.45);
 }
 .qr-scan-frame.waiting {
@@ -7640,7 +7640,7 @@ body.resizing .side-resizer::after {
   text-shadow: 0 1px 3px rgba(0, 0, 0, 0.8);
 }
 
-/* 打开会话时从主机取记录的提示：还没有内容时居中，已有内容（重新加载）时贴在顶部 */
+/* Notice while fetching the session log from the host on open: centered when there's no content yet, pinned to the top when there is (reload) */
 .chat-loading {
   display: flex;
   align-items: center;
@@ -7657,13 +7657,13 @@ body.resizing .side-resizer::after {
   width: 13px;
   height: 13px;
 }
-/* 设置行右侧的下拉框按内容宽，不占满整行 */
+/* Dropdowns on the right of settings rows size to content instead of filling the row */
 .pref-row > select {
   flex: none;
   width: auto;
   min-width: 96px;
 }
-/* 工具进程异常退出后，输入框上方的「恢复会话」条 */
+/* "Resume session" bar above the input box after the tool process exited abnormally */
 .session-recover {
   display: flex;
   align-items: center;
@@ -7690,7 +7690,7 @@ body.resizing .side-resizer::after {
   height: 12px;
 }
 
-/* 对话里的「后台任务完成 / 失败」：和工具行一样靠左的一行，命令用等宽字体单行省略，点开换行显示全文 */
+/* "Background task finished / failed" in the chat: a left-aligned row like tool rows; the command is monospace, single-line ellipsized, and wraps in full when expanded */
 .bgdone {
   display: flex;
   align-items: baseline;

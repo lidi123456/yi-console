@@ -4,7 +4,7 @@ import { isTauri } from '../transport';
 import { openImage } from './Lightbox';
 import { openMenu } from './Overlay';
 
-// 图片的右键菜单：复制图片、另存为、放大查看。对话里的图片和放大查看页共用
+// Image context menu: copy image, save as, view enlarged. Shared by chat images and the enlarged view
 
 function loadImg(src: string) {
   return new Promise<HTMLImageElement>((resolve, reject) => {
@@ -16,7 +16,7 @@ function loadImg(src: string) {
   });
 }
 
-/** 剪贴板只认 PNG，其他格式先画到 canvas 上转一下 */
+/** The clipboard only accepts PNG; draw other formats to a canvas and convert first */
 async function toPng(src: string): Promise<Blob> {
   const img = await loadImg(src);
   const c = document.createElement('canvas');
@@ -38,7 +38,7 @@ export async function copyImage(src: string) {
 
 const EXT: Record<string, string> = { 'image/png': 'png', 'image/jpeg': 'jpg', 'image/gif': 'gif', 'image/webp': 'webp' };
 
-/** data: 地址直接取原始数据，其他地址下载下来 */
+/** Take the raw data straight from data: URLs; download other URLs */
 async function imageData(src: string): Promise<{ mime: string; base64: string }> {
   const m = /^data:([^;,]+);base64,(.*)$/.exec(src);
   if (m) return { mime: m[1], base64: m[2] };
@@ -59,7 +59,7 @@ export async function saveImage(src: string) {
         if (await invoke<boolean>('save_file', { name, data: base64 })) toast(tr('已保存', 'Saved'));
         return;
       } catch {
-        // 手机上没有保存对话框，退回到浏览器下载
+        // No save dialog on mobile, fall back to a browser download
       }
     }
     const a = document.createElement('a');

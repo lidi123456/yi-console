@@ -6,11 +6,11 @@ on:
   workflow_dispatch:
     inputs:
       only_daemons:
-        description: 只编译 yi-agentd / yi-relay（不出安装包，省额度）
+        description: Build only yi-agentd / yi-relay (no installers, saves CI minutes)
         type: boolean
         default: false
       windows_only:
-        description: 只打 Windows 安装包（跳过 macOS、Linux 桌面和 Android；安装包里不带 macOS 的 yi-agentd）
+        description: Build only the Windows installer (skip macOS, Linux desktop and Android; the installer then lacks the macOS yi-agentd)
         type: boolean
         default: false
 
@@ -18,8 +18,8 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # 算出要编哪些平台：只打 Windows 时去掉 macOS 的 yi-agentd 和 Windows 以外的桌面包
-  # （matrix 的 exclude 去不掉 include 里的条目，只能这样先算好再传给 matrix）
+  # Work out which platforms to build: for a Windows-only build, drop the macOS yi-agentd and every non-Windows desktop bundle
+  # (matrix exclude can't remove entries added by include, so compute the list first and pass it to the matrix)
   plan:
     runs-on: ubuntu-latest
     outputs:
@@ -44,14 +44,14 @@ jobs:
             {"os":"windows-latest","target":"x86_64-pc-windows-msvc","daemon":"windows-x86_64","ext":".exe"}
           ]'
           if [ "$WINDOWS_ONLY" = true ]; then
-            # Linux 的 yi-agentd 留着，Windows 版要靠它给 SSH 主机部署
+            # Keep the Linux yi-agentd: the Windows build needs it to deploy to SSH hosts
             daemons=$(jq -c 'map(select(.os != "macos-latest"))' <<<"$daemons")
             desktop=$(jq -c 'map(select(.os == "windows-latest"))' <<<"$desktop")
           fi
           echo "daemons=$(jq -c . <<<"$daemons")" >> "$GITHUB_OUTPUT"
           echo "desktop=$(jq -c . <<<"$desktop")" >> "$GITHUB_OUTPUT"
 
-  # 各平台 yi-agentd（和 Linux 上的 yi-relay）。桌面安装包会把它们全部带上，用来给 SSH 主机自动部署。
+  # yi-agentd for every platform (plus yi-relay on Linux). Desktop installers bundle all of them for automatic deployment to SSH hosts.
   daemons:
     needs: plan
     strategy:
@@ -61,7 +61,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
-      # 版本号里的提交号和构建时间：所有平台用同一个值（客户端连上 yi-agentd 时两者都要一致，不然一直提示升级）
+      # Commit hash and build time in the version: same value on every platform (the client checks both when it connects to yi-agentd, otherwise it keeps asking to upgrade)
       - name: build stamp
         shell: bash
         run: echo "YI_CONSOLE_BUILD_TIME=$(git log -1 --format=%ct)" >> "$GITHUB_ENV"
@@ -102,7 +102,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
-      # 版本号里的提交号和构建时间：所有平台用同一个值（客户端连上 yi-agentd 时两者都要一致，不然一直提示升级）
+      # Commit hash and build time in the version: same value on every platform (the client checks both when it connects to yi-agentd, otherwise it keeps asking to upgrade)
       - name: build stamp
         shell: bash
         run: echo "YI_CONSOLE_BUILD_TIME=$(git log -1 --format=%ct)" >> "$GITHUB_ENV"
@@ -133,7 +133,7 @@ jobs:
         run: |
           mkdir -p app/src-tauri/resources/yi-agentd app/src-tauri/binaries
           cp daemons/yi-agentd-* app/src-tauri/resources/yi-agentd/
-          # 本机 sidecar 复用同平台那一份
+          # The local sidecar reuses the build for the same platform
           cp daemons/yi-agentd-${{ matrix.daemon }}${{ matrix.ext }} app/src-tauri/binaries/yi-agentd-${{ matrix.target }}${{ matrix.ext }}
           chmod +x app/src-tauri/binaries/* app/src-tauri/resources/yi-agentd/* || true
       - run: npm ci
@@ -156,7 +156,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      # 版本号里的提交号和构建时间：所有平台用同一个值（客户端连上 yi-agentd 时两者都要一致，不然一直提示升级）
+      # Commit hash and build time in the version: same value on every platform (the client checks both when it connects to yi-agentd, otherwise it keeps asking to upgrade)
       - name: build stamp
         shell: bash
         run: echo "YI_CONSOLE_BUILD_TIME=$(git log -1 --format=%ct)" >> "$GITHUB_ENV"
@@ -171,7 +171,7 @@ jobs:
         with:
           distribution: temurin
           java-version: 17
-      # runner 自带 Android SDK（$ANDROID_HOME），只补装 NDK
+      # The runner ships with the Android SDK ($ANDROID_HOME); only the NDK needs installing
       - name: ndk
         run: |
           yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;27.2.12479018" > /dev/null
@@ -187,7 +187,7 @@ jobs:
         working-directory: app
         run: |
           npx tauri android init --ci
-          # 换上自己的 MainActivity（输入法弹出时让出键盘高度），见 app/src-tauri/android/MainActivity.kt
+          # Swap in our own MainActivity (makes room for the keyboard when the IME opens), see app/src-tauri/android/MainActivity.kt
           cp src-tauri/android/MainActivity.kt src-tauri/gen/android/app/src/main/java/dev/yiconsole/app/MainActivity.kt
           npx tauri android build --apk --target aarch64 --target armv7 --target x86_64
       - name: sign
@@ -195,7 +195,7 @@ jobs:
           KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
           KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
         run: |
-          # 没配签名密钥时临时生成一个：能装，但每次签名不同，升级前要先卸载旧版
+          # No signing key configured: generate a throwaway one. It installs, but the signature changes every build, so uninstall the old version before upgrading
           if [ -n "$KEYSTORE_B64" ]; then
             echo "$KEYSTORE_B64" | base64 -d > release.jks
             pass="$KEYSTORE_PASSWORD"

@@ -1,10 +1,10 @@
-//! 探测本机安装了哪些 AI coding 工具，以及修正守护进程的 PATH。
+//! Detect which AI coding tools are installed on this machine, and fix up the daemon's PATH.
 
 use yi_proto::{DaemonSettings, ToolInfo, ToolKind};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-/// 每个工具默认的可执行文件名（按顺序尝试）
+/// Default executable names for each tool (tried in order)
 fn binary_names(kind: ToolKind) -> &'static [&'static str] {
     match kind {
         ToolKind::Claude => &["claude"],
@@ -17,9 +17,9 @@ fn binary_names(kind: ToolKind) -> &'static [&'static str] {
     }
 }
 
-/// systemd / launchd 拉起的进程 PATH 很短，看不到 nvm、~/.local/bin 之类的目录；
-/// rc 文件里 export 的 API Key（如 CURSOR_API_KEY）也拿不到。
-/// 启动时用登录 shell 取一次环境：PATH 合并，其他变量只补缺不覆盖；再补上常见安装目录。
+/// Processes started by systemd / launchd have a short PATH without directories like nvm or ~/.local/bin,
+/// and don't get API keys exported in rc files (e.g. CURSOR_API_KEY) either.
+/// At startup, fetch the environment once from a login shell: merge PATH, and only fill in other variables that are missing; then add common install directories.
 pub fn fix_path() {
     #[cfg(unix)]
     let login = login_shell_env();
@@ -56,7 +56,7 @@ pub fn fix_path() {
             PathBuf::from(&appdata).join("npm"),
             PathBuf::from(&local).join("Kiro-Cli"),
             PathBuf::from(&local).join("cursor-agent"),
-            // Qoder 的安装脚本放在 ~/.qoder/bin/qodercli/ 下，不进 PATH
+            // Qoder's install script puts it under ~/.qoder/bin/qodercli/, not on PATH
             home.join(".qoder").join("bin").join("qodercli"),
         ]
     } else {
@@ -87,14 +87,14 @@ fn push_unique(v: &mut Vec<PathBuf>, p: PathBuf) {
     }
 }
 
-/// 只属于那个 shell 进程的变量，不该带进守护进程
+/// Variables that belong only to that shell process and shouldn't be carried into the daemon
 #[cfg(unix)]
 const SKIP_ENV: &[&str] = &["PWD", "OLDPWD", "SHLVL", "_", "PS1", "PS2", "TERM", "COLUMNS", "LINES", "SHELLOPTS", "BASHOPTS"];
 
 #[cfg(unix)]
 fn login_shell_env() -> Vec<(String, String)> {
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
-    // -i 会读 .bashrc（nvm、API Key 一般写在这里），用标记包住防止 rc 文件里的输出混进来
+    // -i reads .bashrc (where nvm and API keys usually live); wrap the output in markers so anything printed by rc files doesn't get mixed in
     let Some(out) = run_with_timeout(
         std::process::Command::new(&shell)
             .args(["-lic", "printf '__AH__'; env -0; printf '__AH__'"])
@@ -147,7 +147,7 @@ fn run_with_timeout(cmd: &mut std::process::Command, t: Duration) -> Option<Vec<
     Some(buf)
 }
 
-/// 在 PATH 里找可执行文件
+/// Find an executable on PATH
 pub fn which(name: &str) -> Option<PathBuf> {
     let p = Path::new(name);
     if p.is_absolute() {
@@ -175,7 +175,7 @@ pub fn which(name: &str) -> Option<PathBuf> {
     None
 }
 
-/// 解析某个工具要执行的程序：设置里的覆盖优先，其次 PATH
+/// Resolve the program a tool should run: the override in settings first, then PATH
 pub fn resolve(kind: ToolKind, settings: &DaemonSettings) -> Option<PathBuf> {
     if let Some(o) = settings.tools.get(kind.as_str()) {
         if !o.command.is_empty() {
@@ -228,9 +228,9 @@ pub fn detect(settings: &DaemonSettings) -> Vec<ToolInfo> {
         .collect()
 }
 
-/// 终端模式的 Codex 要不要带 --no-daemon。新版 Codex 的交互界面默认连共享的后台服务，
-/// 退出后会话还被后台服务占着，之后对话模式的 app-server 接续时会报 "already has an active writer"。
-/// 老版本不认这个参数，所以先看 --help（按路径缓存）
+/// Whether terminal-mode Codex needs --no-daemon. Newer Codex's interactive UI connects to a shared background service by default,
+/// which keeps holding the session after exit, so chat mode's app-server later fails to continue it with "already has an active writer".
+/// Older versions don't recognize the flag, so check --help first (cached by path)
 pub fn codex_no_daemon(p: &Path) -> bool {
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};

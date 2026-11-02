@@ -1,5 +1,5 @@
-//! Codex 适配器：`codex app-server`（JSON-RPC over stdio）。
-//! 审批以服务端→客户端请求的形式到达（item/*/requestApproval），回复 decision。
+//! Codex adapter: `codex app-server` (JSON-RPC over stdio).
+//! Approvals arrive as server→client requests (item/*/requestApproval), answered with a decision.
 
 use super::{AdapterCmd, JsonProc, Prompt, StartSpec};
 use crate::hub::Emitter;
@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use tokio::sync::mpsc;
 
-/// 我们发出的请求 id -> 用途
+/// Request ids we sent -> purpose
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Pending {
     Init,
@@ -22,7 +22,7 @@ struct PendingApproval {
     rpc_id: Value,
     method: String,
     params: Value,
-    /// requestUserInput 的问题
+    /// requestUserInput questions
     questions: Vec<Question>,
 }
 
@@ -33,24 +33,24 @@ struct State {
     thread_id: Option<String>,
     turn_id: Option<String>,
     queue: Vec<Prompt>,
-    /// 会话中切换的模型，之后每个 turn/start 都带上
+    /// Model switched during the session; sent with every turn/start afterwards
     model: Option<String>,
-    /// 思考等级，每个 turn/start 都带上
+    /// Thinking level, sent with every turn/start
     effort: Option<String>,
-    /// 会话中切换的审批模式，之后每个 turn/start 都带上对应的审批策略和沙箱
+    /// Permission mode switched during the session; every turn/start afterwards carries the matching approval policy and sandbox
     perm: Option<String>,
     approvals: HashMap<String, PendingApproval>,
-    /// 上一次的累计 token，用来换算增量
+    /// Previous cumulative tokens, used to compute increments
     last_total: Option<Value>,
-    /// thread/resume 时 app-server 会回放历史 item，用这个开关决定是否记录
+    /// On thread/resume app-server replays history items; this switch decides whether to record them
     replaying: bool,
-    /// 这次压缩是我们发的 thread/compact/start（手动），否则是 Codex 自己触发的
+    /// This compaction is the thread/compact/start we sent (manual); otherwise Codex triggered it itself
     manual_compact: bool,
-    /// 还没回应的 turn/steer：请求 id -> 消息。回合恰好结束导致失败时改成开新回合
+    /// Unanswered turn/steer: request id -> message. If it fails because the turn just ended, start a new turn instead
     steers: HashMap<u64, Prompt>,
-    /// 这次是接着已有线程（发了 thread/resume），不是新开的；接续失败改成新开后置回 false
+    /// This run continues an existing thread (thread/resume was sent) rather than a new one; reset to false when resuming fails and we start a new one
     resumed: bool,
-    /// 新开线程的参数，接续失败改成新开时再用
+    /// Parameters for starting a new thread, reused when resuming fails and we start a new one
     thread_params: Value,
 }
 
@@ -65,14 +65,14 @@ impl State {
 fn policy(mode: &str) -> (&'static str, &'static str) {
     match mode {
         "bypass" => ("never", "danger-full-access"),
-        // 和默认一样按需审批，只是交给 Codex 的自动审核来批（见 reviewer）
+        // Approve on request like default, but hand it to Codex's automatic reviewer (see reviewer)
         "plan" => ("untrusted", "read-only"),
         "strict" => ("untrusted", "workspace-write"),
         _ => ("on-request", "workspace-write"),
     }
 }
 
-/// 审批请求交给谁：auto 模式交给 Codex 的自动审核，其余由用户批
+/// Who handles approval requests: Codex's automatic reviewer in auto mode, the user otherwise
 fn reviewer(mode: &str) -> &'static str {
     if mode == "auto" {
         "auto_review"
@@ -81,7 +81,7 @@ fn reviewer(mode: &str) -> &'static str {
     }
 }
 
-/// thread/start 的 sandbox 取值 -> turn/start 的 sandboxPolicy.type
+/// thread/start sandbox value -> turn/start sandboxPolicy.type
 fn sandbox_type(s: &str) -> &'static str {
     match s {
         "danger-full-access" => "dangerFullAccess",
@@ -131,7 +131,7 @@ pub async fn run(spec: StartSpec, em: Emitter, mut rx: mpsc::UnboundedReceiver<A
                         let m = start_turn(&mut st, &prompt);
                         let _ = p.send(&m).await;
                     } else if let (Some(tid), Some(turn)) = (st.thread_id.clone(), st.turn_id.clone().filter(|t| !t.is_empty() && !prompt.text.starts_with('/'))) {
-                        // 回合进行中：用 turn/steer 把消息插进当前回合
+                        // Turn in progress: use turn/steer to insert the message into the current turn
                         let m = st.req(Pending::Other, "turn/steer", json!({"threadId":tid,"expectedTurnId":turn,
                             "input":input_items(&prompt)}));
                         st.steers.insert(st.next_id, prompt);
@@ -141,7 +141,7 @@ pub async fn run(spec: StartSpec, em: Emitter, mut rx: mpsc::UnboundedReceiver<A
                     }
                 }
                 Some(AdapterCmd::SetModel(model)) => {
-                    // app-server 的模型按回合指定，从下一个 turn/start 开始生效
+                    // app-server sets the model per turn; it takes effect from the next turn/start
                     em.model(&model);
                     st.model = Some(model).filter(|m| !m.is_empty());
                 }
@@ -188,7 +188,7 @@ fn input_items(p: &Prompt) -> Vec<Value> {
     items
 }
 
-/// Codex 终端里的 / 命令是 TUI 自己实现的，app-server 不认；常用的几个在这里接上
+/// The / commands in the Codex terminal are implemented by the TUI and app-server doesn't recognize them; the common ones are wired up here
 pub fn slash_commands() -> Vec<SlashCommand> {
     let c = |name: &str, description: &str, hint: &str| SlashCommand {
         name: name.into(),
@@ -206,7 +206,7 @@ const INIT_PROMPT: &str = "为这个仓库生成一份 AGENTS.md，作为给 AI 
 先浏览目录结构、构建脚本和现有文档，再写：项目结构与模块划分、构建/测试/运行命令、代码风格与命名约定、\
 测试约定、提交与 PR 约定，以及其他需要注意的事项。内容简洁具体，200～400 字为宜；已有 AGENTS.md 时在原文基础上补充，不要整篇重写。";
 
-/// /review 的参数 -> review/start 的 target
+/// /review argument -> review/start target
 fn review_target(arg: &str) -> Value {
     let (head, rest) = arg.split_once(char::is_whitespace).unwrap_or((arg, ""));
     let rest = rest.trim();
@@ -220,7 +220,7 @@ fn review_target(arg: &str) -> Value {
 
 fn start_turn(st: &mut State, prompt: &Prompt) -> Value {
     let tid = st.thread_id.clone().unwrap_or_default();
-    // 先占位，防止 turn/started 之前又来一条消息时重复开回合
+    // Reserve the slot first, so another message arriving before turn/started doesn't start a second turn
     st.turn_id = Some(String::new());
     let text = prompt.text.trim();
     let (cmd, arg) = text.split_once(char::is_whitespace).unwrap_or((text, ""));
@@ -259,7 +259,7 @@ fn start_turn_with(st: &mut State, tid: String, prompt: &Prompt) -> Value {
     st.req(Pending::Turn, "turn/start", params)
 }
 
-/// model/list 的结果
+/// model/list result
 pub fn parse_models(r: &Value) -> Vec<ModelOption> {
     r["data"]
         .as_array()
@@ -285,7 +285,7 @@ pub fn parse_models(r: &Value) -> Vec<ModelOption> {
         .collect()
 }
 
-/// requestUserInput 的回答：{answers: {问题 id: {answers: [选项名或自己填的内容]}}}，跳过就是空的
+/// requestUserInput answer: {answers: {question id: {answers: [option labels or free text]}}}; empty when skipped
 fn user_input_result(a: &PendingApproval, option_id: &str, answers: &[QuestionAnswer]) -> Value {
     let mut map = serde_json::Map::new();
     if option_id == QUESTION_ANSWER {
@@ -332,7 +332,7 @@ fn user_input_questions(params: &Value) -> Vec<Question> {
                         id: q["id"].as_str().unwrap_or("").to_string(),
                         header: q["header"].as_str().unwrap_or("").to_string(),
                         question: q["question"].as_str().unwrap_or("").to_string(),
-                        // 没有选项的题只能自己填
+                        // Questions without options can only be answered with free text
                         allow_other: q["isOther"].as_bool().unwrap_or(false) || options.is_empty(),
                         options,
                         multi_select: false,
@@ -355,7 +355,7 @@ fn approval_result(a: &PendingApproval, option_id: &str) -> Value {
         };
     }
     if a.method == "execCommandApproval" || a.method == "applyPatchApproval" {
-        // 旧版协议的取值
+        // Values from the older protocol
         let d = match option_id {
             "accept" => "approved",
             "acceptForSession" => "approved_for_session",
@@ -367,7 +367,7 @@ fn approval_result(a: &PendingApproval, option_id: &str) -> Value {
     json!({ "decision": option_id })
 }
 
-/// thread/resume 找不到线程记录（rollout）
+/// thread/resume can't find the thread record (rollout)
 fn is_missing_thread(msg: &str) -> bool {
     let m = msg.to_lowercase();
     m.contains("no rollout found") || (m.contains("thread") && m.contains("not found"))
@@ -375,23 +375,23 @@ fn is_missing_thread(msg: &str) -> bool {
 
 fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Vec<Value> {
     let mut out = vec![];
-    // 1) 对我们请求的响应
+    // 1) Responses to our requests
     if let (Some(id), None) = (v["id"].as_u64(), v.get("method")) {
         let kind = st.pending.remove(&id).unwrap_or(Pending::Other);
         let steer = st.steers.remove(&id);
         if let (Some(prompt), Some(_)) = (steer, v.get("error")) {
-            // 插话时回合刚好结束了：等下一个回合发
+            // The turn ended just as we tried to steer: send it with the next turn
             st.queue.push(prompt);
             return out;
         }
         if let Some(err) = v.get("error") {
-            // 旧版本没有 model/list，不当成错误显示
+            // Older versions lack model/list; don't show that as an error
             if kind == Pending::Models {
                 return out;
             }
             let msg = err["message"].as_str().unwrap_or("codex 返回错误").to_string();
-            // 线程开了但一条消息都没发过时，Codex 不写 rollout 文件，进程没了就接不上（刚建或刚 /clear 完）。
-            // 旧线程本来就没有内容，直接新开一个
+            // If a thread was opened but no message was ever sent, Codex doesn't write a rollout file, so it can't be resumed once the process is gone (just created or just /clear-ed).
+            // The old thread had no content anyway, so just start a new one
             if kind == Pending::Thread && st.resumed && is_missing_thread(&msg) {
                 st.resumed = false;
                 st.replaying = false;
@@ -422,9 +422,9 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Vec<Valu
                 if let Some(m) = spec.model.as_ref().filter(|m| !m.is_empty()) {
                     params["model"] = json!(m);
                 }
-                // 会覆盖 config.toml 里的 developer_instructions
+                // Overrides developer_instructions in config.toml
                 params["developerInstructions"] = json!(super::IMAGE_HINT);
-                // 只在 auto 时带上，老版本 Codex 没有这个字段
+                // Only sent for auto; older Codex versions don't have this field
                 if spec.permission_mode == "auto" {
                     params["approvalsReviewer"] = json!("auto_review");
                 }
@@ -477,7 +477,7 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Vec<Valu
     let method = v["method"].as_str().unwrap_or("");
     let params = &v["params"];
 
-    // 2) 服务端发来的请求（有 id）
+    // 2) Requests from the server (with an id)
     if !v["id"].is_null() {
         let rid = v["id"].to_string();
         match method {
@@ -505,7 +505,7 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Vec<Valu
             "item/fileChange/requestApproval" | "applyPatchApproval"
                 if st.perm.as_deref().unwrap_or(&spec.permission_mode) == "acceptEdits" =>
             {
-                // 自动接受编辑模式：改文件直接放行
+                // Accept-edits mode: file edits are allowed right away
                 let a = PendingApproval {
                     rpc_id: v["id"].clone(),
                     method: method.to_string(),
@@ -570,7 +570,7 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Vec<Valu
         return out;
     }
 
-    // 3) 通知
+    // 3) Notifications
     match method {
         "item/reasoning/summaryTextDelta" | "item/reasoning/textDelta" => {
             if let (Some(id), Some(d)) = (params["itemId"].as_str(), params["delta"].as_str()) {
@@ -606,7 +606,7 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Vec<Valu
         }
         "item/completed" => {
             let item = &params["item"];
-            // 命令/补丁在 item/started 已经发过 ToolCall，这里只要结果；补丁的 diff 以完成时为准
+            // Commands/patches already emitted a ToolCall at item/started; only the result is needed here, and a patch's diff is taken from completion
             let started_already = matches!(item["type"].as_str(), Some("commandExecution") | Some("mcpToolCall"));
             let manual = item["type"] == "contextCompaction" && std::mem::take(&mut st.manual_compact);
             for mut ev in item_events(item, false) {
@@ -672,7 +672,7 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Vec<Valu
             let d = |k: &str| {
                 g(&total, k).saturating_sub(prev.as_ref().map(|p| g(p, k)).unwrap_or(0))
             };
-            // resume 后第一次上报的是历史累计，不计入本次用量
+            // The first report after resume is the historical total; don't count it as usage for this run
             if prev.is_none() && st.resumed {
                 return out;
             }
@@ -763,7 +763,7 @@ fn codex_options(session: bool) -> Vec<PermissionOption> {
     v
 }
 
-/// app-server 的 ThreadItem -> 统一事件。`with_user` 为 true 时也输出用户消息（回放历史用）
+/// app-server ThreadItem -> unified events. With `with_user` true, user messages are emitted too (for replaying history)
 pub fn item_events(item: &Value, with_user: bool) -> Vec<EventBody> {
     let id = item["id"].as_str().unwrap_or("").to_string();
     let s = |k: &str| item[k].as_str().unwrap_or("").to_string();

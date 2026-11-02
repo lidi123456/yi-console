@@ -1,4 +1,4 @@
-//! WebSocket 连接、证书指纹固定、中继层登录（客户端这一侧）和 yi-agentd 的控制连接。
+//! WebSocket connections, certificate fingerprint pinning, relay-layer login (client side) and yi-agentd's control connection.
 
 use crate::auth;
 use crate::{b64, device_id_of, unb64_32, Identity};
@@ -15,7 +15,7 @@ pub(crate) fn url(base: &str, path: &str) -> String {
     format!("{}{path}", base.trim_end_matches('/'))
 }
 
-/// 只认指定指纹的证书。签名仍照常校验，证明对方确实持有这张证书的私钥。
+/// Accept only the certificate with the given fingerprint. Signatures are still verified as usual, proving the peer holds that certificate's private key.
 #[derive(Debug)]
 struct PinnedCert {
     fp: String,
@@ -114,7 +114,7 @@ pub async fn ws_connect(u: &str, fp: &str) -> Result<Ws> {
     Ok(ws)
 }
 
-/// 中继关闭连接时带的原因
+/// Reason given by the relay when it closes the connection
 fn close_error(f: Option<tokio_tungstenite::tungstenite::protocol::CloseFrame>) -> anyhow::Error {
     match f {
         Some(f) => {
@@ -125,7 +125,7 @@ fn close_error(f: Option<tokio_tungstenite::tungstenite::protocol::CloseFrame>) 
     }
 }
 
-/// 连上中继、完成中继层鉴权。`extra` 里放 stream / invite / ticket
+/// Connect to the relay and complete relay-layer authentication. `extra` carries stream / invite / ticket
 pub(crate) async fn login(relay: &str, path: &str, fp: &str, me: &Identity, role: &str, device: &str, extra: Value) -> Result<Ws> {
     let mut ws = ws_connect(&url(relay, path), fp).await?;
     let challenge = tokio::time::timeout(Duration::from_secs(10), next_text(&mut ws))
@@ -155,7 +155,7 @@ pub(crate) async fn login(relay: &str, path: &str, fp: &str, me: &Identity, role
     Ok(ws)
 }
 
-/// 下一条文本消息；被关闭时带上中继给的原因
+/// Next text message; when closed, includes the reason from the relay
 async fn next_text(ws: &mut Ws) -> Result<String> {
     loop {
         match ws.next().await {
@@ -168,9 +168,9 @@ async fn next_text(ws: &mut Ws) -> Result<String> {
     }
 }
 
-// ---------------- yi-agentd 的控制连接 ----------------
+// ---------------- yi-agentd's control connection ----------------
 
-/// yi-agentd 连中继需要的东西
+/// What yi-agentd needs to connect to the relay
 #[derive(Debug, Clone)]
 pub struct AgentLink {
     pub relay: String,
@@ -184,32 +184,32 @@ impl AgentLink {
     }
 }
 
-/// 建立控制连接。`invite` 只在首次登记时需要
+/// Establish the control connection. `invite` is only needed for the first registration
 pub async fn agent_control(a: &AgentLink, invite: &str) -> Result<Ws> {
     let extra = if invite.is_empty() { json!({}) } else { json!({"invite": invite}) };
     login(&a.relay, "/v1/agent", &a.fp, &a.me, auth::ROLE_AGENT, &a.device(), extra).await
 }
 
-/// 中继请 yi-agentd 为某个客户端开一条数据流
+/// The relay asks yi-agentd to open a stream for a client
 #[derive(Debug, Clone)]
 pub struct OpenReq {
     pub stream: String,
-    /// 客户端的签名公钥（中继已验证）
+    /// The client's signing public key (verified by the relay)
     pub client: [u8; 32],
-    /// 用配对票据进来的：票据本身，yi-agentd 据此找到对应的配对码
+    /// Came in with a pairing ticket: the ticket itself, which yi-agentd uses to find the matching pairing code
     pub ticket: Option<[u8; 32]>,
 }
 
 #[derive(Debug)]
 pub enum Control {
     Open(OpenReq),
-    /// 设备代发邀请的结果：Ok(邀请码) / Err(原因)
+    /// Result of a device-issued invite: Ok(invite code) / Err(reason)
     Invite(std::result::Result<String, String>),
-    /// 心跳等
+    /// Heartbeats etc.
     Other,
 }
 
-/// 读控制连接上的下一条消息。调用方据此给每条消息套超时，长时间没有心跳就重连。
+/// Read the next message on the control connection. Callers wrap each read in a timeout and reconnect when heartbeats stop for too long.
 pub async fn next_control(ws: &mut Ws) -> Result<Control> {
     match ws.next().await {
         Some(Ok(Message::Text(t))) => {
@@ -232,7 +232,7 @@ pub async fn next_control(ws: &mut Ws) -> Result<Control> {
             }
         }
         Some(Ok(Message::Ping(_))) => {
-            // tungstenite 已自动排队 Pong，flush 一下让它发出去
+            // tungstenite has already queued the Pong; flush so it actually goes out
             let _ = ws.flush().await;
             Ok(Control::Other)
         }
@@ -243,7 +243,7 @@ pub async fn next_control(ws: &mut Ws) -> Result<Control> {
     }
 }
 
-/// 在控制连接上发一条消息（白名单 acl、要邀请码 invite）
+/// Send a message on the control connection (acl allow list, invite request)
 pub async fn send_control(ws: &mut Ws, v: &Value) -> Result<()> {
     ws.send(Message::Text(v.to_string().into())).await?;
     Ok(())

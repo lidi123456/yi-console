@@ -1,4 +1,4 @@
-//! Hub：会话管理器。持有所有会话的运行时状态，负责事件编号、落库和广播。
+//! Hub: the session manager. Holds the runtime state of every session and handles event numbering, persistence and broadcasting.
 
 use crate::adapters::{self, AdapterCmd, Prompt, PromptImage, StartSpec};
 use crate::store::Store;
@@ -11,13 +11,13 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 use tokio::sync::{broadcast, mpsc};
 
-/// 终端回放缓冲上限
+/// Terminal replay buffer limit
 const TERM_BUF_MAX: usize = 2 * 1024 * 1024;
 
-/// 单张图片上限
+/// Per-image size limit
 pub const IMAGE_MAX: usize = 5 * 1024 * 1024;
 
-/// 客户端发来的图片（base64）
+/// Image sent by the client (base64)
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IncomingImage {
@@ -39,19 +39,19 @@ fn uploads_dir(sid: &str) -> PathBuf {
     crate::paths::base_dir().join("uploads").join(sid)
 }
 
-/// 会话 id 都是我们生成的 UUID：只含十六进制数字和 `-`。拼进路径前用它挡住 `..`、绝对路径和空串
+/// Session ids are UUIDs we generate: only hex digits and `-`. Used before building paths to block `..`, absolute paths and empty strings
 fn safe_sid(sid: &str) -> bool {
     !sid.is_empty() && sid.len() <= 64 && sid.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
 }
 
-/// 输入框里粘贴 / 拖进来的普通文件：存到 `uploads/<会话>/files/`，重名就加 (1) (2)，删会话时一起删
+/// Regular files pasted / dropped into the input box: saved to `uploads/<session>/files/`, with (1) (2) appended on name clashes, deleted with the session
 pub fn attach_file(sid: &str, name: &str, data: &str) -> Result<serde_json::Value> {
     let clean: String = std::path::Path::new(name)
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_default()
         .chars()
-        // 空格也换掉：@引用里的路径带空格要加引号，有的工具认不出
+        // Replace spaces too: paths with spaces in @references need quoting, which some tools don't understand
         .map(|c| if c.is_control() || c.is_whitespace() || r#"<>:"/\|?*"#.contains(c) { '_' } else { c })
         .collect();
     let clean = if clean.trim().is_empty() || clean.trim_matches('.').is_empty() { "file".to_string() } else { clean };
@@ -70,7 +70,7 @@ pub fn attach_file(sid: &str, name: &str, data: &str) -> Result<serde_json::Valu
     crate::fsapi::upload(&p.display().to_string(), data, false)
 }
 
-/// 分块上传的后续块：接到 `attach_file` 刚建的文件末尾。只认这个会话上传目录里已有的文件，总大小不超过 50MB
+/// Subsequent chunks of a chunked upload: appended to the file `attach_file` just created. Only files already in this session's upload directory are accepted, up to 50MB total
 pub fn attach_append(sid: &str, path: &str, data: &str) -> Result<serde_json::Value> {
     use base64::Engine;
     use std::io::Write;
@@ -93,7 +93,7 @@ fn models_path() -> PathBuf {
     crate::paths::base_dir().join("models.json")
 }
 
-/// 发往客户端连接的消息。`session_id` 有值时只发给订阅了该会话的连接。
+/// Message to client connections. When `session_id` is set, it goes only to connections subscribed to that session.
 #[derive(Debug, Clone)]
 pub struct Outbound {
     pub session_id: Option<String>,
@@ -106,21 +106,21 @@ struct SessionRt {
     cmd: Mutex<Option<mpsc::UnboundedSender<AdapterCmd>>>,
     term: Mutex<VecDeque<u8>>,
     pending: Mutex<HashSet<String>>,
-    /// 每次启动 adapter 加一；旧 adapter 的迟到事件按代号丢弃
+    /// Incremented on every adapter start; late events from an old adapter are dropped by generation
     generation: Mutex<u64>,
-    /// 工具这次启动时报告的可选模型
+    /// Models the tool reported on this start
     models: Mutex<Vec<ModelOption>>,
-    /// 这一轮最后一段回复，回合结束的通知里带上开头一段
+    /// Last reply segment of this turn; its beginning goes into the turn-finished notification
     last_text: Mutex<String>,
-    /// 工具报告的斜杠命令
+    /// Slash commands reported by the tool
     commands: Mutex<Vec<SlashCommand>>,
-    /// 排队等当前回合结束再发的消息
+    /// Messages queued until the current turn ends
     queue: Mutex<VecDeque<Queued>>,
-    /// 用户点了中断，这一轮结束后不自动发排队的消息
+    /// The user clicked interrupt; don't auto-send queued messages after this turn
     interrupted: Mutex<bool>,
-    /// 当前进程启动时的审批模式
+    /// Permission mode when the current process started
     launched_mode: Mutex<String>,
-    /// 审批模式改了但要重启进程才能生效（Claude 切到全部放行），等这一轮结束再重启
+    /// Permission mode changed but needs a process restart to apply (Claude switching to allow-all); restart once this turn ends
     restart_pending: Mutex<bool>,
 }
 
@@ -128,12 +128,12 @@ struct Queued {
     id: String,
     text: String,
     images: Vec<IncomingImage>,
-    /// 用户点了"立即发送"
+    /// The user clicked "Send now"
     now: bool,
 }
 
-/// 各工具实际支持的审批模式（前端 `permModes` 手动同步）。
-/// auto 是工具自己的自动审批：Claude 的 `--permission-mode auto`，Codex 的 auto_review
+/// Permission modes each tool actually supports (manually kept in sync with the frontend's `permModes`).
+/// auto is the tool's own automatic approval: Claude's `--permission-mode auto`, Codex's auto_review
 pub fn permission_modes(tool: ToolKind, mode: SessionMode) -> &'static [&'static str] {
     use SessionMode::*;
     use ToolKind::*;
@@ -143,15 +143,15 @@ pub fn permission_modes(tool: ToolKind, mode: SessionMode) -> &'static [&'static
         (Cursor | Kiro, Structured) => &["default", "acceptEdits", "plan", "bypass"],
         (Cursor, Terminal) => &["default", "plan", "bypass"],
         (Kiro, Terminal) => &["default", "bypass"],
-        // Qoder 没有规划模式
+        // Qoder has no plan mode
         (Qoder, _) => &["default", "acceptEdits", "bypass"],
         (Codebuddy, _) => &["default", "acceptEdits", "plan", "bypass"],
         (Shell, _) => &[],
     }
 }
 
-/// 终端会话等页面报上实际尺寸再启动（最多等 3 秒）：按默认尺寸启动后马上改尺寸，
-/// cursor-agent、Claude Code 这类全屏程序重画时会按旧宽度擦屏，留下一堆残影
+/// Terminal sessions wait for the page to report its real size before starting (up to 3 s): starting at a default size and resizing right after
+/// makes full-screen programs like cursor-agent and Claude Code redraw by clearing at the old width, leaving ghost artifacts
 async fn start_when_sized(mut spec: StartSpec, em: Emitter, mut rx: mpsc::UnboundedReceiver<AdapterCmd>) {
     let mut early = vec![];
     let deadline = tokio::time::sleep(std::time::Duration::from_secs(3));
@@ -190,9 +190,9 @@ pub struct Hub {
     pub bus: broadcast::Sender<Arc<Outbound>>,
     pub settings: RwLock<DaemonSettings>,
     pub shutdown: tokio::sync::Notify,
-    /// 各工具最近一次报告的模型列表（落盘，新建会话时用）
+    /// Each tool's most recently reported model list (persisted, used for new sessions)
     tool_models: Mutex<HashMap<String, Vec<ModelOption>>>,
-    /// 各工具最近一次报告的斜杠命令（只在内存里）
+    /// Each tool's most recently reported slash commands (memory only)
     tool_commands: Mutex<HashMap<String, Vec<SlashCommand>>>,
 }
 
@@ -205,7 +205,7 @@ pub struct CreateParams {
     pub mode: Option<SessionMode>,
     #[serde(default)]
     pub title: Option<String>,
-    /// 接着某个已有的工具会话（历史导入）
+    /// Continue an existing tool session (history import)
     #[serde(default)]
     pub resume_id: Option<String>,
     #[serde(default)]
@@ -215,7 +215,7 @@ pub struct CreateParams {
     pub permission_mode: Option<String>,
     #[serde(default)]
     pub effort: Option<String>,
-    /// shell 工具或终端模式下自定义命令行
+    /// Custom command line for the shell tool or terminal mode
     #[serde(default)]
     pub command: Option<String>,
     #[serde(default)]
@@ -224,7 +224,7 @@ pub struct CreateParams {
     pub cols: Option<u16>,
     #[serde(default)]
     pub rows: Option<u16>,
-    /// 底部终端面板：所属对话会话
+    /// Bottom terminal panel: the chat session it belongs to
     #[serde(default)]
     pub parent_id: Option<String>,
 }
@@ -250,7 +250,7 @@ impl Hub {
         hub
     }
 
-    /// 守护进程重启后，之前的工具进程都已不在，统一标记为 exited
+    /// After a daemon restart, the old tool processes are all gone, so mark everything exited
     fn restore(&self) {
         let Ok(list) = self.store.load_sessions() else {
             return;
@@ -340,8 +340,8 @@ impl Hub {
             .insert(info.id.clone(), rt.clone());
         self.broadcast_updated(&info);
 
-        // 接续历史会话：能离线读取的（claude/codex）先把历史导入事件日志，
-        // 读不了的（ACP 工具）让工具在 session/load 时回放
+        // Continuing a history session: for tools readable offline (claude/codex), import the history into the event log first;
+        // for those that aren't (ACP tools), let the tool replay it on session/load
         let mut replay = p.resume_id.is_some();
         if let Some(rid) = &p.resume_id {
             if mode == SessionMode::Structured && matches!(tool, ToolKind::Claude | ToolKind::Codex) {
@@ -372,8 +372,8 @@ impl Hub {
         let settings = self.settings.read().unwrap().clone();
         let program = crate::tools::resolve(info.tool, &settings)
             .ok_or_else(|| anyhow!("这台机器上没有找到 {}", info.tool.as_str()))?;
-        // 终端里的 Claude：第一次启动就指定会话 id，之后重启接着这个会话。
-        // 开了没说话就退出时 Claude 不会留下记录，这时还用同一个 id 新开
+        // Claude in the terminal: pin the session id on first launch, and continue that session on later restarts.
+        // If it was opened and exited without anything said, Claude leaves no record, so start a new one with the same id
         let mut resume = info.external_id.clone();
         let mut session_id = None;
         if info.mode == SessionMode::Terminal && crate::history::pins_session_id(info.tool) {
@@ -450,9 +450,9 @@ impl Hub {
         g.as_ref().filter(|t| !t.is_closed()).cloned()
     }
 
-    /// 发送用户消息；进程已退出时自动 resume。
-    /// `queue` 为 true 且这一轮还没结束时：Claude、Codex 直接交给工具，工具在下一次工具调用后读到
-    /// （没赶上的由工具在回合结束后接着处理）；其他工具先排队，回合结束后按顺序发出
+    /// Send a user message; resumes automatically if the process has exited.
+    /// With `queue` true and the turn still running: Claude and Codex get it directly and read it after their next tool call
+    /// (anything that misses that is handled by the tool after the turn ends); other tools queue it and send in order after the turn
     pub fn send(self: &Arc<Self>, id: &str, text: &str, images: Vec<IncomingImage>, queue: bool) -> Result<()> {
         let rt = self.get(id)?;
         let info = rt.info.lock().unwrap().clone();
@@ -460,7 +460,7 @@ impl Hub {
             bail!("终端模式不支持发送图片");
         }
         let busy = matches!(info.status, SessionStatus::Running | SessionStatus::WaitingPermission);
-        // 回合结束要重启进程（换审批模式）时，工具没读到的消息会随进程丢掉，这时也排队
+        // If the process must restart at turn end (permission mode change), messages the tool hasn't read would be lost with it, so queue in that case too
         let steer = matches!(info.tool, ToolKind::Claude | ToolKind::Codex)
             && rt.queue.lock().unwrap().is_empty()
             && !*rt.restart_pending.lock().unwrap();
@@ -474,7 +474,7 @@ impl Hub {
             self.sync_queue(&rt);
             return Ok(());
         }
-        // 先校验、落盘图片，失败时不拉起进程
+        // Validate and save images first, so a failure doesn't start the process
         let (refs, prompt_images) = self.save_images(id, images)?;
         let tx = match self.running_tx(&rt) {
             Some(tx) => tx,
@@ -541,11 +541,11 @@ impl Hub {
         Ok((refs, out))
     }
 
-    /// 读用户消息里的图片
+    /// Read an image from a user message
     pub fn image(&self, sid: &str, image_id: &str) -> Result<Value> {
         use base64::Engine;
         self.get(sid)?;
-        // id 由我们生成（hex + 扩展名），拒绝其他字符防止路径穿越
+        // We generate ids (hex + extension); reject any other characters to prevent path traversal
         let ok = !image_id.is_empty()
             && image_id.chars().all(|c| c.is_ascii_alphanumeric() || c == '.')
             && !image_id.starts_with('.');
@@ -567,7 +567,7 @@ impl Hub {
         }))
     }
 
-    /// 切换模型：记到会话上（重启后也生效），进程在跑就通知工具
+    /// Switch model: recorded on the session (survives restarts), and the tool is told if the process is running
     pub fn set_model(&self, id: &str, model: &str) -> Result<()> {
         let rt = self.get(id)?;
         let info = {
@@ -586,8 +586,8 @@ impl Hub {
         Ok(())
     }
 
-    /// 切换思考等级：记到会话上，进程在跑就通知工具（Claude 立即生效，Codex 下一回合）
-    /// 压缩上下文：各工具都认 /compact（Codex 由适配器转成 thread/compact/start），当普通消息发
+    /// Switch thinking level: recorded on the session, and the tool is told if running (immediate for Claude, next turn for Codex)
+    /// Compact context: every tool understands /compact (the adapter turns it into thread/compact/start for Codex), sent as a normal message
     pub fn compact(self: &Arc<Self>, id: &str) -> Result<()> {
         let info = self.get(id)?.info.lock().unwrap().clone();
         if info.mode == SessionMode::Terminal || info.tool == ToolKind::Shell {
@@ -596,8 +596,8 @@ impl Hub {
         self.send(id, "/compact", vec![], true)
     }
 
-    /// /clear：结束工具进程、删掉聊天记录、用量清零，忘掉工具会话 id，下次发消息时新开一个工具会话。
-    /// Yi Console 会话（id、标题、目录、模型、审批模式、底部终端）不变；回复进行中会直接中断
+    /// /clear: end the tool process, delete the chat history, reset usage and forget the tool session id; the next message starts a new tool session.
+    /// The Yi Console session (id, title, directory, model, permission mode, bottom terminal) stays; a reply in progress is interrupted
     pub async fn clear(self: &Arc<Self>, id: &str) -> Result<()> {
         let rt = self.get(id)?;
         {
@@ -606,7 +606,7 @@ impl Hub {
                 bail!("终端模式请直接在终端里输入 /clear");
             }
         }
-        // 先作废代号，旧进程迟到的事件、退出状态都不再记进会话
+        // Invalidate the generation first, so late events and exit status from the old process are no longer recorded on the session
         let old = rt.cmd.lock().unwrap().take();
         *rt.generation.lock().unwrap() += 1;
         if let Some(tx) = old {
@@ -638,17 +638,17 @@ impl Hub {
         *rt.restart_pending.lock().unwrap() = false;
         self.store.delete_events(id)?;
         self.store.save_session(&info)?;
-        // 对话里的图片、附件只被删掉的记录引用，一起删
+        // Images and attachments in the chat are only referenced by the deleted records, so delete them too
         if safe_sid(id) {
             let _ = std::fs::remove_dir_all(uploads_dir(id));
         }
         self.broadcast_updated(&info);
-        // seq 接着往后编，客户端按这条丢掉之前的事件；重连补拉时也会收到它
+        // seq keeps counting up; clients drop earlier events based on this one, and also receive it in reconnect catch-ups
         self.emit(id, 0, EventBody::Cleared {});
         Ok(())
     }
 
-    /// 停止一个后台任务（目前只有 Claude 支持）
+    /// Stop a background task (only Claude supports this for now)
     pub fn stop_task(&self, id: &str, task_id: &str) -> Result<()> {
         let rt = self.get(id)?;
         if !rt.info.lock().unwrap().background_tasks.iter().any(|t| t.id == task_id) {
@@ -679,7 +679,7 @@ impl Hub {
         Ok(())
     }
 
-    /// 会话可选模型：这次启动时工具报告的，没有就用该工具上次的
+    /// Models available to a session: those the tool reported on this start, otherwise the tool's last list
     pub fn session_models(&self, id: &str) -> Result<Value> {
         let rt = self.get(id)?;
         let info = rt.info.lock().unwrap().clone();
@@ -713,7 +713,7 @@ impl Hub {
         }
     }
 
-    /// 重新拉起已退出的会话（不发消息），用于查看 ACP 工具的历史或重开终端
+    /// Restart an exited session (without sending a message), to view an ACP tool's history or reopen a terminal
     pub fn resume(self: &Arc<Self>, id: &str, cols: u16, rows: u16) -> Result<()> {
         let rt = self.get(id)?;
         if self.running_tx(&rt).is_some() {
@@ -725,8 +725,8 @@ impl Hub {
         self.launch(&rt, spec)
     }
 
-    /// 从工具历史接过来的 ACP 会话（Cursor、Kiro…）第一次 session/load 没成功（比如会话被另一个 Kiro 占着），
-    /// 历史没回放进来，事件里却已经有了出错记录，last_seq 不是 0：这时还得让工具回放
+    /// When an ACP session taken over from tool history (Cursor, Kiro…) failed its first session/load (e.g. the session was held by another Kiro),
+    /// the history was never replayed but the events already contain an error record, so last_seq isn't 0: the tool still needs to replay
     fn history_missing(&self, info: &SessionInfo) -> bool {
         info.mode == SessionMode::Structured
             && !matches!(info.tool, ToolKind::Claude | ToolKind::Codex | ToolKind::Shell)
@@ -734,9 +734,9 @@ impl Hub {
             && self.store.count_user_messages(&info.id).is_ok_and(|n| n == 0)
     }
 
-    /// 在对话模式和终端模式之间切换，接着同一个工具会话。
-    /// 切到终端：记下工具会话里已有几条用户消息，用工具的交互界面 resume；
-    /// 切回对话：只把终端里新聊的导入对话（Claude / Codex 读工具日志，Cursor / Kiro 让工具回放时跳过前面的）
+    /// Switch between chat mode and terminal mode, continuing the same tool session.
+    /// To terminal: record how many user messages the tool session already has, and resume in the tool's interactive UI;
+    /// back to chat: import only what was said in the terminal (Claude / Codex read the tool log; Cursor / Kiro replay and skip the earlier part)
     pub async fn set_mode(self: &Arc<Self>, id: &str, mode: SessionMode) -> Result<()> {
         let rt = self.get(id)?;
         let info = rt.info.lock().unwrap().clone();
@@ -746,22 +746,22 @@ impl Hub {
         if info.mode == mode {
             return Ok(());
         }
-        // 终端里的 Codex / Cursor / Kiro 还没记下工具会话 id 的，先从工具历史里找
+        // Codex / Cursor / Kiro in the terminal that haven't recorded a tool session id yet: look it up in the tool history first
         self.guess_terminal_session(id).await;
-        // 结束当前进程。先作废代号，旧进程退出时的状态、退出码不再记进会话
+        // End the current process. Invalidate the generation first so the old process's exit status and code aren't recorded on the session
         let old = rt.cmd.lock().unwrap().take();
         *rt.generation.lock().unwrap() += 1;
         if let Some(tx) = &old {
             let _ = tx.send(AdapterCmd::Kill);
         }
         if info.mode == SessionMode::Terminal {
-            // 用户主动切走，tmux 里的程序一起结束，等它退出了再接续
+            // Switched away by the user: the program in tmux ends too; continue once it has exited
             if !crate::tmux::kill_and_wait(&crate::tmux::session_name(id)).await {
-                // 没用 tmux：适配器收到 Kill 直接杀进程，留一点收尾时间
+                // No tmux: the adapter kills the process on Kill directly; leave a little time to wrap up
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             }
         } else if let Some(tx) = old {
-            // 等对话模式的工具进程退出，免得两个进程同时写同一个工具会话
+            // Wait for the chat-mode tool process to exit, so two processes don't write the same tool session at once
             for _ in 0..40 {
                 if tx.is_closed() {
                     break;
@@ -789,7 +789,7 @@ impl Hub {
                 self.store.count_user_messages(id)? as usize
             };
             info.synced_users = Some(users as u32);
-            // 没说过话的会话工具那边可能还没有记录，resume 会失败；Claude 由 spec_for 用 --session-id 处理
+            // A session where nothing was said may have no record on the tool side, and resume would fail; for Claude, spec_for handles it with --session-id
             if users == 0 && !offline {
                 info.external_id = None;
             }
@@ -798,7 +798,7 @@ impl Hub {
             if crate::history::pins_session_id(tool)
                 && info.external_id.as_deref().is_some_and(|e| !crate::history::tool_session_exists(tool, e))
             {
-                // 终端里开了 Claude 但没说话，没有可接的会话
+                // Claude was opened in the terminal but nothing was said, so there's no session to continue
                 info.external_id = None;
             }
             if offline {
@@ -814,7 +814,7 @@ impl Hub {
         info.permission_mode = info
             .permission_mode
             .filter(|m| permission_modes(tool, mode).contains(&m.as_str()));
-        // 置成已退出，launch 报 Starting 时一定会广播新的会话信息
+        // Mark it exited, so launch is sure to broadcast the new session info when it reports Starting
         info.status = SessionStatus::Exited;
         info.pending_permissions = 0;
         info.queued.clear();
@@ -832,15 +832,15 @@ impl Hub {
         for ev in import {
             self.emit(id, 0, ev);
         }
-        // Cursor / Kiro 读不了离线历史，让工具 session/load 回放，跳过对话里已经有的
+        // Cursor / Kiro can't read history offline; have the tool replay via session/load and skip what's already in the chat
         let replay = mode == SessionMode::Structured && !offline && info.external_id.is_some();
         let mut spec = self.spec_for(&info, replay, 120, 32)?;
         spec.replay_skip = skip;
-        // 终端模式由 start_when_sized 等前端报上尺寸再起进程
+        // In terminal mode, start_when_sized waits for the frontend to report its size before starting the process
         self.launch(&rt, spec)
     }
 
-    /// 把排队列表同步到会话信息上，客户端据此显示
+    /// Sync the queue onto the session info so clients can show it
     fn sync_queue(&self, rt: &SessionRt) {
         let list: Vec<QueuedMessage> = rt
             .queue
@@ -864,7 +864,7 @@ impl Hub {
         self.broadcast_updated(&info);
     }
 
-    /// 排队消息：remove 撤回（返回内容，客户端放回输入框）；sendNow 中断当前回合并马上发它
+    /// Queued messages: remove recalls one (returns the content; the client puts it back in the input box); sendNow interrupts the current turn and sends it immediately
     pub fn queue_action(self: &Arc<Self>, id: &str, qid: &str, action: &str) -> Result<Value> {
         let rt = self.get(id)?;
         let item = {
@@ -897,7 +897,7 @@ impl Hub {
         Ok(json!({ "text": text }))
     }
 
-    /// 回合结束：需要的话先重启进程（换审批模式），再发排队的下一条
+    /// Turn ended: restart the process first if needed (permission mode change), then send the next queued message
     fn after_turn(self: &Arc<Self>, sid: &str, gen: u64, stop_reason: Option<&str>) {
         let Some(rt) = self.alive(sid, gen) else {
             return;
@@ -924,7 +924,7 @@ impl Hub {
         }
     }
 
-    /// 结束当前进程，按会话现在的设置重新拉起（接着同一个工具会话）
+    /// End the current process and start it again with the session's current settings (continuing the same tool session)
     fn relaunch(self: &Arc<Self>, rt: &Arc<SessionRt>) -> Result<()> {
         if let Some(tx) = self.running_tx(rt) {
             let _ = tx.send(AdapterCmd::Kill);
@@ -941,7 +941,7 @@ impl Hub {
         tx.send(AdapterCmd::Interrupt).map_err(|_| anyhow!("会话已结束"))
     }
 
-    /// 切换审批模式：记到会话上（恢复时沿用），进程在跑就让工具马上换
+    /// Switch permission mode: recorded on the session (kept on resume), and the tool switches right away if running
     pub fn set_permission_mode(self: &Arc<Self>, id: &str, mode: &str) -> Result<()> {
         let rt = self.get(id)?;
         let info = {
@@ -960,7 +960,7 @@ impl Hub {
         let Some(tx) = self.running_tx(&rt) else {
             return Ok(());
         };
-        // Claude 只有启动时带了跳过审批的参数，才能切到全部放行，所以要重启进程
+        // Claude can only switch to allow-all if it was started with the skip-permissions flag, so the process must restart
         let launched = rt.launched_mode.lock().unwrap().clone();
         if info.tool == ToolKind::Claude && mode == "bypass" && launched != "bypass" {
             let busy = matches!(info.status, SessionStatus::Running | SessionStatus::WaitingPermission);
@@ -976,7 +976,7 @@ impl Hub {
         Ok(())
     }
 
-    /// 全局搜索：消息正文里包含 q 的，带上会话标题和命中处前后一段
+    /// Global search: messages whose text contains q, with the session title and some context around the match
     pub fn search(&self, q: &str, limit: usize) -> Result<Value> {
         let hits = self.store.search(q, limit)?;
         let sessions = self.sessions.lock().unwrap();
@@ -1012,7 +1012,7 @@ impl Hub {
         Ok(())
     }
 
-    /// 斜杠命令：这次启动时工具报告的，没有就用该工具上次的
+    /// Slash commands: those the tool reported on this start, otherwise the tool's last list
     pub fn session_commands(&self, id: &str) -> Result<Vec<SlashCommand>> {
         let rt = self.get(id)?;
         let tool = rt.info.lock().unwrap().tool;
@@ -1035,7 +1035,7 @@ impl Hub {
         tx.send(cmd).map_err(|_| anyhow!("会话已结束"))
     }
 
-    /// 守护进程重启后，tmux 里还活着的终端会话直接接上
+    /// After a daemon restart, reattach terminal sessions still alive in tmux
     pub fn reattach_terminals(self: &Arc<Self>) {
         let ids: Vec<String> = self
             .sessions
@@ -1057,7 +1057,7 @@ impl Hub {
         }
     }
 
-    /// 对话模式下正开着工具进程的会话（终端模式、shell 不算：里面可能有用户自己开的程序）
+    /// Sessions with a tool process open in chat mode (terminal mode and shells don't count: they may contain programs the user started)
     fn live_structured(&self) -> Vec<(Arc<SessionRt>, SessionInfo)> {
         let list: Vec<Arc<SessionRt>> = self.sessions.lock().unwrap().values().cloned().collect();
         list.into_iter()
@@ -1070,9 +1070,9 @@ impl Hub {
             .collect()
     }
 
-    /// 能不能结束这个进程而不丢东西：没在回复、没有排队的消息、没有后台任务。
-    /// 闲着的要有工具会话 id（下次才接得回去）；出错的结束了也没损失；
-    /// `waiting` 时等审批的也算（审批作废，下次发消息重新来）
+    /// Whether this process can be ended without losing anything: not replying, no queued messages, no background tasks.
+    /// Idle ones need a tool session id (to reconnect later); errored ones lose nothing by ending;
+    /// with `waiting`, those awaiting approval count too (the approval is voided and redone on the next message)
     fn releasable(rt: &SessionRt, info: &SessionInfo, waiting: bool) -> bool {
         if !rt.queue.lock().unwrap().is_empty() || !info.background_tasks.is_empty() {
             return false;
@@ -1085,8 +1085,8 @@ impl Hub {
         }
     }
 
-    /// 结束闲置太久的工具进程（每个约占 100~250MB 内存），会话记录和工具会话 id 都在，
-    /// 下次发消息时 send 会自动接着原来的会话拉起。等审批太久的、出错后没退出的也一并结束
+    /// End tool processes idle for too long (each takes about 100–250MB of memory); the session log and tool session id remain,
+    /// and send restarts the original session automatically on the next message. Processes waiting too long for approval, or errored but not exited, are ended too
     pub fn release_idle(&self) {
         let minutes = self
             .settings
@@ -1109,8 +1109,8 @@ impl Hub {
         }
     }
 
-    /// 要给 `id` 拉起对话模式的工具进程前，保证同时开着的不超过上限：
-    /// 超出时按最久没动静的顺序结束空闲进程。都在忙时只能先超出，等它们闲下来再回收
+    /// Before starting a chat-mode tool process for `id`, make sure the number open at once stays within the limit:
+    /// when over, end idle processes in order of least recent activity. If all are busy, go over for now and reclaim once they're idle
     fn make_room(&self, id: &str) {
         let max = self
             .settings
@@ -1145,9 +1145,9 @@ impl Hub {
     }
 
     pub fn delete(&self, id: &str) -> Result<()> {
-        // id 来自客户端，后面要拼进路径做 remove_dir_all：只处理确实存在的会话
+        // The id comes from the client and is later used in a path for remove_dir_all: only handle sessions that really exist
         self.get(id)?;
-        // 先删底部终端面板里属于它的终端
+        // First delete its terminals in the bottom terminal panel
         let kids: Vec<String> = self
             .sessions
             .lock()
@@ -1162,7 +1162,7 @@ impl Hub {
             let _ = self.delete(&k);
         }
         let _ = self.kill(id);
-        // 进程没在跑（比如守护进程刚重启还没接上）时，tmux 里的会话也要清掉
+        // When the process isn't running (e.g. the daemon just restarted and hasn't reattached), the tmux session must be cleaned up too
         crate::tmux::kill(&crate::tmux::session_name(id));
         self.sessions.lock().unwrap().remove(id);
         self.store.delete_session(id)?;
@@ -1177,7 +1177,7 @@ impl Hub {
         Ok(())
     }
 
-    /// 记下工具自己的会话 id（终端模式重启时据此恢复）
+    /// Record the tool's own session id (used to resume when terminal mode restarts)
     pub fn set_external_id(&self, id: &str, ext: &str) {
         let Ok(rt) = self.get(id) else { return };
         let info = {
@@ -1189,8 +1189,8 @@ impl Hub {
         self.broadcast_updated(&info);
     }
 
-    /// 终端模式的 Codex / Cursor / Kiro 重启前：没记下工具会话 id 的，从工具的历史会话里找
-    /// 同一目录、在这个会话创建之后用过、还没被别的会话占用的最新一个，找到就记下来，重启时接着它
+    /// Before restarting Codex / Cursor / Kiro in terminal mode: if no tool session id was recorded, look in the tool's history sessions
+    /// for the newest one in the same directory, used after this session was created and not claimed by another session; record it and continue it on restart
     pub async fn guess_terminal_session(&self, id: &str) {
         let Ok(rt) = self.get(id) else { return };
         let info = rt.info.lock().unwrap().clone();
@@ -1238,7 +1238,7 @@ impl Hub {
         self.store.events_since(id, since, 20_000)
     }
 
-    /// 最近的 limit 条（before 为空）或 before 之前的 limit 条，打开长会话时不用一次传完
+    /// The latest limit events (before empty) or the limit events before before, so long sessions don't have to be sent all at once on open
     pub fn backlog_tail(&self, id: &str, before: Option<i64>, limit: usize) -> Result<(Vec<Event>, bool)> {
         self.get(id)?;
         self.store.events_tail(id, before, limit.clamp(1, 20_000))
@@ -1273,7 +1273,7 @@ impl Hub {
         (cur == gen || gen == 0).then_some(rt)
     }
 
-    /// 编号、更新会话状态、落库、广播。gen=0 表示由 hub 自己发出（不校验代号）
+    /// Number, update session state, persist, broadcast. gen=0 means emitted by the hub itself (generation not checked)
     pub fn emit(&self, sid: &str, gen: u64, mut body: EventBody) {
         let Some(rt) = self.alive(sid, gen) else {
             return;
@@ -1393,7 +1393,7 @@ impl Hub {
         if changed {
             self.broadcast_updated(&info);
         }
-        // 应用内通知：由客户端按自己的偏好决定弹不弹
+        // In-app notifications: the client decides whether to show them based on its own preferences
         if let Some((title, body)) = notify {
             self.publish(
                 None,
@@ -1440,7 +1440,7 @@ impl Hub {
         );
     }
 
-    /// adapter 退出：清掉挂起的审批，标记 exited
+    /// Adapter exited: clear pending approvals and mark exited
     fn exited(&self, sid: &str, gen: u64, message: Option<String>) {
         let Some(rt) = self.alive(sid, gen) else {
             return;
@@ -1457,7 +1457,7 @@ impl Hub {
                 },
             );
         }
-        // 进程没了，后台任务也跟着没了
+        // The process is gone, and so are its background tasks
         self.set_info(sid, gen, |i| !std::mem::take(&mut i.background_tasks).is_empty());
         let failed = message.is_some();
         if let Some(m) = &message {
@@ -1475,7 +1475,7 @@ impl Hub {
                 message,
             },
         );
-        // 失败也允许再次发送消息触发重启，所以 Error 之后统一落到 Exited 语义上由 send 处理
+        // A failure still allows sending another message to trigger a restart, so after Error everything falls back to Exited semantics, handled by send
         *rt.cmd.lock().unwrap() = None;
     }
 }
@@ -1484,7 +1484,7 @@ fn count_users(evs: &[EventBody]) -> usize {
     evs.iter().filter(|e| matches!(e, EventBody::UserMessage { .. })).count()
 }
 
-/// 跳过前 skip 条用户消息（连同它们的回复），返回之后的事件
+/// Skip the first skip user messages (with their replies) and return the events after them
 fn after_users(evs: Vec<EventBody>, skip: usize) -> Vec<EventBody> {
     let mut seen = 0;
     evs.into_iter()
@@ -1497,12 +1497,12 @@ fn after_users(evs: Vec<EventBody>, skip: usize) -> Vec<EventBody> {
         .collect()
 }
 
-/// 命中处前后各取 ctx 个字符，压成一行
+/// Take ctx characters on each side of the match and flatten into one line
 fn around(text: &str, q: &str, ctx: usize) -> String {
     let one: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
     let lower = one.to_lowercase();
     let chars: Vec<char> = one.chars().collect();
-    // to_lowercase 可能改变字节长度，按字符位置换算
+    // to_lowercase may change byte lengths, so convert by character position
     let pos = lower
         .find(&q.to_lowercase())
         .map(|b| lower[..b].chars().count())
@@ -1519,7 +1519,7 @@ fn around(text: &str, q: &str, ctx: usize) -> String {
     s
 }
 
-/// 通知正文：去掉 Markdown 记号、压成一行，截到 max 个字符
+/// Notification body: strip Markdown markup, flatten into one line, truncate to max characters
 fn snippet(text: &str, max: usize) -> String {
     let one: String = text
         .lines()
@@ -1562,7 +1562,7 @@ fn new_rt(info: SessionInfo) -> SessionRt {
     }
 }
 
-/// adapter 往 hub 报告事件用的句柄
+/// Handle adapters use to report events to the hub
 #[derive(Clone)]
 pub struct Emitter {
     hub: Arc<Hub>,
@@ -1582,7 +1582,7 @@ impl Emitter {
         }
     }
 
-    /// 工具报告的斜杠命令
+    /// Slash commands reported by the tool
     pub fn commands(&self, list: Vec<SlashCommand>) {
         let Some(rt) = self.hub.alive(&self.sid, self.gen) else {
             return;
@@ -1598,8 +1598,8 @@ impl Emitter {
         *rt.commands.lock().unwrap() = list;
     }
 
-    /// 工具自己换了审批模式（比如 Claude 规划完退出 plan）。
-    /// 认不出的模式也照实记下，界面显示原名，免得和工具实际状态对不上
+    /// The tool changed its permission mode itself (e.g. Claude leaving plan after planning).
+    /// Unrecognized modes are recorded as is and the UI shows the raw name, so it never disagrees with the tool's actual state
     pub fn permission_mode(&self, mode: &str) {
         let m = mode.to_string();
         if m.is_empty() {
@@ -1640,7 +1640,7 @@ impl Emitter {
         });
     }
 
-    /// 工具报告的可选模型
+    /// Models the tool reported
     pub fn models(&self, models: Vec<ModelOption>) {
         let Some(rt) = self.hub.alive(&self.sid, self.gen) else {
             return;
@@ -1650,7 +1650,7 @@ impl Emitter {
         *rt.models.lock().unwrap() = models;
     }
 
-    /// 上下文占用百分比
+    /// Context usage percentage
     pub fn context(&self, percent: f64) {
         let p = (percent.clamp(0.0, 100.0) * 10.0).round() / 10.0;
         self.hub.set_info(&self.sid, self.gen, |i| {
@@ -1724,7 +1724,7 @@ mod tests {
         }
     }
 
-    /// 往 hub 里塞一个"正开着进程"的会话，返回能看到它收到什么命令的接收端
+    /// Insert a session with a "running process" into the hub; returns a receiver showing which commands it gets
     fn live(hub: &Hub, id: &str, mode: SessionMode, status: SessionStatus, updated_at: i64) -> mpsc::UnboundedReceiver<AdapterCmd> {
         let info = SessionInfo {
             id: id.into(),
@@ -1772,12 +1772,12 @@ mod tests {
         let mut busy = live(&hub, "busy", Structured, Running, 0);
         let mut asking = live(&hub, "asking", Structured, WaitingPermission, 0);
         let mut term = live(&hub, "term", Terminal, Idle, 0);
-        // 对话模式开着 4 个，再开 1 个要降到 2 个：两个闲着的都得停，忙的、等审批的、终端不动
+        // 4 open in chat mode, and opening 1 more must bring it down to 2: both idle ones must stop; busy, awaiting-approval and terminal ones are left alone
         hub.make_room("new");
         assert!(killed(&mut old) && killed(&mut newer));
         assert!(!killed(&mut busy) && !killed(&mut asking) && !killed(&mut term));
 
-        // 只超 1 个时只停最久没用的那个
+        // When only 1 over, stop only the least recently used one
         let hub = Hub::new(
             crate::store::Store::open_memory().unwrap(),
             DaemonSettings { max_live_processes: Some(3), ..Default::default() },
@@ -1787,12 +1787,12 @@ mod tests {
         let mut c = live(&hub, "c", Structured, Idle, 3);
         hub.make_room("new");
         assert!(killed(&mut a) && !killed(&mut b) && !killed(&mut c));
-        // 给已开着的会话重启进程，不算新增
+        // Restarting the process of an already open session doesn't count as a new one
         let mut c2 = live(&hub, "c", Structured, Idle, 3);
         hub.make_room("c");
         assert!(!killed(&mut c2));
 
-        // 0 表示不限
+        // 0 means unlimited
         let hub = Hub::new(
             crate::store::Store::open_memory().unwrap(),
             DaemonSettings { max_live_processes: Some(0), ..Default::default() },
@@ -1846,7 +1846,7 @@ mod attach_tests {
         assert!(a.ends_with("my_notes.txt") && a.contains("files"), "{a}");
         assert!(b.ends_with("my_notes (1).txt"), "{b}");
         assert_eq!(std::fs::read_to_string(&a).unwrap(), "hi");
-        // 分块上传：后续块接在末尾；目录外的文件、不存在的文件都不行
+        // Chunked upload: later chunks append to the end; files outside the directory or nonexistent files are refused
         super::attach_append("s1", &a, "IHRoZXJl").unwrap();
         assert_eq!(std::fs::read_to_string(&a).unwrap(), "hi there");
         let outside = home.join("x.txt");

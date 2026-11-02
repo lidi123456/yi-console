@@ -1,13 +1,13 @@
-// 代码大纲：按扩展名用正则从源码里找函数、类、标题等，不依赖语法树
-// （语言包是懒加载的，大文件也只解析到可见的部分，正则更可预期）
+// Code outline: find functions, classes, headings, etc. in source with per-extension regexes, without a syntax tree
+// (language packs are lazy-loaded and large files are only parsed up to the visible part, so regexes are more predictable)
 
 export interface Symbol {
   name: string;
   /** function / class / type / heading / ... */
   kind: string;
-  /** 从 1 开始 */
+  /** 1-based */
   line: number;
-  /** 缩进层级（标题按 # 个数） */
+  /** Indent level (headings use the number of #) */
   depth: number;
 }
 
@@ -105,7 +105,7 @@ export function outline(filename: string, text: string): Symbol[] {
   let block = false;
   for (let i = 0; i < lines.length && out.length < 2000; i++) {
     const l = lines[i];
-    // 跳过块注释里的内容
+    // Skip content inside block comments
     if (block) {
       if (l.includes('*/')) block = false;
       continue;

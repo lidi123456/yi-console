@@ -44,6 +44,6 @@
       "resources/yi-agentd/": "yi-agentd-dist/"
     },
     "category": "DeveloperTool",
-    "shortDescription": "统一管理多个 AI 编程工具的会话"
+    "shortDescription": "Use and manage all your AI coding tools in one place"
   }
 }

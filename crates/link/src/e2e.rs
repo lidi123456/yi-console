@@ -1,10 +1,10 @@
-//! 端到端加密：Noise IK（配对时 IKpsk1），实现用 snow。
+//! End-to-end encryption: Noise IK (IKpsk1 when pairing), implemented with snow.
 //!
-//! - 客户端事先知道设备的 Noise 静态公钥（配对二维码里的 `apk`），第一条消息就带上自己的静态公钥（加密的），
-//!   一个往返完成双向认证；双方各自的临时密钥保证前向保密。
-//! - 配对时多混入一个由一次性配对码派生的 psk（放在第一条消息末尾），yi-agentd 读第一条消息时就能确认
-//!   对方确实拿到了二维码，确认之后才把它加进已配对列表。
-//! - 握手完成后每个 WebSocket 二进制帧是一条 Noise 传输消息，nonce 递增，篡改、重放、调换顺序都会解密失败。
+//! - The client knows the device's Noise static public key in advance (`apk` in the pairing QR code) and sends its own static key (encrypted) in the first message,
+//!   so mutual authentication completes in one round trip; each side's ephemeral keys provide forward secrecy.
+//! - When pairing, a psk derived from the one-time pairing code is mixed in (at the end of the first message), so yi-agentd can confirm on reading the first message
+//!   that the peer really has the QR code, and only then adds it to the paired list.
+//! - After the handshake, each WebSocket binary frame is one Noise transport message with an incrementing nonce; tampering, replay or reordering all fail to decrypt.
 
 use crate::auth::{self, psk_of, ticket_of};
 use crate::wire::{login, AgentLink, OpenReq};
@@ -21,21 +21,21 @@ use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 const IK: &str = "Noise_IK_25519_ChaChaPoly_SHA256";
 const IK_PSK: &str = "Noise_IKpsk1_25519_ChaChaPoly_SHA256";
 const PROLOGUE: &[u8] = b"yi-console e2e v2";
-/// Noise 单条消息上限 65535 字节（含 16 字节认证标签）
+/// A single Noise message is at most 65535 bytes (including the 16-byte auth tag)
 const MAX_MSG: usize = 65535;
 const CHUNK: usize = 60 * 1024;
 
 pub trait WsLike: Stream<Item = Result<Message, WsError>> + Sink<Message, Error = WsError> + Unpin + Send + 'static {}
 impl<T> WsLike for T where T: Stream<Item = Result<Message, WsError>> + Sink<Message, Error = WsError> + Unpin + Send + 'static {}
 
-/// 客户端在握手第一条消息里报给 yi-agentd 的信息
+/// What the client reports to yi-agentd in the first handshake message
 #[derive(Debug, Clone)]
 pub struct Hello {
-    /// 客户端的名字（只有配对时有意义）
+    /// Client name (only meaningful when pairing)
     pub name: String,
-    /// 客户端的签名公钥，应与中继报告的一致
+    /// Client signing public key; should match what the relay reports
     pub sign_pub: [u8; 32],
-    /// 客户端的 Noise 静态公钥（握手里认证过的）
+    /// Client Noise static public key (authenticated in the handshake)
     pub noise_pub: [u8; 32],
 }
 
@@ -43,7 +43,7 @@ fn prologue(device: &str) -> Vec<u8> {
     [PROLOGUE, device.as_bytes()].concat()
 }
 
-/// 握手阶段的下一帧。yi-agentd 拒绝时会发一条文本 `{"error":..}` 再断开
+/// The next frame during the handshake. When yi-agentd refuses, it sends a text `{"error":..}` and disconnects
 async fn next_frame<S: WsLike>(ws: &mut S) -> Result<Vec<u8>> {
     loop {
         match ws.next().await {
@@ -161,8 +161,8 @@ async fn stopped(rx: &mut Option<watch::Receiver<bool>>) {
     }
 }
 
-/// 把加密的 WebSocket 变成明文字节流（DuplexStream），后台任务负责加解密。
-/// `stop` 置为 true 时断开（吊销客户端用）。
+/// Turn an encrypted WebSocket into a plaintext byte stream (DuplexStream); a background task handles encryption and decryption.
+/// Disconnects when `stop` is set to true (used to revoke clients).
 fn pump<S: WsLike>(ws: S, ts: snow::TransportState, stop: Option<watch::Receiver<bool>>) -> DuplexStream {
     let ts = Arc::new(Mutex::new(ts));
     let (ours, theirs) = tokio::io::duplex(256 * 1024);
@@ -170,7 +170,7 @@ fn pump<S: WsLike>(ws: S, ts: snow::TransportState, stop: Option<watch::Receiver
     let (mut rd, mut wr) = tokio::io::split(ours);
     let (ts1, mut stop1) = (ts.clone(), stop.clone());
     tokio::spawn(async move {
-        // 明文 -> 密文帧，同时定时 ping 保活（手机网络 NAT 超时短）
+        // Plaintext -> ciphertext frames, with periodic pings as keepalive (mobile network NAT timeouts are short)
         let mut buf = vec![0u8; CHUNK];
         let mut out = vec![0u8; MAX_MSG];
         let mut ping = tokio::time::interval(Duration::from_secs(20));
@@ -217,18 +217,18 @@ fn pump<S: WsLike>(ws: S, ts: snow::TransportState, stop: Option<watch::Receiver
     theirs
 }
 
-// ---------------- 对外接口 ----------------
+// ---------------- Public API ----------------
 
-/// 客户端：经中继连到已配对的设备，返回明文字节流
+/// Client: connect through the relay to a paired device; returns a plaintext byte stream
 pub async fn client_connect(c: &Credential) -> Result<DuplexStream> {
     let mut ws = login(&c.relay, "/v1/client", &c.fp, &c.me, auth::ROLE_CLIENT, &c.device, json!({})).await?;
     let ts = initiate(&mut ws, &c.me, &c.apk, &c.device, "", None).await?;
     Ok(pump(ws, ts, None))
 }
 
-/// 客户端：用配对二维码完成配对，返回要保存的凭据。`my_name` 显示在电脑的已配对列表里
-/// `me` 是这台设备以前和同一台电脑配对时用的身份：沿用它，电脑那边按客户端 id 覆盖旧记录，不会多出一条；
-/// 没配对过时传 None，生成新的
+/// Client: complete pairing using the pairing QR code; returns the credentials to save. `my_name` is shown in the computer's paired list
+/// `me` is the identity this device used when it previously paired with the same computer: reusing it lets the computer overwrite the old record by client id instead of adding another;
+/// pass None if never paired, and a new one is generated
 pub async fn client_pair(o: &PairOffer, my_name: &str, me: Option<Identity>) -> Result<Credential> {
     let me = me.unwrap_or_else(Identity::generate);
     let extra = json!({"ticket": b64(&ticket_of(&o.code))});
@@ -246,8 +246,8 @@ pub async fn client_pair(o: &PairOffer, my_name: &str, me: Option<Identity>) -> 
     Ok(Credential { relay: o.relay.clone(), fp: o.fp.clone(), device: o.device.clone(), apk: o.apk, name: o.name.clone(), me })
 }
 
-/// yi-agentd：响应一次 open，建立数据流并完成握手。
-/// `psk` 是配对码派生的（配对连接时），`authorize` 在读完客户端第一条消息后调用，返回错误就拒绝。
+/// yi-agentd: answer one open, set up the stream and complete the handshake.
+/// `psk` is derived from the pairing code (for pairing connections); `authorize` is called after reading the client's first message, and returning an error refuses it.
 pub async fn agent_accept<F>(
     a: &AgentLink,
     req: &OpenReq,
@@ -315,7 +315,7 @@ mod tests {
         let mut buf = [0u8; 11];
         b.read_exact(&mut buf).await.unwrap();
         assert_eq!(&buf, b"hello agent");
-        // 大于一个分块的数据
+        // Data larger than one chunk
         let big = vec![7u8; 200 * 1024];
         let big2 = big.clone();
         tokio::spawn(async move { b.write_all(&big2).await.unwrap() });
@@ -346,7 +346,7 @@ mod tests {
         let code = crate::random_bytes::<32>();
         let (cr, sr, _, _) = run(&cl, ag.noise_pub(), &ag, Some(psk_of(&code)), Some(psk_of(&code)), true).await;
         assert!(cr.is_ok() && sr.is_ok());
-        // psk 不对时，yi-agentd 读第一条消息就失败，authorize 不会被调用
+        // With a wrong psk, yi-agentd fails on reading the first message and authorize is never called
         let wrong = crate::random_bytes::<32>();
         let (cr, sr, _, _) = run(&cl, ag.noise_pub(), &ag, Some(psk_of(&wrong)), Some(psk_of(&code)), true).await;
         assert!(sr.is_err());

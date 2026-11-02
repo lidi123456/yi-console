@@ -1,4 +1,4 @@
-//! SQLite 持久化：会话元信息、事件日志、用量流水。
+//! SQLite persistence: session metadata, event log, usage records.
 
 use anyhow::Result;
 use yi_proto::{Event, EventBody, SessionInfo, Usage};
@@ -54,7 +54,7 @@ impl Store {
         })
     }
 
-    /// 在用户消息和助手回复里找包含 q 的（不区分大小写），新的在前
+    /// Find user messages and assistant replies containing q (case-insensitive), newest first
     pub fn search(&self, q: &str, limit: usize) -> Result<Vec<(String, i64, i64, EventBody)>> {
         let c = self.conn.lock().unwrap();
         let pat = format!("%{}%", q.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_"));
@@ -72,7 +72,7 @@ impl Store {
         for r in rows {
             let (sid, seq, ts, body) = r?;
             let Ok(b) = serde_json::from_str::<EventBody>(&body) else { continue };
-            // LIKE 匹配的是 JSON 原文，可能命中转义字符或字段名，再按正文确认一次
+            // LIKE matches the raw JSON and may hit escape sequences or field names, so confirm against the text again
             let text = match &b {
                 EventBody::UserMessage { text, .. } | EventBody::AssistantText { text, .. } => text,
                 _ => continue,
@@ -118,7 +118,7 @@ impl Store {
         Ok(())
     }
 
-    /// 删掉会话的全部事件（/clear），会话本身保留
+    /// Delete all of a session's events (/clear); the session itself is kept
     pub fn delete_events(&self, id: &str) -> Result<()> {
         let c = self.conn.lock().unwrap();
         c.execute("DELETE FROM events WHERE session_id = ?1", params![id])?;
@@ -134,7 +134,7 @@ impl Store {
         Ok(())
     }
 
-    /// 取 seq > since 的事件，最多 limit 条（按 seq 升序）
+    /// Events with seq > since, at most limit (ascending by seq)
     pub fn events_since(&self, session_id: &str, since: i64, limit: usize) -> Result<Vec<Event>> {
         let c = self.conn.lock().unwrap();
         let mut st = c.prepare(
@@ -154,7 +154,7 @@ impl Store {
         Ok(out)
     }
 
-    /// 取 seq < before 的最后 limit 条事件（按 seq 升序），以及更早是否还有。before=None 表示取最新的
+    /// The last limit events with seq < before (ascending by seq), and whether there are older ones. before=None means the latest
     pub fn events_tail(
         &self,
         session_id: &str,
@@ -184,7 +184,7 @@ impl Store {
         Ok((out, more))
     }
 
-    /// 会话里记下的用户消息条数
+    /// Number of user messages recorded in the session
     pub fn count_user_messages(&self, session_id: &str) -> Result<u32> {
         let c = self.conn.lock().unwrap();
         let n: i64 = c.query_row(
@@ -227,7 +227,7 @@ impl Store {
         Ok(())
     }
 
-    /// 返回 (ts, tool, usage) 流水，供统计按天聚合
+    /// Returns (ts, tool, usage) records for daily aggregation in stats
     pub fn usage_rows(&self, since_ms: i64) -> Result<Vec<(i64, String, Usage)>> {
         let c = self.conn.lock().unwrap();
         let mut st = c.prepare(
@@ -297,7 +297,7 @@ mod tests {
         assert!(s.events_since("a", 0, 100).unwrap().is_empty());
         assert_eq!(s.events_since("b", 0, 100).unwrap().len(), 1);
         assert_eq!(s.load_sessions().unwrap().len(), 2);
-        // 清空标记接着原来的 seq 编号，客户端据此丢掉之前的
+        // The clear marker continues the existing seq numbering; clients drop earlier events based on it
         s.append_event("a", &Event { seq: 3, ts: 3, body: EventBody::Cleared {} }).unwrap();
         let ev = s.events_since("a", 0, 100).unwrap();
         assert_eq!(ev.len(), 1);

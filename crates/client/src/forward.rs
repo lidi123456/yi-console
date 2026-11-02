@@ -1,8 +1,8 @@
-//! 端口转发（客户端这一端）：在本机 127.0.0.1 上开一个端口，每来一条连接，就经主机的连接通道
-//! 接到主机上的 127.0.0.1:port。通道怎么开由 `ClientHub::open_port` 决定（SSH 用 direct-tcpip，
-//! 中继和经电脑转发的主机新开一条连接发 `port.connect`）。
+//! Port forwarding (client side): open a port on local 127.0.0.1, and for each incoming connection, go through the host's connection channel
+//! to 127.0.0.1:port on the host. How the channel is opened is up to `ClientHub::open_port` (SSH uses direct-tcpip;
+//! relay hosts and hosts forwarded through a computer open a new connection and send `port.connect`).
 //!
-//! 只监听回环地址，别的机器连不进来。
+//! Only listens on loopback, so other machines can't connect.
 
 use anyhow::{Context, Result};
 use serde::Serialize;
@@ -21,15 +21,15 @@ pub type Opener = Arc<dyn Fn() -> Pin<Box<dyn Future<Output = Result<(BoxR, BoxW
 #[serde(rename_all = "camelCase")]
 pub struct ForwardInfo {
     pub host_id: String,
-    /// 主机上的端口
+    /// Port on the host
     pub port: u16,
-    /// 本机监听的端口
+    /// Port listening on this machine
     pub local_port: u16,
-    /// 本机主机不用转发，直接就是那个端口
+    /// The local host needs no forwarding; it's just that port
     pub direct: bool,
-    /// 当前打开的连接数
+    /// Number of currently open connections
     pub conns: usize,
-    /// 最近一次连接失败的原因（比如主机上那个端口没在监听）
+    /// Reason for the last failed connection (e.g. nothing listening on that port on the host)
     pub error: Option<String>,
     pub label: Option<String>,
 }
@@ -38,7 +38,7 @@ pub struct Forward {
     pub info: std::sync::Mutex<ForwardInfo>,
     conns: Arc<AtomicUsize>,
     task: Option<tokio::task::JoinHandle<()>>,
-    /// 停止转发时连带断开已经打开的连接
+    /// Stopping the forward also closes connections already open
     stop: Option<tokio::sync::watch::Sender<bool>>,
 }
 
@@ -61,7 +61,7 @@ impl Drop for Forward {
     }
 }
 
-/// 本机主机：端口本来就在本机，不开监听
+/// Local host: the port is already on this machine, so don't listen
 pub fn direct(host_id: &str, port: u16, label: Option<String>) -> Forward {
     Forward {
         info: std::sync::Mutex::new(ForwardInfo {
@@ -79,7 +79,7 @@ pub fn direct(host_id: &str, port: u16, label: Option<String>) -> Forward {
     }
 }
 
-/// 开本地监听。先试和主机上相同的端口号（地址好记，前端开发服务器的回调地址也对得上），被占了再随便选一个
+/// Start the local listener. Try the same port number as on the host first (easy to remember, and dev-server callback URLs still match); if taken, pick any
 pub async fn start(host_id: &str, port: u16, local: Option<u16>, label: Option<String>, open: Opener) -> Result<Arc<Forward>> {
     let l = match local {
         Some(p) => TcpListener::bind(("127.0.0.1", p)).await.with_context(|| format!("本机 {p} 端口已被占用"))?,
@@ -136,7 +136,7 @@ pub async fn start(host_id: &str, port: u16, local: Option<u16>, label: Option<S
 async fn pipe(tcp: tokio::net::TcpStream, open: Opener) -> Result<()> {
     let (mut rr, mut rw) = open().await?;
     let (mut tr, mut tw) = tcp.into_split();
-    // 任一方向结束就关掉另一边的写端，让对方知道
+    // When either direction ends, close the other side's write half so the peer knows
     let up = async {
         let _ = tokio::io::copy(&mut tr, &mut rw).await;
         let _ = rw.shutdown().await;
@@ -156,7 +156,7 @@ mod tests {
 
     #[tokio::test]
     async fn forwards_bytes() {
-        // 「主机上」的服务：回显
+        // The service "on the host": echo
         let srv = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let sp = srv.local_addr().unwrap().port();
         tokio::spawn(async move {

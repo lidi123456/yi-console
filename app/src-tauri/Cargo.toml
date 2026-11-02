@@ -2,7 +2,7 @@
 name = "yi-console"
 version = "0.1.0"
 edition = "2021"
-description = "Yi Console 桌面 / Android 客户端"
+description = "Yi Console desktop / Android client"
 license = "MIT"
 
 [lib]
@@ -11,30 +11,30 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
-# build.rs 往 Android 清单里加相机权限（和 tauri-build 用同一个 feature，不多拉依赖）
+# build.rs adds the camera permission to the Android manifest (same feature as tauri-build, no extra dependencies)
 tauri-utils = { version = "2", features = ["build-2"] }
 
 [dependencies]
 tauri = { version = "2", features = [] }
-# 2.8 起桌面端点击通知才会回报给 onAction
+# Since 2.8, clicking a notification on desktop is reported to onAction
 tauri-plugin-notification = "2.8"
 tauri-plugin-clipboard-manager = "2"
 serde_json = "1"
 base64 = "0.22"
 yi-client = { path = "../../crates/client" }
 
-# 另存为用系统的保存对话框
+# "Save as" uses the system save dialog
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 tauri-plugin-dialog = "2"
-# 记住窗口大小和位置
+# Remember window size and position
 tauri-plugin-window-state = "2"
 
-# 粘贴本机文件时读剪贴板里的文件路径（CF_HDROP），见 src/clipfiles.rs
+# Read file paths from the clipboard (CF_HDROP) when pasting local files, see src/clipfiles.rs
 [target.'cfg(windows)'.dependencies]
 clipboard-win = "5"
 
 [target.'cfg(any(target_os = "android", target_os = "ios"))'.dependencies]
-# 手机上用系统浏览器打开链接（桌面端走 ClientHub 的 url.open）
+# Open links in the system browser on mobile (desktop goes through ClientHub's url.open)
 tauri-plugin-opener = "2"
 
 [profile.release]

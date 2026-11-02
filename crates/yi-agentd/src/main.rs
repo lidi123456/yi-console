@@ -1,12 +1,12 @@
-//! yi-agentd：Yi Console 守护进程。
+//! yi-agentd: the Yi Console daemon.
 //!
-//!   yi-agentd serve [-f]        启动守护进程（-f 前台运行，日志打到 stderr）
-//!   yi-agentd bridge [--local]  把 stdin/stdout 接到本机守护进程，必要时自动拉起；
-//!                            本机客户端带 --local，SSH 远程不带（守护进程据此限制只限本机的方法）
-//!   yi-agentd install|uninstall 注册/移除开机自启服务
+//!   yi-agentd serve [-f]        start the daemon (-f runs in the foreground, logging to stderr)
+//!   yi-agentd bridge [--local]  connect stdin/stdout to the local daemon, starting it if needed;
+//!                            local clients pass --local, SSH remotes don't (the daemon uses this to restrict local-only methods)
+//!   yi-agentd install|uninstall register/remove the autostart service
 //!   yi-agentd status|stop|version
-//!   yi-agentd relay setup <接入链接 | wss://中继地址 [--invite 邀请码] [--fp 证书指纹]>
-//!   yi-agentd relay pair        生成一次性配对二维码（手机扫码连接，10 分钟有效）
+//!   yi-agentd relay setup <access link | wss://relay-address [--invite code] [--fp cert-fingerprint]>
+//!   yi-agentd relay pair        generate a one-time pairing QR code (scan with a phone to connect, valid for 10 minutes)
 //!   yi-agentd relay clients | revoke <id> | reset | disable
 
 mod adapters;
@@ -78,7 +78,7 @@ fn relay_cmd(args: &[String]) -> Result<()> {
             if opt("--token").is_some() || args.iter().any(|a| a == "--reset-key") {
                 anyhow::bail!("--token / --reset-key 已经去掉：登记中继用邀请（--invite 或接入链接），重置配对用 yi-agentd relay reset");
             }
-            // 也可以直接给一条接入链接，地址、指纹、邀请码都从里面取
+            // An access link can also be given directly; address, fingerprint and invite code are all taken from it
             let c = if url.starts_with("yiconsole://") {
                 let a = yi_link::RelayAccess::parse(url)?;
                 relay::setup(&a.url, Some(&a.fp), &a.invite)?
@@ -86,7 +86,7 @@ fn relay_cmd(args: &[String]) -> Result<()> {
                 relay::setup(url, opt("--fp").as_deref(), &opt("--invite").unwrap_or_default())?
             };
             println!("中继已设置：{}", c.url);
-            // 让正在运行的守护进程重新读取配置
+            // Make the running daemon reload its config
             install::stop_running();
             spawn_detached()?;
             println!("守护进程已重启。运行 `yi-agentd relay pair` 生成配对二维码。");
@@ -144,7 +144,7 @@ fn relay_cmd(args: &[String]) -> Result<()> {
     }
 }
 
-/// 命令行调用本机守护进程的一个方法（没在运行就先拉起）
+/// Call a method on the local daemon from the command line (starting it first if not running)
 fn daemon_call(method: &str, params: serde_json::Value) -> Result<serde_json::Value> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
@@ -184,8 +184,8 @@ fn daemon_call(method: &str, params: serde_json::Value) -> Result<serde_json::Va
 }
 
 fn serve(foreground: bool) -> Result<()> {
-    // 登录自启（HKCU Run）等方式直接运行时，Windows 会给控制台程序开一个窗口；
-    // 这种情况换成隐藏方式重新启动自己
+    // When run directly, e.g. by login autostart (HKCU Run), Windows opens a window for console programs;
+    // in that case restart ourselves hidden
     #[cfg(windows)]
     if !foreground && owns_console_window() {
         return spawn_detached();
@@ -216,7 +216,7 @@ fn serve(foreground: bool) -> Result<()> {
         let listen = transport::listen(hub.clone());
         tokio::select! {
             r = listen => if let Err(e) = r {
-                // 后台运行时 stderr 没人看，原因要进日志
+                // Nobody watches stderr when running in the background, so the reason goes to the log
                 crate::warn!("监听失败，守护进程退出: {e:#}");
                 return Err(e);
             },
@@ -227,13 +227,13 @@ fn serve(foreground: bool) -> Result<()> {
         let _ = std::fs::remove_file(paths::socket_path());
         Ok::<_, anyhow::Error>(())
     })?;
-    // 不等后台任务（工具子进程会随 kill_on_drop 结束）
+    // Don't wait for background tasks (tool child processes end via kill_on_drop)
     rt.shutdown_timeout(Duration::from_secs(2));
     Ok(())
 }
 
-/// 当前进程独占一个可见的控制台窗口（不是在别人的终端里运行）。
-/// 必须检查可见：spawn_detached 拉起的进程也独占控制台，只是窗口隐藏，否则会无限重启
+/// The current process owns a visible console window by itself (not running inside someone else's terminal).
+/// Visibility must be checked: processes started by spawn_detached also own their console, just hidden; otherwise it would restart forever
 #[cfg(windows)]
 fn owns_console_window() -> bool {
     use windows_sys::Win32::System::Console::{GetConsoleProcessList, GetConsoleWindow};
@@ -248,7 +248,7 @@ fn owns_console_window() -> bool {
     }
 }
 
-/// 后台启动一个与当前终端/SSH 会话脱钩的 `yi-agentd serve`
+/// Start a `yi-agentd serve` in the background, detached from the current terminal/SSH session
 pub fn spawn_detached() -> Result<()> {
     let exe = std::env::current_exe()?;
     #[cfg(unix)]
@@ -269,11 +269,11 @@ pub fn spawn_detached() -> Result<()> {
     }
     #[cfg(windows)]
     {
-        // 经 SSH 启动的进程在 job 对象里，会话断开会被一起结束；
-        // 用 WMI 的 Win32_Process.Create 拉起，进程就不属于这个 job
+        // Processes started over SSH live in a job object and are killed with it when the session disconnects;
+        // starting via WMI's Win32_Process.Create puts the process outside that job
         let cmdline = format!("\"{}\" serve", exe.display()).replace('\'', "''");
-        // WMI 默认会给控制台程序开一个可见窗口，ShowWindow=0 让它隐藏；
-        // 子进程继承这个隐藏的控制台，也不会各自弹窗（WMI 不接受 CREATE_NO_WINDOW）
+        // WMI opens a visible window for console programs by default; ShowWindow=0 hides it;
+        // children inherit this hidden console and don't pop up their own windows (WMI doesn't accept CREATE_NO_WINDOW)
         let ps = format!(
             "$si = New-CimInstance -ClassName Win32_ProcessStartup -ClientOnly -Property @{{ShowWindow=[uint16]0}}; \
              $r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{{CommandLine='{cmdline}'; ProcessStartupInformation=$si}}; \
@@ -291,7 +291,7 @@ pub fn spawn_detached() -> Result<()> {
     Ok(())
 }
 
-/// stdin/stdout <-> 本机守护进程。不带 --local 时先报一行远程标记（见 `BRIDGE_REMOTE_MARK`）
+/// stdin/stdout <-> local daemon. Without --local, first sends a remote marker line (see `BRIDGE_REMOTE_MARK`)
 fn bridge(local: bool) -> Result<()> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -299,7 +299,7 @@ fn bridge(local: bool) -> Result<()> {
     rt.block_on(async {
         let conn = match transport::connect().await {
             Ok(c) => c,
-            // 守护进程在跑但没权限连：再拉起一个也只会因为管道名被占而退出
+            // The daemon is running but we lack permission to connect: starting another would just exit because the pipe name is taken
             Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => anyhow::bail!("{e}"),
             Err(_) => {
                 paths::ensure_base()?;
@@ -351,7 +351,7 @@ fn bridge(local: bool) -> Result<()> {
         tokio::select! { _ = up => {}, _ = down => {} }
         Ok::<(), anyhow::Error>(())
     })?;
-    // 读 stdin 的后台线程还阻塞着，运行时退出时会一直等它；守护进程断开后要立即退出，
-    // 客户端才能察觉并重连（重连时会用新版 yi-agentd 拉起守护进程）
+    // The stdin reader thread is still blocked, and runtime shutdown would wait on it forever; once the daemon disconnects we must exit immediately
+    // so the client notices and reconnects (reconnecting starts the daemon with the new yi-agentd)
     std::process::exit(0)
 }

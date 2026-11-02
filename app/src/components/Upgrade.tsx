@@ -2,7 +2,7 @@ import { tr } from '../i18n';
 import { hubCall } from '../transport';
 import { errorToast, setState, useStore } from '../store';
 
-/** yi-agentd 升级：上传 / 重启期间整屏挡住（这段时间连不上主机）；等回合结束时只在角落提示 */
+/** yi-agentd upgrade: block the whole screen while uploading / restarting (the host is unreachable then); while waiting for a turn to end, only a corner notice */
 export function UpgradeOverlay() {
   const upgrades = useStore((s) => s.upgrades);
   const hosts = useStore((s) => s.hosts);

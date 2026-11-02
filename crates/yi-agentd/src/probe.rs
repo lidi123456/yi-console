@@ -1,4 +1,4 @@
-//! 临时起一个工具进程查询模型列表和账号额度，不建会话（ACP 工具要建一个空会话，放在专用目录里）。
+//! Start a temporary tool process to query the model list and account quota without creating a session (ACP tools need an empty session, created in a dedicated directory).
 
 use crate::adapters::{self, JsonProc};
 use crate::hub::Hub;
@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 const TIMEOUT: Duration = Duration::from_secs(30);
-/// 额度结果缓存时间，避免切页面时反复拉起进程
+/// How long quota results are cached, to avoid restarting processes on every page switch
 const QUOTA_TTL_MS: i64 = 60_000;
 
 static QUOTA_CACHE: Mutex<Option<HashMap<String, (i64, Value)>>> = Mutex::new(None);
@@ -29,7 +29,7 @@ fn probe_dir() -> PathBuf {
     d
 }
 
-/// 起进程，发 first，之后每收到一行交给 on 处理，直到 Done 或超时
+/// Start the process, send first, then pass each line received to on until Done or timeout
 async fn converse(
     tool: ToolKind,
     settings: &DaemonSettings,
@@ -67,7 +67,7 @@ async fn converse(
     }
 }
 
-/// 各工具的结果
+/// Per-tool results
 #[derive(Default)]
 struct Probe {
     models: Vec<ModelOption>,
@@ -197,7 +197,7 @@ fn codex_quota(account: &Value, rl: &Value) -> Value {
             json!({
                 "label": window_label(w["windowDurationMins"].as_u64().unwrap_or(0)),
                 "usedPercent": w["usedPercent"],
-                // 秒 -> 毫秒
+                // seconds -> milliseconds
                 "resetsAt": w["resetsAt"].as_i64().map(|s| s * 1000),
             })
         })
@@ -210,7 +210,7 @@ fn codex_quota(account: &Value, rl: &Value) -> Value {
     })
 }
 
-/// Cursor / Kiro：建一个空会话拿模型列表；Kiro 再执行 /usage
+/// Cursor / Kiro: create an empty session to get the model list; Kiro then runs /usage
 async fn acp(tool: ToolKind, settings: &DaemonSettings, want_quota: bool) -> Result<Probe> {
     let mut out = Probe::default();
     let cwd = probe_dir().display().to_string();
@@ -219,7 +219,7 @@ async fn acp(tool: ToolKind, settings: &DaemonSettings, want_quota: bool) -> Res
         "clientInfo":{"name":"yi-console","version":DAEMON_VERSION}}});
     let kiro_usage = want_quota && tool == ToolKind::Kiro;
     let mut sid = String::new();
-    // Qoder 每建一个会话都会出现在它的历史里，问完就删掉
+    // Every session Qoder creates shows up in its history, so delete it after asking
     let delete = tool == ToolKind::Qoder;
     converse(tool, settings, &[adapters::acp::acp_arg(tool)], vec![init], |v| {
         let Some(id) = v["id"].as_u64().filter(|_| v.get("method").is_none()) else {
@@ -288,7 +288,7 @@ fn fmt_num(x: f64) -> String {
     }
 }
 
-/// Cursor：账号从 `cursor-agent about` 拿，用量查 Cursor 后台（和 cursor-agent 的 /usage 一样）
+/// Cursor: account from `cursor-agent about`, usage queried from Cursor's backend (same as cursor-agent's /usage)
 async fn cursor_account(settings: &DaemonSettings) -> Result<Value> {
     let program = crate::tools::resolve(ToolKind::Cursor, settings)
         .ok_or_else(|| anyhow!("这台机器上没有找到 cursor"))?;
@@ -308,7 +308,7 @@ async fn cursor_account(settings: &DaemonSettings) -> Result<Value> {
     };
     let email = field("User Email");
     let tier = field("Subscription Tier");
-    // 和 cursor-agent 里 /usage 一样，用它登录时存下的令牌查后台
+    // Same as /usage in cursor-agent: query the backend with the token it saved at login
     match tokio::task::spawn_blocking(cursor_usage).await? {
         Ok(mut q) => {
             if q["account"]["plan"].is_null() {
@@ -325,7 +325,7 @@ async fn cursor_account(settings: &DaemonSettings) -> Result<Value> {
     }
 }
 
-/// cursor-agent 登录信息的位置（和它自己的实现一致）
+/// Where cursor-agent keeps its login info (matching its own implementation)
 fn cursor_auth_file() -> std::path::PathBuf {
     let home = crate::paths::home();
     if cfg!(windows) {
@@ -372,7 +372,7 @@ fn cursor_usage() -> Result<Value> {
     Ok(cursor_quota(&usage, &plan, &hard))
 }
 
-/// 金额单位是美分，时间是毫秒字符串
+/// Amounts are in cents, times are millisecond strings
 fn cursor_quota(usage: &Value, plan: &Value, hard: &Value) -> Value {
     let num = |v: &Value| v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok()));
     let reset = num(&usage["billingCycleEnd"])
@@ -381,7 +381,7 @@ fn cursor_quota(usage: &Value, plan: &Value, hard: &Value) -> Value {
         .map(|v| json!(v as i64));
     let pu = &usage["planUsage"];
     let mut windows = vec![];
-    // 和 cursor-agent 的 /usage 一样：套餐内总用量、Auto、指定模型（API）三项百分比
+    // Same as cursor-agent's /usage: three percentages for total plan usage, Auto, and named models (API)
     if pu.is_object() {
         let used = num(&pu["includedSpend"]).unwrap_or(0.0);
         let limit = num(&pu["limit"]).unwrap_or(0.0);
@@ -391,7 +391,7 @@ fn cursor_quota(usage: &Value, plan: &Value, hard: &Value) -> Value {
             windows.push(json!({"label": label, "usedPercent": num(&pu[k]).unwrap_or(0.0), "resetsAt": reset}));
         }
     }
-    // 按量付费，判断规则照搬 cursor-agent（proto3 的 JSON 里 0 值字段可能省略）
+    // Pay-as-you-go, using cursor-agent's rules (fields with 0 values may be omitted in proto3 JSON)
     let sl = &usage["spendLimitUsage"];
     let used = num(&sl["individualUsed"]).unwrap_or(0.0) / 100.0;
     let own = num(&sl["individualLimit"]).map(|c| if c > 0.0 { Some(c / 100.0) } else { None });
@@ -452,7 +452,7 @@ fn cursor_quota(usage: &Value, plan: &Value, hard: &Value) -> Value {
     json!({ "account": {"plan": plan["planInfo"]["planName"]}, "windows": windows, "note": note })
 }
 
-/// Qoder：通过 stream-json 控制协议发 get_usage_info 拿积分额度（加 --no-session-persistence 不留空会话）
+/// Qoder: send get_usage_info over the stream-json control protocol to get the credit quota (--no-session-persistence avoids leaving an empty session)
 async fn qoder_account(settings: &DaemonSettings) -> Result<Value> {
     let mut account = Value::Null;
     let mut quota = Value::Null;
@@ -545,7 +545,7 @@ fn qoder_quota(account: &Value, r: &Value) -> Value {
     })
 }
 
-/// CodeBuddy：从 ACP 的 `_codebuddy.ai/getUserInfo` 拿登录令牌，再查后台积分与资源包汇总
+/// CodeBuddy: get the login token from ACP's `_codebuddy.ai/getUserInfo`, then query the backend for credit and resource pack totals
 async fn codebuddy_account(settings: &DaemonSettings) -> Result<Value> {
     let mut user = Value::Null;
     let init = json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,
@@ -710,7 +710,7 @@ pub async fn models(tool: ToolKind, settings: &DaemonSettings) -> Result<Vec<Mod
     Ok(run(tool, settings, false).await?.models)
 }
 
-/// 账号额度：{tool, account:{email,plan}, windows:[{label,usedPercent,resetsAt,detail?}], note?, fetchedAt}
+/// Account quota: {tool, account:{email,plan}, windows:[{label,usedPercent,resetsAt,detail?}], note?, fetchedAt}
 pub async fn quota(hub: &Arc<Hub>, tool: ToolKind, settings: &DaemonSettings, refresh: bool) -> Result<Value> {
     let key = tool.as_str().to_string();
     if !refresh {
@@ -749,7 +749,7 @@ mod tests {
         assert_eq!(q["account"]["plan"], "Team");
         assert_eq!(q["windows"][0]["usedPercent"], 3.228);
         assert_eq!(q["windows"][0]["resetsAt"], 1794881855000i64);
-        // 团队账号、个人限额 0：按量付费没开
+        // Team account with a personal limit of 0: pay-as-you-go not enabled
         assert_eq!(q["windows"][3]["detail"], "未开启");
         let q = cursor_quota(&json!({"spendLimitUsage":{"individualUsed":1234}}), &plan, &json!({"hardLimit":50}));
         assert_eq!(q["windows"][0]["detail"], "$12.34 / $50.00");

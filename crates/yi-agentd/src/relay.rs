@@ -1,8 +1,8 @@
-//! yi-agentd 侧的中继（设计见 `docs/relay-security-v2.md`）：
-//! - 保持一条到中继的控制连接（首次凭邀请码登记），把已配对客户端的白名单和配对票据推给中继；
-//! - 收到 open 就开数据流做 Noise 握手：配对连接校验一次性配对码后把客户端加进已配对列表，
-//!   普通连接只接受已配对的客户端，握手通过后按普通客户端连接处理（serve_conn）；
-//! - 吊销客户端时推新白名单，并断开它在本机的连接。
+//! The yi-agentd side of the relay (design in `docs/relay-security-v2.md`):
+//! - keep a control connection to the relay (registering with an invite code the first time), and push the allow list of paired clients and pairing tickets to it;
+//! - on open, start a stream and do the Noise handshake: pairing connections check the one-time pairing code and then add the client to the paired list,
+//!   normal connections only accept paired clients and, once the handshake passes, are handled like any client connection (serve_conn);
+//! - when a client is revoked, push the new allow list and drop its connections on this machine.
 
 use crate::hub::Hub;
 use anyhow::{anyhow, bail, Result};
@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, watch};
 
-/// 配对码有效期
+/// Pairing code lifetime
 const PAIR_TTL: u64 = 600;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -23,9 +23,9 @@ const PAIR_TTL: u64 = 600;
 pub struct PairedClient {
     pub id: String,
     pub name: String,
-    /// Ed25519 签名公钥（中继层身份）
+    /// Ed25519 signing public key (relay-layer identity)
     pub sign_pub: String,
-    /// X25519 静态公钥（Noise 握手里认证）
+    /// X25519 static public key (authenticated in the Noise handshake)
     pub noise_pub: String,
     pub created_at: u64,
     #[serde(default)]
@@ -37,16 +37,16 @@ pub struct PairedClient {
 pub struct RelayConfig {
     pub enabled: bool,
     pub url: String,
-    /// 中继证书指纹（自签名证书时必填）
+    /// Relay certificate fingerprint (required for self-signed certificates)
     #[serde(default)]
     pub relay_fp: String,
     #[serde(default)]
     pub name: String,
-    /// 这台电脑的身份密钥，见 [`Identity::encode`]
+    /// This computer's identity keys, see [`Identity::encode`]
     pub identity: String,
     #[serde(default)]
     pub clients: Vec<PairedClient>,
-    /// 还没用掉的邀请码：首次登记成功后清空
+    /// Invite code not used yet: cleared after the first successful registration
     #[serde(default)]
     pub invite: String,
 }
@@ -69,18 +69,18 @@ fn now() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
-/// 读改写配置时串行化
+/// Serializes read-modify-write of the config
 static CFG_LOCK: Mutex<()> = Mutex::new(());
 static KICK: tokio::sync::Notify = tokio::sync::Notify::const_new();
 static ONLINE: AtomicBool = AtomicBool::new(false);
-/// 最近一次连中继失败的原因，界面上提示用
+/// Reason for the last failed relay connection, shown in the UI
 static LAST_ERROR: Mutex<String> = Mutex::new(String::new());
-/// 待用的配对码和过期时间（只在内存里，重启作废）
+/// Pending pairing codes and their expiry (memory only, voided on restart)
 static PENDING: Mutex<Vec<([u8; 32], u64)>> = Mutex::new(Vec::new());
-/// 当前控制连接的发送端（推白名单、要邀请码）
+/// Sender of the current control connection (pushing allow lists, requesting invites)
 static CTRL: Mutex<Option<mpsc::UnboundedSender<Value>>> = Mutex::new(None);
 static INVITE_WAIT: Mutex<Option<oneshot::Sender<std::result::Result<String, String>>>> = Mutex::new(None);
-/// 客户端 id -> 它在本机的连接（吊销时断开）
+/// client id -> its connections on this machine (dropped on revocation)
 static CONNS: Mutex<Option<HashMap<String, Vec<watch::Sender<bool>>>>> = Mutex::new(None);
 
 fn path() -> std::path::PathBuf {
@@ -92,7 +92,7 @@ pub fn load_config() -> Option<RelayConfig> {
     if let Ok(c) = serde_json::from_str::<RelayConfig>(&raw) {
         return Some(c);
     }
-    // 旧版配置：只保留地址、指纹和名字，换成新身份；要重新用邀请登记
+    // Old-format config: keep only address, fingerprint and name, switch to a new identity; must re-register with an invite
     let v: Value = serde_json::from_str(&raw).ok()?;
     let url = v["url"].as_str()?.to_string();
     Some(RelayConfig {
@@ -113,7 +113,7 @@ fn save_config(c: &RelayConfig) -> Result<()> {
     Ok(())
 }
 
-/// 读改写；返回改后的配置
+/// Read-modify-write; returns the updated config
 fn update<F: FnOnce(&mut RelayConfig) -> Result<()>>(f: F) -> Result<RelayConfig> {
     let _g = CFG_LOCK.lock().unwrap();
     let mut c = load_config().ok_or_else(|| anyhow!("还没设置中继"))?;
@@ -126,8 +126,8 @@ fn hostname() -> String {
     gethostname::gethostname().to_string_lossy().to_string()
 }
 
-/// 设置中继地址；首次会生成这台电脑的身份密钥。
-/// `fp` 为 None 时保留原来的指纹，Some("") 表示清空；`invite` 非空时用于首次登记
+/// Set the relay address; the first time, this computer's identity keys are generated.
+/// With `fp` None the old fingerprint is kept, Some("") clears it; a non-empty `invite` is used for the first registration
 pub fn setup(url: &str, fp: Option<&str>, invite: &str) -> Result<RelayConfig> {
     let url = url.trim().trim_end_matches('/').to_string();
     if !(url.starts_with("ws://") || url.starts_with("wss://")) {
@@ -171,7 +171,7 @@ pub fn disable() -> Result<()> {
     Ok(())
 }
 
-/// 推给中继的白名单：已配对客户端的签名公钥 + 有效的配对票据
+/// Allow list pushed to the relay: signing public keys of paired clients + valid pairing tickets
 fn acl_msg(c: &RelayConfig) -> Value {
     let t = now();
     let mut pending = PENDING.lock().unwrap();
@@ -210,7 +210,7 @@ fn online_ids() -> std::collections::HashSet<String> {
 
 // ---------------- RPC ----------------
 
-/// RPC relay.pairing：中继状态
+/// RPC relay.pairing: relay status
 pub fn pairing_info() -> Result<Value> {
     let Some(c) = load_config() else {
         return Ok(json!({ "configured": false }));
@@ -231,7 +231,7 @@ pub fn pairing_info() -> Result<Value> {
     }))
 }
 
-/// RPC relay.configure：设置中继地址或开关。`link` 是接入链接（可带邀请码），给了就以它为准
+/// RPC relay.configure: set the relay address or toggle it. `link` is an access link (may include an invite code); when given it takes precedence
 pub fn configure(url: &str, fp: Option<&str>, invite: Option<&str>, enabled: bool, link: Option<&str>) -> Result<Value> {
     if let Some(link) = link.filter(|l| !l.trim().is_empty()) {
         let a = yi_link::RelayAccess::parse(link)?;
@@ -244,7 +244,7 @@ pub fn configure(url: &str, fp: Option<&str>, invite: Option<&str>, enabled: boo
     pairing_info()
 }
 
-/// RPC relay.pairStart：生成一次性配对码，返回配对链接（二维码内容）和过期时间
+/// RPC relay.pairStart: generate a one-time pairing code; returns the pairing link (QR code content) and expiry
 pub fn pair_start() -> Result<Value> {
     let c = load_config().filter(|c| c.enabled).ok_or_else(|| anyhow!("还没开启中继"))?;
     let me = c.identity()?;
@@ -263,7 +263,7 @@ pub fn pair_start() -> Result<Value> {
     Ok(json!({ "uri": offer.to_uri(), "expiresAt": exp, "online": ONLINE.load(Ordering::Relaxed) }))
 }
 
-/// RPC relay.clients：已配对的设备
+/// RPC relay.clients: paired devices
 pub fn clients() -> Result<Value> {
     let Some(c) = load_config() else { return Ok(json!([])) };
     let online = online_ids();
@@ -274,7 +274,7 @@ pub fn clients() -> Result<Value> {
         .collect::<Vec<_>>()))
 }
 
-/// RPC relay.revoke：移除一台已配对的设备，它的连接立刻断开
+/// RPC relay.revoke: remove a paired device; its connections drop immediately
 pub fn revoke(id: &str) -> Result<Value> {
     let mut found = false;
     update(|c| {
@@ -305,8 +305,8 @@ pub fn rename_client(id: &str, name: &str) -> Result<Value> {
     clients()
 }
 
-/// RPC relay.reset：清空所有配对、作废未用的配对码、更换端到端密钥。
-/// 签名密钥（设备 id）不变，不用重新到中继登记
+/// RPC relay.reset: clear all pairings, void unused pairing codes, rotate the end-to-end key.
+/// The signing key (device id) stays the same, so there's no need to re-register with the relay
 pub fn reset() -> Result<Value> {
     let mut old = Vec::new();
     update(|c| {
@@ -325,7 +325,7 @@ pub fn reset() -> Result<Value> {
     pairing_info()
 }
 
-/// RPC relay.invite：向中继要一个一次性邀请（中继要开启 --device-invites），返回接入链接
+/// RPC relay.invite: ask the relay for a one-time invite (the relay must have --device-invites); returns an access link
 pub async fn invite() -> Result<Value> {
     let c = load_config().filter(|c| c.enabled).ok_or_else(|| anyhow!("这台电脑没有开启中继"))?;
     let (tx, rx) = oneshot::channel();
@@ -344,9 +344,9 @@ pub async fn invite() -> Result<Value> {
     Ok(json!({ "link": link }))
 }
 
-// ---------------- 连接 ----------------
+// ---------------- Connections ----------------
 
-/// 把连接错误翻成用户看得懂的提示；原始错误附在后面
+/// Turn connection errors into hints users can understand; the raw error is appended
 fn explain(e: &anyhow::Error) -> String {
     let raw = format!("{e:#}");
     let l = raw.to_lowercase();
@@ -366,7 +366,7 @@ fn explain(e: &anyhow::Error) -> String {
     format!("{hint}（{raw}）")
 }
 
-/// 处理一次 open：配对或普通连接
+/// Handle one open: pairing or normal connection
 async fn accept(hub: Arc<Hub>, link: AgentLink, req: OpenReq) {
     let t = now();
     let code = req
@@ -384,7 +384,7 @@ async fn accept(hub: Arc<Hub>, link: AgentLink, req: OpenReq) {
         client_id = client_id_of(&h.sign_pub);
         match code {
             Some(c) => {
-                // 配对码只能用一次
+                // A pairing code can only be used once
                 {
                     let mut p = PENDING.lock().unwrap();
                     let n = p.len();
@@ -400,7 +400,7 @@ async fn accept(hub: Arc<Hub>, link: AgentLink, req: OpenReq) {
                     cfg.clients.push(PairedClient { id, name, sign_pub: sign, noise_pub: noise, created_at: now(), last_seen: now() });
                     Ok(())
                 })?;
-                // 先推白名单再回握手：客户端收到回复后马上会以已配对身份重连
+                // Push the allow list before answering the handshake: right after the reply, the client reconnects as a paired client
                 push_acl();
                 Ok(())
             }
@@ -515,7 +515,7 @@ pub async fn run(hub: Arc<Hub>) {
     }
 }
 
-/// 在终端里打印二维码
+/// Print a QR code in the terminal
 pub fn print_qr(text: &str) {
     match qrcode::QrCode::new(text.as_bytes()) {
         Ok(code) => {

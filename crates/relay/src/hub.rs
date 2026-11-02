@@ -1,4 +1,4 @@
-//! 连接处理：中继层鉴权、设备控制连接、客户端与数据流的对接。
+//! Connection handling: relay-layer authentication, device control connections, splicing clients to streams.
 
 use crate::limits::{self, Cidr, ConnSlot, Limits};
 use crate::store::{now, Store};
@@ -26,15 +26,15 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Io for T {}
 pub type BoxIo = Box<dyn Io>;
 type WsIo = WebSocketStream<BoxIo>;
 
-/// 每台设备同时最多这么多条数据流
+/// Max concurrent streams per device
 const MAX_STREAMS_PER_DEVICE: usize = 32;
-/// 每个客户端最多这么多条
+/// Max per client
 const MAX_STREAMS_PER_CLIENT: usize = 8;
-/// 凭配对票据进来的连接，每台设备同时最多这么多条
+/// Max concurrent connections per device that came in with a pairing ticket
 const MAX_PAIRING: usize = 2;
-/// 设备代发的邀请：一次性、10 分钟
+/// Invites issued by devices: one-time, 10 minutes
 const DEVICE_INVITE_TTL: u64 = 600;
-/// 从 TCP 建连到 WebSocket 升级完成、再到鉴权完成，各自的时限
+/// Time limits for each step: TCP connect to WebSocket upgrade, and upgrade to authentication
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct Config {
@@ -56,9 +56,9 @@ struct Active {
 struct Device {
     control: Option<(u64, mpsc::UnboundedSender<Message>)>,
     waiting: HashMap<String, Waiting>,
-    /// yi-agentd 推来的客户端白名单（签名公钥）
+    /// Client allow list pushed by yi-agentd (signing public keys)
     acl: HashSet<[u8; 32]>,
-    /// 有效的配对票据和过期时间
+    /// Valid pairing tickets and their expiry
     tickets: Vec<([u8; 32], u64)>,
     streams: HashMap<u64, Active>,
 }
@@ -76,12 +76,12 @@ impl Device {
 pub struct State {
     pub cfg: Config,
     pub store: Store,
-    /// 运行中的写操作串行化（命令行进程另算，见 store.rs）
+    /// Serializes writes at runtime (command-line processes are separate, see store.rs)
     store_lock: Mutex<()>,
-    /// 已登记设备的公钥（文件的缓存，文件变了就重读）
+    /// Public keys of registered devices (cache of the file, reread when the file changes)
     registered: RwLock<BTreeMap<String, [u8; 32]>>,
     devices: Mutex<HashMap<String, Device>>,
-    /// 设备被吊销时通知它的所有连接
+    /// Notifies all of a device's connections when it's revoked
     kills: Mutex<HashMap<String, watch::Sender<bool>>>,
     seq: AtomicU64,
 }
@@ -108,7 +108,7 @@ impl State {
         self.kills.lock().unwrap().entry(device.to_string()).or_insert_with(|| watch::channel(false).0).subscribe()
     }
 
-    /// 重新读登记文件；不在了的设备立刻断开
+    /// Reread the registration file; devices no longer in it are disconnected immediately
     pub fn reload(&self) {
         let fresh = self.store.device_keys();
         let gone: Vec<String> = {
@@ -130,7 +130,7 @@ impl State {
     }
 }
 
-/// 每 5 秒看一眼登记文件有没有被命令行改过
+/// Every 5 seconds, check whether the registration file was changed from the command line
 pub async fn watch_store(state: Arc<State>) {
     let mut last = state.store.devices_mtime();
     loop {
@@ -153,7 +153,7 @@ async fn close(ws: &mut WsIo, code: u16, reason: &str) {
     let _ = ws.close(Some(CloseFrame { code: CloseCode::from(code), reason: reason.to_string().into() })).await;
 }
 
-/// 一条连接从 TLS 之后开始的全部处理
+/// All handling of a connection after TLS
 pub async fn handle(state: Arc<State>, limits: Arc<Limits>, mut slot: ConnSlot, io: BoxIo, peer: IpAddr) {
     let cfg = WebSocketConfig::default().max_message_size(Some(4 << 20)).max_frame_size(Some(1 << 20));
     let mut path = String::new();
@@ -165,7 +165,7 @@ pub async fn handle(state: Arc<State>, limits: Arc<Limits>, mut slot: ConnSlot, 
             |req: &Request, resp: Response| {
                 path = req.uri().path().to_string();
                 xff = req.headers().get("x-forwarded-for").and_then(|v| v.to_str().ok()).map(str::to_string);
-                // 反向代理没去掉路径前缀时也认
+                // Also accept it when the reverse proxy didn't strip the path prefix
                 if !["/v1/agent", "/v1/client", "/v1/stream"].iter().any(|p| path.ends_with(p)) {
                     return Err(reject(StatusCode::NOT_FOUND, "not found"));
                 }
@@ -183,7 +183,7 @@ pub async fn handle(state: Arc<State>, limits: Arc<Limits>, mut slot: ConnSlot, 
             return;
         }
     };
-    // 在代理后面：到这里才知道真实 IP
+    // Behind a proxy: only now do we know the real IP
     if limits::trusted(&state.cfg.trusted, peer) && !slot.bind(ip) {
         close(&mut ws, auth::CLOSE_BUSY, "连接过多或已被暂时封禁").await;
         return;
@@ -191,8 +191,8 @@ pub async fn handle(state: Arc<State>, limits: Arc<Limits>, mut slot: ConnSlot, 
     let authed = match tokio::time::timeout(HANDSHAKE_TIMEOUT, authenticate(&state, &mut ws)).await {
         Ok(Ok(a)) => a,
         Ok(Err((code, reason, guess))) => {
-            // 只有可能是在猜（签名错、乱发、猜邀请码 / 配对票据）才计入拉黑；
-            // 身份没问题只是没权限的（被移除的设备还在自动重连）不计，免得同一 NAT 后面的设备被一起拉黑
+            // Only failures that could be guessing (bad signature, garbage, guessing invite codes / pairing tickets) count toward banning;
+            // a valid identity without permission (a removed device still auto-reconnecting) doesn't, so devices behind the same NAT aren't banned along with it
             if guess {
                 limits.record_fail(ip);
             }
@@ -225,19 +225,19 @@ pub async fn handle(state: Arc<State>, limits: Arc<Limits>, mut slot: ConnSlot, 
 
 struct Authed {
     req: AuthRequest,
-    /// 客户端凭配对票据进来的
+    /// The client came in with a pairing ticket
     ticket: Option<[u8; 32]>,
 }
 
-/// (close code, 原因, 是否计入拉黑)
+/// (close code, reason, counts toward banning)
 type AuthErr = (u16, String, bool);
 
-/// 签名、格式这类错误：计入拉黑
+/// Signature / format errors: count toward banning
 fn deny(code: u16, msg: &str) -> AuthErr {
     (code, msg.to_string(), true)
 }
 
-/// 身份已证明，只是没有权限：不计入拉黑
+/// Identity proven but not permitted: doesn't count toward banning
 fn refuse(code: u16, msg: &str) -> AuthErr {
     (code, msg.to_string(), false)
 }
@@ -280,8 +280,8 @@ async fn authenticate(state: &Arc<State>, ws: &mut WsIo) -> std::result::Result<
                 Some(d) if d.control.is_some() => d,
                 _ => return Err(refuse(auth::CLOSE_OFFLINE, "设备不在线")),
             };
-            // 带了配对票据就按配对处理（已配对的设备沿用原身份重新配对时也带），票据要一并转给电脑，
-            // 电脑靠它找到配对码、用配对码派生的密钥握手
+            // With a pairing ticket, treat it as pairing (paired devices re-pairing with their existing identity send one too); the ticket is passed on to the computer,
+            // which uses it to find the pairing code and handshake with the key derived from it
             if let Some(tk) = req.ticket {
                 let t = now();
                 if !d.tickets.iter().any(|(h, exp)| *exp > t && yi_link::ct_eq(h, &tk)) {
@@ -303,7 +303,7 @@ async fn authenticate(state: &Arc<State>, ws: &mut WsIo) -> std::result::Result<
     Ok(Authed { req, ticket })
 }
 
-/// 未登记的设备：凭邀请码登记，或者开放模式下直接登记
+/// Unregistered device: register with an invite code, or directly in open mode
 fn admit(state: &Arc<State>, req: &AuthRequest) -> std::result::Result<(), AuthErr> {
     let _g = state.store_lock.lock().unwrap();
     let (via, by) = if !req.invite.is_empty() {
@@ -330,7 +330,7 @@ fn admit(state: &Arc<State>, req: &AuthRequest) -> std::result::Result<(), AuthE
     Ok(())
 }
 
-/// yi-agentd 的控制连接
+/// yi-agentd's control connection
 async fn agent(state: Arc<State>, device: String, ws: WsIo) {
     let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
     let conn_id = state.next_id();
@@ -338,7 +338,7 @@ async fn agent(state: Arc<State>, device: String, ws: WsIo) {
     {
         let mut devs = state.devices.lock().unwrap();
         let d = devs.entry(device.clone()).or_insert_with(Device::new);
-        // 新连接顶替旧连接（yi-agentd 断线重连时旧连接可能还没超时）
+        // A new connection replaces the old one (the old one may not have timed out yet when yi-agentd reconnects)
         d.control = Some((conn_id, tx.clone()));
     }
     {
@@ -386,7 +386,7 @@ async fn agent(state: Arc<State>, device: String, ws: WsIo) {
     }
 }
 
-/// 控制连接上 yi-agentd 发来的消息：白名单 acl、要邀请码 invite
+/// Messages from yi-agentd on the control connection: acl allow list, invite request
 fn on_control(state: &Arc<State>, device: &str, text: &str) -> Option<Value> {
     let v: Value = serde_json::from_str(text).ok()?;
     match v["type"].as_str()? {
@@ -405,7 +405,7 @@ fn on_control(state: &Arc<State>, device: &str, text: &str) -> Option<Value> {
                 .unwrap_or_default();
             let mut devs = state.devices.lock().unwrap();
             let d = devs.get_mut(device)?;
-            // 不在白名单里的客户端（配对中的除外）立刻断开
+            // Clients not on the allow list (except those pairing) are disconnected immediately
             for a in d.streams.values_mut() {
                 if !a.pairing && !acl.contains(&a.client) {
                     if let Some(k) = a.kill.take() {
@@ -433,7 +433,7 @@ fn on_control(state: &Arc<State>, device: &str, text: &str) -> Option<Value> {
     }
 }
 
-/// 客户端：请 yi-agentd 开一条数据流，对接
+/// Client: ask yi-agentd to open a stream and splice them together
 async fn client(state: Arc<State>, device: String, client_key: [u8; 32], ticket: Option<[u8; 32]>, mut ws: WsIo) {
     let sid = yi_link::random_id();
     let (tx, rx) = oneshot::channel();
@@ -484,7 +484,7 @@ async fn client(state: Arc<State>, device: String, client_key: [u8; 32], ticket:
     }
 }
 
-/// 双向转发数据帧（Ping/Pong 各段自己处理，不转发）；`stop` 完成时两边都断开
+/// Forward data frames both ways (each leg handles its own Ping/Pong, not forwarded); when `stop` fires, both sides disconnect
 async fn splice(a: WsIo, b: WsIo, stop: impl std::future::Future<Output = ()>) {
     let (mut a_tx, mut a_rx) = a.split();
     let (mut b_tx, mut b_rx) = b.split();
@@ -526,7 +526,7 @@ async fn splice(a: WsIo, b: WsIo, stop: impl std::future::Future<Output = ()>) {
 
 #[cfg(test)]
 mod tests {
-    //! 进程内起中继 + 模拟 yi-agentd + 客户端，走完整流程
+    //! Run a relay + simulated yi-agentd + client in-process through the full flow
     use super::*;
     use yi_link::{agent_accept, agent_control, auth::psk_of, auth::ticket_of, client_connect, client_pair, next_control, send_control};
     use yi_link::{AgentLink, Control, Credential, Identity, PairOffer};
@@ -556,7 +556,7 @@ mod tests {
         Relay { url, state }
     }
 
-    /// 模拟 yi-agentd：维护已授权客户端和配对码，处理 open
+    /// Simulated yi-agentd: keeps authorized clients and pairing codes, handles open
     struct Agent {
         link: AgentLink,
         out: mpsc::UnboundedSender<Value>,
@@ -605,7 +605,7 @@ mod tests {
                                     } else if g.0.contains(&h.sign_pub) { Ok(()) } else { Err(anyhow!("未授权")) }
                                 }).await;
                                 if let Ok((mut d, _)) = r {
-                                    // 回显
+                                    // echo
                                     let mut buf = [0u8; 4096];
                                     while let Ok(n) = d.read(&mut buf).await { if n == 0 { break } if d.write_all(&buf[..n]).await.is_err() { break } }
                                 }
@@ -639,35 +639,35 @@ mod tests {
     async fn full_flow() {
         let r = relay(false, false).await;
         let shared: Shared = Default::default();
-        // 没有邀请登记不了
+        // Can't register without an invite
         let e = agent(&r, "", shared.clone()).await.err().unwrap();
         assert!(e.to_string().contains("4403"), "{e}");
         let (_, code) = r.state.store.create_invite(600, 1, "", "admin").unwrap();
         let a = agent(&r, &code, shared.clone()).await.unwrap();
-        // 邀请只能用一次，但已登记的设备不带邀请也能连
+        // An invite works only once, but a registered device can connect without one
         assert!(agent(&r, &code, Default::default()).await.is_err());
         let a2 = AgentLink { relay: r.url.clone(), fp: String::new(), me: a.link.me.clone() };
 
-        // 配对
+        // Pairing
         let pc = yi_link::random_bytes::<32>();
         shared.lock().unwrap().1.push(pc);
         a.out.send(acl(&shared)).unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
         let cred = client_pair(&offer(&a, pc), "phone", None).await.unwrap();
-        // 配对码用过就失效
+        // A pairing code is invalid once used
         assert!(client_pair(&offer(&a, pc), "phone2", None).await.is_err());
-        // 错的配对码
+        // Wrong pairing code
         assert!(client_pair(&offer(&a, yi_link::random_bytes()), "x", None).await.is_err());
         tokio::time::sleep(Duration::from_millis(100)).await;
         let mut d = echo(&cred).await.unwrap();
 
-        // 不在白名单的客户端被中继拒绝
+        // Clients not on the allow list are refused by the relay
         let mut stranger = cred.clone();
         stranger.me = Identity::generate();
         let e = client_connect(&stranger).await.err().unwrap();
         assert!(e.to_string().contains("4403"), "{e}");
 
-        // 同一台设备再配对一次：沿用原来的身份，电脑那边还是同一个客户端，不多出一条
+        // The same device pairs again: it keeps its identity, so it's still the same client on the computer, with no duplicate
         let pc2 = yi_link::random_bytes::<32>();
         shared.lock().unwrap().1.push(pc2);
         a.out.send(acl(&shared)).unwrap();
@@ -678,23 +678,23 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
         drop(echo(&cred2).await.unwrap());
 
-        // 吊销：推新白名单后已有连接被断开，再连也不行
+        // Revocation: after a new allow list is pushed, existing connections are dropped and reconnecting fails
         shared.lock().unwrap().0.clear();
         a.out.send(acl(&shared)).unwrap();
         let mut b = [0u8; 1];
         assert_eq!(tokio::time::timeout(Duration::from_secs(5), d.read(&mut b)).await.unwrap().unwrap(), 0);
         assert!(client_connect(&cred).await.is_err());
 
-        // 设备代发邀请默认关闭
+        // Device-issued invites are off by default
         let (tx, rx) = oneshot::channel();
         *a.invite.lock().unwrap() = Some(tx);
         a.out.send(json!({"type": "invite"})).unwrap();
         assert!(rx.await.unwrap().is_err());
 
-        // 已登记的设备不带邀请也能连（新连接会顶替旧的控制连接，所以放在最后测）
+        // A registered device connects without an invite (the new connection replaces the old control connection, so this is tested last)
         let again = agent_control(&a2, "").await.unwrap();
 
-        // 运营者移除设备：控制连接断开，之后连不上
+        // Operator removes the device: the control connection drops and it can't connect afterwards
         let closed = a.closed.clone();
         let wait = closed.notified();
         r.state.store.revoke(&a.link.device(), false).unwrap();
@@ -724,7 +724,7 @@ mod tests {
 
     #[tokio::test]
     async fn refused_clients_do_not_get_ip_banned() {
-        // 被移除的设备会不停自动重连；它和正常设备常在同一个 NAT 后面，不能因此把 IP 拉黑
+        // A removed device keeps auto-reconnecting; it's often behind the same NAT as healthy devices, so its IP mustn't get banned for it
         let r = relay(true, false).await;
         let shared: Shared = Default::default();
         let ok = Identity::generate();

@@ -4,7 +4,7 @@ import { tr } from '../i18n';
 import { Icon } from './Icon';
 import { imageMenu, saveImage } from './ImageMenu';
 
-// 图片放大查看：滚轮缩放、拖动平移、旋转，Esc 或点空白处关闭
+// Enlarged image view: wheel to zoom, drag to pan, rotate; Esc or clicking empty space closes it
 
 let current: string | null = null;
 const subs = new Set<() => void>();
@@ -96,7 +96,7 @@ function Viewer({ src }: { src: string }) {
       return;
     }
     gesture.current = null;
-    // 没拖动、点在图片外面就关闭
+    // Close on a click outside the image that wasn't a drag
     if (g && !g.moved && (e.target as HTMLElement).tagName !== 'IMG') close();
   };
 

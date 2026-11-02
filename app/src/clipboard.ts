@@ -1,6 +1,6 @@
 import { isTauri } from './transport';
 
-// App 里走 Tauri 的剪贴板插件：WebView 自带的剪贴板接口读取时可能弹权限框或直接失败
+// In the app, use Tauri's clipboard plugin: the WebView's own clipboard API may show a permission prompt or just fail when reading
 export async function readClipboard(trim = true): Promise<string> {
   try {
     const t = isTauri

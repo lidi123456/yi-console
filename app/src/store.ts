@@ -1,6 +1,6 @@
 import { lsGet, lsSet } from './util';
-// 全局状态：主机、会话列表、当前视图放在一个小 store 里；
-// 每个会话的事件流单独存放（量大、变化频繁），按会话粒度通知订阅者。
+// Global state: hosts, session list and the current view live in one small store;
+// each session's event stream is stored separately (large, changes often) and subscribers are notified per session.
 
 import { useSyncExternalStore } from 'react';
 import { tr, trErr } from './i18n';
@@ -10,10 +10,10 @@ import type { ClientSettings, HostConfig, HostStatus, HubEvent, NotifyPrefs, Ses
 export type View =
   | { kind: 'home' }
   | { kind: 'hosts'; editId?: string }
-  /** seq：打开后滚到这条消息（全局搜索跳过来） */
+  /** seq: scroll to this message after opening (jumped here from global search) */
   | { kind: 'session'; hostId: string; sessionId: string; seq?: number }
   | { kind: 'search'; q?: string }
-  /** cwd：只看这个目录（含子目录）下的历史会话 */
+  /** cwd: only history sessions under this directory (including subdirectories) */
   | { kind: 'history'; hostId: string; cwd?: string }
   | { kind: 'files'; hostId: string; path?: string }
   | { kind: 'stats'; hostId: string }
@@ -34,7 +34,7 @@ export interface Toast {
 }
 
 export interface Upgrade {
-  /** waiting：等回合结束；uploading / restarting：升级中，界面暂时不能用 */
+  /** waiting: waiting for the turn to end; uploading / restarting: upgrading, UI temporarily unusable */
   phase: 'waiting' | 'uploading' | 'restarting' | 'done' | 'error';
   message: string;
   progress?: number | null;
@@ -46,7 +46,7 @@ export interface State {
   sessions: Record<string, SessionInfo[]>;
   view: View;
   deploy: Record<string, string[]>;
-  /** yi-agentd 升级进度，按主机 */
+  /** yi-agentd upgrade progress, per host */
   upgrades: Record<string, Upgrade>;
   toasts: Toast[];
   transport: 'open' | 'closed' | 'connecting';
@@ -57,17 +57,17 @@ export interface State {
     tool?: string;
     resumeId?: string;
     title?: string;
-    /** 换个工具继续：原会话的工具（新会话不能再选它）和预填的第一条消息 */
+    /** Continue with another tool: the original session's tool (the new session can't pick it) and the prefilled first message */
     handoff?: { from: ToolKind; prompt: string };
   } | null;
-  /** 这台设备的设置（代理、通知），存在客户端数据目录 */
+  /** This device's settings (proxy, notifications), stored in the client data directory */
   client: ClientSettings | null;
   detectedProxy: string | null;
-  /** Ctrl+K 命令面板 */
+  /** Ctrl+K command palette */
   palette: boolean;
-  /** 桌面端收起侧边栏 */
+  /** Desktop: sidebar collapsed */
   sidebarHidden: boolean;
-  /** 能否后退 / 前进（标题栏按钮） */
+  /** Whether back / forward are possible (title bar buttons) */
   canBack: boolean;
   canForward: boolean;
 }
@@ -119,22 +119,22 @@ export function useStore<T>(sel: (s: State) => T): T {
   );
 }
 
-// ---------- 会话事件流 ----------
+// ---------- Session event streams ----------
 
 export interface SessionData {
   events: HubEvent[];
   seqs: Set<number>;
-  /** 流式中的助手文本：id -> 已收到的文本 */
+  /** Streaming assistant text: id -> text received so far */
   live: Map<string, string>;
-  /** 流式中的思考过程 */
+  /** Streaming thinking */
   liveThinking: Map<string, string>;
   loaded: boolean;
   loading: boolean;
-  /** 打开时只取了最近一段，更早的还在 yi-agentd 上 */
+  /** Opening only fetched the most recent part; older events are still on yi-agentd */
   hasMore: boolean;
   loadingOlder: boolean;
   version: number;
-  /** 终端输出的消费者（TerminalView 挂上来），reset=true 表示先清屏再写快照 */
+  /** Consumer of terminal output (attached by TerminalView); reset=true means clear the screen before writing the snapshot */
   term?: (data: Uint8Array, reset: boolean) => void;
   termBacklog: Uint8Array[];
 }
@@ -201,14 +201,14 @@ function addEvents(key: string, evs: HubEvent[]) {
       if (d.seqs.has(e.seq)) continue;
       d.seqs.add(e.seq);
     }
-    // 最终文本到了，清掉对应的流式缓冲（claude 的块 id 是 "消息id:序号"）
+    // The final text arrived, clear the matching streaming buffer (claude block ids are "messageId:index")
     if (e.kind === 'assistant_text' || e.kind === 'thinking') {
       const m = e.kind === 'thinking' ? d.liveThinking : d.live;
       for (const id of [...m.keys()]) {
         if (e.id === id || e.id.startsWith(id + ':')) m.delete(id);
       }
     }
-    // 思考结束、开始输出正文时，流式思考也就结束了
+    // Once thinking ends and the reply body starts, streaming thinking is over too
     if (e.kind === 'assistant_text' || e.kind === 'tool_call') d.liveThinking.clear();
     if (e.kind === 'turn_end' || (e.kind === 'status' && (e.status === 'exited' || e.status === 'error'))) {
       d.live.clear();
@@ -218,9 +218,9 @@ function addEvents(key: string, evs: HubEvent[]) {
     changed = true;
   }
   if (changed) {
-    // 积压和实时事件可能交错到达，按 seq 排一下
+    // Backlog and live events may arrive interleaved, so sort by seq
     d.events.sort((a, b) => a.seq - b.seq);
-    // /clear 之前的都已删掉：只留最后一次清空之后的，也不用再往前翻
+    // Everything before /clear has been deleted: keep only what's after the last clear, and there's no need to page further back
     let cut = -1;
     for (let i = d.events.length - 1; i >= 0; i--) if (d.events[i].kind === 'cleared') { cut = i; break; }
     if (cut >= 0) {
@@ -251,7 +251,7 @@ function b64(s: string): Uint8Array {
   return out;
 }
 
-/** 打开会话时先取最近多少条事件（系统设置「对话外观」里可调，每台设备自己记）；往上翻每次也取这么多 */
+/** How many recent events to fetch when opening a session (adjustable in system settings under "Chat appearance", remembered per device); paging back fetches this many each time */
 export const TAIL_OPTIONS = [100, 200, 500, 1000];
 export const DEFAULT_TAIL = 200;
 export function historyTail(): number {
@@ -262,7 +262,7 @@ export function setHistoryTail(n: number) {
   lsSet('history-tail', n);
 }
 
-/** 往前翻：取当前最早一条之前的 historyTail() 条 */
+/** Page back: fetch historyTail() events before the current earliest one */
 export async function loadOlder(hostId: string, sid: string) {
   const key = skey(hostId, sid);
   const d = getSession(key);
@@ -289,7 +289,7 @@ export async function loadSession(hostId: string, sid: string, force = false) {
   try {
     let since = 0;
     if (!force) for (const x of d.seqs) if (x > since) since = x;
-    // 第一次打开只取最近 historyTail() 条（默认 200），长会话（工具输出多）经 SSH/中继也能很快打开；更早的往上翻时再取
+    // The first open only fetches the latest historyTail() events (200 by default), so long sessions (lots of tool output) open quickly even over SSH/relay; older ones are fetched when paging back
     const r = await rpc(hostId, 'session.subscribe', { sessionId: sid, sinceSeq: since, ...(since === 0 ? { tail: historyTail() } : {}) });
     if (since === 0) d.hasMore = !!r.hasMore;
     if (force) {
@@ -318,9 +318,9 @@ const catching = new Set<string>();
 const lastCatch = new Map<string, number>();
 
 /**
- * 按界面上实际有的最大 seq 补拉打开过的会话。重连时 ClientHub 也会补，但它按自己收到的 seq 算：
- * 手机切后台时 WebView 被暂停，事件到了 Rust 却没进界面，或者重连补拉失败被它取消了订阅，都会让会话停在旧内容。
- * 失败就标成未加载，下次打开（或正在看的会话页）重新加载
+ * Catch up the opened sessions from the largest seq actually in the UI. ClientHub also catches up on reconnect, but it counts from the seq it received itself:
+ * when the WebView is paused while the phone is in the background, events reach Rust but not the UI, or a failed catch-up on reconnect makes it drop the subscription, leaving the session stuck on old content.
+ * On failure, mark it unloaded so it reloads next time it's opened (or on the session page currently being viewed)
  */
 async function catchUp(hostId: string, sid: string) {
   const key = skey(hostId, sid);
@@ -345,7 +345,7 @@ function catchUpHost(hostId: string) {
   for (const key of sessionData.keys()) if (key.startsWith(prefix)) catchUp(hostId, key.slice(prefix.length));
 }
 
-// 回到前台（手机从后台切回、桌面从最小化恢复）时补一次
+// Catch up once when returning to the foreground (phone back from background, desktop restored from minimized)
 if (typeof document !== 'undefined') {
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState !== 'visible') return;
@@ -353,7 +353,7 @@ if (typeof document !== 'undefined') {
   });
 }
 
-// ---------- 主机与会话列表 ----------
+// ---------- Hosts and session list ----------
 
 export async function refreshHosts() {
   const r = await hubCall<{ hosts: HostEntry[]; localSupported: boolean }>('hosts.list');
@@ -368,7 +368,7 @@ export async function refreshSessions(hostId: string) {
     const list = await rpc<SessionInfo[]>(hostId, 'session.list');
     setState((s) => ({ sessions: { ...s.sessions, [hostId]: list } }));
   } catch {
-    /* 主机未连接 */
+    /* host not connected */
   }
 }
 
@@ -391,7 +391,7 @@ export function sessionInfo(hostId: string, sid: string): SessionInfo | undefine
   return state.sessions[hostId]?.find((s) => s.id === sid);
 }
 
-/** 按侧边栏的顺序排好的所有会话（切换上一个 / 下一个会话用） */
+/** All sessions in sidebar order (for switching to the previous / next session) */
 export function orderedSessions(): { hostId: string; s: SessionInfo }[] {
   const out: { hostId: string; s: SessionInfo }[] = [];
   for (const h of state.hosts) {
@@ -402,7 +402,7 @@ export function orderedSessions(): { hostId: string; s: SessionInfo }[] {
   return out;
 }
 
-/** 主机设置里的提示词片段，按主机缓存 */
+/** Prompt snippets from host settings, cached per host */
 const snippetCache = new Map<string, Promise<Snippet[]>>();
 
 export function hostSnippets(hostId: string): Promise<Snippet[]> {
@@ -419,7 +419,7 @@ export function invalidateSnippets(hostId: string) {
   snippetCache.delete(hostId);
 }
 
-// ---------- 提示与通知 ----------
+// ---------- Toasts and notifications ----------
 
 let toastId = 1;
 
@@ -429,7 +429,7 @@ export function toast(text: string, kind: Toast['kind'] = 'info', action?: Toast
   setTimeout(() => setState((s) => ({ toasts: s.toasts.filter((x) => x.id !== t.id) })), kind === 'error' ? 8000 : 4000);
 }
 
-/// 把各种报错变成一句话：Tauri 手机插件 reject 的是 {message, code} 这样的对象
+/// Turn all kinds of errors into one sentence: Tauri mobile plugins reject with objects like {message, code}
 export function errText(e: unknown): string {
   if (e instanceof Error) return trErr(e.message);
   if (typeof e === 'string') return trErr(e);
@@ -439,7 +439,7 @@ export function errText(e: unknown): string {
     try {
       return JSON.stringify(e);
     } catch {
-      /* 循环引用之类，退回 String */
+      /* circular references and such: fall back to String */
     }
   }
   return trErr(String(e));
@@ -456,11 +456,11 @@ export async function loadClientSettings() {
     const r = await hubCall<{ settings: ClientSettings; detectedProxy: string | null }>('client.getSettings');
     setState({ client: { ...r.settings, notify: { ...DEFAULT_NOTIFY, ...(r.settings.notify ?? {}) } }, detectedProxy: r.detectedProxy });
   } catch {
-    /* 旧版客户端核心没有这个命令 */
+    /* older client core doesn't have this command */
   }
 }
 
-/** 只改传进来的部分，返回保存后的完整设置 */
+/** Only change the given parts; returns the full settings after saving */
 export async function saveClientSettings(patch: Partial<ClientSettings>) {
   const r = await hubCall<{ settings: ClientSettings; detectedProxy: string | null }>('client.setSettings', { settings: patch });
   setState({ client: { ...r.settings, notify: { ...DEFAULT_NOTIFY, ...(r.settings.notify ?? {}) } }, detectedProxy: r.detectedProxy });
@@ -469,7 +469,7 @@ export async function saveClientSettings(patch: Partial<ClientSettings>) {
 
 let notifyAllowed: boolean | null = null;
 
-/** 查询（必要时申请）系统通知权限；返回 granted / denied / unsupported */
+/** Query (and request if needed) the system notification permission; returns granted / denied / unsupported */
 export async function notifyPermission(ask: boolean): Promise<'granted' | 'denied' | 'default' | 'unsupported'> {
   try {
     if (isTauri) {
@@ -487,7 +487,7 @@ export async function notifyPermission(ask: boolean): Promise<'granted' | 'denie
   }
 }
 
-/** 通知点哪个会话：点系统通知时把窗口拉到前面并打开它 */
+/** Which session a notification points at: clicking the system notification brings the window to front and opens it */
 type NotifyTarget = { hostId: string; sessionId: string };
 
 async function focusWindow() {
@@ -504,7 +504,7 @@ function openTarget(t: NotifyTarget) {
   navigate({ kind: 'session', hostId: t.hostId, sessionId: t.sessionId });
 }
 
-/** 桌面端只有发通知时已经有 onAction 监听，点击才会回报，所以第一次发之前先注册 */
+/** On desktop, clicks are only reported if an onAction listener exists when the notification is sent, so register before the first one */
 let actionListener: Promise<unknown> | null = null;
 function listenNotifyClick(n: typeof import('@tauri-apps/plugin-notification')) {
   actionListener ??= n
@@ -538,11 +538,11 @@ export async function systemNotify(title: string, body: string, target?: NotifyT
         };
     }
   } catch {
-    /* 通知不可用时忽略 */
+    /* ignore when notifications are unavailable */
   }
 }
 
-// 页面前进后退：自己记一份，不走浏览器 history（Tauri 里没有地址栏，网页版刷新后也不想回到很久以前）
+// Page back/forward: we keep our own record instead of browser history (Tauri has no address bar, and in the web build a refresh shouldn't go back to long ago)
 const past: View[] = [];
 const future: View[] = [];
 const sameView = (a: View, b: View) => JSON.stringify(a) === JSON.stringify(b);
@@ -570,7 +570,7 @@ export function toggleSidebar() {
   try {
     localStorage.setItem('yi-console-sidebar-hidden', hidden ? '1' : '0');
   } catch {
-    /* 存储不可用 */
+    /* storage unavailable */
   }
 }
 
@@ -591,11 +591,11 @@ function show(view: View) {
     const { seq: _seq, ...keep } = view as View & { seq?: number };
     localStorage.setItem('yi-console-view', JSON.stringify(keep));
   } catch {
-    /* 存储不可用 */
+    /* storage unavailable */
   }
 }
 
-// ---------- 事件入口 ----------
+// ---------- Event entry point ----------
 
 export function startEventLoop() {
   onHubEvent((ev) => {
@@ -661,7 +661,7 @@ function onNotification(hostId: string, method: string, p: any) {
       const d = sessionData.get(key);
       const before = d?.loaded ? maxSeq(d) : 0;
       addEvents(key, [p.event]);
-      // seq 在每个会话里连续编号：接不上说明中间漏了，补一次（5 秒内不重复补）
+      // seq is consecutive within each session: a gap means something was missed, so catch up once (not again within 5 s)
       const seq = p.event?.seq ?? 0;
       if (before > 0 && seq > before + 1 && Date.now() - (lastCatch.get(key) ?? 0) > 5000) catchUp(hostId, p.sessionId);
       break;
@@ -680,11 +680,11 @@ function onNotification(hostId: string, method: string, p: any) {
       const prefs = state.client?.notify ?? DEFAULT_NOTIFY;
       const v = state.view;
       const viewing = v.kind === 'session' && v.hostId === hostId && v.sessionId === p.sessionId;
-      // 窗口在后面（被别的窗口挡住、最小化）也算不在看，所以用 hasFocus 而不只是 hidden
+      // A window behind others (covered, minimized) also counts as not watching, hence hasFocus rather than just hidden
       const away = document.hidden || !document.hasFocus() || !viewing;
       const want = p.kind === 'permission' ? prefs.onPermission : prefs.onTurnEnd;
       if (prefs.enabled && want && (prefs.when === 'always' || away)) systemNotify(p.title, p.body || '', { hostId, sessionId: p.sessionId });
-      // 应用内提示：在别的会话里时提醒一下
+      // In-app toast: remind the user when they're in another session
       if (!viewing) {
         toast(p.title, 'info', {
           label: tr('查看', 'View'),
@@ -701,6 +701,6 @@ export function restoreView() {
     const v = JSON.parse(localStorage.getItem('yi-console-view') || 'null');
     if (v && v.kind) setState({ view: v });
   } catch {
-    /* 忽略 */
+    /* ignore */
   }
 }

@@ -7,14 +7,14 @@ pub fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-/// 不引入 chrono，只为日志和日期分组手写一个 UTC 格式化
+/// No chrono dependency; a hand-written UTC formatter just for logs and date grouping
 pub fn now_rfc3339() -> String {
     let ms = now_ms();
     let (y, mo, d, h, mi, s) = civil(ms / 1000);
     format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}.{:03}Z", ms % 1000)
 }
 
-/// 毫秒时间戳 -> "YYYY-MM-DD"（按给定时区偏移分钟）
+/// Millisecond timestamp -> "YYYY-MM-DD" (with the given timezone offset in minutes)
 pub fn day_of(ms: i64, tz_offset_min: i64) -> String {
     let (y, mo, d, ..) = civil(ms / 1000 + tz_offset_min * 60);
     format!("{y:04}-{mo:02}-{d:02}")
@@ -23,7 +23,7 @@ pub fn day_of(ms: i64, tz_offset_min: i64) -> String {
 fn civil(secs: i64) -> (i64, u32, u32, u32, u32, u32) {
     let days = secs.div_euclid(86400);
     let rem = secs.rem_euclid(86400);
-    // Howard Hinnant 的 civil_from_days
+    // Howard Hinnant's civil_from_days
     let z = days + 719468;
     let era = z.div_euclid(146097);
     let doe = z.rem_euclid(146097);
@@ -44,7 +44,7 @@ fn civil(secs: i64) -> (i64, u32, u32, u32, u32, u32) {
     )
 }
 
-/// 解析 RFC3339 / ISO8601 时间（只处理 UTC 的 `Z` 和 `+hh:mm` 偏移），失败返回 None
+/// Parse an RFC3339 / ISO8601 time (only UTC `Z` and `+hh:mm` offsets); None on failure
 pub fn parse_iso(s: &str) -> Option<i64> {
     let b = s.as_bytes();
     if b.len() < 19 {
@@ -83,7 +83,7 @@ pub fn parse_iso(s: &str) -> Option<i64> {
     Some(((days * 86400 + h * 3600 + mi * 60 + sec) - offset * 60) * 1000 + ms)
 }
 
-/// 含密钥的文件只给自己读写
+/// Files containing secrets are readable and writable only by the owner
 pub fn restrict_file(p: &std::path::Path) {
     #[cfg(unix)]
     {
@@ -94,7 +94,7 @@ pub fn restrict_file(p: &std::path::Path) {
     let _ = p;
 }
 
-/// 截断过长的字符串（按字符边界）
+/// Truncate overly long strings (on character boundaries)
 pub fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         return s.to_string();

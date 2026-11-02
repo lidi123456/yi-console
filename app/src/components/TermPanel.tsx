@@ -7,8 +7,8 @@ import { lsGet, lsSet } from '../util';
 import { Icon } from './Icon';
 import { TermTools, TerminalView } from './TerminalView';
 
-// 会话页底部的终端面板：在对话的工作目录里开 shell，可以开多个，用标签切换。
-// 每个终端是一个 parentId 指向对话会话的 shell 会话，侧边栏不单独列出，删对话时一起删
+// Terminal panel at the bottom of the session page: opens shells in the chat's working directory; several can be open, switched with tabs.
+// Each terminal is a shell session whose parentId points at the chat session; not listed separately in the sidebar, deleted along with the chat
 
 const EMPTY: SessionInfo[] = [];
 
@@ -50,7 +50,7 @@ export function TermPanel({ hostId, info, onClose }: { hostId: string; info: Ses
 
   const remove = (id: string) => rpc(hostId, 'session.delete', { sessionId: id }).catch(errorToast);
 
-  // 第一次打开、一个终端都没有时自动开一个
+  // Open one automatically the first time if there are no terminals
   const auto = useRef(false);
   useEffect(() => {
     if (auto.current || tabs.length) return;
@@ -63,7 +63,7 @@ export function TermPanel({ hostId, info, onClose }: { hostId: string; info: Ses
     if (cur) loadSession(hostId, cur.id).catch(() => {});
   }, [hostId, cur?.id]);
 
-  // ---------- 拖上边缘调整高度 ----------
+  // ---------- Drag the top edge to resize ----------
   const [h, setH] = useState(() => lsGet('term-panel-h', 280));
   const box = useRef<HTMLDivElement>(null);
   const drag = (e: React.PointerEvent) => {

@@ -1,25 +1,25 @@
-//! 端口转发（主机这一端）：列出正在监听的 TCP 端口，以及把一条连接接到本机的某个端口。
+//! Port forwarding (host side): list listening TCP ports, and connect a connection to a local port.
 //!
-//! `port.connect` 和 `proxy.connect` 一样是连接的第一条消息：回一行结果后，这条连接的字节
-//! 原样转给 127.0.0.1:port。只连本机回环地址，不能拿来访问别的机器。yi-agentd 自己仍然不监听端口，
-//! 本地端口由客户端开（见 crates/client/src/forward.rs）。
+//! Like `proxy.connect`, `port.connect` is the first message on a connection: after a one-line reply, the connection's bytes
+//! are relayed as is to 127.0.0.1:port. Only local loopback is reachable, so it can't be used to reach other machines. yi-agentd itself still listens on no ports;
+//! the local port is opened by the client (see crates/client/src/forward.rs).
 
 use anyhow::{bail, Result};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use tokio::io::{AsyncBufRead, AsyncRead, AsyncWrite, AsyncWriteExt};
 
-/// 一个监听中的端口
+/// A listening port
 #[derive(Debug, Clone, PartialEq)]
 pub struct Listen {
     pub port: u16,
-    /// 监听地址：127.0.0.1、0.0.0.0、::、::1 等
+    /// Listen address: 127.0.0.1, 0.0.0.0, ::, ::1, etc.
     pub addr: String,
     pub pid: Option<u32>,
     pub process: Option<String>,
 }
 
-/// ports.list：本机正在监听的 TCP 端口（同一端口多个地址合并成一条）
+/// ports.list: TCP ports listening on this machine (multiple addresses for one port merged into one entry)
 pub fn list() -> Result<Value> {
     let mut v = listening()?;
     v.sort_by_key(|l| l.port);
@@ -31,7 +31,7 @@ pub fn list() -> Result<Value> {
                     e.process = l.process.clone();
                     e.pid = l.pid;
                 }
-                // 只要有一个地址对外，就按对外显示
+                // If any address is externally reachable, show it as external
                 if !is_loopback(&l.addr) {
                     e.addr = l.addr.clone();
                 }
@@ -70,7 +70,7 @@ fn listening() -> Result<Vec<Listen>> {
             }
         }
     }
-    // 按 socket inode 找进程：只看得到自己用户的进程，别人的留空
+    // Find processes by socket inode: only our own user's processes are visible; others are left blank
     if let Ok(rd) = std::fs::read_dir("/proc") {
         for e in rd.flatten() {
             let Ok(pid) = e.file_name().to_string_lossy().parse::<u32>() else { continue };
@@ -102,7 +102,7 @@ fn proc_name(pid: u32) -> Option<String> {
         .collect();
     let first = args.first()?;
     let base = first.rsplit('/').next().unwrap_or(first).to_string();
-    // node / python 这类解释器带上脚本名，更好认
+    // For interpreters like node / python, include the script name so it's easier to recognize
     let script = args.iter().skip(1).find(|a| !a.starts_with('-')).map(|a| a.rsplit('/').next().unwrap_or(a).to_string());
     Some(match script {
         Some(s) if ["node", "python", "python3", "deno", "bun", "ruby", "java"].contains(&base.as_str()) => format!("{base} {s}"),
@@ -110,7 +110,7 @@ fn proc_name(pid: u32) -> Option<String> {
     })
 }
 
-/// /proc/net/tcp 的一行：`sl local_address rem_address st ... inode`，st=0A 是 LISTEN
+/// A line of /proc/net/tcp: `sl local_address rem_address st ... inode`; st=0A is LISTEN
 #[cfg(any(target_os = "linux", test))]
 fn parse_proc_line(l: &str, v6: bool) -> Option<(Listen, u64)> {
     let f: Vec<&str> = l.split_whitespace().collect();
@@ -124,7 +124,7 @@ fn parse_proc_line(l: &str, v6: bool) -> Option<(Listen, u64)> {
         if b.len() != 16 {
             return None;
         }
-        // 每 4 字节是小端的 32 位
+        // Every 4 bytes is a little-endian 32-bit word
         let mut o = [0u8; 16];
         for w in 0..4 {
             for k in 0..4 {
@@ -146,7 +146,7 @@ fn parse_proc_line(l: &str, v6: bool) -> Option<(Listen, u64)> {
 
 #[cfg(target_os = "macos")]
 fn listening() -> Result<Vec<Listen>> {
-    // lsof -F：p<pid> c<命令> n<地址:端口>
+    // lsof -F: p<pid> c<command> n<addr:port>
     let o = std::process::Command::new("lsof").args(["-nP", "-iTCP", "-sTCP:LISTEN", "-FpcnT"]).output()?;
     let mut out = Vec::new();
     let (mut pid, mut cmd) = (None, None);
@@ -189,7 +189,7 @@ fn listening() -> Result<Vec<Listen>> {
         }
     }
     let mut out = Vec::new();
-    // netstat 的状态列会本地化，按「远端地址是 0.0.0.0:0 / [::]:0」认监听
+    // netstat's state column is localized, so recognize listeners by "remote address is 0.0.0.0:0 / [::]:0"
     for l in run(&["netstat", "-ano", "-p", "TCP"])?.lines().chain(run(&["netstat", "-ano", "-p", "TCPv6"])?.lines()) {
         let f: Vec<&str> = l.split_whitespace().collect();
         if f.len() < 5 || !f[0].starts_with("TCP") || !(f[2] == "0.0.0.0:0" || f[2] == "[::]:0") {
@@ -213,7 +213,7 @@ fn listening() -> Result<Vec<Listen>> {
     Ok(Vec::new())
 }
 
-/// 连本机端口：先试 IPv4 回环，再试 IPv6（有的开发服务器只监听 ::1）
+/// Connect to a local port: try IPv4 loopback first, then IPv6 (some dev servers only listen on ::1)
 pub async fn dial(port: u16) -> Result<tokio::net::TcpStream> {
     if port == 0 {
         bail!("端口无效");
@@ -227,7 +227,7 @@ pub async fn dial(port: u16) -> Result<tokio::net::TcpStream> {
     }
 }
 
-/// 处理 port.connect：先回一行结果，成功后双向转发直到任一方断开
+/// Handle port.connect: reply with one result line first, then relay both ways until either side disconnects
 pub async fn serve<R, W>(mut r: R, mut w: W, id: u64, port: u16)
 where
     R: AsyncBufRead + AsyncRead + Unpin + Send + 'static,
@@ -267,7 +267,7 @@ mod tests {
         let l = "   0: 0100007F:0BB8 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 12345 1 0000000000000000 100 0 0 10 0";
         let (x, ino) = parse_proc_line(l, false).unwrap();
         assert_eq!((x.port, x.addr.as_str(), ino), (3000, "127.0.0.1", 12345));
-        // 已建立的连接不算
+        // Established connections don't count
         assert!(parse_proc_line(&l.replace(" 0A ", " 01 "), false).is_none());
         // [::1]:5173
         let l6 = "   0: 00000000000000000000000001000000:1435 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 999 1";

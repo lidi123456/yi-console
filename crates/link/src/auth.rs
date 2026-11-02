@@ -1,13 +1,13 @@
-//! 中继层鉴权协议，yi-agentd、客户端、中继三方共用。
+//! Relay-layer authentication protocol, shared by yi-agentd, the client and the relay.
 //!
-//! WebSocket 升级后：
+//! After the WebSocket upgrade:
 //! ```text
-//! 中继 → 对端  {"type":"challenge","v":2,"nonce":"<32 字节 b64>"}
-//! 对端 → 中继  {"type":"auth","role":"agent|stream|client","device":"..","pub":"..","sig":"..",
+//! relay → peer  {"type":"challenge","v":2,"nonce":"<32 bytes b64>"}
+//! peer → relay  {"type":"auth","role":"agent|stream|client","device":"..","pub":"..","sig":"..",
 //!              "stream"?: "..", "invite"?: "..", "ticket"?: ".."}
-//! 中继 → 对端  {"type":"ok"}，失败直接用 close code + 原因关闭
+//! relay → peer  {"type":"ok"}; on failure it closes with a close code + reason
 //! ```
-//! 签名内容见 [`signed_payload`]，绑定角色、设备、数据流和这次的随机数，不能挪用或重放。
+//! See [`signed_payload`] for what is signed: it binds the role, device, stream and this nonce, so it can't be reused or replayed.
 
 use crate::{b64, sha256, unb64, unb64_32};
 use anyhow::{anyhow, bail, Result};
@@ -17,15 +17,15 @@ pub const ROLE_AGENT: &str = "agent";
 pub const ROLE_STREAM: &str = "stream";
 pub const ROLE_CLIENT: &str = "client";
 
-/// 签名错、格式错
+/// Bad signature, malformed
 pub const CLOSE_UNAUTHORIZED: u16 = 4401;
-/// 身份没问题，但没有权限（设备未登记、客户端不在白名单、邀请无效）
+/// Identity is fine but not permitted (device not registered, client not on the allow list, invalid invite)
 pub const CLOSE_FORBIDDEN: u16 = 4403;
 pub const CLOSE_OFFLINE: u16 = 4004;
 pub const CLOSE_NO_RESPONSE: u16 = 4008;
-/// 连接数超限
+/// Too many connections
 pub const CLOSE_BUSY: u16 = 4029;
-/// 被吊销
+/// Revoked
 pub const CLOSE_REVOKED: u16 = 4410;
 
 const CTX: &[u8] = b"yi-console relay auth v2";
@@ -34,7 +34,7 @@ pub fn challenge_msg(nonce: &[u8; 32]) -> String {
     json!({"type": "challenge", "v": 2, "nonce": b64(nonce)}).to_string()
 }
 
-/// 被签名的内容：各字段带长度前缀拼接，避免 "ab"+"c" 和 "a"+"bc" 混淆
+/// Signed content: fields are concatenated with length prefixes so "ab"+"c" can't be confused with "a"+"bc"
 pub fn signed_payload(role: &str, device: &str, stream: &str, nonce: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(160);
     for part in [CTX, role.as_bytes(), device.as_bytes(), stream.as_bytes(), nonce] {
@@ -51,12 +51,12 @@ pub fn verify(pub_key: &[u8; 32], sig: &[u8; 64], msg: &[u8]) -> bool {
     vk.verify_strict(msg, &ed25519_dalek::Signature::from_bytes(sig)).is_ok()
 }
 
-/// 配对票据：中继只知道它，推不出 Noise 用的 psk
+/// Pairing ticket: the relay only knows this and can't derive the psk used by Noise
 pub fn ticket_of(code: &[u8; 32]) -> [u8; 32] {
     sha256(&[b"yi-console pair ticket", code])
 }
 
-/// 配对握手（IKpsk2）的 psk
+/// psk for the pairing handshake (IKpsk2)
 pub fn psk_of(code: &[u8; 32]) -> [u8; 32] {
     let hk = hkdf::Hkdf::<sha2::Sha256>::new(Some(b"yi-console pair psk"), code);
     let mut out = [0u8; 32];
@@ -64,12 +64,12 @@ pub fn psk_of(code: &[u8; 32]) -> [u8; 32] {
     out
 }
 
-/// 邀请码在中继上只存这个哈希
+/// The relay stores only this hash of an invite code
 pub fn invite_hash(code: &str) -> [u8; 32] {
     sha256(&[b"yi-console invite", code.trim().as_bytes()])
 }
 
-/// 解析后的 auth 消息
+/// Parsed auth message
 #[derive(Debug, Clone)]
 pub struct AuthRequest {
     pub role: String,
@@ -120,7 +120,7 @@ mod tests {
         let v = json!({"type":"auth","role":ROLE_CLIENT,"device":"dev","pub":b64(&id.sign_pub()),"sig":b64(&sig)});
         let r = AuthRequest::parse(&v).unwrap();
         assert!(r.verify(&nonce));
-        // 换个随机数（重放）、换个角色都不行
+        // A different nonce (replay) or a different role must both fail
         assert!(!r.verify(&crate::random_bytes::<32>()));
         let mut r2 = r.clone();
         r2.role = ROLE_AGENT.into();

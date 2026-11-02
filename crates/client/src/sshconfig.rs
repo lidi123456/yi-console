@@ -1,4 +1,4 @@
-//! 解析 ~/.ssh/config，导入成主机配置候选（只处理常用字段，忽略通配符 Host）。
+//! Parse ~/.ssh/config and import it as host config candidates (common fields only, wildcard Host entries ignored).
 
 use serde::Serialize;
 

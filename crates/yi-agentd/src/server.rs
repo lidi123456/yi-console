@@ -1,4 +1,4 @@
-//! 单个客户端连接：按行读 JSON-RPC 请求、分发，同时把 hub 的广播转给这个连接。
+//! A single client connection: read JSON-RPC requests line by line and dispatch them, while forwarding the hub's broadcasts to this connection.
 
 use crate::adapters::AdapterCmd;
 use crate::hub::{CreateParams, Hub};
@@ -32,7 +32,7 @@ where
         crate::info!("client disconnected ({peer})");
         return;
     }
-    // SSH 进来的 `yi-agentd bridge` 先报一行标记：本地 IPC 上的这条连接其实是远程的
+    // `yi-agentd bridge` coming in over SSH first sends a marker line: this connection on local IPC is actually remote
     let mut peer = peer;
     if peer == "local" && first.trim() == yi_proto::BRIDGE_REMOTE_MARK {
         peer = "ssh";
@@ -42,7 +42,7 @@ where
         }
     }
     crate::info!("client connected ({peer})");
-    // 第一条是 proxy.connect 的话，这条连接整个转给目标主机（见 proxy.rs）
+    // If the first message is proxy.connect, the whole connection is handed to the target host (see proxy.rs)
     if let Ok(req) = serde_json::from_str::<Request>(&first) {
         if req.method == methods::PROXY_CONNECT {
             let target = req.params["hostId"].as_str().unwrap_or("").to_string();
@@ -65,7 +65,7 @@ where
             if w.write_all(line.as_bytes()).await.is_err() {
                 break;
             }
-            // 尽量合并：队列里还有就先不 flush
+            // Batch where possible: don't flush while more is queued
             if out_rx.is_empty() && w.flush().await.is_err() {
                 break;
             }
@@ -93,7 +93,7 @@ where
                     }
                 }
                 Err(broadcast::error::RecvError::Lagged(_)) => {
-                    // 客户端太慢丢了消息：让它按 lastSeq 重新订阅
+                    // The client was too slow and dropped messages: have it resubscribe from lastSeq
                     let n = Notification {
                         method: "resync".into(),
                         params: json!({}),
@@ -131,11 +131,11 @@ where
         let local = peer == "local";
         tokio::spawn(async move {
             let id = req.id;
-            // 主机凭据只能由本机的桌面客户端写入，经中继、SSH 连进来的设备不行
+            // Host credentials can only be written by the desktop client on this machine, not by devices coming in through the relay or SSH
             let r = if req.method == methods::PROXY_SET_HOSTS && !local {
                 Err(anyhow!("只能由本机客户端同步主机"))
             } else if req.method == methods::FS_OPEN && !local {
-                // 远程设备不能在这台电脑上拉起程序
+                // Remote devices can't launch programs on this computer
                 Err(anyhow!("只能在本机打开文件"))
             } else if req.method == methods::FS_OPEN {
                 let p = &req.params;
@@ -210,10 +210,10 @@ pub async fn dispatch(
         SESSION_SUBSCRIBE => {
             let sid = s(&p, "sessionId")?.to_string();
             let since = p["sinceSeq"].as_i64().unwrap_or(0);
-            // 先登记订阅再取积压，中间产生的事件可能重复，客户端按 seq 去重
+            // Register the subscription before fetching the backlog; events in between may be duplicated, and clients dedupe by seq
             subs.lock().unwrap().insert(sid.clone());
             let info = hub.info(&sid)?;
-            // 首次打开时可以只要最近 tail 条，更早的用 session.history 往前翻
+            // On first open, only the latest tail events may be requested; older ones are paged in with session.history
             let tail = p["tail"].as_u64().filter(|_| since == 0);
             let mut r = match tail {
                 Some(n) => {
@@ -362,7 +362,7 @@ pub async fn dispatch(
             let tool = ToolKind::parse(s(&p, "tool")?).ok_or_else(|| anyhow!("未知工具"))?;
             let cached = hub.cached_models(tool);
             if cached.is_empty() {
-                // 还没用过这个工具：起一个临时进程问一下
+                // This tool hasn't been used yet: start a temporary process to ask
                 let settings = hub.settings.read().unwrap().clone();
                 let models = crate::probe::models(tool, &settings).await.unwrap_or_default();
                 hub.remember_models(tool, &models);
@@ -499,7 +499,7 @@ pub async fn dispatch(
         FS_DELETE => crate::fsapi::delete(s(&p, "path")?)?,
         FS_ROOTS => tokio::task::spawn_blocking(crate::fsapi::roots).await?,
         STATS_USAGE => {
-            // 第一次要扫一遍 Claude / Codex 的日志，放到阻塞线程里
+            // The first time requires scanning Claude / Codex logs, so do it on a blocking thread
             let h = hub.clone();
             let (days, tz) = (p["days"].as_i64().unwrap_or(30), p["tzOffset"].as_i64().unwrap_or(0));
             tokio::task::spawn_blocking(move || crate::stats::usage(&h.store, days, tz)).await??

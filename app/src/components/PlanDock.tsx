@@ -5,7 +5,7 @@ import type { HubEvent } from '../types';
 import { PlanList } from './ChatView';
 import { Icon } from './Icon';
 
-/** 输入框上方的任务进度：还有没完成的任务时显示一行「任务 3/7 · 正在：…」，点开看完整清单；全部完成后消失 */
+/** Task progress above the input box: while tasks remain, one line "Tasks 3/7 · Now: …", click for the full list; disappears when all are done */
 export function PlanDock({ events, busy }: { events: HubEvent[]; busy: boolean }) {
   const plan = useMemo(() => latestPlan(events), [events, events.length]);
   const [open, setOpen] = useState(false);

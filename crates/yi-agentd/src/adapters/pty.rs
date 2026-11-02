@@ -1,4 +1,4 @@
-//! 终端模式：用 PTY 跑任意 CLI，输出原样转给客户端的 xterm.js。
+//! Terminal mode: run any CLI in a PTY and pass the output as is to the client's xterm.js.
 
 use super::{AdapterCmd, StartSpec};
 use crate::hub::Emitter;
@@ -7,7 +7,7 @@ use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use std::io::{Read, Write};
 use tokio::sync::mpsc;
 
-/// 各工具交互模式的启动参数（含 resume）
+/// Launch arguments for each tool's interactive mode (including resume)
 pub fn interactive_args(spec: &StartSpec) -> Vec<String> {
     let mut a: Vec<String> = vec![];
     let model = spec.model.as_ref().filter(|m| !m.is_empty());
@@ -51,9 +51,9 @@ pub fn interactive_args(spec: &StartSpec) -> Vec<String> {
             if let Some(r) = &spec.resume {
                 a.extend(["--resume".into(), r.clone()]);
             }
-            // 不传 --model：对话模式（ACP）的模型 id 带参数（grok-4.7[reasoning_effort=high,fast=true]），
-            // 交互界面在 Windows 上常报「Cannot use this model」。不传时用 Cursor 自己记的上次选择
-            // （~/.cursor/cli-config.json 的 selectedModel，和 ACP 共用），终端里也能用 /model 换
+            // Don't pass --model: chat-mode (ACP) model ids carry parameters (grok-4.7[reasoning_effort=high,fast=true]),
+            // and the interactive UI often reports "Cannot use this model" on Windows. Without it, Cursor uses its own last choice
+            // (selectedModel in ~/.cursor/cli-config.json, shared with ACP), and /model still works in the terminal
             if spec.permission_mode == "bypass" {
                 a.push("--force".into());
             }
@@ -174,14 +174,14 @@ pub fn start(spec: StartSpec, em: Emitter, mut rx: mpsc::UnboundedReceiver<Adapt
     let mut killer = child.clone_killer();
     em.status(SessionStatus::Running, None);
 
-    // 读输出：阻塞线程
+    // Reading output: blocking thread
     let em_r = em.clone();
     let (reply_tx, mut reply_rx) = mpsc::unbounded_channel::<Vec<u8>>();
     std::thread::spawn(move || {
         let mut buf = [0u8; 16 * 1024];
-        // Windows ConPTY 启动时先发 ESC[6n 查询光标位置，收到回应前不往下执行。
-        // 没有客户端在看时会一直卡住；查询留在终端缓冲里，重连回放时 xterm 还会再答一次，
-        // 答案被当成键盘输入打进 shell。所以第一次由这里代答，并且不转发给客户端。
+        // Windows ConPTY sends ESC[6n at startup to query the cursor position and doesn't continue until it gets an answer.
+        // With no client watching it would hang forever; and the query left in the terminal buffer gets answered again by xterm on reconnect replay,
+        // typing the answer into the shell as keyboard input. So the first one is answered here and not forwarded to clients.
         let mut startup_dsr = cfg!(windows);
         loop {
             match reader.read(&mut buf) {
@@ -203,7 +203,7 @@ pub fn start(spec: StartSpec, em: Emitter, mut rx: mpsc::UnboundedReceiver<Adapt
         }
     });
 
-    // 等待退出：阻塞线程
+    // Waiting for exit: blocking thread
     let em_w = em.clone();
     let (done_tx, mut done_rx) = tokio::sync::oneshot::channel::<()>();
     std::thread::spawn(move || {
@@ -213,7 +213,7 @@ pub fn start(spec: StartSpec, em: Emitter, mut rx: mpsc::UnboundedReceiver<Adapt
             Ok(s) => Some(format!("进程退出，退出码 {}", s.exit_code())),
             Err(e) => Some(format!("等待进程失败: {e}")),
         };
-        // 给读线程一点时间把最后的输出推出去
+        // Give the reader thread a moment to push out the last output
         std::thread::sleep(std::time::Duration::from_millis(200));
         em_w.exited(msg);
         let _ = done_tx.send(());
@@ -245,7 +245,7 @@ pub fn start(spec: StartSpec, em: Emitter, mut rx: mpsc::UnboundedReceiver<Adapt
                         let _ = writer.flush();
                     }
                     Some(AdapterCmd::Kill) => {
-                        // 用户主动结束：tmux 里的程序也一起结束
+                        // Ended by the user: the program in tmux ends too
                         if let Some((_, name)) = &tmux {
                             crate::tmux::kill(name);
                         }
@@ -263,7 +263,7 @@ pub fn start(spec: StartSpec, em: Emitter, mut rx: mpsc::UnboundedReceiver<Adapt
     });
 }
 
-/// 去掉数据里第一个光标位置查询（ESC[6n），没有就返回 None
+/// Strip the first cursor position query (ESC[6n) from the data; None if there isn't one
 fn strip_first_dsr(data: &[u8]) -> Option<Vec<u8>> {
     const DSR: &[u8] = b"\x1b[6n";
     let i = data.windows(DSR.len()).position(|w| w == DSR)?;

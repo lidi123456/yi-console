@@ -1,4 +1,4 @@
-//! yi-agentd 的所有本地文件都放在 ~/.yi-console 下。
+//! All of yi-agentd's local files live under ~/.yi-console.
 
 use std::path::PathBuf;
 
@@ -39,7 +39,7 @@ pub fn log_path() -> PathBuf {
 #[cfg(unix)]
 pub fn socket_path() -> PathBuf {
     let p = base_dir().join("yi-agentd.sock");
-    // unix socket 路径上限约 104~108 字节；家目录很深时退到 /tmp，按数据目录哈希区分
+    // Unix socket paths are limited to about 104–108 bytes; when the home directory is deep, fall back to /tmp, distinguished by a hash of the data directory
     if p.as_os_str().len() < 100 {
         return p;
     }
@@ -58,7 +58,7 @@ pub fn pipe_name() -> String {
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
         .collect();
-    // 设了 YI_CONSOLE_HOME（测试用的隔离环境）就按数据目录哈希另起一个管道，免得连到正在用的守护进程
+    // With YI_CONSOLE_HOME set (isolated test environment), use a separate pipe keyed by a hash of the data directory, so we don't connect to the daemon in real use
     if std::env::var_os("YI_CONSOLE_HOME").is_some_and(|v| !v.is_empty()) {
         let h = base_dir()
             .to_string_lossy()
@@ -69,7 +69,7 @@ pub fn pipe_name() -> String {
     format!(r"\\.\pipe\yi-console-{user}")
 }
 
-/// 把 `~` 开头的路径展开成绝对路径
+/// Expand paths starting with `~` to absolute paths
 pub fn expand(p: &str) -> PathBuf {
     if p == "~" || p.is_empty() {
         return home();

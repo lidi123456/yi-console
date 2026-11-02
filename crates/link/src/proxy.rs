@@ -1,8 +1,8 @@
-//! 经 HTTP 代理（CONNECT 隧道）连中继。公司内网往往只能经代理出网。
+//! Connect to the relay through an HTTP proxy (CONNECT tunnel). Corporate networks often only get out through a proxy.
 //!
-//! 自动模式（默认）下代理来源按顺序：`HTTPS_PROXY`（wss）/ `HTTP_PROXY`（ws）→ `ALL_PROXY`
-//! → Windows 系统代理设置；`NO_PROXY` 里列出的主机直连。客户端也可以用 [`set_mode`]
-//! 改成不用代理或手动指定。只支持 http:// 代理；socks 代理会被忽略并直连。
+//! In auto mode (default) the proxy is looked up in order: `HTTPS_PROXY` (wss) / `HTTP_PROXY` (ws) → `ALL_PROXY`
+//! → Windows system proxy settings; hosts listed in `NO_PROXY` connect directly. Clients can also use [`set_mode`]
+//! to disable the proxy or set one manually. Only http:// proxies are supported; socks proxies are ignored and the connection goes direct.
 
 use anyhow::{anyhow, bail, Context, Result};
 use base64::engine::general_purpose::STANDARD;
@@ -11,12 +11,12 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use std::sync::RwLock;
 use tokio::net::TcpStream;
 
-/// 代理设置（进程级）。yi-agentd 一直用 Auto；桌面 / 手机客户端按用户设置调整
+/// Proxy settings (process-wide). yi-agentd always uses Auto; desktop / mobile clients follow the user's setting
 #[derive(Debug, Clone, PartialEq)]
 pub enum Mode {
     Auto,
     Off,
-    /// 例如 `http://127.0.0.1:7897`
+    /// e.g. `http://127.0.0.1:7897`
     Manual(String),
 }
 
@@ -34,11 +34,11 @@ fn mode() -> Mode {
 pub struct Proxy {
     pub host: String,
     pub port: u16,
-    /// `user:pass`，有的话发 Basic 认证
+    /// `user:pass`; sent as Basic auth if present
     pub auth: Option<String>,
 }
 
-/// 从 ws(s):// 地址里取出主机和端口
+/// Extract host and port from a ws(s):// URL
 pub fn target_of(url: &str) -> Result<(String, u16)> {
     let (secure, rest) = if let Some(r) = url.strip_prefix("wss://") {
         (true, r)
@@ -54,7 +54,7 @@ pub fn target_of(url: &str) -> Result<(String, u16)> {
 
 fn split_host_port(s: &str, default: u16) -> Result<(String, u16)> {
     if let Some(r) = s.strip_prefix('[') {
-        // IPv6 字面量
+        // IPv6 literal
         let (h, after) = r.split_once(']').ok_or_else(|| anyhow!("地址格式错误: {s}"))?;
         let port = match after.strip_prefix(':') {
             Some(p) => p.parse().context("端口格式错误")?,
@@ -68,7 +68,7 @@ fn split_host_port(s: &str, default: u16) -> Result<(String, u16)> {
     }
 }
 
-/// 解析代理地址，格式不支持时返回 None
+/// Parse a proxy URL; returns None for unsupported formats
 pub fn parse_proxy(v: &str) -> Option<Proxy> {
     let v = v.trim();
     if v.is_empty() {
@@ -76,7 +76,7 @@ pub fn parse_proxy(v: &str) -> Option<Proxy> {
     }
     let rest = match v.split_once("://") {
         Some(("http", r)) | Some(("HTTP", r)) => r,
-        Some(_) => return None, // socks5:// 等不支持
+        Some(_) => return None, // socks5:// etc. not supported
         None => v,
     };
     let rest = rest.trim_end_matches('/');
@@ -112,14 +112,14 @@ fn env(names: &[&str]) -> Option<String> {
         .find_map(|n| std::env::var(n).ok().filter(|v| !v.trim().is_empty()))
 }
 
-/// 这个 ws(s):// 地址该走哪个代理；None 表示直连
+/// Which proxy this ws(s):// URL should use; None means direct
 pub fn proxy_for(url: &str) -> Option<Proxy> {
     let (host, _) = target_of(url).ok()?;
     proxy_for_host(&host, url.starts_with("wss://"))
 }
 
-/// 连 host 时该走哪个代理。`secure` 决定优先读 HTTPS_PROXY 还是 HTTP_PROXY；
-/// SSH 这类非 HTTP 的连接也按 secure=true 处理（都是 CONNECT 隧道）
+/// Which proxy to use when connecting to host. `secure` decides whether HTTPS_PROXY or HTTP_PROXY is read first;
+/// non-HTTP connections such as SSH are treated as secure=true too (they're all CONNECT tunnels)
 pub fn proxy_for_host(host: &str, secure: bool) -> Option<Proxy> {
     lookup(host, secure).map(|(p, _)| p)
 }
@@ -128,8 +128,8 @@ fn is_local(host: &str) -> bool {
     host == "localhost" || host.starts_with("127.") || host == "::1"
 }
 
-/// 内网地址（10/8、172.16/12、192.168/16、169.254/16、fc00::/7、fe80::/10）。
-/// 自动模式下直连：公司代理一般到不了内网，也常不允许 CONNECT 到非 443 端口
+/// Private addresses (10/8, 172.16/12, 192.168/16, 169.254/16, fc00::/7, fe80::/10).
+/// Direct in auto mode: corporate proxies usually can't reach the internal network and often don't allow CONNECT to ports other than 443
 fn is_private(host: &str) -> bool {
     match host.parse::<std::net::IpAddr>() {
         Ok(std::net::IpAddr::V4(a)) => a.is_private() || a.is_link_local(),
@@ -141,7 +141,7 @@ fn is_private(host: &str) -> bool {
     }
 }
 
-/// 返回代理和它的来源说明（给界面显示）
+/// Returns the proxy and a description of where it came from (for the UI)
 fn lookup(host: &str, secure: bool) -> Option<(Proxy, String)> {
     if is_local(host) {
         return None;
@@ -174,13 +174,13 @@ fn lookup(host: &str, secure: bool) -> Option<(Proxy, String)> {
     }
 }
 
-/// 给界面看的当前代理状态：例如 "127.0.0.1:7897（环境变量 HTTPS_PROXY）"，直连时返回 None
+/// Current proxy status for the UI: e.g. "127.0.0.1:7897（环境变量 HTTPS_PROXY）"; None when direct
 pub fn describe() -> Option<String> {
-    // 用一个不在 NO_PROXY 里的公网地址来探测
+    // Probe with a public address that isn't in NO_PROXY
     lookup("example.com", true).map(|(p, src)| format!("{}:{}（{src}）", p.host, p.port))
 }
 
-/// Windows 的"系统代理"（Clash 等工具常只改这里，不设环境变量）
+/// Windows' "system proxy" (tools like Clash often only change this, without setting environment variables)
 #[cfg(windows)]
 fn system_proxy(secure: bool) -> Option<Proxy> {
     let out = std::process::Command::new("reg")
@@ -201,7 +201,7 @@ fn system_proxy(secure: bool) -> Option<Proxy> {
         return None;
     }
     let server = value("ProxyServer")?;
-    // 可能是 "host:port"，也可能是 "http=h:p;https=h:p"
+    // May be "host:port" or "http=h:p;https=h:p"
     let pick = if server.contains('=') {
         let want = if secure { "https=" } else { "http=" };
         server
@@ -220,7 +220,7 @@ fn system_proxy(_secure: bool) -> Option<Proxy> {
     None
 }
 
-/// 连到代理并建立到 host:port 的 CONNECT 隧道，返回的 TcpStream 之后就像直连一样用
+/// Connect to the proxy and set up a CONNECT tunnel to host:port; the returned TcpStream is then used like a direct connection
 pub async fn connect(p: &Proxy, host: &str, port: u16) -> Result<TcpStream> {
     let mut s = TcpStream::connect((p.host.as_str(), p.port))
         .await
@@ -236,7 +236,7 @@ pub async fn connect(p: &Proxy, host: &str, port: u16) -> Result<TcpStream> {
     }
     req.push_str("\r\n");
     s.write_all(req.as_bytes()).await?;
-    // 逐字节读到响应头结束，不能多读，后面的字节属于 TLS
+    // Read byte by byte up to the end of the response headers, never further: the following bytes belong to TLS
     let mut head = Vec::with_capacity(256);
     let mut b = [0u8; 1];
     while !head.ends_with(b"\r\n\r\n") {
@@ -295,7 +295,7 @@ mod tests {
 
     #[tokio::test]
     async fn connect_tunnel() {
-        // 假代理：回 200 后把后面的字节原样返回
+        // Fake proxy: after replying 200, echo the following bytes back
         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = l.local_addr().unwrap().port();
         tokio::spawn(async move {

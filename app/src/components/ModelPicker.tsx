@@ -8,16 +8,16 @@ import type { ModelOption, SessionInfo } from '../types';
 import { Icon } from './Icon';
 import { isMobile } from '../util';
 
-/** 让模型菜单打开（输入框里 /model 用） */
+/** Open the model menu (used by /model in the input box) */
 export const OPEN_MODEL = 'ah:open-model';
 
-/** 按 id 找，找不到再按实际模型对上（Claude 的别名）；「Default」和「Opus」可能指向同一个实际模型，优先具体的那个 */
+/** Look up by id, then by the actual model (Claude aliases); "Default" and "Opus" may point at the same model, prefer the more specific one */
 function findModel(current: string, models: ModelOption[]) {
   const same = models.filter((o) => o.resolved === current);
   return models.find((o) => o.id === current) ?? same.find((o) => o.id !== 'default') ?? same[0];
 }
 
-/** 模型名：列表里有就用显示名 */
+/** Model name: use the display name if it's in the list */
 function modelLabel(current: string | null | undefined, models: ModelOption[]) {
   if (!current) return tr('默认模型', 'Default Model');
   return findModel(current, models)?.name || current;
@@ -52,7 +52,7 @@ export const EFFORT_LABEL: Record<string, string> = new Proxy(EFFORT_LABEL_ZH, {
 
 const effortLabel = (e: string) => EFFORT_LABEL[e] ?? e;
 
-/** 当前模型支持的思考等级 */
+/** Thinking levels supported by the current model */
 function currentModel(current: string | null | undefined, models: ModelOption[]) {
   if (!current) return models[0];
   return findModel(current, models);
@@ -64,7 +64,7 @@ export function ModelPicker({ hostId, info }: { hostId: string; info: SessionInf
   const [q, setQ] = useState('');
   const wrapRef = useRef<HTMLDivElement>(null);
   const sheetRef = useRef<HTMLDivElement>(null);
-  /** 手机上是从底部弹出的面板（挂到 body 上），桌面是输入框上方的下拉菜单 */
+  /** On mobile it's a bottom sheet (attached to body); on desktop a dropdown above the input box */
   const sheet = open && isMobile();
   useBack(open, () => setOpen(false));
   useEffect(() => {
@@ -85,7 +85,7 @@ export function ModelPicker({ hostId, info }: { hostId: string; info: SessionInf
     load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [hostId, info.id]);
-  // 输入框里的 /model
+  // /model typed in the input box
   useEffect(() => {
     const f = () => {
       load();
@@ -98,7 +98,7 @@ export function ModelPicker({ hostId, info }: { hostId: string; info: SessionInf
   const pick = async (id: string) => {
     setOpen(false);
     try {
-      // 不弹提示：输入框右下角的模型名会跟着变
+      // No toast: the model name at the bottom right of the input box changes anyway
       await rpc(hostId, 'session.setModel', { sessionId: info.id, model: id });
     } catch (e) {
       errorToast(e);

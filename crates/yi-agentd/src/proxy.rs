@@ -1,10 +1,10 @@
-//! 经本机转发到 SSH 主机。
+//! Forwarding to SSH hosts through this machine.
 //!
-//! 手机经中继连到电脑后，看不到电脑上配的其他主机（配置在桌面客户端里，内网服务器手机也直连不到）。
-//! 桌面客户端把可共享的主机同步过来（`proxy.setHosts`，只接受本机连接）；设备新开一条中继连接，
-//! 第一条消息发 `proxy.connect`，这里连到目标（SSH 主机起 `yi-agentd bridge`，中继主机直接连它的 yi-agentd），
-//! 之后原样转发字节。
-//! 设备和目标 yi-agentd 之间仍是普通的 JSON-RPC，订阅、重连、补拉都不用改。
+//! A phone connected to a computer through the relay can't see other hosts configured on that computer (they're configured in the desktop client, and phones can't reach internal servers directly).
+//! The desktop client syncs shareable hosts here (`proxy.setHosts`, local connections only); the device opens a new relay connection
+//! whose first message is `proxy.connect`, and we connect to the target here (SSH hosts start `yi-agentd bridge`, relay hosts connect to their yi-agentd directly),
+//! then relay bytes as is.
+//! Between the device and the target yi-agentd it's still plain JSON-RPC, so subscriptions, reconnects and catch-ups need no changes.
 
 use anyhow::{anyhow, bail, Result};
 use yi_client::hosts::{HostConfig, HostKind};
@@ -35,7 +35,7 @@ fn write_private(p: &PathBuf, data: &str) -> Result<()> {
     Ok(())
 }
 
-/// 桌面客户端同步过来的主机（含跳板机）和它信任过的主机指纹（OpenSSH known_hosts 格式）
+/// Hosts synced from the desktop client (including jump hosts) and the host fingerprints it trusts (OpenSSH known_hosts format)
 pub fn set_hosts(hosts: Vec<HostConfig>, known_hosts: &str) -> Result<()> {
     write_private(&hosts_path(), &serde_json::to_string(&hosts)?)?;
     write_private(&known_path(), known_hosts)
@@ -60,7 +60,7 @@ fn shared(h: &HostConfig) -> bool {
 trait Duplex: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> Duplex for T {}
 
-/// 给设备看的列表：不带任何凭据
+/// List for devices: carries no credentials
 pub fn list() -> Value {
     let list: Vec<Value> = load()
         .iter()
@@ -76,7 +76,7 @@ pub fn list() -> Value {
     json!(list)
 }
 
-/// 连上目标主机的 yi-agentd；SSH 时返回的会话要一直持有，断了通道也就断了
+/// Connect to the target host's yi-agentd; for SSH, the returned session must be held, since the channel dies with it
 async fn open(host_id: &str) -> Result<(Option<ssh::SshSession>, Box<dyn Duplex>)> {
     let hosts = load();
     let h = hosts
@@ -105,7 +105,7 @@ async fn open(host_id: &str) -> Result<(Option<ssh::SshSession>, Box<dyn Duplex>
     Ok((Some(s), Box::new(stream)))
 }
 
-/// 处理 proxy.connect：先回一行结果，成功后双向转发直到任一方断开
+/// Handle proxy.connect: reply with one result line first, then relay both ways until either side disconnects
 pub async fn serve<R, W>(mut r: R, mut w: W, id: u64, host_id: &str)
 where
     R: AsyncBufRead + AsyncRead + Unpin + Send + 'static,

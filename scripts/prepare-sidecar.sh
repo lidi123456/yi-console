@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# 编译本机用的 yi-agentd，放到 Tauri sidecar 目录（binaries/yi-agentd-<target-triple>）。
-# 用法：scripts/prepare-sidecar.sh [target-triple]，默认是当前 rustc 的 host。
+# Build yi-agentd for this machine and put it in the Tauri sidecar directory (binaries/yi-agentd-<target-triple>).
+# Usage: scripts/prepare-sidecar.sh [target-triple]; defaults to the current rustc host.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 target="${1:-$(rustc -vV | sed -n 's/^host: //p')}"

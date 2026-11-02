@@ -1,10 +1,10 @@
-//! 中继的持久化数据（都在 `--data` 目录里）：
-//! - `relay-devices.json`：已登记的设备（只有公钥）
-//! - `relay-invites.json`：邀请码（只存哈希）
-//! - `relay-meta.json`：对外地址和证书指纹，命令行生成邀请链接时用
+//! The relay's persistent data (all in the `--data` directory):
+//! - `relay-devices.json`: registered devices (public keys only)
+//! - `relay-invites.json`: invite codes (hashes only)
+//! - `relay-meta.json`: public address and certificate fingerprint, used by the command line to build invite links
 //!
-//! 运行中的中继和 `yi-relay invite / revoke` 等命令都直接读写这些文件；改之前总是重新读一遍，
-//! 写入用临时文件 + 改名。中继每 5 秒检查一次文件变化（吊销即时生效）。
+//! The running relay and commands such as `yi-relay invite / revoke` all read and write these files directly; they always reread before changing,
+//! and write via temp file + rename. The relay checks for file changes every 5 seconds (revocation takes effect right away).
 
 use anyhow::{anyhow, bail, Context, Result};
 use yi_link::{auth, b64, unb64_32};
@@ -20,15 +20,15 @@ pub fn now() -> u64 {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeviceRec {
-    /// Ed25519 签名公钥（base64url）
+    /// Ed25519 signing public key (base64url)
     pub pub_key: String,
     #[serde(default)]
     pub note: String,
     pub admitted_at: u64,
-    /// 怎么登记的：invite:<邀请 id> / open
+    /// How it was registered: invite:<invite id> / open
     #[serde(default)]
     pub via: String,
-    /// 设备代发的邀请登记进来的：发邀请的设备 id
+    /// Registered through a device-issued invite: id of the device that issued it
     #[serde(default)]
     pub invited_by: String,
     #[serde(default)]
@@ -39,14 +39,14 @@ pub struct DeviceRec {
 #[serde(rename_all = "camelCase")]
 pub struct InviteRec {
     pub id: String,
-    /// 邀请码的哈希（base64url），见 [`auth::invite_hash`]
+    /// Hash of the invite code (base64url), see [`auth::invite_hash`]
     pub hash: String,
     pub created_at: u64,
     pub expires_at: u64,
     pub uses_left: u32,
     #[serde(default)]
     pub note: String,
-    /// admin（服务器上生成的）或发邀请的设备 id
+    /// admin (generated on the server) or the id of the device that issued it
     pub by: String,
 }
 
@@ -108,7 +108,7 @@ impl Store {
         mtime(&self.devices_path())
     }
 
-    /// 设备 id -> 签名公钥
+    /// device id -> signing public key
     pub fn device_keys(&self) -> BTreeMap<String, [u8; 32]> {
         self.devices()
             .into_iter()
@@ -131,7 +131,7 @@ impl Store {
         write_json(&self.meta_path(), m)
     }
 
-    /// 生成邀请码，返回（记录, 邀请码明文）
+    /// Generate an invite code; returns (record, plaintext invite code)
     pub fn create_invite(&self, ttl: u64, uses: u32, note: &str, by: &str) -> Result<(InviteRec, String)> {
         if uses == 0 {
             bail!("可用次数至少为 1");
@@ -153,7 +153,7 @@ impl Store {
         Ok((rec, code))
     }
 
-    /// 用掉一次邀请码；无效、过期、用完时返回 None
+    /// Use up one invite; returns None if invalid, expired or used up
     pub fn consume_invite(&self, code: &str) -> Result<Option<InviteRec>> {
         let h = auth::invite_hash(code);
         let mut all = self.invites();
@@ -204,7 +204,7 @@ impl Store {
         }
     }
 
-    /// 吊销设备；`cascade` 时连同它代发邀请登记进来的设备（递归）。返回被吊销的 id
+    /// Revoke a device; with `cascade`, also devices registered through invites it issued (recursively). Returns the revoked ids
     pub fn revoke(&self, device: &str, cascade: bool) -> Result<Vec<String>> {
         let mut all = self.devices();
         if !all.contains_key(device) {
@@ -223,7 +223,7 @@ impl Store {
         }
         all.retain(|id, _| !gone.contains(id));
         write_json(&self.devices_path(), &all)?;
-        // 被吊销的设备代发、还没用掉的邀请也一并作废
+        // Unused invites issued by revoked devices are voided too
         let mut inv = self.invites();
         inv.retain(|r| !gone.contains(&r.by));
         write_json(&self.invites_path(), &inv)?;
@@ -231,7 +231,7 @@ impl Store {
     }
 }
 
-/// 24h / 10m / 7d / 3600（秒）
+/// 24h / 10m / 7d / 3600 (seconds)
 pub fn parse_ttl(s: &str) -> Result<u64> {
     let s = s.trim();
     let (num, unit) = s.split_at(s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len()));
@@ -271,7 +271,7 @@ mod tests {
         let (rec, code) = s.create_invite(600, 1, "", "admin").unwrap();
         assert!(s.revoke_invite(&rec.id).unwrap());
         assert!(s.consume_invite(&code).unwrap().is_none());
-        // 文件里不存明文
+        // The file never stores plaintext
         let raw = std::fs::read_to_string(s.invites_path()).unwrap_or_default();
         assert!(!raw.contains(&code));
     }

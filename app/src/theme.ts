@@ -1,8 +1,8 @@
 import { useEffect, useState } from 'react';
 import { lsGet, lsSet } from './util';
 
-// 界面主题：跟随系统 / 亮色 / 暗色，存在本机 localStorage。
-// 选了亮色或暗色就在 <html> 上写 data-theme，styles.css 按它覆盖系统的 prefers-color-scheme
+// UI theme: follow system / light / dark, stored in local localStorage.
+// Choosing light or dark sets data-theme on <html>, and styles.css uses it to override the system prefers-color-scheme
 
 export type Theme = 'auto' | 'light' | 'dark';
 
@@ -14,7 +14,7 @@ export function getTheme(): Theme {
   return lsGet<Theme>(KEY, 'auto');
 }
 
-/** 当前界面实际是不是暗色 */
+/** Whether the UI is actually dark right now */
 export function isAppDark(): boolean {
   const t = getTheme();
   return t === 'dark' || (t === 'auto' && mq().matches);
@@ -25,7 +25,7 @@ function apply() {
   const root = document.documentElement;
   if (t === 'auto') delete root.dataset.theme;
   else root.dataset.theme = t;
-  // 手机浏览器地址栏等跟着变色
+  // Also recolor things like the mobile browser's address bar
   for (const m of document.querySelectorAll<HTMLMetaElement>('meta[name="theme-color"]')) {
     if (t === 'auto') m.media = m.dataset.media ?? m.media;
     else {
@@ -41,13 +41,13 @@ export function setTheme(t: Theme) {
   window.dispatchEvent(new Event(EVENT));
 }
 
-/** 启动时（渲染前）调一次，避免先闪一下系统配色 */
+/** Call once at startup (before rendering) to avoid a flash of the system color scheme */
 export function initTheme() {
   apply();
   mq().addEventListener('change', () => window.dispatchEvent(new Event(EVENT)));
 }
 
-/** 主题设置或系统配色变了就重新渲染；返回 [设置值, 实际是否暗色] */
+/** Re-render when the theme setting or system color scheme changes; returns [setting, whether actually dark] */
 export function useTheme(): [Theme, boolean] {
   const [, bump] = useState(0);
   useEffect(() => {
@@ -58,7 +58,7 @@ export function useTheme(): [Theme, boolean] {
   return [getTheme(), isAppDark()];
 }
 
-/** 不在 React 里的地方（xterm 实例）订阅主题变化 */
+/** Subscribe to theme changes from outside React (xterm instances) */
 export function onThemeChange(f: () => void): () => void {
   window.addEventListener(EVENT, f);
   return () => window.removeEventListener(EVENT, f);

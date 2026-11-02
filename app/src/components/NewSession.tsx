@@ -34,7 +34,7 @@ export function DirPicker({
         setErr('');
       })
       .catch((e) => {
-        // 起始目录在这台主机上不存在时，退回用户主目录，不至于什么都选不了
+        // If the start directory doesn't exist on this host, fall back to the home directory so there's still something to pick
         if (path !== '~' && !list) setPath('~');
         else setErr(String(e.message ?? e));
       });
@@ -102,7 +102,7 @@ export function getPermModesList(): [string, string, string][] {
 
 export const PERM_MODES = PERM_MODES_ZH;
 
-/** 各工具实际支持的审批模式，和 yi-agentd 的 `permission_modes` 保持一致 */
+/** Permission modes each tool actually supports; keep in sync with yi-agentd's `permission_modes` */
 export function permModes(tool: ToolKind, mode: SessionMode) {
   const ids: Record<ToolKind, string[]> = {
     claude: ['default', 'acceptEdits', 'auto', 'plan', 'bypass'],
@@ -116,7 +116,7 @@ export function permModes(tool: ToolKind, mode: SessionMode) {
   return getPermModesList().filter((m) => ids[tool].includes(m[0]));
 }
 
-/** 每个工具上次新建会话时的选择：界面、审批模式、模型、思考等级（存 localStorage `new-session-prefs`） */
+/** Last choices per tool when creating a session: UI, permission mode, model, thinking level (stored in localStorage `new-session-prefs`) */
 type ToolPrefs = { mode?: 'structured' | 'terminal'; perm?: string; model?: string; effort?: string };
 const PREFS_KEY = 'new-session-prefs';
 
@@ -137,7 +137,7 @@ export function NewSessionDialog() {
   const [models, setModels] = useState<ModelOption[] | null>(null);
   const [customModel, setCustomModel] = useState(false);
 
-  // 工具的可选模型：yi-agentd 有缓存就直接给，没有会临时起一次工具去问（几秒）
+  // The tool's available models: returned directly if yi-agentd has them cached, otherwise it starts the tool once to ask (a few seconds)
   useEffect(() => {
     setModels(null);
     setCustomModel(false);
@@ -147,7 +147,7 @@ export function NewSessionDialog() {
       .then((m) => {
         if (!alive) return;
         setModels(m);
-        // 记住的模型不在这台主机的列表里（手动输入过、或换了主机）：改用输入框显示，不要被下拉框吞掉
+        // The remembered model isn't in this host's list (typed by hand, or a different host): show it in the text input instead of letting the dropdown swallow it
         setModel((cur) => {
           if (cur && m.length > 0 && !m.some((x) => x.id === cur)) setCustomModel(true);
           return cur;
@@ -164,7 +164,7 @@ export function NewSessionDialog() {
     setHostId(ns.hostId);
     const recent = lsGet<Record<string, string>>('recent-cwd', {});
     setCwd(ns.cwd ?? recent[ns.hostId] ?? '~');
-    // 换个工具继续：默认用上次用的工具，正好是原工具就先选 claude / codex 里另一个，没装的话下面再换
+    // Continue with another tool: default to the last tool used; if that's the original tool, pick the other of claude / codex first (switched below if not installed)
     const last = lsGet<ToolKind>('last-tool', 'claude');
     const from = ns.handoff?.from;
     setTool((ns.tool as ToolKind) ?? (from && (last === from || last === 'shell') ? (from === 'claude' ? 'codex' : 'claude') : last));
@@ -173,11 +173,11 @@ export function NewSessionDialog() {
     setPicking(false);
   }, [ns]);
 
-  // 换工具（包括刚打开）时带出这个工具上次的选择
+  // When the tool changes (including on open), bring back that tool's last choices
   useEffect(() => {
     if (!ns) return;
     const p = lsGet<Record<string, ToolPrefs>>(PREFS_KEY, {})[tool] ?? {};
-    // 换个工具继续只走对话模式：第一条消息要靠对话模式发出去
+    // Continue with another tool only uses chat mode: the first message has to be sent through chat mode
     const m = ns.handoff ? 'structured' : (p.mode ?? lsGet<'structured' | 'terminal'>('last-mode', 'structured'));
     setMode(m);
     setPerm(p.perm && permModes(tool, m).some((x) => x[0] === p.perm) ? p.perm : 'default');
@@ -185,7 +185,7 @@ export function NewSessionDialog() {
     setEffort(p.effort ?? '');
   }, [ns, tool]);
 
-  // 默认选中的工具（上次用的、或 claude）在这台主机上没装：改选第一个装了的，免得选中一个灰掉的按钮
+  // The default tool (last used, or claude) isn't installed on this host: pick the first installed one instead of leaving a greyed-out button selected
   const helloTools = hostStatus(hostId).hello?.tools;
   useEffect(() => {
     if (!ns || ns.resumeId || !helloTools?.length) return;
@@ -203,10 +203,10 @@ export function NewSessionDialog() {
   const connectedHosts = hosts.filter((h) => h.status.status === 'connected');
   const close = () => setState({ newSession: null });
   const effectiveMode = tool === 'shell' ? 'terminal' : mode;
-  // 换个工具继续：选中的必须是原工具以外、这台主机装了的工具（只装了原工具时停在一个灰掉的按钮上）
+  // Continue with another tool: the selection must be an installed tool other than the original (if only the original is installed, it stays on a greyed-out button)
   const handoffBlocked = !!ns.handoff && (tool === ns.handoff.from || tool === 'shell' || !tools.some((t) => t.kind === tool && t.available));
 
-  // 当前模型可选的思考等级；记住的等级这个模型不支持时就不发
+  // Thinking levels available for the current model; don't send a remembered level the model doesn't support
   const curModel = models?.find((x) => x.id === model) ?? (!model ? models?.[0] : undefined);
   const effortList = curModel?.efforts ?? [];
   const sendEffort = effort && (models === null || effortList.includes(effort)) ? effort : '';
@@ -233,7 +233,7 @@ export function NewSessionDialog() {
       lsSet('recent-cwd', recent);
       lsSet('last-tool', tool);
       if (tool !== 'shell') {
-        // 换个工具继续固定是对话模式，不当作用户选的界面记下来
+        // Continue with another tool always uses chat mode; don't record that as the user's chosen UI
         if (!ns.handoff) lsSet('last-mode', mode);
         const all = lsGet<Record<string, ToolPrefs>>(PREFS_KEY, {});
         all[tool] = { mode: ns.handoff ? all[tool]?.mode : mode, perm, model, effort: sendEffort };
@@ -269,14 +269,14 @@ export function NewSessionDialog() {
           />
         ) : (
           <div className="form">
-            {/* 换个工具继续：原会话的记录文件在原主机上，不能换主机 */}
+            {/* Continue with another tool: the original session's log is on the original host, so the host can't change */}
             {connectedHosts.length > 1 && !ns.resumeId && !ns.handoff && (
               <label>
                 {tr('主机', 'Host')}
                 <select
                   value={hostId}
                   onChange={(e) => {
-                    // 换主机后原来的目录在那边多半不存在，换成那台主机上次用的目录
+                    // After switching hosts the old directory probably doesn't exist there; use the directory last used on that host
                     const id = e.target.value;
                     setHostId(id);
                     setCwd(lsGet<Record<string, string>>('recent-cwd', {})[id] ?? '~');

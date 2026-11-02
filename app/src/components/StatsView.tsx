@@ -9,9 +9,9 @@ import { ToolBadge } from './Icon';
 interface Stats {
   daily: { day: string; tool: string; usage: Usage }[];
   totals: Record<string, Usage>;
-  /** 每个工具各模型的 token 数（来自工具自己的日志） */
+  /** Tokens per model for each tool (from the tool's own logs) */
   models?: Record<string, Record<string, number>>;
-  /** 哪些工具的 token 来自本地日志（旧版守护进程没有这个字段） */
+  /** Which tools' tokens come from local logs (older daemons don't send this field) */
   fromLogs?: string[];
 }
 
@@ -45,7 +45,7 @@ const fmtReset = (v: number | string | null | undefined) => {
   return isEn() ? `resets ${clock}` : `${clock} 重置`;
 };
 
-/** 一个工具的额度窗口：undefined 读取中，字符串是错误信息 */
+/** Quota windows for one tool: undefined while loading, a string is an error message */
 export function QuotaBody({ q }: { q: Quota | string | undefined }) {
   return (
     <>
@@ -80,7 +80,7 @@ export function QuotaBody({ q }: { q: Quota | string | undefined }) {
   );
 }
 
-/** 各工具的账号额度。每个工具单独请求，谁先回来先显示（第一次要临时起一下工具，几秒） */
+/** Account quotas of each tool. One request per tool, shown as each returns (the first time starts the tool briefly, a few seconds) */
 function QuotaCard({ hostId }: { hostId: string }) {
   const hello = useStore((s) => s.hosts.find((h) => h.config.id === hostId)?.status.hello);
   const tools = useMemo(

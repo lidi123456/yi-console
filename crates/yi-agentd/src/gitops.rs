@@ -1,11 +1,11 @@
-//! 会话改动汇总用的 git 操作：看改了哪些文件和 diff、丢弃改动、提交。
+//! git operations for summarizing session changes: which files changed and their diffs, discarding changes, committing.
 
 use anyhow::{anyhow, bail, Result};
 use serde_json::{json, Value};
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-/// 单个文件 diff 的上限，太大的只给提示
+/// Size limit for a single file's diff; larger ones just get a notice
 const DIFF_MAX: usize = 200 * 1024;
 
 fn git(cwd: &Path, args: &[&str]) -> Result<std::process::Output> {
@@ -29,14 +29,14 @@ fn git_ok(cwd: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
 }
 
-/// 仓库根目录；不是 git 仓库返回 None
+/// Repository root; None if not a git repo
 fn repo_root(cwd: &Path) -> Option<std::path::PathBuf> {
     git_ok(cwd, &["rev-parse", "--show-toplevel"])
         .ok()
         .map(|s| std::path::PathBuf::from(s.trim()))
 }
 
-/// 路径只能在仓库里，防止传 ../ 之类的出去
+/// Paths must stay inside the repo, so things like ../ can't escape it
 fn check_paths(paths: &[String]) -> Result<()> {
     for p in paths {
         if p.is_empty() || p.starts_with('-') || Path::new(p).is_absolute() || p.split(['/', '\\']).any(|c| c == "..") {
@@ -46,13 +46,13 @@ fn check_paths(paths: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// 工作区相对 HEAD 的改动。路径相对仓库根目录
+/// Working tree changes relative to HEAD. Paths are relative to the repo root
 pub fn changes(cwd: &str) -> Result<Value> {
     changes_with(cwd, true, None)
 }
 
-/// with_diff=false 只列状态，不算 diff（大仓库里改动多时逐个 git diff 很慢）；
-/// only 给了就只返回这些路径（相对仓库根目录），用来单独取某个文件的 diff
+/// with_diff=false only lists statuses without diffs (running git diff per file is slow in a big repo with many changes);
+/// if only is given, return just those paths (relative to the repo root), used to fetch one file's diff
 pub fn changes_with(cwd: &str, with_diff: bool, only: Option<&[String]>) -> Result<Value> {
     let dir = crate::paths::expand(cwd);
     let Some(root) = repo_root(&dir) else {
@@ -69,7 +69,7 @@ pub fn changes_with(cwd: &str, with_diff: bool, only: Option<&[String]>) -> Resu
         }
         let (code, path) = entry.split_at(3);
         let code = code.trim().to_string();
-        // 改名的条目后面还跟着原路径
+        // Rename entries are followed by the original path
         if code.starts_with('R') || code.starts_with('C') {
             it.next();
         }
@@ -105,7 +105,7 @@ pub fn changes_with(cwd: &str, with_diff: bool, only: Option<&[String]>) -> Resu
                 d
             }
         };
-        // 新增 / 删除行数：二进制、太大的文件、没有 HEAD 的仓库给 null
+        // Lines added / removed: null for binaries, files too large, and repos without HEAD
         let (added, deleted) = if untracked {
             (count_lines(&root.join(path)), Some(0))
         } else {
@@ -126,8 +126,8 @@ pub fn changes_with(cwd: &str, with_diff: bool, only: Option<&[String]>) -> Resu
     }))
 }
 
-/// 已跟踪文件相对 HEAD 的增删行数，一次 git diff --numstat 算完（不用逐个文件跑 diff）；
-/// 二进制文件 git 给的是 "-"，记成 None
+/// Lines added/removed relative to HEAD for tracked files, computed in one git diff --numstat (no per-file diff runs);
+/// git reports "-" for binary files, recorded as None
 fn numstat(root: &Path) -> std::collections::HashMap<String, (Option<u64>, Option<u64>)> {
     let mut m = std::collections::HashMap::new();
     let Ok(out) = git_ok(root, &["diff", "HEAD", "--numstat", "-z", "--no-renames"]) else {
@@ -143,7 +143,7 @@ fn numstat(root: &Path) -> std::collections::HashMap<String, (Option<u64>, Optio
     m
 }
 
-/// 新文件的行数；太大或二进制的不数
+/// Line count of a new file; not counted for files that are too large or binary
 fn count_lines(full: &Path) -> Option<u64> {
     let meta = std::fs::metadata(full).ok()?;
     if !meta.is_file() || meta.len() as usize > DIFF_MAX {
@@ -157,7 +157,7 @@ fn count_lines(full: &Path) -> Option<u64> {
     Some(n as u64)
 }
 
-/// 丢弃改动：已跟踪的恢复成 HEAD，新文件直接删
+/// Discard changes: tracked files are restored to HEAD, new files are deleted
 pub fn discard(cwd: &str, paths: &[String]) -> Result<()> {
     check_paths(paths)?;
     let dir = crate::paths::expand(cwd);
@@ -180,7 +180,7 @@ pub fn discard(cwd: &str, paths: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// 只提交选中的文件（不动暂存区里的其他内容）
+/// Commit only the selected files (leaving everything else in the index alone)
 pub fn commit(cwd: &str, paths: &[String], message: &str) -> Result<Value> {
     check_paths(paths)?;
     if paths.is_empty() {
@@ -226,7 +226,7 @@ mod tests {
         let fast = changes_with(&cwd, false, None).unwrap();
         let fast = fast["files"].as_array().unwrap();
         assert!(fast.iter().all(|f| f["diff"] == ""));
-        // 不带 diff 也给增删行数：a.txt 改了一行（+1 -1），b.txt 是一行的新文件
+        // Line counts come back even without diffs: a.txt changed one line (+1 -1), b.txt is a new one-line file
         let a = fast.iter().find(|f| f["path"] == "a.txt").unwrap();
         assert_eq!((a["added"].as_u64(), a["deleted"].as_u64()), (Some(1), Some(1)));
         let b = fast.iter().find(|f| f["path"] == "b.txt").unwrap();
