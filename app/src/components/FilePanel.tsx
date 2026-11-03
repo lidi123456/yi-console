@@ -401,6 +401,10 @@ const SEARCH_LIMIT = 200;
  *  git: null = not a repo. In memory only */
 const gitCache = new Map<string, { git: GitInfo | null; sig: string }>();
 const gitKey = (hostId: string, cwd: string) => `${hostId}\n${cwd}`;
+/** Root path and top-level listing per host + directory + hidden-files setting. The Changes list and the tree are
+ *  both laid out against the root, so without it a remounted panel stays blank until fs.list returns. In memory only */
+const rootCache = new Map<string, { path: string; entries: DirEntry[] }>();
+const rootKey = (hostId: string, cwd: string, hidden: boolean) => `${hostId}\n${cwd}\n${hidden ? 1 : 0}`;
 
 export function FilePanel({
   hostId,
@@ -427,10 +431,13 @@ export function FilePanel({
   standalone?: boolean;
 }) {
   const [, lang] = useLang();
-  const [root, setRoot] = useState<string | null>(null);
-  const [kids, setKids] = useState<Record<string, DirEntry[]>>({});
-  const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [hidden, setHidden] = useState(() => lsGet('wp-hidden', true));
+  const [root, setRoot] = useState<string | null>(() => rootCache.get(rootKey(hostId, cwd, hidden))?.path ?? null);
+  const [kids, setKids] = useState<Record<string, DirEntry[]>>(() => {
+    const c = rootCache.get(rootKey(hostId, cwd, hidden));
+    return c ? { [c.path]: c.entries } : {};
+  });
+  const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [file, setFile] = useState<OpenFile | null>(null);
   const [saveState, setSaveState] = useState<SaveState>(null);
   const [saveError, setSaveError] = useState('');
@@ -502,12 +509,16 @@ export function FilePanel({
 
   // Root directory: fs.list normalizes ~ and relative forms into absolute paths
   useEffect(() => {
-    setKids({});
+    const key = rootKey(hostId, cwd, hidden);
+    const c = rootCache.get(key);
+    setKids(c ? { [c.path]: c.entries } : {});
+    if (c) setRoot(c.path);
     setExpanded(new Set());
     rpc<{ path: string; entries: DirEntry[] }>(hostId, 'fs.list', { path: cwd, showHidden: hidden })
       .then((r) => {
+        rootCache.set(key, { path: r.path, entries: r.entries });
         setRoot(r.path);
-        setKids({ [r.path]: r.entries });
+        setKids((k) => ({ ...k, [r.path]: r.entries }));
       })
       .catch(errorToast);
   }, [hostId, cwd, hidden]);
