@@ -210,8 +210,6 @@ function hostMenu(h: HostEntry, connect: () => void): (MenuItem | '-')[] {
     { label: tr('用量统计', 'Usage Stats'), icon: 'chart', run: () => navigate({ kind: 'stats', hostId: id }) },
     { label: tr('端口转发', 'Port Forwarding'), icon: 'external', run: () => navigate({ kind: 'ports', hostId: id }) },
     '-',
-    { label: tr('侧栏设置…', 'Sidebar Settings…'), icon: 'settings', run: () => navigate({ kind: 'prefs' }) },
-    '-',
     { label: tr('主机设置', 'Host Settings'), icon: 'settings', run: () => navigate({ kind: 'settings', hostId: id }) },
     { label: tr('编辑连接', 'Edit Connection'), icon: 'edit', run: () => navigate({ kind: 'hosts', editId: id }) },
     ...(h.config.kind !== 'local'
