@@ -7057,6 +7057,8 @@ body.resizing .side-resizer::after {
   flex-direction: column;
   min-height: 0;
   border-top: 1px solid var(--border);
+  /* Stays at the bottom of the side column even when the tree above shrinks (no changes) and the box is closed */
+  margin-top: auto;
 }
 .wp-hist.open.grow {
   flex: 1;

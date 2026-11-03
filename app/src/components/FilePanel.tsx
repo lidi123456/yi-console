@@ -396,6 +396,12 @@ function searchRows(root: string, paths: string[], collapsed: Set<string>): Tree
 
 const SEARCH_LIMIT = 200;
 
+/** Last git status per host + directory (like VS Code's Source Control view): reopening the panel or switching back to a
+ *  session shows it at once and refreshes in the background instead of starting from "Loading changes…".
+ *  git: null = not a repo. In memory only */
+const gitCache = new Map<string, { git: GitInfo | null; sig: string }>();
+const gitKey = (hostId: string, cwd: string) => `${hostId}\n${cwd}`;
+
 export function FilePanel({
   hostId,
   cwd,
@@ -444,7 +450,7 @@ export function FilePanel({
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
   // Opened files (tabs); the current file is file
   const [tabs, setTabs] = useState<string[]>([]);
-  const [git, setGit] = useState<GitInfo | null>(null);
+  const [git, setGit] = useState<GitInfo | null>(() => gitCache.get(gitKey(hostId, cwd))?.git ?? null);
   const [view, setView] = useState<'all' | 'changes' | 'search'>(() => lsGet('wp-view', 'all'));
   const [showDiff, setShowDiff] = useState(false);
   const [diffLayout, setDiffLayout] = useState<'split' | 'unified'>(() => lsGet('wp-diff-layout', 'split'));
@@ -507,11 +513,11 @@ export function FilePanel({
   }, [hostId, cwd, hidden]);
 
   // Until git status comes back we don't know whether this is a repo, so the snippets recorded in the session can't be shown as a diff yet
-  const [gitReady, setGitReady] = useState(false);
+  const [gitReady, setGitReady] = useState(() => gitCache.has(gitKey(hostId, cwd)));
   // Diff of a single file (git.changes only lists statuses; the diff is fetched when the file is opened), keyed by norm(absolute path)
   const [fileDiffs, setFileDiffs] = useState<Record<string, string | null>>({});
   // Summary of the last git status: periodic refreshes leave the UI alone if nothing changed, so an open diff doesn't flicker
-  const gitSig = useRef('');
+  const gitSig = useRef(gitCache.get(gitKey(hostId, cwd))?.sig ?? '');
   /** quiet: background refresh (timer / window refocus); if the status didn't change, just quietly refetch the current file's diff */
   const loadGit = useCallback((quiet = false) => {
     // Without diffs: in a big repo with many changed files, running git diff for each takes ages, so fetch only the file that gets opened
@@ -522,7 +528,10 @@ export function FilePanel({
         if (quiet && sig === gitSig.current) return refreshCurDiff.current();
         gitSig.current = sig;
         setFileDiffs({});
-        if (!r.repo) return setGit(null);
+        if (!r.repo) {
+          gitCache.set(gitKey(hostId, cwd), { git: null, sig });
+          return setGit(null);
+        }
         const files = new Map<string, GitFile>();
         const dirs = new Set<string>();
         for (const f of r.files) {
@@ -534,12 +543,15 @@ export function FilePanel({
             dirs.add(d);
           }
         }
-        setGit({ repo: r.repo, branch: r.branch ?? '', head: r.head, files, dirs });
+        const info = { repo: r.repo, branch: r.branch ?? '', head: r.head, files, dirs };
+        gitCache.set(gitKey(hostId, cwd), { git: info, sig });
+        setGit(info);
       })
       .catch(() => (setGitReady(true), quiet || setGit(null)));
   }, [hostId, cwd]);
   const refreshCurDiff = useRef(() => {});
-  useEffect(() => loadGit(), [loadGit]);
+  // With a cached status this is a background refresh: nothing changes on screen unless the status did
+  useEffect(() => loadGit(gitCache.has(gitKey(hostId, cwd))), [loadGit]);
   // Commits made by the AI in a terminal or files changed by other programs aren't caught by the end-of-turn refresh: check again when the window regains focus and every 10 s (while visible)
   useEffect(() => {
     const tick = () => document.visibilityState === 'visible' && loadGit(true);
@@ -1335,8 +1347,9 @@ export function FilePanel({
               {changed.length > 0 && <span className="wp-count">{changed.length}</span>}
             </>,
             {
-              disabled: !git && touched.size === 0,
-              title: git
+              // Usable while git status is still loading (the commit history below doesn't wait for it)
+              disabled: gitReady && !git && touched.size === 0,
+              title: git || !gitReady
                 ? tr('工作区里未提交的改动', 'Uncommitted changes in the workspace')
                 : touched.size
                   ? tr('这个会话里工具改过的文件', 'Files changed by tools in this session')
@@ -1491,8 +1504,9 @@ export function FilePanel({
               <div className="wp-tip">{tr('正在加载…', 'Loading…')}</div>
             )}
           </div>
-          {view === 'changes' && git && (
-            <GitHistory hostId={hostId} cwd={cwd} head={git.head} selected={file?.path} grow={histGrow} onOpen={(t) => openFile(t)} />
+          {/* Independent of git status: shows right away and loads on its own; hidden only once status says this isn't a repo */}
+          {view === 'changes' && (!gitReady || git) && (
+            <GitHistory hostId={hostId} cwd={cwd} head={git?.head} selected={file?.path} grow={histGrow} onOpen={(t) => openFile(t)} />
           )}
           {(dropDir || uploading > 0) && (
             <div className="wp-dropbar">

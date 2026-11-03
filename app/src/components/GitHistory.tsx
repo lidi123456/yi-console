@@ -22,6 +22,12 @@ export function parseCommitTab(t: string): { hash: string; rel: string } | null 
 }
 
 const PAGE = 50;
+
+/** Pages already loaded per host + directory, shown at once when the box mounts again and refreshed in the background */
+const logCache = new Map<string, { commits: CommitInfo[]; more: boolean }>();
+/** Files of a commit never change, so they are kept for good (per host + directory + hash) */
+const showCache = new Map<string, CommitFile[]>();
+const cacheKey = (hostId: string, cwd: string) => `${hostId}\n${cwd}`;
 const HEAD_MIN = 28;
 
 /** "HEAD -> main" -> "main"; skip a bare HEAD (detached) and remote HEAD pointers */
@@ -55,10 +61,12 @@ export function GitHistory({
   useLang();
   const [open, setOpen] = useState(() => lsGet('wp-hist-open', !window.matchMedia('(max-width: 760px)').matches));
   const [height, setHeight] = useState(() => lsGet('wp-hist-h', 280));
-  const [commits, setCommits] = useState<CommitInfo[]>([]);
-  const [more, setMore] = useState(false);
+  const key = cacheKey(hostId, cwd);
+  const [commits, setCommits] = useState<CommitInfo[]>(() => logCache.get(key)?.commits ?? []);
+  const [more, setMore] = useState(() => logCache.get(key)?.more ?? false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
+  const [notRepo, setNotRepo] = useState(false);
   const [expanded, setExpanded] = useState<string | null>(null);
   const [files, setFiles] = useState<Record<string, CommitFile[] | 'loading' | 'error'>>({});
   const box = useRef<HTMLDivElement>(null);
@@ -73,7 +81,13 @@ export function GitHistory({
         .then((r) => {
           if (g !== gen.current) return;
           setError('');
-          setCommits((c) => (skip === 0 ? r.commits : [...c, ...r.commits.filter((x) => !c.some((y) => y.hash === x.hash))]));
+          setNotRepo(!r.repo);
+          setCommits((c) => {
+            const next = skip === 0 ? r.commits : [...c, ...r.commits.filter((x) => !c.some((y) => y.hash === x.hash))];
+            // Keep only the first page across remounts; older pages load again as you scroll
+            if (skip === 0) logCache.set(cacheKey(hostId, cwd), { commits: next, more: r.more });
+            return next;
+          });
           setMore(r.more);
         })
         .catch((e) => g === gen.current && setError(String((e as Error)?.message ?? e)))
@@ -82,10 +96,17 @@ export function GitHistory({
     [hostId, cwd],
   );
 
-  // Load when first opened and whenever HEAD moves
+  // Load when first opened; reload when HEAD moves. head is undefined until the panel's git status arrives,
+  // and that first value isn't a move, so it doesn't load the list a second time
   useEffect(() => {
     if (open) loadPage(0);
-  }, [open, head, loadPage]);
+  }, [open, loadPage]);
+  const lastHead = useRef(head);
+  useEffect(() => {
+    const prev = lastHead.current;
+    lastHead.current = head;
+    if (open && prev !== undefined && head !== prev) loadPage(0);
+  }, [head, open, loadPage]);
 
   const toggleOpen = () => {
     lsSet('wp-hist-open', !open);
@@ -96,9 +117,15 @@ export function GitHistory({
     if (expanded === c.hash) return setExpanded(null);
     setExpanded(c.hash);
     if (Array.isArray(files[c.hash]) || files[c.hash] === 'loading') return;
+    const sk = `${key}\n${c.hash}`;
+    const hit = showCache.get(sk);
+    if (hit) return setFiles((m) => ({ ...m, [c.hash]: hit }));
     setFiles((m) => ({ ...m, [c.hash]: 'loading' }));
     rpc<{ files: CommitFile[] }>(hostId, 'git.show', { cwd, hash: c.hash })
-      .then((r) => setFiles((m) => ({ ...m, [c.hash]: r.files })))
+      .then((r) => {
+        showCache.set(sk, r.files);
+        setFiles((m) => ({ ...m, [c.hash]: r.files }));
+      })
       .catch(() => setFiles((m) => ({ ...m, [c.hash]: 'error' })));
   };
 
@@ -141,6 +168,8 @@ export function GitHistory({
     window.addEventListener('pointerup', up);
   };
 
+  // git.log says this isn't a repo (the panel hides the box too once its own status arrives)
+  if (notRepo) return null;
   return (
     <div
       ref={box}
