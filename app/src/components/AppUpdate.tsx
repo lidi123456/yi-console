@@ -52,7 +52,7 @@ export function AppUpdateNotice() {
   // "Close" hides the notice for the phase it was closed in (Android: waiting for the installer / the permission)
   const [closedIn, setClosedIn] = useState<string | null>(null);
   if (!updateSupported || closedIn === u.phase) return null;
-  // Errors from automatic checks never get here (silent); install errors and manual-check errors show in the settings card
+  // Failed checks count as "up to date" and never show an error; install errors show in the settings card
   const show =
     (u.phase === 'available' && !isDismissed(u.version)) || ['downloading', 'installing', 'permission'].includes(u.phase);
   if (!show) return null;

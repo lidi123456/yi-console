@@ -165,9 +165,11 @@ export function checkUpdate(silent = false): Promise<void> {
         checkedAt: Date.now(),
         installable: r.installable !== false,
       });
-    } catch (e) {
+    } catch {
+      // A failed check (no release yet, private repository, no network, bad manifest) counts as "no newer version":
+      // automatic checks keep the current phase, a manual check shows "up to date". Install errors are still shown
       if (silent) set({ phase: before === 'checking' ? 'idle' : before });
-      else set({ phase: 'error', error: errText(e), checkedAt: Date.now() });
+      else set({ phase: 'latest', version: undefined, notes: undefined, error: undefined, checkedAt: Date.now() });
     } finally {
       checking = null;
     }
