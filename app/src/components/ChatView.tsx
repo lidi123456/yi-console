@@ -1523,7 +1523,8 @@ export function ChatView({
                 </div>
               );
             case 'compact':
-              return <CompactNote key={it.key} ev={it.ev} live={!!busy} />;
+              // Kiro compacts after its /compact turn has ended, while the session is idle
+              return <CompactNote key={it.key} ev={it.ev} live={!!busy || (info?.tool === 'kiro' && info.status === 'idle')} />;
             case 'limit':
               return <LimitNote key={it.key} it={it} live={it.key === lastLimitKey} />;
           }

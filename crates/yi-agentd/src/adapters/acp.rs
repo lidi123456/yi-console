@@ -3,6 +3,7 @@
 
 use super::{AdapterCmd, JsonProc, Prompt, StartSpec};
 use crate::hub::Emitter;
+use crate::util::now_ms;
 use yi_proto::*;
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -73,6 +74,11 @@ struct State {
     auth_tried: bool,
     /// This run continues an existing session (session/load was sent) rather than a new one; reset to false when load fails and we fall back to a new session
     resumed: bool,
+    /// Kiro compacts in the background after its /compact turn has ended, and a prompt sent meanwhile never gets
+    /// an answer. Between `_kiro.dev/compaction/status` started and completed, messages wait in `queue`
+    compacting: Option<i64>,
+    /// The last prompt we sent was /compact, so the next compaction is manual
+    compact_manual: bool,
 }
 
 impl State {
@@ -141,7 +147,7 @@ pub async fn run(spec: StartSpec, em: Emitter, mut rx: mpsc::UnboundedReceiver<A
                     Ok(outs) => for out in outs { let _ = p.send(&out).await; },
                     Err(msg) => { fatal = Some(msg); killed = true; break; }
                 }
-                if st.session_id.is_some() && !st.prompting && !st.loading && !st.queue.is_empty() {
+                if st.session_id.is_some() && !st.prompting && !st.loading && st.compacting.is_none() && !st.queue.is_empty() {
                     let next = st.queue.remove(0);
                     let m = prompt(&mut st, &em, &next);
                     let _ = p.send(&m).await;
@@ -150,7 +156,7 @@ pub async fn run(spec: StartSpec, em: Emitter, mut rx: mpsc::UnboundedReceiver<A
             cmd = rx.recv() => match cmd {
                 Some(AdapterCmd::Send(next)) => {
                     em.status(SessionStatus::Running, None);
-                    if st.session_id.is_some() && !st.prompting && !st.loading {
+                    if st.session_id.is_some() && !st.prompting && !st.loading && st.compacting.is_none() {
                         let m = prompt(&mut st, &em, &next);
                         let _ = p.send(&m).await;
                     } else {
@@ -173,6 +179,11 @@ pub async fn run(spec: StartSpec, em: Emitter, mut rx: mpsc::UnboundedReceiver<A
                     }
                 }
                 Some(AdapterCmd::Interrupt) => {
+                    // Messages held during a compaction have no turn to cancel: drop them and end the wait here
+                    if st.compacting.is_some() && !st.prompting && !st.queue.is_empty() {
+                        st.queue.clear();
+                        em.event(EventBody::TurnEnd { stop_reason: Some("cancelled".into()), model: None });
+                    }
                     if let Some(sid) = st.session_id.clone() {
                         for (rid, rpc_id) in st.perms.drain().chain(st.asks.drain()) {
                             let _ = p.send(&json!({"jsonrpc":"2.0","id":rpc_id,
@@ -216,6 +227,7 @@ pub async fn run(spec: StartSpec, em: Emitter, mut rx: mpsc::UnboundedReceiver<A
 
 fn prompt(st: &mut State, em: &Emitter, p: &Prompt) -> Value {
     st.prompting = true;
+    st.compact_manual = p.text.trim().starts_with("/compact");
     st.turn_credits = 0.0;
     let sid = st.session_id.clone().unwrap_or_default();
     let mut blocks = vec![];
@@ -593,6 +605,7 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Result<V
     // Notifications
     match method {
         "session/update" => update(st, em, &params["update"]),
+        "_kiro.dev/compaction/status" => compaction_status(st, em, &params["status"]["type"]),
         "_kiro.dev/metadata" => {
             if let Some(p) = params["contextUsagePercentage"].as_f64() {
                 em.context(p);
@@ -606,6 +619,28 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Result<V
         _ => {}
     }
     Ok(out)
+}
+
+/// Kiro's `_kiro.dev/compaction/status`: status.type is started, then completed (or failed)
+fn compaction_status(st: &mut State, em: &Emitter, kind: &Value) {
+    let kind = kind.as_str().unwrap_or("");
+    if kind == "started" {
+        if st.compacting.is_none() {
+            st.compacting = Some(now_ms());
+            em.event(EventBody::Compact { phase: "start".into(), trigger: None, pre_tokens: None, post_tokens: None, duration_ms: None });
+        }
+        return;
+    }
+    // Any other status ends the compaction, so held messages are never stuck
+    let Some(t0) = st.compacting.take() else { return };
+    let ok = kind == "completed";
+    em.event(EventBody::Compact {
+        phase: if ok { "done" } else { "failed" }.into(),
+        trigger: ok.then(|| if std::mem::take(&mut st.compact_manual) { "manual" } else { "auto" }.into()),
+        pre_tokens: None,
+        post_tokens: None,
+        duration_ms: ok.then(|| (now_ms() - t0).max(0) as u64),
+    });
 }
 
 fn new_or_load(st: &mut State, spec: &StartSpec) -> Value {
