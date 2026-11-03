@@ -54,13 +54,16 @@ export function GitHistory({
   head?: string | null;
   /** Path of the current tab, to highlight the open commit file */
   selected?: string;
-  /** Nothing above (no uncommitted changes): take all the remaining height */
+  /** Nothing above (no uncommitted changes): take all the remaining height until the user drags the top edge */
   grow?: boolean;
   onOpen: (tab: string) => void;
 }) {
   useLang();
   const [open, setOpen] = useState(() => lsGet('wp-hist-open', !window.matchMedia('(max-width: 760px)').matches));
   const [height, setHeight] = useState(() => lsGet('wp-hist-h', 280));
+  // With nothing above, the box fills the column until the user drags it; that height is kept separately
+  const [growH, setGrowH] = useState<number | null>(() => lsGet<number | null>('wp-hist-grow-h', null));
+  const fill = !!grow && growH == null;
   const key = cacheKey(hostId, cwd);
   const [commits, setCommits] = useState<CommitInfo[]>(() => logCache.get(key)?.commits ?? []);
   const [more, setMore] = useState(() => logCache.get(key)?.more ?? false);
@@ -155,13 +158,13 @@ export function GitHistory({
     let h = h0;
     const move = (ev: PointerEvent) => {
       h = Math.round(Math.min(max, Math.max(80, h0 + y0 - ev.clientY)));
-      setHeight(h);
+      (grow ? setGrowH : setHeight)(h);
     };
     const up = () => {
       window.removeEventListener('pointermove', move);
       window.removeEventListener('pointerup', up);
       document.body.classList.remove('resizing-y');
-      lsSet('wp-hist-h', h);
+      lsSet(grow ? 'wp-hist-grow-h' : 'wp-hist-h', h);
     };
     document.body.classList.add('resizing-y');
     window.addEventListener('pointermove', move);
@@ -173,10 +176,10 @@ export function GitHistory({
   return (
     <div
       ref={box}
-      className={`wp-hist ${open ? 'open' : ''} ${open && grow ? 'grow' : ''}`}
-      style={open && !grow ? { height: Math.max(HEAD_MIN, height) } : undefined}
+      className={`wp-hist ${open ? 'open' : ''} ${open && fill ? 'grow' : ''}`}
+      style={open && !fill ? { height: Math.max(HEAD_MIN, grow ? growH! : height) } : undefined}
     >
-      {open && !grow && <div className="wp-hist-split" onPointerDown={drag} title={tr('拖动调整高度', 'Drag to resize')} />}
+      {open && <div className="wp-hist-split" onPointerDown={drag} title={tr('拖动调整高度', 'Drag to resize')} />}
       <div className="wp-hist-head">
         <button className="wp-hist-title" onClick={toggleOpen} aria-expanded={open}>
           <span className={`chev ${open ? 'open' : ''}`}>
