@@ -32,6 +32,12 @@ pub fn settings_path() -> PathBuf {
     base_dir().join("settings.json")
 }
 
+/// Single-instance lock for the daemon (Unix; on Windows the named pipe itself is the lock)
+#[cfg(unix)]
+pub fn lock_path() -> PathBuf {
+    base_dir().join("yi-agentd.lock")
+}
+
 pub fn log_path() -> PathBuf {
     base_dir().join("yi-agentd.log")
 }

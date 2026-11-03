@@ -114,12 +114,41 @@ mod pipe_sec {
     }
 }
 
+/// A bound local endpoint. Binding comes first in `serve`: only the process that wins it may touch the database,
+/// so a second daemon started by accident (concurrent bridges, login autostart) exits without side effects
 #[cfg(unix)]
-pub async fn listen(hub: Arc<Hub>) -> Result<()> {
+pub struct Listener {
+    listener: tokio::net::UnixListener,
+    /// Single-instance lock, held for the life of the process
+    _lock: std::fs::File,
+}
+
+/// Remove the socket on exit. Drop runs before the fields are dropped, i.e. while we still hold the lock,
+/// so it can't delete the socket of a daemon that has just taken over
+#[cfg(unix)]
+impl Drop for Listener {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(crate::paths::socket_path());
+    }
+}
+
+#[cfg(unix)]
+pub async fn bind() -> Result<Listener> {
     use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::io::AsRawFd;
+    // A failed connect alone doesn't prove the socket is stale (the daemon may just be busy), so deleting on that basis
+    // could orphan a live daemon. Whoever holds the lock owns the socket; the lock goes away with the process, even on a crash
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(crate::paths::lock_path())?;
+    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        anyhow::bail!("yi-agentd 已在运行");
+    }
     let path = crate::paths::socket_path();
+    // Daemons from before the lock existed don't hold it: if one still answers, leave it alone
     if path.exists() {
-        // If we can connect, an instance is already running; if not, it's a leftover file
         if tokio::net::UnixStream::connect(&path).await.is_ok() {
             anyhow::bail!("yi-agentd 已在运行");
         }
@@ -128,8 +157,14 @@ pub async fn listen(hub: Arc<Hub>) -> Result<()> {
     let listener = tokio::net::UnixListener::bind(&path)?;
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
     crate::info!("listening on {}", path.display());
+    Ok(Listener { listener, _lock: lock })
+}
+
+#[cfg(unix)]
+pub async fn serve(l: Listener, hub: Arc<Hub>) -> Result<()> {
+    // Owned by this future: when the daemon shuts down, select! drops it, which removes the socket and releases the lock
     loop {
-        let (stream, _) = listener.accept().await?;
+        let (stream, _) = l.listener.accept().await?;
         let hub = hub.clone();
         tokio::spawn(async move {
             let (r, w) = tokio::io::split(stream);
@@ -139,30 +174,56 @@ pub async fn listen(hub: Arc<Hub>) -> Result<()> {
 }
 
 #[cfg(windows)]
-pub async fn listen(hub: Arc<Hub>) -> Result<()> {
+pub struct Listener {
+    name: String,
+    sec: pipe_sec::PipeSecurity,
+    server: tokio::net::windows::named_pipe::NamedPipeServer,
+}
+
+#[cfg(windows)]
+fn create_pipe(
+    name: &str,
+    sec: &pipe_sec::PipeSecurity,
+    first: bool,
+) -> std::io::Result<tokio::net::windows::named_pipe::NamedPipeServer> {
     use tokio::net::windows::named_pipe::ServerOptions;
     use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+    let mut attrs = sec.attrs;
+    // Safety: the security descriptor attrs points to is valid while sec lives, and create only reads it
+    unsafe {
+        ServerOptions::new()
+            .first_pipe_instance(first)
+            .reject_remote_clients(true)
+            .create_with_security_attributes_raw(name, (&mut attrs as *mut SECURITY_ATTRIBUTES).cast())
+    }
+}
+
+#[cfg(windows)]
+pub async fn bind() -> Result<Listener> {
     let name = crate::paths::pipe_name();
     if connect().await.is_ok() {
         anyhow::bail!("yi-agentd 已在运行");
     }
     let sec = pipe_sec::new()?;
-    let create = |first: bool| {
-        let mut attrs = sec.attrs;
-        // Safety: the security descriptor attrs points to is valid while sec lives, and create only reads it
-        unsafe {
-            ServerOptions::new()
-                .first_pipe_instance(first)
-                .reject_remote_clients(true)
-                .create_with_security_attributes_raw(&name, (&mut attrs as *mut SECURITY_ATTRIBUTES).cast())
+    // first_pipe_instance makes creation atomic: it fails with access denied if another process already owns the name
+    let server = create_pipe(&name, &sec, true).map_err(|e| {
+        if e.raw_os_error() == Some(5) {
+            anyhow::anyhow!("yi-agentd 已在运行")
+        } else {
+            e.into()
         }
-    };
-    let mut server = create(true)?;
+    })?;
     crate::info!("listening on {name}");
+    Ok(Listener { name, sec, server })
+}
+
+#[cfg(windows)]
+pub async fn serve(l: Listener, hub: Arc<Hub>) -> Result<()> {
+    let Listener { name, sec, mut server } = l;
     loop {
         server.connect().await?;
         let client = server;
-        server = create(false)?;
+        server = create_pipe(&name, &sec, false)?;
         let hub = hub.clone();
         tokio::spawn(async move {
             let (r, w) = tokio::io::split(client);

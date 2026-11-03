@@ -35,7 +35,15 @@ use anyhow::Result;
 use std::time::Duration;
 
 fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    // --home <dir> is the same as YI_CONSOLE_HOME. spawn_detached passes it on Windows, because processes started via WMI
+    // don't inherit our environment; set it here, before any threads, so tool child processes inherit it too
+    if let Some(i) = args.iter().position(|a| a == "--home") {
+        if let Some(dir) = args.get(i + 1).cloned() {
+            std::env::set_var("YI_CONSOLE_HOME", dir);
+            args.drain(i..=i + 1);
+        }
+    }
     let cmd = args.first().map(String::as_str).unwrap_or("help");
     let res = match cmd {
         "serve" => serve(args.iter().any(|a| a == "-f" || a == "--foreground")),
@@ -198,6 +206,15 @@ fn serve(foreground: bool) -> Result<()> {
         .enable_all()
         .build()?;
     rt.block_on(async {
+        // Take the socket / pipe first; until we own it, touch nothing (database, relay, resume timers)
+        let listener = match transport::bind().await {
+            Ok(l) => l,
+            Err(e) => {
+                // Nobody watches stderr when running in the background, so the reason goes to the log
+                crate::warn!("监听失败，守护进程退出: {e:#}");
+                return Err(e);
+            }
+        };
         let store = store::Store::open(&paths::db_path())?;
         let hub = hub::Hub::new(store, settings::load());
         info!("yi-agentd {} starting, pid {}", yi_proto::DAEMON_VERSION, std::process::id());
@@ -214,18 +231,17 @@ fn serve(foreground: bool) -> Result<()> {
                 }
             });
         }
-        let listen = transport::listen(hub.clone());
+        let listen = transport::serve(listener, hub.clone());
         tokio::select! {
             r = listen => if let Err(e) = r {
                 // Nobody watches stderr when running in the background, so the reason goes to the log
-                crate::warn!("监听失败，守护进程退出: {e:#}");
+                crate::warn!("本地连接中断，守护进程退出: {e:#}");
                 return Err(e);
             },
             _ = hub.shutdown.notified() => info!("shutdown requested"),
             _ = tokio::signal::ctrl_c() => info!("interrupted"),
         }
-        #[cfg(unix)]
-        let _ = std::fs::remove_file(paths::socket_path());
+        // Leaving the select! dropped the listener: the socket is gone and the single-instance lock released
         Ok::<_, anyhow::Error>(())
     })?;
     // Don't wait for background tasks (tool child processes end via kill_on_drop)
@@ -272,7 +288,13 @@ pub fn spawn_detached() -> Result<()> {
     {
         // Processes started over SSH live in a job object and are killed with it when the session disconnects;
         // starting via WMI's Win32_Process.Create puts the process outside that job
-        let cmdline = format!("\"{}\" serve", exe.display()).replace('\'', "''");
+        let mut cmdline = format!("\"{}\" serve", exe.display());
+        // WMI processes get the user's registry environment, not ours: pass a custom data directory explicitly,
+        // otherwise a test daemon would start on the real ~/.yi-console. Trailing backslashes would escape the closing quote
+        if let Some(home) = std::env::var_os("YI_CONSOLE_HOME").filter(|v| !v.is_empty()) {
+            cmdline.push_str(&format!(" --home \"{}\"", home.to_string_lossy().trim_end_matches('\\')));
+        }
+        let cmdline = cmdline.replace('\'', "''");
         // WMI opens a visible window for console programs by default; ShowWindow=0 hides it;
         // children inherit this hidden console and don't pop up their own windows (WMI doesn't accept CREATE_NO_WINDOW)
         let ps = format!(
