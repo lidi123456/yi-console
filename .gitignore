@@ -7,3 +7,11 @@ app/src-tauri/binaries/*
 app/src-tauri/resources/yi-agentd/*
 !app/src-tauri/binaries/README.md
 !app/src-tauri/resources/yi-agentd/README.md
+
+# Per-machine config of AI coding tools (project rules live in AGENTS.md)
+.claude/
+.codex/
+.cursor/
+.kiro/
+.qoder/
+.codebuddy/
