@@ -114,8 +114,13 @@ export class PlanTracker {
 /** The session's current task list (for the bar above the input box) */
 export function latestPlan(events: HubEvent[]): PlanState | null {
   const t = new PlanTracker();
-  for (const e of events) t.feed(e);
-  return t.plan;
+  // A turn the user interrupted abandons its list: hide it until the tool updates the list again
+  let stopped = false;
+  for (const e of events) {
+    if (t.feed(e)) stopped = false;
+    else if (e.kind === 'turn_end' && (e.stopReason === 'cancelled' || e.stopReason === 'interrupted')) stopped = true;
+  }
+  return stopped ? null : t.plan;
 }
 
 /** Status for display: with infer, while the turn runs, the first unfinished item counts as in progress */
