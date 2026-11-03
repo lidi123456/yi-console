@@ -248,7 +248,8 @@ export function sessionMenu(
       ? [{ label: tr('换个工具继续…', 'Continue in Another Tool…'), icon: 'forward', run: () => handoffSession(hostId, info) }]
       : []),
     '-',
-    { label: tr('查看改动', 'View Changes'), icon: 'edit', run: () => showChanges(hostId, sid) },
+    // The session page has its own "View Changes" button in the top bar
+    ...(opts.inSession ? [] : [{ label: tr('查看改动', 'View Changes'), icon: 'diff', run: () => showChanges(hostId, sid) }]),
     // The mobile top bar already has a usage button, so don't repeat it in the menu; the terminal panel is the reverse and only appears in the mobile menu
     ...(opts.onUsage && info.tool !== 'shell' && !mobile ? [{ label: tr('查看用量', 'View Usage'), icon: 'chart', run: opts.onUsage }] : []),
     ...(opts.onToggleTerm && info.tool !== 'shell' && mobile

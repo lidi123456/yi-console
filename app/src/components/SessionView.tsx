@@ -6,7 +6,7 @@ import { rpc } from '../transport';
 import { TOOL_LABEL, type QuestionAnswer } from '../types';
 import { fmtUsage, lsGet, lsSet, shortPath, STATUS_LABEL } from '../util';
 import { openMenu } from './Overlay';
-import { exportSession, OPEN_CHANGES, renameSession, sessionMenu, switchMode } from './SessionActions';
+import { exportSession, OPEN_CHANGES, renameSession, sessionMenu, showChanges, switchMode } from './SessionActions';
 import { FilePanel } from './FilePanel';
 import { TermPanel } from './TermPanel';
 import { ChatView, PermissionCard, setChatStyle, useChatStyle } from './ChatView';
@@ -129,7 +129,6 @@ export function SessionView({ hostId, sessionId, seq }: { hostId: string; sessio
     );
   }
 
-  const running = info.status === 'running' || info.status === 'starting' || info.status === 'waiting-permission';
   const alive = info.status !== 'exited' && info.status !== 'error';
 
   const answer = async (requestId: string, optionId: string, answers?: QuestionAnswer[]) => {
@@ -209,11 +208,6 @@ export function SessionView({ hostId, sessionId, seq }: { hostId: string; sessio
             <span className="hide-mobile narrow-hide">{fmtUsage(info.usage) || tr('用量', 'Usage')}</span>
           </button>
         )}
-        {running && info.mode === 'structured' && (
-          <button className="btn small hide-mobile" onClick={() => act('session.interrupt')} title={tr('中断当前回合', 'Interrupt current turn')}>
-            <Icon name="stop" size={14} /> {tr('中断', 'Stop')}
-          </button>
-        )}
         {info.tool !== 'shell' && (
           <button
             className="btn small hide-mobile"
@@ -255,6 +249,9 @@ export function SessionView({ hostId, sessionId, seq }: { hostId: string; sessio
             <Icon name={style === 'modern' ? 'rows' : 'outline'} size={16} />
           </button>
         )}
+        <button className="icon-btn" title={tr('查看改动', 'View Changes')} aria-label={tr('查看改动', 'View Changes')} onClick={() => showChanges(hostId, sessionId)}>
+          <Icon name="diff" size={17} />
+        </button>
         <button className={`icon-btn ${files ? 'active' : ''}`} title={tr('工作目录文件', 'Workspace Files')} onClick={toggleFiles}>
           <Icon name="folder" size={17} />
         </button>

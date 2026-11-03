@@ -66,6 +66,7 @@ const paths: Record<string, string> = {
   columns: 'M4 5h16v14H4zM12 5v14',
   rows: 'M4 5h16v14H4zM4 12h16',
   compare: 'M7 4v13M4 14l3 3 3-3M17 20V7M14 10l3-3 3 3',
+  diff: 'M6 3h8l4 4v14H6zM14 3v4h4M12 9v5M9.5 11.5h5M9.5 17h5',
   external: 'M14 4h6v6M20 4l-9 9M18 14v6H4V6h6',
   upload: 'M12 16V5M7 10l5-5 5 5M5 20h14',
 };
