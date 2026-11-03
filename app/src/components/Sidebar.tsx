@@ -277,6 +277,10 @@ function HostBlock({ h, filter }: { h: HostEntry; filter: string }) {
     lsSet(`fold-dirs-${id}`, next);
     setFolded(next);
   };
+  const setAllFolded = (next: string[]) => {
+    lsSet(`fold-dirs-${id}`, next);
+    setFolded(next);
+  };
   const connected = h.status.status === 'connected';
 
   const q = filter.trim();
@@ -298,6 +302,7 @@ function HostBlock({ h, filter }: { h: HostEntry; filter: string }) {
     return { pinned, groups, flat: split(rest), matched: all.length };
   }, [sessions, q, staleDays, now]);
 
+  const allFolded = groups.length > 0 && groups.every((g) => folded.includes(g.cwd));
   const total = (sessions ?? []).filter((s) => !s.parentId).length;
   const hostCls = (sessions ?? []).filter((s) => !s.parentId).map(sessionStatusClass);
   const hostSum = hostCls.includes('attn') ? 'attn' : hostCls.includes('busy') ? 'busy' : null;
@@ -348,6 +353,16 @@ function HostBlock({ h, filter }: { h: HostEntry; filter: string }) {
             <Icon name="chevron" size={12} />
           </span>
         </button>
+        {/* Fold / unfold every directory at once (by-directory layout only): folds all while any is open */}
+        {layout === 'project' && !collapsed && !q && groups.length > 1 && (
+          <button
+            className="host-act"
+            title={allFolded ? tr('展开所有目录', 'Expand All Directories') : tr('折叠所有目录', 'Collapse All Directories')}
+            onClick={() => setAllFolded(allFolded ? [] : groups.map((g) => g.cwd))}
+          >
+            <Icon name={allFolded ? 'unfold-all' : 'fold-all'} size={14} />
+          </button>
+        )}
         {/* Layout switch sits in the header for one-click toggling; the icon shows the layout a click switches to */}
         <button
           className="host-act"
