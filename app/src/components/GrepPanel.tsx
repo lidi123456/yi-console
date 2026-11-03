@@ -125,8 +125,7 @@ export function GrepPanel({
   const [cs, setCs] = useState(() => lsGet('wp-grep-cs', false));
   const [ww, setWw] = useState(() => lsGet('wp-grep-ww', false));
   const [re, setRe] = useState(() => lsGet('wp-grep-re', false));
-  // Files to include / exclude (comma-separated globs, as in VS Code); the row is hidden until asked for
-  const [scope, setScope] = useState(() => lsGet('wp-grep-scope', false));
+  // Files to include / exclude (comma-separated globs, as in VS Code), always shown
   const [inc, setInc] = useState(() => lsGet('wp-grep-inc', ''));
   const [exc, setExc] = useState(() => lsGet('wp-grep-exc', ''));
   const [openOnly, setOpenOnly] = useState(() => lsGet('wp-grep-open', false));
@@ -156,8 +155,6 @@ export function GrepPanel({
   useEffect(() => {
     if (!includeRequest || includeRequest.n <= appliedInclude) return;
     appliedInclude = includeRequest.n;
-    setScope(true);
-    lsSet('wp-grep-scope', true);
     setInc(includeRequest.value);
     input.current?.focus();
   }, [includeRequest?.n]); // eslint-disable-line react-hooks/exhaustive-deps
@@ -168,13 +165,15 @@ export function GrepPanel({
     lsSet('wp-grep-exc', exc);
     lsSet('wp-grep-rep', rep);
     if (!term) {
+      // The pending search was cancelled by the cleanup below, so its finally won't clear busy
       setRes(null);
+      setBusy(false);
       return;
     }
     let alive = true;
     const t = setTimeout(() => {
       setBusy(true);
-      const range = scope ? { include: inc.trim(), exclude: exc.trim(), ...(openOnly ? { paths: openFiles } : {}) } : {};
+      const range = { include: inc.trim(), exclude: exc.trim(), ...(openOnly ? { paths: openFiles } : {}) };
       const withRep = showRep;
       rpc<Omit<Result, 'q'>>(hostId, 'fs.grep', {
         root,
@@ -209,7 +208,7 @@ export function GrepPanel({
       alive = false;
       clearTimeout(t);
     };
-  }, [hostId, root, term, cs, ww, re, scope, inc, exc, openOnly, openKey, showRep, showRep && rep, showRep && pc, nonce]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [hostId, root, term, cs, ww, re, inc, exc, openOnly, openKey, showRep, showRep && rep, showRep && pc, nonce]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // One item per match, grouped by file, without dismissed ones
   const groups = useMemo(() => {
@@ -231,8 +230,8 @@ export function GrepPanel({
   const previewing = showRep && !!res?.withRep;
   const canReplace = previewing && total > 0 && !working && !busy;
 
-  const toggle = (k: 'cs' | 'ww' | 're' | 'scope' | 'open' | 'pc') => {
-    const [v, set] = ({ cs: [cs, setCs], ww: [ww, setWw], re: [re, setRe], scope: [scope, setScope], open: [openOnly, setOpenOnly], pc: [pc, setPc] } as const)[k] as [
+  const toggle = (k: 'cs' | 'ww' | 're' | 'open' | 'pc') => {
+    const [v, set] = ({ cs: [cs, setCs], ww: [ww, setWw], re: [re, setRe], open: [openOnly, setOpenOnly], pc: [pc, setPc] } as const)[k] as [
       boolean,
       (b: boolean) => void,
     ];
@@ -457,32 +456,23 @@ export function GrepPanel({
           )}
         </div>
       </div>
-      <div className="grep-scope-bar">
-        <button
-          className={`grep-opt ${scope ? 'on' : ''}`}
-          title={tr('限定文件范围', 'Toggle search details')}
-          aria-expanded={scope}
-          onClick={() => toggle('scope')}
-        >
-          <Icon name="more" size={13} />
-        </button>
-      </div>
-      {scope && (
-        <div className="grep-scope">
-          <div className="grep-scope-row">
-            <input
-              value={inc}
-              onChange={(e) => setInc(e.target.value)}
-              placeholder={tr('包含的文件，例如 src, *.ts', 'Files to include, e.g. src, *.ts')}
-              aria-label={tr('包含的文件', 'Files to include')}
-              spellCheck={false}
-              onBlur={hi.push}
-              onKeyDown={hi.onKeyDown}
-            />
-            <button className={`grep-opt ${openOnly ? 'on' : ''}`} title={tr('仅在打开的文件中搜索', 'Search only in open files')} onClick={() => toggle('open')}>
-              <Icon name="file" size={13} />
-            </button>
-          </div>
+      {/* Same column as the search / replace boxes (right of the replace toggle) */}
+      <div className="grep-inputs grep-scope">
+        <div className="wp-filter grep-input">
+          <input
+            value={inc}
+            onChange={(e) => setInc(e.target.value)}
+            placeholder={tr('包含的文件，例如 src, *.ts', 'Files to include, e.g. src, *.ts')}
+            aria-label={tr('包含的文件', 'Files to include')}
+            spellCheck={false}
+            onBlur={hi.push}
+            onKeyDown={hi.onKeyDown}
+          />
+          <button className={`grep-opt ${openOnly ? 'on' : ''}`} title={tr('仅在打开的文件中搜索', 'Search only in open files')} onClick={() => toggle('open')}>
+            <Icon name="file" size={13} />
+          </button>
+        </div>
+        <div className="wp-filter grep-input">
           <input
             value={exc}
             onChange={(e) => setExc(e.target.value)}
@@ -493,7 +483,7 @@ export function GrepPanel({
             onKeyDown={he.onKeyDown}
           />
         </div>
-      )}
+      </div>
       <div className="grep-sum">
         {busy || working ? (
           <span className="spinner" />
