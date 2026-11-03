@@ -4,6 +4,7 @@ use anyhow::{bail, Result};
 use yi_proto::DirEntry;
 use serde_json::{json, Value};
 use std::io::{Read, Seek, SeekFrom};
+use std::path::Path;
 
 const MAX_READ: u64 = 1024 * 1024;
 /// Size limit for image previews in the file panel
@@ -252,7 +253,7 @@ pub fn open_native(path: &str, reveal: bool) -> Result<Value> {
     Ok(Value::Null)
 }
 
-/// Options for [`grep`]. include / exclude are comma-separated globs (VS Code's "files to include / exclude")
+/// Options for [`grep`] / [`replace`]. include / exclude are comma-separated globs (VS Code's "files to include / exclude")
 #[derive(Default)]
 pub struct GrepOpts {
     pub case_sensitive: bool,
@@ -260,6 +261,11 @@ pub struct GrepOpts {
     pub regex: bool,
     pub include: String,
     pub exclude: String,
+    /// Only these files (relative, /-separated): VS Code's "search only in open editors"
+    pub paths: Option<Vec<String>>,
+    /// Replacement text: grep then also returns what each match would become
+    pub replace: Option<String>,
+    pub preserve_case: bool,
 }
 
 /// Turn "a, b" into one regex over /-separated relative paths, following VS Code's search globs: `*` `?` stay
@@ -350,9 +356,219 @@ fn split_globs(list: &str) -> Vec<&str> {
     out
 }
 
+/// Compiled query shared by search and replace, so both see exactly the same matches
+struct Matcher {
+    re: regex::Regex,
+    whole_word: bool,
+    /// Replacement pattern (regex mode expands $1 etc.)
+    replace: Option<Vec<Piece>>,
+    preserve_case: bool,
+}
+
+impl Matcher {
+    fn new(query: &str, o: &GrepOpts) -> Result<Self> {
+        let src = if o.regex { query.to_string() } else { regex::escape(query) };
+        let re = regex::RegexBuilder::new(&src)
+            .case_insensitive(!o.case_sensitive)
+            .size_limit(1 << 22)
+            .build()
+            .map_err(|e| anyhow::anyhow!("正则表达式有误: {e}"))?;
+        let replace = o.replace.as_deref().map(|r| if o.regex { parse_replace(r) } else { vec![Piece::Text(r.to_string())] });
+        Ok(Self { re, whole_word: o.whole_word, replace, preserve_case: o.preserve_case })
+    }
+
+    /// Non-empty matches in one line (a pattern like `a*` matches the empty string everywhere). Whole word: the
+    /// characters next to the match must not be letters, digits or _ (checked here, since the regex crate has no lookaround)
+    fn find<'a>(&self, line: &'a str) -> Vec<regex::Captures<'a>> {
+        let is_word = |c: char| c.is_alphanumeric() || c == '_';
+        self.re
+            .captures_iter(line)
+            .filter(|c| {
+                let m = c.get(0).unwrap();
+                !m.is_empty()
+                    && (!self.whole_word
+                        || (!line[..m.start()].chars().next_back().is_some_and(is_word) && !line[m.end()..].chars().next().is_some_and(is_word)))
+            })
+            .collect()
+    }
+
+    fn replacement(&self, c: &regex::Captures) -> String {
+        let Some(pieces) = &self.replace else { return String::new() };
+        let out = expand(pieces, c);
+        if self.preserve_case {
+            preserve_case(c.get(0).unwrap().as_str(), &out)
+        } else {
+            out
+        }
+    }
+}
+
+/// Parsed replacement pattern
+#[derive(Debug, PartialEq)]
+enum Piece {
+    Text(String),
+    Group(usize),
+    /// \u \l (next character), \U \L (until \E), \E
+    Case(char),
+}
+
+/// VS Code's replace syntax in regex mode: $0 / $& whole match, $1..$99 groups, $$ a literal $, \n \t \\ escapes,
+/// and \u \l \U \L \E to change case
+fn parse_replace(r: &str) -> Vec<Piece> {
+    let mut out = vec![];
+    let mut text = String::new();
+    let cs: Vec<char> = r.chars().collect();
+    let mut i = 0;
+    let flush = |text: &mut String, out: &mut Vec<Piece>| {
+        if !text.is_empty() {
+            out.push(Piece::Text(std::mem::take(text)));
+        }
+    };
+    while i < cs.len() {
+        match (cs[i], cs.get(i + 1).copied()) {
+            ('$', Some('$')) => {
+                text.push('$');
+                i += 2;
+            }
+            ('$', Some('&')) => {
+                flush(&mut text, &mut out);
+                out.push(Piece::Group(0));
+                i += 2;
+            }
+            ('$', Some(d)) if d.is_ascii_digit() => {
+                let mut n = d.to_digit(10).unwrap() as usize;
+                i += 2;
+                if let Some(d2) = cs.get(i).and_then(|c| c.to_digit(10)) {
+                    n = n * 10 + d2 as usize;
+                    i += 1;
+                }
+                flush(&mut text, &mut out);
+                out.push(Piece::Group(n));
+            }
+            ('\\', Some(e @ ('n' | 't' | '\\'))) => {
+                text.push(match e {
+                    'n' => '\n',
+                    't' => '\t',
+                    _ => '\\',
+                });
+                i += 2;
+            }
+            ('\\', Some(c @ ('u' | 'l' | 'U' | 'L' | 'E'))) => {
+                flush(&mut text, &mut out);
+                out.push(Piece::Case(c));
+                i += 2;
+            }
+            (c, _) => {
+                text.push(c);
+                i += 1;
+            }
+        }
+    }
+    flush(&mut text, &mut out);
+    out
+}
+
+fn expand(pieces: &[Piece], c: &regex::Captures) -> String {
+    let mut out = String::new();
+    let (mut once, mut span) = (None::<char>, None::<char>);
+    for p in pieces {
+        let s = match p {
+            Piece::Text(t) => t.clone(),
+            // A group number the pattern doesn't have stays as written, as in VS Code
+            Piece::Group(n) if *n < c.len() => c.get(*n).map_or(String::new(), |m| m.as_str().to_string()),
+            Piece::Group(n) => format!("${n}"),
+            Piece::Case('E') => {
+                span = None;
+                continue;
+            }
+            Piece::Case(k @ ('U' | 'L')) => {
+                span = Some(*k);
+                continue;
+            }
+            Piece::Case(k) => {
+                once = Some(*k);
+                continue;
+            }
+        };
+        let mut s = match span {
+            Some('U') => s.to_uppercase(),
+            Some('L') => s.to_lowercase(),
+            _ => s,
+        };
+        if let Some(k) = once.take() {
+            let mut it = s.chars();
+            if let Some(f) = it.next() {
+                let f: String = if k == 'u' { f.to_uppercase().collect() } else { f.to_lowercase().collect() };
+                s = f + it.as_str();
+            }
+        }
+        out.push_str(&s);
+    }
+    out
+}
+
+/// VS Code's "preserve case": follow the matched text's case (ALL CAPS, all lower, Capitalized; for words joined by - or _,
+/// each part is capitalized when the match's parts are)
+fn preserve_case(matched: &str, rep: &str) -> String {
+    if rep.is_empty() {
+        return String::new();
+    }
+    let has_letter = |s: &str| s.chars().any(char::is_alphabetic);
+    if has_letter(matched) && matched == matched.to_uppercase() {
+        return rep.to_uppercase();
+    }
+    if has_letter(matched) && matched == matched.to_lowercase() {
+        return rep.to_lowercase();
+    }
+    let cap = |w: &str| {
+        let mut it = w.chars();
+        it.next().map_or(String::new(), |f| f.to_uppercase().collect::<String>() + it.as_str())
+    };
+    if matched.chars().next().is_some_and(char::is_uppercase) {
+        for sep in ['-', '_'] {
+            let (m, r): (Vec<&str>, Vec<&str>) = (matched.split(sep).collect(), rep.split(sep).collect());
+            if m.len() > 1 && m.len() == r.len() {
+                return r
+                    .iter()
+                    .zip(&m)
+                    .map(|(r, m)| if m.chars().next().is_some_and(char::is_uppercase) { cap(r) } else { r.to_string() })
+                    .collect::<Vec<_>>()
+                    .join(&sep.to_string());
+            }
+        }
+        return cap(rep);
+    }
+    rep.to_string()
+}
+
+/// Lines with their byte offsets, numbered the same way as str::lines (a trailing \r is not part of the line)
+fn line_spans(text: &str) -> impl Iterator<Item = (usize, &str)> {
+    let mut at = 0;
+    text.split_inclusive('\n').map(move |l| {
+        let start = at;
+        at += l.len();
+        let l = l.strip_suffix('\n').unwrap_or(l);
+        (start, l.strip_suffix('\r').unwrap_or(l))
+    })
+}
+
+fn files_in(dir: &Path, o: &GrepOpts) -> Result<Vec<String>> {
+    let include = glob_set(&o.include)?;
+    let exclude = glob_set(&o.exclude)?;
+    let mut files = match &o.paths {
+        Some(p) => p.iter().filter(|r| !r.split('/').any(|c| c == "..")).cloned().collect(),
+        None => file_list(dir).as_ref().clone(),
+    };
+    files.retain(|rel| !include.as_ref().is_some_and(|g| !g.is_match(rel)) && !exclude.as_ref().is_some_and(|g| g.is_match(rel)));
+    Ok(files)
+}
+
 /// Content search: under root (git ls-files in a git repo), find lines matching query file by file.
-/// The query is literal text unless `regex` is set; matching is per line. Skips binaries and files over 2MB;
-/// keeps only the first 300 characters of each line, at most limit hits
+/// The query is literal text unless `regex` is set; matching is per line. Skips binaries and files over 2MB.
+/// Each hit is a line: text holds up to 300 characters starting at offset, col/len are the first match within text,
+/// and matches lists every match as [column in the line, length, matched text, replacement?] (columns in characters).
+/// stat gives [modified, size] per file with hits, which replace uses to make sure the file hasn't changed since.
+/// Stops after limit matches
 pub fn grep(root: &str, query: &str, o: &GrepOpts, limit: usize) -> Result<Value> {
     let dir = crate::paths::expand(root);
     if !dir.is_dir() {
@@ -361,30 +577,18 @@ pub fn grep(root: &str, query: &str, o: &GrepOpts, limit: usize) -> Result<Value
     if query.is_empty() {
         return Ok(json!({ "hits": [], "truncated": false, "files": 0 }));
     }
-    let body = if o.regex { query.to_string() } else { regex::escape(query) };
-    // Whole word: the characters next to the match must not be letters, digits or _. The regex crate has no lookaround,
-    // so those neighbours are matched outside group 1, which holds the actual match
-    let src = if o.whole_word { format!(r"(?:^|[^\w])({body})(?:[^\w]|$)") } else { format!("({body})") };
-    let re = regex::RegexBuilder::new(&src)
-        .case_insensitive(!o.case_sensitive)
-        .size_limit(1 << 22)
-        .build()
-        .map_err(|e| anyhow::anyhow!("正则表达式有误: {e}"))?;
-    let include = glob_set(&o.include)?;
-    let exclude = glob_set(&o.exclude)?;
-    let files = file_list(&dir);
+    let m = Matcher::new(query, o)?;
+    let files = files_in(&dir, o)?;
     let started = std::time::Instant::now();
     let mut hits = vec![];
-    let mut matched_files = 0usize;
+    let mut stat = serde_json::Map::new();
+    let mut count = 0usize;
     let mut truncated = false;
     'files: for rel in files.iter() {
         // Don't let a single search hang for too long when there are many files
         if started.elapsed() > std::time::Duration::from_secs(8) {
             truncated = true;
             break;
-        }
-        if include.as_ref().is_some_and(|g| !g.is_match(rel)) || exclude.as_ref().is_some_and(|g| g.is_match(rel)) {
-            continue;
         }
         let full = dir.join(rel);
         let Ok(meta) = std::fs::metadata(&full) else { continue };
@@ -397,36 +601,161 @@ pub fn grep(root: &str, query: &str, o: &GrepOpts, limit: usize) -> Result<Value
         }
         let text = String::from_utf8_lossy(&buf);
         let mut any = false;
-        for (i, line) in text.lines().enumerate() {
-            // First non-empty match (a pattern like `a*` matches the empty string everywhere)
-            let Some(m) = re.captures_iter(line).filter_map(|c| c.get(1)).find(|m| !m.is_empty()) else { continue };
-            // Columns are counted in characters (the frontend highlights by character)
-            let ch = line[..m.start()].chars().count();
-            let qlen = m.as_str().chars().count();
-            let chars: Vec<char> = line.chars().collect();
+        for (i, (_, line)) in line_spans(&text).enumerate() {
+            let caps = m.find(line);
+            let Some(first) = caps.first() else { continue };
+            let char_col = |b: usize| line[..b].chars().count();
+            let list: Vec<Value> = caps
+                .iter()
+                .map(|c| {
+                    let g = c.get(0).unwrap();
+                    let mut v = json!([char_col(g.start()), g.as_str().chars().count(), g.as_str()]);
+                    if m.replace.is_some() {
+                        v.as_array_mut().unwrap().push(json!(m.replacement(c)));
+                    }
+                    v
+                })
+                .collect();
+            let g = first.get(0).unwrap();
+            let ch = char_col(g.start());
             // When the match is far into the line, cut off the beginning so the match stays visible
             let start = ch.saturating_sub(60);
-            let shown: String = chars[start..].iter().take(300).collect();
+            let shown: String = line.chars().skip(start).take(300).collect();
+            count += list.len();
             hits.push(json!({
                 "path": rel,
                 "line": i + 1,
                 "col": ch - start,
-                "len": qlen.min(300usize.saturating_sub(ch - start)),
+                "len": g.as_str().chars().count().min(300usize.saturating_sub(ch - start)),
                 "offset": start,
                 "text": shown,
+                "matches": list,
             }));
             any = true;
-            if hits.len() >= limit {
+            if count >= limit {
                 truncated = true;
-                matched_files += 1;
+                stat.insert(rel.clone(), json!([mtime(&meta), meta.len()]));
                 break 'files;
             }
         }
         if any {
-            matched_files += 1;
+            stat.insert(rel.clone(), json!([mtime(&meta), meta.len()]));
         }
     }
-    Ok(json!({ "hits": hits, "truncated": truncated, "files": matched_files }))
+    let files = stat.len();
+    Ok(json!({ "hits": hits, "truncated": truncated, "files": files, "stat": stat }))
+}
+
+/// One file to replace in
+pub struct ReplaceFile {
+    /// Relative to root, /-separated
+    pub path: String,
+    /// [modified, size] seen by grep: if the file changed since, it's skipped rather than overwritten
+    pub stat: Option<(i64, u64)>,
+    /// Matches to replace as (line, column in characters); None means every match
+    pub only: Option<Vec<(usize, usize)>>,
+    /// Text to work on instead of the file on disk (the editor's unsaved draft); never written
+    pub content: Option<String>,
+}
+
+/// Replace matches of query in the given files, as VS Code's search does: only the listed results are replaced.
+/// Line endings, BOM and everything outside the matches stay byte for byte. dry_run only returns the new text.
+/// Returns per file {path, abs, count, before (when written and under 1MB, for undo), after (dry run), modified, size}
+/// plus skipped [{path, reason}]
+pub fn replace(root: &str, query: &str, o: &GrepOpts, files: &[ReplaceFile], dry_run: bool) -> Result<Value> {
+    let dir = crate::paths::expand(root);
+    if !dir.is_dir() {
+        bail!("目录不存在: {}", dir.display());
+    }
+    if query.is_empty() || o.replace.is_none() {
+        bail!("缺少搜索词或替换内容");
+    }
+    let m = Matcher::new(query, o)?;
+    let (mut done, mut skipped) = (vec![], vec![]);
+    let mut skip = |path: &str, reason: &str| skipped.push(json!({ "path": path, "reason": reason }));
+    for f in files {
+        if f.path.is_empty() || f.path.split(['/', '\\']).any(|c| c == "..") || Path::new(&f.path).is_absolute() {
+            skip(&f.path, "路径无效");
+            continue;
+        }
+        let full = dir.join(&f.path);
+        let text = match &f.content {
+            Some(t) => t.clone(),
+            None => {
+                let Ok(meta) = std::fs::metadata(&full) else {
+                    skip(&f.path, "文件不存在");
+                    continue;
+                };
+                if f.stat.is_some_and(|(t, n)| t != mtime(&meta) || n != meta.len()) {
+                    skip(&f.path, "搜索之后文件被修改过");
+                    continue;
+                }
+                if meta.len() > 2 * 1024 * 1024 {
+                    skip(&f.path, "文件超过 2MB");
+                    continue;
+                }
+                let Ok(buf) = std::fs::read(&full) else {
+                    skip(&f.path, "读取失败");
+                    continue;
+                };
+                match String::from_utf8(buf) {
+                    Ok(t) if !t.as_bytes().iter().take(8000).any(|&b| b == 0) => t,
+                    _ => {
+                        skip(&f.path, "不是 UTF-8 文本");
+                        continue;
+                    }
+                }
+            }
+        };
+        let mut out = String::with_capacity(text.len());
+        let mut last = 0;
+        let mut count = 0;
+        for (i, (at, line)) in line_spans(&text).enumerate() {
+            for c in m.find(line) {
+                let g = c.get(0).unwrap();
+                if let Some(only) = &f.only {
+                    let col = line[..g.start()].chars().count();
+                    if !only.contains(&(i + 1, col)) {
+                        continue;
+                    }
+                }
+                out.push_str(&text[last..at + g.start()]);
+                out.push_str(&m.replacement(&c));
+                last = at + g.end();
+                count += 1;
+            }
+        }
+        out.push_str(&text[last..]);
+        // Asked-for matches that are no longer there: the file changed in a way mtime didn't show
+        if f.only.as_ref().is_some_and(|o| o.len() != count) && f.content.is_none() {
+            skip(&f.path, "搜索之后文件被修改过");
+            continue;
+        }
+        let abs = full.display().to_string();
+        if dry_run || f.content.is_some() {
+            done.push(json!({ "path": f.path, "abs": abs, "count": count, "before": text, "after": out }));
+            continue;
+        }
+        if count == 0 {
+            continue;
+        }
+        let (t, n) = match f.stat {
+            Some(s) => (Some(s.0), Some(s.1)),
+            None => (None, None),
+        };
+        match write(&abs, &out, t, n, false) {
+            Ok(r) => done.push(json!({
+                "path": f.path,
+                "abs": abs,
+                "count": count,
+                "before": if text.len() <= MAX_READ as usize { Some(text) } else { None },
+                "modified": r["modified"],
+                "size": r["size"],
+            })),
+            Err(e) => skip(&f.path, &e.to_string()),
+        }
+    }
+    Ok(json!({ "files": done, "skipped": skipped }))
 }
 
 fn mtime(meta: &std::fs::Metadata) -> i64 {
@@ -747,6 +1076,59 @@ mod tests {
         assert_eq!(r["hits"][0]["col"], 1);
         assert_eq!(r["hits"][0]["len"], 4);
         assert!(grep(&root, "(", &o(false, false, true), 10).is_err());
+    }
+
+    #[test]
+    fn grep_lists_every_match_and_whole_words() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("a.txt"), "a a xa a_ a\n").unwrap();
+        let root = d.path().display().to_string();
+        let o = GrepOpts { whole_word: true, ..Default::default() };
+        let r = grep(&root, "a", &o, 10).unwrap();
+        let cols: Vec<u64> = r["hits"][0]["matches"].as_array().unwrap().iter().map(|m| m[0].as_u64().unwrap()).collect();
+        assert_eq!(cols, [0, 2, 10]);
+        assert!(r["stat"]["a.txt"][1].as_u64() == Some(12));
+    }
+
+    #[test]
+    fn replace_patterns_and_case() {
+        let c = regex::Regex::new(r"(\w+)-(\w+)").unwrap().captures("foo-bar").unwrap();
+        assert_eq!(expand(&parse_replace(r"$2_$1 $& $$ $9 \U$1\E!\n"), &c), "bar_foo foo-bar $ $9 FOO!\n");
+        assert_eq!(expand(&parse_replace(r"\u$1"), &c), "Foo");
+        assert_eq!(preserve_case("FOO", "bar"), "BAR");
+        assert_eq!(preserve_case("foo", "Bar"), "bar");
+        assert_eq!(preserve_case("Foo", "bar"), "Bar");
+        assert_eq!(preserve_case("Foo-Bar", "baz-qux"), "Baz-Qux");
+        assert_eq!(preserve_case("fOO", "bar"), "bar");
+    }
+
+    #[test]
+    fn replace_keeps_bytes_and_checks_stat() {
+        let d = tempfile::tempdir().unwrap();
+        let f = d.path().join("a.txt");
+        std::fs::write(&f, "\u{feff}foo x\r\nfoo foo\r\nend").unwrap();
+        let root = d.path().display().to_string();
+        let o = GrepOpts { replace: Some("bar".into()), ..Default::default() };
+        let r = grep(&root, "foo", &o, 100).unwrap();
+        assert_eq!(r["hits"][1]["matches"][1], json!([4, 3, "foo", "bar"]));
+        let st = (r["stat"]["a.txt"][0].as_i64().unwrap(), r["stat"]["a.txt"][1].as_u64().unwrap());
+        // Only the listed matches (line 2, column 4 and line 1, column 1 after the BOM)
+        let file = |only: Option<Vec<(usize, usize)>>, stat| ReplaceFile { path: "a.txt".into(), stat, only, content: None };
+        let out = replace(&root, "foo", &o, &[file(Some(vec![(2, 4), (1, 1)]), Some(st))], false).unwrap();
+        assert_eq!(out["files"][0]["count"], 2);
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "\u{feff}bar x\r\nfoo bar\r\nend");
+        // A stat that doesn't match the file on disk: skipped, file untouched
+        let out = replace(&root, "foo", &o, &[file(None, Some((st.0, st.1 + 1)))], false).unwrap();
+        assert_eq!(out["skipped"][0]["reason"], "搜索之后文件被修改过");
+        // Dry run on a draft
+        let draft = ReplaceFile { path: "a.txt".into(), stat: None, only: None, content: Some("foo\n".into()) };
+        let out = replace(&root, "foo", &o, &[draft], true).unwrap();
+        assert_eq!(out["files"][0]["after"], "bar\n");
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "\u{feff}bar x\r\nfoo bar\r\nend");
+        // Regex groups
+        let o = GrepOpts { regex: true, replace: Some("<$1>".into()), ..Default::default() };
+        replace(&root, r"(o+)", &o, &[file(None, None)], false).unwrap();
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "\u{feff}bar x\r\nf<oo> bar\r\nend");
     }
 
     #[test]

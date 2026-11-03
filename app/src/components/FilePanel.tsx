@@ -479,7 +479,9 @@ export function FilePanel({
   const [quick, setQuick] = useState<QuickMode | null>(null);
   // Another file opened side by side on the right (read-only); compare diffs the current file against another
   const [second, setSecond] = useState<OpenFile | null>(null);
-  const [compare, setCompare] = useState<{ path: string; text: string } | null>(null);
+  const [compare, setCompare] = useState<{ path: string; text: string; replace?: boolean } | null>(null);
+  // "Find in folder" from the tree: the search view fills "files to include" with it
+  const [grepInclude, setGrepInclude] = useState<{ value: string; n: number } | null>(null);
   const [dropDir, setDropDir] = useState<string | null>(null);
   const [uploading, setUploading] = useState(0);
   const isLocal = useStore((st) => st.hosts.find((h) => h.config.id === hostId)?.config.kind === 'local');
@@ -1236,6 +1238,9 @@ export function FilePanel({
       r.isDir
         ? { label: r.expanded ? tr('收起', 'Collapse') : tr('展开', 'Expand'), icon: 'folder', run: () => toggle(r.path) }
         : { label: tr('打开', 'Open'), icon: 'file', run: () => openFile(r.path) },
+      ...(r.isDir && !r.loading
+        ? [{ label: tr('在文件夹中查找…', 'Find in folder…'), icon: 'search', run: () => (pickView('search'), setGrepInclude({ value: `./${rel(r.path)}`, n: Date.now() })) }]
+        : []),
       ...(!r.isDir && isHtml(r.path) ? [{ label: tr('在浏览器标签中打开', 'Open in browser tab'), icon: 'globe', run: () => openWeb(`file:${r.path}`) }] : []),
       ...(canSide
         ? [
@@ -1475,7 +1480,28 @@ export function FilePanel({
         </button>
       </div>
       {view === 'search' && root ? (
-        <GrepPanel hostId={hostId} root={root} onOpen={(r, line, col, len) => openFile(relOpen(r), false, { line, col, len })} />
+        <GrepPanel
+          hostId={hostId}
+          root={root}
+          onOpen={(r, line, col, len) => openFile(relOpen(r), false, { line, col, len })}
+          openFiles={tabs.filter((t) => !isWebTab(t) && !parseCommitTab(t) && rel(t) !== t).map(rel)}
+          dirty={file && dirty && !file.web && !file.commit && rel(file.path) !== file.path ? { rel: rel(file.path), draft: file.draft } : null}
+          includeRequest={grepInclude}
+          onPreview={async (r, line, col, len, after) => {
+            const abs = relOpen(r);
+            await openFile(abs, false, { line, col, len });
+            if (norm(fileRef.current?.path ?? '') === norm(abs)) setCompare({ path: abs, text: after, replace: true });
+          }}
+          onDraft={(next, expect) =>
+            setFile((cur) => (cur && !cur.web && !cur.commit && (expect == null || cur.draft === expect) ? { ...cur, draft: next, rev: Date.now() } : cur))
+          }
+          onReplaced={(paths) => {
+            refreshTree();
+            const f = fileRef.current;
+            if (!f || f.draft !== f.content || !paths.some((p) => norm(p) === norm(f.path))) return;
+            readFile(f.path, true).then((n) => n && setFile((cur) => (cur && cur.path === f.path && cur.draft === cur.content ? n : cur)));
+          }}
+        />
       ) : (
         <>
           {view === 'all' && (
@@ -1644,7 +1670,7 @@ export function FilePanel({
   const editor = file && (
     <CodeEditor
       docKey={`${file.path}#${file.rev}`}
-      value={file.content}
+      value={file.draft}
       filename={baseName(file.path)}
       readOnly={file.truncated || !!file.notUtf8}
       wrap={wrap || (md && mdSplit && wide())}
@@ -1990,7 +2016,7 @@ export function FilePanel({
             <div className="wp-compare-title truncate" title={`${file.path}\n${compare.path}`}>
               <span className="pd-tag del">{baseName(file.path)}</span>
               <Icon name="forward" size={12} />
-              <span className="pd-tag add">{rel(compare.path)}</span>
+              <span className="pd-tag add">{compare.replace ? tr('替换后', 'After replace') : rel(compare.path)}</span>
             </div>
           ) : (
             <Breadcrumbs hostId={hostId} root={root ?? cwd} path={file.path} hidden={hidden} onOpen={openFile} dirty={dirty} />

@@ -6495,6 +6495,82 @@ body.resizing .side-resizer::after {
 .grep-input {
   margin-top: 0;
 }
+/* Search + replace boxes with VS Code's toggle on the left */
+.grep-boxes {
+  display: flex;
+  align-items: stretch;
+  gap: 2px;
+  padding-left: 4px;
+}
+.grep-rep-toggle {
+  flex: none;
+  width: 18px;
+  margin-bottom: 6px;
+  border-radius: 4px;
+  color: var(--text-3);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.grep-rep-toggle:hover {
+  background: var(--side-hover);
+  color: var(--text);
+}
+.grep-inputs {
+  flex: 1;
+  min-width: 0;
+}
+.grep-inputs .wp-filter {
+  margin-left: 0;
+}
+.grep-rep {
+  padding-left: 10px;
+}
+.grep-opt:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+.grep-scope-bar {
+  display: flex;
+  justify-content: flex-end;
+  margin: -4px 8px 4px;
+}
+.grep-scope-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.grep-scope-row input {
+  flex: 1;
+  min-width: 0;
+}
+/* Per-row actions (replace / dismiss), shown on hover like VS Code */
+.grep-acts {
+  flex: none;
+  display: none;
+  gap: 2px;
+}
+.grep-acts .icon-btn {
+  width: 20px;
+  height: 20px;
+}
+.grep-head:hover .grep-acts,
+.grep-hit:hover .grep-acts {
+  display: flex;
+}
+.grep-head:hover .grep-n {
+  display: none;
+}
+.grep-text del {
+  background: var(--del-bg);
+  text-decoration: line-through;
+  border-radius: 2px;
+}
+.grep-text ins {
+  background: var(--add-bg);
+  text-decoration: none;
+  border-radius: 2px;
+}
 .grep-opt {
   flex: none;
   height: 20px;

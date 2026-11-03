@@ -684,8 +684,12 @@ pub mod methods {
     pub const FS_DELETE: &str = "fs.delete";
     /// Drive list on Windows; ["/"] on other systems
     pub const FS_ROOTS: &str = "fs.roots";
-    /// {root, query, caseSensitive?, wholeWord?, regex?, include?, exclude?(comma-separated globs), limit?} -> {hits: [{path(relative), line, col, len, offset, text}], truncated, files}: search file contents
+    /// {root, query, caseSensitive?, wholeWord?, regex?, include?, exclude?(comma-separated globs), paths?(only these), replace?, preserveCase?, limit?}
+    /// -> {hits: [{path(relative), line, col, len, offset, text, matches:[[col, len, text, replacement?]]}], truncated, files, stat:{path:[modified, size]}}: search file contents
     pub const FS_GREP: &str = "fs.grep";
+    /// {same options as fs.grep with replace, files:[{path, stat?, matches?:[[line, col]], content?}], dryRun?}
+    /// -> {files:[{path, abs, count, before?, after?, modified?, size?}], skipped:[{path, reason}]}: replace search results
+    pub const FS_REPLACE: &str = "fs.replace";
     /// {path, data(base64), overwrite?} -> {path, size, modified}: upload a file
     pub const FS_UPLOAD: &str = "fs.upload";
     /// {path, reveal?}: open with the system default program / reveal in the file manager; local connections only

@@ -497,15 +497,33 @@ pub async fn dispatch(
         FS_GREP => {
             let root = s(&p, "root")?.to_string();
             let q = p["query"].as_str().unwrap_or("").to_string();
-            let o = crate::fsapi::GrepOpts {
-                case_sensitive: p["caseSensitive"].as_bool().unwrap_or(false),
-                whole_word: p["wholeWord"].as_bool().unwrap_or(false),
-                regex: p["regex"].as_bool().unwrap_or(false),
-                include: p["include"].as_str().unwrap_or("").to_string(),
-                exclude: p["exclude"].as_str().unwrap_or("").to_string(),
-            };
-            let limit = p["limit"].as_u64().unwrap_or(500).min(2000) as usize;
+            let o = grep_opts(&p);
+            let limit = p["limit"].as_u64().unwrap_or(500).min(20000) as usize;
             tokio::task::spawn_blocking(move || crate::fsapi::grep(&root, &q, &o, limit)).await??
+        }
+        FS_REPLACE => {
+            let root = s(&p, "root")?.to_string();
+            let q = p["query"].as_str().unwrap_or("").to_string();
+            let o = grep_opts(&p);
+            let dry = p["dryRun"].as_bool().unwrap_or(false);
+            let files: Vec<crate::fsapi::ReplaceFile> = p["files"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .map(|f| crate::fsapi::ReplaceFile {
+                            path: f["path"].as_str().unwrap_or("").to_string(),
+                            stat: f["stat"].as_array().and_then(|v| Some((v.first()?.as_i64()?, v.get(1)?.as_u64()?))),
+                            only: f["matches"].as_array().map(|m| {
+                                m.iter()
+                                    .filter_map(|x| Some((x.get(0)?.as_u64()? as usize, x.get(1)?.as_u64()? as usize)))
+                                    .collect()
+                            }),
+                            content: f["content"].as_str().map(str::to_string),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            tokio::task::spawn_blocking(move || crate::fsapi::replace(&root, &q, &o, &files, dry)).await??
         }
         FS_UPLOAD => {
             let path = s(&p, "path")?.to_string();
@@ -559,4 +577,18 @@ pub async fn dispatch(
         }
         _ => return Err(anyhow!("未知方法: {method}")),
     })
+}
+
+/// Search options shared by fs.grep and fs.replace
+fn grep_opts(p: &Value) -> crate::fsapi::GrepOpts {
+    crate::fsapi::GrepOpts {
+        case_sensitive: p["caseSensitive"].as_bool().unwrap_or(false),
+        whole_word: p["wholeWord"].as_bool().unwrap_or(false),
+        regex: p["regex"].as_bool().unwrap_or(false),
+        include: p["include"].as_str().unwrap_or("").to_string(),
+        exclude: p["exclude"].as_str().unwrap_or("").to_string(),
+        paths: p["paths"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect()),
+        replace: p["replace"].as_str().map(str::to_string),
+        preserve_case: p["preserveCase"].as_bool().unwrap_or(false),
+    }
 }
