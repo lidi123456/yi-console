@@ -14,6 +14,7 @@ import { setTermPrefs, useTermPrefs, type TermScheme } from './TerminalView';
 import { setChatStyle, useChatStyle, type ChatStyle } from './ChatView';
 import { historyTail, setHistoryTail, TAIL_OPTIONS } from '../store';
 import { HandoffCard } from './HandoffCard';
+import { setSidePrefs, STALE_OPTIONS, useSidePrefs, type SideLayout } from './Sidebar';
 import { Icon } from './Icon';
 import { setTheme, useTheme, type Theme } from '../theme';
 import { setLangPref, tr, useLang, type LangPref } from '../i18n';
@@ -35,6 +36,7 @@ export function PrefsView() {
       <ThemeCard />
       <NotifyCard />
       <ChatStyleCard />
+      <SidebarCard />
       <HandoffCard />
       <TermCard />
       <ProxyCard />
@@ -144,6 +146,53 @@ function ChatStyleCard() {
           {TAIL_OPTIONS.map((n) => (
             <option key={n} value={n}>
               {tr(`${n} 条`, `${n}`)}
+            </option>
+          ))}
+        </select>
+      </PrefRow>
+    </div>
+  );
+}
+
+function SidebarCard() {
+  const p = useSidePrefs();
+  return (
+    <div className="card">
+      <div className="card-title">
+        <Icon name="folder" size={16} /> {tr('侧栏会话列表', 'Sidebar Sessions')}
+      </div>
+      <PrefRow
+        title={tr('排列方式', 'Layout')}
+        desc={
+          p.layout === 'project'
+            ? tr('按工作目录分组，组内最近活动的在前', 'Grouped by working directory, most recent first')
+            : tr('不分组，所有会话按最近活动排成一列，每行显示所在目录', 'One list sorted by recent activity, each row shows its directory')
+        }
+      >
+        <div className="seg">
+          {(
+            [
+              ['project', tr('按目录', 'By Directory')],
+              ['time', tr('按时间', 'By Time')],
+            ] as [SideLayout, string][]
+          ).map(([k, l]) => (
+            <button key={k} className={p.layout === k ? 'active' : ''} onClick={() => setSidePrefs({ layout: k })}>
+              {l}
+            </button>
+          ))}
+        </div>
+      </PrefRow>
+      <PrefRow
+        title={tr('收进「更早的」', 'Move to "Older"')}
+        desc={tr(
+          '进程已结束、超过这么久没有活动的会话，收进各目录末尾的「更早的 N 个」。置顶的会话和搜索时不收起。',
+          'Ended sessions idle this long are folded into "N older" at the end of each directory. Pinned sessions and search results are never folded.',
+        )}
+      >
+        <select value={p.staleDays} onChange={(e) => setSidePrefs({ staleDays: Number(e.target.value) })}>
+          {STALE_OPTIONS.map((n) => (
+            <option key={n} value={n}>
+              {n === 0 ? tr('从不', 'Never') : tr(`${n} 天`, n === 1 ? '1 day' : `${n} days`)}
             </option>
           ))}
         </select>

@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { isEn, tr } from '../i18n';
 import { hubCall, rpc } from '../transport';
 import { errorToast, navigate, setState, toast, useStore, type HostEntry } from '../store';
@@ -139,8 +139,45 @@ function SessionRow({ hostId, s, active, showDir }: { hostId: string; s: Session
   );
 }
 
-/** Sessions idle longer than this and not running go under "Earlier" */
-const STALE_MS = 3 * 86400_000;
+/** Sidebar preferences (this device only): layout and how many idle days before a session goes under "Earlier" */
+export type SideLayout = 'project' | 'time';
+export type SidePrefs = { layout: SideLayout; staleDays: number };
+/** 0 = never collapse */
+export const STALE_OPTIONS = [1, 3, 7, 14, 30, 0];
+const SIDE_EVENT = 'yi-console:side-prefs';
+
+export function sidePrefs(): SidePrefs {
+  const p = lsGet<Partial<SidePrefs>>('side-prefs', {});
+  return {
+    layout: p.layout === 'time' ? 'time' : 'project',
+    staleDays: STALE_OPTIONS.includes(p.staleDays as number) ? (p.staleDays as number) : 3,
+  };
+}
+
+export function setSidePrefs(patch: Partial<SidePrefs>) {
+  lsSet('side-prefs', { ...sidePrefs(), ...patch });
+  window.dispatchEvent(new Event(SIDE_EVENT));
+}
+
+export function useSidePrefs() {
+  const [v, setV] = useState(sidePrefs);
+  useEffect(() => {
+    const f = () => setV(sidePrefs());
+    window.addEventListener(SIDE_EVENT, f);
+    return () => window.removeEventListener(SIDE_EVENT, f);
+  }, []);
+  return v;
+}
+
+/** Re-evaluate "Earlier" every 10 minutes, so sessions cross the threshold even when the list doesn't change */
+function useSlowClock() {
+  const [now, setNow] = useState(Date.now);
+  useEffect(() => {
+    const t = setInterval(() => setNow(Date.now()), 600_000);
+    return () => clearInterval(t);
+  }, []);
+  return now;
+}
 
 /** Context menu for directory rows in the sidebar */
 function dirMenu(hostId: string, cwd: string, connected: boolean): (MenuItem | '-')[] {
@@ -173,6 +210,11 @@ function hostMenu(h: HostEntry, connect: () => void): (MenuItem | '-')[] {
     { label: tr('用量统计', 'Usage Stats'), icon: 'chart', run: () => navigate({ kind: 'stats', hostId: id }) },
     { label: tr('端口转发', 'Port Forwarding'), icon: 'external', run: () => navigate({ kind: 'ports', hostId: id }) },
     '-',
+    sidePrefs().layout === 'time'
+      ? { label: tr('按目录分组', 'Group by Directory'), icon: 'folder', run: () => setSidePrefs({ layout: 'project' }) }
+      : { label: tr('按时间排列', 'Sort by Time'), icon: 'clock', run: () => setSidePrefs({ layout: 'time' }) },
+    { label: tr('侧栏设置…', 'Sidebar Settings…'), icon: 'settings', run: () => navigate({ kind: 'prefs' }) },
+    '-',
     { label: tr('主机设置', 'Host Settings'), icon: 'settings', run: () => navigate({ kind: 'settings', hostId: id }) },
     { label: tr('编辑连接', 'Edit Connection'), icon: 'edit', run: () => navigate({ kind: 'hosts', editId: id }) },
     ...(h.config.kind !== 'local'
@@ -181,12 +223,51 @@ function hostMenu(h: HostEntry, connect: () => void): (MenuItem | '-')[] {
   ];
 }
 
+/** "N older" toggle at the end of a directory (or of the flat time list). The open session always stays visible */
+function OldList({
+  k,
+  old,
+  open,
+  onToggle,
+  showDir,
+  hostId,
+  isActive,
+}: {
+  k: string;
+  old: SessionInfo[];
+  open: boolean;
+  onToggle: (k: string) => void;
+  showDir?: boolean;
+  hostId: string;
+  isActive: (s: SessionInfo) => boolean;
+}) {
+  if (old.length === 0) return null;
+  const rows = open ? old : old.filter(isActive);
+  return (
+    <>
+      <button className="project-name old-toggle" onClick={() => onToggle(k)}>
+        {tr(`更早的 ${old.length} 个`, `${old.length} older`)}
+        <span className={`chev ${open ? 'open' : ''}`}>
+          <Icon name="chevron" size={11} />
+        </span>
+      </button>
+      {rows.map((s) => (
+        <SessionRow key={s.id} hostId={hostId} s={s} active={isActive(s)} showDir={showDir} />
+      ))}
+    </>
+  );
+}
+
 function HostBlock({ h, filter }: { h: HostEntry; filter: string }) {
   const id = h.config.id;
   const sessions = useStore((s) => s.sessions[id]);
   const view = useStore((s) => s.view);
   const [collapsed, setCollapsed] = useState<boolean>(() => lsGet(`collapse-${id}`, false));
-  const [showOld, setShowOld] = useState(false);
+  // Directories whose "Earlier" list is expanded ('' = the flat list in time layout); not remembered
+  const [showOld, setShowOld] = useState<string[]>([]);
+  const toggleOld = (k: string) => setShowOld((v) => (v.includes(k) ? v.filter((x) => x !== k) : [...v, k]));
+  const { layout, staleDays } = useSidePrefs();
+  const now = useSlowClock();
   // Collapsed project directories, remembered locally per host
   const [folded, setFolded] = useState<string[]>(() => lsGet(`fold-dirs-${id}`, []));
   const fold = (cwd: string) => {
@@ -197,20 +278,23 @@ function HostBlock({ h, filter }: { h: HostEntry; filter: string }) {
   const connected = h.status.status === 'connected';
 
   const q = filter.trim();
-  const { pinned, groups, old, matched } = useMemo(() => {
+  const { pinned, groups, flat, matched } = useMemo(() => {
     const all = (sessions ?? []).filter((s) => !s.parentId && (!q || fuzzyScore(`${s.title} ${s.cwd}`, q) >= 0));
-    const now = Date.now();
     const pinned = all.filter((s) => s.pinned);
     const rest = all.filter((s) => !s.pinned);
-    // Don't collapse while searching
-    const isOld = (s: SessionInfo) => !q && (s.status === 'exited' || s.status === 'error') && now - s.updatedAt > STALE_MS;
+    // Only ended sessions idle past the threshold; never while searching
+    const staleMs = staleDays * 86400_000;
+    const isOld = (s: SessionInfo) => !q && staleMs > 0 && (s.status === 'exited' || s.status === 'error') && now - s.updatedAt > staleMs;
+    const split = (list: SessionInfo[]) => ({ recent: list.filter((s) => !isOld(s)), old: list.filter(isOld) });
+    // Sessions arrive newest first, so directories with only old sessions naturally end up at the bottom
     const m = new Map<string, SessionInfo[]>();
-    for (const s of rest.filter((x) => !isOld(x))) {
+    for (const s of rest) {
       if (!m.has(s.cwd)) m.set(s.cwd, []);
       m.get(s.cwd)!.push(s);
     }
-    return { pinned, groups: [...m.entries()], old: rest.filter(isOld), matched: all.length };
-  }, [sessions, q]);
+    const groups = [...m.entries()].map(([cwd, list]) => ({ cwd, list, ...split(list) }));
+    return { pinned, groups, flat: split(rest), matched: all.length };
+  }, [sessions, q, staleDays, now]);
 
   const total = (sessions ?? []).filter((s) => !s.parentId).length;
   const hostCls = (sessions ?? []).filter((s) => !s.parentId).map(sessionStatusClass);
@@ -297,65 +381,70 @@ function HostBlock({ h, filter }: { h: HostEntry; filter: string }) {
               ))}
             </div>
           )}
-          {groups.map(([cwd, list]) => {
-            // Expand everything while searching; when collapsed, still show the currently open session
-            const isFolded = !q && folded.includes(cwd);
-            const rows = isFolded ? list.filter(isActive) : list;
-            const cls = list.map(sessionStatusClass);
-            const sum = cls.includes('attn') ? 'attn' : cls.includes('busy') ? 'busy' : null;
-            return (
-              <div className="project" key={cwd}>
-                <div className="project-head">
-                <button
-                  className={`project-add ${connected ? '' : 'hidden'}`}
-                  title={tr(`在 ${basename(cwd)} 新建会话`, `New session in ${basename(cwd)}`)}
-                  onClick={() => setState({ newSession: { hostId: id, cwd } })}
-                >
-                  <Icon name="plus" size={13} />
-                </button>
-                <button
-                  className="project-name project-toggle"
-                  title={
-                    isEn()
-                      ? `${cwd}\nClick to ${isFolded ? 'expand' : 'collapse'}, right-click for more`
-                      : `${cwd}\n点击${isFolded ? '展开' : '折叠'}，右键更多操作`
-                  }
-                  onClick={() => fold(cwd)}
-                  onContextMenu={(e) => openMenu(e, dirMenu(id, cwd, connected))}
-                >
-                  <span className="truncate">{basename(cwd)}</span>
-                  <span className={`chev ${isFolded ? '' : 'open'}`}>
-                    <Icon name="chevron" size={11} />
-                  </span>
-                  {isFolded && (
-                    <span className="project-count">
-                      {list.length}
-                      {sum && (
-                        <span
-                          className={`sdot sdot-${sum}`}
-                          title={sum === 'attn' ? tr('有会话等待审批', 'Session waiting for approval') : tr('有会话在运行', 'Session running')}
-                        />
-                      )}
-                    </span>
-                  )}
-                </button>
-                </div>
-                {rows.map((s) => (
-                  <SessionRow key={s.id} hostId={id} s={s} active={isActive(s)} />
-                ))}
-              </div>
-            );
-          })}
-          {old.length > 0 && (
+          {layout === 'time' ? (
             <div className="project">
-              <button className="project-name old-toggle" onClick={() => setShowOld(!showOld)}>
-                {tr(`更早的 ${old.length} 个会话`, `${old.length} older session(s)`)}
-                <span className={`chev ${showOld ? 'open' : ''}`}>
-                  <Icon name="chevron" size={11} />
-                </span>
-              </button>
-              {showOld && old.map((s) => <SessionRow key={s.id} hostId={id} s={s} active={isActive(s)} showDir />)}
+              {pinned.length > 0 && flat.recent.length + flat.old.length > 0 && <div className="project-name">{tr('最近', 'Recent')}</div>}
+              {flat.recent.map((s) => (
+                <SessionRow key={s.id} hostId={id} s={s} active={isActive(s)} showDir />
+              ))}
+              <OldList k="" old={flat.old} open={showOld.includes('')} onToggle={toggleOld} showDir hostId={id} isActive={isActive} />
             </div>
+          ) : (
+            groups.map(({ cwd, list, recent, old }) => {
+              // Expand everything while searching; when collapsed, still show the currently open session
+              const isFolded = !q && folded.includes(cwd);
+              const cls = list.map(sessionStatusClass);
+              const sum = cls.includes('attn') ? 'attn' : cls.includes('busy') ? 'busy' : null;
+              return (
+                <div className="project" key={cwd}>
+                  <div className="project-head">
+                    <button
+                      className={`project-add ${connected ? '' : 'hidden'}`}
+                      title={tr(`在 ${basename(cwd)} 新建会话`, `New session in ${basename(cwd)}`)}
+                      onClick={() => setState({ newSession: { hostId: id, cwd } })}
+                    >
+                      <Icon name="plus" size={13} />
+                    </button>
+                    <button
+                      className="project-name project-toggle"
+                      title={
+                        isEn()
+                          ? `${cwd}\nClick to ${isFolded ? 'expand' : 'collapse'}, right-click for more`
+                          : `${cwd}\n点击${isFolded ? '展开' : '折叠'}，右键更多操作`
+                      }
+                      onClick={() => fold(cwd)}
+                      onContextMenu={(e) => openMenu(e, dirMenu(id, cwd, connected))}
+                    >
+                      <span className="truncate">{basename(cwd)}</span>
+                      <span className={`chev ${isFolded ? '' : 'open'}`}>
+                        <Icon name="chevron" size={11} />
+                      </span>
+                      {isFolded && (
+                        <span className="project-count">
+                          {list.length}
+                          {sum && (
+                            <span
+                              className={`sdot sdot-${sum}`}
+                              title={sum === 'attn' ? tr('有会话等待审批', 'Session waiting for approval') : tr('有会话在运行', 'Session running')}
+                            />
+                          )}
+                        </span>
+                      )}
+                    </button>
+                  </div>
+                  {isFolded ? (
+                    list.filter(isActive).map((s) => <SessionRow key={s.id} hostId={id} s={s} active />)
+                  ) : (
+                    <>
+                      {recent.map((s) => (
+                        <SessionRow key={s.id} hostId={id} s={s} active={isActive(s)} />
+                      ))}
+                      <OldList k={cwd} old={old} open={showOld.includes(cwd)} onToggle={toggleOld} hostId={id} isActive={isActive} />
+                    </>
+                  )}
+                </div>
+              );
+            })
           )}
           {connected && sessions && !sessions.some((s) => !s.parentId) && (
             <div className="muted small pad-x">{tr('还没有会话，点 + 新建，或从历史里继续', 'No sessions yet. Click + to create one or resume from history.')}</div>
