@@ -112,6 +112,7 @@ export function permModes(tool: ToolKind, mode: SessionMode) {
     qoder: ['default', 'acceptEdits', 'bypass'],
     codebuddy: ['default', 'acceptEdits', 'plan', 'bypass'],
     shell: [],
+    files: [],
   };
   return getPermModesList().filter((m) => ids[tool].includes(m[0]));
 }
@@ -141,7 +142,7 @@ export function NewSessionDialog() {
   useEffect(() => {
     setModels(null);
     setCustomModel(false);
-    if (!ns || !hostId || tool === 'shell') return;
+    if (!ns || !hostId || tool === 'shell' || tool === 'files') return;
     let alive = true;
     rpc<ModelOption[]>(hostId, 'tools.models', { tool })
       .then((m) => {
@@ -167,7 +168,7 @@ export function NewSessionDialog() {
     // Continue with another tool: default to the last tool used; if that's the original tool, pick the other of claude / codex first (switched below if not installed)
     const last = lsGet<ToolKind>('last-tool', 'claude');
     const from = ns.handoff?.from;
-    setTool((ns.tool as ToolKind) ?? (from && (last === from || last === 'shell') ? (from === 'claude' ? 'codex' : 'claude') : last));
+    setTool((ns.tool as ToolKind) ?? (from && (last === from || last === 'shell' || last === 'files') ? (from === 'claude' ? 'codex' : 'claude') : last));
     setPrompt(ns.handoff?.prompt ?? '');
     setCommand('');
     setPicking(false);
@@ -189,7 +190,7 @@ export function NewSessionDialog() {
   const helloTools = hostStatus(hostId).hello?.tools;
   useEffect(() => {
     if (!ns || ns.resumeId || !helloTools?.length) return;
-    const usable = (k: ToolKind) => !ns.handoff || (k !== ns.handoff.from && k !== 'shell');
+    const usable = (k: ToolKind) => !ns.handoff || (k !== ns.handoff.from && k !== 'shell' && k !== 'files');
     if (usable(tool) && helloTools.some((t) => t.kind === tool && t.available)) return;
     const first = helloTools.find((t) => t.available && usable(t.kind));
     if (first) setTool(first.kind);
@@ -202,9 +203,11 @@ export function NewSessionDialog() {
   const tools = st.hello?.tools ?? [];
   const connectedHosts = hosts.filter((h) => h.status.status === 'connected');
   const close = () => setState({ newSession: null });
-  const effectiveMode = tool === 'shell' ? 'terminal' : mode;
+  // Terminal and Files sessions don't talk to an AI tool: no UI choice, permission mode, model or prompt
+  const aiTool = tool !== 'shell' && tool !== 'files';
+  const effectiveMode = tool === 'shell' ? 'terminal' : tool === 'files' ? 'structured' : mode;
   // Continue with another tool: the selection must be an installed tool other than the original (if only the original is installed, it stays on a greyed-out button)
-  const handoffBlocked = !!ns.handoff && (tool === ns.handoff.from || tool === 'shell' || !tools.some((t) => t.kind === tool && t.available));
+  const handoffBlocked = !!ns.handoff && (tool === ns.handoff.from || !aiTool || !tools.some((t) => t.kind === tool && t.available));
 
   // Thinking levels available for the current model; don't send a remembered level the model doesn't support
   const curModel = models?.find((x) => x.id === model) ?? (!model ? models?.[0] : undefined);
@@ -218,10 +221,10 @@ export function NewSessionDialog() {
         tool,
         cwd,
         mode: effectiveMode,
-        prompt: effectiveMode === 'structured' ? prompt : undefined,
-        permissionMode: permModes(tool, mode).some((m) => m[0] === perm) ? perm : 'default',
-        model: model || undefined,
-        effort: sendEffort || undefined,
+        prompt: aiTool && effectiveMode === 'structured' ? prompt : undefined,
+        permissionMode: aiTool && permModes(tool, mode).some((m) => m[0] === perm) ? perm : 'default',
+        model: aiTool ? model || undefined : undefined,
+        effort: aiTool ? sendEffort || undefined : undefined,
         command: tool === 'shell' ? command || undefined : undefined,
         resumeId: ns.resumeId,
         title: ns.title,
@@ -232,7 +235,7 @@ export function NewSessionDialog() {
       recent[hostId] = info.cwd;
       lsSet('recent-cwd', recent);
       lsSet('last-tool', tool);
-      if (tool !== 'shell') {
+      if (aiTool) {
         // Continue with another tool always uses chat mode; don't record that as the user's chosen UI
         if (!ns.handoff) lsSet('last-mode', mode);
         const all = lsGet<Record<string, ToolPrefs>>(PREFS_KEY, {});
@@ -298,7 +301,7 @@ export function NewSessionDialog() {
                   <button
                     key={t.kind}
                     disabled={
-                      !t.available || (!!ns.resumeId && t.kind !== ns.tool) || (!!ns.handoff && (t.kind === ns.handoff.from || t.kind === 'shell'))
+                      !t.available || (!!ns.resumeId && t.kind !== ns.tool) || (!!ns.handoff && (t.kind === ns.handoff.from || t.kind === 'shell' || t.kind === 'files'))
                     }
                     className={`tool-opt ${tool === t.kind ? 'active' : ''}`}
                     onClick={() => setTool(t.kind)}
@@ -313,7 +316,7 @@ export function NewSessionDialog() {
                 ))}
               </div>
             </div>
-            {tool !== 'shell' && !ns.handoff && (
+            {aiTool && !ns.handoff && (
               <div className="field">
                 <span>{tr('界面', 'Interface')}</span>
                 <div className="seg">
@@ -336,7 +339,7 @@ export function NewSessionDialog() {
               </div>
               <span className="muted small">{shortPath(cwd, st.hello?.home)}</span>
             </label>
-            {tool === 'shell' ? (
+            {tool === 'files' ? null : tool === 'shell' ? (
               <label>
                 {tr('命令（留空则打开默认 shell）', 'Command (leave empty for default shell)')}
                 <input value={command} onChange={(e) => setCommand(e.target.value)} placeholder={tr('例如 htop', 'e.g. htop')} />
@@ -427,7 +430,7 @@ export function NewSessionDialog() {
                 {tr('取消', 'Cancel')}
               </button>
               <button className="btn primary" disabled={busy || !cwd || handoffBlocked} onClick={create}>
-                {busy ? tr('启动中…', 'Starting…') : ns.resumeId ? tr('继续', 'Resume') : tr('创建', 'Create')}
+                {busy ? (aiTool || tool === 'shell' ? tr('启动中…', 'Starting…') : tr('创建中…', 'Creating…')) : ns.resumeId ? tr('继续', 'Resume') : tr('创建', 'Create')}
               </button>
             </div>
           </div>

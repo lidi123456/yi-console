@@ -13,7 +13,7 @@ fn binary_names(kind: ToolKind) -> &'static [&'static str] {
         ToolKind::Kiro => &["kiro-cli"],
         ToolKind::Qoder => &["qodercli"],
         ToolKind::Codebuddy => &["codebuddy", "cbc"],
-        ToolKind::Shell => &[],
+        ToolKind::Shell | ToolKind::Files => &[],
     }
 }
 
@@ -185,6 +185,10 @@ pub fn resolve(kind: ToolKind, settings: &DaemonSettings) -> Option<PathBuf> {
     if kind == ToolKind::Shell {
         return Some(PathBuf::from(default_shell()));
     }
+    // Files sessions run nothing; report a placeholder so the tool shows as available
+    if kind == ToolKind::Files {
+        return Some(PathBuf::new());
+    }
     binary_names(kind).iter().find_map(|n| which(n))
 }
 
@@ -214,15 +218,15 @@ pub fn detect(settings: &DaemonSettings) -> Vec<ToolInfo> {
         .map(|kind| {
             let path = resolve(kind, settings);
             let version = match (&path, kind) {
-                (Some(p), k) if k != ToolKind::Shell => version_of(p),
+                (Some(p), k) if k != ToolKind::Shell && k.has_process() => version_of(p),
                 _ => None,
             };
             ToolInfo {
                 kind,
                 available: path.is_some(),
-                path: path.map(|p| p.display().to_string()),
+                path: path.filter(|_| kind.has_process()).map(|p| p.display().to_string()),
                 version,
-                structured: kind != ToolKind::Shell,
+                structured: !matches!(kind, ToolKind::Shell | ToolKind::Files),
             }
         })
         .collect()

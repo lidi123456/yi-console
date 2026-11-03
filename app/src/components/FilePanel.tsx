@@ -393,6 +393,7 @@ export function FilePanel({
   onFullscreen,
   onClose,
   onFileOpen,
+  standalone,
 }: {
   hostId: string;
   cwd: string;
@@ -404,6 +405,8 @@ export function FilePanel({
   onClose: () => void;
   /** Notify the parent when files are opened / closed: the panel width differs (narrow with only the tree) */
   onFileOpen?: (open: boolean) => void;
+  /** Files session: the panel is the whole page (no chat), can't be closed or made full screen, and tabs are kept per session */
+  standalone?: boolean;
 }) {
   const [, lang] = useLang();
   const [root, setRoot] = useState<string | null>(null);
@@ -796,8 +799,8 @@ export function FilePanel({
 
   useEffect(() => onFileOpen?.(!!file), [!!file]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Remember opened files (per host + working directory) and restore the tabs and current file next time the panel opens
-  const tabsKey = `wp-open-${hostId}/${cwd}`;
+  // Remember opened files (per host + working directory; Files sessions per session) and restore the tabs and current file next time the panel opens
+  const tabsKey = standalone ? `wp-open-s-${hostId}/${sessionId}` : `wp-open-${hostId}/${cwd}`;
   const restored = useRef(false);
   const restoring = useRef(false);
   useEffect(() => {
@@ -941,7 +944,7 @@ export function FilePanel({
     const r = rel(path) + (isDir ? '/' : '');
     if (!(await writeClipboard(r))) return toast(tr('无法复制', 'Could not copy'));
     copiedRef = { plain: r, ref: `@${r} ` };
-    toast(tr('已复制，在输入框里粘贴就是引用这个文件', 'Copied. Paste in the input to reference this file'));
+    toast(standalone ? tr('已复制相对路径', 'Relative path copied') : tr('已复制，在输入框里粘贴就是引用这个文件', 'Copied. Paste in the input to reference this file'));
   };
   // The row last clicked / right-clicked in the tree; Ctrl+C copies it
   const lastRow = useRef<{ path: string; isDir: boolean } | null>(null);
@@ -991,6 +994,15 @@ export function FilePanel({
 
   // ---------- Side by side, compare ----------
   const wide = () => !window.matchMedia('(max-width: 900px)').matches;
+  // Files session on desktop: keep the preview area next to the tree even with no file open (mobile shows only the tree)
+  const [desktop, setDesktop] = useState(() => !window.matchMedia('(max-width: 760px)').matches);
+  useEffect(() => {
+    const mq = window.matchMedia('(max-width: 760px)');
+    const on = () => setDesktop(!mq.matches);
+    mq.addEventListener('change', on);
+    return () => mq.removeEventListener('change', on);
+  }, []);
+  const emptyPane = !!standalone && desktop && !file;
   const openSecond = async (path: string) => {
     if (!file) return openFile(path);
     if (path === file.path) return;
@@ -1084,7 +1096,7 @@ export function FilePanel({
             { label: tr(`与 ${baseName(file!.path)} 比较`, `Compare with ${baseName(file!.path)}`), icon: 'compare', run: () => compareWith(r.path) },
           ]
         : []),
-      { label: tr('添加到对话', 'Add to chat'), icon: 'chat', run: () => addToChat(r.path, r.isDir) },
+      ...(standalone ? [] : [{ label: tr('添加到对话', 'Add to chat'), icon: 'chat', run: () => addToChat(r.path, r.isDir) }]),
       { label: tr('复制', 'Copy'), icon: 'copy', hint: `${navigator.platform.includes('Mac') ? '⌘' : 'Ctrl+'}C`, run: () => copyRef(r.path, r.isDir) },
       '-',
       ...(r.isDir ? [] : [{ label: tr('下载', 'Download'), icon: 'download', run: () => download(r.path) }]),
@@ -1112,8 +1124,12 @@ export function FilePanel({
           { label: tr('复制路径', 'Copy path'), icon: 'copy', run: () => copy(file.path) },
           { label: tr('复制相对路径', 'Copy relative path'), run: () => copy(rel(file.path)) },
           { label: tr('复制文件内容', 'Copy file contents'), icon: 'copy', disabled: !!file.image || file.binary, run: () => copy(file.draft, tr('已复制文件内容', 'File contents copied')) },
-          { label: tr('添加到对话', 'Add to chat'), icon: 'chat', run: () => addToChat(file.path, false) },
-          { label: tr('复制（粘贴到输入框即引用）', 'Copy (paste in input to reference)'), run: () => copyRef(file.path, false) },
+          ...(standalone
+            ? []
+            : [
+                { label: tr('添加到对话', 'Add to chat'), icon: 'chat', run: () => addToChat(file.path, false) },
+                { label: tr('复制（粘贴到输入框即引用）', 'Copy (paste in input to reference)'), run: () => copyRef(file.path, false) },
+              ]),
           '-',
           { label: wrap ? tr('关闭自动换行', 'Disable word wrap') : tr('启用自动换行', 'Enable word wrap'), icon: 'wrap', run: () => (lsSet('wp-wrap', !wrap), setWrap(!wrap)) },
           dirty
@@ -1257,7 +1273,7 @@ export function FilePanel({
       { label: tr('打开网页…', 'Open web page…'), icon: 'globe', run: () => openWeb() },
     ]);
   };
-  const panelBtns = (
+  const panelBtns = standalone ? null : (
     <>
       <button className="icon-btn hide-mobile" title={fullscreen ? tr('退出全屏', 'Exit full screen') : tr('全屏', 'Full screen')} onClick={onFullscreen}>
         <Icon name={fullscreen ? 'minimize' : 'maximize'} size={14} />
@@ -1275,7 +1291,7 @@ export function FilePanel({
   );
 
   const tree = (
-    <div className="wp-side" style={file ? { width: treeW } : undefined}>
+    <div className="wp-side" style={file || emptyPane ? { width: treeW } : undefined}>
       <div className="wp-side-head">
         <div className="wp-views" role="tablist" aria-label={tr('文件视图', 'File views')}>
           {viewTab('all', tr('文件', 'Files'))}
@@ -1596,7 +1612,7 @@ export function FilePanel({
 
   return (
     <aside
-      className={`file-panel ${fullscreen ? 'full' : ''} ${file ? '' : 'browse'}`}
+      className={`file-panel ${fullscreen ? 'full' : ''} ${file || emptyPane ? '' : 'browse'} ${standalone ? 'standalone' : ''}`}
       style={{ '--tree-w': `${treeW}px` } as React.CSSProperties}
     >
       {!file ? (
@@ -1833,9 +1849,18 @@ export function FilePanel({
             )}
           </div>
         )}
+        {emptyPane && (
+          <div className="wp-main wp-empty">
+            <Icon name="file" size={28} />
+            <div>{tr('在右侧文件树里选一个文件打开', 'Pick a file in the tree on the right')}</div>
+            <div className="muted small">
+              {tr(`${navigator.platform.includes('Mac') ? '⌘' : 'Ctrl+'}P 按文件名快速打开`, `${navigator.platform.includes('Mac') ? '⌘' : 'Ctrl+'}P to open a file by name`)}
+            </div>
+          </div>
+        )}
         {showTree && (
           <>
-            {file && <div className="wp-split hide-mobile" onPointerDown={dragTree} />}
+            {(file || emptyPane) && <div className="wp-split hide-mobile" onPointerDown={dragTree} />}
             {tree}
           </>
         )}

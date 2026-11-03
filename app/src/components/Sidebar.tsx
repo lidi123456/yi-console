@@ -98,7 +98,7 @@ function SessionRow({ hostId, s, active, showDir }: { hostId: string; s: Session
             renameSession(hostId, s);
           }
         }}
-        title={`${s.title || tr('新会话', 'New Session')}\n${s.cwd}\n${statusText(cls)}${s.mode === 'terminal' ? tr(' · 终端模式', ' · Terminal mode') : ''}${s.mode === 'terminal' && cls !== 'off' && cls !== 'err' ? tr('\n进程不会自动结束，不用时请停止进程', '\nNot stopped automatically; stop the process when done') : ''}`}
+        title={`${s.title || tr('新会话', 'New Session')}\n${s.cwd}\n${s.tool === 'files' ? tr('文件', 'Files') : statusText(cls)}${s.mode === 'terminal' ? tr(' · 终端模式', ' · Terminal mode') : ''}${s.mode === 'terminal' && cls !== 'off' && cls !== 'err' ? tr('\n进程不会自动结束，不用时请停止进程', '\nNot stopped automatically; stop the process when done') : ''}`}
       >
         <span className="row-badge">
           <ToolBadge tool={s.tool} size={16} />

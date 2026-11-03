@@ -703,6 +703,7 @@ async fn run(tool: ToolKind, settings: &DaemonSettings, want_quota: bool) -> Res
         }),
         ToolKind::Cursor => acp(tool, settings, false).await,
         ToolKind::Shell => bail!("终端没有模型和额度"),
+        ToolKind::Files => bail!("文件会话没有模型和额度"),
     }
 }
 

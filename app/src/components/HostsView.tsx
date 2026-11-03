@@ -848,7 +848,7 @@ function HostCard({ h, onEdit }: { h: HostEntry; onEdit: () => void }) {
       {hello && (
         <div className="tool-chips">
           {hello.tools
-            .filter((t) => t.kind !== 'shell')
+            .filter((t) => t.kind !== 'shell' && t.kind !== 'files')
             .map((t) => (
               <span key={t.kind} className={`pill ${t.available ? '' : 'pill-off'}`} title={t.path ?? ''}>
                 {t.kind} {t.available ? (t.version?.split(' ')[0] ?? '') : tr('未安装', 'Not installed')}

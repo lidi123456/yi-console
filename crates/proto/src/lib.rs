@@ -70,10 +70,12 @@ pub enum ToolKind {
     Codebuddy,
     /// Any command, terminal mode only
     Shell,
+    /// No process: the session page is just the workspace file panel (plus the bottom terminal panel)
+    Files,
 }
 
 impl ToolKind {
-    pub const ALL: [ToolKind; 7] = [
+    pub const ALL: [ToolKind; 8] = [
         ToolKind::Claude,
         ToolKind::Codex,
         ToolKind::Cursor,
@@ -81,6 +83,7 @@ impl ToolKind {
         ToolKind::Qoder,
         ToolKind::Codebuddy,
         ToolKind::Shell,
+        ToolKind::Files,
     ];
 
     pub fn as_str(&self) -> &'static str {
@@ -92,7 +95,13 @@ impl ToolKind {
             ToolKind::Qoder => "qoder",
             ToolKind::Codebuddy => "codebuddy",
             ToolKind::Shell => "shell",
+            ToolKind::Files => "files",
         }
+    }
+
+    /// Sessions that never start a process (Files)
+    pub fn has_process(&self) -> bool {
+        !matches!(self, ToolKind::Files)
     }
 
     pub fn parse(s: &str) -> Option<ToolKind> {

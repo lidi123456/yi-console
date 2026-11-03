@@ -1,6 +1,7 @@
 // Types mirroring crates/proto
 
-export type ToolKind = 'claude' | 'codex' | 'cursor' | 'kiro' | 'qoder' | 'codebuddy' | 'shell';
+/** files: no process, the session page is just the workspace file panel */
+export type ToolKind = 'claude' | 'codex' | 'cursor' | 'kiro' | 'qoder' | 'codebuddy' | 'shell' | 'files';
 export type SessionMode = 'structured' | 'terminal';
 export type SessionStatus = 'starting' | 'idle' | 'running' | 'waiting-permission' | 'exited' | 'error';
 
@@ -305,12 +306,13 @@ export const TOOL_LABEL: Record<ToolKind, string> = new Proxy(
     qoder: 'Qoder',
     codebuddy: 'CodeBuddy',
     shell: '终端',
+    files: '文件',
   },
   {
     get(target, prop: string) {
-      if (prop === 'shell' && typeof document !== 'undefined' && document.documentElement.lang === 'en') {
-        return 'Terminal';
-      }
+      const en = typeof document !== 'undefined' && document.documentElement.lang === 'en';
+      if (prop === 'shell' && en) return 'Terminal';
+      if (prop === 'files' && en) return 'Files';
       return target[prop as ToolKind];
     },
   },

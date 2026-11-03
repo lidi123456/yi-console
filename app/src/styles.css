@@ -7742,3 +7742,29 @@ body.resizing .side-resizer::after {
 .bgdone.open .bgdone-icon {
   align-self: flex-start;
 }
+
+/* Files session: the file panel fills the session page below the header (desktop and mobile), above the bottom terminal panel */
+.file-panel.standalone,
+.file-panel.standalone.browse,
+.file-panel.standalone:not(.full) {
+  position: relative;
+  inset: auto;
+  flex: 1;
+  width: auto;
+  min-width: 0;
+  max-width: none;
+  min-height: 0;
+  z-index: auto;
+  padding-top: 0;
+  border-left: none;
+  border-top: 1px solid var(--border);
+}
+/* Files session on desktop with no file open: placeholder where the preview goes */
+.wp-empty {
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  color: var(--text-3);
+  font-size: 13px;
+  user-select: none;
+}

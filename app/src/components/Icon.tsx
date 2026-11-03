@@ -117,10 +117,13 @@ const TOOL_NAMES: Record<string, string> = {
   qoder: 'Qoder',
   codebuddy: 'CodeBuddy',
   shell: '终端',
+  files: '文件',
 };
 
 function toolTitle(tool: string) {
-  if (tool === 'shell' && typeof document !== 'undefined' && document.documentElement.lang === 'en') return 'Terminal';
+  const en = typeof document !== 'undefined' && document.documentElement.lang === 'en';
+  if (tool === 'shell' && en) return 'Terminal';
+  if (tool === 'files' && en) return 'Files';
   return TOOL_NAMES[tool] ?? tool;
 }
 
@@ -176,6 +179,13 @@ function toolLogo(tool: string, gid: string) {
               <stop offset="1" stopColor="#6C4DFF" />
             </radialGradient>
           </defs>
+        </>
+      );
+    case 'files':
+      return (
+        <>
+          <path d={TILE} fill="#3b82f6" />
+          <path d="M5.5 8h4.5l1.5 1.5h7v8h-13z" fill="none" stroke="#fff" strokeWidth="1.8" strokeLinejoin="round" />
         </>
       );
     default:

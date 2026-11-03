@@ -28,10 +28,15 @@ export function Home() {
         </div>
       </div>
       <span className="muted small hide-mobile">{fmtUsage(x.s.usage)}</span>
-      <span className={`status-chip st-${x.s.status}`}>
-        {x.s.pendingPermissions > 0 ? tr(`${x.s.pendingPermissions} 个待审批`, `${x.s.pendingPermissions} pending`) : STATUS_LABEL[x.s.status]}
-      </span>
-      <span className={`sdot sdot-${sessionStatusClass(x.s)}`} />
+      {/* Files sessions have no process, so no status */}
+      {x.s.tool !== 'files' && (
+        <>
+          <span className={`status-chip st-${x.s.status}`}>
+            {x.s.pendingPermissions > 0 ? tr(`${x.s.pendingPermissions} 个待审批`, `${x.s.pendingPermissions} pending`) : STATUS_LABEL[x.s.status]}
+          </span>
+          <span className={`sdot sdot-${sessionStatusClass(x.s)}`} />
+        </>
+      )}
     </button>
   );
 

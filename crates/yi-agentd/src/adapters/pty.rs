@@ -102,6 +102,8 @@ pub fn interactive_args(spec: &StartSpec) -> Vec<String> {
                 a.push("-l".into());
             }
         }
+        // Never launched (Hub::launch refuses); here only to keep the match exhaustive
+        ToolKind::Files => {}
     }
     a.extend(spec.extra_args.iter().cloned());
     a

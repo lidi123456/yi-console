@@ -28,6 +28,8 @@ export function SessionView({ hostId, sessionId, seq }: { hostId: string; sessio
   );
   const home = hostStatus(hostId).hello?.home;
   const style = useChatStyle();
+  // Files session: no process and no chat, the page is the file panel (plus the bottom terminal)
+  const filesOnly = info?.tool === 'files';
   // Whether the file panel is open: remembered per session (like the bottom terminal), so opening it in one session doesn't open it in others
   const filesKey = `file-panel-${key}`;
   const [files, setFiles] = useState(() => lsGet(filesKey, false));
@@ -58,7 +60,7 @@ export function SessionView({ hostId, sessionId, seq }: { hostId: string; sessio
     bumpTerm((n) => n + 1);
   };
   // Mobile back key: collapse the file panel and the bottom terminal first (last opened closes first)
-  useBack(files, toggleFiles);
+  useBack(files && !filesOnly, toggleFiles);
   useBack(term, toggleTerm);
   // Width of the workspace file panel (drag the left edge) and full screen
   const [panelW, setPanelW] = useState(() => lsGet('file-panel-w', 640));
@@ -197,8 +199,8 @@ export function SessionView({ hostId, sessionId, seq }: { hostId: string; sessio
             {info.contextPercent != null && ` · ${tr('上下文', 'Context')} ${Math.round(info.contextPercent)}%`}
           </div>
         </div>
-        <span className={`status-chip st-${info.status}`}>{STATUS_LABEL[info.status]}</span>
-        {info.tool !== 'shell' && (
+        {!filesOnly && <span className={`status-chip st-${info.status}`}>{STATUS_LABEL[info.status]}</span>}
+        {info.tool !== 'shell' && !filesOnly && (
           <button
             className="btn small usage-btn hide-mobile"
             onClick={() => setUsage(true)}
@@ -208,7 +210,7 @@ export function SessionView({ hostId, sessionId, seq }: { hostId: string; sessio
             <span className="hide-mobile narrow-hide">{fmtUsage(info.usage) || tr('用量', 'Usage')}</span>
           </button>
         )}
-        {info.tool !== 'shell' && (
+        {info.tool !== 'shell' && !filesOnly && (
           <button
             className="btn small hide-mobile"
             disabled={!connected || switching}
@@ -233,7 +235,7 @@ export function SessionView({ hostId, sessionId, seq }: { hostId: string; sessio
             </span>
           </button>
         )}
-        {info.mode === 'structured' && info.tool !== 'shell' && (
+        {info.mode === 'structured' && info.tool !== 'shell' && !filesOnly && (
           <button
             className="icon-btn hide-mobile"
             title={
@@ -252,11 +254,13 @@ export function SessionView({ hostId, sessionId, seq }: { hostId: string; sessio
         <button className="icon-btn" title={tr('查看改动', 'View Changes')} aria-label={tr('查看改动', 'View Changes')} onClick={() => showChanges(hostId, sessionId)}>
           <Icon name="diff" size={17} />
         </button>
-        <button className={`icon-btn ${files ? 'active' : ''}`} title={tr('工作目录文件', 'Workspace Files')} onClick={toggleFiles}>
-          <Icon name="folder" size={17} />
-        </button>
+        {!filesOnly && (
+          <button className={`icon-btn ${files ? 'active' : ''}`} title={tr('工作目录文件', 'Workspace Files')} onClick={toggleFiles}>
+            <Icon name="folder" size={17} />
+          </button>
+        )}
         {/* On mobile this spot holds "Usage" (the top-bar usage button is hidden on mobile), and the bottom terminal panel moves into the "More" menu */}
-        {info.tool !== 'shell' && (
+        {info.tool !== 'shell' && !filesOnly && (
           <button
             className="icon-btn show-mobile"
             title={tr('查看这个会话的用量和账号额度', 'View session usage and account quota')}
@@ -267,7 +271,8 @@ export function SessionView({ hostId, sessionId, seq }: { hostId: string; sessio
           </button>
         )}
         {info.tool !== 'shell' && (
-          <button className={`icon-btn hide-mobile ${term ? 'active' : ''}`} title={term ? tr('收起终端', 'Hide Terminal') : tr('打开终端', 'Open Terminal')} onClick={toggleTerm}>
+          // Files sessions have no usage button, so the terminal button stays in the top bar on mobile too
+          <button className={`icon-btn ${filesOnly ? '' : 'hide-mobile'} ${term ? 'active' : ''}`} title={term ? tr('收起终端', 'Hide Terminal') : tr('打开终端', 'Open Terminal')} onClick={toggleTerm}>
             <Icon name="terminal" size={17} />
           </button>
         )}
@@ -293,7 +298,23 @@ export function SessionView({ hostId, sessionId, seq }: { hostId: string; sessio
         </button>
       </header>
 
-      {info.mode === 'terminal' ? (
+      {filesOnly ? (
+        connected ? (
+          <FilePanel
+            key={`${hostId}/${sessionId}`}
+            hostId={hostId}
+            cwd={info.cwd}
+            sessionId={sessionId}
+            status={info.status}
+            fullscreen={false}
+            onFullscreen={() => {}}
+            onClose={() => {}}
+            standalone
+          />
+        ) : (
+          <div className="center-msg">{tr('主机未连接', 'Host not connected')}</div>
+        )
+      ) : info.mode === 'terminal' ? (
         <>
           <TerminalView hostId={hostId} sessionId={sessionId} running={alive} />
           <div className="term-status">
@@ -363,9 +384,9 @@ export function SessionView({ hostId, sessionId, seq }: { hostId: string; sessio
       {usage && <UsageDialog hostId={hostId} info={info} onClose={() => setUsage(false)} />}
       {term && connected && info.tool !== 'shell' && <TermPanel key={key} hostId={hostId} info={info} onClose={toggleTerm} />}
     </div>
-      {files && connected && full && <div className="panel-scrim hide-mobile" onClick={() => setFull(false)} title={tr('退出全屏', 'Exit Fullscreen')} />}
-      {files && connected && !full && fileOpen && <div className="panel-resizer hide-mobile" onPointerDown={dragPanel} title={tr('拖动调整宽度', 'Drag to resize')} />}
-      {files && connected && (
+      {!filesOnly && files && connected && full && <div className="panel-scrim hide-mobile" onClick={() => setFull(false)} title={tr('退出全屏', 'Exit Fullscreen')} />}
+      {!filesOnly && files && connected && !full && fileOpen && <div className="panel-resizer hide-mobile" onPointerDown={dragPanel} title={tr('拖动调整宽度', 'Drag to resize')} />}
+      {!filesOnly && files && connected && (
         <FilePanel
           key={`${hostId}/${info.cwd}`}
           hostId={hostId}

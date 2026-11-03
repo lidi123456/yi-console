@@ -230,6 +230,27 @@ function idItems(info: SessionInfo): MenuItem[] {
   ];
 }
 
+/** Files sessions have no process or conversation: only the session-record actions and directory shortcuts make sense */
+function filesMenu(hostId: string, info: SessionInfo, inSession?: boolean): (MenuItem | '-')[] {
+  const sid = info.id;
+  return [
+    ...(inSession ? [] : [{ label: tr('打开', 'Open'), icon: 'folder', run: () => navigate({ kind: 'session', hostId, sessionId: sid }) }]),
+    {
+      label: tr('重命名', 'Rename'),
+      icon: 'edit',
+      hint: isMobile() ? undefined : inSession ? tr('双击标题', 'Double-click title') : 'F2',
+      run: () => renameSession(hostId, info),
+    },
+    { label: info.pinned ? tr('取消置顶', 'Unpin') : tr('置顶', 'Pin'), icon: 'pin', run: () => call(hostId, sid, 'session.pin', { pinned: !info.pinned }) },
+    '-',
+    ...(inSession ? [] : [{ label: tr('查看改动', 'View Changes'), icon: 'diff', run: () => showChanges(hostId, sid) }]),
+    { label: tr('端口转发', 'Port Forwarding'), icon: 'external', run: () => navigate({ kind: 'ports', hostId }) },
+    { label: tr('复制工作目录路径', 'Copy Directory Path'), icon: 'copy', run: () => writeClipboard(info.cwd).then(() => toast(tr('已复制路径', 'Path copied'))) },
+    '-',
+    { label: tr('删除会话', 'Delete Session'), icon: 'trash', danger: true, run: () => deleteSession(hostId, info) },
+  ];
+}
+
 export function sessionMenu(
   hostId: string,
   info: SessionInfo,
@@ -246,6 +267,7 @@ export function sessionMenu(
   const alive = info.status !== 'exited' && info.status !== 'error';
   const sid = info.id;
   const mobile = isMobile();
+  if (info.tool === 'files') return filesMenu(hostId, info, opts.inSession);
   return [
     ...(opts.inSession ? [] : [{ label: tr('打开', 'Open'), icon: 'chat', run: () => navigate({ kind: 'session', hostId, sessionId: sid }) }]),
     {

@@ -146,7 +146,7 @@ pub fn permission_modes(tool: ToolKind, mode: SessionMode) -> &'static [&'static
         // Qoder has no plan mode
         (Qoder, _) => &["default", "acceptEdits", "bypass"],
         (Codebuddy, _) => &["default", "acceptEdits", "plan", "bypass"],
-        (Shell, _) => &[],
+        (Shell | Files, _) => &[],
     }
 }
 
@@ -258,7 +258,13 @@ impl Hub {
         let mut map = self.sessions.lock().unwrap();
         for mut info in list {
             info.last_seq = self.store.max_seq(&info.id).unwrap_or(info.last_seq);
-            if info.status != SessionStatus::Exited || !info.queued.is_empty() {
+            if !info.tool.has_process() {
+                // Files sessions have no process: always idle
+                if info.status != SessionStatus::Idle {
+                    info.status = SessionStatus::Idle;
+                    let _ = self.store.save_session(&info);
+                }
+            } else if info.status != SessionStatus::Exited || !info.queued.is_empty() {
                 info.status = SessionStatus::Exited;
                 info.pending_permissions = 0;
                 info.queued.clear();
@@ -297,6 +303,8 @@ impl Hub {
         let tool = ToolKind::parse(&p.tool).ok_or_else(|| anyhow!("未知工具: {}", p.tool))?;
         let mode = if tool == ToolKind::Shell {
             SessionMode::Terminal
+        } else if !tool.has_process() {
+            SessionMode::Structured
         } else {
             p.mode.unwrap_or(SessionMode::Structured)
         };
@@ -311,8 +319,8 @@ impl Hub {
             mode,
             cwd: cwd.display().to_string(),
             title: p.title.clone().unwrap_or_default(),
-            status: SessionStatus::Starting,
-            external_id: p.resume_id.clone(),
+            status: if tool.has_process() { SessionStatus::Starting } else { SessionStatus::Idle },
+            external_id: if tool.has_process() { p.resume_id.clone() } else { None },
             created_at: now,
             updated_at: now,
             last_seq: 0,
@@ -339,6 +347,9 @@ impl Hub {
             .unwrap()
             .insert(info.id.clone(), rt.clone());
         self.broadcast_updated(&info);
+        if !tool.has_process() {
+            return Ok(info);
+        }
 
         // Continuing a history session: for tools readable offline (claude/codex), import the history into the event log first;
         // for those that aren't (ACP tools), let the tool replay it on session/load
@@ -418,6 +429,9 @@ impl Hub {
     }
 
     fn launch(self: &Arc<Self>, rt: &Arc<SessionRt>, spec: StartSpec) -> Result<()> {
+        if !spec.tool.has_process() {
+            bail!("文件会话没有进程");
+        }
         let sid = rt.info.lock().unwrap().id.clone();
         if spec.mode == SessionMode::Structured && spec.tool != ToolKind::Shell {
             self.make_room(&sid);
@@ -456,6 +470,9 @@ impl Hub {
     pub fn send(self: &Arc<Self>, id: &str, text: &str, images: Vec<IncomingImage>, queue: bool) -> Result<()> {
         let rt = self.get(id)?;
         let info = rt.info.lock().unwrap().clone();
+        if !info.tool.has_process() {
+            bail!("文件会话不能发送消息");
+        }
         if info.mode == SessionMode::Terminal && !images.is_empty() {
             bail!("终端模式不支持发送图片");
         }
@@ -605,6 +622,9 @@ impl Hub {
             if i.mode == SessionMode::Terminal || i.tool == ToolKind::Shell {
                 bail!("终端模式请直接在终端里输入 /clear");
             }
+            if !i.tool.has_process() {
+                bail!("文件会话没有对话");
+            }
         }
         // Invalidate the generation first, so late events and exit status from the old process are no longer recorded on the session
         let old = rt.cmd.lock().unwrap().take();
@@ -720,6 +740,9 @@ impl Hub {
             return Ok(());
         }
         let info = rt.info.lock().unwrap().clone();
+        if !info.tool.has_process() {
+            return Ok(());
+        }
         let replay = info.last_seq == 0 || self.history_missing(&info);
         let spec = self.spec_for(&info, replay, cols, rows)?;
         self.launch(&rt, spec)
@@ -742,6 +765,9 @@ impl Hub {
         let info = rt.info.lock().unwrap().clone();
         if info.tool == ToolKind::Shell || info.parent_id.is_some() {
             bail!("普通终端没有对话模式");
+        }
+        if !info.tool.has_process() {
+            bail!("文件会话不能切换模式");
         }
         if info.mode == mode {
             return Ok(());
@@ -1541,6 +1567,7 @@ fn display_name(info: &SessionInfo) -> String {
         ToolKind::Qoder => "Qoder",
         ToolKind::Codebuddy => "CodeBuddy",
         ToolKind::Shell => "终端",
+        ToolKind::Files => "文件",
     }
     .to_string()
 }
@@ -1755,6 +1782,37 @@ mod tests {
         *rt.cmd.lock().unwrap() = Some(tx);
         hub.sessions.lock().unwrap().insert(id.into(), Arc::new(rt));
         rx
+    }
+
+    #[tokio::test]
+    async fn files_session_has_no_process() {
+        let hub = Hub::new(crate::store::Store::open_memory().unwrap(), DaemonSettings::default());
+        let dir = tempfile::tempdir().unwrap();
+        let p = CreateParams {
+            tool: "files".into(),
+            cwd: dir.path().display().to_string(),
+            prompt: Some("hi".into()),
+            resume_id: Some("x".into()),
+            ..Default::default()
+        };
+        let info = hub.create(p.clone()).unwrap();
+        assert_eq!(info.tool, ToolKind::Files);
+        assert_eq!(info.status, SessionStatus::Idle);
+        assert!(info.external_id.is_none());
+        let rt = hub.get(&info.id).unwrap();
+        assert!(hub.running_tx(&rt).is_none());
+        assert_eq!(hub.store.max_seq(&info.id).unwrap(), 0, "prompt must not be sent");
+        // Several in the same directory
+        assert_ne!(hub.create(p).unwrap().id, info.id);
+        // Process actions are refused or no-ops
+        assert!(hub.send(&info.id, "x", vec![], false).is_err());
+        assert!(hub.set_mode(&info.id, SessionMode::Terminal).await.is_err());
+        assert!(hub.clear(&info.id).await.is_err());
+        hub.resume(&info.id, 80, 24).unwrap();
+        assert!(hub.running_tx(&rt).is_none());
+        assert_eq!(hub.info(&info.id).unwrap().status, SessionStatus::Idle);
+        hub.delete(&info.id).unwrap();
+        assert!(hub.info(&info.id).is_err());
     }
 
     fn killed(rx: &mut mpsc::UnboundedReceiver<AdapterCmd>) -> bool {
