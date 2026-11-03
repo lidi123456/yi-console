@@ -183,10 +183,10 @@ function SidebarCard() {
         </div>
       </PrefRow>
       <PrefRow
-        title={tr('收进「更早的」', 'Move to "Older"')}
+        title={tr('自动收起空闲会话', 'Fold idle sessions')}
         desc={tr(
-          '进程已结束、超过这么久没有活动的会话，收进各目录末尾的「更早的 N 个」。置顶的会话和搜索时不收起。',
-          'Ended sessions idle this long are folded into "N older" at the end of each directory. Pinned sessions and search results are never folded.',
+          '进程已结束、超过这么久没有活动的会话，收在各目录末尾的「显示更多」里。置顶的会话和搜索时不收起。',
+          'Ended sessions idle this long are folded behind "Show more" at the end of each directory. Pinned sessions and search results are never folded.',
         )}
       >
         <select value={p.staleDays} onChange={(e) => setSidePrefs({ staleDays: Number(e.target.value) })}>

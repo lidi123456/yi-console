@@ -3167,13 +3167,24 @@ textarea {
   position: relative;
 }
 
+/* "Show more (N)" / "Show less" at the end of a directory: a muted row with its text in the session-title column
+   (row margin 6 + padding 8 + icon 16 + gap 8 = 38px) */
 .old-toggle {
-  width: 100%;
+  display: flex;
+  align-items: center;
+  width: calc(100% - 12px);
+  height: 26px;
+  margin: 0 6px 1px;
+  padding: 0 8px 0 32px;
+  border-radius: 7px;
+  font-size: var(--fs-side-aux);
+  color: var(--text-3);
   text-align: left;
   cursor: pointer;
 }
 
 .old-toggle:hover {
+  background: var(--side-hover);
   color: var(--text-2);
 }
 

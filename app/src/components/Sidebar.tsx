@@ -210,9 +210,6 @@ function hostMenu(h: HostEntry, connect: () => void): (MenuItem | '-')[] {
     { label: tr('用量统计', 'Usage Stats'), icon: 'chart', run: () => navigate({ kind: 'stats', hostId: id }) },
     { label: tr('端口转发', 'Port Forwarding'), icon: 'external', run: () => navigate({ kind: 'ports', hostId: id }) },
     '-',
-    sidePrefs().layout === 'time'
-      ? { label: tr('按目录分组', 'Group by Directory'), icon: 'folder', run: () => setSidePrefs({ layout: 'project' }) }
-      : { label: tr('按时间排列', 'Sort by Time'), icon: 'clock', run: () => setSidePrefs({ layout: 'time' }) },
     { label: tr('侧栏设置…', 'Sidebar Settings…'), icon: 'settings', run: () => navigate({ kind: 'prefs' }) },
     '-',
     { label: tr('主机设置', 'Host Settings'), icon: 'settings', run: () => navigate({ kind: 'settings', hostId: id }) },
@@ -223,7 +220,9 @@ function hostMenu(h: HostEntry, connect: () => void): (MenuItem | '-')[] {
   ];
 }
 
-/** "N older" toggle at the end of a directory (or of the flat time list). The open session always stays visible */
+/** Sessions idle past the threshold at the end of a directory (or of the flat time list): folded behind a muted
+ *  "Show more (N)" row aligned with the titles, which turns into "Show less" at the end once expanded (as in Codex / ChatGPT).
+ *  The open session always stays visible */
 function OldList({
   k,
   old,
@@ -245,15 +244,20 @@ function OldList({
   const rows = open ? old : old.filter(isActive);
   return (
     <>
-      <button className="project-name old-toggle" onClick={() => onToggle(k)}>
-        {tr(`更早的 ${old.length} 个`, `${old.length} older`)}
-        <span className={`chev ${open ? 'open' : ''}`}>
-          <Icon name="chevron" size={11} />
-        </span>
-      </button>
       {rows.map((s) => (
         <SessionRow key={s.id} hostId={hostId} s={s} active={isActive(s)} showDir={showDir} />
       ))}
+      <button
+        className="old-toggle"
+        title={
+          open
+            ? tr('收起空闲较久的会话', 'Hide sessions idle for a while')
+            : tr(`还有 ${old.length} 个空闲较久的会话`, `${old.length} more sessions idle for a while`)
+        }
+        onClick={() => onToggle(k)}
+      >
+        {open ? tr('收起', 'Show less') : tr(`显示更多 (${old.length})`, `Show more (${old.length})`)}
+      </button>
     </>
   );
 }
@@ -345,6 +349,14 @@ function HostBlock({ h, filter }: { h: HostEntry; filter: string }) {
           <span className={`chev ${collapsed ? '' : 'open'}`}>
             <Icon name="chevron" size={12} />
           </span>
+        </button>
+        {/* Layout switch sits in the header for one-click toggling; the icon shows the layout a click switches to */}
+        <button
+          className="host-act"
+          title={layout === 'time' ? tr('改为按目录分组', 'Group by directory') : tr('改为按时间排列', 'Sort by time')}
+          onClick={() => setSidePrefs({ layout: layout === 'time' ? 'project' : 'time' })}
+        >
+          <Icon name={layout === 'time' ? 'folder' : 'clock'} size={14} />
         </button>
         {connected ? (
           <button className="host-act" title={tr('新建会话', 'New Session')} onClick={() => setState({ newSession: { hostId: id } })}>
