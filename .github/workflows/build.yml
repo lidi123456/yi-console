@@ -234,6 +234,8 @@ jobs:
           npx tauri android init --ci
           # Swap in our own MainActivity (makes room for the keyboard when the IME opens), see app/src-tauri/android/MainActivity.kt
           cp src-tauri/android/MainActivity.kt src-tauri/gen/android/app/src/main/java/dev/yiconsole/app/MainActivity.kt
+          # Launcher icons come from src-tauri/icons/android; don't rely on init picking them up
+          cp -r src-tauri/icons/android/. src-tauri/gen/android/app/src/main/res/
           npx tauri android build --apk --target aarch64 --target armv7 --target x86_64
       - name: sign
         env:
