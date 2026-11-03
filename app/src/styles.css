@@ -8094,6 +8094,25 @@ body.resizing-y .wp-hist-split {
   padding-left: 18px;
 }
 
+/* "Show more": a chevron in the icon column (down, up once expanded), text lined up with the session titles */
+.old-toggle {
+  gap: 8px;
+  padding-left: 8px;
+}
+
 .dir-group .old-toggle {
-  padding-left: 42px;
+  padding-left: 18px;
+}
+
+.old-toggle-icon {
+  flex: none;
+  width: 16px;
+  display: inline-flex;
+  justify-content: center;
+  transform: rotate(90deg);
+  transition: transform 0.15s;
+}
+
+.old-toggle-icon.up {
+  transform: rotate(-90deg);
 }

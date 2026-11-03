@@ -254,6 +254,9 @@ function OldList({
         }
         onClick={() => onToggle(k)}
       >
+        <span className={`old-toggle-icon ${open ? 'up' : ''}`}>
+          <Icon name="chevron" size={12} />
+        </span>
         {open ? tr('收起', 'Show less') : tr(`显示更多 (${old.length})`, `Show more (${old.length})`)}
       </button>
     </>
