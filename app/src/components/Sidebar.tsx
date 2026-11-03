@@ -6,7 +6,7 @@ import type { SessionInfo } from '../types';
 import { basename, fuzzyScore, lsGet, lsSet } from '../util';
 import { openMenu, type MenuItem } from './Overlay';
 import { writeClipboard } from '../clipboard';
-import { openTerminal, renameSession, sessionMenu } from './SessionActions';
+import { deleteDirSessions, openTerminal, renameSession, sessionMenu } from './SessionActions';
 import { Icon, ToolBadge } from './Icon';
 import { MOD } from './Palette';
 
@@ -138,13 +138,15 @@ function SessionRow({ hostId, s, active, showDir }: { hostId: string; s: Session
 const STALE_MS = 3 * 86400_000;
 
 /** Context menu for directory rows in the sidebar */
-function dirMenu(hostId: string, cwd: string, connected: boolean): MenuItem[] {
+function dirMenu(hostId: string, cwd: string, connected: boolean): (MenuItem | '-')[] {
   return [
     { label: tr('搜索此目录的历史会话', 'Search History in Directory'), icon: 'history', disabled: !connected, run: () => navigate({ kind: 'history', hostId, cwd }) },
     { label: tr('在此目录新建会话', 'New Session in Directory'), icon: 'plus', disabled: !connected, run: () => setState({ newSession: { hostId, cwd } }) },
     { label: tr('浏览目录', 'Browse Directory'), icon: 'folder', disabled: !connected, run: () => navigate({ kind: 'files', hostId, path: cwd }) },
     { label: tr('在此目录打开终端', 'Open Terminal in Directory'), icon: 'terminal', disabled: !connected, run: () => openTerminal(hostId, cwd) },
     { label: tr('复制路径', 'Copy Path'), icon: 'copy', run: () => writeClipboard(cwd).then(() => toast(tr('已复制路径', 'Path copied'))) },
+    '-',
+    { label: tr('删除此目录的所有会话…', 'Delete All Sessions in Directory…'), icon: 'trash', danger: true, disabled: !connected, run: () => deleteDirSessions(hostId, cwd) },
   ];
 }
 

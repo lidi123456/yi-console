@@ -5090,15 +5090,6 @@ body.resizing .side-resizer::after {
   color: var(--text);
 }
 
-/* "…" only appears on hover, "+" is always there */
-.host-act:last-child {
-  display: none;
-}
-
-.host-head:hover .host-act:last-child {
-  display: inline-flex;
-}
-
 .host-connect {
   flex: none;
   height: 22px;
@@ -5336,8 +5327,7 @@ body.resizing .side-resizer::after {
   .kbd-hint {
     display: none;
   }
-  .project-add:not(.hidden),
-  .host-act:last-child {
+  .project-add:not(.hidden) {
     display: inline-flex;
   }
   .row-actions {

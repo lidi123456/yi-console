@@ -87,6 +87,39 @@ export async function handoffSession(hostId: string, info: SessionInfo) {
   }
 }
 
+/** Delete every session in one working directory (the sidebar's directory row). Bottom-panel terminals go with their chat in Hub::delete */
+export async function deleteDirSessions(hostId: string, cwd: string) {
+  const list = (getState().sessions[hostId] ?? []).filter((s) => s.cwd === cwd && !s.parentId);
+  if (list.length === 0) return;
+  const busy = list.filter((s) => s.status === 'running' || s.status === 'starting' || s.status === 'waiting-permission').length;
+  const name = cwd.split(/[\\/]/).filter(Boolean).pop() || cwd;
+  const ok = await askConfirm({
+    title: tr(`删除“${name}”下的全部 ${list.length} 个会话？`, `Delete all ${list.length} sessions in "${name}"?`),
+    message:
+      tr('只删除 Yi Console 里的记录，工具自己的历史不受影响。', 'Only removes the records in Yi Console. Tool history is unaffected.') +
+      (busy ? tr(`\n其中 ${busy} 个正在运行，会被中断。`, `\n${busy} of them are running and will be interrupted.`) : ''),
+    okText: tr('全部删除', 'Delete All'),
+    danger: true,
+  });
+  if (!ok) return;
+  let failed = 0;
+  for (const s of list) {
+    try {
+      await rpc(hostId, 'session.delete', { sessionId: s.id });
+    } catch {
+      failed++;
+    }
+  }
+  const v = getState().view;
+  if ('sessionId' in v && v.hostId === hostId && list.some((s) => s.id === v.sessionId)) navigate({ kind: 'home' });
+  toast(
+    failed
+      ? tr(`已删除 ${list.length - failed} 个会话，${failed} 个删除失败`, `Deleted ${list.length - failed} sessions, ${failed} failed`)
+      : tr(`已删除 ${list.length} 个会话`, `Deleted ${list.length} sessions`),
+    failed ? 'error' : 'info',
+  );
+}
+
 export async function deleteSession(hostId: string, info: SessionInfo) {
   const name = info.title || tr('新会话', 'New Session');
   const ok = await askConfirm({
