@@ -20,6 +20,7 @@ mod log;
 mod paths;
 mod ports;
 mod probe;
+mod proctree;
 mod proxy;
 mod statusline;
 mod relay;
@@ -244,7 +245,7 @@ fn serve(foreground: bool) -> Result<()> {
         // Leaving the select! dropped the listener: the socket is gone and the single-instance lock released
         Ok::<_, anyhow::Error>(())
     })?;
-    // Don't wait for background tasks (tool child processes end via kill_on_drop)
+    // Don't wait for background tasks (dropping their JsonProc kills tool process trees; on Windows the job objects also go when we exit)
     rt.shutdown_timeout(Duration::from_secs(2));
     Ok(())
 }

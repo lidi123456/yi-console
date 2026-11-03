@@ -138,6 +138,9 @@ pub struct JsonProc {
     pub stdin: ChildStdin,
     pub stdout: tokio::io::Lines<BufReader<ChildStdout>>,
     pub stderr_tail: Arc<Mutex<VecDeque<String>>>,
+    /// The child's whole process tree; killing only `child` would orphan node.exe behind a `cmd /c tool.cmd` shim.
+    /// Dropping it (session ended, probe done, daemon shutting down) kills whatever is still running in the tree
+    tree: crate::proctree::Tree,
 }
 
 impl JsonProc {
@@ -153,7 +156,9 @@ impl JsonProc {
             // CREATE_NO_WINDOW, so no console window pops up in service mode
             cmd.creation_flags(0x0800_0000);
         }
+        crate::proctree::prepare(&mut cmd);
         let mut child = cmd.spawn()?;
+        let tree = crate::proctree::Tree::attach(&child);
         let stdin = child.stdin.take().expect("stdin");
         let stdout = BufReader::new(child.stdout.take().expect("stdout")).lines();
         let stderr = child.stderr.take().expect("stderr");
@@ -174,6 +179,7 @@ impl JsonProc {
             stdin,
             stdout,
             stderr_tail: tail,
+            tree,
         })
     }
 
@@ -187,6 +193,7 @@ impl JsonProc {
     /// Wait for the process to exit; returns an error message for the user (None on a normal exit)
     pub async fn finish(mut self, killed: bool) -> Option<String> {
         if killed {
+            self.tree.kill();
             let _ = self.child.start_kill();
         }
         drop(self.stdin);
@@ -195,6 +202,7 @@ impl JsonProc {
             {
                 Ok(Ok(s)) => Some(s),
                 _ => {
+                    self.tree.kill();
                     let _ = self.child.start_kill();
                     None
                 }
