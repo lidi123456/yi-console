@@ -1,0 +1,18 @@
+{
+  "commitHashCopied": "Commit hash copied",
+  "showLess": "Show less",
+  "showAll": "Show all",
+  "copyCommitHash": "Copy commit hash",
+  "copied": "Copied",
+  "copyCommitMessage": "Copy commit message",
+  "dragToResize": "Drag to resize",
+  "commits": "Commits",
+  "refresh": "Refresh",
+  "commitHistory": "Commit history",
+  "cannotReadCommitHistory": "Cannot read commit history",
+  "loading": "Loading…",
+  "noCommitsYet": "No commits yet.",
+  "mergeCommitComparedWithIts": "Merge commit (compared with its first parent)",
+  "failedToLoad": "Failed to load",
+  "thisCommitChangesNoFiles": "This commit changes no files."
+}

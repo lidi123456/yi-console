@@ -1,0 +1,21 @@
+{
+  "n5HourLimit": "5-hour limit",
+  "weeklyLimit": "weekly limit",
+  "weeklyOpusLimit": "weekly Opus limit",
+  "weeklySonnetLimit": "weekly Sonnet limit",
+  "resets": "resets {{v}}",
+  "lookingUpWhenItResets": "Looking up when it resets…",
+  "willContinueAutomaticallyAt": "will continue automatically at {{v}}",
+  "automaticContinueIsTurnedOff": "automatic continue is turned off in settings",
+  "couldnTFindWhenIt": "couldn't find when it resets, so it won't continue automatically",
+  "resetsMoreThanADay": "resets more than a day from now, so it won't continue automatically",
+  "hitTheLimitAgainSeveral": "hit the limit again several times in a row, automatic continue stopped",
+  "wonTContinueAutomatically": "won't continue automatically",
+  "continuedNowByHand": "continued now by hand",
+  "limitResetSentContinueAutomatically": "limit reset, sent \"continue\" automatically",
+  "automaticContinueCancelled": "automatic continue cancelled",
+  "youSentAMessageAutomatic": "you sent a message, automatic continue dropped",
+  "switchedToTheTerminalUi": "switched to the terminal UI, automatic continue dropped",
+  "theSessionWasBusyAutomatic": "the session was busy, automatic continue skipped",
+  "automaticContinueCancelled2": "automatic continue cancelled"
+}

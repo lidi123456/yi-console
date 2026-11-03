@@ -1,0 +1,10 @@
+{
+  "saved": "Saved",
+  "restoredDefaultTemplate": "Restored default template",
+  "continueInAnotherTool": "Continue in Another Tool",
+  "whenYouUseContinueIn": "When you use \"Continue in Another Tool\" from the session menu, the new session's first message is generated from this template. You can still edit it in the dialog.",
+  "availablePlaceholdersReplacedWithActual": "Available placeholders (replaced with actual values):",
+  "leaveEmptyOrIdenticalTo": "Leave empty or identical to the default to use the default template (follows the UI language). Saved on this device only.",
+  "restoreDefault": "Restore Default",
+  "save": "Save"
+}

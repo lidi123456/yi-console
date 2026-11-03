@@ -1,0 +1,15 @@
+{
+  "terminal": "终端",
+  "terminalPanel": "终端面板",
+  "terminalTabs": "终端列表",
+  "exited": "{{title}}（已退出）",
+  "exited2": "已退出",
+  "closeTerminal": "删除终端 {{title}}",
+  "newTerminal": "新建终端",
+  "hideTerminalPanelProcessesKeep": "关闭终端面板（终端在后台继续运行）",
+  "failedToCreateTerminal": "无法创建终端",
+  "retry": "重试",
+  "openingTerminal": "正在打开终端…",
+  "noTerminals": "还没有终端",
+  "openATerminalInThe": "在当前会话的工作目录中打开一个终端。"
+}

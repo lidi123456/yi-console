@@ -1,6 +1,6 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { useBack } from '../back';
-import { isEn, tr, useLang } from '../i18n';
+import { getT, isEn, useLang } from '../i18n';
 import { errorToast, hostSnippets, navigate, setState, toast, useStore } from '../store';
 import { clearSession, showChanges } from './SessionActions';
 import { isTauri, rpc } from '../transport';
@@ -14,6 +14,8 @@ import { openMenu } from './Overlay';
 import { copiedRef, DRAG_REF, INSERT_COMPOSER, toB64 } from './FilePanel';
 import { getPermModesList, permModes } from './NewSession';
 import { ModelPicker, OPEN_MODEL } from './ModelPicker';
+
+const t = getT('composer');
 
 /** Matching for / commands: name prefix > word start in name > name contains > description contains > name subsequence; descriptions aren't fuzzy-matched, or everything would match */
 function cmdScore(label: string, desc: string, q: string) {
@@ -77,27 +79,21 @@ function readImage(f: File): Promise<Attached> {
     if (!IMAGE_TYPES.includes(f.type))
       return reject(
         new Error(
-          tr(
-            `不支持的图片格式：${f.type || f.name}，请用 PNG / JPEG / GIF / WebP`,
-            `Unsupported image format: ${f.type || f.name}. Use PNG / JPEG / GIF / WebP`,
-          ),
+          t('unsupportedImageFormatUsePng', { v: f.type || f.name }),
         ),
       );
     if (f.size > IMAGE_MAX)
       return reject(
         new Error(
-          tr(
-            `图片超过 5MB（${(f.size / 1048576).toFixed(1)}MB），请压缩后再发`,
-            `Image exceeds 5MB (${(f.size / 1048576).toFixed(1)}MB). Please compress before sending.`,
-          ),
+          t('imageExceeds5mbMbPlease', { v: (f.size / 1048576).toFixed(1) }),
         ),
       );
     const r = new FileReader();
     r.onload = () => {
       const url = String(r.result);
-      resolve({ mimeType: f.type, data: url.slice(url.indexOf(',') + 1), url, name: f.name || tr('粘贴的图片', 'Pasted image') });
+      resolve({ mimeType: f.type, data: url.slice(url.indexOf(',') + 1), url, name: f.name || t('pastedImage') });
     };
-    r.onerror = () => reject(new Error(tr('读取图片失败', 'Failed to read image')));
+    r.onerror = () => reject(new Error(t('failedToReadImage')));
     r.readAsDataURL(f);
   });
 }
@@ -144,7 +140,7 @@ function PermPicker({
     <div className="menu-wrap" ref={wrapRef}>
       <button
         className={`perm-btn perm-${cur}`}
-        title={tr('审批模式（Shift+Tab 切换）', 'Permission mode (Shift+Tab to cycle)')}
+        title={t('permissionModeShiftTabTo')}
         onClick={() => setOpen(!open)}
       >
         <Icon name="shield" size={14} />
@@ -184,13 +180,10 @@ async function setPermMode(hostId: string, info: SessionInfo, mode: string) {
     if (mode === 'bypass' && info.tool === 'claude' && info.status !== 'exited' && info.status !== 'error') {
       toast(
         busy
-          ? tr(
-              '已切到全部放行：Claude 要重启进程才能生效，这一轮结束后自动重启',
-              'Switched to Bypass All: Claude process will restart automatically after this turn',
-            )
-          : tr('已切到全部放行，Claude 进程已重启', 'Switched to Bypass All (Claude process restarted)'),
+          ? t('switchedToBypassAllClaude')
+          : t('switchedToBypassAllClaude2'),
       );
-    } else toast(tr(`审批模式：${permLabel(mode)}`, `Permission mode: ${permLabel(mode)}`));
+    } else toast(t('permissionMode', { v: permLabel(mode) }));
   } catch (e) {
     errorToast(e);
   }
@@ -373,15 +366,15 @@ export function Composer({
       return (files ?? []).map((f) => ({
         key: f.path,
         label: f.path + (f.isDir ? '/' : ''),
-        group: tr('文件', 'Files'),
+        group: t('files'),
         icon: f.isDir ? 'folder' : 'file',
         apply: () => (f.isDir ? replaceTrigger(`@${f.path}/`, true) : replaceTrigger(`@${f.path} `)),
       }));
     }
     const q = slash![1];
     const builtin: PopItem[] = [
-      { key: 'b-model', label: 'model', desc: tr('切换模型', 'Switch model'), group: 'Yi Console', icon: 'chat', apply: () => (clearSlash(), window.dispatchEvent(new Event(OPEN_MODEL))) },
-      { key: 'b-mode', label: 'mode', desc: tr(`审批模式（现在：${permLabel(info.permissionMode)}）`, `Permission mode (current: ${permLabel(info.permissionMode)})`), group: 'Yi Console', icon: 'shield', apply: () => (clearSlash(), setPermOpen(true)) },
+      { key: 'b-model', label: 'model', desc: t('switchModel'), group: 'Yi Console', icon: 'chat', apply: () => (clearSlash(), window.dispatchEvent(new Event(OPEN_MODEL))) },
+      { key: 'b-mode', label: 'mode', desc: t('permissionModeCurrent', { v: permLabel(info.permissionMode) }), group: 'Yi Console', icon: 'shield', apply: () => (clearSlash(), setPermOpen(true)) },
       ...permModes(info.tool, info.mode).map(([id, label, desc]) => ({
         key: `b-mode-${id}`,
         label: `mode ${id}`,
@@ -391,39 +384,39 @@ export function Composer({
         apply: () => (clearSlash(), setPermMode(hostId, info, id)),
       })),
       ...(info.tool === 'codex'
-        ? [{ key: 'b-diff', label: 'diff', desc: tr('查看工作区改动（同 /changes）', 'View workspace changes (same as /changes)'), group: 'Yi Console', icon: 'edit' as const, apply: () => (clearSlash(), showChanges(hostId, info.id)) }]
+        ? [{ key: 'b-diff', label: 'diff', desc: t('viewWorkspaceChangesSameAs'), group: 'Yi Console', icon: 'edit' as const, apply: () => (clearSlash(), showChanges(hostId, info.id)) }]
         : []),
-      { key: 'b-changes', label: 'changes', desc: tr('查看这个会话改了哪些文件', 'View files modified in this session'), group: 'Yi Console', icon: 'edit', apply: () => (clearSlash(), showChanges(hostId, info.id)) },
-      { key: 'b-export', label: 'export', desc: tr('导出为 Markdown', 'Export as Markdown'), group: 'Yi Console', icon: 'copy', apply: () => (clearSlash(), onExport()) },
-      { key: 'b-rename', label: 'rename', desc: tr('重命名会话', 'Rename session'), group: 'Yi Console', icon: 'edit', apply: () => (clearSlash(), onRename()) },
-      { key: 'b-new', label: 'new', desc: tr('在同一目录新开一个会话', 'New session in the same directory'), group: 'Yi Console', icon: 'plus', apply: () => (clearSlash(), setState({ newSession: { hostId, cwd: info.cwd, tool: info.tool } })) },
-      { key: 'b-files', label: 'files', desc: tr('浏览工作目录', 'Browse working directory'), group: 'Yi Console', icon: 'folder', apply: () => (clearSlash(), navigate({ kind: 'files', hostId, path: info.cwd })) },
-      { key: 'b-search', label: 'search', desc: tr('在所有会话的消息里搜索', 'Search messages across all sessions'), group: 'Yi Console', icon: 'search', apply: () => (clearSlash(), navigate({ kind: 'search' })) },
+      { key: 'b-changes', label: 'changes', desc: t('viewFilesModifiedInThis'), group: 'Yi Console', icon: 'edit', apply: () => (clearSlash(), showChanges(hostId, info.id)) },
+      { key: 'b-export', label: 'export', desc: t('exportAsMarkdown'), group: 'Yi Console', icon: 'copy', apply: () => (clearSlash(), onExport()) },
+      { key: 'b-rename', label: 'rename', desc: t('renameSession'), group: 'Yi Console', icon: 'edit', apply: () => (clearSlash(), onRename()) },
+      { key: 'b-new', label: 'new', desc: t('newSessionInTheSame'), group: 'Yi Console', icon: 'plus', apply: () => (clearSlash(), setState({ newSession: { hostId, cwd: info.cwd, tool: info.tool } })) },
+      { key: 'b-files', label: 'files', desc: t('browseWorkingDirectory'), group: 'Yi Console', icon: 'folder', apply: () => (clearSlash(), navigate({ kind: 'files', hostId, path: info.cwd })) },
+      { key: 'b-search', label: 'search', desc: t('searchMessagesAcrossAllSessions'), group: 'Yi Console', icon: 'search', apply: () => (clearSlash(), navigate({ kind: 'search' })) },
     ];
     if (info.mode !== 'terminal')
       builtin.splice(2 + permModes(info.tool, info.mode).length, 0, {
         key: 'b-compact',
         label: 'compact',
-        desc: tr('压缩上下文：总结之前的对话，释放上下文空间', 'Compact context: summarize earlier conversation to free context window'),
+        desc: t('compactContextSummarizeEarlierConversation'),
         group: 'Yi Console',
         icon: 'refresh',
-        apply: () => (clearSlash(), rpc(hostId, 'session.compact', { sessionId: info.id }).then(() => toast(tr('正在压缩上下文…', 'Compacting context…')), errorToast)),
+        apply: () => (clearSlash(), rpc(hostId, 'session.compact', { sessionId: info.id }).then(() => toast(t('compactingContext')), errorToast)),
       });
     if (info.mode !== 'terminal')
       builtin.splice(3 + permModes(info.tool, info.mode).length, 0, {
         key: 'b-clear',
         label: 'clear',
-        desc: tr('清空对话：删掉聊天记录、用量清零，新开一个工具会话', 'Clear conversation: delete messages, reset usage, and start fresh'),
+        desc: t('clearConversationDeleteMessagesReset'),
         group: 'Yi Console',
         icon: 'trash',
         apply: () => (clearSlash(), clearSession(hostId, info)),
       });
-    if (running) builtin.push({ key: 'b-stop', label: 'stop', desc: tr('中断当前回合（Esc）', 'Interrupt current turn (Esc)'), group: 'Yi Console', icon: 'stop', apply: () => (clearSlash(), onInterrupt()) });
+    if (running) builtin.push({ key: 'b-stop', label: 'stop', desc: t('interruptCurrentTurnEsc'), group: 'Yi Console', icon: 'stop', apply: () => (clearSlash(), onInterrupt()) });
     const snip: PopItem[] = snippets.map((s, i) => ({
       key: `s-${i}`,
       label: s.name,
       desc: s.text.replace(/\s+/g, ' ').slice(0, 80),
-      group: tr('提示词片段', 'Snippets'),
+      group: t('snippets'),
       icon: 'file',
       apply: () => replaceTrigger(s.text),
     }));
@@ -431,7 +424,7 @@ export function Composer({
       key: `t-${c.name}`,
       label: c.name + (c.hint ? ` ${c.hint}` : ''),
       desc: c.description,
-      group: tr('工具命令', 'Tool Commands'),
+      group: t('toolCommands'),
       icon: 'terminal',
       apply: () => replaceTrigger(`/${c.name} `),
     }));
@@ -522,8 +515,8 @@ export function Composer({
           setImgs((l) => [...l, a]);
           continue;
         }
-        if (f.size > FILE_MAX) throw new Error(tr(`${f.name} 超过 50MB，太大了`, `${f.name} exceeds 50MB`));
-        if (!f.size && !f.type) throw new Error(tr(`${f.name} 是文件夹或空文件，没法引用`, `${f.name} is a folder or empty file`));
+        if (f.size > FILE_MAX) throw new Error(t('exceeds50mb', { name: f.name }));
+        if (!f.size && !f.type) throw new Error(t('isAFolderOrEmpty', { name: f.name }));
         if (up) setUploads((l) => [...l, up]);
         const path = await uploadFile(f, up!);
         if (path) refs.push(refOf(path));
@@ -693,14 +686,14 @@ export function Composer({
             <div key={q.id} className="queue-item">
               <Icon name="history" size={14} />
               <span className="queue-text truncate" title={q.text}>
-                {q.text || tr('（图片）', '(Image)')}
-                {q.images > 0 && <span className="muted"> · {tr(`${q.images} 张图片`, `${q.images} image(s)`)}</span>}
+                {q.text || t('image')}
+                {q.images > 0 && <span className="muted"> · {t('imageS', { images: q.images })}</span>}
               </span>
-              <span className="muted small hide-mobile">{i === 0 ? tr('本轮结束后发送', 'Send after current turn') : tr('排队中', 'Queued')}</span>
-              <button className="btn small" title={tr('中断当前回合，马上发这条', 'Interrupt current turn and send now')} onClick={() => queueAction(q.id, 'sendNow')}>
-                {tr('立即发送', 'Send Now')}
+              <span className="muted small hide-mobile">{i === 0 ? t('sendAfterCurrentTurn') : t('queued')}</span>
+              <button className="btn small" title={t('interruptCurrentTurnAndSend')} onClick={() => queueAction(q.id, 'sendNow')}>
+                {t('sendNow')}
               </button>
-              <button className="icon-btn" title={tr('撤回到输入框（输入框为空时按 ↑ 也行）', 'Recall to input (or press ↑ when input is empty)')} onClick={() => queueAction(q.id, 'remove')}>
+              <button className="icon-btn" title={t('recallToInputOrPress')} onClick={() => queueAction(q.id, 'remove')}>
                 <Icon name="x" size={14} />
               </button>
             </div>
@@ -730,7 +723,7 @@ export function Composer({
       >
         {popOpen && (items.length > 0 || (at && files === null)) && (
           <div className="pop" ref={listRef}>
-            {at && files === null && <div className="muted small pad-x">{tr('搜索中…', 'Searching…')}</div>}
+            {at && files === null && <div className="muted small pad-x">{t('searching')}</div>}
             {items.slice(0, 80).map((it, i) => (
               <div key={it.key}>
                 {(i === 0 || items[i - 1].group !== it.group) && <div className="pop-group">{it.group}</div>}
@@ -750,15 +743,15 @@ export function Composer({
             ))}
           </div>
         )}
-        {popOpen && at && files?.length === 0 && <div className="pop muted small pad-x">{tr('没有匹配的文件', 'No matching files')}</div>}
+        {popOpen && at && files?.length === 0 && <div className="pop muted small pad-x">{t('noMatchingFiles')}</div>}
         {uploads.length > 0 && (
           <div className="upload-row" aria-live="polite">
             {uploads.map((u) => (
               <span key={u.id} className="upload-chip" title={u.name}>
                 <span className="spinner mini" />
-                <span className="truncate">{tr(`正在上传 ${u.name}`, `Uploading ${u.name}`)}</span>
+                <span className="truncate">{t('uploading', { name: u.name })}</span>
                 {u.total > CHUNK && <span className="upload-pct">{Math.floor((u.sent / u.total) * 100)}%</span>}
-                <button className="upload-x" title={tr('取消上传', 'Cancel upload')} aria-label={tr('取消上传', 'Cancel upload')} onClick={() => cancelUpload(u.id)}>
+                <button className="upload-x" title={t('cancelUpload')} aria-label={t('cancelUpload')} onClick={() => cancelUpload(u.id)}>
                   <Icon name="x" size={12} />
                 </button>
               </span>
@@ -768,9 +761,9 @@ export function Composer({
         {imgs.length > 0 && (
           <div className="attach-row">
             {imgs.map((im, i) => (
-              <div key={i} className="attach" title={tr(`${im.name}（双击放大）`, `${im.name} (double-click to zoom)`)}>
+              <div key={i} className="attach" title={t('doubleClickToZoom', { name: im.name })}>
                 <img src={im.url} alt="" onDoubleClick={() => openImage(im.url)} onContextMenu={(e) => imageMenu(e, im.url)} />
-                <button className="attach-x" title={tr('移除', 'Remove')} onClick={() => setImgs((l) => l.filter((_, j) => j !== i))}>
+                <button className="attach-x" title={t('remove')} onClick={() => setImgs((l) => l.filter((_, j) => j !== i))}>
                   <Icon name="x" size={12} />
                 </button>
               </div>
@@ -784,16 +777,16 @@ export function Composer({
             rows={1}
             placeholder={
               !connected
-                ? tr('主机未连接', 'Host not connected')
+                ? t('hostNotConnected')
                 : busy
                   ? steer
-                    ? tr('继续输入，AI 会在下一步读到；Esc 中断', 'Type a follow-up (AI will read it on the next step); Esc to stop')
-                    : tr('继续输入，本轮结束后自动发送；Esc 中断', 'Type a message to queue for after this turn; Esc to stop')
+                    ? t('typeAFollowUpAi')
+                    : t('typeAMessageToQueue')
                   : info.status === 'exited' || info.status === 'error'
-                    ? tr('会话已结束，发送消息会自动恢复', 'Session exited. Send a message to resume automatically.')
+                    ? t('sessionExitedSendAMessage')
                     : isMobile()
-                      ? tr('输入消息，/ 命令，@ 文件', 'Message, / commands, @ files')
-                      : tr('输入消息，Enter 发送；/ 命令和片段，@ 引用文件，Ctrl+K 命令面板', 'Type a message, Enter to send; / commands & snippets, @ files, Ctrl+K palette')
+                      ? t('messageCommandsFiles')
+                      : t('typeAMessageEnterTo')
             }
             disabled={!connected}
             onChange={(e) => {
@@ -827,17 +820,14 @@ export function Composer({
         <div className="composer-tools">
           <button
             className="icon-btn add-btn"
-            title={tr(
-              '添加图片或文件（也可以粘贴或拖进来）：图片单张不超过 5MB，其他文件作为 @引用，不超过 50MB',
-              'Attach images or files (or paste/drag & drop): images up to 5MB, other files referenced via @ up to 50MB',
-            )}
+            title={t('attachImagesOrFilesOr')}
             disabled={!connected}
             onClick={(e) => {
               if (!isMobile()) return fileInput.current?.click();
               const r = e.currentTarget.getBoundingClientRect();
               openMenu({ clientX: r.left, clientY: r.top - 96 }, [
-                { label: tr('相册图片', 'Photo Library'), icon: 'image', run: () => imageInput.current?.click() },
-                { label: tr('文件', 'File'), icon: 'file', run: () => fileInput.current?.click() },
+                { label: t('photoLibrary'), icon: 'image', run: () => imageInput.current?.click() },
+                { label: t('file'), icon: 'file', run: () => fileInput.current?.click() },
               ]);
             }}
           >
@@ -867,7 +857,7 @@ export function Composer({
           <PermPicker hostId={hostId} info={info} open={permOpen} setOpen={setPermOpen} />
           <button
             className="tool-chip"
-            title={tr('斜杠命令、提示词片段', 'Slash commands & snippets')}
+            title={t('slashCommandsSnippets')}
             onClick={() => {
               setText('/' + text.replace(/^\//, ''));
               setCaret(1);
@@ -882,7 +872,7 @@ export function Composer({
           </button>
           <button
             className="tool-chip"
-            title={tr('引用文件', 'Reference file')}
+            title={t('referenceFile')}
             onClick={() => {
               const pos = ta.current?.selectionStart ?? text.length;
               const pre = text.slice(0, pos);
@@ -902,7 +892,7 @@ export function Composer({
           <span className="composer-spacer" />
           <ModelPicker hostId={hostId} info={info} />
           {running && !hasText ? (
-            <button className="send-btn stop" onClick={onInterrupt} title={tr('中断（Esc）', 'Stop (Esc)')}>
+            <button className="send-btn stop" onClick={onInterrupt} title={t('stopEsc')}>
               <Icon name="stop" size={16} />
             </button>
           ) : (
@@ -912,12 +902,12 @@ export function Composer({
               onClick={send}
               title={
                 waitSend
-                  ? tr('文件传完后自动发送', 'Will send after the upload finishes')
+                  ? t('willSendAfterTheUpload')
                   : busy
                   ? steer
-                    ? tr('发给 AI：它会在下一步读到', 'Send to AI (read on next step)')
-                    : tr('排队：本轮结束后发送', 'Queue (send after current turn)')
-                  : tr('发送', 'Send')
+                    ? t('sendToAiReadOn')
+                    : t('queueSendAfterCurrentTurn')
+                  : t('send')
               }
             >
               {sending || waitSend ? <span className="spinner send-spin" /> : <Icon name={busy && !steer ? 'history' : 'arrowUp'} size={18} />}

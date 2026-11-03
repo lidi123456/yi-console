@@ -1,0 +1,9 @@
+{
+  "continuesAtIn": "continues at {{v}} · in {{v2}}",
+  "autoAt": "Auto at {{v}} · {{v2}}",
+  "continuing": "Continuing…",
+  "sendContinueRightAway": "Send \"continue\" right away",
+  "continueNow": "Continue now",
+  "continue": "Continue",
+  "cancel": "Cancel"
+}

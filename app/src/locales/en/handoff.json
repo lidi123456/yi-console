@@ -1,0 +1,14 @@
+{
+  "jsonlOneJsonObjectPer": "JSONL, one JSON object per line. Lines with type \"user\" / \"assistant\" are the conversation; the content is in message.content (a string, or an array where text blocks are text and tool_use / tool_result are tool calls and results). Other types (api-request, attachment, file-history-*, etc.) can be ignored. User entries containing tool_result are tool results, not something the user said.",
+  "jsonlOneJsonObjectPer2": "JSONL, one JSON object per line. Entries with type==\"response_item\" and payload.type==\"message\" are the conversation; payload.role is user / assistant and the text is in payload.content[].text (the first few role=user entries may be injected content such as AGENTS.md or environment info). payload.type function_call / custom_tool_call are tool calls, *_output are their results; reasoning can be ignored.",
+  "jsonlOneJsonObjectPer3": "JSONL, one JSON object per line. kind==\"Prompt\" is a user message, kind==\"AssistantMessage\" is a reply, with the text in the data of data.content[] items whose kind==\"text\"; kind==\"ToolResults\" are tool results and \"Compaction\" is a context compaction summary.",
+  "jsonlOneJsonObjectPer4": "JSONL, one JSON object per line. Entries with type==\"message\" are the conversation; role is user / assistant and the text is in content[].text (content type input_text / output_text).",
+  "toolOfTheOriginalSession": "Tool of the original session, e.g. Claude Code",
+  "titleOfTheOriginalSession": "Title of the original session",
+  "workingDirectory": "Working directory",
+  "absolutePathOfTheOriginal": "Absolute path of the original session record",
+  "descriptionOfTheRecordFile": "Description of the record file format (filled in per tool)",
+  "thisTaskWasPreviouslyWorked": "This task was previously worked on in {tool}; you are taking it over now. Working directory: {cwd}\n\nOriginal session record: `{path}`\nFormat: {format}\n\nFirst read the original session record to understand the earlier context, and check the current changes with git status / git diff / git log.\n\nIn this turn, only report back. Do not modify any files and do not continue the task. Please report:\n- What the goal was\n- What has been completed\n- What is still unfinished, and where it stopped\n- What you suggest as the next step",
+  "markdownExportedByYiConsole": "Markdown exported by Yi Console from the session record: user messages, reply text and tool call summaries (tool output not included).",
+  "untitledSession": "Untitled session"
+}

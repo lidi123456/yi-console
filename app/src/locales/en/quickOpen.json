@@ -1,0 +1,17 @@
+{
+  "enterALine1": "Enter a line (1–{{lines}})",
+  "goToLine": "Go to line {{line}}",
+  "line": "Line {{line}}",
+  "openAFileFirst": "Open a file first",
+  "noFunctionsClassesOrHeadings": "No functions, classes, or headings in this file",
+  "noMatchingSymbols": "No matching symbols",
+  "searching": "Searching…",
+  "noMatchingFiles": "No matching files",
+  "typeAFileName": "Type a file name",
+  "quickOpen": "Quick open",
+  "fileNameSymbolsLine": "File name; @ symbols; : line",
+  "files": "Files",
+  "symbols": "@ Symbols",
+  "line2": ": Line",
+  "recent": "Recent"
+}

@@ -1,0 +1,15 @@
+{
+  "questions": "共 {{length}} 个问题",
+  "expand": "展开问题",
+  "collapse": "暂时收起",
+  "multiSelect": "（可多选）",
+  "otherTypeYourAnswer": "其他，自己填写…",
+  "typeYourAnswer": "输入你的回答…",
+  "skip": "跳过",
+  "pleaseAnswerAllQuestions": "每个问题都要回答",
+  "submit": "提交",
+  "cancelled": "已取消",
+  "skipped": "已跳过",
+  "unanswered": "（未回答）",
+  "pleaseSelect": "请选择"
+}

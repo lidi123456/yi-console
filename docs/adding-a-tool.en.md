@@ -29,7 +29,7 @@ A tool usually needs both modes: **chat mode** (structured; Yi Console draws the
 | Tool color `--c-<tool>` (check both light and dark) | top of `app/src/styles.css` |
 | Tool list in system settings (path, extra arguments) | `app/src/components/SettingsView.tsx` |
 | Tool lists on the history and usage pages | `HISTORY_TOOLS` in `HistoryView.tsx`; colors and `QUOTA_TOOLS` in `StatsView.tsx` |
-| Display names correct in both the Chinese and English UI | write both languages with `tr()` |
+| Display names correct in both the Chinese and English UI | add the strings to `app/src/locales/zh/*.json` and `en/*.json`, use them with `getT()` |
 
 ## 2. Chat mode (the adapter)
 

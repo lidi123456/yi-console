@@ -1,0 +1,8 @@
+{
+  "yiAgentdOnHasBeen": "{{name}} 的 yi-agentd 已升级到新版本",
+  "usageLimitReached": "{{name}} 额度已用完",
+  "continuesAutomaticallyAt": "{{v}} 自动继续",
+  "continuesAutomaticallyOnceTheLimit": "额度恢复后会自动继续",
+  "wonTContinueAutomatically": "不会自动继续",
+  "view": "查看"
+}

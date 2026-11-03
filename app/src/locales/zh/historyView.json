@@ -1,0 +1,20 @@
+{
+  "history": "历史会话",
+  "refresh": "刷新",
+  "sessionsSavedByEachTool": "各工具自己保存的会话记录，可以在这里接着聊。",
+  "includingSubfolders": "（含子目录）",
+  "allFolders": "查看全部目录",
+  "searchTitlesInThisFolder": "在这个目录的会话里搜索标题",
+  "searchTitlesOrFolders": "搜索标题或目录",
+  "all": "全部",
+  "reading": "正在读取",
+  "unknownFolder": "未知目录",
+  "msgs": " · {{messageCount}} 条",
+  "showMoreLeft": "显示更多（还有 {{v}} 条）",
+  "noHistoryInThisFolder": "这个目录下没有历史会话",
+  "nothingHere": "没有记录",
+  "continue": "继续此会话",
+  "loading": "加载中…",
+  "historyIsShownAfterYou": "{{v}} 的历史内容需要继续会话后由工具回放显示。",
+  "selectASessionToView": "选择左侧的会话查看内容"
+}

@@ -1,0 +1,11 @@
+{
+  "failedToLoadImage": "Failed to load image",
+  "conversionFailed": "Conversion failed",
+  "imageCopied": "Image copied",
+  "failedToCopyImage": "Failed to copy image: {{v}}",
+  "saved": "Saved",
+  "failedToSave": "Failed to save: {{v}}",
+  "copyImage": "Copy Image",
+  "saveImageAs": "Save Image As…",
+  "zoomIn": "Zoom In"
+}

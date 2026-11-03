@@ -1,0 +1,35 @@
+{
+  "placeholder": "Jump to session, or type a command…",
+  "untitledSession": "New Session",
+  "shortcuts": {
+    "palette": "Command Palette: jump to session or run action",
+    "newSession": "New Session (Alt+N in browser)",
+    "switchSession": "Previous / Next session",
+    "backForward": "Back / Forward",
+    "sidebar": "Toggle Sidebar",
+    "rename": "Rename current session",
+    "interrupt": "Interrupt current turn (in input)",
+    "permissionMode": "Cycle permission mode (in input)",
+    "slash": "Slash commands & snippets (at start of input)",
+    "mention": "Reference files"
+  },
+  "actions": {
+    "newSession": "New Session",
+    "overview": "Overview",
+    "hosts": "Hosts",
+    "prefs": "Preferences",
+    "prefsSub": "Appearance, language, notifications, proxy"
+  },
+  "host": {
+    "history": "{{name}}: Session History",
+    "files": "{{name}}: Files",
+    "stats": "{{name}}: Usage Stats",
+    "ports": "{{name}}: Port Forwarding",
+    "settings": "{{name}}: Host Settings",
+    "settingsSub": "Snippets, status line, push notifications"
+  },
+  "search": {
+    "all": "Search messages across all sessions",
+    "query": "Search messages for \"{{query}}\""
+  }
+}

@@ -5,12 +5,14 @@ import { Terminal, type ITheme } from '@xterm/xterm';
 import '@xterm/xterm/css/xterm.css';
 import { useEffect, useRef, useState } from 'react';
 import { readClipboard, writeClipboard } from '../clipboard';
-import { tr } from '../i18n';
+import { getT } from '../i18n';
 import { getSession, loadSession, skey } from '../store';
 import { rpc } from '../transport';
 import { lsGet, lsSet, toB64 } from '../util';
 import { openMenu } from './Overlay';
 import { isAppDark, onThemeChange, useTheme } from '../theme';
+
+const t = getT('terminalView');
 
 // Dark: VS Code's integrated terminal (Dark Modern background, default ANSI colors); light: Windows Terminal's One Half Light
 const DARK: ITheme = {
@@ -116,13 +118,13 @@ export function TermTools() {
   const dark = isDark(prefs.scheme);
   return (
     <div className="term-tools">
-      <button title={dark ? tr('换成亮色', 'Switch to light theme') : tr('换成暗色', 'Switch to dark theme')} onClick={() => setTermPrefs({ scheme: dark ? 'light' : 'dark' })}>
-        {dark ? tr('☀ 亮色', '☀ Light') : tr('☾ 暗色', '☾ Dark')}
+      <button title={dark ? t('switchToLightTheme') : t('switchToDarkTheme')} onClick={() => setTermPrefs({ scheme: dark ? 'light' : 'dark' })}>
+        {dark ? t('light') : t('dark')}
       </button>
-      <button title={tr('缩小字号', 'Decrease font size')} onClick={() => setTermPrefs({ fontSize: Math.max(10, prefs.fontSize - 1) })}>
+      <button title={t('decreaseFontSize')} onClick={() => setTermPrefs({ fontSize: Math.max(10, prefs.fontSize - 1) })}>
         A−
       </button>
-      <button title={tr('放大字号', 'Increase font size')} onClick={() => setTermPrefs({ fontSize: Math.min(24, prefs.fontSize + 1) })}>
+      <button title={t('increaseFontSize')} onClick={() => setTermPrefs({ fontSize: Math.min(24, prefs.fontSize + 1) })}>
         A+
       </button>
     </div>
@@ -431,11 +433,11 @@ export function TerminalView({ hostId, sessionId, running }: { hostId: string; s
         onClick={() => termRef.current?.focus()}
         onContextMenu={(e) =>
           openMenu(e, [
-            { label: tr('复制', 'Copy'), icon: 'copy', disabled: !termRef.current?.hasSelection(), run: copy },
-            { label: tr('粘贴', 'Paste'), icon: 'paste', run: paste },
+            { label: t('copy'), icon: 'copy', disabled: !termRef.current?.hasSelection(), run: copy },
+            { label: t('paste'), icon: 'paste', run: paste },
             '-',
-            { label: tr('全选', 'Select All'), run: () => termRef.current?.selectAll() },
-            { label: tr('清屏', 'Clear'), icon: 'trash', run: () => termRef.current?.clear() },
+            { label: t('selectAll'), run: () => termRef.current?.selectAll() },
+            { label: t('clear'), icon: 'trash', run: () => termRef.current?.clear() },
           ])
         }
       />
@@ -473,7 +475,7 @@ export function TerminalView({ hostId, sessionId, running }: { hostId: string; s
               paste();
             }}
           >
-            {tr('粘贴', 'Paste')}
+            {t('paste')}
           </button>
         </div>
       )}
@@ -618,8 +620,8 @@ function TmuxScrollbar({
         />
       </div>
       {position > 0 && (
-        <button className="tmux-bottom" onClick={onBottom} title={tr('回到底部（直接打字也会回到底部）', 'Jump to bottom (typing also returns to bottom)')}>
-          {tr(`↓ 回到底部 · 上翻 ${position} 行`, `↓ Bottom · +${position} lines`)}
+        <button className="tmux-bottom" onClick={onBottom} title={t('jumpToBottomTypingAlso')}>
+          {t('bottomLines', { position })}
         </button>
       )}
     </>

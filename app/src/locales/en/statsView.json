@@ -1,0 +1,23 @@
+{
+  "thisHostSDaemonIs": "This host’s daemon is too old. Restart it from Hosts.",
+  "resetsSoon": "Resets soon",
+  "loading": "Loading…",
+  "failed": "Failed: ",
+  "used": "{{v}}% used",
+  "accountQuota": "Account quota",
+  "refresh": "Refresh",
+  "usage": "Usage",
+  "d": "{{d}}d",
+  "credits": "Credits",
+  "cost": "Cost",
+  "claudeCodeCodexQoderAnd": "Claude Code, Codex, Qoder, and CodeBuddy usage is read from each tool’s own logs on this host, including use outside Yi Console. Kiro only counts Yi Console sessions. Qoder and Kiro use credits; CodeBuddy records both tokens and credits. Only Claude Code reports cost for Yi Console sessions.",
+  "onlyStructuredYiConsoleSessions": "Only structured Yi Console sessions are counted. Claude Code reports cost; Codex reports tokens; Kiro uses credits.",
+  "thisHostSDaemonIs2": "This host’s daemon is old and does not count terminal use. Restart it from Hosts for a fuller picture.",
+  "calculatingTheFirstReadOf": "Calculating… (the first read of tool logs can take a few seconds)",
+  "noUsageInThisRange": "No usage in this range",
+  "in": "In",
+  "out": "Out",
+  "cache": "Cache",
+  "billedInCreditsNoTokens": "Billed in credits (no tokens reported)",
+  "dailyUsage": "Daily usage"
+}

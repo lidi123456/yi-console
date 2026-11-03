@@ -1,8 +1,10 @@
 import { useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore } from 'react';
 import { useBack } from '../back';
 import { readClipboard, writeClipboard } from '../clipboard';
-import { tr } from '../i18n';
+import { getT } from '../i18n';
 import { Icon } from './Icon';
+
+const t = getT('overlay');
 
 // Our own input dialog, confirm dialog and context menu, replacing the browser's prompt / confirm / context menu
 
@@ -61,14 +63,14 @@ const useOverlay = () =>
 
 export function askText(o: { title: string; label?: string; value?: string; placeholder?: string; okText?: string }) {
   return new Promise<string | null>((resolve) => {
-    dialog = { kind: 'text', value: '', okText: tr('确定', 'OK'), ...o, resolve } as TextReq;
+    dialog = { kind: 'text', value: '', okText: t('ok'), ...o, resolve } as TextReq;
     bump();
   });
 }
 
 export function askConfirm(o: { title: string; message?: string; okText?: string; danger?: boolean }) {
   return new Promise<boolean>((resolve) => {
-    dialog = { kind: 'confirm', okText: tr('确定', 'OK'), ...o, resolve } as ConfirmReq;
+    dialog = { kind: 'confirm', okText: t('ok'), ...o, resolve } as ConfirmReq;
     bump();
   });
 }
@@ -129,7 +131,7 @@ function Dialog({ d }: { d: TextReq | ConfirmReq }) {
         )}
         <div className="dlg-actions">
           <button className="btn" onClick={() => done(false)}>
-            {tr('取消', 'Cancel')}
+            {t('cancel')}
           </button>
           <button
             ref={ok}
@@ -239,7 +241,7 @@ export function editMenu(target: Element | null): (MenuItem | '-')[] {
     const secret = ed.type === 'password';
     return [
       {
-        label: tr('剪切', 'Cut'),
+        label: t('cut'),
         icon: 'cut',
         hint: `${MOD}X`,
         disabled: !sel || ro || secret,
@@ -248,9 +250,9 @@ export function editMenu(target: Element | null): (MenuItem | '-')[] {
           writeClipboard(sel).then(() => document.execCommand('delete'));
         },
       },
-      { label: tr('复制', 'Copy'), icon: 'copy', hint: `${MOD}C`, disabled: !sel || secret, run: () => writeClipboard(sel) },
+      { label: t('copy'), icon: 'copy', hint: `${MOD}C`, disabled: !sel || secret, run: () => writeClipboard(sel) },
       {
-        label: tr('粘贴', 'Paste'),
+        label: t('paste'),
         icon: 'paste',
         hint: `${MOD}V`,
         disabled: ro,
@@ -262,7 +264,7 @@ export function editMenu(target: Element | null): (MenuItem | '-')[] {
       },
       '-',
       {
-        label: tr('全选', 'Select All'),
+        label: t('selectAll'),
         hint: `${MOD}A`,
         disabled: !ed.value,
         run: () => {
@@ -274,7 +276,7 @@ export function editMenu(target: Element | null): (MenuItem | '-')[] {
   }
   const text = window.getSelection()?.toString() ?? '';
   if (!text.trim()) return [];
-  return [{ label: tr('复制', 'Copy'), icon: 'copy', hint: `${MOD}C`, run: () => writeClipboard(text) }];
+  return [{ label: t('copy'), icon: 'copy', hint: `${MOD}C`, run: () => writeClipboard(text) }];
 }
 
 /** Suppress the WebView's built-in context menu globally; leave alone events components already handled (preventDefault) */

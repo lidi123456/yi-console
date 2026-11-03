@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { useBack } from '../back';
-import { tr, trErr, useLang } from '../i18n';
+import { getT, trErr, useLang } from '../i18n';
 import { errorToast, skey, toast, useSessionData, useStore } from '../store';
 import { isTauri, rpc } from '../transport';
 import type { DirEntry, FileDiff } from '../types';
@@ -16,6 +16,8 @@ import { QuickOpen, type QuickMode } from './QuickOpen';
 import { OPEN_CHANGES } from './SessionActions';
 import { BrowserPane, isWebTab, WEB_PREFIX, webTabFile, webTabTitle } from './Browser';
 import { CommitDetails, GitHistory, isCommitTab, parseCommitTab } from './GitHistory';
+
+const tx = getT('filePanel');
 
 // The "workspace files" panel on the right of the session page, modeled on the VS Code / Cursor explorer:
 // - on desktop the panel always shows the preview area on the left and the tree on the right (collapsible), with a placeholder until a file is opened;
@@ -121,22 +123,22 @@ export function gitMark(status: string): [string, string] {
 }
 
 export function gitText(code: string): string {
-  if (code === 'U') return tr('新文件（未跟踪）', 'Untracked');
-  if (code === 'A') return tr('新增', 'Added');
-  if (code === 'D') return tr('已删除', 'Deleted');
-  if (code === 'R') return tr('改名', 'Renamed');
-  if (code === 'M') return tr('已修改', 'Modified');
-  if (code === '!') return tr('有冲突', 'Conflict');
+  if (code === 'U') return tx('untracked');
+  if (code === 'A') return tx('added');
+  if (code === 'D') return tx('deleted');
+  if (code === 'R') return tx('renamed');
+  if (code === 'M') return tx('modified');
+  if (code === '!') return tx('conflict');
   return code;
 }
 
 type SaveState = 'saving' | 'conflict' | 'error' | null;
 
 function saveStateText(state: string): string {
-  if (state === 'dirty') return tr('已修改', 'Modified');
-  if (state === 'saving') return tr('正在保存', 'Saving');
-  if (state === 'conflict') return tr('磁盘内容已变化', 'Changed on disk');
-  if (state === 'error') return tr('保存失败', 'Save failed');
+  if (state === 'dirty') return tx('modified');
+  if (state === 'saving') return tx('saving');
+  if (state === 'conflict') return tx('changedOnDisk');
+  if (state === 'error') return tx('saveFailed');
   return state;
 }
 
@@ -331,7 +333,7 @@ function Rows({
           {onMenu && !r.loading && (
             <button
               className="wp-row-more"
-              title={tr('更多操作', 'More actions')}
+              title={tx('moreActions')}
               onClick={(e) => {
                 e.stopPropagation();
                 const rect = e.currentTarget.getBoundingClientRect();
@@ -355,7 +357,7 @@ function flatten(dir: string, depth: number, kids: Record<string, DirEntry[]>, e
     out.push({ key: e.path, path: e.path, name: e.name, depth, isDir: e.isDir, expanded: open });
     if (open) {
       if (kids[e.path]) flatten(e.path, depth + 1, kids, expanded, out);
-      else out.push({ key: e.path + '/…', path: '', name: tr('加载中…', 'Loading…'), depth: depth + 1, isDir: false, loading: true });
+      else out.push({ key: e.path + '/…', path: '', name: tx('loading'), depth: depth + 1, isDir: false, loading: true });
     }
   }
   return out;
@@ -697,9 +699,9 @@ export function FilePanel({
   const confirmDiscard = async () =>
     !dirty ||
     (await askConfirm({
-      title: tr(`放弃“${baseName(file!.path)}”的更改？`, `Discard changes to "${baseName(file!.path)}"?`),
-      message: tr('未保存的编辑会被丢弃。', 'Unsaved edits will be discarded.'),
-      okText: tr('放弃更改', 'Discard'),
+      title: tx('discardChangesTo', { v: baseName(file!.path) }),
+      message: tx('unsavedEditsWillBeDiscarded'),
+      okText: tx('discard'),
       danger: true,
     }));
 
@@ -881,9 +883,9 @@ export function FilePanel({
   const closeItems = (t: string) => {
     const i = tabs.indexOf(t);
     return [
-      { label: tr('关闭其他', 'Close others'), disabled: tabs.length < 2, run: () => keepTabs(t, [t]) },
-      { label: tr('关闭左侧', 'Close to the left'), disabled: i <= 0, run: () => keepTabs(t, tabs.slice(i)) },
-      { label: tr('关闭右侧', 'Close to the right'), disabled: i < 0 || i >= tabs.length - 1, run: () => keepTabs(t, tabs.slice(0, i + 1)) },
+      { label: tx('closeOthers'), disabled: tabs.length < 2, run: () => keepTabs(t, [t]) },
+      { label: tx('closeToTheLeft'), disabled: i <= 0, run: () => keepTabs(t, tabs.slice(i)) },
+      { label: tx('closeToTheRight'), disabled: i < 0 || i >= tabs.length - 1, run: () => keepTabs(t, tabs.slice(0, i + 1)) },
     ];
   };
 
@@ -937,7 +939,7 @@ export function FilePanel({
     if (f) {
       setFile(f);
       setSaveState(null);
-      toast(tr(`已读取磁盘上的 ${baseName(f.path)}`, `Reloaded ${baseName(f.path)} from disk`));
+      toast(tx('reloadedFromDisk', { v: baseName(f.path) }));
     }
   };
 
@@ -954,7 +956,7 @@ export function FilePanel({
       });
       setFile((cur) => (cur && cur.path === f.path ? { ...cur, content: f.draft, modified: r.modified, size: r.size } : cur));
       setSaveState(null);
-      toast(tr(`已保存 ${baseName(f.path)}`, `Saved ${baseName(f.path)}`));
+      toast(tx('saved', { v: baseName(f.path) }));
     } catch (e) {
       const msg = String((e as Error)?.message ?? e);
       setSaveError(msg);
@@ -989,7 +991,7 @@ export function FilePanel({
   // ---------- New, rename, delete ----------
 
   const create = async (dir: string, kind: 'file' | 'dir') => {
-    const name = await askText({ title: kind === 'file' ? tr('新建文件', 'New file') : tr('新建文件夹', 'New folder'), label: dir, placeholder: tr('名称', 'Name') });
+    const name = await askText({ title: kind === 'file' ? tx('newFile') : tx('newFolder'), label: dir, placeholder: tx('name') });
     if (!name?.trim()) return;
     const path = join(dir, name.trim());
     try {
@@ -1005,7 +1007,7 @@ export function FilePanel({
 
   const rename = async (path: string) => {
     const old = baseName(path);
-    const name = await askText({ title: tr('重命名', 'Rename'), value: old });
+    const name = await askText({ title: tx('rename'), value: old });
     if (!name?.trim() || name.trim() === old) return;
     const to = join(parentOf(path), name.trim());
     try {
@@ -1031,11 +1033,11 @@ export function FilePanel({
   const remove = async (path: string, isDir: boolean) => {
     const name = baseName(path);
     const ok = await askConfirm({
-      title: isDir ? tr(`删除文件夹 ${name}？`, `Delete folder ${name}?`) : tr(`删除 ${name}？`, `Delete ${name}?`),
+      title: isDir ? tx('deleteFolder', { name }) : tx('delete', { name }),
       message: isDir
-        ? tr(`${path}\n删除后无法恢复（只能删除空文件夹）`, `${path}\nThis cannot be undone (empty folders only)`)
-        : tr(`${path}\n删除后无法恢复`, `${path}\nThis cannot be undone`),
-      okText: tr('删除', 'Delete'),
+        ? tx('thisCannotBeUndoneEmpty', { path })
+        : tx('thisCannotBeUndone', { path }),
+      okText: tx('delete2'),
       danger: true,
     });
     if (!ok) return;
@@ -1050,12 +1052,12 @@ export function FilePanel({
   };
 
   const rel = (p: string) => (root && p.startsWith(root) ? p.slice(root.length).replace(/^[\\/]/, '').replace(/\\/g, '/') || '.' : p);
-  const copy = async (text: string, ok = tr('路径已复制', 'Path copied')) => toast((await writeClipboard(text)) ? ok : tr('无法复制', 'Could not copy'));
+  const copy = async (text: string, ok: string = tx('pathCopied')) => toast((await writeClipboard(text)) ? ok : tx('couldNotCopy'));
   const copyRef = async (path: string, isDir: boolean) => {
     const r = rel(path) + (isDir ? '/' : '');
-    if (!(await writeClipboard(r))) return toast(tr('无法复制', 'Could not copy'));
+    if (!(await writeClipboard(r))) return toast(tx('couldNotCopy'));
     copiedRef = { plain: r, ref: `@${r} ` };
-    toast(standalone ? tr('已复制相对路径', 'Relative path copied') : tr('已复制，在输入框里粘贴就是引用这个文件', 'Copied. Paste in the input to reference this file'));
+    toast(standalone ? tx('relativePathCopied') : tx('copiedPasteInTheInput'));
   };
   // The row last clicked / right-clicked in the tree; Ctrl+C copies it
   const lastRow = useRef<{ path: string; isDir: boolean } | null>(null);
@@ -1063,7 +1065,7 @@ export function FilePanel({
     window.dispatchEvent(new CustomEvent(INSERT_COMPOSER, { detail: { sessionId, text: `@${rel(path)}${isDir ? '/' : ''} ` } }));
     if (window.matchMedia('(max-width: 760px)').matches) {
       onClose();
-      toast(tr('已添加到输入框', 'Added to input'));
+      toast(tx('addedToInput'));
     }
   };
 
@@ -1075,7 +1077,7 @@ export function FilePanel({
       if (isTauri) {
         const { invoke } = await import('@tauri-apps/api/core');
         try {
-          if (await invoke<boolean>('save_file', { name, data: r.base64 })) toast(tr(`已保存 ${name}`, `Saved ${name}`));
+          if (await invoke<boolean>('save_file', { name, data: r.base64 })) toast(tx('saved2', { name }));
           return;
         } catch {
           // No save dialog on mobile, fall back to a browser download
@@ -1093,13 +1095,13 @@ export function FilePanel({
   };
   const openNative = (path: string, reveal: boolean) =>
     rpc(hostId, 'fs.open', { path, reveal }).catch((e) =>
-      errorToast(String((e as Error)?.message ?? e).includes('未知方法') ? tr('守护进程版本太旧，重启守护进程后可用', 'Daemon is too old. Restart it to use this.') : e),
+      errorToast(String((e as Error)?.message ?? e).includes('未知方法') ? tx('daemonIsTooOldRestart') : e),
     );
   const nativeItems = (path: string): MenuItem[] =>
     isLocal
       ? [
-          { label: tr('用系统默认程序打开', 'Open with default app'), icon: 'external', run: () => openNative(path, false) },
-          { label: tr('在文件管理器中显示', 'Show in file manager'), icon: 'folder', run: () => openNative(path, true) },
+          { label: tx('openWithDefaultApp'), icon: 'external', run: () => openNative(path, false) },
+          { label: tx('showInFileManager'), icon: 'folder', run: () => openNative(path, true) },
         ]
       : [];
 
@@ -1116,10 +1118,10 @@ export function FilePanel({
   };
   const compareWith = async (path: string) => {
     if (!file || path === file.path) return;
-    if (file.binary) return toast(tr('当前文件不是文本，不能比较', 'Current file is not text and cannot be compared'));
+    if (file.binary) return toast(tx('currentFileIsNotText'));
     const f = await readFile(path);
     if (!f) return;
-    if (f.binary) return toast(tr(`${baseName(path)} 不是文本文件，不能比较`, `${baseName(path)} is not a text file and cannot be compared`));
+    if (f.binary) return toast(tx('isNotATextFile', { v: baseName(path) }));
     setCompare({ path, text: f.content });
     setShowDiff(false);
   };
@@ -1137,7 +1139,7 @@ export function FilePanel({
     let ok = 0;
     for (const f of files) {
       try {
-        if (f.size > UPLOAD_MAX) throw new Error(tr(`${f.name} 超过 50MB`, `${f.name} exceeds 50MB`));
+        if (f.size > UPLOAD_MAX) throw new Error(tx('exceeds50mb', { name: f.name }));
         const data = toB64(await f.arrayBuffer());
         const path = join(dir, f.name);
         try {
@@ -1145,9 +1147,9 @@ export function FilePanel({
         } catch (e) {
           if (!String((e as Error)?.message ?? e).includes('已经存在')) throw e;
           const yes = await askConfirm({
-            title: tr(`覆盖 ${f.name}？`, `Overwrite ${f.name}?`),
-            message: tr(`${dir} 里已经有同名文件。`, `${dir} already has a file with this name.`),
-            okText: tr('覆盖', 'Overwrite'),
+            title: tx('overwrite', { name: f.name }),
+            message: tx('alreadyHasAFileWith', { dir }),
+            okText: tx('overwrite2'),
             danger: true,
           });
           if (!yes) continue;
@@ -1163,7 +1165,7 @@ export function FilePanel({
     if (dir !== root) setExpanded((x) => new Set(x).add(dir));
     await load(dir);
     loadGit();
-    if (ok) toast(tr(`已上传 ${ok} 个文件到 ${rel(dir)}`, `Uploaded ${ok} files to ${rel(dir)}`));
+    if (ok) toast(tx('uploadedFilesTo', { ok, v: rel(dir) }));
   };
   const treeDrop = {
     onDragOver: (e: React.DragEvent) => {
@@ -1238,31 +1240,31 @@ export function FilePanel({
     const canSide = !r.isDir && !!file && !file.web && !file.commit && file.path !== r.path && wide();
     openMenu(ev, [
       r.isDir
-        ? { label: r.expanded ? tr('收起', 'Collapse') : tr('展开', 'Expand'), icon: 'folder', run: () => toggle(r.path) }
-        : { label: tr('打开', 'Open'), icon: 'file', run: () => openFile(r.path) },
+        ? { label: r.expanded ? tx('collapse') : tx('expand'), icon: 'folder', run: () => toggle(r.path) }
+        : { label: tx('open'), icon: 'file', run: () => openFile(r.path) },
       ...(r.isDir && !r.loading
-        ? [{ label: tr('在文件夹中查找…', 'Find in folder…'), icon: 'search', run: () => (pickView('search'), setGrepInclude({ value: `./${rel(r.path)}`, n: Date.now() })) }]
+        ? [{ label: tx('findInFolder'), icon: 'search', run: () => (pickView('search'), setGrepInclude({ value: `./${rel(r.path)}`, n: Date.now() })) }]
         : []),
-      ...(!r.isDir && isHtml(r.path) ? [{ label: tr('在浏览器标签中打开', 'Open in browser tab'), icon: 'globe', run: () => openWeb(`file:${r.path}`) }] : []),
+      ...(!r.isDir && isHtml(r.path) ? [{ label: tx('openInBrowserTab'), icon: 'globe', run: () => openWeb(`file:${r.path}`) }] : []),
       ...(canSide
         ? [
-            { label: tr('在右侧打开', 'Open to the side'), icon: 'columns', run: () => openSecond(r.path) },
-            { label: tr(`与 ${baseName(file!.path)} 比较`, `Compare with ${baseName(file!.path)}`), icon: 'compare', run: () => compareWith(r.path) },
+            { label: tx('openToTheSide'), icon: 'columns', run: () => openSecond(r.path) },
+            { label: tx('compareWith', { v: baseName(file!.path) }), icon: 'compare', run: () => compareWith(r.path) },
           ]
         : []),
-      ...(standalone ? [] : [{ label: tr('添加到对话', 'Add to chat'), icon: 'chat', run: () => addToChat(r.path, r.isDir) }]),
-      { label: tr('复制', 'Copy'), icon: 'copy', hint: `${navigator.platform.includes('Mac') ? '⌘' : 'Ctrl+'}C`, run: () => copyRef(r.path, r.isDir) },
+      ...(standalone ? [] : [{ label: tx('addToChat'), icon: 'chat', run: () => addToChat(r.path, r.isDir) }]),
+      { label: tx('copy'), icon: 'copy', hint: `${navigator.platform.includes('Mac') ? '⌘' : 'Ctrl+'}C`, run: () => copyRef(r.path, r.isDir) },
       '-',
-      ...(r.isDir ? [] : [{ label: tr('下载', 'Download'), icon: 'download', run: () => download(r.path) }]),
+      ...(r.isDir ? [] : [{ label: tx('download'), icon: 'download', run: () => download(r.path) }]),
       ...nativeItems(r.path),
-      { label: tr('复制路径', 'Copy path'), icon: 'copy', run: () => copy(r.path) },
-      { label: tr('复制相对路径', 'Copy relative path'), run: () => copy(rel(r.path)) },
+      { label: tx('copyPath'), icon: 'copy', run: () => copy(r.path) },
+      { label: tx('copyRelativePath'), run: () => copy(rel(r.path)) },
       '-',
-      { label: tr('新建文件', 'New file'), icon: 'plus', run: () => create(dir, 'file') },
-      { label: tr('新建文件夹', 'New folder'), icon: 'folder', run: () => create(dir, 'dir') },
+      { label: tx('newFile'), icon: 'plus', run: () => create(dir, 'file') },
+      { label: tx('newFolder'), icon: 'folder', run: () => create(dir, 'dir') },
       '-',
-      { label: tr('重命名', 'Rename'), icon: 'edit', run: () => rename(r.path) },
-      { label: tr('删除', 'Delete'), icon: 'trash', danger: true, run: () => remove(r.path, r.isDir) },
+      { label: tx('rename'), icon: 'edit', run: () => rename(r.path) },
+      { label: tx('delete2'), icon: 'trash', danger: true, run: () => remove(r.path, r.isDir) },
     ]);
   };
 
@@ -1270,31 +1272,31 @@ export function FilePanel({
     const r = e.currentTarget.getBoundingClientRect();
     const items: (MenuItem | '-')[] = file
       ? [
-          { label: tr('跳到符号…', 'Go to symbol…'), icon: 'search', hint: `${navigator.platform.includes('Mac') ? '⌘' : 'Ctrl+'}Shift+O`, run: () => setQuick('@') },
-          { label: tr('跳到行…', 'Go to line…'), hint: `${navigator.platform.includes('Mac') ? '⌘' : 'Ctrl+'}G`, run: () => setQuick(':') },
+          { label: tx('goToSymbol'), icon: 'search', hint: `${navigator.platform.includes('Mac') ? '⌘' : 'Ctrl+'}Shift+O`, run: () => setQuick('@') },
+          { label: tx('goToLine'), hint: `${navigator.platform.includes('Mac') ? '⌘' : 'Ctrl+'}G`, run: () => setQuick(':') },
           '-',
-          { label: tr('下载', 'Download'), icon: 'download', disabled: !!file.deleted, run: () => download(file.path) },
+          { label: tx('download'), icon: 'download', disabled: !!file.deleted, run: () => download(file.path) },
           ...nativeItems(file.path),
-          { label: tr('复制路径', 'Copy path'), icon: 'copy', run: () => copy(file.path) },
-          { label: tr('复制相对路径', 'Copy relative path'), run: () => copy(rel(file.path)) },
-          { label: tr('复制文件内容', 'Copy file contents'), icon: 'copy', disabled: !!file.image || file.binary, run: () => copy(file.draft, tr('已复制文件内容', 'File contents copied')) },
+          { label: tx('copyPath'), icon: 'copy', run: () => copy(file.path) },
+          { label: tx('copyRelativePath'), run: () => copy(rel(file.path)) },
+          { label: tx('copyFileContents'), icon: 'copy', disabled: !!file.image || file.binary, run: () => copy(file.draft, tx('fileContentsCopied')) },
           ...(standalone
             ? []
             : [
-                { label: tr('添加到对话', 'Add to chat'), icon: 'chat', run: () => addToChat(file.path, false) },
-                { label: tr('复制（粘贴到输入框即引用）', 'Copy (paste in input to reference)'), run: () => copyRef(file.path, false) },
+                { label: tx('addToChat'), icon: 'chat', run: () => addToChat(file.path, false) },
+                { label: tx('copyPasteInInputTo'), run: () => copyRef(file.path, false) },
               ]),
           '-',
-          { label: wrap ? tr('关闭自动换行', 'Disable word wrap') : tr('启用自动换行', 'Enable word wrap'), icon: 'wrap', run: () => (lsSet('wp-wrap', !wrap), setWrap(!wrap)) },
+          { label: wrap ? tx('disableWordWrap') : tx('enableWordWrap'), icon: 'wrap', run: () => (lsSet('wp-wrap', !wrap), setWrap(!wrap)) },
           dirty
-            ? { label: tr('放弃更改并重新加载', 'Discard and reload'), icon: 'refresh', danger: true, run: async () => (await confirmDiscard()) && reload() }
-            : { label: tr('重新加载', 'Reload'), icon: 'refresh', run: reload },
+            ? { label: tx('discardAndReload'), icon: 'refresh', danger: true, run: async () => (await confirmDiscard()) && reload() }
+            : { label: tx('reload'), icon: 'refresh', run: reload },
           '-',
-          { label: tr('重命名', 'Rename'), icon: 'edit', run: () => rename(file.path) },
+          { label: tx('rename'), icon: 'edit', run: () => rename(file.path) },
         ]
       : [
-          { label: tr('复制目录路径', 'Copy directory path'), icon: 'copy', run: () => copy(root ?? cwd) },
-          { label: hidden ? tr('不显示隐藏文件', 'Hide hidden files') : tr('显示隐藏文件', 'Show hidden files'), icon: 'eye', run: () => (lsSet('wp-hidden', !hidden), setHidden(!hidden)) },
+          { label: tx('copyDirectoryPath'), icon: 'copy', run: () => copy(root ?? cwd) },
+          { label: hidden ? tx('hideHiddenFiles') : tx('showHiddenFiles'), icon: 'eye', run: () => (lsSet('wp-hidden', !hidden), setHidden(!hidden)) },
         ];
     openMenu({ clientX: r.right - 220, clientY: r.bottom + 4 }, items);
   };
@@ -1316,8 +1318,8 @@ export function FilePanel({
   const conflictMenu = (e: React.MouseEvent<HTMLElement>) => {
     const r = e.currentTarget.getBoundingClientRect();
     openMenu({ clientX: r.left, clientY: r.bottom + 4 }, [
-      { label: tr('读取磁盘版本（丢弃当前编辑）', 'Load from disk (discard edits)'), icon: 'refresh', run: reload },
-      { label: tr('用当前内容覆盖磁盘', 'Overwrite disk with current contents'), icon: 'save', danger: true, run: () => save(true) },
+      { label: tx('loadFromDiskDiscardEdits'), icon: 'refresh', run: reload },
+      { label: tx('overwriteDiskWithCurrentContents'), icon: 'save', danger: true, run: () => save(true) },
     ]);
   };
 
@@ -1422,18 +1424,18 @@ export function FilePanel({
   const newMenu = (e: React.MouseEvent<HTMLElement>) => {
     const r = e.currentTarget.getBoundingClientRect();
     openMenu({ clientX: r.right - 160, clientY: r.bottom + 4 }, [
-      { label: tr('新建文件', 'New file'), icon: 'file', run: () => root && create(root, 'file') },
-      { label: tr('新建文件夹', 'New folder'), icon: 'folder', run: () => root && create(root, 'dir') },
+      { label: tx('newFile'), icon: 'file', run: () => root && create(root, 'file') },
+      { label: tx('newFolder'), icon: 'folder', run: () => root && create(root, 'dir') },
       '-',
-      { label: tr('打开网页…', 'Open web page…'), icon: 'globe', run: () => openWeb() },
+      { label: tx('openWebPage'), icon: 'globe', run: () => openWeb() },
     ]);
   };
   const panelBtns = standalone ? null : (
     <>
-      <button className="icon-btn hide-mobile" title={fullscreen ? tr('退出全屏', 'Exit full screen') : tr('全屏', 'Full screen')} onClick={onFullscreen}>
+      <button className="icon-btn hide-mobile" title={fullscreen ? tx('exitFullScreen') : tx('fullScreen')} onClick={onFullscreen}>
         <Icon name={fullscreen ? 'minimize' : 'maximize'} size={14} />
       </button>
-      <button className="icon-btn" title={tr('关闭', 'Close')} onClick={closePanel}>
+      <button className="icon-btn" title={tx('close')} onClick={closePanel}>
         <Icon name="x" size={15} />
       </button>
     </>
@@ -1450,34 +1452,34 @@ export function FilePanel({
   const tree = (
     <div className="wp-side" style={file || emptyPane ? { width: treeW } : undefined}>
       <div className="wp-side-head">
-        <div className="wp-views" role="tablist" aria-label={tr('文件视图', 'File views')}>
-          {viewTab('all', tr('文件', 'Files'))}
+        <div className="wp-views" role="tablist" aria-label={tx('fileViews')}>
+          {viewTab('all', tx('files'))}
           {viewTab(
             'changes',
             <>
-              {tr('改动', 'Changes')}
+              {tx('changes')}
               {changed.length > 0 && <span className="wp-count">{changed.length}</span>}
             </>,
             {
               // Usable while git status is still loading (the commit history below doesn't wait for it)
               disabled: gitReady && !git && touched.size === 0,
               title: git || !gitReady
-                ? tr('工作区里未提交的改动', 'Uncommitted changes in the workspace')
+                ? tx('uncommittedChangesInTheWorkspace')
                 : touched.size
-                  ? tr('这个会话里工具改过的文件', 'Files changed by tools in this session')
-                  : tr('不是 git 仓库，这个会话也还没改过文件', 'Not a git repo, and this session has not changed any files'),
+                  ? tx('filesChangedByToolsIn')
+                  : tx('notAGitRepoAnd'),
             },
           )}
-          {viewTab('search', tr('搜索', 'Search'), { title: tr('在文件内容里搜索', 'Search in file contents') })}
+          {viewTab('search', tx('search'), { title: tx('searchInFileContents') })}
         </div>
         <div className="grow" />
-        <button className="icon-btn" title={tr(`快速打开（${navigator.platform.includes('Mac') ? '⌘' : 'Ctrl+'}P）`, `Quick open (${navigator.platform.includes('Mac') ? '⌘' : 'Ctrl+'}P)`)} onClick={() => setQuick('')}>
+        <button className="icon-btn" title={tx('quickOpenP', { v: navigator.platform.includes('Mac') ? '⌘' : 'Ctrl+' })} onClick={() => setQuick('')}>
           <Icon name="zoom" size={14} />
         </button>
-        <button className="icon-btn" title={tr('新建', 'New')} disabled={!root} onClick={newMenu}>
+        <button className="icon-btn" title={tx('new')} disabled={!root} onClick={newMenu}>
           <Icon name="plus" size={15} />
         </button>
-        <button className="icon-btn" title={tr('刷新', 'Refresh')} onClick={refreshTree}>
+        <button className="icon-btn" title={tx('refresh')} onClick={refreshTree}>
           <Icon name="refresh" size={14} />
         </button>
       </div>
@@ -1512,12 +1514,12 @@ export function FilePanel({
               <input
                 value={filter}
                 onChange={(e) => setFilter(e.target.value)}
-                placeholder={tr('按文件名筛选…', 'Filter by file name…')}
-                aria-label={tr('按文件名筛选', 'Filter by file name')}
+                placeholder={tx('filterByFileName')}
+                aria-label={tx('filterByFileName2')}
                 onKeyDown={(e) => e.key === 'Escape' && setFilter('')}
               />
               {filter && (
-                <button className="icon-btn" title={tr('清除', 'Clear')} onClick={() => setFilter('')}>
+                <button className="icon-btn" title={tx('clear')} onClick={() => setFilter('')}>
                   <Icon name="x" size={12} />
                 </button>
               )}
@@ -1526,7 +1528,7 @@ export function FilePanel({
           <div
             className={`wp-tree ${dropDir === root ? 'drop' : ''} ${histGrow ? 'shrink' : ''}`}
             role="tree"
-            aria-label={tr('文件树', 'File tree')}
+            aria-label={tx('fileTree')}
             tabIndex={0}
             ref={treeBox}
             {...treeDrop}
@@ -1542,27 +1544,27 @@ export function FilePanel({
               root &&
               !q &&
               openMenu(e, [
-                { label: tr('新建文件', 'New file'), icon: 'plus', run: () => create(root, 'file') },
-                { label: tr('新建文件夹', 'New folder'), icon: 'folder', run: () => create(root, 'dir') },
+                { label: tx('newFile'), icon: 'plus', run: () => create(root, 'file') },
+                { label: tx('newFolder'), icon: 'folder', run: () => create(root, 'dir') },
                 '-',
-                { label: hidden ? tr('不显示隐藏文件', 'Hide hidden files') : tr('显示隐藏文件', 'Show hidden files'), icon: 'eye', run: toggleHidden },
-                { label: tr('复制目录路径', 'Copy directory path'), icon: 'copy', run: () => copy(root) },
-                ...(isLocal ? [{ label: tr('在文件管理器中显示', 'Show in file manager'), icon: 'folder', run: () => openNative(root, false) }] : []),
+                { label: hidden ? tx('hideHiddenFiles') : tx('showHiddenFiles'), icon: 'eye', run: toggleHidden },
+                { label: tx('copyDirectoryPath'), icon: 'copy', run: () => copy(root) },
+                ...(isLocal ? [{ label: tx('showInFileManager'), icon: 'folder', run: () => openNative(root, false) }] : []),
               ])
             }
           >
             {view === 'all' && q ? (
               !search || search.q !== q ? (
-                <div className="wp-tip">{tr('正在查找…', 'Searching…')}</div>
+                <div className="wp-tip">{tx('searching')}</div>
               ) : search.error ? (
                 <div className="wp-tip">
-                  <b>{tr('暂时无法查找文件', 'Cannot search files right now')}</b>
-                  {tr('请稍后重试，或清除筛选词继续浏览。', 'Try again later, or clear the filter to keep browsing.')}
+                  <b>{tx('cannotSearchFilesRightNow')}</b>
+                  {tx('tryAgainLaterOrClear')}
                 </div>
               ) : sRows.length === 0 ? (
                 <div className="wp-tip">
-                  <b>{tr('没有匹配的文件', 'No matching files')}</b>
-                  {tr('换个关键词，或切到「搜索」在文件内容里找。', 'Try another term, or switch to Search to look inside files.')}
+                  <b>{tx('noMatchingFiles')}</b>
+                  {tx('tryAnotherTermOrSwitch')}
                 </div>
               ) : (
                 <>
@@ -1576,32 +1578,29 @@ export function FilePanel({
                     onMenu={rowMenu}
                     onDragRow={dragRow}
                   />
-                  {search.truncated && <div className="wp-limit">{tr(`只显示前 ${search.paths.length} 个结果，请缩小范围。`, `Showing the first ${search.paths.length} results. Narrow the search.`)}</div>}
+                  {search.truncated && <div className="wp-limit">{tx('showingTheFirstResultsNarrow', { length: search.paths.length })}</div>}
                 </>
               )
             ) : view === 'changes' && !gitReady ? (
-              <div className="wp-tip">{tr('正在读取改动…', 'Reading changes…')}</div>
+              <div className="wp-tip">{tx('readingChanges')}</div>
             ) : view === 'changes' && (git || touched.size > 0) ? (
               <>
                 {git && touched.size > 0 && (
                   <label className="wp-mine">
                     <input type="checkbox" checked={onlyMine} onChange={(e) => setOnlyMine(e.target.checked)} />
-                    {tr('只看这个会话改的', 'Only this session')}
-                    {mineFilter && otherCount > 0 && <span className="muted">{tr(`（另有 ${otherCount} 个）`, ` (${otherCount} more)`)}</span>}
+                    {tx('onlyThisSession')}
+                    {mineFilter && otherCount > 0 && <span className="muted">{tx('more', { otherCount })}</span>}
                   </label>
                 )}
-                {!git && <div className="wp-limit">{tr('不是 git 仓库：下面是这个会话里工具改过的文件，只能查看。', 'Not a git repo. Files below were changed by tools in this session and are view-only.')}</div>}
+                {!git && <div className="wp-limit">{tx('notAGitRepoFiles')}</div>}
                 {git?.total && (
                   <div className="wp-limit">
-                    {tr(
-                      `改动太多（${git.total} 个），只列出前 ${git.files.size} 个。可以把不需要跟踪的目录写进 .gitignore。`,
-                      `Too many changes (${git.total}); showing the first ${git.files.size}. Add folders you don't track to .gitignore.`,
-                    )}
+                    {tx('tooManyChangesShowingThe', { total: git.total, size: git.files.size })}
                   </div>
                 )}
                 {totals && changed.length > 0 && (
                   <div className="wp-totals">
-                    {tr(`${changed.length} 个文件`, `${changed.length} files`)}
+                    {tx('files2', { length: changed.length })}
                     <LineStat a={totals.a} d={totals.d} />
                   </div>
                 )}
@@ -1619,10 +1618,10 @@ export function FilePanel({
                   />
                 ) : (
                   <div className="wp-tip">
-                    <b>{tr('没有改动', 'No changes')}</b>
+                    <b>{tx('noChanges')}</b>
                     {otherCount > 0
-                      ? tr('这个会话改的文件都已经提交或撤销了。', 'Files changed in this session are already committed or reverted.')
-                      : tr('工作区和上次提交一致。', 'Working tree matches the last commit.')}
+                      ? tx('filesChangedInThisSession')
+                      : tx('workingTreeMatchesTheLast')}
                   </div>
                 )}
               </>
@@ -1641,10 +1640,10 @@ export function FilePanel({
                   onDropOver={(d) => dropDir !== d && setDropDir(d)}
                 />
               ) : (
-                <div className="wp-tip">{tr('这个目录为空。', 'This folder is empty.')}</div>
+                <div className="wp-tip">{tx('thisFolderIsEmpty')}</div>
               )
             ) : (
-              <div className="wp-tip">{tr('正在加载…', 'Loading…')}</div>
+              <div className="wp-tip">{tx('loading2')}</div>
             )}
           </div>
           {/* Independent of git status: shows right away and loads on its own; hidden only once status says this isn't a repo */}
@@ -1655,11 +1654,11 @@ export function FilePanel({
             <div className="wp-dropbar">
               {uploading > 0 ? (
                 <>
-                  <span className="spinner" /> {tr(`正在上传 ${uploading} 个文件…`, `Uploading ${uploading} files…`)}
+                  <span className="spinner" /> {tx('uploadingFiles', { uploading })}
                 </>
               ) : (
                 <>
-                  <Icon name="upload" size={13} /> {tr(`松开上传到 ${rel(dropDir!)}`, `Drop to upload to ${rel(dropDir!)}`)}
+                  <Icon name="upload" size={13} /> {tx('dropToUploadTo', { v: rel(dropDir!) })}
                 </>
               )}
             </div>
@@ -1692,8 +1691,8 @@ export function FilePanel({
       </div>
     ) : (
       <div className="wp-empty">
-        <div className="wp-empty-title">{tr('没有可显示的改动', 'No changes to show')}</div>
-        <div className="muted small">{tr('文件太大、是二进制文件，或只改了权限。', 'File is too large, binary, or only its mode changed.')}</div>
+        <div className="wp-empty-title">{tx('noChangesToShow')}</div>
+        <div className="muted small">{tx('fileIsTooLargeBinary')}</div>
       </div>
     )
   ) : file.web ? (
@@ -1712,20 +1711,20 @@ export function FilePanel({
     ) : diffPending ? (
       <div className="wp-empty">
         <div className="muted small">
-          <span className="spinner" /> {tr('正在读取改动…', 'Reading changes…')}
+          <span className="spinner" /> {tx('readingChanges')}
         </div>
       </div>
     ) : fileSessionDiffs.length ? (
       <div className="wp-diff">
-        <div className="wp-limit">{tr(`不是 git 仓库：下面是这个会话里工具对这个文件做的 ${fileSessionDiffs.length} 次修改，每次只显示改动的那一段。`, `Not a git repo. Below are ${fileSessionDiffs.length} edits tools made to this file in this session; each shows only the changed part.`)}</div>
+        <div className="wp-limit">{tx('notAGitRepoBelow', { length: fileSessionDiffs.length })}</div>
         {fileSessionDiffs.map((d, i) => (
           <PaneDiff key={i} diff={{ ...d, path: rel(file.path) }} layout={layout} />
         ))}
       </div>
     ) : (
       <div className="wp-empty">
-        <div className="wp-empty-title">{tr('没有可显示的改动', 'No changes to show')}</div>
-        <div className="muted small">{tr('文件太大或是二进制文件。', 'File is too large or binary.')}</div>
+        <div className="wp-empty-title">{tx('noChangesToShow')}</div>
+        <div className="muted small">{tx('fileIsTooLargeOr')}</div>
       </div>
     )
   ) : file.image ? (
@@ -1734,15 +1733,15 @@ export function FilePanel({
     <PdfView base64={file.pdf} onDownload={() => download(file.path)} />
   ) : file.binary ? (
     <div className="wp-empty">
-      <div className="wp-empty-title">{tr('无法预览这种文件', 'Cannot preview this file')}</div>
-      <div className="muted small">{tr(`暂不支持这种文件的格式、编码或大小（${fmtSize(file.size)}）。`, `Format, encoding, or size (${fmtSize(file.size)}) is not supported.`)}</div>
+      <div className="wp-empty-title">{tx('cannotPreviewThisFile')}</div>
+      <div className="muted small">{tx('formatEncodingOrSizeIs', { v: fmtSize(file.size) })}</div>
       <div className="row wp-empty-acts">
         <button className="btn small" onClick={() => download(file.path)}>
-          <Icon name="download" size={13} /> {tr('下载', 'Download')}
+          <Icon name="download" size={13} /> {tx('download')}
         </button>
         {isLocal && (
           <button className="btn small" onClick={() => openNative(file.path, false)}>
-            {tr('用系统程序打开', 'Open with system app')}
+            {tx('openWithSystemApp')}
           </button>
         )}
       </div>
@@ -1784,21 +1783,21 @@ export function FilePanel({
         <span className="truncate" title={second.path}>
           {rel(second.path)}
         </span>
-        <span className="muted small">{tr('只读', 'Read-only')}</span>
+        <span className="muted small">{tx('readOnly')}</span>
         <div className="grow" />
-        <button className="icon-btn" title={tr(`与 ${baseName(file.path)} 比较`, `Compare with ${baseName(file.path)}`)} onClick={() => setCompare({ path: second.path, text: second.content })}>
+        <button className="icon-btn" title={tx('compareWith', { v: baseName(file.path) })} onClick={() => setCompare({ path: second.path, text: second.content })}>
           <Icon name="compare" size={13} />
         </button>
-        <button className="icon-btn" title={tr('在左边编辑', 'Edit on the left')} onClick={() => (setSecond(null), openFile(second.path))}>
+        <button className="icon-btn" title={tx('editOnTheLeft')} onClick={() => (setSecond(null), openFile(second.path))}>
           <Icon name="back" size={13} />
         </button>
-        <button className="icon-btn" title={tr('关闭', 'Close')} onClick={() => setSecond(null)}>
+        <button className="icon-btn" title={tx('close')} onClick={() => setSecond(null)}>
           <Icon name="x" size={13} />
         </button>
       </div>
       {second.binary ? (
         <div className="wp-empty">
-          <div className="wp-empty-title">{tr('不是文本文件', 'Not a text file')}</div>
+          <div className="wp-empty-title">{tx('notATextFile')}</div>
         </div>
       ) : (
         <CodeEditor
@@ -1826,12 +1825,12 @@ export function FilePanel({
             {baseName(root ?? cwd) || root || cwd}
           </span>
           {git?.branch && (
-            <span className="wp-branch truncate" title={tr(`git 分支 ${git.branch}`, `git branch ${git.branch}`)}>
+            <span className="wp-branch truncate" title={tx('gitBranch', { branch: git.branch })}>
               {git.branch}
             </span>
           )}
           <div className="grow" />
-          <button className="icon-btn" title={tr('打开网页（新的浏览器标签）', 'Open web page (new browser tab)')} onClick={() => openWeb()}>
+          <button className="icon-btn" title={tx('openWebPageNewBrowser')} onClick={() => openWeb()}>
             <Icon name="globe" size={14} />
           </button>
           {panelBtns}
@@ -1841,7 +1840,7 @@ export function FilePanel({
           <div
             className="wp-filetabs"
             role="tablist"
-            aria-label={tr('打开的文件', 'Open files')}
+            aria-label={tx('openFiles')}
             ref={tabsRef}
             onScroll={measureTabs}
             // Like VS Code: vertical wheel scrolling scrolls the tabs horizontally
@@ -1859,15 +1858,15 @@ export function FilePanel({
                     role="tab"
                     aria-selected={cur}
                     className={`wp-ftab ${cur ? 'active' : ''}`}
-                    title={`${ct.rel}\n${tr('提交', 'Commit')} ${ct.hash.slice(0, 10)}${cur && file.commit ? ` · ${file.commit.subject}` : ''}`}
+                    title={`${ct.rel}\n${tx('commit')} ${ct.hash.slice(0, 10)}${cur && file.commit ? ` · ${file.commit.subject}` : ''}`}
                     onClick={() => openFile(t)}
                     onAuxClick={(e) => e.button === 1 && closeTab(t)}
                     onContextMenu={(e) =>
                       openMenu(e, [
-                        { label: tr('关闭', 'Close'), icon: 'x', run: () => closeTab(t) },
+                        { label: tx('close'), icon: 'x', run: () => closeTab(t) },
                         ...closeItems(t),
                         '-',
-                        { label: tr('复制提交号', 'Copy commit hash'), icon: 'copy', run: () => copy(ct.hash, tr('提交号已复制', 'Commit hash copied')) },
+                        { label: tx('copyCommitHash'), icon: 'copy', run: () => copy(ct.hash, tx('commitHashCopied')) },
                       ])
                     }
                   >
@@ -1876,7 +1875,7 @@ export function FilePanel({
                     <span className="wp-ftab-hash">{ct.hash.slice(0, 7)}</span>
                     <button
                       className="wp-ftab-x"
-                      title={tr('关闭', 'Close')}
+                      title={tx('close')}
                       onClick={(e) => {
                         e.stopPropagation();
                         closeTab(t);
@@ -1893,12 +1892,12 @@ export function FilePanel({
                     role="tab"
                     aria-selected={cur}
                     className={`wp-ftab ${cur ? 'active' : ''}`}
-                    title={t.slice(WEB_PREFIX.length) || tr('新标签', 'New tab')}
+                    title={t.slice(WEB_PREFIX.length) || tx('newTab')}
                     onClick={() => openFile(t)}
                     onAuxClick={(e) => e.button === 1 && closeTab(t)}
                     onContextMenu={(e) =>
                       openMenu(e, [
-                        { label: tr('关闭', 'Close'), icon: 'x', run: () => closeTab(t) },
+                        { label: tx('close'), icon: 'x', run: () => closeTab(t) },
                         ...closeItems(t),
                       ])
                     }
@@ -1907,7 +1906,7 @@ export function FilePanel({
                     <span className="truncate">{webTabTitle(t)}</span>
                     <button
                       className="wp-ftab-x"
-                      title={tr('关闭', 'Close')}
+                      title={tx('close')}
                       onClick={(e) => {
                         e.stopPropagation();
                         closeTab(t);
@@ -1937,17 +1936,17 @@ export function FilePanel({
                     openMenu(e, [
                       ...(!cur && wide()
                         ? [
-                            { label: tr('在右侧打开', 'Open to the side'), icon: 'columns', run: () => openSecond(t) },
-                            { label: tr(`与 ${baseName(file.path)} 比较`, `Compare with ${baseName(file.path)}`), icon: 'compare', run: () => compareWith(t) },
+                            { label: tx('openToTheSide'), icon: 'columns', run: () => openSecond(t) },
+                            { label: tx('compareWith', { v: baseName(file.path) }), icon: 'compare', run: () => compareWith(t) },
                             '-' as const,
                           ]
                         : []),
-                      { label: tr('关闭', 'Close'), icon: 'x', run: () => closeTab(t) },
+                      { label: tx('close'), icon: 'x', run: () => closeTab(t) },
                       ...closeItems(t),
                       '-',
-                      { label: tr('下载', 'Download'), icon: 'download', run: () => download(t) },
-                      { label: tr('复制（粘贴到输入框即引用）', 'Copy (paste in input to reference)'), icon: 'copy', run: () => copyRef(t, false) },
-                      { label: tr('复制相对路径', 'Copy relative path'), run: () => copy(rel(t)) },
+                      { label: tx('download'), icon: 'download', run: () => download(t) },
+                      { label: tx('copyPasteInInputTo'), icon: 'copy', run: () => copyRef(t, false) },
+                      { label: tx('copyRelativePath'), run: () => copy(rel(t)) },
                     ])
                   }
                 >
@@ -1955,7 +1954,7 @@ export function FilePanel({
                   <span className="truncate">{baseName(t)}</span>
                   <button
                     className={`wp-ftab-x ${cur && dirty ? 'dirty' : ''}`}
-                    title={tr('关闭', 'Close')}
+                    title={tx('close')}
                     onClick={(e) => {
                       e.stopPropagation();
                       closeTab(t);
@@ -1968,16 +1967,16 @@ export function FilePanel({
             })}
           </div>
           {tabsOverflow && (
-            <button className="icon-btn wp-tabs-more" title={tr(`全部打开的文件（${tabs.length}）`, `All open files (${tabs.length})`)} onClick={tabsMenu}>
+            <button className="icon-btn wp-tabs-more" title={tx('allOpenFiles', { length: tabs.length })} onClick={tabsMenu}>
               <Icon name="down" size={14} />
             </button>
           )}
-          <button className="icon-btn" title={tr('打开网页（新的浏览器标签）', 'Open web page (new browser tab)')} onClick={() => openWeb()}>
+          <button className="icon-btn" title={tx('openWebPageNewBrowser')} onClick={() => openWeb()}>
             <Icon name="globe" size={14} />
           </button>
           <button
             className={`icon-btn ${treeOpen ? 'active' : ''}`}
-            title={treeOpen ? tr('收起文件树', 'Hide file tree') : tr('显示文件树', 'Show file tree')}
+            title={treeOpen ? tx('hideFileTree') : tx('showFileTree')}
             onClick={() => (lsSet('wp-tree', !treeOpen), setTreeOpen(!treeOpen))}
           >
             <Icon name="fileTree" size={14} />
@@ -1991,7 +1990,7 @@ export function FilePanel({
           <button
             className="wp-commit-title truncate"
             aria-expanded={commitInfo}
-            title={tr('查看提交详情', 'Show commit details')}
+            title={tx('showCommitDetails')}
             onClick={() => setCommitInfo(!commitInfo)}
           >
             <span className="pd-tag">{file.commit.hash.slice(0, 7)}</span>
@@ -2002,16 +2001,16 @@ export function FilePanel({
             </span>
           </button>
           <div className="wp-actions">
-            <span className="hide-mobile">{tr('只读', 'Read-only')}</span>
+            <span className="hide-mobile">{tx('readOnly')}</span>
             {wide() && (
-              <button className="icon-btn" title={layout === 'split' ? tr('改成上下对照', 'Switch to stacked') : tr('改成左右并排', 'Switch to side by side')} onClick={flipLayout}>
+              <button className="icon-btn" title={layout === 'split' ? tx('switchToStacked') : tx('switchToSideBySide')} onClick={flipLayout}>
                 <Icon name={layout === 'split' ? 'rows' : 'columns'} size={14} />
               </button>
             )}
             {git && !gitMark(file.commit.status)[0].includes('D') && (
               <button
                 className="icon-btn"
-                title={tr('打开工作区里的这个文件', 'Open this file in the workspace')}
+                title={tx('openThisFileInThe')}
                 onClick={() => openFile(join(git.repo, file.commit!.rel.split('/').join(sepOf(git.repo))))}
               >
                 <Icon name="file" size={14} />
@@ -2031,7 +2030,7 @@ export function FilePanel({
             <div className="wp-compare-title truncate" title={`${file.path}\n${compare.path}`}>
               <span className="pd-tag del">{baseName(file.path)}</span>
               <Icon name="forward" size={12} />
-              <span className="pd-tag add">{compare.replace ? tr('替换后', 'After replace') : rel(compare.path)}</span>
+              <span className="pd-tag add">{compare.replace ? tx('afterReplace') : rel(compare.path)}</span>
             </div>
           ) : (
             <Breadcrumbs hostId={hostId} root={root ?? cwd} path={file.path} hidden={hidden} onOpen={openFile} dirty={dirty} />
@@ -2042,77 +2041,77 @@ export function FilePanel({
                 {saveStateText(state)}
               </span>
             )}
-            {file.truncated && <span>{tr('只读 · 前 1MB', 'Read-only · first 1MB')}</span>}
+            {file.truncated && <span>{tx('readOnlyFirst1mb')}</span>}
             {!file.truncated && file.notUtf8 && (
-              <span title={tr('按 UTF-8 显示会有乱码，保存会损坏原文件，所以只能查看', 'Shown as UTF-8 with replacement characters; saving would corrupt the file, so it is view-only')}>
-                {tr('只读 · 不是 UTF-8 编码', 'Read-only · not UTF-8')}
+              <span title={tx('shownAsUtf8With')}>
+                {tx('readOnlyNotUtf8')}
               </span>
             )}
             {dirty &&
               (saveState === 'conflict' ? (
                 <button className="btn small primary" onClick={conflictMenu}>
-                  {tr('解决冲突', 'Resolve conflict')}
+                  {tx('resolveConflict')}
                 </button>
               ) : (
-                <button className="btn small primary" disabled={saveState === 'saving'} onClick={() => save()} title={tr('保存（Ctrl+S）', 'Save (Ctrl+S)')}>
-                  <Icon name="save" size={13} /> {tr('保存', 'Save')}
+                <button className="btn small primary" disabled={saveState === 'saving'} onClick={() => save()} title={tx('saveCtrlS')}>
+                  <Icon name="save" size={13} /> {tx('save')}
                 </button>
               ))}
             {compare && (
               <button className="btn small" onClick={() => setCompare(null)}>
-                {tr('结束比较', 'End compare')}
+                {tx('endCompare')}
               </button>
             )}
             {hasChange(file.path) && !file.deleted && !compare && (
               <div className="seg wp-seg">
                 <button className={!showDiff ? 'active' : ''} onClick={() => setShowDiff(false)}>
-                  {tr('文件', 'File')}
+                  {tx('file')}
                 </button>
-                <button className={showDiff ? 'active' : ''} onClick={() => setShowDiff(true)} title={tr('和上次提交相比改了什么', 'Changes since the last commit')}>
-                  {tr('改动', 'Changes')}
+                <button className={showDiff ? 'active' : ''} onClick={() => setShowDiff(true)} title={tx('changesSinceTheLastCommit')}>
+                  {tx('changes')}
                 </button>
               </div>
             )}
             {viewing !== 'file' && wide() && (
-              <button className="icon-btn" title={layout === 'split' ? tr('改成上下对照', 'Switch to stacked') : tr('改成左右并排', 'Switch to side by side')} onClick={flipLayout}>
+              <button className="icon-btn" title={layout === 'split' ? tx('switchToStacked') : tx('switchToSideBySide')} onClick={flipLayout}>
                 <Icon name={layout === 'split' ? 'rows' : 'columns'} size={14} />
               </button>
             )}
             {(csv || html) && viewing === 'file' && (
               <div className="seg wp-seg">
                 <button className={!preview ? 'active' : ''} onClick={() => setPreview(false)}>
-                  {tr('源码', 'Source')}
+                  {tx('source')}
                 </button>
                 <button
                   className={preview ? 'active' : ''}
                   onClick={() => setPreview(true)}
-                  title={html ? tr('按保存在磁盘上的内容显示，保存后自动刷新', 'Shows the saved file. Refreshes after save.') : undefined}
+                  title={html ? tx('showsTheSavedFileRefreshes') : undefined}
                 >
-                  {csv ? tr('表格', 'Table') : tr('预览', 'Preview')}
+                  {csv ? tx('table') : tx('preview')}
                 </button>
               </div>
             )}
             {md && viewing === 'file' && (
               <div className="seg wp-seg">
                 <button className={!preview && !(mdSplit && wide()) ? 'active' : ''} onClick={() => pickMdMode('source')}>
-                  {tr('源码', 'Source')}
+                  {tx('source')}
                 </button>
                 {wide() && (
-                  <button className={!preview && mdSplit ? 'active' : ''} onClick={() => pickMdMode('split')} title={tr('左边编辑，右边实时预览', 'Edit on the left, live preview on the right')}>
-                    {tr('分栏', 'Split')}
+                  <button className={!preview && mdSplit ? 'active' : ''} onClick={() => pickMdMode('split')} title={tx('editOnTheLeftLive')}>
+                    {tx('split')}
                   </button>
                 )}
                 <button className={preview ? 'active' : ''} onClick={() => pickMdMode('preview')}>
-                  {tr('预览', 'Preview')}
+                  {tx('preview')}
                 </button>
               </div>
             )}
             {viewing === 'file' && !file.binary && (!preview || md) && (
-              <button className="icon-btn" title={tr(`大纲：跳到函数、类、标题（${navigator.platform.includes('Mac') ? '⌘' : 'Ctrl+'}Shift+O）`, `Outline: go to a function, class, or heading (${navigator.platform.includes('Mac') ? '⌘' : 'Ctrl+'}Shift+O)`)} onClick={() => setQuick('@')}>
+              <button className="icon-btn" title={tx('outlineGoToAFunction', { v: navigator.platform.includes('Mac') ? '⌘' : 'Ctrl+' })} onClick={() => setQuick('@')}>
                 <Icon name="outline" size={14} />
               </button>
             )}
-            <button className="icon-btn" title={tr('更多文件操作', 'More file actions')} onClick={fileMenu}>
+            <button className="icon-btn" title={tx('moreFileActions')} onClick={fileMenu}>
               <Icon name="more" size={16} />
             </button>
           </div>
@@ -2137,11 +2136,11 @@ export function FilePanel({
             <Icon name="file" size={28} />
             <div>
               {view === 'changes'
-                ? tr('在右侧选一个改动的文件或提交查看差异', 'Pick a changed file or a commit on the right to see the diff')
-                : tr('在右侧文件树里选一个文件打开', 'Pick a file in the tree on the right')}
+                ? tx('pickAChangedFileOr')
+                : tx('pickAFileInThe')}
             </div>
             <div className="muted small">
-              {tr(`${navigator.platform.includes('Mac') ? '⌘' : 'Ctrl+'}P 按文件名快速打开`, `${navigator.platform.includes('Mac') ? '⌘' : 'Ctrl+'}P to open a file by name`)}
+              {tx('pToOpenAFile', { v: navigator.platform.includes('Mac') ? '⌘' : 'Ctrl+' })}
             </div>
           </div>
         )}
@@ -2211,7 +2210,7 @@ function Breadcrumbs({
   };
 
   return (
-    <div className="wp-crumbs" ref={box} title={path} aria-label={tr('文件路径', 'File path')}>
+    <div className="wp-crumbs" ref={box} title={path} aria-label={tx('filePath')}>
       {inRoot && (
         <button className="wp-crumb" onClick={(e) => openPop(e, root)}>
           {rootLabel}
@@ -2229,7 +2228,7 @@ function Breadcrumbs({
             {last ? (
               <span className="wp-crumb cur">
                 {s}
-                {dirty && <span className="wp-dot" title={tr('有未保存的修改', 'Unsaved changes')}>•</span>}
+                {dirty && <span className="wp-dot" title={tx('unsavedChanges')}>•</span>}
               </span>
             ) : (
               <button className="wp-crumb" onClick={(e) => (inRoot ? openPop(e, dirAt(i)) : undefined)}>
@@ -2302,11 +2301,11 @@ function DirPopover({
   }, [onClose]);
   const rows = flatten(dir, 0, kids, expanded);
   return (
-    <div className="wp-pop" ref={box} style={{ left: x, top: y }} role="tree" aria-label={tr('目录内容', 'Folder contents')}>
+    <div className="wp-pop" ref={box} style={{ left: x, top: y }} role="tree" aria-label={tx('folderContents')}>
       {!kids[dir] ? (
-        <div className="wp-tip">{tr('正在加载文件…', 'Loading files…')}</div>
+        <div className="wp-tip">{tx('loadingFiles')}</div>
       ) : rows.length === 0 ? (
-        <div className="wp-tip">{tr('这个目录为空。', 'This folder is empty.')}</div>
+        <div className="wp-tip">{tx('thisFolderIsEmpty')}</div>
       ) : (
         <Rows
           rows={rows}

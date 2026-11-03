@@ -1,0 +1,20 @@
+{
+  "downloadingUpdate": "Downloading update {{p}}%",
+  "downloadingUpdate2": "Downloading update {{v}}",
+  "confirmTheInstallInThe": "Confirm the install in the system installer",
+  "installingTheAppWillRestart": "Installing, the app will restart when done",
+  "allowYiConsoleToInstall": "Allow Yi Console to install apps; installing continues when you come back",
+  "yiConsoleIsAvailable": "Yi Console {{version}} is available",
+  "download": "Download",
+  "updateNow": "Update Now",
+  "later": "Later",
+  "installAgain": "Install Again",
+  "close": "Close",
+  "checkingForUpdates": "Checking for updates…",
+  "youAreUpToDate": "You are up to date ({{current}})",
+  "newVersionAvailable": "New version {{version}} available",
+  "currentVersion": "Current version {{current}}",
+  "checkForUpdatesAutomatically": "Check for updates automatically",
+  "atStartupAndEvery6": "At startup and every 6 hours; a new version is announced in the corner.",
+  "checkForUpdates": "Check for Updates"
+}

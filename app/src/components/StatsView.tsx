@@ -1,10 +1,12 @@
 import { useEffect, useMemo, useState } from 'react';
-import { isEn, tr } from '../i18n';
+import { getT, isEn } from '../i18n';
 import { useStore } from '../store';
 import { rpc } from '../transport';
 import { TOOL_LABEL, type Quota, type ToolKind, type Usage } from '../types';
 import { fmtTokens } from '../util';
 import { ToolBadge } from './Icon';
+
+const tx = getT('statsView');
 
 interface Stats {
   daily: { day: string; tool: string; usage: Usage }[];
@@ -17,7 +19,7 @@ interface Stats {
 
 export const errText = (e: unknown) => {
   const m = String((e as Error)?.message ?? e);
-  return m.includes('未知方法') ? tr('这台主机的守护进程版本太旧，到「主机管理」里重启守护进程后可用', 'This host’s daemon is too old. Restart it from Hosts.') : m;
+  return m.includes('未知方法') ? tx('thisHostSDaemonIs') : m;
 };
 
 const TOOL_VAR: Record<string, string> = {
@@ -37,7 +39,7 @@ const fmtReset = (v: number | string | null | undefined) => {
   const d = new Date(v);
   if (isNaN(d.getTime())) return '';
   const ms = d.getTime() - Date.now();
-  if (ms <= 0) return tr('即将重置', 'Resets soon');
+  if (ms <= 0) return tx('resetsSoon');
   const h = Math.floor(ms / 3600000);
   const mins = Math.ceil((ms % 3600000) / 60000);
   if (h < 24) return isEn() ? `resets in ${h > 0 ? `${h}h ` : ''}${mins}m` : `${h > 0 ? `${h} 小时` : ''}${mins} 分钟后重置`;
@@ -49,8 +51,8 @@ const fmtReset = (v: number | string | null | undefined) => {
 export function QuotaBody({ q }: { q: Quota | string | undefined }) {
   return (
     <>
-      {q === undefined && <div className="muted small">{tr('读取中…', 'Loading…')}</div>}
-      {typeof q === 'string' && <div className="muted small">{tr('读取失败：', 'Failed: ')}{q}</div>}
+      {q === undefined && <div className="muted small">{tx('loading')}</div>}
+      {typeof q === 'string' && <div className="muted small">{tx('failed')}{q}</div>}
       {typeof q === 'object' && (
         <>
           {q.windows.map((w) => (
@@ -59,7 +61,7 @@ export function QuotaBody({ q }: { q: Quota | string | undefined }) {
                 <span>{w.label}</span>
                 <span className="grow" />
                 <span className="muted">
-                  {w.detail ?? (w.usedPercent != null ? tr(`已用 ${Math.round(w.usedPercent)}%`, `${Math.round(w.usedPercent)}% used`) : '')}
+                  {w.detail ?? (w.usedPercent != null ? tx('used', { v: Math.round(w.usedPercent) }) : '')}
                   {fmtReset(w.resetsAt) && ` · ${fmtReset(w.resetsAt)}`}
                 </span>
               </div>
@@ -104,10 +106,10 @@ function QuotaCard({ hostId }: { hostId: string }) {
   return (
     <div className="card">
       <div className="card-title row">
-        <span>{tr('账号额度', 'Account quota')}</span>
+        <span>{tx('accountQuota')}</span>
         <span className="grow" />
         <button className="btn small" onClick={() => load(true)}>
-          {tr('刷新', 'Refresh')}
+          {tx('refresh')}
         </button>
       </div>
       <div className="quota-list">
@@ -179,12 +181,12 @@ export function StatsView({ hostId }: { hostId: string }) {
   return (
     <div className="page">
       <div className="page-head">
-        <h2>{tr('用量统计', 'Usage')}</h2>
+        <h2>{tx('usage')}</h2>
         <div className="row">
           <div className="seg">
             {[7, 30, 90].map((d) => (
               <button key={d} className={days === d ? 'active' : ''} onClick={() => setDays(d)}>
-                {tr(`${d} 天`, `${d}d`)}
+                {tx('d', { d })}
               </button>
             ))}
           </div>
@@ -193,10 +195,10 @@ export function StatsView({ hostId }: { hostId: string }) {
               Tokens
             </button>
             <button className={metric === 'credits' ? 'active' : ''} onClick={() => setMetric('credits')}>
-              {tr('积分', 'Credits')}
+              {tx('credits')}
             </button>
             <button className={metric === 'cost' ? 'active' : ''} onClick={() => setMetric('cost')}>
-              {tr('费用', 'Cost')}
+              {tx('cost')}
             </button>
           </div>
         </div>
@@ -204,22 +206,16 @@ export function StatsView({ hostId }: { hostId: string }) {
       <QuotaCard hostId={hostId} />
       <p className="muted small">
         {data?.fromLogs
-          ? tr(
-              'Claude Code、Codex、Qoder、CodeBuddy 的用量读自这台主机上工具自己的日志，终端里直接用的也算在内；Kiro 只统计 Yi Console 里的会话。Qoder、Kiro 按积分（credits）计，CodeBuddy 同时记录 token 与积分，费用只有 Claude Code 在 Yi Console 会话里会上报。',
-              'Claude Code, Codex, Qoder, and CodeBuddy usage is read from each tool’s own logs on this host, including use outside Yi Console. Kiro only counts Yi Console sessions. Qoder and Kiro use credits; CodeBuddy records both tokens and credits. Only Claude Code reports cost for Yi Console sessions.',
-            )
-          : tr(
-              '只统计通过 Yi Console 结构化模式运行的会话。Claude Code 会上报费用；Codex 只有 token；Kiro 按 credit 计。',
-              'Only structured Yi Console sessions are counted. Claude Code reports cost; Codex reports tokens; Kiro uses credits.',
-            )}
+          ? tx('claudeCodeCodexQoderAnd')
+          : tx('onlyStructuredYiConsoleSessions')}
       </p>
       {data && !data.fromLogs && (
-        <div className="muted small">{tr('这台主机的守护进程版本较旧，没有统计终端里直接使用的部分，到「主机管理」里重启守护进程后会更完整。', 'This host’s daemon is old and does not count terminal use. Restart it from Hosts for a fuller picture.')}</div>
+        <div className="muted small">{tx('thisHostSDaemonIs2')}</div>
       )}
       <div className="stat-tiles">
-        {loading && !data && <div className="muted">{tr('统计中…（第一次要读一遍工具日志，可能要几秒）', 'Calculating… (the first read of tool logs can take a few seconds)')}</div>}
-        {error && <div className="muted">{tr('读取失败：', 'Failed: ')}{error}</div>}
-        {!loading && !error && tools.length === 0 && <div className="muted">{tr('这段时间还没有用量记录', 'No usage in this range')}</div>}
+        {loading && !data && <div className="muted">{tx('calculatingTheFirstReadOf')}</div>}
+        {error && <div className="muted">{tx('failed')}{error}</div>}
+        {!loading && !error && tools.length === 0 && <div className="muted">{tx('noUsageInThisRange')}</div>}
         {tools.map((t) => {
           const u = data!.totals[t];
           const tok = tokensOf(u);
@@ -232,15 +228,15 @@ export function StatsView({ hostId }: { hostId: string }) {
                 <>
                   <div className="tile-num">{fmtTokens(tok)}</div>
                   <div className="muted small">
-                    {tr('输入', 'In')} {fmtTokens(u.inputTokens)} · {tr('输出', 'Out')} {fmtTokens(u.outputTokens)} · {tr('缓存', 'Cache')} {fmtTokens(u.cacheReadTokens)}
+                    {tx('in')} {fmtTokens(u.inputTokens)} · {tx('out')} {fmtTokens(u.outputTokens)} · {tx('cache')} {fmtTokens(u.cacheReadTokens)}
                   </div>
-                  {u.costUsd > 0 && <div className="small">{tr('费用', 'Cost')} ${u.costUsd.toFixed(2)}</div>}
+                  {u.costUsd > 0 && <div className="small">{tx('cost')} ${u.costUsd.toFixed(2)}</div>}
                   {u.credits > 0 && <div className="small">{u.credits.toFixed(2)} credits</div>}
                 </>
               ) : (
                 <>
                   <div className="tile-num">{u.credits.toFixed(2)} credits</div>
-                  <div className="muted small">{tr('按积分计费（未上报 token）', 'Billed in credits (no tokens reported)')}</div>
+                  <div className="muted small">{tx('billedInCreditsNoTokens')}</div>
                 </>
               )}
               {Object.entries(data!.models?.[t] ?? {})
@@ -257,7 +253,7 @@ export function StatsView({ hostId }: { hostId: string }) {
       </div>
       {tools.length > 0 && (
         <div className="card chart-card">
-          <svg viewBox={`0 0 ${W} ${H + 22}`} className="chart" role="img" aria-label={tr('每日用量', 'Daily usage')}>
+          <svg viewBox={`0 0 ${W} ${H + 22}`} className="chart" role="img" aria-label={tx('dailyUsage')}>
             {[0.25, 0.5, 0.75, 1].map((f) => (
               <line key={f} x1={0} x2={W} y1={H - H * f} y2={H - H * f} className="grid" />
             ))}

@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useBack } from '../back';
-import { isEn, tr } from '../i18n';
+import { getT, isEn } from '../i18n';
 import { errorToast, hostStatus, loadOlder, loadSession, navigate, setState, skey, toast, useSessionData, useStore } from '../store';
 import { rpc } from '../transport';
 import { TOOL_LABEL, type QuestionAnswer } from '../types';
@@ -18,6 +18,8 @@ import { TermTools, TerminalView } from './TerminalView';
 import { StatusLine } from './StatusLine';
 import { BgTasks } from './BgTasks';
 import { UsageDialog } from './UsageDialog';
+
+const t = getT('sessionView');
 
 export function SessionView({ hostId, sessionId, seq }: { hostId: string; sessionId: string; seq?: number }) {
   const key = skey(hostId, sessionId);
@@ -124,9 +126,9 @@ export function SessionView({ hostId, sessionId, seq }: { hostId: string; sessio
   if (!info) {
     return (
       <div className="center-msg">
-        {connected ? tr('会话不存在或已删除', 'Session not found or deleted') : tr('主机未连接', 'Host not connected')}
+        {connected ? t('sessionNotFoundOrDeleted') : t('hostNotConnected')}
         <button className="btn" onClick={() => navigate({ kind: 'home' })}>
-          {tr('返回总览', 'Back to Overview')}
+          {t('backToOverview')}
         </button>
       </div>
     );
@@ -177,7 +179,7 @@ export function SessionView({ hostId, sessionId, seq }: { hostId: string; sessio
     <div className="session-split" ref={split} style={{ '--panel-w': `${panelW}px` } as React.CSSProperties}>
     <div className="session-view">
       <header className="session-head">
-        <button className="icon-btn show-mobile session-nav-btn" onClick={() => setState({ sidebarOpen: true })} aria-label={tr('菜单', 'Menu')}>
+        <button className="icon-btn show-mobile session-nav-btn" onClick={() => setState({ sidebarOpen: true })} aria-label={t('menu')}>
           <Icon name="menu" />
           {attn > 0 && <span className="badge">{attn}</span>}
         </button>
@@ -192,12 +194,12 @@ export function SessionView({ hostId, sessionId, seq }: { hostId: string; sessio
                 : `${info.externalId ? `${TOOL_LABEL[info.tool]} 会话 ID：${info.externalId}\n` : ''}Yi Console 会话 ID：${info.id}\n双击重命名，「更多」菜单里可复制 ID`
             }
           >
-            {info.title || tr('新会话', 'New Session')}
+            {info.title || t('newSession')}
           </div>
           <div className="muted small truncate">
             {TOOL_LABEL[info.tool]}
             {info.mode === 'terminal' && info.model ? ` · ${info.model}` : ''} · {shortPath(info.cwd, home)}
-            {info.contextPercent != null && ` · ${tr('上下文', 'Context')} ${Math.round(info.contextPercent)}%`}
+            {info.contextPercent != null && ` · ${t('context')} ${Math.round(info.contextPercent)}%`}
           </div>
         </div>
         {!filesOnly && <span className={`status-chip st-${info.status}`}>{STATUS_LABEL[info.status]}</span>}
@@ -205,10 +207,10 @@ export function SessionView({ hostId, sessionId, seq }: { hostId: string; sessio
           <button
             className="btn small usage-btn hide-mobile"
             onClick={() => setUsage(true)}
-            title={tr('查看这个会话的用量和账号额度', 'View session usage and account quota')}
+            title={t('viewSessionUsageAndAccount')}
           >
             <Icon name="chart" size={14} />
-            <span className="hide-mobile narrow-hide">{fmtUsage(info.usage) || tr('用量', 'Usage')}</span>
+            <span className="hide-mobile narrow-hide">{fmtUsage(info.usage) || t('usage')}</span>
           </button>
         )}
         {info.tool !== 'shell' && !filesOnly && (
@@ -222,17 +224,17 @@ export function SessionView({ hostId, sessionId, seq }: { hostId: string; sessio
             }}
             title={
               info.mode === 'terminal'
-                ? tr('切换到对话模式，接着同一个会话', 'Switch to Chat mode and continue the same session')
-                : tr('切换到终端模式，用工具自己的界面接着这个会话', 'Switch to Terminal mode and continue in the tool CLI')
+                ? t('switchToChatModeAnd')
+                : t('switchToTerminalModeAnd')
             }
           >
             <Icon name={info.mode === 'terminal' ? 'chat' : 'terminal'} size={14} />
             <span className="hide-mobile narrow-hide">
               {switching
-                ? tr('切换中…', 'Switching…')
+                ? t('switching')
                 : info.mode === 'terminal'
-                  ? tr('对话模式', 'Chat Mode')
-                  : tr('终端模式', 'Terminal Mode')}
+                  ? t('chatMode')
+                  : t('terminalMode')}
             </span>
           </button>
         )}
@@ -241,22 +243,19 @@ export function SessionView({ hostId, sessionId, seq }: { hostId: string; sessio
             className="icon-btn hide-mobile"
             title={
               style === 'modern'
-                ? tr(
-                    '回复显示风格：简约（思考和工具调用收成一组）。点击切换到 Claude Code 时间线',
-                    'Reply style: Minimal (grouped thinking & tool calls). Click to switch to Claude Code timeline',
-                  )
-                : tr('回复显示风格：Claude Code 时间线。点击切换到简约', 'Reply style: Claude Code timeline. Click to switch to Minimal')
+                ? t('replyStyleMinimalGroupedThinking')
+                : t('replyStyleClaudeCodeTimeline')
             }
             onClick={() => setChatStyle(style === 'modern' ? 'claude' : 'modern')}
           >
             <Icon name={style === 'modern' ? 'rows' : 'outline'} size={16} />
           </button>
         )}
-        <button className="icon-btn" title={tr('查看改动', 'View Changes')} aria-label={tr('查看改动', 'View Changes')} onClick={() => showChanges(hostId, sessionId)}>
+        <button className="icon-btn" title={t('viewChanges')} aria-label={t('viewChanges')} onClick={() => showChanges(hostId, sessionId)}>
           <Icon name="diff" size={17} />
         </button>
         {!filesOnly && (
-          <button className={`icon-btn ${files ? 'active' : ''}`} title={tr('工作目录文件', 'Workspace Files')} onClick={toggleFiles}>
+          <button className={`icon-btn ${files ? 'active' : ''}`} title={t('workspaceFiles')} onClick={toggleFiles}>
             <Icon name="folder" size={17} />
           </button>
         )}
@@ -264,8 +263,8 @@ export function SessionView({ hostId, sessionId, seq }: { hostId: string; sessio
         {info.tool !== 'shell' && !filesOnly && (
           <button
             className="icon-btn show-mobile"
-            title={tr('查看这个会话的用量和账号额度', 'View session usage and account quota')}
-            aria-label={tr('用量', 'Usage')}
+            title={t('viewSessionUsageAndAccount')}
+            aria-label={t('usage')}
             onClick={() => setUsage(true)}
           >
             <Icon name="chart" size={17} />
@@ -273,13 +272,13 @@ export function SessionView({ hostId, sessionId, seq }: { hostId: string; sessio
         )}
         {info.tool !== 'shell' && (
           // Files sessions have no usage button, so the terminal button stays in the top bar on mobile too
-          <button className={`icon-btn ${filesOnly ? '' : 'hide-mobile'} ${term ? 'active' : ''}`} title={term ? tr('收起终端', 'Hide Terminal') : tr('打开终端', 'Open Terminal')} onClick={toggleTerm}>
+          <button className={`icon-btn ${filesOnly ? '' : 'hide-mobile'} ${term ? 'active' : ''}`} title={term ? t('hideTerminal') : t('openTerminal')} onClick={toggleTerm}>
             <Icon name="terminal" size={17} />
           </button>
         )}
         <button
           className="icon-btn"
-          title={tr('更多', 'More')}
+          title={t('more')}
           onClick={(e) => {
             const r = e.currentTarget.getBoundingClientRect();
             openMenu(
@@ -313,7 +312,7 @@ export function SessionView({ hostId, sessionId, seq }: { hostId: string; sessio
             standalone
           />
         ) : (
-          <div className="center-msg">{tr('主机未连接', 'Host not connected')}</div>
+          <div className="center-msg">{t('hostNotConnected')}</div>
         )
       ) : info.mode === 'terminal' ? (
         <>
@@ -324,9 +323,9 @@ export function SessionView({ hostId, sessionId, seq }: { hostId: string; sessio
           </div>
           {!alive && (
             <div className="term-restart">
-              {tr('进程已结束', 'Process exited')}
+              {t('processExited')}
               <button className="btn primary small" onClick={() => act('session.resume', { cols: 120, rows: 32 })}>
-                {tr('重新启动', 'Restart')}
+                {t('restart')}
               </button>
             </div>
           )}
@@ -355,11 +354,11 @@ export function SessionView({ hostId, sessionId, seq }: { hostId: string; sessio
             {info.status === 'error' && (
               <div className="session-recover" role="status">
                 <span className="session-recover-text">
-                  {tr('工具进程异常退出，聊天记录还在', 'The tool process exited unexpectedly. Your history is kept.')}
+                  {t('theToolProcessExitedUnexpectedly')}
                 </span>
                 <button className="btn primary small" disabled={!connected || recovering} onClick={recover}>
                   {recovering && <span className="spinner" />}
-                  {recovering ? tr('正在恢复…', 'Resuming…') : tr('恢复会话', 'Resume session')}
+                  {recovering ? t('resuming') : t('resumeSession')}
                 </button>
               </div>
             )}
@@ -386,8 +385,8 @@ export function SessionView({ hostId, sessionId, seq }: { hostId: string; sessio
       {usage && <UsageDialog hostId={hostId} info={info} onClose={() => setUsage(false)} />}
       {term && connected && info.tool !== 'shell' && <TermPanel key={key} hostId={hostId} info={info} onClose={toggleTerm} />}
     </div>
-      {!filesOnly && files && connected && full && <div className="panel-scrim hide-mobile" onClick={() => setFull(false)} title={tr('退出全屏', 'Exit Fullscreen')} />}
-      {!filesOnly && files && connected && !full && fileOpen && <div className="panel-resizer hide-mobile" onPointerDown={dragPanel} title={tr('拖动调整宽度', 'Drag to resize')} />}
+      {!filesOnly && files && connected && full && <div className="panel-scrim hide-mobile" onClick={() => setFull(false)} title={t('exitFullscreen')} />}
+      {!filesOnly && files && connected && !full && fileOpen && <div className="panel-resizer hide-mobile" onPointerDown={dragPanel} title={t('dragToResize')} />}
       {!filesOnly && files && connected && (
         <FilePanel
           key={`${hostId}/${info.cwd}`}

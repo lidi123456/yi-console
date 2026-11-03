@@ -4,10 +4,12 @@ import { errorToast, navigate, refreshHosts, toast, useStore, type HostEntry } f
 import { hubCall, rpc } from '../transport';
 import type { HostConfig, SshTarget } from '../types';
 import { readClipboard, writeClipboard } from '../clipboard';
-import { tr, useLang } from '../i18n';
+import { getT, useLang } from '../i18n';
 import { askConfirm, askText } from './Overlay';
 import { Icon } from './Icon';
 import { QrScanner, canScanQr } from './QrScanner';
+
+const tx = getT('hostsView');
 
 const emptySsh = (): SshTarget => ({
   host: '',
@@ -38,7 +40,7 @@ const isAndroid = /Android/i.test(navigator.userAgent);
 
 function statusText(h: HostEntry) {
   const s = h.status.status;
-  return s === 'connected' ? tr('已连接', 'Connected') : s === 'connecting' ? tr('连接中…', 'Connecting…') : s === 'error' ? tr('连接失败', 'Connection failed') : tr('未连接', 'Not connected');
+  return s === 'connected' ? tx('connected') : s === 'connecting' ? tx('connecting') : s === 'error' ? tx('connectionFailed') : tx('notConnected');
 }
 
 function HostKeyPrompt({ h, onDone }: { h: HostEntry; onDone: () => void }) {
@@ -59,18 +61,18 @@ function HostKeyPrompt({ h, onDone }: { h: HostEntry; onDone: () => void }) {
   return (
     <div className={`callout ${changed ? 'callout-err' : 'callout-warn'}`}>
       <div className="callout-title">
-        <Icon name="key" size={16} /> {changed ? tr('主机密钥已变化！', 'Host key changed!') : tr('首次连接，请确认主机指纹', 'First connection. Confirm the host fingerprint.')}
+        <Icon name="key" size={16} /> {changed ? tx('hostKeyChanged') : tx('firstConnectionConfirmTheHost')}
       </div>
       <div className="mono small">{fp}</div>
       {changed ? (
         <div className="small">
-          {tr('可能是服务器重装，也可能是中间人攻击。确认无误后，请先从 known_hosts 中删除旧记录再连接。', 'The server may have been reinstalled, or this may be a man-in-the-middle attack. If you are sure, delete the old entry from known_hosts, then connect.')}
+          {tx('theServerMayHaveBeen')}
         </div>
       ) : (
         <div className="row">
-          <span className="small muted">{tr('请与服务器上 `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub` 的输出核对', 'Compare with the output of `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub` on the server')}</span>
+          <span className="small muted">{tx('compareWithTheOutputOf')}</span>
           <button className="btn primary small" onClick={trust}>
-            {tr('信任并连接', 'Trust and connect')}
+            {tx('trustAndConnect')}
           </button>
         </div>
       )}
@@ -109,17 +111,17 @@ interface PairedClient {
 const hostOf = (url = '') => url.replace(/^wss?:\/\//, '');
 
 async function copy(text: string, what: string) {
-  if (await writeClipboard(text)) toast(tr(`已复制${what}`, `Copied ${what}`));
-  else errorToast(tr('复制失败，请手动选中复制', 'Copy failed. Select the text and copy it manually.'));
+  if (await writeClipboard(text)) toast(tx('copied', { what }));
+  else errorToast(tx('copyFailedSelectTheText'));
 }
 
 function ago(t: number) {
-  if (!t) return tr('从未', 'never');
+  if (!t) return tx('never');
   const s = Math.max(0, Date.now() / 1000 - t);
-  if (s < 60) return tr('刚刚', 'just now');
-  if (s < 3600) return tr(`${Math.floor(s / 60)} 分钟前`, `${Math.floor(s / 60)} min ago`);
-  if (s < 86400) return tr(`${Math.floor(s / 3600)} 小时前`, `${Math.floor(s / 3600)} h ago`);
-  return tr(`${Math.floor(s / 86400)} 天前`, `${Math.floor(s / 86400)} d ago`);
+  if (s < 60) return tx('justNow');
+  if (s < 3600) return tx('minAgo', { v: Math.floor(s / 60) });
+  if (s < 86400) return tx('hAgo', { v: Math.floor(s / 3600) });
+  return tx('dAgo', { v: Math.floor(s / 86400) });
 }
 
 /** On this machine, "let other devices connect to this computer": ① connect to a relay (register with an invite the first time) → ② generate a one-time pairing QR code → manage paired devices */
@@ -154,7 +156,7 @@ function RelayPanel({ hostId }: { hostId: string }) {
           // A device was added while the QR code was shown, or a paired device paired again (pairing time changed): pairing succeeded
           const added = list.find((c) => !old.some((o) => o.id === c.id && o.createdAt === c.createdAt));
           if (offer && added) {
-            toast(tr(`已配对 ${added?.name ?? ''}`, `Paired ${added?.name ?? ''}`));
+            toast(tx('paired', { v: added?.name ?? '' }));
             setOffer(null);
           }
           return list;
@@ -217,7 +219,7 @@ function RelayPanel({ hostId }: { hostId: string }) {
       setBusy(false);
     }
   };
-  const configure = (params: object, ok = tr('中继已开启，正在连接…', 'Relay is on. Connecting…')) =>
+  const configure = (params: object, ok = tx('relayIsOnConnecting')) =>
     run(rpc(hostId, 'relay.configure', { url, fp, enabled: true, ...params }), ok);
 
   const startPair = async () => {
@@ -237,23 +239,23 @@ function RelayPanel({ hostId }: { hostId: string }) {
   const revoke = async (c: PairedClient) => {
     if (
       !(await askConfirm({
-        title: tr(`移除 ${c.name}？`, `Remove ${c.name}?`),
-        message: tr('移除后它会立刻断开，之后要重新扫码配对才能再连进来。', 'It is disconnected right away and has to pair again to reconnect.'),
-        okText: tr('移除', 'Remove'),
+        title: tx('remove', { name: c.name }),
+        message: tx('itIsDisconnectedRightAway'),
+        okText: tx('remove2'),
         danger: true,
       }))
     )
       return;
     try {
       setClients(await rpc<PairedClient[]>(hostId, 'relay.revoke', { id: c.id }));
-      toast(tr(`已移除 ${c.name}`, `Removed ${c.name}`));
+      toast(tx('removed', { name: c.name }));
     } catch (e) {
       errorToast(e);
     }
   };
 
   const rename = async (c: PairedClient) => {
-    const name = await askText({ title: tr('重命名设备', 'Rename device'), value: c.name, okText: tr('保存', 'Save') });
+    const name = await askText({ title: tx('renameDevice'), value: c.name, okText: tx('save') });
     if (!name || name === c.name) return;
     try {
       setClients(await rpc<PairedClient[]>(hostId, 'relay.renameClient', { id: c.id, name }));
@@ -266,7 +268,7 @@ function RelayPanel({ hostId }: { hostId: string }) {
     setBusy(true);
     try {
       const r = await rpc<{ link: string }>(hostId, 'relay.invite', {});
-      await copy(r.link, tr('中继接入链接（10 分钟内有效，只能用一次）', 'relay access link (valid for 10 minutes, single use)'));
+      await copy(r.link, tx('relayAccessLinkValidFor'));
     } catch (e) {
       errorToast(e);
     } finally {
@@ -282,35 +284,35 @@ function RelayPanel({ hostId }: { hostId: string }) {
   return (
     <div className="card relay-panel" id="relay-panel">
       <div className="card-title">
-        <Icon name="cloud" size={16} /> {tr('让其他设备连接这台电脑', 'Let other devices connect to this computer')}
+        <Icon name="cloud" size={16} /> {tx('letOtherDevicesConnectTo')}
         <span className="grow" />
         {active && (
           <span className={`pill ${info.online ? 'pill-ok' : info.error ? 'pill-err' : ''}`}>
-            {info.online ? tr('可被连接', 'Reachable') : info.error ? tr('中继连接失败', 'Relay connection failed') : tr('正在连接中继…', 'Connecting to relay…')}
+            {info.online ? tx('reachable') : info.error ? tx('relayConnectionFailed') : tx('connectingToRelay')}
           </span>
         )}
       </div>
       <p className="muted small">
-        {tr('手机或另一台电脑连不到这台电脑时（不在同一网络、在 NAT 后面），可以经中继服务器连进来。数据端到端加密，中继只转发密文。', 'When a phone or another computer cannot reach this computer (different network, or behind NAT), it can connect through a relay. Traffic is end-to-end encrypted; the relay only forwards ciphertext.')}
+        {tx('whenAPhoneOrAnother')}
       </p>
 
       <div className="step">
         <div className="step-no">{active && info.online ? <Icon name="check" size={14} /> : '1'}</div>
         <div className="step-body">
-          <div className="step-title">{tr('连接中继服务器', 'Connect to a relay')}</div>
+          <div className="step-title">{tx('connectToARelay')}</div>
           {!setupMode ? (
             <>
               <div className="small">
                 {hostOf(info.url)}
-                {info.online ? <span className="ok-text">{tr(' · 已连上', ' · Connected')}</span> : !info.error && <span className="muted">{tr(' · 连接中…', ' · Connecting…')}</span>}
+                {info.online ? <span className="ok-text">{tx('connected2')}</span> : !info.error && <span className="muted">{tx('connecting2')}</span>}
               </div>
               {info.error && <div className="error-text small">{info.error}</div>}
               <div className="row">
                 <button className="btn small" onClick={() => setChanging(true)}>
-                  {info.error ? tr('换一条接入链接', 'Use another access link') : tr('更换中继', 'Change relay')}
+                  {info.error ? tx('useAnotherAccessLink') : tx('changeRelay')}
                 </button>
-                <button className="btn small" disabled={busy} onClick={() => run(rpc(hostId, 'relay.configure', { url: info.url, enabled: false }), tr('已关闭，其他设备暂时连不进来', 'Turned off. Other devices cannot connect for now.'))}>
-                  {tr('关闭', 'Turn off')}
+                <button className="btn small" disabled={busy} onClick={() => run(rpc(hostId, 'relay.configure', { url: info.url, enabled: false }), tx('turnedOffOtherDevicesCannot'))}>
+                  {tx('turnOff')}
                 </button>
               </div>
             </>
@@ -318,31 +320,31 @@ function RelayPanel({ hostId }: { hostId: string }) {
             <>
               {known.length > 0 && (
                 <>
-                  <div className="muted small">{tr('这个 App 里已经连过中继，让那台电脑代发一个邀请，直接用同一个（中继要开启 --device-invites）：', 'This app already uses a relay. Ask that computer for an invite and use the same relay (the relay must allow --device-invites):')}</div>
+                  <div className="muted small">{tx('thisAppAlreadyUsesA')}</div>
                   <div className="row wrap">
                     {known.map((k) => (
                       <button
                         key={k.hostId}
                         className="btn primary small"
                         disabled={busy}
-                        onClick={() => run(hubCall('relay.reuse', { hostId, fromHostId: k.hostId }), tr('中继已开启，正在连接…', 'Relay is on. Connecting…'))}
+                        onClick={() => run(hubCall('relay.reuse', { hostId, fromHostId: k.hostId }), tx('relayIsOnConnecting'))}
                       >
-                        {tr('使用', 'Use')} {hostOf(k.url)}
-                        <span className="small" style={{ opacity: 0.7 }}>{tr(`（经 ${k.name}）`, `(via ${k.name})`)}</span>
+                        {tx('use')} {hostOf(k.url)}
+                        <span className="small" style={{ opacity: 0.7 }}>{tx('via', { name: k.name })}</span>
                       </button>
                     ))}
                   </div>
                 </>
               )}
               <div className="muted small">
-                {known.length > 0 ? tr('或者粘贴一条', 'Or paste a ') : tr('粘贴一条', 'Paste a ')}
-                <b>{tr('中继接入链接', 'relay access link')}</b>
-                {tr('（中继运营者在服务器上运行 yi-relay invite 生成，24 小时内有效、只能用一次）：', ' (the relay operator generates it with yi-relay invite on the server; valid for 24 hours, single use):')}
+                {known.length > 0 ? tx('orPasteA') : tx('pasteA')}
+                <b>{tx('relayAccessLink')}</b>
+                {tx('theRelayOperatorGeneratesIt')}
               </div>
               <div className="row">
                 <input className="grow" value={link} onChange={(e) => setLink(e.target.value)} placeholder="yiconsole://relay?…" />
                 <button className="btn small" onClick={async () => setLink(await readClipboard())}>
-                  <Icon name="copy" size={14} /> {tr('粘贴', 'Paste')}
+                  <Icon name="copy" size={14} /> {tx('paste')}
                 </button>
               </div>
               {typeof linkInfo === 'string' && <div className="error-text small">{linkInfo}</div>}
@@ -350,38 +352,38 @@ function RelayPanel({ hostId }: { hostId: string }) {
                 <>
                   <div className="row">
                     <span className="small grow">
-                      {tr('中继', 'Relay')} <b>{hostOf(linkInfo.url)}</b>
-                      {linkInfo.kind === 'pair' && <span className="muted">{tr(`（取自 ${linkInfo.name} 的配对链接）`, ` (from ${linkInfo.name}’s pairing link)`)}</span>}
+                      {tx('relay')} <b>{hostOf(linkInfo.url)}</b>
+                      {linkInfo.kind === 'pair' && <span className="muted">{tx('fromSPairingLink', { name: linkInfo.name ?? '' })}</span>}
                     </span>
                     <button className="btn primary small" disabled={busy} onClick={() => configure({ link: link.trim() })}>
-                      {tr('开启', 'Turn on')}
+                      {tx('turnOn')}
                     </button>
                   </div>
                   {!linkInfo.hasInvite && (
                     <div className="attn-text small">
-                      {tr('这条链接里没有邀请码，只有这台电脑之前已经在这个中继上登记过才能用。', 'This link has no invite code. It works only if this computer is already registered with this relay.')}
+                      {tx('thisLinkHasNoInvite')}
                     </div>
                   )}
                 </>
               )}
               <button className="link-btn small" onClick={() => setManual(!manual)}>
-                {manual ? tr('收起手动填写', 'Hide manual entry') : tr('没有链接？手动填写中继地址和邀请码', 'No link? Enter the relay address and invite code')}
+                {manual ? tx('hideManualEntry') : tx('noLinkEnterTheRelay')}
               </button>
               {manual && (
                 <div className="form">
-                  <input value={url} onChange={(e) => setUrl(e.target.value)} placeholder={tr('中继地址，例如 wss://43.110.40.75:7878', 'Relay address, e.g. wss://43.110.40.75:7878')} />
-                  <input value={invite} onChange={(e) => setInvite(e.target.value)} placeholder={tr('邀请码（yi-relay invite 生成；已登记过可留空）', 'Invite code (from yi-relay invite; leave empty if already registered)')} />
-                  <input value={fp} onChange={(e) => setFp(e.target.value)} placeholder={tr('证书指纹（自签名证书时填写，见 yi-relay 启动日志）', 'Certificate fingerprint (for a self-signed certificate; see the yi-relay startup log)')} />
+                  <input value={url} onChange={(e) => setUrl(e.target.value)} placeholder={tx('relayAddressEGWss')} />
+                  <input value={invite} onChange={(e) => setInvite(e.target.value)} placeholder={tx('inviteCodeFromYiRelay')} />
+                  <input value={fp} onChange={(e) => setFp(e.target.value)} placeholder={tx('certificateFingerprintForASelf')} />
                   <div className="row">
                     <button className="btn primary small" disabled={!url || busy} onClick={() => configure({ invite })}>
-                      {tr('开启', 'Turn on')}
+                      {tx('turnOn')}
                     </button>
                   </div>
                 </div>
               )}
               {changing && (
                 <button className="btn small" onClick={() => setChanging(false)}>
-                  {tr('取消', 'Cancel')}
+                  {tx('cancel')}
                 </button>
               )}
             </>
@@ -392,51 +394,51 @@ function RelayPanel({ hostId }: { hostId: string }) {
       <div className={`step ${active ? '' : 'disabled'}`}>
         <div className="step-no">2</div>
         <div className="step-body">
-          <div className="step-title">{tr('在另一台设备上添加这台电脑', 'Add this computer on another device')}</div>
+          <div className="step-title">{tx('addThisComputerOnAnother')}</div>
           {!active ? (
-            <div className="muted small">{tr('先完成第 1 步。', 'Finish step 1 first.')}</div>
+            <div className="muted small">{tx('finishStep1First')}</div>
           ) : !offer ? (
             <>
-              <div className="muted small">{tr('生成一个一次性配对二维码，10 分钟内有效，只能配对一台设备。', 'Generate a one-time pairing QR code. It is valid for 10 minutes and pairs a single device.')}</div>
+              <div className="muted small">{tx('generateAOneTimePairing')}</div>
               <button className="btn primary small" disabled={busy} onClick={startPair}>
-                <Icon name="qr" size={14} /> {tr('生成配对二维码', 'Generate pairing QR code')}
+                <Icon name="qr" size={14} /> {tx('generatePairingQrCode')}
               </button>
             </>
           ) : (
             <div className="pair-row">
-              {!expired && <img className="pair-qr" src={offer.qr} alt={tr('配对二维码', 'Pairing QR code')} width={168} height={168} />}
+              {!expired && <img className="pair-qr" src={offer.qr} alt={tx('pairingQrCode')} width={168} height={168} />}
               <div className="pair-help small">
                 {expired ? (
-                  <div className="attn-text">{tr('二维码已过期。', 'The QR code has expired.')}</div>
+                  <div className="attn-text">{tx('theQrCodeHasExpired')}</div>
                 ) : (
                   <>
                     <div>
-                      <b>{tr('手机', 'Phone')}</b>
-                      {tr('：打开 Yi Console →「主机」→「配对设备」→「扫码」，扫左边的二维码。', ': Open Yi Console → Hosts → Pair device → Scan, and scan the QR code on the left.')}
+                      <b>{tx('phone')}</b>
+                      {tx('openYiConsoleHostsPair')}
                     </div>
                     <div>
-                      <b>{tr('另一台电脑', 'Another computer')}</b>
-                      {tr('：复制配对链接发过去，在 Yi Console「主机」→「配对设备」里粘贴。', ': Copy the pairing link, send it over, and paste it in Yi Console → Hosts → Pair device.')}
+                      <b>{tx('anotherComputer')}</b>
+                      {tx('copyThePairingLinkSend')}
                     </div>
                     <div className="muted">
-                      {tr(`${Math.floor(left / 60)}:${String(left % 60).padStart(2, '0')} 后过期 · 只能用一次`, `Expires in ${Math.floor(left / 60)}:${String(left % 60).padStart(2, '0')} · single use`)}
+                      {tx('expiresInSingleUse', { v: Math.floor(left / 60), v2: String(left % 60).padStart(2, '0') })}
                     </div>
                   </>
                 )}
                 <div className="row wrap">
                   {!expired && (
-                    <button className="btn primary small" onClick={() => copy(offer.uri, tr('配对链接', 'pairing link'))}>
-                      <Icon name="copy" size={14} /> {tr('复制配对链接', 'Copy pairing link')}
+                    <button className="btn primary small" onClick={() => copy(offer.uri, tx('pairingLink'))}>
+                      <Icon name="copy" size={14} /> {tx('copyPairingLink')}
                     </button>
                   )}
                   <button className="btn small" disabled={busy} onClick={startPair}>
-                    <Icon name="refresh" size={14} /> {tr('重新生成', 'Regenerate')}
+                    <Icon name="refresh" size={14} /> {tx('regenerate')}
                   </button>
                   <button className="btn small" onClick={() => setOffer(null)}>
-                    {tr('完成', 'Done')}
+                    {tx('done')}
                   </button>
                 </div>
-                {!info.online && <div className="attn-text">{tr('中继还没连上，对方要等这边连上后才能完成配对。', 'The relay is not connected yet. The other side can pair only after this side connects.')}</div>}
+                {!info.online && <div className="attn-text">{tx('theRelayIsNotConnected')}</div>}
               </div>
             </div>
           )}
@@ -449,21 +451,21 @@ function RelayPanel({ hostId }: { hostId: string }) {
             <Icon name="key" size={12} />
           </div>
           <div className="step-body">
-            <div className="step-title">{tr('已配对的设备', 'Paired devices')}</div>
+            <div className="step-title">{tx('pairedDevices')}</div>
             {clients.length === 0 ? (
-              <div className="muted small">{tr('还没有。', 'None yet.')}</div>
+              <div className="muted small">{tx('noneYet')}</div>
             ) : (
               <div className="paired-list">
                 {clients.map((c) => (
                   <div key={c.id} className="paired-row small">
                     <span className={`dot ${c.online ? 'dot-connected' : ''}`} />
                     <b className="grow">{c.name}</b>
-                    <span className="muted">{c.online ? tr('在线', 'online') : tr(`最近 ${ago(c.lastSeen)}`, `last ${ago(c.lastSeen)}`)}</span>
+                    <span className="muted">{c.online ? tx('online') : tx('last', { v: ago(c.lastSeen) })}</span>
                     <button className="link-btn small" onClick={() => rename(c)}>
-                      {tr('改名', 'Rename')}
+                      {tx('rename')}
                     </button>
                     <button className="link-btn small error-text" onClick={() => revoke(c)}>
-                      {tr('移除', 'Remove')}
+                      {tx('remove2')}
                     </button>
                   </div>
                 ))}
@@ -475,12 +477,12 @@ function RelayPanel({ hostId }: { hostId: string }) {
 
       {active && (
         <details className="relay-more small">
-          <summary>{tr('更多', 'More')}</summary>
+          <summary>{tx('more')}</summary>
           <div className="row wrap">
             <button className="btn small" disabled={busy || !info.online} onClick={shareRelay}>
-              {tr('给另一台电脑生成中继接入链接', 'Create a relay access link for another computer')}
+              {tx('createARelayAccessLink')}
             </button>
-            <span className="muted">{tr('一次性、10 分钟有效；中继要开启 --device-invites', 'Single use, valid for 10 minutes; the relay must allow --device-invites')}</span>
+            <span className="muted">{tx('singleUseValidFor10')}</span>
           </div>
           <div className="row wrap">
             <button
@@ -488,22 +490,22 @@ function RelayPanel({ hostId }: { hostId: string }) {
               disabled={busy}
               onClick={async () =>
                 (await askConfirm({
-                  title: tr('重置所有配对？', 'Reset all pairings?'),
-                  message: tr('所有已配对的手机和电脑都会立刻断开，需要重新扫码配对。', 'All paired phones and computers are disconnected right away and must pair again.'),
-                  okText: tr('重置', 'Reset'),
+                  title: tx('resetAllPairings'),
+                  message: tx('allPairedPhonesAndComputers'),
+                  okText: tx('reset'),
                   danger: true,
                 })) &&
                 run(
                   rpc(hostId, 'relay.reset', {}).then(loadClients),
-                  tr('已重置，所有旧配对都失效了', 'Reset. All previous pairings no longer work.'),
+                  tx('resetAllPreviousPairingsNo'),
                 )
               }
             >
-              {tr('重置所有配对', 'Reset all pairings')}
+              {tx('resetAllPairings2')}
             </button>
-            <span className="muted">{tr('怀疑有设备泄露时用；单台设备在上面的列表里移除即可', 'Use if a device may be compromised; to remove one device, use the list above')}</span>
+            <span className="muted">{tx('useIfADeviceMay')}</span>
           </div>
-          <div className="muted">{tr(`设备 ID ${info.deviceId}`, `Device ID ${info.deviceId}`)}</div>
+          <div className="muted">{tx('deviceId', { deviceId: info.deviceId ?? '' })}</div>
         </details>
       )}
     </div>
@@ -526,7 +528,7 @@ function HostForm({ initial, hosts, onSaved, onCancel }: { initial: HostConfig; 
     readClipboard().then((c) => {
       if (c.startsWith('yiconsole://pair?')) {
         setH((x) => (x.pairing ? x : { ...x, pairing: c }));
-        toast(tr('已从剪贴板读取配对链接', 'Pairing link read from the clipboard'));
+        toast(tx('pairingLinkReadFromThe'));
       }
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -541,10 +543,7 @@ function HostForm({ initial, hosts, onSaved, onCancel }: { initial: HostConfig; 
         setPairInfo(
           r.kind === 'pair'
             ? r
-            : tr(
-                '这是中继接入链接，是给电脑开启中继用的（在那台电脑「让其他设备连接这台电脑」第 1 步里粘贴）。添加设备要用配对链接。',
-                'This is a relay access link for turning the relay on a computer (paste it in step 1 of “Let other devices connect to this computer” on that computer). To add a device, use a pairing link.',
-              ),
+            : tx('thisIsARelayAccess'),
         ),
       )
       .catch((e) => setPairInfo(String(e?.message ?? e)));
@@ -589,26 +588,26 @@ function HostForm({ initial, hosts, onSaved, onCancel }: { initial: HostConfig; 
           }}
         />
       )}
-      <div className="card-title">{h.id ? tr(`编辑 ${h.name}`, `Edit ${h.name}`) : h.kind === 'ssh' ? tr('添加 SSH 主机', 'Add SSH host') : tr('配对设备（经中继连接另一台电脑）', 'Pair a device (connect to another computer via relay)')}</div>
+      <div className="card-title">{h.id ? tx('edit', { name: h.name }) : h.kind === 'ssh' ? tx('addSshHost') : tx('pairADeviceConnectTo')}</div>
       {isNewRelay && (
         <ol className="muted small how-to">
           <li>
-            {tr('在要连接的那台电脑上打开 Yi Console →「主机」，找到本机下面的', 'On the computer you want to connect to, open Yi Console → Hosts and find ')}
-            <b>{tr('「让其他设备连接这台电脑」', '“Let other devices connect to this computer”')}</b>
-            {tr('，按第 1 步开启中继。', ' under this computer, then turn the relay on in step 1.')}
+            {tx('onTheComputerYouWant')}
+            <b>{tx('letOtherDevicesConnectTo2')}</b>
+            {tx('underThisComputerThenTurn')}
           </li>
-          <li>{tr('点第 2 步里的「生成配对二维码」，再点「复制配对链接」发到这里（手机可以直接扫二维码）。二维码 10 分钟内有效，只能用一次。', 'In step 2, click “Generate pairing QR code”, then “Copy pairing link” and send it here (a phone can scan the QR code). The code is valid for 10 minutes and works once.')}</li>
-          <li>{tr('粘贴到下面，保存后会自动连接。', 'Paste it below. It connects automatically after you save.')}</li>
+          <li>{tx('inStep2ClickGenerate')}</li>
+          <li>{tx('pasteItBelowItConnects')}</li>
         </ol>
       )}
       <div className="form">
         <label>
-          {tr('名称', 'Name')}
-          <input value={h.name} onChange={(e) => setH({ ...h, name: e.target.value })} placeholder={h.kind === 'relay' ? tr('留空使用设备名', 'Leave empty to use the device name') : tr('例如：开发机', 'e.g. dev machine')} />
+          {tx('name')}
+          <input value={h.name} onChange={(e) => setH({ ...h, name: e.target.value })} placeholder={h.kind === 'relay' ? tx('leaveEmptyToUseThe') : tx('eGDevMachine')} />
         </label>
         {h.kind === 'relay' && (
           <label>
-            {tr('配对链接', 'Pairing link')}
+            {tx('pairingLink2')}
             <div className="row">
               <input
                 className="grow"
@@ -622,28 +621,28 @@ function HostForm({ initial, hosts, onSaved, onCancel }: { initial: HostConfig; 
                   onClick={async () => {
                     const c = await readClipboard();
                     if (c) setH({ ...h, pairing: c });
-                    else toast(tr('剪贴板是空的', 'Clipboard is empty'));
+                    else toast(tx('clipboardIsEmpty'));
                   }}
                 >
-                  <Icon name="copy" size={14} /> {tr('粘贴', 'Paste')}
+                  <Icon name="copy" size={14} /> {tx('paste')}
                 </button>
               )}
               {isAndroid && canScanQr() && (
                 <button className="btn small" onClick={() => setScanning(true)}>
-                  <Icon name="qr" size={14} /> {tr('扫码', 'Scan')}
+                  <Icon name="qr" size={14} /> {tx('scan')}
                 </button>
               )}
             </div>
             {typeof pairInfo === 'string' && <span className="error-text small">{pairInfo}</span>}
             {pairInfo && typeof pairInfo === 'object' && (
               <span className="ok-text small">
-                {tr('✓ 将添加 ', '✓ Will add ')}
-                <b>{pairInfo.name || tr('设备', 'device')}</b>
-                {tr(`，经中继 ${hostOf(pairInfo.url)} 连接`, `, via relay ${hostOf(pairInfo.url)}`)}
+                {tx('willAdd')}
+                <b>{pairInfo.name || tx('device')}</b>
+                {tx('viaRelay', { v: hostOf(pairInfo.url) })}
               </span>
             )}
             {!pairInfo && (
-              <span className="muted small">{tr('没有图形界面的电脑上，可以运行 `yi-agentd relay pair` 打印一次性配对链接和二维码', 'On a computer without a GUI, run `yi-agentd relay pair` to print a one-time pairing link and QR code')}</span>
+              <span className="muted small">{tx('onAComputerWithoutA')}</span>
             )}
           </label>
         )}
@@ -651,12 +650,12 @@ function HostForm({ initial, hosts, onSaved, onCancel }: { initial: HostConfig; 
           <>
             {!h.id && (
               <button className="link-btn small" onClick={importCfg}>
-                {tr('从 ~/.ssh/config 导入', 'Import from ~/.ssh/config')}
+                {tx('importFromSshConfig')}
               </button>
             )}
             {imports && (
               <div className="import-list">
-                {imports.length === 0 && <span className="muted small">{tr('没有找到可导入的主机', 'No hosts to import')}</span>}
+                {imports.length === 0 && <span className="muted small">{tx('noHostsToImport')}</span>}
                 {imports.map((c) => (
                   <button
                     key={c.alias}
@@ -679,33 +678,33 @@ function HostForm({ initial, hosts, onSaved, onCancel }: { initial: HostConfig; 
                     }}
                   >
                     <b>{c.alias}</b> <span className="muted">{c.user ? c.user + '@' : ''}{c.host}:{c.port}</span>
-                    {c.proxyJump && <span className="muted"> {tr(`经 ${c.proxyJump}`, `via ${c.proxyJump}`)}</span>}
+                    {c.proxyJump && <span className="muted"> {tx('via2', { proxyJump: c.proxyJump })}</span>}
                   </button>
                 ))}
               </div>
             )}
             <div className="row">
               <label className="grow">
-                {tr('地址', 'Address')}
+                {tx('address')}
                 <input value={ssh.host} onChange={(e) => setSsh({ host: e.target.value })} placeholder="192.168.1.10" />
               </label>
               <label style={{ width: 90 }}>
-                {tr('端口', 'Port')}
+                {tx('port')}
                 <input type="number" value={ssh.port} onChange={(e) => setSsh({ port: Number(e.target.value) || 22 })} />
               </label>
             </div>
             <label>
-              {tr('用户名', 'Username')}
+              {tx('username')}
               <input value={ssh.user} onChange={(e) => setSsh({ user: e.target.value })} placeholder="root" />
             </label>
             <div className="field">
-              <span>{tr('认证方式', 'Authentication')}</span>
+              <span>{tx('authentication')}</span>
               <div className="seg">
                 {(
                   [
-                    ['agent', tr('SSH Agent / 默认密钥', 'SSH agent / default key')],
-                    ['key', tr('私钥', 'Private key')],
-                    ['password', tr('密码', 'Password')],
+                    ['agent', tx('sshAgentDefaultKey')],
+                    ['key', tx('privateKey')],
+                    ['password', tx('password')],
                   ] as const
                 ).map(([v, l]) => (
                   <button key={v} className={ssh.auth === v ? 'active' : ''} onClick={() => setSsh({ auth: v })}>
@@ -717,29 +716,29 @@ function HostForm({ initial, hosts, onSaved, onCancel }: { initial: HostConfig; 
             {ssh.auth === 'key' && (
               <>
                 <label>
-                  {tr('私钥文件路径', 'Private key path')}
+                  {tx('privateKeyPath')}
                   <input value={ssh.keyPath} onChange={(e) => setSsh({ keyPath: e.target.value })} placeholder="~/.ssh/id_ed25519" />
                 </label>
                 <label>
-                  {tr('或直接粘贴私钥内容（手机上用）', 'Or paste the private key (for phones)')}
+                  {tx('orPasteThePrivateKey')}
                   <textarea rows={3} value={ssh.keyText} onChange={(e) => setSsh({ keyText: e.target.value })} placeholder="-----BEGIN OPENSSH PRIVATE KEY-----" />
                 </label>
                 <label>
-                  {tr('私钥口令（没有可留空）', 'Key passphrase (leave empty if none)')}
+                  {tx('keyPassphraseLeaveEmptyIf')}
                   <input type="password" value={ssh.passphrase} onChange={(e) => setSsh({ passphrase: e.target.value })} />
                 </label>
               </>
             )}
             {ssh.auth === 'password' && (
               <label>
-                {tr('密码', 'Password')}
+                {tx('password')}
                 <input type="password" value={ssh.password} onChange={(e) => setSsh({ password: e.target.value })} />
               </label>
             )}
             <label>
-              {tr('跳板机', 'Jump host')}
+              {tx('jumpHost')}
               <select value={ssh.jumpHostId} onChange={(e) => setSsh({ jumpHostId: e.target.value })}>
-                <option value="">{tr('不使用', 'None')}</option>
+                <option value="">{tx('none')}</option>
                 {hosts
                   .filter((x) => x.config.kind === 'ssh' && x.config.id !== h.id)
                   .map((x) => (
@@ -751,26 +750,26 @@ function HostForm({ initial, hosts, onSaved, onCancel }: { initial: HostConfig; 
             </label>
             <label className="check">
               <input type="checkbox" checked={h.installService} onChange={(e) => setH({ ...h, installService: e.target.checked })} />
-              {tr('首次部署时把 yi-agentd 注册为自启服务（重启服务器后会话仍可继续）', 'On first deploy, register yi-agentd as a startup service (sessions continue after a server reboot)')}
+              {tx('onFirstDeployRegisterYi')}
             </label>
           </>
         )}
         <label className="check">
           <input type="checkbox" checked={h.autoConnect} onChange={(e) => setH({ ...h, autoConnect: e.target.checked })} />
-          {tr('启动时自动连接', 'Connect automatically on startup')}
+          {tx('connectAutomaticallyOnStartup')}
         </label>
         {!isAndroid && (
           <label className="check">
             <input type="checkbox" checked={h.relayShare !== false} onChange={(e) => setH({ ...h, relayShare: e.target.checked })} />
-            {tr('允许已配对的手机经这台电脑访问这台主机', 'Let paired phones reach this host through this computer')}
+            {tx('letPairedPhonesReachThis')}
           </label>
         )}
         <div className="row end">
           <button className="btn" onClick={onCancel}>
-            {tr('取消', 'Cancel')}
+            {tx('cancel')}
           </button>
           <button className="btn primary" disabled={saving || (h.kind === 'relay' && typeof pairInfo === 'string')} onClick={save}>
-            {saving && pairInfo && typeof pairInfo === 'object' ? tr('正在配对…', 'Pairing…') : isNewRelay ? tr('添加并连接', 'Add and connect') : tr('保存', 'Save')}
+            {saving && pairInfo && typeof pairInfo === 'object' ? tx('pairing') : isNewRelay ? tx('addAndConnect') : tx('save')}
           </button>
         </div>
       </div>
@@ -804,9 +803,9 @@ function HostCard({ h, onEdit }: { h: HostEntry; onEdit: () => void }) {
           <div className="card-title">{h.config.name}</div>
           <div className="muted small">
             {h.config.kind === 'ssh' && `${h.config.ssh?.user}@${h.config.ssh?.host}:${h.config.ssh?.port}`}
-            {h.config.kind === 'relay' && tr('经中继连接', 'Via relay')}
-            {h.config.kind === 'proxy' && tr(`经 ${hosts.find((x) => x.config.id === h.config.viaHostId)?.config.name ?? '已配对电脑'} 转发`, `Forwarded via ${hosts.find((x) => x.config.id === h.config.viaHostId)?.config.name ?? 'a paired computer'}`)}
-            {h.config.kind === 'local' && tr('这台电脑', 'This computer')}
+            {h.config.kind === 'relay' && tx('viaRelay2')}
+            {h.config.kind === 'proxy' && tx('forwardedVia', { name: hosts.find((x) => x.config.id === h.config.viaHostId)?.config.name ?? tx('aPairedComputer') })}
+            {h.config.kind === 'local' && tx('thisComputer')}
             {hello && ` · ${hello.os}/${hello.arch} · yi-agentd ${hello.daemonVersion}`}
           </div>
         </div>
@@ -820,22 +819,16 @@ function HostCard({ h, onEdit }: { h: HostEntry; onEdit: () => void }) {
       {h.status.versionMismatch && (
         <div className="callout callout-warn small">
           {h.config.kind === 'local'
-            ? tr(
-                `本机守护进程还在运行旧版本 ${hello?.daemonVersion ?? ''}，新版本 ${h.status.clientVersion} 已就绪，重启守护进程后生效。`,
-                `The local daemon is still running old version ${hello?.daemonVersion ?? ''}. Version ${h.status.clientVersion} is ready and takes effect after you restart the daemon.`,
-              )
-            : tr(
-                `远程 yi-agentd 版本 ${hello?.daemonVersion ?? ''} 与客户端 ${h.status.clientVersion} 不一致。`,
-                `Remote yi-agentd ${hello?.daemonVersion ?? ''} does not match client ${h.status.clientVersion}.`,
-              )}
+            ? tx('theLocalDaemonIsStill', { v: hello?.daemonVersion ?? '', clientVersion: h.status.clientVersion ?? '' })
+            : tx('remoteYiAgentdDoesNot', { v: hello?.daemonVersion ?? '', clientVersion: h.status.clientVersion ?? '' })}
           {h.config.kind === 'relay' || h.config.kind === 'proxy' ? (
-            <span className="muted">{tr('（经中继连接的主机需要在它所在的电脑上更新 Yi Console）', '(Update Yi Console on the computer where this host runs.)')}</span>
+            <span className="muted">{tx('updateYiConsoleOnThe')}</span>
           ) : (
             <button className="btn small" disabled={!!busy} onClick={() => run('upgrade', () => hubCall('hosts.upgrade', { id }))}>
-              {h.config.kind === 'local' ? tr('重启守护进程', 'Restart daemon') : tr('升级 yi-agentd', 'Upgrade yi-agentd')}
+              {h.config.kind === 'local' ? tx('restartDaemon') : tx('upgradeYiAgentd')}
             </button>
           )}
-          <span className="muted">{tr('（正在进行的回合会被中断；会话保留，之后发消息会自动接上上下文）', '(The turn in progress will be interrupted. Sessions are kept, and the next message resumes the context.)')}</span>
+          <span className="muted">{tx('theTurnInProgressWill')}</span>
         </div>
       )}
       {deploy && deploy.length > 0 && (
@@ -851,7 +844,7 @@ function HostCard({ h, onEdit }: { h: HostEntry; onEdit: () => void }) {
             .filter((t) => t.kind !== 'shell' && t.kind !== 'files')
             .map((t) => (
               <span key={t.kind} className={`pill ${t.available ? '' : 'pill-off'}`} title={t.path ?? ''}>
-                {t.kind} {t.available ? (t.version?.split(' ')[0] ?? '') : tr('未安装', 'Not installed')}
+                {t.kind} {t.available ? (t.version?.split(' ')[0] ?? '') : tx('notInstalled')}
               </span>
             ))}
         </div>
@@ -859,16 +852,16 @@ function HostCard({ h, onEdit }: { h: HostEntry; onEdit: () => void }) {
       <div className="row wrap">
         {connected ? (
           <button className="btn small" disabled={!!busy} onClick={() => run('dis', () => hubCall('hosts.disconnect', { id }))}>
-            {tr('断开', 'Disconnect')}
+            {tx('disconnect')}
           </button>
         ) : (
           <button className="btn primary small" disabled={!!busy} onClick={() => run('con', () => hubCall('hosts.connect', { id }))}>
-            {busy === 'con' ? tr('连接中…', 'Connecting…') : tr('连接', 'Connect')}
+            {busy === 'con' ? tx('connecting') : tx('connect')}
           </button>
         )}
         {h.config.kind !== 'local' && h.config.kind !== 'proxy' && (
           <button className="btn small" onClick={onEdit}>
-            {tr('编辑', 'Edit')}
+            {tx('edit2')}
           </button>
         )}
         {connected && h.config.kind !== 'relay' && h.config.kind !== 'proxy' && (
@@ -877,23 +870,23 @@ function HostCard({ h, onEdit }: { h: HostEntry; onEdit: () => void }) {
             disabled={!!busy}
             onClick={() => run('svc', async () => toast(String(await hubCall('hosts.installService', { id }))))}
           >
-            {tr('注册自启服务', 'Register startup service')}
+            {tx('registerStartupService')}
           </button>
         )}
         {connected && (
           <button className="btn small" onClick={() => navigate({ kind: 'settings', hostId: id })}>
-            {tr('设置', 'Settings')}
+            {tx('settings')}
           </button>
         )}
         {h.config.kind !== 'local' && (
           <button
             className="btn small danger-ghost"
             onClick={async () =>
-              (await askConfirm({ title: tr(`删除主机 ${h.config.name}？`, `Delete host ${h.config.name}?`), okText: tr('删除', 'Delete'), danger: true })) &&
+              (await askConfirm({ title: tx('deleteHost', { name: h.config.name }), okText: tx('delete'), danger: true })) &&
               run('del', () => hubCall('hosts.delete', { id }))
             }
           >
-            {tr('删除', 'Delete')}
+            {tx('delete')}
           </button>
         )}
       </div>
@@ -940,21 +933,21 @@ export function HostsView({ editId }: { editId?: string }) {
   return (
     <div className="page">
       <div className="page-head">
-        <h2>{tr('主机管理', 'Hosts')}</h2>
+        <h2>{tx('hosts')}</h2>
         <div className="row">
           <button className="btn" onClick={() => setEditing(newHost('ssh'))}>
-            <Icon name="plus" size={14} /> {tr('SSH 主机', 'SSH host')}
+            <Icon name="plus" size={14} /> {tx('sshHost')}
           </button>
-          <button className="btn" onClick={() => setEditing(newHost('relay'))} title={tr('用另一台电脑给出的配对链接添加', 'Add with a pairing link from another computer')}>
-            <Icon name="cloud" size={14} /> {tr('配对设备', 'Pair device')}
+          <button className="btn" onClick={() => setEditing(newHost('relay'))} title={tx('addWithAPairingLink')}>
+            <Icon name="cloud" size={14} /> {tx('pairDevice')}
           </button>
           {localOk && (
             <button
               className="btn"
-              title={tr('开启中继，生成配对链接给手机或其他电脑', 'Turn on the relay and create a pairing link for a phone or another computer')}
+              title={tx('turnOnTheRelayAnd')}
               onClick={() => document.getElementById('relay-panel')?.scrollIntoView({ behavior: 'smooth', block: 'start' })}
             >
-              <Icon name="qr" size={14} /> {tr('让这台电脑可被连接', 'Make this computer reachable')}
+              <Icon name="qr" size={14} /> {tx('makeThisComputerReachable')}
             </button>
           )}
         </div>
@@ -969,7 +962,7 @@ export function HostsView({ editId }: { editId?: string }) {
           ),
         )}
         <button className="link-btn small" onClick={() => navigate({ kind: 'prefs' })}>
-          {tr('网络代理、通知等设置在「系统设置」里', 'Proxy, notifications, and other settings are in Preferences')}
+          {tx('proxyNotificationsAndOtherSettings')}
         </button>
       </div>
     </div>

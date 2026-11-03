@@ -1,5 +1,7 @@
 // Channel between the frontend and ClientHub: invoke/events in Tauri, yi-web's WebSocket in the browser.
-import { tr } from './i18n';
+import { getT } from './i18n';
+
+const t = getT('transport');
 
 type Listener = (ev: any) => void;
 
@@ -61,10 +63,10 @@ function connectWeb(): Promise<void> {
       dispatch({ type: 'transport', status: 'open' });
       resolve();
     };
-    sock.onerror = () => reject(new Error(tr('无法连接 Yi Console 服务', 'Cannot connect to Yi Console service')));
+    sock.onerror = () => reject(new Error(t('cannotConnectToYiConsole')));
     sock.onclose = () => {
       webStatus = 'closed';
-      for (const [, p] of pending) p.rej(new Error(tr('连接已断开', 'Connection closed')));
+      for (const [, p] of pending) p.rej(new Error(t('connectionClosed')));
       pending.clear();
       dispatch({ type: 'transport', status: 'closed' });
       // Reconnect automatically when the page server restarts

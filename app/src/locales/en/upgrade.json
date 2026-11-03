@@ -1,0 +1,8 @@
+{
+  "upgradingYiAgentd": "Upgrading yi-agentd",
+  "close": "Close",
+  "retry": "Retry",
+  "temporarilyUnavailableDuringUpgradeIt": "Temporarily unavailable during upgrade. It will reconnect automatically and all sessions will be preserved.",
+  "text": ": ",
+  "upgradeNow": "Upgrade Now"
+}

@@ -1,4 +1,4 @@
-import { isEn, tr } from '../i18n';
+import { getT, isEn } from '../i18n';
 import { errorToast, getState, loadSession, navigate, setState, skey, toast } from '../store';
 import { rpc } from '../transport';
 import { TOOL_LABEL, type HubEvent, type SessionInfo } from '../types';
@@ -6,6 +6,8 @@ import { downloadText, isMobile, lsSet, safeFileName, sessionMarkdown, toB64 } f
 import { handoffPrompt } from '../handoff';
 import { writeClipboard } from '../clipboard';
 import { askConfirm, askText, type MenuItem } from './Overlay';
+
+const tx = getT('sessionActions');
 
 /** When the session page receives this, it opens the file panel on "Changes" */
 export const OPEN_CHANGES = 'yi-console:open-changes';
@@ -37,10 +39,10 @@ async function call(hostId: string, sessionId: string, method: string, params: R
 
 export async function renameSession(hostId: string, info: SessionInfo) {
   const t = await askText({
-    title: tr('重命名会话', 'Rename Session'),
+    title: tx('renameSession'),
     value: info.title || '',
-    placeholder: tr('会话名称', 'Session title'),
-    okText: tr('保存', 'Save'),
+    placeholder: tx('sessionTitle'),
+    okText: tx('save'),
   });
   if (t && t.trim() && t.trim() !== info.title) await call(hostId, info.id, 'session.rename', { title: t.trim() });
 }
@@ -48,7 +50,7 @@ export async function renameSession(hostId: string, info: SessionInfo) {
 export async function exportSession(hostId: string, info: SessionInfo, how: 'copy' | 'download') {
   try {
     const md = sessionMarkdown(info, await allEvents(hostId, info.id), TOOL_LABEL[info.tool]);
-    if (how === 'copy') toast((await writeClipboard(md)) ? tr('已复制为 Markdown', 'Copied as Markdown') : tr('复制失败', 'Failed to copy'));
+    if (how === 'copy') toast((await writeClipboard(md)) ? tx('copiedAsMarkdown') : tx('failedToCopy'));
     else downloadText(`${safeFileName(info.title)}.md`, md);
   } catch (e) {
     errorToast(e);
@@ -64,13 +66,13 @@ export async function handoffSession(hostId: string, info: SessionInfo) {
     // Older daemons don't send hasUser; skip the check then
     let { path, hasUser } = await rpc<{ path: string | null; hasUser?: boolean }>(hostId, 'session.logFile', { sessionId: info.id });
     if (hasUser === false) {
-      toast(tr('这个会话还没有对话内容', 'This session has no conversation yet'));
+      toast(tx('thisSessionHasNoConversation'));
       return;
     }
     const exported = !path;
     if (!path) {
       // No readable log file (Cursor): export the whole conversation as Markdown, which needs all events
-      const done = toast(tr('正在读取会话内容…', 'Loading conversation…'), 'loading');
+      const done = toast(tx('loadingConversation'), 'loading');
       let events: HubEvent[];
       try {
         events = await allEvents(hostId, info.id);
@@ -94,11 +96,11 @@ export async function deleteDirSessions(hostId: string, cwd: string) {
   const busy = list.filter((s) => s.status === 'running' || s.status === 'starting' || s.status === 'waiting-permission').length;
   const name = cwd.split(/[\\/]/).filter(Boolean).pop() || cwd;
   const ok = await askConfirm({
-    title: tr(`删除“${name}”下的全部 ${list.length} 个会话？`, `Delete all ${list.length} sessions in "${name}"?`),
+    title: tx('deleteAllSessionsIn', { name, length: list.length }),
     message:
-      tr('只删除 Yi Console 里的记录，工具自己的历史不受影响。', 'Only removes the records in Yi Console. Tool history is unaffected.') +
-      (busy ? tr(`\n其中 ${busy} 个正在运行，会被中断。`, `\n${busy} of them are running and will be interrupted.`) : ''),
-    okText: tr('全部删除', 'Delete All'),
+      tx('onlyRemovesTheRecordsIn') +
+      (busy ? tx('ofThemAreRunningAnd', { busy }) : ''),
+    okText: tx('deleteAll'),
     danger: true,
   });
   if (!ok) return;
@@ -114,18 +116,18 @@ export async function deleteDirSessions(hostId: string, cwd: string) {
   if ('sessionId' in v && v.hostId === hostId && list.some((s) => s.id === v.sessionId)) navigate({ kind: 'home' });
   toast(
     failed
-      ? tr(`已删除 ${list.length - failed} 个会话，${failed} 个删除失败`, `Deleted ${list.length - failed} sessions, ${failed} failed`)
-      : tr(`已删除 ${list.length} 个会话`, `Deleted ${list.length} sessions`),
+      ? tx('deletedSessionsFailed', { v: list.length - failed, failed })
+      : tx('deletedSessions', { length: list.length }),
     failed ? 'error' : 'info',
   );
 }
 
 export async function deleteSession(hostId: string, info: SessionInfo) {
-  const name = info.title || tr('新会话', 'New Session');
+  const name = info.title || tx('newSession');
   const ok = await askConfirm({
-    title: tr(`删除会话“${name}”？`, `Delete session "${name}"?`),
-    message: tr('只删除 Yi Console 里的记录，工具自己的历史不受影响。', 'Only removes the record in Yi Console. Tool history is unaffected.'),
-    okText: tr('删除', 'Delete'),
+    title: tx('deleteSession', { name }),
+    message: tx('onlyRemovesTheRecordIn'),
+    okText: tx('delete'),
     danger: true,
   });
   if (!ok) return;
@@ -138,15 +140,15 @@ export async function deleteSession(hostId: string, info: SessionInfo) {
 export async function clearSession(hostId: string, info: SessionInfo) {
   const busy = info.status === 'running' || info.status === 'waiting-permission' || info.status === 'starting';
   const ok = await askConfirm({
-    title: tr('清空这个会话的对话？', 'Clear this conversation?'),
+    title: tx('clearThisConversation'),
     message: isEn()
       ? `Chat history will be permanently deleted, token usage and cost reset to zero, and ${info.tool === 'claude' ? 'Claude Code' : 'the tool'} will start fresh on the next message.${busy ? '\nThe current turn in progress will be interrupted.' : ''}`
       : `聊天记录会被删除且无法恢复，token 和费用清零，下次发消息时 ${info.tool === 'claude' ? 'Claude Code' : '工具'}会从头开始，不记得之前的内容。${busy ? '\nAI 正在回复，这一轮会被中断。' : ''}`,
-    okText: tr('清空', 'Clear'),
+    okText: tx('clear'),
     danger: true,
   });
   if (!ok) return;
-  await call(hostId, info.id, 'session.clear', {}, tr('已清空对话', 'Conversation cleared'));
+  await call(hostId, info.id, 'session.clear', {}, tx('conversationCleared'));
 }
 
 /** Switch the same session between chat mode and terminal mode; the tool continues its original session */
@@ -155,9 +157,9 @@ export async function switchMode(hostId: string, info: SessionInfo) {
   const busy = info.status === 'running' || info.status === 'waiting-permission';
   if (to === 'terminal' && busy) {
     const ok = await askConfirm({
-      title: tr('切换到终端模式？', 'Switch to Terminal Mode?'),
-      message: tr('AI 正在回复，切换会中断这一轮。', 'AI is replying. Switching modes will interrupt the current turn.'),
-      okText: tr('切换', 'Switch'),
+      title: tx('switchToTerminalMode'),
+      message: tx('aiIsReplyingSwitchingModes'),
+      okText: tx('switch'),
     });
     if (!ok) return;
   }
@@ -172,7 +174,7 @@ export async function openTerminal(hostId: string, cwd = '~') {
       tool: 'shell',
       cwd,
       mode: 'terminal',
-      title: `${tr('终端', 'Terminal')} · ${dir}`,
+      title: `${tx('terminal')} · ${dir}`,
       cols: 120,
       rows: 32,
     });
@@ -213,19 +215,19 @@ function idItems(info: SessionInfo): MenuItem[] {
     ...(info.externalId
       ? [
           {
-            label: tr(`复制 ${tool} 会话 ID`, `Copy ${tool} Session ID`),
+            label: tx('copySessionId', { tool }),
             icon: 'copy',
             hint: info.externalId.slice(0, 8),
-            run: copy(info.externalId, tr(`已复制 ${tool} 会话 ID`, `Copied ${tool} Session ID`)),
+            run: copy(info.externalId, tx('copiedSessionId', { tool })),
           },
         ]
       : []),
-    ...(cmd ? [{ label: tr('复制恢复命令', 'Copy Resume Command'), icon: 'terminal', run: copy(cmd, tr(`已复制：${cmd}`, `Copied: ${cmd}`)) }] : []),
+    ...(cmd ? [{ label: tx('copyResumeCommand'), icon: 'terminal', run: copy(cmd, tx('copied', { cmd })) }] : []),
     {
-      label: tr('复制 Yi Console 会话 ID', 'Copy Yi Console Session ID'),
+      label: tx('copyYiConsoleSessionId'),
       icon: 'copy',
       hint: info.id.slice(0, 8),
-      run: copy(info.id, tr('已复制 Yi Console 会话 ID', 'Copied Yi Console Session ID')),
+      run: copy(info.id, tx('copiedYiConsoleSessionId')),
     },
   ];
 }
@@ -234,20 +236,20 @@ function idItems(info: SessionInfo): MenuItem[] {
 function filesMenu(hostId: string, info: SessionInfo, inSession?: boolean): (MenuItem | '-')[] {
   const sid = info.id;
   return [
-    ...(inSession ? [] : [{ label: tr('打开', 'Open'), icon: 'folder', run: () => navigate({ kind: 'session', hostId, sessionId: sid }) }]),
+    ...(inSession ? [] : [{ label: tx('open'), icon: 'folder', run: () => navigate({ kind: 'session', hostId, sessionId: sid }) }]),
     {
-      label: tr('重命名', 'Rename'),
+      label: tx('rename'),
       icon: 'edit',
-      hint: isMobile() ? undefined : inSession ? tr('双击标题', 'Double-click title') : 'F2',
+      hint: isMobile() ? undefined : inSession ? tx('doubleClickTitle') : 'F2',
       run: () => renameSession(hostId, info),
     },
-    { label: info.pinned ? tr('取消置顶', 'Unpin') : tr('置顶', 'Pin'), icon: 'pin', run: () => call(hostId, sid, 'session.pin', { pinned: !info.pinned }) },
+    { label: info.pinned ? tx('unpin') : tx('pin'), icon: 'pin', run: () => call(hostId, sid, 'session.pin', { pinned: !info.pinned }) },
     '-',
-    ...(inSession ? [] : [{ label: tr('查看改动', 'View Changes'), icon: 'diff', run: () => showChanges(hostId, sid) }]),
-    { label: tr('端口转发', 'Port Forwarding'), icon: 'external', run: () => navigate({ kind: 'ports', hostId }) },
-    { label: tr('复制工作目录路径', 'Copy Directory Path'), icon: 'copy', run: () => writeClipboard(info.cwd).then(() => toast(tr('已复制路径', 'Path copied'))) },
+    ...(inSession ? [] : [{ label: tx('viewChanges'), icon: 'diff', run: () => showChanges(hostId, sid) }]),
+    { label: tx('portForwarding'), icon: 'external', run: () => navigate({ kind: 'ports', hostId }) },
+    { label: tx('copyDirectoryPath'), icon: 'copy', run: () => writeClipboard(info.cwd).then(() => toast(tx('pathCopied'))) },
     '-',
-    { label: tr('删除会话', 'Delete Session'), icon: 'trash', danger: true, run: () => deleteSession(hostId, info) },
+    { label: tx('deleteSession2'), icon: 'trash', danger: true, run: () => deleteSession(hostId, info) },
   ];
 }
 
@@ -269,58 +271,58 @@ export function sessionMenu(
   const mobile = isMobile();
   if (info.tool === 'files') return filesMenu(hostId, info, opts.inSession);
   return [
-    ...(opts.inSession ? [] : [{ label: tr('打开', 'Open'), icon: 'chat', run: () => navigate({ kind: 'session', hostId, sessionId: sid }) }]),
+    ...(opts.inSession ? [] : [{ label: tx('open'), icon: 'chat', run: () => navigate({ kind: 'session', hostId, sessionId: sid }) }]),
     {
-      label: tr('重命名', 'Rename'),
+      label: tx('rename'),
       icon: 'edit',
-      hint: mobile ? undefined : opts.inSession ? tr('双击标题', 'Double-click title') : 'F2',
+      hint: mobile ? undefined : opts.inSession ? tx('doubleClickTitle') : 'F2',
       run: () => renameSession(hostId, info),
     },
     {
-      label: info.pinned ? tr('取消置顶', 'Unpin') : tr('置顶', 'Pin'),
+      label: info.pinned ? tx('unpin') : tx('pin'),
       icon: 'pin',
       run: () => call(hostId, sid, 'session.pin', { pinned: !info.pinned }),
     },
     ...(info.tool !== 'shell' && !info.parentId
       ? [
           info.mode === 'terminal'
-            ? { label: tr('切换到对话模式', 'Switch to Chat Mode'), icon: 'chat', run: () => switchMode(hostId, info) }
-            : { label: tr('切换到终端模式', 'Switch to Terminal Mode'), icon: 'terminal', run: () => switchMode(hostId, info) },
+            ? { label: tx('switchToChatMode'), icon: 'chat', run: () => switchMode(hostId, info) }
+            : { label: tx('switchToTerminalMode2'), icon: 'terminal', run: () => switchMode(hostId, info) },
         ]
       : []),
     ...(opts.onToggleStyle && info.mode === 'structured' && info.tool !== 'shell'
       ? [
           {
-            label: opts.style === 'modern' ? tr('回复风格：切换到时间线', 'Reply Style: Switch to Timeline') : tr('回复风格：切换到简约', 'Reply Style: Switch to Minimal'),
+            label: opts.style === 'modern' ? tx('replyStyleSwitchToTimeline') : tx('replyStyleSwitchToMinimal'),
             icon: opts.style === 'modern' ? 'outline' : 'rows',
             run: opts.onToggleStyle,
           },
         ]
       : []),
-    ...(info.tool !== 'shell' && info.mode !== 'terminal' ? [{ label: tr('清空对话', 'Clear Conversation'), icon: 'trash', run: () => clearSession(hostId, info) }] : []),
+    ...(info.tool !== 'shell' && info.mode !== 'terminal' ? [{ label: tx('clearConversation'), icon: 'trash', run: () => clearSession(hostId, info) }] : []),
     // No tool session id means nothing has been said yet (or just /clear-ed), so there's nothing to hand off
     ...(info.tool !== 'shell' && info.mode === 'structured' && !info.parentId && info.externalId
-      ? [{ label: tr('换个工具继续…', 'Continue in Another Tool…'), icon: 'forward', run: () => handoffSession(hostId, info) }]
+      ? [{ label: tx('continueInAnotherTool'), icon: 'forward', run: () => handoffSession(hostId, info) }]
       : []),
     '-',
     // The session page has its own "View Changes" button in the top bar
-    ...(opts.inSession ? [] : [{ label: tr('查看改动', 'View Changes'), icon: 'diff', run: () => showChanges(hostId, sid) }]),
+    ...(opts.inSession ? [] : [{ label: tx('viewChanges'), icon: 'diff', run: () => showChanges(hostId, sid) }]),
     // The mobile top bar already has a usage button, so don't repeat it in the menu; the terminal panel is the reverse and only appears in the mobile menu
-    ...(opts.onUsage && info.tool !== 'shell' && !mobile ? [{ label: tr('查看用量', 'View Usage'), icon: 'chart', run: opts.onUsage }] : []),
+    ...(opts.onUsage && info.tool !== 'shell' && !mobile ? [{ label: tx('viewUsage'), icon: 'chart', run: opts.onUsage }] : []),
     ...(opts.onToggleTerm && info.tool !== 'shell' && mobile
-      ? [{ label: opts.term ? tr('收起终端面板', 'Hide Terminal Panel') : tr('打开终端面板', 'Open Terminal Panel'), icon: 'terminal', run: opts.onToggleTerm }]
+      ? [{ label: opts.term ? tx('hideTerminalPanel') : tx('openTerminalPanel'), icon: 'terminal', run: opts.onToggleTerm }]
       : []),
-    { label: tr('复制为 Markdown', 'Copy as Markdown'), icon: 'copy', run: () => exportSession(hostId, info, 'copy') },
-    { label: tr('导出 Markdown 文件', 'Export Markdown File'), icon: 'download', run: () => exportSession(hostId, info, 'download') },
-    { label: tr('浏览工作目录', 'Browse Working Directory'), icon: 'folder', run: () => navigate({ kind: 'files', hostId, path: info.cwd }) },
-    { label: tr('端口转发', 'Port Forwarding'), icon: 'external', run: () => navigate({ kind: 'ports', hostId }) },
-    { label: tr('复制工作目录路径', 'Copy Directory Path'), icon: 'copy', run: () => writeClipboard(info.cwd).then(() => toast(tr('已复制路径', 'Path copied'))) },
+    { label: tx('copyAsMarkdown'), icon: 'copy', run: () => exportSession(hostId, info, 'copy') },
+    { label: tx('exportMarkdownFile'), icon: 'download', run: () => exportSession(hostId, info, 'download') },
+    { label: tx('browseWorkingDirectory'), icon: 'folder', run: () => navigate({ kind: 'files', hostId, path: info.cwd }) },
+    { label: tx('portForwarding'), icon: 'external', run: () => navigate({ kind: 'ports', hostId }) },
+    { label: tx('copyDirectoryPath'), icon: 'copy', run: () => writeClipboard(info.cwd).then(() => toast(tx('pathCopied'))) },
     ...idItems(info),
     '-',
-    ...(alive ? [{ label: tr('停止进程', 'Stop Process'), icon: 'power', run: () => call(hostId, sid, 'session.kill', {}, tr('已停止', 'Stopped')) }] : []),
+    ...(alive ? [{ label: tx('stopProcess'), icon: 'power', run: () => call(hostId, sid, 'session.kill', {}, tx('stopped')) }] : []),
     ...(opts.inSession
-      ? [{ label: tr('重新加载', 'Reload'), icon: 'refresh', run: () => loadSession(hostId, sid, true).catch(errorToast) }]
+      ? [{ label: tx('reload'), icon: 'refresh', run: () => loadSession(hostId, sid, true).catch(errorToast) }]
       : []),
-    { label: tr('删除会话', 'Delete Session'), icon: 'trash', danger: true, run: () => deleteSession(hostId, info) },
+    { label: tx('deleteSession2'), icon: 'trash', danger: true, run: () => deleteSession(hostId, info) },
   ];
 }

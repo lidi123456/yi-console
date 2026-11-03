@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { useBack } from '../back';
-import { isEn, tr } from '../i18n';
+import { getT, isEn } from '../i18n';
 import { errorToast, hostStatus, navigate, setState, useStore } from '../store';
 import { rpc } from '../transport';
 import { TOOL_LABEL, type DirEntry, type ModelOption, type SessionInfo, type SessionMode, type ToolKind } from '../types';
@@ -8,6 +8,8 @@ import { lsGet, lsSet, shortPath } from '../util';
 import { useDrives } from './FilesView';
 import { Icon, ToolBadge } from './Icon';
 import { EFFORT_LABEL } from './ModelPicker';
+
+const tx = getT('newSession');
 
 export function DirPicker({
   hostId,
@@ -43,13 +45,13 @@ export function DirPicker({
   return (
     <div className="dirpicker">
       <div className="dirpicker-head">
-        <button className="icon-btn" disabled={!list?.parent} onClick={() => list?.parent && setPath(list.parent)} title={tr('上一级', 'Up')}>
+        <button className="icon-btn" disabled={!list?.parent} onClick={() => list?.parent && setPath(list.parent)} title={tx('up')}>
           <Icon name="up" size={16} />
         </button>
         <span className="mono truncate grow">{list?.path ?? path}</span>
         {drives.length > 1 && (
-          <select value="" onChange={(e) => e.target.value && setPath(e.target.value)} title={tr('切换磁盘', 'Switch Drive')}>
-            <option value="">{tr('盘符', 'Drive')}</option>
+          <select value="" onChange={(e) => e.target.value && setPath(e.target.value)} title={tx('switchDrive')}>
+            <option value="">{tx('drive')}</option>
             {drives.map((d) => (
               <option key={d} value={d}>
                 {d}
@@ -70,10 +72,10 @@ export function DirPicker({
       </div>
       <div className="row end">
         <button className="btn" onClick={onClose}>
-          {tr('取消', 'Cancel')}
+          {tx('cancel')}
         </button>
         <button className="btn primary" disabled={!list} onClick={() => list && onPick(list.path)}>
-          {tr('选择此目录', 'Select Directory')}
+          {tx('selectDirectory')}
         </button>
       </div>
     </div>
@@ -255,7 +257,7 @@ export function NewSessionDialog() {
     <div className="modal-bg" onClick={close}>
       <div className="modal ns-modal" onClick={(e) => e.stopPropagation()}>
         <div className="modal-head">
-          <h3>{ns.resumeId ? tr('继续会话', 'Resume Session') : ns.handoff ? tr('换个工具继续', 'Continue in Another Tool') : tr('新建会话', 'New Session')}</h3>
+          <h3>{ns.resumeId ? tx('resumeSession') : ns.handoff ? tx('continueInAnotherTool') : tx('newSession')}</h3>
           <button className="icon-btn" onClick={close}>
             <Icon name="x" />
           </button>
@@ -275,7 +277,7 @@ export function NewSessionDialog() {
             {/* Continue with another tool: the original session's log is on the original host, so the host can't change */}
             {connectedHosts.length > 1 && !ns.resumeId && !ns.handoff && (
               <label>
-                {tr('主机', 'Host')}
+                {tx('host')}
                 <select
                   value={hostId}
                   onChange={(e) => {
@@ -295,7 +297,7 @@ export function NewSessionDialog() {
               </label>
             )}
             <div className="field">
-              <span>{tr('工具', 'Tool')}</span>
+              <span>{tx('tool')}</span>
               <div className="tool-grid">
                 {tools.map((t) => (
                   <button
@@ -305,12 +307,12 @@ export function NewSessionDialog() {
                     }
                     className={`tool-opt ${tool === t.kind ? 'active' : ''}`}
                     onClick={() => setTool(t.kind)}
-                    title={t.available ? (t.version ?? t.path ?? '') : tr('这台机器上没有安装', 'Not installed on this host')}
+                    title={t.available ? (t.version ?? t.path ?? '') : tx('notInstalledOnThisHost')}
                   >
                     <ToolBadge tool={t.kind} size={18} />
                     <span className="tool-opt-label">
                       {TOOL_LABEL[t.kind]}
-                      {!t.available && <span className="tool-opt-tag">{tr('未安装', 'Not installed')}</span>}
+                      {!t.available && <span className="tool-opt-tag">{tx('notInstalled')}</span>}
                     </span>
                   </button>
                 ))}
@@ -318,36 +320,36 @@ export function NewSessionDialog() {
             </div>
             {aiTool && !ns.handoff && (
               <div className="field">
-                <span>{tr('界面', 'Interface')}</span>
+                <span>{tx('interface')}</span>
                 <div className="seg">
                   <button className={mode === 'structured' ? 'active' : ''} onClick={() => setMode('structured')}>
-                    <Icon name="chat" size={14} /> {tr('对话', 'Chat')}
+                    <Icon name="chat" size={14} /> {tx('chat')}
                   </button>
                   <button className={mode === 'terminal' ? 'active' : ''} onClick={() => setMode('terminal')}>
-                    <Icon name="terminal" size={14} /> {tr('终端', 'Terminal')}
+                    <Icon name="terminal" size={14} /> {tx('terminal')}
                   </button>
                 </div>
               </div>
             )}
             <label>
-              {tr('工作目录', 'Working Directory')}
+              {tx('workingDirectory')}
               <div className="row">
                 <input value={cwd} onChange={(e) => setCwd(e.target.value)} placeholder="~/project" />
                 <button className="btn" onClick={() => setPicking(true)}>
-                  {tr('浏览', 'Browse')}
+                  {tx('browse')}
                 </button>
               </div>
               <span className="muted small">{shortPath(cwd, st.hello?.home)}</span>
             </label>
             {tool === 'files' ? null : tool === 'shell' ? (
               <label>
-                {tr('命令（留空则打开默认 shell）', 'Command (leave empty for default shell)')}
-                <input value={command} onChange={(e) => setCommand(e.target.value)} placeholder={tr('例如 htop', 'e.g. htop')} />
+                {tx('commandLeaveEmptyForDefault')}
+                <input value={command} onChange={(e) => setCommand(e.target.value)} placeholder={tx('eGHtop')} />
               </label>
             ) : (
               <>
                 <div className="field">
-                  <span>{tr('审批模式', 'Permission Mode')}</span>
+                  <span>{tx('permissionMode')}</span>
                   <div className="seg wrap">
                     {permModes(tool, mode).map(([v, l, d]) => (
                       <button key={v} className={perm === v ? 'active' : ''} onClick={() => setPerm(v)} title={d}>
@@ -357,7 +359,7 @@ export function NewSessionDialog() {
                   </div>
                 </div>
                 <label>
-                  {tr('模型', 'Model')}
+                  {tx('model')}
                   {models && models.length > 0 && !customModel ? (
                     <select
                       value={model}
@@ -368,14 +370,14 @@ export function NewSessionDialog() {
                         } else setModel(e.target.value);
                       }}
                     >
-                      <option value="">{tr('工具默认', 'Tool Default')}</option>
+                      <option value="">{tx('toolDefault')}</option>
                       {models.map((m) => (
                         <option key={m.id} value={m.id}>
                           {m.name || m.id}
                           {m.description ? ` — ${m.description}` : ''}
                         </option>
                       ))}
-                      <option value="__custom">{tr('其他（手动输入）…', 'Other (custom)…')}</option>
+                      <option value="__custom">{tx('otherCustom')}</option>
                     </select>
                   ) : (
                     <input
@@ -383,8 +385,8 @@ export function NewSessionDialog() {
                       onChange={(e) => setModel(e.target.value)}
                       placeholder={
                         models === null
-                          ? tr('正在读取可选模型…（也可以直接输入）', 'Loading models… (or type model ID)')
-                          : tr('留空使用工具默认模型', 'Leave empty for tool default model')
+                          ? tx('loadingModelsOrTypeModel')
+                          : tx('leaveEmptyForToolDefault')
                       }
                     />
                   )}
@@ -395,10 +397,10 @@ export function NewSessionDialog() {
                   if (!list.length) return null;
                   return (
                     <div className="field">
-                      <span>{tr('思考等级', 'Reasoning Effort')}</span>
+                      <span>{tx('reasoningEffort')}</span>
                       <div className="seg wrap">
                         <button className={!effort ? 'active' : ''} onClick={() => setEffort('')}>
-                          {tr('默认', 'Default')}
+                          {tx('default')}
                           {m?.defaultEffort
                             ? isEn()
                               ? ` (${EFFORT_LABEL[m.defaultEffort] ?? m.defaultEffort})`
@@ -416,21 +418,21 @@ export function NewSessionDialog() {
                 })()}
                 {effectiveMode === 'structured' && !ns.resumeId && (
                   <label>
-                    {ns.handoff ? tr('第一条消息', 'Initial Prompt') : tr('第一条消息（可选）', 'Initial Prompt (optional)')}
-                    <textarea rows={ns.handoff ? 10 : 3} value={prompt} onChange={(e) => setPrompt(e.target.value)} placeholder={tr('想让它做什么？', 'What would you like to do?')} />
+                    {ns.handoff ? tx('initialPrompt') : tx('initialPromptOptional')}
+                    <textarea rows={ns.handoff ? 10 : 3} value={prompt} onChange={(e) => setPrompt(e.target.value)} placeholder={tx('whatWouldYouLikeTo')} />
                   </label>
                 )}
               </>
             )}
             {handoffBlocked && tools.length > 0 && (
-              <p className="muted small">{tr('这台主机上没有装其他可用的工具。', 'No other tool is installed on this host.')}</p>
+              <p className="muted small">{tx('noOtherToolIsInstalled')}</p>
             )}
             <div className="row end ns-actions">
               <button className="btn" onClick={close}>
-                {tr('取消', 'Cancel')}
+                {tx('cancel')}
               </button>
               <button className="btn primary" disabled={busy || !cwd || handoffBlocked} onClick={create}>
-                {busy ? (aiTool || tool === 'shell' ? tr('启动中…', 'Starting…') : tr('创建中…', 'Creating…')) : ns.resumeId ? tr('继续', 'Resume') : tr('创建', 'Create')}
+                {busy ? (aiTool || tool === 'shell' ? tx('starting') : tx('creating')) : ns.resumeId ? tx('resume') : tx('create')}
               </button>
             </div>
           </div>

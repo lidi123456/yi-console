@@ -1,0 +1,14 @@
+{
+  "switchToLightTheme": "换成亮色",
+  "switchToDarkTheme": "换成暗色",
+  "light": "☀ 亮色",
+  "dark": "☾ 暗色",
+  "decreaseFontSize": "缩小字号",
+  "increaseFontSize": "放大字号",
+  "copy": "复制",
+  "paste": "粘贴",
+  "selectAll": "全选",
+  "clear": "清屏",
+  "jumpToBottomTypingAlso": "回到底部（直接打字也会回到底部）",
+  "bottomLines": "↓ 回到底部 · 上翻 {{position}} 行"
+}

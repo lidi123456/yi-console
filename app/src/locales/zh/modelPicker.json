@@ -1,0 +1,13 @@
+{
+  "defaultModel": "默认模型",
+  "chooseModel": "选择模型",
+  "close": "关闭",
+  "searchModels": "搜索模型",
+  "loading": "加载中…",
+  "noModelsReportedYetTry": "工具还没报告可选模型，发一条消息后再试",
+  "reasoningEffort": "思考等级",
+  "toolDefault": "工具默认（{{v}}）",
+  "toolDefault2": "工具默认",
+  "default": "默认",
+  "switchModel": "切换模型"
+}

@@ -1,0 +1,35 @@
+{
+  "placeholder": "跳到会话，或输入操作…",
+  "untitledSession": "新会话",
+  "shortcuts": {
+    "palette": "命令面板：跳到会话、执行操作",
+    "newSession": "新建会话（浏览器里用 Alt+N）",
+    "switchSession": "上一个 / 下一个会话",
+    "backForward": "后退 / 前进",
+    "sidebar": "收起 / 展开侧边栏",
+    "rename": "重命名当前会话",
+    "interrupt": "中断当前回合（输入框里）",
+    "permissionMode": "切换审批模式（输入框里）",
+    "slash": "斜杠命令、提示词片段（输入框开头）",
+    "mention": "引用文件"
+  },
+  "actions": {
+    "newSession": "新建会话",
+    "overview": "总览",
+    "hosts": "主机管理",
+    "prefs": "系统设置",
+    "prefsSub": "外观、语言、通知、网络代理"
+  },
+  "host": {
+    "history": "{{name}}：历史会话",
+    "files": "{{name}}：文件",
+    "stats": "{{name}}：用量",
+    "ports": "{{name}}：端口转发",
+    "settings": "{{name}}：主机设置",
+    "settingsSub": "提示词片段、状态栏、推送"
+  },
+  "search": {
+    "all": "在所有会话的消息里搜索",
+    "query": "在消息里搜索“{{query}}”"
+  }
+}

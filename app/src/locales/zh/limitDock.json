@@ -1,0 +1,9 @@
+{
+  "continuesAtIn": "{{v}} 自动继续 · 还有 {{v2}}",
+  "autoAt": "{{v}} 自动继续 · 还有 {{v2}}",
+  "continuing": "正在自动继续…",
+  "sendContinueRightAway": "现在就发送“继续”",
+  "continueNow": "立即继续",
+  "continue": "立即继续",
+  "cancel": "取消"
+}

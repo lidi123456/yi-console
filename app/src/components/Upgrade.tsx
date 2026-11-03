@@ -1,6 +1,8 @@
-import { tr } from '../i18n';
+import { getT } from '../i18n';
 import { hubCall } from '../transport';
 import { errorToast, setState, useStore } from '../store';
+
+const t = getT('upgrade');
 
 /** yi-agentd upgrade: block the whole screen while uploading / restarting (the host is unreachable then); while waiting for a turn to end, only a corner notice */
 export function UpgradeOverlay() {
@@ -24,7 +26,7 @@ export function UpgradeOverlay() {
         <div className="modal-bg upgrade-bg">
           <div className="modal upgrade-modal">
             <div className="modal-head">
-              <h3>{tr('正在升级 yi-agentd', 'Upgrading yi-agentd')}</h3>
+              <h3>{t('upgradingYiAgentd')}</h3>
             </div>
             {blocking.map(([id, u]) => (
               <div key={id} className="upgrade-item">
@@ -41,17 +43,17 @@ export function UpgradeOverlay() {
                 {u.phase === 'error' && (
                   <div className="upgrade-actions">
                     <button className="btn small" onClick={() => dismiss(id)}>
-                      {tr('关闭', 'Close')}
+                      {t('close')}
                     </button>
                     <button className="btn small primary" onClick={() => now(id)}>
-                      {tr('重试', 'Retry')}
+                      {t('retry')}
                     </button>
                   </div>
                 )}
               </div>
             ))}
             <div className="muted small upgrade-note">
-              {tr('升级期间暂时无法使用，完成后会自动重新连接，会话都会保留。', 'Temporarily unavailable during upgrade. It will reconnect automatically and all sessions will be preserved.')}
+              {t('temporarilyUnavailableDuringUpgradeIt')}
             </div>
           </div>
         </div>
@@ -59,10 +61,10 @@ export function UpgradeOverlay() {
       {waiting.map(([id, u]) => (
         <div key={id} className="upgrade-toast">
           <span>
-            {name(id)}{tr('：', ': ')}{u.message}
+            {name(id)}{t('text')}{u.message}
           </span>
           <button className="link-btn small" onClick={() => now(id)}>
-            {tr('立即升级', 'Upgrade Now')}
+            {t('upgradeNow')}
           </button>
         </div>
       ))}

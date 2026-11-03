@@ -19,7 +19,9 @@ import { customFrame, TitleBar } from './components/TitleBar';
 import { Lightbox } from './components/Lightbox';
 import { UpgradeOverlay } from './components/Upgrade';
 import { AppUpdateNotice } from './components/AppUpdate';
-import { tr, useLang } from './i18n';
+import { getT, useLang } from './i18n';
+
+const t = getT('app');
 
 function Toasts() {
   const toasts = useStore((s) => s.toasts);
@@ -91,7 +93,7 @@ export function App() {
       <Sidebar />
       <main className="main">
         <div className="mobile-bar">
-          <button className="icon-btn" onClick={() => setState({ sidebarOpen: true })} aria-label={tr('菜单', 'Menu')}>
+          <button className="icon-btn" onClick={() => setState({ sidebarOpen: true })} aria-label={t('menu')}>
             <Icon name="menu" />
             {attn > 0 && <span className="badge">{attn}</span>}
           </button>

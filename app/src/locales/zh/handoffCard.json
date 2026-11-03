@@ -1,0 +1,10 @@
+{
+  "saved": "已保存",
+  "restoredDefaultTemplate": "已恢复默认模板",
+  "continueInAnotherTool": "换个工具继续",
+  "whenYouUseContinueIn": "会话菜单里「换个工具继续」时，新会话第一条消息用这个模板生成，打开对话框后还可以再改。",
+  "availablePlaceholdersReplacedWithActual": "可用的占位符（生成时替换成实际内容）：",
+  "leaveEmptyOrIdenticalTo": "留空或和默认一样时使用默认模板（跟随界面语言）。只保存在这台设备上。",
+  "restoreDefault": "恢复默认",
+  "save": "保存"
+}

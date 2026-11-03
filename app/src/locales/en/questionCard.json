@@ -1,0 +1,15 @@
+{
+  "questions": "{{length}} questions",
+  "expand": "Expand",
+  "collapse": "Collapse",
+  "multiSelect": " (Multi-select)",
+  "otherTypeYourAnswer": "Other (type your answer)…",
+  "typeYourAnswer": "Type your answer…",
+  "skip": "Skip",
+  "pleaseAnswerAllQuestions": "Please answer all questions",
+  "submit": "Submit",
+  "cancelled": "Cancelled",
+  "skipped": "Skipped",
+  "unanswered": "(Unanswered)",
+  "pleaseSelect": "Please select"
+}

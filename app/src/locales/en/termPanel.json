@@ -1,0 +1,15 @@
+{
+  "terminal": "Terminal",
+  "terminalPanel": "Terminal Panel",
+  "terminalTabs": "Terminal Tabs",
+  "exited": "{{title}} (Exited)",
+  "exited2": "Exited",
+  "closeTerminal": "Close terminal {{title}}",
+  "newTerminal": "New Terminal",
+  "hideTerminalPanelProcessesKeep": "Hide terminal panel (processes keep running)",
+  "failedToCreateTerminal": "Failed to create terminal",
+  "retry": "Retry",
+  "openingTerminal": "Opening terminal…",
+  "noTerminals": "No terminals",
+  "openATerminalInThe": "Open a terminal in the session working directory."
+}

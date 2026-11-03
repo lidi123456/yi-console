@@ -1,9 +1,11 @@
 import { useEffect, useMemo, useState } from 'react';
-import { isEn, tr } from '../i18n';
+import { getT, isEn } from '../i18n';
 import { hostStatus } from '../store';
 import { rpc } from '../transport';
 import { TOOL_LABEL, type DaemonSettings, type HubEvent, type Quota, type SessionInfo, type StatusLineSettings } from '../types';
 import { basename, fmtTokens, shortPath, STATUS_LABEL } from '../util';
+
+const t = getT('statusLine');
 
 export const DEFAULT_STATUS_LINE: StatusLineSettings = {
   items: ['model', 'context', 'branch', 'tokens', 'cost'],
@@ -191,10 +193,10 @@ function values(info: SessionInfo, events: HubEvent[], git: Git | null, quota: Q
     .join(' ');
   const v: Record<string, string> = {
     model: info.model ?? '',
-    context: info.contextPercent != null ? `${tr('上下文', 'Context')} ${Math.round(info.contextPercent)}%` : '',
+    context: info.contextPercent != null ? `${t('context')} ${Math.round(info.contextPercent)}%` : '',
     tokens: tokens ? `${fmtTokens(tokens)} tokens` : '',
     cost,
-    lastTurn: turn != null ? `${tr('上一轮', 'Last')} ${fmtMs(turn)}` : '',
+    lastTurn: turn != null ? `${t('last')} ${fmtMs(turn)}` : '',
     branch: git?.branch ?? '',
     dirty: git && git.changed > 0 ? '*' : '',
     changed: git ? String(git.changed) : '',
@@ -301,7 +303,7 @@ export function StatusLine({ hostId, info, events }: { hostId: string; info: Ses
   return (
     <div
       className="status-line"
-      title={cmd?.source === 'claude' ? tr('右侧来自 ~/.claude/settings.json 的 statusLine 命令', 'Right side from statusLine command in ~/.claude/settings.json') : undefined}
+      title={cmd?.source === 'claude' ? t('rightSideFromStatuslineCommand') : undefined}
     >
       {builtin.trim() && <span className="sl-builtin">{cfg.template.includes('{command}') ? <Ansi text={builtin} /> : builtin}</span>}
       {showCmd && <Ansi text={cmd!.text} />}

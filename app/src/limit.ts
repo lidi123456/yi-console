@@ -1,8 +1,10 @@
 // Wording for usage limits and the automatic continue (`rate_limit` events, `SessionInfo.autoResume`)
 
-import { isEn, tr } from './i18n';
+import { getT, isEn } from './i18n';
 import type { HubEvent } from './types';
 import { clock } from './util';
+
+const t = getT('limit');
 
 export type LimitEvent = HubEvent & { kind: 'rate_limit' };
 
@@ -10,13 +12,13 @@ export type LimitEvent = HubEvent & { kind: 'rate_limit' };
 export function limitName(limit?: string | null): string {
   switch (limit) {
     case 'five_hour':
-      return tr('5 小时额度', '5-hour limit');
+      return t('n5HourLimit');
     case 'seven_day':
-      return tr('每周额度', 'weekly limit');
+      return t('weeklyLimit');
     case 'seven_day_opus':
-      return tr('每周 Opus 额度', 'weekly Opus limit');
+      return t('weeklyOpusLimit');
     case 'seven_day_sonnet':
-      return tr('每周 Sonnet 额度', 'weekly Sonnet limit');
+      return t('weeklySonnetLimit');
     case null:
     case undefined:
     case '':
@@ -47,7 +49,7 @@ export function fmtLeft(ms: number): string {
 export function limitHead(hit: LimitEvent | undefined, resetsAt?: number): string {
   const name = limitName(hit?.limit);
   const at = resetsAt ?? hit?.resetsAt;
-  const extra = [name, at ? tr(`${fmtAt(at)} 恢复`, `resets ${fmtAt(at)}`) : ''].filter(Boolean).join(isEn() ? ', ' : '，');
+  const extra = [name, at ? t('resets', { v: fmtAt(at) }) : ''].filter(Boolean).join(isEn() ? ', ' : '，');
   return isEn() ? `Usage limit reached${extra ? ` (${extra})` : ''}` : `额度已用完${extra ? `（${extra}）` : ''}`;
 }
 
@@ -55,38 +57,38 @@ export function limitHead(hit: LimitEvent | undefined, resetsAt?: number): strin
 export function limitOutcome(e: LimitEvent, live: boolean): string {
   switch (e.phase) {
     case 'hit':
-      return live ? tr('正在查询恢复时间…', 'Looking up when it resets…') : '';
+      return live ? t('lookingUpWhenItResets') : '';
     case 'scheduled':
-      return e.resumeAt ? tr(`将在 ${fmtAt(e.resumeAt)} 自动继续`, `will continue automatically at ${fmtAt(e.resumeAt)}`) : '';
+      return e.resumeAt ? t('willContinueAutomaticallyAt', { v: fmtAt(e.resumeAt) }) : '';
     case 'skipped':
       switch (e.reason) {
         case 'off':
-          return tr('自动继续已在设置中关闭', 'automatic continue is turned off in settings');
+          return t('automaticContinueIsTurnedOff');
         case 'unknown':
-          return tr('查不到恢复时间，不会自动继续', "couldn't find when it resets, so it won't continue automatically");
+          return t('couldnTFindWhenIt');
         case 'far':
-          return tr('恢复时间超过一天，不会自动继续', "resets more than a day from now, so it won't continue automatically");
+          return t('resetsMoreThanADay');
         case 'repeated':
-          return tr('连续多次碰到额度上限，已停止自动继续', 'hit the limit again several times in a row, automatic continue stopped');
+          return t('hitTheLimitAgainSeveral');
         default:
-          return tr('不会自动继续', "won't continue automatically");
+          return t('wonTContinueAutomatically');
       }
     case 'resumed':
-      return e.reason === 'now' ? tr('已手动立即继续', 'continued now by hand') : tr('额度已恢复，已自动发送继续', 'limit reset, sent "continue" automatically');
+      return e.reason === 'now' ? t('continuedNowByHand') : t('limitResetSentContinueAutomatically');
     case 'cancelled':
       switch (e.reason) {
         case 'user':
-          return tr('已取消自动继续', 'automatic continue cancelled');
+          return t('automaticContinueCancelled');
         case 'manual':
-          return tr('你发送了消息，不再自动继续', 'you sent a message, automatic continue dropped');
+          return t('youSentAMessageAutomatic');
         case 'mode':
-          return tr('切换到了终端界面，不再自动继续', 'switched to the terminal UI, automatic continue dropped');
+          return t('switchedToTheTerminalUi');
         case 'off':
-          return tr('自动继续已在设置中关闭', 'automatic continue is turned off in settings');
+          return t('automaticContinueIsTurnedOff');
         case 'busy':
-          return tr('会话正在运行，跳过了自动继续', 'the session was busy, automatic continue skipped');
+          return t('theSessionWasBusyAutomatic');
         default:
-          return tr('自动继续已取消', 'automatic continue cancelled');
+          return t('automaticContinueCancelled2');
       }
   }
 }

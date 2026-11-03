@@ -1,5 +1,7 @@
 import { useEffect, useState } from 'react';
+import i18next from 'i18next';
 import { lsGet, lsSet } from './util';
+import { resources } from './locales';
 
 // UI language: follow system / Chinese / English, stored in local localStorage.
 
@@ -24,7 +26,27 @@ export function isEn(): boolean {
   return getLang() === 'en';
 }
 
+// Resources are bundled, so init and changeLanguage complete synchronously
+i18next.init({
+  resources,
+  lng: getLang(),
+  fallbackLng: 'zh',
+  ns: Object.keys(resources.zh),
+  defaultNS: false,
+  initAsync: false,
+  interpolation: { escapeValue: false }, // React escapes already
+});
+
+/** Translator for one namespace (one JSON file per language), usable outside components:
+ *    const t = getT('palette');  t('host.files', { name })
+ *  Keys and {{placeholders}} are type-checked against the Chinese file (see locales/i18next.d.ts). The language is
+ *  resolved on every call, so a module-level t follows language changes. */
+export function getT<N extends keyof typeof resources.zh>(ns: N) {
+  return i18next.getFixedT(null, ns);
+}
+
 function apply() {
+  if (i18next.language !== getLang()) i18next.changeLanguage(getLang());
   if (typeof document === 'undefined') return;
   document.documentElement.lang = isEn() ? 'en' : 'zh-CN';
 }
@@ -59,11 +81,6 @@ export function useLang(): [LangPref, Lang] {
 export function onLangChange(f: () => void): () => void {
   window.addEventListener(EVENT, f);
   return () => window.removeEventListener(EVENT, f);
-}
-
-/** Bilingual value: returns the Chinese or English text for the current language */
-export function tr<T = string>(zh: T, en: T): T {
-  return isEn() ? en : zh;
 }
 
 const ERR_PATTERNS: [RegExp, string | ((...m: string[]) => string)][] = [

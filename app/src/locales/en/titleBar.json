@@ -1,0 +1,10 @@
+{
+  "minimize": "Minimize",
+  "restore": "Restore",
+  "maximize": "Maximize",
+  "close": "Close",
+  "backAlt": "Back (Alt+←)",
+  "forwardAlt": "Forward (Alt+→)",
+  "showSidebar": "Show Sidebar ({{mod}}+B)",
+  "hideSidebar": "Hide Sidebar ({{mod}}+B)"
+}

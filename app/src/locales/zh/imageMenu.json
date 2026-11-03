@@ -1,0 +1,11 @@
+{
+  "failedToLoadImage": "图片加载失败",
+  "conversionFailed": "转换失败",
+  "imageCopied": "已复制图片",
+  "failedToCopyImage": "复制图片失败：{{v}}",
+  "saved": "已保存",
+  "failedToSave": "保存失败：{{v}}",
+  "copyImage": "复制图片",
+  "saveImageAs": "另存为…",
+  "zoomIn": "放大查看"
+}

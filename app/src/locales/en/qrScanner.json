@@ -1,0 +1,9 @@
+{
+  "noCameraPermissionAllowYi": "No camera permission. Allow Yi Console to use the camera in system settings, or paste the pairing link.",
+  "noCameraFound": "No camera found",
+  "theCameraIsInUse": "The camera is in use by another app or could not be opened",
+  "couldNotOpenTheCamera": "Could not open the camera: {{v}}",
+  "close": "Close",
+  "fitThePairingQrCode": "Fit the pairing QR code from the computer inside the frame",
+  "openingTheCamera": "Opening the camera…"
+}

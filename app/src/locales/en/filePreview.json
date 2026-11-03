@@ -1,0 +1,20 @@
+{
+  "firstRowIsAHeader": "First row is a header",
+  "filterRows": "Filter rows…",
+  "showingTheFirstRowsSwitch": "Showing the first {{MAX_ROWS}} rows. Switch to Source for the rest.",
+  "pdfPreview": "PDF preview",
+  "pdfPreviewIsNotAvailable": "PDF preview is not available on this system",
+  "download": "Download",
+  "couldNotLoadImage": "Could not load image: {{raw}}",
+  "imagePreview": "Image preview: {{name}}",
+  "zoomOut": "Zoom out (-)",
+  "clickToToggleFitActual": "Click to toggle fit / actual size",
+  "zoomIn": "Zoom in (+)",
+  "fit0": "Fit (0)",
+  "rotateLeftShiftR": "Rotate left (Shift+R)",
+  "rotateRightR": "Rotate right (R)",
+  "flipHorizontal": "Flip horizontal",
+  "fullScreen": "Full screen",
+  "csvSize": "{{rows}} rows · {{cols}} cols",
+  "csvShown": " · {{n}} shown"
+}

@@ -1,0 +1,13 @@
+{
+  "newSession": "New Session",
+  "pending": "{{pendingPermissions}} pending",
+  "overview": "Overview",
+  "newSession2": "New Session",
+  "loading": "Loading…",
+  "noHostsConnected": "No hosts connected",
+  "addAnSshHostOr": "Add an SSH host, or pair a computer connected via relay.",
+  "manageHosts": "Manage Hosts",
+  "waitingForApproval": "Waiting for Approval",
+  "running": "Running",
+  "recent": "Recent"
+}

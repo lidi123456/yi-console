@@ -1,0 +1,53 @@
+{
+  "src/App.tsx": {
+    "hardcoded: Yi Console": 1
+  },
+  "src/chatImages.ts": {
+    "concatenation: Avoid string concatenation in translations. Use a single string with placeholders instead.": 1
+  },
+  "src/components/Browser.tsx": {
+    "concatenation: Avoid splitting text across multiple translations (<Trans> or t()). Use a single translation with placeholders instead.": 1
+  },
+  "src/components/FilesView.tsx": {
+    "hardcoded: ..": 1
+  },
+  "src/components/GrepPanel.tsx": {
+    "concatenation: Avoid string concatenation in translations. Use a single string with placeholders instead.": 1,
+    "hardcoded: .*": 1,
+    "hardcoded: AB": 1,
+    "hardcoded: Aa": 1
+  },
+  "src/components/HandoffCard.tsx": {
+    "concatenation: Avoid splitting text across multiple translations (<Trans> or t()). Use a single translation with placeholders instead.": 1
+  },
+  "src/components/HostsView.tsx": {
+    "concatenation: Avoid splitting text across multiple translations (<Trans> or t()). Use a single translation with placeholders instead.": 2,
+    "hardcoded: -----BEGIN OPENSSH PRIVATE KEY-----": 1
+  },
+  "src/components/PortsView.tsx": {
+    "hardcoded: localhost:": 1
+  },
+  "src/components/PrefsView.tsx": {
+    "hardcoded: Yi Console": 1,
+    "hardcoded: px": 1
+  },
+  "src/components/SearchView.tsx": {
+    "concatenation: Avoid string concatenation in translations. Use a single string with placeholders instead.": 1
+  },
+  "src/components/SessionActions.ts": {
+    "concatenation: Avoid string concatenation in translations. Use a single string with placeholders instead.": 1
+  },
+  "src/components/Sidebar.tsx": {
+    "hardcoded: Enter": 1,
+    "hardcoded: Yi Console": 1
+  },
+  "src/components/StatsView.tsx": {
+    "concatenation: Avoid splitting text across multiple translations (<Trans> or t()). Use a single translation with placeholders instead.": 1,
+    "hardcoded: Tokens": 1,
+    "hardcoded: credits": 2
+  },
+  "src/components/TerminalView.tsx": {
+    "hardcoded: A+": 1,
+    "hardcoded: A−": 1
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "bashCommand": "Bash Command",
+  "subagent": "Subagent",
+  "remoteAgent": "Remote Agent",
+  "loading": "Loading…",
+  "noOutputYet": "(no output yet)",
+  "backgroundTaskS": "{{length}} background task(s)",
+  "hide": "Hide",
+  "output": "Output",
+  "stop": "Stop"
+}

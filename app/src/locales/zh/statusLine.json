@@ -1,0 +1,5 @@
+{
+  "context": "上下文",
+  "last": "上一轮",
+  "rightSideFromStatuslineCommand": "右侧来自 ~/.claude/settings.json 的 statusLine 命令"
+}

@@ -1,0 +1,8 @@
+{
+  "upgradingYiAgentd": "正在升级 yi-agentd",
+  "close": "关闭",
+  "retry": "重试",
+  "temporarilyUnavailableDuringUpgradeIt": "升级期间暂时无法使用，完成后会自动重新连接，会话都会保留。",
+  "text": "：",
+  "upgradeNow": "立即升级"
+}

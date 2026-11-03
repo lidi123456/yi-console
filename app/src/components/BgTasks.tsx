@@ -1,18 +1,20 @@
 import { useEffect, useState } from 'react';
-import { isEn, tr } from '../i18n';
+import { getT, isEn } from '../i18n';
 import { errorToast } from '../store';
 import { rpc } from '../transport';
 import type { BackgroundTask, SessionInfo } from '../types';
 import { Icon } from './Icon';
 
+const tx = getT('bgTasks');
+
 function kindLabel(k: string) {
   switch (k) {
     case 'local_bash':
-      return tr('终端命令', 'Bash Command');
+      return tx('bashCommand');
     case 'local_agent':
-      return tr('子代理', 'Subagent');
+      return tx('subagent');
     case 'remote_agent':
-      return tr('远程代理', 'Remote Agent');
+      return tx('remoteAgent');
     default:
       return k;
   }
@@ -46,7 +48,7 @@ function TaskOutput({ hostId, path }: { hostId: string; path: string }) {
       clearInterval(t);
     };
   }, [hostId, path]);
-  return <pre className="mono bg-output">{text === null ? tr('读取中…', 'Loading…') : text || tr('（还没有输出）', '(no output yet)')}</pre>;
+  return <pre className="mono bg-output">{text === null ? tx('loading') : text || tx('noOutputYet')}</pre>;
 }
 
 /** Background task bar above the input box: one line normally, expands to list each task, with output and stop */
@@ -74,7 +76,7 @@ export function BgTasks({ hostId, info }: { hostId: string; info: SessionInfo })
     <div className={`bg-tasks ${open ? 'open' : ''}`}>
       <button className="bg-tasks-head" onClick={() => setOpen(!open)}>
         <span className="spinner" />
-        <span className="bg-tasks-count">{tr(`${tasks.length} 个后台任务`, `${tasks.length} background task(s)`)}</span>
+        <span className="bg-tasks-count">{tx('backgroundTaskS', { length: tasks.length })}</span>
         {!open && (
           <span className="bg-tasks-sum truncate" title={tasks.map((t) => t.description || t.id).join('\n')}>
             {tasks.map((t) => oneLine(t.description || t.id)).join(isEn() ? ', ' : '、')}
@@ -97,11 +99,11 @@ export function BgTasks({ hostId, info }: { hostId: string; info: SessionInfo })
               <span className="muted small">{fmtElapsed(now - t.startedAt)}</span>
               {t.outputFile && (
                 <button className="btn small" onClick={() => setViewing(viewing === t.id ? null : t.id)}>
-                  {viewing === t.id ? tr('收起', 'Hide') : tr('输出', 'Output')}
+                  {viewing === t.id ? tx('hide') : tx('output')}
                 </button>
               )}
               <button className="btn small danger-ghost" onClick={() => stop(t)}>
-                {tr('停止', 'Stop')}
+                {tx('stop')}
               </button>
             </div>
             {viewing === t.id && t.outputFile && <TaskOutput hostId={hostId} path={t.outputFile} />}

@@ -1,10 +1,12 @@
 import { useDeferredValue, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import { tr } from '../i18n';
+import { getT } from '../i18n';
 import { marked, type Token, type TokensList } from 'marked';
 import DOMPurify from 'dompurify';
 import { rpc } from '../transport';
 import { Icon } from './Icon';
 import { openImage } from './Lightbox';
+
+const t = getT('filePreview');
 
 // PDF, CSV and Markdown previews in the file panel
 
@@ -60,16 +62,14 @@ export function CsvView({ text, tsv }: { text: string; tsv: boolean }) {
     <div className="csv">
       <div className="csv-bar">
         <span className="muted small">
-          {tr(
-            `${body.length}${more ? '+' : ''} 行 · ${cols} 列${ql ? ` · 筛出 ${shown.length} 行` : ''}`,
-            `${body.length}${more ? '+' : ''} rows · ${cols} cols${ql ? ` · ${shown.length} shown` : ''}`,
-          )}
+          {t('csvSize', { rows: `${body.length}${more ? '+' : ''}`, cols })}
+          {ql ? t('csvShown', { n: shown.length }) : ''}
         </span>
         <label className="csv-opt small">
-          <input type="checkbox" checked={header} onChange={(e) => setHeader(e.target.checked)} /> {tr('第一行是表头', 'First row is a header')}
+          <input type="checkbox" checked={header} onChange={(e) => setHeader(e.target.checked)} /> {t('firstRowIsAHeader')}
         </label>
         <div className="grow" />
-        <input className="csv-filter" value={q} placeholder={tr('筛选行…', 'Filter rows…')} onChange={(e) => setQ(e.target.value)} />
+        <input className="csv-filter" value={q} placeholder={t('filterRows')} onChange={(e) => setQ(e.target.value)} />
       </div>
       <div className="csv-scroll">
         <table>
@@ -98,7 +98,7 @@ export function CsvView({ text, tsv }: { text: string; tsv: boolean }) {
             ))}
           </tbody>
         </table>
-        {more && <div className="muted small csv-more">{tr(`只显示前 ${MAX_ROWS} 行，完整内容切到「源码」看。`, `Showing the first ${MAX_ROWS} rows. Switch to Source for the rest.`)}</div>}
+        {more && <div className="muted small csv-more">{t('showingTheFirstRowsSwitch', { MAX_ROWS })}</div>}
       </div>
     </div>
   );
@@ -115,12 +115,12 @@ export function PdfView({ base64, onDownload }: { base64: string; onDownload: ()
   useEffect(() => () => URL.revokeObjectURL(url), [url]);
   const supported = typeof navigator !== 'undefined' && (navigator as Navigator & { pdfViewerEnabled?: boolean }).pdfViewerEnabled !== false;
   return supported ? (
-    <iframe className="wp-pdf" src={url} title={tr('PDF 预览', 'PDF preview')} />
+    <iframe className="wp-pdf" src={url} title={t('pdfPreview')} />
   ) : (
     <div className="wp-empty">
-      <div className="wp-empty-title">{tr('这个系统上不能直接预览 PDF', 'PDF preview is not available on this system')}</div>
+      <div className="wp-empty-title">{t('pdfPreviewIsNotAvailable')}</div>
       <button className="btn small" onClick={onDownload}>
-        {tr('下载到本机', 'Download')}
+        {t('download')}
       </button>
     </div>
   );
@@ -270,7 +270,7 @@ export function MdPreview({
         () => {
           img.alt = img.alt || raw;
           img.classList.add('md-img-missing');
-          img.title = tr(`读不到图片：${raw}`, `Could not load image: ${raw}`);
+          img.title = t('couldNotLoadImage', { raw });
         },
       );
       img.addEventListener('load', measure, { once: true });
@@ -442,7 +442,7 @@ export function ImageView({ src, name, size }: { src: string; name: string; size
     }}>
       <img
         src={src}
-        alt={tr(`图片预览：${name}`, `Image preview: ${name}`)}
+        alt={t('imagePreview', { name })}
         draggable={false}
         onLoad={(e) => setNat({ w: e.currentTarget.naturalWidth, h: e.currentTarget.naturalHeight })}
         style={{
@@ -454,29 +454,29 @@ export function ImageView({ src, name, size }: { src: string; name: string; size
         }}
       />
       <div className="iv-bar" onDoubleClick={(e) => e.stopPropagation()}>
-        <button title={tr('缩小（-）', 'Zoom out (-)')} onClick={() => zoomTo(s / 1.25)}>
+        <button title={t('zoomOut')} onClick={() => zoomTo(s / 1.25)}>
           <Icon name="zoom-out" size={15} />
         </button>
-        <button className="iv-pct" title={`${nat ? `${nat.w} × ${nat.h} · ` : ''}${size}\n${tr('点一下切换适应窗口 / 原始大小', 'Click to toggle fit / actual size')}`} onClick={() => (scale === null ? (zoomTo(1), setPos({ x: 0, y: 0 })) : fit())}>
+        <button className="iv-pct" title={`${nat ? `${nat.w} × ${nat.h} · ` : ''}${size}\n${t('clickToToggleFitActual')}`} onClick={() => (scale === null ? (zoomTo(1), setPos({ x: 0, y: 0 })) : fit())}>
           {Math.round(s * 100)}%
         </button>
-        <button title={tr('放大（+）', 'Zoom in (+)')} onClick={() => zoomTo(s * 1.25)}>
+        <button title={t('zoomIn')} onClick={() => zoomTo(s * 1.25)}>
           <Icon name="zoom" size={15} />
         </button>
         <span className="iv-sep" />
-        <button title={tr('适应窗口（0）', 'Fit (0)')} className={scale === null ? 'on' : ''} onClick={fit}>
+        <button title={t('fit0')} className={scale === null ? 'on' : ''} onClick={fit}>
           <Icon name="fit" size={15} />
         </button>
-        <button title={tr('向左旋转（Shift+R）', 'Rotate left (Shift+R)')} onClick={() => rotate(-90)}>
+        <button title={t('rotateLeftShiftR')} onClick={() => rotate(-90)}>
           <Icon name="rotate-l" size={15} />
         </button>
-        <button title={tr('向右旋转（R）', 'Rotate right (R)')} onClick={() => rotate(90)}>
+        <button title={t('rotateRightR')} onClick={() => rotate(90)}>
           <Icon name="rotate-r" size={15} />
         </button>
-        <button title={tr('水平翻转', 'Flip horizontal')} className={flip ? 'on' : ''} onClick={() => setFlip(!flip)}>
+        <button title={t('flipHorizontal')} className={flip ? 'on' : ''} onClick={() => setFlip(!flip)}>
           <Icon name="flip" size={15} />
         </button>
-        <button title={tr('全屏查看', 'Full screen')} onClick={() => openImage(src)}>
+        <button title={t('fullScreen')} onClick={() => openImage(src)}>
           <Icon name="maximize" size={14} />
         </button>
         <span className="iv-info">

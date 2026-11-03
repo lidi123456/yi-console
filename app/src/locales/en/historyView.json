@@ -1,0 +1,20 @@
+{
+  "history": "History",
+  "refresh": "Refresh",
+  "sessionsSavedByEachTool": "Sessions saved by each tool. Continue one from here.",
+  "includingSubfolders": " (including subfolders)",
+  "allFolders": "All folders",
+  "searchTitlesInThisFolder": "Search titles in this folder",
+  "searchTitlesOrFolders": "Search titles or folders",
+  "all": "All",
+  "reading": "Reading",
+  "unknownFolder": "Unknown folder",
+  "msgs": " · {{messageCount}} msgs",
+  "showMoreLeft": "Show more ({{v}} left)",
+  "noHistoryInThisFolder": "No history in this folder",
+  "nothingHere": "Nothing here",
+  "continue": "Continue",
+  "loading": "Loading…",
+  "historyIsShownAfterYou": "{{v}} history is shown after you continue the session.",
+  "selectASessionToView": "Select a session to view"
+}

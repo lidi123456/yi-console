@@ -1,0 +1,13 @@
+{
+  "newSession": "新会话",
+  "pending": "{{pendingPermissions}} 个待审批",
+  "overview": "总览",
+  "newSession2": "新建会话",
+  "loading": "加载中…",
+  "noHostsConnected": "还没有连上任何主机",
+  "addAnSshHostOr": "添加一台 SSH 主机，或者扫码配对一台通过中继连接的电脑。",
+  "manageHosts": "打开主机管理",
+  "waitingForApproval": "等待你审批",
+  "running": "运行中",
+  "recent": "最近"
+}

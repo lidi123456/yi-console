@@ -1,0 +1,15 @@
+{
+  "openInBrowser": "Open in browser",
+  "loadingImage": "Loading image…",
+  "imageUnavailable": "Image unavailable: {{path}} ({{v}})",
+  "clickToLoad": "Click to load",
+  "imageTooLargeOver10mb": "Image too large ({{v}}), over 10MB: {{path}}",
+  "text": " (",
+  "text2": ")",
+  "downloadImage": "Download image",
+  "downloadImageFrom": "Download image {{name}}{{sz}} from \"{{hostName}}\"?\n{{path}}",
+  "download": "Download",
+  "imageFailedToLoad": "Image failed to load",
+  "image": "Image",
+  "image2": "Image: {{src}}"
+}

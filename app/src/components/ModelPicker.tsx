@@ -1,12 +1,14 @@
 import { useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { useBack } from '../back';
-import { isEn, tr } from '../i18n';
+import { getT, isEn } from '../i18n';
 import { errorToast } from '../store';
 import { rpc } from '../transport';
 import type { ModelOption, SessionInfo } from '../types';
 import { Icon } from './Icon';
 import { isMobile } from '../util';
+
+const t = getT('modelPicker');
 
 /** Open the model menu (used by /model in the input box) */
 export const OPEN_MODEL = 'ah:open-model';
@@ -19,7 +21,7 @@ function findModel(current: string, models: ModelOption[]) {
 
 /** Model name: use the display name if it's in the list */
 function modelLabel(current: string | null | undefined, models: ModelOption[]) {
-  if (!current) return tr('默认模型', 'Default Model');
+  if (!current) return t('defaultModel');
   return findModel(current, models)?.name || current;
 }
 
@@ -128,18 +130,18 @@ export function ModelPicker({ hostId, info }: { hostId: string; info: SessionInf
         >
           {sheet && (
             <div className="model-sheet-head">
-              <span>{tr('选择模型', 'Choose Model')}</span>
-              <button className="icon-btn" aria-label={tr('关闭', 'Close')} onClick={() => setOpen(false)}>
+              <span>{t('chooseModel')}</span>
+              <button className="icon-btn" aria-label={t('close')} onClick={() => setOpen(false)}>
                 <Icon name="x" size={16} />
               </button>
             </div>
           )}
           {(models?.length ?? 0) > 8 && (
-            <input autoFocus={!sheet} value={q} onChange={(e) => setQ(e.target.value)} placeholder={tr('搜索模型', 'Search models')} />
+            <input autoFocus={!sheet} value={q} onChange={(e) => setQ(e.target.value)} placeholder={t('searchModels')} />
           )}
-          {models === null && <div className="muted small pad-x">{tr('加载中…', 'Loading…')}</div>}
+          {models === null && <div className="muted small pad-x">{t('loading')}</div>}
           {models?.length === 0 && (
-            <div className="muted small pad-x">{tr('工具还没报告可选模型，发一条消息后再试', 'No models reported yet. Try again after sending a message.')}</div>
+            <div className="muted small pad-x">{t('noModelsReportedYetTry')}</div>
           )}
           <div className="model-list">
             {list.map((m) => {
@@ -157,18 +159,18 @@ export function ModelPicker({ hostId, info }: { hostId: string; info: SessionInf
           </div>
           {efforts.length > 0 && (
             <div className="effort-row">
-              <div className="muted small">{tr('思考等级', 'Reasoning Effort')}</div>
+              <div className="muted small">{t('reasoningEffort')}</div>
               <div className="seg effort-seg">
                 <button
                   className={!effort ? 'active' : ''}
                   title={
                     curModel?.defaultEffort
-                      ? tr(`工具默认（${effortLabel(curModel.defaultEffort)}）`, `Tool default (${effortLabel(curModel.defaultEffort)})`)
-                      : tr('工具默认', 'Tool default')
+                      ? t('toolDefault', { v: effortLabel(curModel.defaultEffort) })
+                      : t('toolDefault2')
                   }
                   onClick={() => pickEffort('')}
                 >
-                  {tr('默认', 'Default')}
+                  {t('default')}
                 </button>
                 {efforts.map((e) => (
                   <button key={e} className={effort === e ? 'active' : ''} onClick={() => pickEffort(e)}>
@@ -184,7 +186,7 @@ export function ModelPicker({ hostId, info }: { hostId: string; info: SessionInf
     <div className="menu-wrap" ref={wrapRef}>
       <button
         className="model-btn"
-        title={tr('切换模型', 'Switch Model')}
+        title={t('switchModel')}
         onClick={() => {
           if (!open) load();
           setOpen(!open);

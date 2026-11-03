@@ -1,0 +1,9 @@
+{
+  "files": "Files",
+  "newSessionHere": "New session here",
+  "showHiddenFiles": "Show hidden files",
+  "binaryFileCannotPreview": "Binary file, cannot preview",
+  "fileIsLargeShowingThe": "… File is large; showing the first 1MB",
+  "selectAFileToPreview": "Select a file to preview",
+  "viewHistory": "View history"
+}

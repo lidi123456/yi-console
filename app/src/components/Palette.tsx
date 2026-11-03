@@ -1,11 +1,13 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { tr, useLang } from '../i18n';
+import { getT, useLang } from '../i18n';
 import { getState, goBack, goForward, navigate, orderedSessions, setState, toggleSidebar, useStore } from '../store';
 import { renameSession } from './SessionActions';
 import { TOOL_LABEL } from '../types';
 import { basename, fuzzyScore, timeAgo } from '../util';
 import { Icon, ToolBadge } from './Icon';
 import { sessionStatusClass } from './Sidebar';
+
+const t = getT('palette');
 
 interface Entry {
   key: string;
@@ -22,17 +24,17 @@ export const MOD = isMac ? '⌘' : 'Ctrl';
 
 export function getShortcuts(): [string, string][] {
   return [
-    [`${MOD}+K`, tr('命令面板：跳到会话、执行操作', 'Command Palette: jump to session or run action')],
-    [`${MOD}+Shift+F`, tr('在所有会话的消息里搜索', 'Search messages across all sessions')],
-    [`${MOD}+N`, tr('新建会话（浏览器里用 Alt+N）', 'New Session (Alt+N in browser)')],
-    ['Alt+↑ / Alt+↓', tr('上一个 / 下一个会话', 'Previous / Next session')],
-    ['Alt+← / Alt+→', tr('后退 / 前进', 'Back / Forward')],
-    [`${MOD}+B`, tr('收起 / 展开侧边栏', 'Toggle Sidebar')],
-    ['F2', tr('重命名当前会话', 'Rename current session')],
-    ['Esc', tr('中断当前回合（输入框里）', 'Interrupt current turn (in input)')],
-    ['Shift+Tab', tr('切换审批模式（输入框里）', 'Cycle permission mode (in input)')],
-    ['/', tr('斜杠命令、提示词片段（输入框开头）', 'Slash commands & snippets (at start of input)')],
-    ['@', tr('引用文件', 'Reference files')],
+    [`${MOD}+K`, t('shortcuts.palette')],
+    [`${MOD}+Shift+F`, t('search.all')],
+    [`${MOD}+N`, t('shortcuts.newSession')],
+    ['Alt+↑ / Alt+↓', t('shortcuts.switchSession')],
+    ['Alt+← / Alt+→', t('shortcuts.backForward')],
+    [`${MOD}+B`, t('shortcuts.sidebar')],
+    ['F2', t('shortcuts.rename')],
+    ['Esc', t('shortcuts.interrupt')],
+    ['Shift+Tab', t('shortcuts.permissionMode')],
+    ['/', t('shortcuts.slash')],
+    ['@', t('shortcuts.mention')],
   ];
 }
 
@@ -128,33 +130,33 @@ export function Palette() {
     const hostName = (id: string) => hosts.find((h) => h.config.id === id)?.config.name ?? '';
     const sess: Entry[] = orderedSessions().map(({ hostId, s }) => ({
       key: `s-${hostId}-${s.id}`,
-      label: s.title || tr('新会话', 'New Session'),
+      label: s.title || t('untitledSession'),
       sub: `${TOOL_LABEL[s.tool]} · ${hostName(hostId)} · ${basename(s.cwd)} · ${timeAgo(s.updatedAt)}`,
       tool: s.tool,
       cls: sessionStatusClass(s),
       run: () => navigate({ kind: 'session', hostId, sessionId: s.id }),
     }));
     const acts: Entry[] = [
-      { key: 'a-new', label: tr('新建会话', 'New Session'), icon: 'plus', sub: `${MOD}+N`, run: newSession },
-      { key: 'a-home', label: tr('总览', 'Overview'), icon: 'home', run: () => navigate({ kind: 'home' }) },
-      { key: 'a-hosts', label: tr('主机管理', 'Hosts'), icon: 'server', run: () => navigate({ kind: 'hosts' }) },
-      { key: 'a-prefs', label: tr('系统设置', 'Preferences'), icon: 'settings', sub: tr('外观、语言、通知、网络代理', 'Appearance, language, notifications, proxy'), run: () => navigate({ kind: 'prefs' }) },
+      { key: 'a-new', label: t('actions.newSession'), icon: 'plus', sub: `${MOD}+N`, run: newSession },
+      { key: 'a-home', label: t('actions.overview'), icon: 'home', run: () => navigate({ kind: 'home' }) },
+      { key: 'a-hosts', label: t('actions.hosts'), icon: 'server', run: () => navigate({ kind: 'hosts' }) },
+      { key: 'a-prefs', label: t('actions.prefs'), icon: 'settings', sub: t('actions.prefsSub'), run: () => navigate({ kind: 'prefs' }) },
     ];
     for (const h of hosts.filter((x) => x.status.status === 'connected')) {
       const id = h.config.id;
       const n = h.config.name;
       acts.push(
-        { key: `h-hist-${id}`, label: tr(`${n}：历史会话`, `${n}: Session History`), icon: 'history', run: () => navigate({ kind: 'history', hostId: id }) },
-        { key: `h-files-${id}`, label: tr(`${n}：文件`, `${n}: Files`), icon: 'folder', run: () => navigate({ kind: 'files', hostId: id }) },
-        { key: `h-stats-${id}`, label: tr(`${n}：用量`, `${n}: Usage Stats`), icon: 'chart', run: () => navigate({ kind: 'stats', hostId: id }) },
-        { key: `h-ports-${id}`, label: tr(`${n}：端口转发`, `${n}: Port Forwarding`), icon: 'external', run: () => navigate({ kind: 'ports', hostId: id }) },
-        { key: `h-set-${id}`, label: tr(`${n}：主机设置`, `${n}: Host Settings`), icon: 'settings', sub: tr('提示词片段、状态栏、推送', 'Snippets, status line, tool paths'), run: () => navigate({ kind: 'settings', hostId: id }) },
+        { key: `h-hist-${id}`, label: t('host.history', { name: n }), icon: 'history', run: () => navigate({ kind: 'history', hostId: id }) },
+        { key: `h-files-${id}`, label: t('host.files', { name: n }), icon: 'folder', run: () => navigate({ kind: 'files', hostId: id }) },
+        { key: `h-stats-${id}`, label: t('host.stats', { name: n }), icon: 'chart', run: () => navigate({ kind: 'stats', hostId: id }) },
+        { key: `h-ports-${id}`, label: t('host.ports', { name: n }), icon: 'external', run: () => navigate({ kind: 'ports', hostId: id }) },
+        { key: `h-set-${id}`, label: t('host.settings', { name: n }), icon: 'settings', sub: t('host.settingsSub'), run: () => navigate({ kind: 'settings', hostId: id }) },
       );
     }
     const query = q.trim();
     const search: Entry = {
       key: 'a-search',
-      label: query ? tr(`在消息里搜索“${query}”`, `Search messages for "${query}"`) : tr('在所有会话的消息里搜索', 'Search messages across all sessions'),
+      label: query ? t('search.query', { query }) : t('search.all'),
       icon: 'search',
       sub: `${MOD}+Shift+F`,
       run: () => navigate({ kind: 'search', q: query || undefined }),
@@ -190,7 +192,7 @@ export function Palette() {
           <input
             autoFocus
             value={q}
-            placeholder={tr('跳到会话，或输入操作…', 'Jump to session, or type a command…')}
+            placeholder={t('placeholder')}
             onChange={(e) => setQ(e.target.value)}
             onKeyDown={(e) => {
               if (e.nativeEvent.isComposing) return;

@@ -3,8 +3,10 @@
 // Order: first close the topmost open thing (dialog, menu, image viewer, file panel, etc.; last opened closes first), then the command palette;
 // if the left navigation is open, only collapse it; finally go back to the previous page.
 import { useEffect, useRef } from 'react';
-import { tr } from './i18n';
+import { getT } from './i18n';
 import { getState, goBack, setState, toast } from './store';
+
+const t = getT('back');
 
 const stack: (() => void)[] = [];
 
@@ -43,7 +45,7 @@ export function handleBack(): boolean {
   const now = Date.now();
   if (now - lastTry < 2000) return false;
   lastTry = now;
-  toast(tr('再按一次退出', 'Press back again to exit'));
+  toast(t('pressBackAgainToExit'));
   return true;
 }
 

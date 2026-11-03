@@ -1,4 +1,4 @@
-import { tr } from '../i18n';
+import { getT } from '../i18n';
 import {
   autoUpdateEnabled,
   checkUpdate,
@@ -14,6 +14,8 @@ import {
 import { fmtSize } from '../util';
 import { useState } from 'react';
 
+const t = getT('appUpdate');
+
 // App self-update UI: a corner notice when a new version is found (or while it downloads / installs),
 // and the "Updates" part of the About card in system settings. Logic is in app/src/update.ts.
 
@@ -24,18 +26,18 @@ function percent(u: UpdateState): number | null {
 function progressText(u: UpdateState): string {
   const p = percent(u);
   return p != null
-    ? tr(`正在下载更新 ${p}%`, `Downloading update ${p}%`)
-    : tr(`正在下载更新 ${fmtSize(u.got ?? 0)}`, `Downloading update ${fmtSize(u.got ?? 0)}`);
+    ? t('downloadingUpdate', { p })
+    : t('downloadingUpdate2', { v: fmtSize(u.got ?? 0) });
 }
 
 function installingText(): string {
   return updatePlatform === 'android'
-    ? tr('请在系统安装界面确认安装', 'Confirm the install in the system installer')
-    : tr('正在安装，完成后会自动重启', 'Installing, the app will restart when done');
+    ? t('confirmTheInstallInThe')
+    : t('installingTheAppWillRestart');
 }
 
 const PERMISSION_TEXT = () =>
-  tr('请允许 Yi Console 安装应用，返回后会继续安装', 'Allow Yi Console to install apps; installing continues when you come back');
+  t('allowYiConsoleToInstall');
 
 function Bar({ u }: { u: UpdateState }) {
   const p = percent(u);
@@ -60,7 +62,7 @@ export function AppUpdateNotice() {
     <div className="upgrade-toast app-update" role="status">
       <div className="grow min0">
         {u.phase === 'available' && (
-          <span>{tr(`Yi Console ${u.version} 可以更新了`, `Yi Console ${u.version} is available`)}</span>
+          <span>{t('yiConsoleIsAvailable', { version: u.version ?? '' })}</span>
         )}
         {u.phase === 'downloading' && (
           <>
@@ -74,21 +76,21 @@ export function AppUpdateNotice() {
       {u.phase === 'available' && (
         <>
           <button className="link-btn small" onClick={() => installUpdate()}>
-            {u.installable === false ? tr('去下载', 'Download') : tr('立即更新', 'Update Now')}
+            {u.installable === false ? t('download') : t('updateNow')}
           </button>
           <button className="link-btn small muted" onClick={dismissUpdate}>
-            {tr('稍后', 'Later')}
+            {t('later')}
           </button>
         </>
       )}
       {u.phase === 'installing' && updatePlatform === 'android' && (
         <button className="link-btn small" onClick={() => installUpdate()}>
-          {tr('重新安装', 'Install Again')}
+          {t('installAgain')}
         </button>
       )}
       {(u.phase === 'installing' || u.phase === 'permission') && updatePlatform === 'android' && (
         <button className="link-btn small muted" onClick={() => setClosedIn(u.phase)}>
-          {tr('关闭', 'Close')}
+          {t('close')}
         </button>
       )}
     </div>
@@ -102,20 +104,20 @@ export function UpdateSection({ Switch }: { Switch: (p: { checked: boolean; onCh
   if (!updateSupported) return null;
   const busy = ['checking', 'downloading', 'installing'].includes(u.phase);
   let status = '';
-  if (u.phase === 'checking') status = tr('正在检查更新…', 'Checking for updates…');
-  else if (u.phase === 'latest') status = tr(`已经是最新版本（${u.current}）`, `You are up to date (${u.current})`);
-  else if (u.phase === 'available') status = tr(`发现新版本 ${u.version}`, `New version ${u.version} available`);
+  if (u.phase === 'checking') status = t('checkingForUpdates');
+  else if (u.phase === 'latest') status = t('youAreUpToDate', { current: u.current });
+  else if (u.phase === 'available') status = t('newVersionAvailable', { version: u.version ?? '' });
   else if (u.phase === 'downloading') status = progressText(u);
   else if (u.phase === 'installing') status = installingText();
   else if (u.phase === 'permission') status = PERMISSION_TEXT();
-  else if (u.current) status = tr(`当前版本 ${u.current}`, `Current version ${u.current}`);
+  else if (u.current) status = t('currentVersion', { current: u.current });
   return (
     <div className="app-update-section">
       <div className="pref-row">
         <div className="grow min0">
-          <div>{tr('自动检查更新', 'Check for updates automatically')}</div>
+          <div>{t('checkForUpdatesAutomatically')}</div>
           <div className="muted small">
-            {tr('启动后和之后每 6 小时检查一次，有新版本时在右下角提示。', 'At startup and every 6 hours; a new version is announced in the corner.')}
+            {t('atStartupAndEvery6')}
           </div>
         </div>
         <Switch
@@ -134,14 +136,14 @@ export function UpdateSection({ Switch }: { Switch: (p: { checked: boolean; onCh
         {u.phase === 'available' || (u.phase === 'installing' && updatePlatform === 'android') ? (
           <button className="btn primary small" onClick={() => installUpdate()}>
             {u.phase !== 'available'
-              ? tr('重新安装', 'Install Again')
+              ? t('installAgain')
               : u.installable === false
-                ? tr('去下载', 'Download')
-                : tr('立即更新', 'Update Now')}
+                ? t('download')
+                : t('updateNow')}
           </button>
         ) : (
           <button className="btn small" disabled={busy} onClick={() => checkUpdate()}>
-            {tr('检查更新', 'Check for Updates')}
+            {t('checkForUpdates')}
           </button>
         )}
       </div>

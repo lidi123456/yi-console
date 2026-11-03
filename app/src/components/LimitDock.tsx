@@ -1,10 +1,12 @@
 import { useEffect, useState } from 'react';
-import { isEn, tr } from '../i18n';
+import { getT, isEn } from '../i18n';
 import { fmtAt, fmtLeft, limitName } from '../limit';
 import { errorToast } from '../store';
 import { rpc } from '../transport';
 import type { SessionInfo } from '../types';
 import { Icon } from './Icon';
+
+const t = getT('limitDock');
 
 /** Above the input box while an automatic continue is pending: countdown, "Continue now" and "Cancel" */
 export function LimitDock({ hostId, info, connected }: { hostId: string; info: SessionInfo; connected: boolean }) {
@@ -38,20 +40,20 @@ export function LimitDock({ hostId, info, connected }: { hostId: string; info: S
         <span className="limit-dock-when">
           {left > 0 ? (
             <>
-              <span className="hide-mobile">{tr(`${fmtAt(ar.at)} 自动继续 · 还有 ${fmtLeft(left)}`, `continues at ${fmtAt(ar.at)} · in ${fmtLeft(left)}`)}</span>
-              <span className="show-mobile">{tr(`${fmtAt(ar.at)} 自动继续 · 还有 ${fmtLeft(left)}`, `Auto at ${fmtAt(ar.at)} · ${fmtLeft(left)}`)}</span>
+              <span className="hide-mobile">{t('continuesAtIn', { v: fmtAt(ar.at), v2: fmtLeft(left) })}</span>
+              <span className="show-mobile">{t('autoAt', { v: fmtAt(ar.at), v2: fmtLeft(left) })}</span>
             </>
           ) : (
-            tr('正在自动继续…', 'Continuing…')
+            t('continuing')
           )}
         </span>
       </span>
-      <button className="btn small" disabled={!connected || busy} onClick={() => act('now')} title={tr('现在就发送“继续”', 'Send "continue" right away')}>
-        <span className="hide-mobile">{tr('立即继续', 'Continue now')}</span>
-        <span className="show-mobile">{tr('立即继续', 'Continue')}</span>
+      <button className="btn small" disabled={!connected || busy} onClick={() => act('now')} title={t('sendContinueRightAway')}>
+        <span className="hide-mobile">{t('continueNow')}</span>
+        <span className="show-mobile">{t('continue')}</span>
       </button>
       <button className="btn small" disabled={!connected || busy} onClick={() => act('cancel')}>
-        {tr('取消', 'Cancel')}
+        {t('cancel')}
       </button>
     </div>
   );

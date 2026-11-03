@@ -1,6 +1,6 @@
 import { createContext, memo, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { hydrateImages, type ImgCtx } from '../chatImages';
-import { isEn, tr, trErr, useLang } from '../i18n';
+import { getT, isEn, trErr, useLang } from '../i18n';
 import { rpc } from '../transport';
 import type { FileDiff, HubEvent, ImageRef, PermissionOption, PlanEntry, Question, QuestionAnswer, SessionInfo, Usage } from '../types';
 import { clock, fmtTokens, isMobile, lsGet, lsSet, renderMarkdown } from '../util';
@@ -13,6 +13,8 @@ import { Icon } from './Icon';
 import { parseTextQuestions, QuestionCard, textAnswer } from './QuestionCard';
 import { PLAN_TOOLS, PlanTracker, viewEntries, type PlanState } from '../plan';
 import { limitHead, limitOutcome, type LimitEvent } from '../limit';
+
+const t = getT('chatView');
 
 type Item =
   | { k: 'user'; key: string; text: string; ts: number; images: ImageRef[] }
@@ -153,10 +155,10 @@ function buildItems(events: HubEvent[], hideCompactCmd = false): Item[] {
         if (bg) {
           const s = bg[1] === '完成' ? 'done' : bg[1] === '失败' ? 'failed' : bg[1] === '已停止' ? 'stopped' : 'other';
           const label =
-            s === 'done' ? tr('后台任务完成', 'Background task done')
-            : s === 'failed' ? tr('后台任务失败', 'Background task failed')
-            : s === 'stopped' ? tr('后台任务已停止', 'Background task stopped')
-            : tr(`后台任务 ${bg[1].trim()}`, `Background task ${bg[1].trim()}`);
+            s === 'done' ? t('backgroundTaskDone')
+            : s === 'failed' ? t('backgroundTaskFailed')
+            : s === 'stopped' ? t('backgroundTaskStopped')
+            : t('backgroundTask', { v: bg[1].trim() });
           items.push({ k: 'bgdone', key, status: s, label, what: bg[2].replace(/\s+/g, ' ').trim() });
         } else if (e.text.trim()) items.push({ k: 'note', key, text: e.text, tone: 'muted' });
         break;
@@ -194,10 +196,10 @@ function buildItems(events: HubEvent[], hideCompactCmd = false): Item[] {
           exitNote = last?.k === 'note' && last.tone === 'err' ? last : null;
         } else if (exitNote && e.status !== 'exited') {
           exitNote.tone = 'muted';
-          exitNote.text = `${exitNote.text.split('\n')[0]}${tr('，已恢复', ' (resumed)')}`;
+          exitNote.text = `${exitNote.text.split('\n')[0]}${t('resumed')}`;
           exitNote = null;
         }
-        if (e.status === 'exited') items.push({ k: 'note', key, text: tr('会话进程已结束，发送消息会自动恢复', 'Session process ended. Sending a message will resume it.'), tone: 'muted' });
+        if (e.status === 'exited') items.push({ k: 'note', key, text: t('sessionProcessEndedSendingA'), tone: 'muted' });
         break;
       case 'usage': {
         const u = e.usage;
@@ -271,18 +273,15 @@ function TurnFooter({ it }: { it: Item & { k: 'turn' } }) {
   if (it.ms != null && it.ms >= 0) parts.push(fmtMs(it.ms));
   if (u) {
     if (u.inputTokens || u.cacheReadTokens || u.cacheWriteTokens)
-      parts.push(`${tr('输入', 'In')} ${fmtTokens(u.inputTokens + u.cacheReadTokens + u.cacheWriteTokens)}`);
-    if (u.outputTokens) parts.push(`${tr('输出', 'Out')} ${fmtTokens(u.outputTokens)}`);
+      parts.push(`${t('in')} ${fmtTokens(u.inputTokens + u.cacheReadTokens + u.cacheWriteTokens)}`);
+    if (u.outputTokens) parts.push(`${t('out')} ${fmtTokens(u.outputTokens)}`);
     if (u.costUsd) parts.push(`$${u.costUsd.toFixed(u.costUsd < 1 ? 3 : 2)}`);
     if (u.credits) parts.push(`${u.credits.toFixed(2)} credits`);
   }
-  if (it.tools) parts.push(tr(`${it.tools} 次工具调用`, `${it.tools} tool call(s)`));
+  if (it.tools) parts.push(t('toolCallS', { tools: it.tools }));
   if (it.model) parts.push(it.model);
   const tip = u
-    ? tr(
-        `输入 ${u.inputTokens}（其中缓存读取 ${u.cacheReadTokens}、缓存写入 ${u.cacheWriteTokens} 另计）\n输出 ${u.outputTokens}`,
-        `Input ${u.inputTokens} (cache read ${u.cacheReadTokens}, cache write ${u.cacheWriteTokens} counted separately)\nOutput ${u.outputTokens}`,
-      )
+    ? t('inputCacheReadCacheWrite', { inputTokens: u.inputTokens, cacheReadTokens: u.cacheReadTokens, cacheWriteTokens: u.cacheWriteTokens, outputTokens: u.outputTokens })
     : '';
   return (
     <div className="turn-foot" title={tip}>
@@ -292,8 +291,8 @@ function TurnFooter({ it }: { it: Item & { k: 'turn' } }) {
       {it.text && (
         <button
           className="turn-copy"
-          title={tr('复制这一轮的回复', 'Copy this reply')}
-          onClick={async () => toast((await writeClipboard(it.text)) ? tr('已复制', 'Copied') : tr('复制失败', 'Copy failed'))}
+          title={t('copyThisReply')}
+          onClick={async () => toast((await writeClipboard(it.text)) ? t('copied') : t('copyFailed'))}
         >
           <Icon name="copy" size={13} />
         </button>
@@ -382,7 +381,7 @@ function toolName(name: string) {
   if (['fetch', 'web'].some((x) => n.includes(x))) return 'Fetch';
   if (['search', 'find', 'grep', 'glob'].some((x) => n.includes(x))) return 'Search';
   if (n === 'task' || n === 'agent') return 'Task';
-  if (n.includes('todo')) return tr('任务清单', 'Todo');
+  if (n.includes('todo')) return t('todo');
   if (n === 'delete') return 'Delete';
   if (n === 'move') return 'Move';
   if (n === 'think') return 'Think';
@@ -507,7 +506,7 @@ const ToolLine = memo(function ToolLine({ it, active, cwd }: { it: Item & { k: '
   // Changing existing content is called Update, same as Claude Code
   if (shown === 'Write' && it.diffs.some((d) => d.oldText)) shown = 'Update';
   const kind = toolKind(shown, it);
-  const arg = generic || shown === tr('任务清单', 'Todo') ? '' : toolArg(it, shown, cwd);
+  const arg = generic || shown === t('todo') ? '' : toolArg(it, shown, cwd);
   const raw = it.result?.output ?? '';
   const parsed = useMemo(() => parseOutput(raw), [raw]);
   const out = parsed.text;
@@ -516,13 +515,13 @@ const ToolLine = memo(function ToolLine({ it, active, cwd }: { it: Item & { k: '
   const state = !it.result ? (active ? 'run' : 'idle') : err ? 'err' : 'ok';
 
   let summary: React.ReactNode;
-  if (!it.result) summary = <span className="muted">{active ? tr('运行中…', 'Running…') : tr('（没有返回结果）', '(no result)')}</span>;
+  if (!it.result) summary = <span className="muted">{active ? t('running') : t('noResult')}</span>;
   else if (err)
     summary = (
       <span className="tl-err">
-        {parsed.exitCode ? tr(`退出码 ${parsed.exitCode}`, `exit ${parsed.exitCode}`) : ''}
+        {parsed.exitCode ? t('exit', { exitCode: parsed.exitCode }) : ''}
         {parsed.exitCode && firstLine(out) ? (isEn() ? ': ' : '：') : ''}
-        {firstLine(out) || (parsed.exitCode ? '' : tr('失败', 'Failed'))}
+        {firstLine(out) || (parsed.exitCode ? '' : t('failed'))}
       </span>
     );
   else if (kind === 'edit' && it.diffs.length) {
@@ -532,8 +531,8 @@ const ToolLine = memo(function ToolLine({ it, active, cwd }: { it: Item & { k: '
     summary = (
       <>
         <span className="muted">
-          {[add && tr(`新增 ${add} 行`, `+${add} lines`), del && tr(`删除 ${del} 行`, `-${del} lines`)].filter(Boolean).join(isEn() ? ', ' : '，') || tr('没有改动', 'No changes')}
-          {it.diffs.length > 1 && tr(`，共 ${it.diffs.length} 个文件`, `, ${it.diffs.length} files`)}
+          {[add && t('lines', { add }), del && t('lines2', { del })].filter(Boolean).join(isEn() ? ', ' : '，') || t('noChanges')}
+          {it.diffs.length > 1 && t('files', { length: it.diffs.length })}
         </span>
         {!open && <MiniDiff diff={it.diffs[0]} />}
       </>
@@ -549,20 +548,20 @@ const ToolLine = memo(function ToolLine({ it, active, cwd }: { it: Item & { k: '
         ))}
       </>
     ) : (
-      <span className="muted">{tr('已清空', 'Cleared')}</span>
+      <span className="muted">{t('cleared')}</span>
     );
-  else if (kind === 'read') summary = <span className="muted">{tr(`读取 ${lines.length} 行`, `Read ${lines.length} lines`)}</span>;
+  else if (kind === 'read') summary = <span className="muted">{t('readLines', { length: lines.length })}</span>;
   else if (kind === 'search') {
     const n = parsed.count ?? lines.length;
-    summary = <span className="muted">{n ? tr(`找到 ${n} 项`, `${n} matches`) : tr('没有结果', 'No matches')}</span>;
+    summary = <span className="muted">{n ? t('matches', { n }) : t('noMatches')}</span>;
   }
-  else if (!lines.length) summary = <span className="muted">{tr('（无输出）', '(no output)')}</span>;
-  else if (open) summary = <span className="muted">{tr(`输出 ${lines.length} 行`, `${lines.length} lines`)}</span>;
+  else if (!lines.length) summary = <span className="muted">{t('noOutput')}</span>;
+  else if (open) summary = <span className="muted">{t('lines3', { length: lines.length })}</span>;
   else
     summary = (
       <>
         <div className="tl-out mono">{lines.slice(0, 3).join('\n')}</div>
-        {lines.length > 3 && <span className="muted">{tr(`… +${lines.length - 3} 行`, `… +${lines.length - 3} lines`)}</span>}
+        {lines.length > 3 && <span className="muted">{t('lines4', { v: lines.length - 3 })}</span>}
       </>
     );
 
@@ -586,10 +585,10 @@ const ToolLine = memo(function ToolLine({ it, active, cwd }: { it: Item & { k: '
             {cmd ? <pre className="mono">{cmd}</pre> : hasInput && <pre className="mono">{typeof it.input === 'string' ? it.input : JSON.stringify(it.input, null, 2)}</pre>}
             {it.result && kind !== 'edit' && (
               <>
-                <pre className="mono">{(full ? out : out.split('\n').slice(0, 200).join('\n')) || tr('（无输出）', '(no output)')}</pre>
+                <pre className="mono">{(full ? out : out.split('\n').slice(0, 200).join('\n')) || t('noOutput')}</pre>
                 {!full && out.split('\n').length > 200 && (
                   <button className="link-btn small" onClick={() => setFull(true)}>
-                    {tr(`显示全部 ${out.split('\n').length} 行`, `Show all ${out.split('\n').length} lines`)}
+                    {t('showAllLines', { length: out.split('\n').length })}
                   </button>
                 )}
               </>
@@ -619,8 +618,8 @@ function Waiting({ since, starting }: { since: number; starting?: boolean }) {
       <span />
       {(sec >= 5 || (starting && sec >= 1)) && (
         <em className="typing-wait">
-          {starting ? tr('正在启动工具', 'Starting tool') : tr('等待回复', 'Waiting for reply')} · {sec >= 60 ? (isEn() ? `${Math.floor(sec / 60)}m ${sec % 60}s` : `${Math.floor(sec / 60)} 分 ${sec % 60} 秒`) : isEn() ? `${sec}s` : `${sec} 秒`}
-          {sec >= 60 && tr('，模型响应较慢，可以按 Esc 中断后重发', '. The model is slow — press Esc to interrupt and resend')}
+          {starting ? t('startingTool') : t('waitingForReply')} · {sec >= 60 ? (isEn() ? `${Math.floor(sec / 60)}m ${sec % 60}s` : `${Math.floor(sec / 60)} 分 ${sec % 60} 秒`) : isEn() ? `${sec}s` : `${sec} 秒`}
+          {sec >= 60 && t('theModelIsSlowPress')}
         </em>
       )}
     </div>
@@ -653,20 +652,20 @@ function CompactNote({ ev, live }: { ev: HubEvent & { kind: 'compact' }; live: b
       <div className="note note-muted compact-note">
         {live ? (
           <>
-            <span className="spinner" /> {tr('正在压缩上下文…', 'Compacting context…')}
+            <span className="spinner" /> {t('compactingContext')}
           </>
         ) : (
-          tr('上下文压缩未完成', 'Compaction did not finish')
+          t('compactionDidNotFinish')
         )}
       </div>
     );
   }
-  if (ev.phase === 'failed') return <div className="note note-err">{tr('上下文压缩失败', 'Context compaction failed')}</div>;
-  const how = ev.trigger === 'auto' ? tr('自动', 'auto') : ev.trigger === 'manual' ? tr('手动', 'manual') : '';
+  if (ev.phase === 'failed') return <div className="note note-err">{t('contextCompactionFailed')}</div>;
+  const how = ev.trigger === 'auto' ? t('auto') : ev.trigger === 'manual' ? t('manual') : '';
   const parts = [isEn() ? `Context compacted${how ? ` (${how})` : ''}` : `上下文已${how}压缩`];
   if (ev.preTokens != null && ev.postTokens != null) parts.push(`${ktok(ev.preTokens)} → ${ktok(ev.postTokens)} tokens`);
-  else if (ev.preTokens != null) parts.push(tr(`压缩前 ${ktok(ev.preTokens)} tokens`, `${ktok(ev.preTokens)} tokens before`));
-  if (ev.durationMs != null) parts.push(tr(`用时 ${Math.max(1, Math.round(ev.durationMs / 1000))} 秒`, `${Math.max(1, Math.round(ev.durationMs / 1000))}s`));
+  else if (ev.preTokens != null) parts.push(t('tokensBefore', { v: ktok(ev.preTokens) }));
+  if (ev.durationMs != null) parts.push(t('s', { v: Math.max(1, Math.round(ev.durationMs / 1000)) }));
   return <div className="note note-muted compact-note">{parts.join(' · ')}</div>;
 }
 
@@ -678,7 +677,7 @@ function Thinking({ text, live }: { text: string; live?: boolean }) {
       <span className="tl-star">✻</span>
       <div className="tl-main">
         <button className="tl-head" onClick={() => setOpen(!open)}>
-          <span>{live ? tr('思考中…', 'Thinking…') : tr('思考', 'Thought')}</span>
+          <span>{live ? t('thinking') : t('thought')}</span>
           {!open && !live && <span className="tl-arg truncate">{text.replace(/\s+/g, ' ').slice(0, 120)}</span>}
         </button>
         {(open || live) && <div className="thinking-body">{open ? text : tail}</div>}
@@ -717,7 +716,7 @@ function Fold({ items, render }: { items: RunItem[]; render: (it: RunItem) => Re
   const n = items.filter((x) => x.k === 'tool').length;
   return (
     <button className="tl-fold" onClick={() => setOpen(true)}>
-      {tr(`… 还执行了 ${n} 次工具（展开）`, `… ${n} more tool calls (expand)`)}
+      {t('moreToolCallsExpand', { n })}
     </button>
   );
 }
@@ -750,10 +749,10 @@ function MsgImage({ hostId, sessionId, img }: { hostId: string; sessionId: strin
       alive = false;
     };
   }, [hostId, sessionId, img.id]);
-  if (failed) return <div className="msg-img msg-img-missing">{tr('图片不可用', 'Image unavailable')}</div>;
+  if (failed) return <div className="msg-img msg-img-missing">{t('imageUnavailable')}</div>;
   if (!src) return <div className="msg-img msg-img-loading" />;
   return (
-    <button className="msg-img" title={tr('点击放大，右键复制或保存', 'Click to zoom, right-click to copy or save')} onClick={() => openImage(src)} onContextMenu={(e) => imageMenu(e, src)}>
+    <button className="msg-img" title={t('clickToZoomRightClick')} onClick={() => openImage(src)} onContextMenu={(e) => imageMenu(e, src)}>
       <img src={src} alt="" />
     </button>
   );
@@ -783,10 +782,10 @@ function Plan({ plan, busy }: { plan: PlanState; busy: boolean }) {
     <div className="tl tl-tool ok tl-plan">
       <span className="tl-dot" />
       <div className="tl-main">
-        <button className="tl-head plan-head" onClick={() => setOpen(!shown)} title={shown ? tr('收起', 'Collapse') : tr('展开', 'Expand')}>
-          <span className="tl-name">{tr('任务清单', 'Todo')}</span>
+        <button className="tl-head plan-head" onClick={() => setOpen(!shown)} title={shown ? t('collapse') : t('expand')}>
+          <span className="tl-name">{t('todo')}</span>
           {plan.title && <span className="plan-title truncate">{plan.title}</span>}
-          <span className="tl-arg">{all ? tr(`${done}/${entries.length} 已完成`, `${done}/${entries.length} done`) : `(${done}/${entries.length})`}</span>
+          <span className="tl-arg">{all ? t('done', { done, length: entries.length }) : `(${done}/${entries.length})`}</span>
           <span className={`chev ${shown ? 'open' : ''}`}>
             <Icon name="chevron" size={11} />
           </span>
@@ -850,7 +849,7 @@ function PermissionBody({
   const [folded, setFolded] = useState(false);
   const resolvedLabel = it.resolved
     ? it.resolved === 'cancelled'
-      ? tr('已取消', 'Cancelled')
+      ? t('cancelled')
       : (it.options.find((o) => o.id === it.resolved)?.label ?? it.resolved)
     : null;
   const cmd = (it.input as any)?.command;
@@ -864,7 +863,7 @@ function PermissionBody({
           <button
             type="button"
             className="icon-btn card-fold-btn"
-            title={folded ? tr('展开审批', 'Expand') : tr('暂时收起', 'Collapse')}
+            title={folded ? t('expand2') : t('collapse2')}
             onClick={(e) => {
               e.stopPropagation();
               setFolded(!folded);
@@ -880,7 +879,7 @@ function PermissionBody({
       {!it.resolved && it.input !== undefined && it.input !== null && typeof cmd !== 'string' && (
         <>
           <button className="link-btn small" onClick={() => setShowInput(!showInput)}>
-            {showInput ? tr('收起详情', 'Hide details') : tr('查看详情', 'Show details')}
+            {showInput ? t('hideDetails') : t('showDetails')}
           </button>
           {showInput && <pre className="mono perm-cmd">{JSON.stringify(it.input, null, 2)}</pre>}
         </>
@@ -961,7 +960,7 @@ function toolView(it: Item & { k: 'tool' }, cwd?: string) {
   let shown = generic ? it.title : toolName(it.name);
   if (shown === 'Write' && it.diffs.some((d) => d.oldText)) shown = 'Update';
   const kind = toolKind(shown, it);
-  const arg = generic || shown === tr('任务清单', 'Todo') ? '' : toolArg(it, shown, cwd);
+  const arg = generic || shown === t('todo') ? '' : toolArg(it, shown, cwd);
   const parsed = parseOutput(it.result?.output ?? '');
   const err = !!it.result?.isError || (parsed.exitCode ?? 0) !== 0;
   return { shown, kind, arg, parsed, err, label: generic ? it.title : toolUiLabel(shown) };
@@ -1017,7 +1016,7 @@ const ModernTool = memo(function ModernTool({ it, active, cwd }: { it: Item & { 
             {stat.del > 0 && <span className="del">-{stat.del}</span>}
           </span>
         )}
-        {v.err && <span className="mt-fail">{v.parsed.exitCode ? tr(`退出码 ${v.parsed.exitCode}`, `exit ${v.parsed.exitCode}`) : tr('失败', 'Failed')}</span>}
+        {v.err && <span className="mt-fail">{v.parsed.exitCode ? t('exit', { exitCode: v.parsed.exitCode }) : t('failed')}</span>}
       </button>
       {open && (
         <div className="mt-detail">
@@ -1027,17 +1026,17 @@ const ModernTool = memo(function ModernTool({ it, active, cwd }: { it: Item & { 
             <div className="mt-box mono">
               {input && (
                 <>
-                  <div className="mt-box-label">{tr('输入', 'Input')}</div>
+                  <div className="mt-box-label">{t('input')}</div>
                   <pre>{input}</pre>
                 </>
               )}
               {it.result ? (
                 <>
-                  <div className="mt-box-label">{tr('输出', 'Output')}</div>
-                  <pre className={v.err ? 'err' : ''}>{v.parsed.tasks ? v.parsed.tasks.map((t) => `${t.done ? '☑' : '☐'} ${t.text}`).join('\n') : out.split('\n').slice(0, 400).join('\n') || tr('（无输出）', '(no output)')}</pre>
+                  <div className="mt-box-label">{t('output')}</div>
+                  <pre className={v.err ? 'err' : ''}>{v.parsed.tasks ? v.parsed.tasks.map((t) => `${t.done ? '☑' : '☐'} ${t.text}`).join('\n') : out.split('\n').slice(0, 400).join('\n') || t('noOutput')}</pre>
                 </>
               ) : (
-                <div className="mt-box-label">{running ? tr('运行中…', 'Running…') : tr('没有返回结果', 'No result')}</div>
+                <div className="mt-box-label">{running ? t('running') : t('noResult2')}</div>
               )}
             </div>
           )}
@@ -1059,7 +1058,7 @@ function ModernThinking({ text, live }: { text: string; live?: boolean }) {
     <div className="mt-row mt-think">
       <button className="mt-head" disabled={!has} onClick={() => setOpen(!open)} aria-expanded={open}>
         <span className="mt-icon">{live ? <span className="spinner mini" /> : <span className="ok-icon"><Icon name="check" size={12} /></span>}</span>
-        <span className="mt-name">{live ? tr('思考中', 'Thinking') : tr('已思考', 'Thought')}</span>
+        <span className="mt-name">{live ? t('thinking2') : t('thought2')}</span>
         {has && <span className="mt-desc">· {text.replace(/\s+/g, ' ').slice(0, 120)}</span>}
       </button>
       {has && (open || live) && (
@@ -1100,12 +1099,12 @@ function ActGroup({
       const v = toolView(cur, cwd);
       const d = v.kind === 'read' || v.kind === 'edit' ? baseName(v.arg) : v.arg;
       summary = isEn() ? `${v.label}${d ? ` · ${d}` : ''}` : `正在${v.label.replace(/^正在/, '')}${d ? ` · ${d}` : ''}`;
-    } else summary = liveThought != null || items[items.length - 1]?.k === 'thinking' ? tr('正在思考', 'Thinking') : tr('正在执行', 'Working');
-  } else if (!tools.length) summary = tr('已思考', 'Thought');
+    } else summary = liveThought != null || items[items.length - 1]?.k === 'thinking' ? t('thinking3') : t('working');
+  } else if (!tools.length) summary = t('thought2');
   else
     summary = failed
-      ? tr(`执行工具 ${tools.length} 次，其中 ${failed} 次失败`, `${tools.length} tool calls, ${failed} failed`)
-      : tr(`执行工具 ${tools.length} 次`, `${tools.length} tool calls`);
+      ? t('toolCallsFailed', { length: tools.length, failed })
+      : t('toolCalls', { length: tools.length });
   return (
     <div className="act-group">
       <button className="ag-head" onClick={() => setToggled(!open)} aria-expanded={open}>
@@ -1175,13 +1174,13 @@ function ModernWaiting({ since, starting }: { since: number; starting?: boolean 
           <i key={k} style={{ animationDelay: `${[0, 1, 2, 1, 2, 3, 2, 3, 4][k] * 0.14}s` }} />
         ))}
       </span>
-      <span>{starting ? tr('正在启动工具', 'Starting tool') : phrases[i % phrases.length]}</span>
+      <span>{starting ? t('startingTool') : phrases[i % phrases.length]}</span>
       {sec >= 1 && <span className="m-waiting-sec">{sec >= 60 ? (isEn() ? `${Math.floor(sec / 60)}m ${sec % 60}s` : `${Math.floor(sec / 60)}分${sec % 60}秒`) : isEn() ? `${sec}s` : `${sec}秒`}</span>}
       {sec >= 60 && (
         <span className="m-waiting-sec">
           {isMobile()
-            ? tr('，模型响应较慢，可以点停止按钮中断后重发', '. Slow response — tap Stop to interrupt and resend')
-            : tr('，模型响应较慢，可以按 Esc 中断后重发', '. Slow response — press Esc to interrupt and resend')}
+            ? t('slowResponseTapStopTo')
+            : t('slowResponsePressEscTo')}
         </span>
       )}
     </div>
@@ -1198,19 +1197,16 @@ function fullTime(ms: number) {
 function ModernTurnFooter({ it, latest }: { it: Item & { k: 'turn' }; latest: boolean }) {
   const u = it.usage;
   const parts: string[] = [];
-  if (it.ms != null && it.ms >= 0) parts.push(`${tr('耗时', 'Took')} ${fmtDur(it.ms)}`);
+  if (it.ms != null && it.ms >= 0) parts.push(`${t('took')} ${fmtDur(it.ms)}`);
   if (u) {
-    if (u.inputTokens || u.cacheReadTokens || u.cacheWriteTokens) parts.push(`${tr('输入', 'In')} ${fmtTokens(u.inputTokens + u.cacheReadTokens + u.cacheWriteTokens)}`);
-    if (u.outputTokens) parts.push(`${tr('输出', 'Out')} ${fmtTokens(u.outputTokens)}`);
+    if (u.inputTokens || u.cacheReadTokens || u.cacheWriteTokens) parts.push(`${t('in')} ${fmtTokens(u.inputTokens + u.cacheReadTokens + u.cacheWriteTokens)}`);
+    if (u.outputTokens) parts.push(`${t('out')} ${fmtTokens(u.outputTokens)}`);
     if (u.costUsd) parts.push(`$${u.costUsd.toFixed(u.costUsd < 1 ? 3 : 2)}`);
     if (u.credits) parts.push(`${u.credits.toFixed(2)} credits`);
   }
   if (it.model) parts.push(it.model);
   const tip = u
-    ? tr(
-        `输入 ${u.inputTokens}（其中缓存读取 ${u.cacheReadTokens}、缓存写入 ${u.cacheWriteTokens} 另计）\n输出 ${u.outputTokens}`,
-        `Input ${u.inputTokens} (cache read ${u.cacheReadTokens}, cache write ${u.cacheWriteTokens} counted separately)\nOutput ${u.outputTokens}`,
-      )
+    ? t('inputCacheReadCacheWrite', { inputTokens: u.inputTokens, cacheReadTokens: u.cacheReadTokens, cacheWriteTokens: u.cacheWriteTokens, outputTokens: u.outputTokens })
     : '';
   return (
     <div className={`m-actions ${latest ? 'latest' : ''}`}>
@@ -1218,8 +1214,8 @@ function ModernTurnFooter({ it, latest }: { it: Item & { k: 'turn' }; latest: bo
       {it.text && (
         <button
           className="m-act-btn"
-          title={tr('复制这一轮的回复', 'Copy this reply')}
-          onClick={async () => toast((await writeClipboard(it.text)) ? tr('已复制', 'Copied') : tr('复制失败', 'Copy failed'))}
+          title={t('copyThisReply')}
+          onClick={async () => toast((await writeClipboard(it.text)) ? t('copied') : t('copyFailed'))}
         >
           <Icon name="copy" size={14} />
         </button>
@@ -1444,12 +1440,12 @@ export function ChatView({
         {loading && (
           <div className={`chat-loading ${events.length ? 'top' : ''}`} role="status">
             <span className="spinner" />
-            {tr('正在从主机抓取会话消息…', 'Fetching messages from host…')}
+            {t('fetchingMessagesFromHost')}
           </div>
         )}
         {canOlder && (
           <button className="link-btn small center" disabled={loadingOlder} onClick={older}>
-            {loadingOlder ? tr('正在加载更早的消息…', 'Loading earlier messages…') : tr('显示更早的消息', 'Show earlier messages')}
+            {loadingOlder ? t('loadingEarlierMessages') : t('showEarlierMessages')}
           </button>
         )}
         {blocks.map((it) => {
@@ -1487,8 +1483,8 @@ export function ChatView({
                       {it.text.trim() && (
                         <button
                           className="m-act-btn"
-                          title={tr('复制消息', 'Copy message')}
-                          onClick={async () => toast((await writeClipboard(it.text)) ? tr('已复制', 'Copied') : tr('复制失败', 'Copy failed'))}
+                          title={t('copyMessage')}
+                          onClick={async () => toast((await writeClipboard(it.text)) ? t('copied') : t('copyFailed'))}
                         >
                           <Icon name="copy" size={13} />
                         </button>
@@ -1532,9 +1528,9 @@ export function ChatView({
         {textAsk && onSendText && (
           <QuestionCard
             key={textAsk.key}
-            title={tr('Kiro 在等你选择', 'Kiro is waiting for your choice')}
+            title={t('kiroIsWaitingForYour')}
             questions={textAsk.questions}
-            submitLabel={tr('发送回答', 'Send answer')}
+            submitLabel={t('sendAnswer')}
             onSubmit={async (a) => {
               await onSendText(textAnswer(textAsk.questions, a));
               setDismissedAsk(textAsk.key);
@@ -1549,9 +1545,9 @@ export function ChatView({
         {busy && !liveText.trim() && !liveThought && modern && !tailGroup?.items.some((x) => x.k === 'tool' && !x.result) && (
           <ModernWaiting key={lastChange.current} since={lastChange.current} starting={info?.status === 'starting'} />
         )}
-        {items.length === 0 && !busy && !loading && <div className="empty">{tr('发送一条消息开始', 'Send a message to start')}</div>}
+        {items.length === 0 && !busy && !loading && <div className="empty">{t('sendAMessageToStart')}</div>}
         {away && (
-          <button className="jump-bottom" title={tr('回到底部', 'Jump to bottom')} onClick={() => toBottom(true)}>
+          <button className="jump-bottom" title={t('jumpToBottom')} onClick={() => toBottom(true)}>
             <Icon name="arrow-down" size={16} />
             {busy && <span className="jump-live" />}
           </button>

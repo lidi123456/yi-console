@@ -1,0 +1,23 @@
+{
+  "thisHostSDaemonIs": "这台主机的守护进程版本太旧，到「主机管理」里重启守护进程后可用",
+  "resetsSoon": "即将重置",
+  "loading": "读取中…",
+  "failed": "读取失败：",
+  "used": "已用 {{v}}%",
+  "accountQuota": "账号额度",
+  "refresh": "刷新",
+  "usage": "用量统计",
+  "d": "{{d}} 天",
+  "credits": "积分",
+  "cost": "费用",
+  "claudeCodeCodexQoderAnd": "Claude Code、Codex、Qoder、CodeBuddy 的用量读自这台主机上工具自己的日志，终端里直接用的也算在内；Kiro 只统计 Yi Console 里的会话。Qoder、Kiro 按积分（credits）计，CodeBuddy 同时记录 token 与积分，费用只有 Claude Code 在 Yi Console 会话里会上报。",
+  "onlyStructuredYiConsoleSessions": "只统计通过 Yi Console 结构化模式运行的会话。Claude Code 会上报费用；Codex 只有 token；Kiro 按 credit 计。",
+  "thisHostSDaemonIs2": "这台主机的守护进程版本较旧，没有统计终端里直接使用的部分，到「主机管理」里重启守护进程后会更完整。",
+  "calculatingTheFirstReadOf": "统计中…（第一次要读一遍工具日志，可能要几秒）",
+  "noUsageInThisRange": "这段时间还没有用量记录",
+  "in": "输入",
+  "out": "输出",
+  "cache": "缓存",
+  "billedInCreditsNoTokens": "按积分计费（未上报 token）",
+  "dailyUsage": "每日用量"
+}

@@ -2,8 +2,10 @@ import jsQR from 'jsqr';
 import { useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { useBack } from '../back';
-import { tr } from '../i18n';
+import { getT } from '../i18n';
 import { Icon } from './Icon';
+
+const t = getT('qrScanner');
 
 // QR scanning in the page itself: getUserMedia opens the rear camera, and frames are periodically scaled down onto a canvas for jsQR to decode.
 // No native scanner plugin: Tauri's official plugin relies on ML Kit from Google Play services, which crashes on opening the camera on phones in mainland China.
@@ -19,10 +21,10 @@ const INTERVAL = 150;
 function cameraError(e: unknown): string {
   const name = e instanceof DOMException ? e.name : '';
   if (name === 'NotAllowedError' || name === 'SecurityError')
-    return tr('没有相机权限。请在系统设置里允许 Yi Console 使用相机，或者直接粘贴配对链接。', 'No camera permission. Allow Yi Console to use the camera in system settings, or paste the pairing link.');
-  if (name === 'NotFoundError' || name === 'OverconstrainedError') return tr('没有找到可用的相机', 'No camera found');
-  if (name === 'NotReadableError' || name === 'AbortError') return tr('相机被其他应用占用，或者打不开', 'The camera is in use by another app or could not be opened');
-  return tr(`打不开相机：${String(e)}`, `Could not open the camera: ${String(e)}`);
+    return t('noCameraPermissionAllowYi');
+  if (name === 'NotFoundError' || name === 'OverconstrainedError') return t('noCameraFound');
+  if (name === 'NotReadableError' || name === 'AbortError') return t('theCameraIsInUse');
+  return t('couldNotOpenTheCamera', { v: String(e) });
 }
 
 export function QrScanner({ onResult, onClose }: { onResult: (text: string) => void; onClose: () => void }) {
@@ -95,12 +97,12 @@ export function QrScanner({ onResult, onClose }: { onResult: (text: string) => v
       <video ref={video} className="qr-scan-video" playsInline muted autoPlay />
       {!error && <div className={'qr-scan-frame' + (ready ? '' : ' waiting')} />}
       <div className="qr-scan-bar">
-        <button className="qr-scan-close" onClick={onClose} aria-label={tr('关闭', 'Close')}>
+        <button className="qr-scan-close" onClick={onClose} aria-label={t('close')}>
           <Icon name="x" size={22} />
         </button>
       </div>
       <div className="qr-scan-tip">
-        {error ?? (ready ? tr('把电脑上的配对二维码放进框里', 'Fit the pairing QR code from the computer inside the frame') : tr('正在打开相机…', 'Opening the camera…'))}
+        {error ?? (ready ? t('fitThePairingQrCode') : t('openingTheCamera'))}
       </div>
     </div>,
     document.body,

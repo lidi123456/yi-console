@@ -1,0 +1,17 @@
+{
+  "enterALine1": "输入行号（1–{{lines}}）",
+  "goToLine": "跳到第 {{line}} 行",
+  "line": "第 {{line}} 行",
+  "openAFileFirst": "先打开一个文件",
+  "noFunctionsClassesOrHeadings": "这个文件里没找到函数、类或标题",
+  "noMatchingSymbols": "没有匹配的符号",
+  "searching": "查找中…",
+  "noMatchingFiles": "没有匹配的文件",
+  "typeAFileName": "输入文件名查找",
+  "quickOpen": "快速打开",
+  "fileNameSymbolsLine": "按文件名查找；@ 找函数和标题；: 跳到行",
+  "files": "文件",
+  "symbols": "@ 符号",
+  "line2": ": 行号",
+  "recent": "最近打开"
+}

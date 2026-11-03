@@ -1,0 +1,11 @@
+{
+  "bashCommand": "终端命令",
+  "subagent": "子代理",
+  "remoteAgent": "远程代理",
+  "loading": "读取中…",
+  "noOutputYet": "（还没有输出）",
+  "backgroundTaskS": "{{length}} 个后台任务",
+  "hide": "收起",
+  "output": "输出",
+  "stop": "停止"
+}

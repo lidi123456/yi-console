@@ -1,0 +1,6 @@
+{
+  "newFile": "新文件",
+  "moreLines": "… 还有 {{v}} 行",
+  "bothSidesAreTheSame": "两边内容一样，没有差异。",
+  "moreLinesNotShown": "… 还有 {{more}} 行没显示"
+}

@@ -1,8 +1,10 @@
-import { tr } from '../i18n';
+import { getT } from '../i18n';
 import { toast } from '../store';
 import { isTauri } from '../transport';
 import { openImage } from './Lightbox';
 import { openMenu } from './Overlay';
+
+const t = getT('imageMenu');
 
 // Image context menu: copy image, save as, view enlarged. Shared by chat images and the enlarged view
 
@@ -11,7 +13,7 @@ function loadImg(src: string) {
     const img = new Image();
     img.crossOrigin = 'anonymous';
     img.onload = () => resolve(img);
-    img.onerror = () => reject(new Error(tr('图片加载失败', 'Failed to load image')));
+    img.onerror = () => reject(new Error(t('failedToLoadImage')));
     img.src = src;
   });
 }
@@ -23,16 +25,16 @@ async function toPng(src: string): Promise<Blob> {
   c.width = img.naturalWidth;
   c.height = img.naturalHeight;
   c.getContext('2d')!.drawImage(img, 0, 0);
-  return new Promise((resolve, reject) => c.toBlob((b) => (b ? resolve(b) : reject(new Error(tr('转换失败', 'Conversion failed')))), 'image/png'));
+  return new Promise((resolve, reject) => c.toBlob((b) => (b ? resolve(b) : reject(new Error(t('conversionFailed')))), 'image/png'));
 }
 
 export async function copyImage(src: string) {
   try {
     const blob = await toPng(src);
     await navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })]);
-    toast(tr('已复制图片', 'Image copied'));
+    toast(t('imageCopied'));
   } catch (e) {
-    toast(tr(`复制图片失败：${e instanceof Error ? e.message : e}`, `Failed to copy image: ${e instanceof Error ? e.message : e}`), 'error');
+    toast(t('failedToCopyImage', { v: e instanceof Error ? e.message : String(e) }), 'error');
   }
 }
 
@@ -56,7 +58,7 @@ export async function saveImage(src: string) {
     if (isTauri) {
       const { invoke } = await import('@tauri-apps/api/core');
       try {
-        if (await invoke<boolean>('save_file', { name, data: base64 })) toast(tr('已保存', 'Saved'));
+        if (await invoke<boolean>('save_file', { name, data: base64 })) toast(t('saved'));
         return;
       } catch {
         // No save dialog on mobile, fall back to a browser download
@@ -67,14 +69,14 @@ export async function saveImage(src: string) {
     a.download = name;
     a.click();
   } catch (e) {
-    toast(tr(`保存失败：${e instanceof Error ? e.message : e}`, `Failed to save: ${e instanceof Error ? e.message : e}`), 'error');
+    toast(t('failedToSave', { v: e instanceof Error ? e.message : String(e) }), 'error');
   }
 }
 
 export function imageMenu(e: { clientX: number; clientY: number; preventDefault?: () => void }, src: string, opts: { zoom?: boolean } = {}) {
   openMenu(e, [
-    { label: tr('复制图片', 'Copy Image'), icon: 'copy', run: () => copyImage(src) },
-    { label: tr('另存为…', 'Save Image As…'), icon: 'download', run: () => saveImage(src) },
-    ...(opts.zoom === false ? [] : ['-' as const, { label: tr('放大查看', 'Zoom In'), icon: 'zoom', run: () => openImage(src) }]),
+    { label: t('copyImage'), icon: 'copy', run: () => copyImage(src) },
+    { label: t('saveImageAs'), icon: 'download', run: () => saveImage(src) },
+    ...(opts.zoom === false ? [] : ['-' as const, { label: t('zoomIn'), icon: 'zoom', run: () => openImage(src) }]),
   ]);
 }

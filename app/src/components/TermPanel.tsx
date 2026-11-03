@@ -1,11 +1,13 @@
 import { useEffect, useRef, useState } from 'react';
-import { tr } from '../i18n';
+import { getT } from '../i18n';
 import { errorToast, loadSession, useStore } from '../store';
 import { rpc } from '../transport';
 import type { SessionInfo } from '../types';
 import { lsGet, lsSet } from '../util';
 import { Icon } from './Icon';
 import { TermTools, TerminalView } from './TerminalView';
+
+const tx = getT('termPanel');
 
 // Terminal panel at the bottom of the session page: opens shells in the chat's working directory; several can be open, switched with tabs.
 // Each terminal is a shell session whose parentId points at the chat session; not listed separately in the sidebar, deleted along with the chat
@@ -35,7 +37,7 @@ export function TermPanel({ hostId, info, onClose }: { hostId: string; info: Ses
         tool: 'shell',
         cwd: info.cwd,
         mode: 'terminal',
-        title: `${tr('终端', 'Terminal')} ${n}`,
+        title: `${tx('terminal')} ${n}`,
         parentId: info.id,
         cols: 120,
         rows: 12,
@@ -88,10 +90,10 @@ export function TermPanel({ hostId, info, onClose }: { hostId: string; info: Ses
   };
 
   return (
-    <div className="term-panel" ref={box} style={{ height: h }} aria-label={tr('终端面板', 'Terminal Panel')}>
+    <div className="term-panel" ref={box} style={{ height: h }} aria-label={tx('terminalPanel')}>
       <div className="term-panel-resizer" onPointerDown={drag} />
       <div className="term-panel-head">
-        <div className="term-tabs" role="tablist" aria-label={tr('终端列表', 'Terminal Tabs')}>
+        <div className="term-tabs" role="tablist" aria-label={tx('terminalTabs')}>
           {tabs.map((t) => {
             const exited = t.status === 'exited' || t.status === 'error';
             return (
@@ -101,14 +103,14 @@ export function TermPanel({ hostId, info, onClose }: { hostId: string; info: Ses
                 aria-selected={t.id === cur?.id}
                 className={`term-tab ${t.id === cur?.id ? 'active' : ''} ${exited ? 'exited' : ''}`}
                 onClick={() => pick(t.id)}
-                title={exited ? tr(`${t.title}（已退出）`, `${t.title} (Exited)`) : t.title}
+                title={exited ? tx('exited', { title: t.title }) : t.title}
               >
                 <Icon name="terminal" size={13} />
-                <span className="truncate">{t.title || tr('终端', 'Terminal')}</span>
-                {exited && <span className="muted">{tr('已退出', 'Exited')}</span>}
+                <span className="truncate">{t.title || tx('terminal')}</span>
+                {exited && <span className="muted">{tx('exited2')}</span>}
                 <button
                   className="term-tab-x"
-                  title={tr(`删除终端 ${t.title}`, `Close terminal ${t.title}`)}
+                  title={tx('closeTerminal', { title: t.title })}
                   onClick={(e) => {
                     e.stopPropagation();
                     remove(t.id);
@@ -119,12 +121,12 @@ export function TermPanel({ hostId, info, onClose }: { hostId: string; info: Ses
               </div>
             );
           })}
-          <button className="icon-btn" title={tr('新建终端', 'New Terminal')} disabled={creating} onClick={create}>
+          <button className="icon-btn" title={tx('newTerminal')} disabled={creating} onClick={create}>
             <Icon name="plus" size={15} />
           </button>
         </div>
         <TermTools />
-        <button className="icon-btn" title={tr('关闭终端面板（终端在后台继续运行）', 'Hide terminal panel (processes keep running)')} onClick={onClose}>
+        <button className="icon-btn" title={tx('hideTerminalPanelProcessesKeep')} onClick={onClose}>
           <Icon name="down" size={16} />
         </button>
       </div>
@@ -138,20 +140,20 @@ export function TermPanel({ hostId, info, onClose }: { hostId: string; info: Ses
           />
         ) : error ? (
           <div className="term-panel-empty">
-            <b>{tr('无法创建终端', 'Failed to create terminal')}</b>
+            <b>{tx('failedToCreateTerminal')}</b>
             <span className="muted small">{error}</span>
             <button className="btn small" onClick={create}>
-              {tr('重试', 'Retry')}
+              {tx('retry')}
             </button>
           </div>
         ) : creating ? (
-          <div className="term-panel-empty muted small">{tr('正在打开终端…', 'Opening terminal…')}</div>
+          <div className="term-panel-empty muted small">{tx('openingTerminal')}</div>
         ) : (
           <div className="term-panel-empty">
-            <b>{tr('还没有终端', 'No terminals')}</b>
-            <span className="muted small">{tr('在当前会话的工作目录中打开一个终端。', 'Open a terminal in the session working directory.')}</span>
+            <b>{tx('noTerminals')}</b>
+            <span className="muted small">{tx('openATerminalInThe')}</span>
             <button className="btn small" onClick={create}>
-              <Icon name="plus" size={13} /> {tr('新建终端', 'New Terminal')}
+              <Icon name="plus" size={13} /> {tx('newTerminal')}
             </button>
           </div>
         )}

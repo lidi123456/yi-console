@@ -1,11 +1,13 @@
 import { useEffect, useState } from 'react';
 import { useBack } from '../back';
-import { tr } from '../i18n';
+import { getT } from '../i18n';
 import { errorToast, navigate, setState, useStore } from '../store';
 import { rpc } from '../transport';
 import type { DirEntry } from '../types';
 import { fmtSize, timeAgo } from '../util';
 import { Icon } from './Icon';
+
+const t = getT('filesView');
 
 interface Listing {
   path: string;
@@ -55,13 +57,13 @@ export function FilesView({ hostId, path }: { hostId: string; path?: string }) {
     <div className={`page split ${file ? 'has-sel' : ''}`}>
       <div className="split-list">
         <div className="page-head">
-          <h2>{tr('文件', 'Files')}</h2>
+          <h2>{t('files')}</h2>
           <button
             className="btn small"
             disabled={!list}
             onClick={() => list && setState({ newSession: { hostId, cwd: list.path } })}
           >
-            <Icon name="plus" size={14} /> {tr('在此新建会话', 'New session here')}
+            <Icon name="plus" size={14} /> {t('newSessionHere')}
           </button>
         </div>
         {drives.length > 1 && (
@@ -88,7 +90,7 @@ export function FilesView({ hostId, path }: { hostId: string; path?: string }) {
           ))}
         </div>
         <label className="check small">
-          <input type="checkbox" checked={hidden} onChange={(e) => setHidden(e.target.checked)} /> {tr('显示隐藏文件', 'Show hidden files')}
+          <input type="checkbox" checked={hidden} onChange={(e) => setHidden(e.target.checked)} /> {t('showHiddenFiles')}
         </label>
         <div className="list">
           {list?.parent && (
@@ -117,7 +119,7 @@ export function FilesView({ hostId, path }: { hostId: string; path?: string }) {
               <span className="muted small">{fmtSize(file.size)}</span>
             </div>
             {file.binary ? (
-              <div className="center-msg muted">{tr('二进制文件，无法预览', 'Binary file, cannot preview')}</div>
+              <div className="center-msg muted">{t('binaryFileCannotPreview')}</div>
             ) : (
               <pre className="file-view mono">
                 {file.content.split('\n').map((l, i) => (
@@ -126,15 +128,15 @@ export function FilesView({ hostId, path }: { hostId: string; path?: string }) {
                     <span>{l || ' '}</span>
                   </div>
                 ))}
-                {file.truncated && <div className="muted">{tr('… 文件过大，只显示前 1MB', '… File is large; showing the first 1MB')}</div>}
+                {file.truncated && <div className="muted">{t('fileIsLargeShowingThe')}</div>}
               </pre>
             )}
           </>
         ) : (
           <div className="center-msg muted">
-            {tr('选择文件预览', 'Select a file to preview')}
+            {t('selectAFileToPreview')}
             <button className="link-btn" onClick={() => navigate({ kind: 'history', hostId })}>
-              {tr('查看历史会话', 'View history')}
+              {t('viewHistory')}
             </button>
           </div>
         )}

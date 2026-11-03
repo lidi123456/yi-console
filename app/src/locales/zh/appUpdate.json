@@ -1,0 +1,20 @@
+{
+  "downloadingUpdate": "正在下载更新 {{p}}%",
+  "downloadingUpdate2": "正在下载更新 {{v}}",
+  "confirmTheInstallInThe": "请在系统安装界面确认安装",
+  "installingTheAppWillRestart": "正在安装，完成后会自动重启",
+  "allowYiConsoleToInstall": "请允许 Yi Console 安装应用，返回后会继续安装",
+  "yiConsoleIsAvailable": "Yi Console {{version}} 可以更新了",
+  "download": "去下载",
+  "updateNow": "立即更新",
+  "later": "稍后",
+  "installAgain": "重新安装",
+  "close": "关闭",
+  "checkingForUpdates": "正在检查更新…",
+  "youAreUpToDate": "已经是最新版本（{{current}}）",
+  "newVersionAvailable": "发现新版本 {{version}}",
+  "currentVersion": "当前版本 {{current}}",
+  "checkForUpdatesAutomatically": "自动检查更新",
+  "atStartupAndEvery6": "启动后和之后每 6 小时检查一次，有新版本时在右下角提示。",
+  "checkForUpdates": "检查更新"
+}

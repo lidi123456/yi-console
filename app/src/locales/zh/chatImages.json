@@ -1,0 +1,15 @@
+{
+  "openInBrowser": "用浏览器打开",
+  "loadingImage": "正在加载图片…",
+  "imageUnavailable": "图片不可用：{{path}}（{{v}}）",
+  "clickToLoad": "点击加载",
+  "imageTooLargeOver10mb": "图片太大（{{v}}），超过 10MB 不预览：{{path}}",
+  "text": "（",
+  "text2": "）",
+  "downloadImage": "下载图片",
+  "downloadImageFrom": "从「{{hostName}}」下载图片 {{name}}{{sz}}？\n{{path}}",
+  "download": "下载",
+  "imageFailedToLoad": "图片加载失败",
+  "image": "图片",
+  "image2": "图片：{{src}}"
+}

@@ -1,8 +1,10 @@
 import { structuredPatch } from 'diff';
 import { memo, useMemo } from 'react';
-import { tr, useLang } from '../i18n';
+import { getT, useLang } from '../i18n';
 import type { FileDiff } from '../types';
 import { basename } from '../util';
+
+const t = getT('diffView');
 
 interface Line {
   t: 'add' | 'del' | 'ctx' | 'hunk';
@@ -71,7 +73,7 @@ export const DiffView = memo(function DiffView({ diff }: { diff: FileDiff }) {
     <div className="diff">
       <div className="diff-head" title={diff.path}>
         <span className="mono truncate">{basename(diff.path)}</span>
-        {isNew && <span className="pill">{tr('新文件', 'New file')}</span>}
+        {isNew && <span className="pill">{t('newFile')}</span>}
         <span className="diff-stat">
           <span className="add">+{adds}</span> <span className="del">-{dels}</span>
         </span>
@@ -83,7 +85,7 @@ export const DiffView = memo(function DiffView({ diff }: { diff: FileDiff }) {
             <span className="dl-text">{l.text || ' '}</span>
           </div>
         ))}
-        {lines.length > 800 && <div className="dl dl-hunk">{tr(`… 还有 ${lines.length - 800} 行`, `… ${lines.length - 800} more lines`)}</div>}
+        {lines.length > 800 && <div className="dl dl-hunk">{t('moreLines', { v: lines.length - 800 })}</div>}
       </div>
     </div>
   );
@@ -158,7 +160,7 @@ export const PaneDiff = memo(function PaneDiff({ diff, layout }: { diff: FileDif
   const lines = useMemo(() => paneLines(diff), [diff]);
   const rows = useMemo(() => (layout === 'split' ? splitRows(lines) : []), [lines, layout]);
   const more = (layout === 'split' ? rows.length : lines.length) - PANE_MAX;
-  if (!lines.some((l) => l.t !== 'hunk')) return <div className="pd-empty muted small">{tr('两边内容一样，没有差异。', 'Both sides are the same.')}</div>;
+  if (!lines.some((l) => l.t !== 'hunk')) return <div className="pd-empty muted small">{t('bothSidesAreTheSame')}</div>;
   return (
     <div className={`pd mono pd-${layout}`}>
       {layout === 'unified'
@@ -192,7 +194,7 @@ export const PaneDiff = memo(function PaneDiff({ diff, layout }: { diff: FileDif
               </div>
             ),
           )}
-      {more > 0 && <div className="pd-row pd-hunk">{tr(`… 还有 ${more} 行没显示`, `… ${more} more lines not shown`)}</div>}
+      {more > 0 && <div className="pd-row pd-hunk">{t('moreLinesNotShown', { more })}</div>}
     </div>
   );
 });

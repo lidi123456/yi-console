@@ -2,11 +2,13 @@
 // - Files on the host: the local host reads and shows them directly; remote hosts (SSH / relay / forwarded) show a placeholder first, and on click ask for the size, then download
 // - Public URLs: always show a placeholder first; the current device only loads them on click (opening a chat never requests third parties automatically)
 // Images that were opened / confirmed are remembered for this run and shown directly when they reappear (streaming redraws, switching away and back).
-import { tr } from './i18n';
+import { getT } from './i18n';
 import { rpc } from './transport';
 import { askConfirm } from './components/Overlay';
 import { resolvePath } from './components/FilePreview';
 import { basename, fmtSize } from './util';
+
+const t = getT('chatImages');
 
 export interface ImgCtx {
   hostId: string;
@@ -66,7 +68,7 @@ function showError(el: HTMLElement, msg: string, link?: string) {
     const a = document.createElement('a');
     a.href = link;
     a.textContent = link;
-    a.title = tr('用浏览器打开', 'Open in browser');
+    a.title = t('openInBrowser');
     box.append(' ', a);
   }
   el.replaceChildren(box);
@@ -76,7 +78,7 @@ function showLoading(el: HTMLElement) {
   el.className = 'md-rimg loading';
   const s = document.createElement('span');
   s.className = 'md-rimg-ph';
-  s.textContent = tr('正在加载图片…', 'Loading image…');
+  s.textContent = t('loadingImage');
   el.replaceChildren(s);
 }
 
@@ -111,29 +113,29 @@ function fillFile(el: HTMLElement, ctx: ImgCtx, path: string, alt: string) {
     showLoading(el);
     loadFile(ctx.hostId, path)
       .then((src) => el.isConnected && showImg(el, src, alt))
-      .catch((e) => el.isConnected && showError(el, tr(`图片不可用：${path}（${errText(e)}）`, `Image unavailable: ${path} (${errText(e)})`)));
+      .catch((e) => el.isConnected && showError(el, t('imageUnavailable', { path, v: errText(e) })));
   };
   if (ctx.local || fileCache.has(key)) return load();
   const name = basename(path) || path;
-  showPlaceholder(el, alt || name, tr('点击加载', 'Click to load'), async () => {
+  showPlaceholder(el, alt || name, t('clickToLoad'), async () => {
     showLoading(el);
     let size = -1;
     try {
       const r = await rpc<{ size: number; tooBig?: boolean }>(ctx.hostId, 'fs.read', { path, image: true, strict: true, probe: true });
       size = typeof r.size === 'number' ? r.size : -1;
       if (r.tooBig) {
-        showError(el, tr(`图片太大（${fmtSize(size)}），超过 10MB 不预览：${path}`, `Image too large (${fmtSize(size)}), over 10MB: ${path}`));
+        showError(el, t('imageTooLargeOver10mb', { v: fmtSize(size), path }));
         return;
       }
     } catch (e) {
-      showError(el, tr(`图片不可用：${path}（${errText(e)}）`, `Image unavailable: ${path} (${errText(e)})`));
+      showError(el, t('imageUnavailable', { path, v: errText(e) }));
       return;
     }
-    const sz = size >= 0 ? (tr('（', ' (') + fmtSize(size) + tr('）', ')')) : '';
+    const sz = size >= 0 ? (t('text') + fmtSize(size) + t('text2')) : '';
     const ok = await askConfirm({
-      title: tr('下载图片', 'Download image'),
-      message: tr(`从「${ctx.hostName}」下载图片 ${name}${sz}？\n${path}`, `Download image ${name}${sz} from "${ctx.hostName}"?\n${path}`),
-      okText: tr('下载', 'Download'),
+      title: t('downloadImage'),
+      message: t('downloadImageFrom', { hostName: ctx.hostName, name, sz, path }),
+      okText: t('download'),
     });
     if (!el.isConnected) return;
     if (!ok) return fillFile(el, ctx, path, alt);
@@ -147,7 +149,7 @@ function fillWeb(el: HTMLElement, url: string, alt: string) {
     showLoading(el);
     const probe = new Image();
     probe.onload = () => el.isConnected && showImg(el, url, alt);
-    probe.onerror = () => el.isConnected && showError(el, tr('图片加载失败', 'Image failed to load'), url);
+    probe.onerror = () => el.isConnected && showError(el, t('imageFailedToLoad'), url);
     probe.src = url;
   };
   if (webAllowed.has(url)) return load();
@@ -157,7 +159,7 @@ function fillWeb(el: HTMLElement, url: string, alt: string) {
   } catch {
     /* leave as is */
   }
-  showPlaceholder(el, alt || tr('图片', 'Image'), `${host} · ${tr('点击加载', 'Click to load')}`, load);
+  showPlaceholder(el, alt || t('image'), `${host} · ${t('clickToLoad')}`, load);
 }
 
 /** Fill in image placeholders in root that haven't been handled yet. Called after every Markdown redraw (streaming) */
@@ -167,7 +169,7 @@ export function hydrateImages(root: HTMLElement, ctx: ImgCtx | null) {
     const src = el.dataset.src ?? '';
     const alt = el.dataset.alt ?? '';
     if (el.dataset.kind === 'web') fillWeb(el, src, alt);
-    else if (!ctx) showError(el, tr(`图片：${src}`, `Image: ${src}`));
+    else if (!ctx) showError(el, t('image2', { src }));
     else fillFile(el, ctx, filePath(src, ctx.cwd), alt);
   }
 }

@@ -1,0 +1,9 @@
+{
+  "files": "文件",
+  "newSessionHere": "在此新建会话",
+  "showHiddenFiles": "显示隐藏文件",
+  "binaryFileCannotPreview": "二进制文件，无法预览",
+  "fileIsLargeShowingThe": "… 文件过大，只显示前 1MB",
+  "selectAFileToPreview": "选择文件预览",
+  "viewHistory": "查看历史会话"
+}

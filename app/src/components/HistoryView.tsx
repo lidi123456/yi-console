@@ -1,12 +1,14 @@
 import { useEffect, useMemo, useState } from 'react';
 import { useBack } from '../back';
-import { isEn, tr } from '../i18n';
+import { getT, isEn } from '../i18n';
 import { errorToast, hostStatus, setState } from '../store';
 import { rpc } from '../transport';
 import { TOOL_LABEL, type HistoryEntry, type HubEvent, type ToolKind } from '../types';
 import { shortPath, timeAgo } from '../util';
 import { ChatView } from './ChatView';
 import { Icon, ToolBadge } from './Icon';
+
+const t = getT('historyView');
 
 const HISTORY_TOOLS: ToolKind[] = ['claude', 'codex', 'cursor', 'kiro', 'qoder', 'codebuddy'];
 const PAGE = 100;
@@ -101,17 +103,17 @@ export function HistoryView({ hostId, cwd }: { hostId: string; cwd?: string }) {
     <div className={`page split ${sel ? 'has-sel' : ''}`}>
       <div className="split-list">
         <div className="page-head">
-          <h2>{tr('历史会话', 'History')}</h2>
-          <button className="icon-btn" onClick={() => void load()} title={tr('刷新', 'Refresh')}>
+          <h2>{t('history')}</h2>
+          <button className="icon-btn" onClick={() => void load()} title={t('refresh')}>
             <Icon name="refresh" size={16} />
           </button>
         </div>
-        <p className="muted small">{tr('各工具自己保存的会话记录，可以在这里接着聊。', 'Sessions saved by each tool. Continue one from here.')}</p>
+        <p className="muted small">{t('sessionsSavedByEachTool')}</p>
         {dir && (
           <div className="history-dir" title={dir}>
             <Icon name="folder" size={13} />
-            <span className="truncate grow">{shortPath(dir, home)}{tr('（含子目录）', ' (including subfolders)')}</span>
-            <button className="icon-btn" title={tr('查看全部目录', 'All folders')} onClick={() => setDir('')}>
+            <span className="truncate grow">{shortPath(dir, home)}{t('includingSubfolders')}</span>
+            <button className="icon-btn" title={t('allFolders')} onClick={() => setDir('')}>
               <Icon name="x" size={13} />
             </button>
           </div>
@@ -120,13 +122,13 @@ export function HistoryView({ hostId, cwd }: { hostId: string; cwd?: string }) {
           <input
             value={q}
             onChange={(e) => setQ(e.target.value)}
-            placeholder={dir ? tr('在这个目录的会话里搜索标题', 'Search titles in this folder') : tr('搜索标题或目录', 'Search titles or folders')}
+            placeholder={dir ? t('searchTitlesInThisFolder') : t('searchTitlesOrFolders')}
             autoFocus={!!dir}
           />
         </div>
         <div className="seg wrap">
           <button className={tool === '' ? 'active' : ''} onClick={() => setTool('')}>
-            {tr('全部', 'All')} {list ? inDir.length : ''}
+            {t('all')} {list ? inDir.length : ''}
           </button>
           {HISTORY_TOOLS.map((t) => (
             <button key={t} className={tool === t ? 'active' : ''} onClick={() => setTool(t)}>
@@ -135,7 +137,7 @@ export function HistoryView({ hostId, cwd }: { hostId: string; cwd?: string }) {
           ))}
         </div>
         {pending.length > 0 && (
-          <div className="muted small">{tr('正在读取', 'Reading')} {pending.map((t) => TOOL_LABEL[t]).join(isEn() ? ', ' : '、')}…</div>
+          <div className="muted small">{t('reading')} {pending.map((t) => TOOL_LABEL[t]).join(isEn() ? ', ' : '、')}…</div>
         )}
         <div className="list">
           {filtered.slice(0, limit).map((h) => (
@@ -144,19 +146,19 @@ export function HistoryView({ hostId, cwd }: { hostId: string; cwd?: string }) {
               <div className="grow min0">
                 <div className="truncate">{h.title}</div>
                 <div className="muted small truncate">
-                  {shortPath(h.cwd, home) || tr('未知目录', 'Unknown folder')} · {timeAgo(h.updatedAt)}
-                  {h.messageCount ? tr(` · ${h.messageCount} 条`, ` · ${h.messageCount} msgs`) : ''}
+                  {shortPath(h.cwd, home) || t('unknownFolder')} · {timeAgo(h.updatedAt)}
+                  {h.messageCount ? t('msgs', { messageCount: h.messageCount }) : ''}
                 </div>
               </div>
             </button>
           ))}
           {filtered.length > limit && (
             <button className="btn more-btn" onClick={() => setLimit((n) => n + PAGE)}>
-              {tr(`显示更多（还有 ${filtered.length - limit} 条）`, `Show more (${filtered.length - limit} left)`)}
+              {t('showMoreLeft', { v: filtered.length - limit })}
             </button>
           )}
           {list && pending.length === 0 && filtered.length === 0 && (
-            <div className="muted pad">{dir && !q && !tool ? tr('这个目录下没有历史会话', 'No history in this folder') : tr('没有记录', 'Nothing here')}</div>
+            <div className="muted pad">{dir && !q && !tool ? t('noHistoryInThisFolder') : t('nothingHere')}</div>
           )}
         </div>
       </div>
@@ -172,26 +174,26 @@ export function HistoryView({ hostId, cwd }: { hostId: string; cwd?: string }) {
                 <div className="muted small truncate">{sel.cwd}</div>
               </div>
               <button className="btn primary" onClick={() => resume(sel)}>
-                <Icon name="play" size={14} /> {tr('继续此会话', 'Continue')}
+                <Icon name="play" size={14} /> {t('continue')}
               </button>
             </div>
             {sel.readable ? (
               preview ? (
                 <ChatView events={preview} live={new Map()} onAnswer={() => {}} />
               ) : (
-                <div className="muted pad">{tr('加载中…', 'Loading…')}</div>
+                <div className="muted pad">{t('loading')}</div>
               )
             ) : (
               <div className="center-msg">
-                {tr(`${TOOL_LABEL[sel.tool]} 的历史内容需要继续会话后由工具回放显示。`, `${TOOL_LABEL[sel.tool]} history is shown after you continue the session.`)}
+                {t('historyIsShownAfterYou', { v: TOOL_LABEL[sel.tool] })}
                 <button className="btn primary" onClick={() => resume(sel)}>
-                  {tr('继续此会话', 'Continue')}
+                  {t('continue')}
                 </button>
               </div>
             )}
           </>
         ) : (
-          <div className="center-msg muted">{tr('选择左侧的会话查看内容', 'Select a session to view')}</div>
+          <div className="center-msg muted">{t('selectASessionToView')}</div>
         )}
       </div>
     </div>

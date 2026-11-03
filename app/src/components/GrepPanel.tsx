@@ -1,11 +1,13 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { tr } from '../i18n';
+import { getT } from '../i18n';
 import { errorToast, toast } from '../store';
 import { rpc } from '../transport';
 import { lsGet, lsSet } from '../util';
 import { FileIcon } from './FilePanel';
 import { Icon } from './Icon';
 import { askConfirm } from './Overlay';
+
+const tx = getT('grepPanel');
 
 // The file panel's "Search", modelled on VS Code's search view: searches file contents in the working directory
 // (yi-agentd's fs.grep; git repos respect .gitignore), results grouped by file, one row per match. Clicking a match
@@ -199,7 +201,7 @@ export function GrepPanel({
               hits: [],
               truncated: false,
               files: 0,
-              error: String((e as Error)?.message ?? e).includes('未知方法') ? tr('这台主机的守护进程太旧，重启守护进程后可用', 'This host’s daemon is too old. Restart it to search.') : String((e as Error)?.message ?? e),
+              error: String((e as Error)?.message ?? e).includes('未知方法') ? tx('thisHostSDaemonIs') : String((e as Error)?.message ?? e),
             }),
         )
         .finally(() => alive && setBusy(false));
@@ -298,14 +300,14 @@ export function GrepPanel({
       if (count) {
         const canUndo = undo.files.length > 0 || !!undo.draft;
         toast(
-          tr(`已在 ${nfiles} 个文件中替换 ${count} 处`, `Replaced ${count} ${count === 1 ? 'occurrence' : 'occurrences'} in ${nfiles} ${nfiles === 1 ? 'file' : 'files'}`),
+          tx('replacedInFiles', { occurrences: tx('occurrenceCount', { count }), files: tx('fileCount', { count: nfiles }) }),
           'info',
-          canUndo ? { label: tr('撤销', 'Undo'), run: () => void runUndo(undo) } : undefined,
+          canUndo ? { label: tx('undo'), run: () => void runUndo(undo) } : undefined,
         );
       }
       if (skipped.length) {
         const names = skipped.slice(0, 3).map((s) => `${base(s.path)}（${s.reason}）`).join('、');
-        toast(tr(`${skipped.length} 个文件没有替换：${names}`, `${skipped.length} files not replaced: ${names}`), 'error');
+        toast(tx('filesNotReplaced', { length: skipped.length, names }), 'error');
       }
       setNonce((n) => n + 1);
     } catch (e) {
@@ -330,8 +332,8 @@ export function GrepPanel({
     if (back.length) onReplaced(back);
     toast(
       failed
-        ? tr(`已撤销，${failed} 个文件在替换后又被修改过，没有恢复`, `Undone; ${failed} files changed after the replace and were left as they are`)
-        : tr('已撤销替换', 'Replace undone'),
+        ? tx('undoneFilesChangedAfterThe', { failed })
+        : tx('replaceUndone'),
       failed ? 'error' : 'info',
     );
     setNonce((n) => n + 1);
@@ -340,11 +342,11 @@ export function GrepPanel({
   const replaceAll = async () => {
     if (!canReplace) return;
     const ok = await askConfirm({
-      title: tr('全部替换？', 'Replace all?'),
+      title: tx('replaceAll'),
       message:
-        tr(`在 ${groups.length} 个文件中把 ${total} 处替换为“${rep}”。`, `Replace ${total} ${total === 1 ? 'occurrence' : 'occurrences'} across ${groups.length} ${groups.length === 1 ? 'file' : 'files'} with "${rep}".`) +
-        (res?.truncated ? tr('\n结果没有列全，只替换列表里的这些。', '\nThe list is incomplete; only the results listed are replaced.') : ''),
-      okText: tr('替换', 'Replace'),
+        tx('replaceConfirm', { occurrences: tx('occurrenceCount', { count: total }), files: tx('fileCount', { count: groups.length }), rep }) +
+        (res?.truncated ? tx('theListIsIncompleteOnly') : ''),
+      okText: tx('replace'),
     });
     if (ok) replaceIn(flat);
   };
@@ -395,7 +397,7 @@ export function GrepPanel({
       <div className="grep-boxes">
         <button
           className="grep-rep-toggle"
-          title={showRep ? tr('收起替换', 'Hide replace') : tr('替换', 'Toggle replace')}
+          title={showRep ? tx('hideReplace') : tx('toggleReplace')}
           aria-expanded={showRep}
           onClick={flipRep}
         >
@@ -410,8 +412,8 @@ export function GrepPanel({
               ref={input}
               value={q}
               onChange={(e) => setQ(e.target.value)}
-              placeholder={tr('搜索', 'Search')}
-              aria-label={tr('在文件内容里搜索', 'Search in files')}
+              placeholder={tx('search')}
+              aria-label={tx('searchInFiles')}
               spellCheck={false}
               onBlur={hq.push}
               onKeyDown={(e) => {
@@ -420,13 +422,13 @@ export function GrepPanel({
                 else hq.onKeyDown(e);
               }}
             />
-            <button className={`grep-opt ${cs ? 'on' : ''}`} title={tr('区分大小写', 'Match case')} onClick={() => toggle('cs')}>
+            <button className={`grep-opt ${cs ? 'on' : ''}`} title={tx('matchCase')} onClick={() => toggle('cs')}>
               Aa
             </button>
-            <button className={`grep-opt ${ww ? 'on' : ''}`} title={tr('全词匹配', 'Match whole word')} onClick={() => toggle('ww')}>
+            <button className={`grep-opt ${ww ? 'on' : ''}`} title={tx('matchWholeWord')} onClick={() => toggle('ww')}>
               <u>ab</u>
             </button>
-            <button className={`grep-opt ${re ? 'on' : ''}`} title={tr('使用正则表达式', 'Use regular expression')} onClick={() => toggle('re')}>
+            <button className={`grep-opt ${re ? 'on' : ''}`} title={tx('useRegularExpression')} onClick={() => toggle('re')}>
               .*
             </button>
           </div>
@@ -435,8 +437,8 @@ export function GrepPanel({
               <input
                 value={rep}
                 onChange={(e) => setRep(e.target.value)}
-                placeholder={tr('替换', 'Replace')}
-                aria-label={tr('替换为', 'Replace with')}
+                placeholder={tx('replace')}
+                aria-label={tx('replaceWith')}
                 spellCheck={false}
                 onBlur={hr.push}
                 onKeyDown={(e) => {
@@ -446,10 +448,10 @@ export function GrepPanel({
                   } else hr.onKeyDown(e);
                 }}
               />
-              <button className={`grep-opt ${pc ? 'on' : ''}`} title={tr('保留大小写', 'Preserve case')} onClick={() => toggle('pc')}>
+              <button className={`grep-opt ${pc ? 'on' : ''}`} title={tx('preserveCase')} onClick={() => toggle('pc')}>
                 AB
               </button>
-              <button className="grep-opt" disabled={!canReplace} title={tr('全部替换（Ctrl+Alt+Enter）', 'Replace all (Ctrl+Alt+Enter)')} onClick={replaceAll}>
+              <button className="grep-opt" disabled={!canReplace} title={tx('replaceAllCtrlAltEnter')} onClick={replaceAll}>
                 <Icon name="check" size={13} />
               </button>
             </div>
@@ -462,13 +464,13 @@ export function GrepPanel({
           <input
             value={inc}
             onChange={(e) => setInc(e.target.value)}
-            placeholder={tr('包含的文件，例如 src, *.ts', 'Files to include, e.g. src, *.ts')}
-            aria-label={tr('包含的文件', 'Files to include')}
+            placeholder={tx('filesToIncludeEG')}
+            aria-label={tx('filesToInclude')}
             spellCheck={false}
             onBlur={hi.push}
             onKeyDown={hi.onKeyDown}
           />
-          <button className={`grep-opt ${openOnly ? 'on' : ''}`} title={tr('仅在打开的文件中搜索', 'Search only in open files')} onClick={() => toggle('open')}>
+          <button className={`grep-opt ${openOnly ? 'on' : ''}`} title={tx('searchOnlyInOpenFiles')} onClick={() => toggle('open')}>
             <Icon name="file" size={13} />
           </button>
         </div>
@@ -476,8 +478,8 @@ export function GrepPanel({
           <input
             value={exc}
             onChange={(e) => setExc(e.target.value)}
-            placeholder={tr('排除的文件，例如 **/test/**', 'Files to exclude, e.g. **/test/**')}
-            aria-label={tr('排除的文件', 'Files to exclude')}
+            placeholder={tx('filesToExcludeEG')}
+            aria-label={tx('filesToExclude')}
             spellCheck={false}
             onBlur={he.push}
             onKeyDown={he.onKeyDown}
@@ -490,26 +492,26 @@ export function GrepPanel({
         ) : res && !res.error ? (
           total ? (
             <>
-              {tr(`${groups.length} 个文件里 ${total}${res.truncated ? '+' : ''} 处`, `${total}${res.truncated ? '+' : ''} results in ${groups.length} files`)}
+              {tx('resultsInFiles', { length: groups.length, total, v: res.truncated ? '+' : '' })}
               {groups.length > 1 && (
                 <button className="link-btn grep-fold" onClick={() => setFolded(folded.size ? new Set() : new Set(groups.map((g) => g[0])))}>
-                  {folded.size ? tr('全部展开', 'Expand all') : tr('全部收起', 'Collapse all')}
+                  {folded.size ? tx('expandAll') : tx('collapseAll')}
                 </button>
               )}
             </>
           ) : (
-            tr('没有找到', 'No results')
+            tx('noResults')
           )
         ) : null}
       </div>
       <div className="wp-tree grep-list" ref={list}>
         {res?.error && (
           <div className="wp-tip">
-            <b>{tr('搜索失败', 'Search failed')}</b>
+            <b>{tx('searchFailed')}</b>
             {res.error}
           </div>
         )}
-        {!term && <div className="wp-tip">{tr('git 仓库会跳过 .gitignore 里的文件；二进制和超过 2MB 的文件不搜。', 'Git repos skip .gitignore. Binary files and files over 2MB are not searched.')}</div>}
+        {!term && <div className="wp-tip">{tx('gitReposSkipGitignoreBinary')}</div>}
         {groups.map(([path, items]) => {
           const closed = folded.has(path);
           return (
@@ -538,14 +540,14 @@ export function GrepPanel({
                   {previewing && (
                     <button
                       className="icon-btn"
-                      title={tr('替换此文件中的全部', 'Replace all in file')}
+                      title={tx('replaceAllInFile')}
                       disabled={working}
                       onClick={(e) => (e.stopPropagation(), replaceIn(items))}
                     >
                       <Icon name="check" size={12} />
                     </button>
                   )}
-                  <button className="icon-btn" title={tr('移除', 'Dismiss')} onClick={(e) => (e.stopPropagation(), setGone((g) => new Set(g).add(path)))}>
+                  <button className="icon-btn" title={tx('dismiss')} onClick={(e) => (e.stopPropagation(), setGone((g) => new Set(g).add(path)))}>
                     <Icon name="x" size={12} />
                   </button>
                 </span>
@@ -586,11 +588,11 @@ export function GrepPanel({
                       </span>
                       <span className="grep-acts">
                         {previewing && (
-                          <button className="icon-btn" title={tr('替换', 'Replace')} disabled={working} onClick={(e) => (e.stopPropagation(), replaceIn([it]))}>
+                          <button className="icon-btn" title={tx('replace')} disabled={working} onClick={(e) => (e.stopPropagation(), replaceIn([it]))}>
                             <Icon name="check" size={12} />
                           </button>
                         )}
-                        <button className="icon-btn" title={tr('移除', 'Dismiss')} onClick={(e) => (e.stopPropagation(), dismiss(it))}>
+                        <button className="icon-btn" title={tx('dismiss')} onClick={(e) => (e.stopPropagation(), dismiss(it))}>
                           <Icon name="x" size={12} />
                         </button>
                       </span>
@@ -601,7 +603,7 @@ export function GrepPanel({
           );
         })}
         {res?.truncated && (
-          <div className="wp-limit">{tr(`结果太多，只显示前 ${total} 处，请换个更具体的词。`, `Too many results. Showing the first ${total}. Try a more specific term.`)}</div>
+          <div className="wp-limit">{tx('tooManyResultsShowingThe', { total })}</div>
         )}
       </div>
     </div>

@@ -1,0 +1,10 @@
+{
+  "minimize": "最小化",
+  "restore": "还原",
+  "maximize": "最大化",
+  "close": "关闭",
+  "backAlt": "后退（Alt+←）",
+  "forwardAlt": "前进（Alt+→）",
+  "showSidebar": "展开侧边栏（{{mod}}+B）",
+  "hideSidebar": "收起侧边栏（{{mod}}+B）"
+}

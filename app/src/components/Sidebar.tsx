@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { isEn, tr } from '../i18n';
+import { getT, isEn } from '../i18n';
 import { hubCall, rpc } from '../transport';
 import { errorToast, navigate, setState, toast, useStore, type HostEntry } from '../store';
 import type { SessionInfo } from '../types';
@@ -9,6 +9,8 @@ import { writeClipboard } from '../clipboard';
 import { deleteDirSessions, openTerminal, renameSession, sessionMenu } from './SessionActions';
 import { Icon, ToolBadge } from './Icon';
 import { MOD } from './Palette';
+
+const tx = getT('sidebar');
 
 const SIDE_MIN = 244;
 const SIDE_MAX = 480;
@@ -33,28 +35,28 @@ export function sessionStatusClass(s: SessionInfo) {
 function hostStatusLabel(s?: string) {
   switch (s) {
     case 'connected':
-      return tr('已连接', 'Connected');
+      return tx('connected');
     case 'connecting':
-      return tr('连接中', 'Connecting');
+      return tx('connecting');
     case 'error':
-      return tr('连接失败', 'Connection failed');
+      return tx('connectionFailed');
     default:
-      return tr('未连接', 'Disconnected');
+      return tx('disconnected');
   }
 }
 
 function statusText(cls: string) {
   switch (cls) {
     case 'attn':
-      return tr('等待审批', 'Waiting for approval');
+      return tx('waitingForApproval');
     case 'busy':
-      return tr('运行中', 'Running');
+      return tx('running');
     case 'err':
-      return tr('出错', 'Error');
+      return tx('error');
     case 'off':
-      return tr('已退出', 'Exited');
+      return tx('exited');
     default:
-      return tr('活动中，等待输入', 'Active, waiting for input');
+      return tx('activeWaitingForInput');
   }
 }
 
@@ -66,10 +68,10 @@ function pin(hostId: string, s: SessionInfo) {
 function shortAgo(ms: number): string {
   if (!ms) return '';
   const d = (Date.now() - ms) / 1000;
-  if (d < 60) return tr('刚刚', 'now');
+  if (d < 60) return tx('now');
   if (d < 3600) return isEn() ? `${Math.floor(d / 60)}m` : `${Math.floor(d / 60)} 分钟`;
   if (d < 86400) return isEn() ? `${Math.floor(d / 3600)}h` : `${Math.floor(d / 3600)} 小时`;
-  if (d < 2 * 86400) return tr('昨天', 'Yesterday');
+  if (d < 2 * 86400) return tx('yesterday');
   if (d < 7 * 86400) return isEn() ? `${Math.floor(d / 86400)}d` : `${Math.floor(d / 86400)} 天`;
   const t = new Date(ms);
   return `${t.getMonth() + 1}/${t.getDate()}`;
@@ -103,7 +105,7 @@ function SessionRow({ hostId, s, active, showDir }: { hostId: string; s: Session
             renameSession(hostId, s);
           }
         }}
-        title={`${s.title || tr('新会话', 'New Session')}\n${s.cwd}\n${s.tool === 'files' ? tr('文件', 'Files') : s.autoResume ? tr(`额度已用完，${clock(s.autoResume.at)} 自动继续`, `Usage limit reached, continues at ${clock(s.autoResume.at)}`) : statusText(cls)}${s.mode === 'terminal' ? tr(' · 终端模式', ' · Terminal mode') : ''}${s.mode === 'terminal' && cls !== 'off' && cls !== 'err' ? tr('\n进程不会自动结束，不用时请停止进程', '\nNot stopped automatically; stop the process when done') : ''}`}
+        title={`${s.title || tx('newSession')}\n${s.cwd}\n${s.tool === 'files' ? tx('files') : s.autoResume ? tx('usageLimitReachedContinuesAt', { v: clock(s.autoResume.at) }) : statusText(cls)}${s.mode === 'terminal' ? tx('terminalMode') : ''}${s.mode === 'terminal' && cls !== 'off' && cls !== 'err' ? tx('notStoppedAutomaticallyStopThe') : ''}`}
       >
         <span className="row-badge">
           <ToolBadge tool={s.tool} size={16} />
@@ -114,19 +116,19 @@ function SessionRow({ hostId, s, active, showDir }: { hostId: string; s: Session
           )}
         </span>
         <span className="session-title">
-          {s.title || tr('新会话', 'New Session')}
+          {s.title || tx('newSession')}
           {showDir && <span className="row-dir"> · {basename(s.cwd)}</span>}
         </span>
-        {(s.queued?.length ?? 0) > 0 && <span className="pill" title={tr('排队中的消息', 'Queued messages')}>{s.queued!.length}</span>}
+        {(s.queued?.length ?? 0) > 0 && <span className="pill" title={tx('queuedMessages')}>{s.queued!.length}</span>}
         <span className="row-end">{status}</span>
       </button>
       <div className="row-actions">
-        <button className={`row-act ${s.pinned ? 'on' : ''}`} title={s.pinned ? tr('取消置顶', 'Unpin') : tr('置顶', 'Pin')} onClick={() => pin(hostId, s)}>
+        <button className={`row-act ${s.pinned ? 'on' : ''}`} title={s.pinned ? tx('unpin') : tx('pin')} onClick={() => pin(hostId, s)}>
           <Icon name="pin" size={13} />
         </button>
         <button
           className="row-act"
-          title={tr('更多', 'More')}
+          title={tx('more')}
           onClick={(e) => {
             const r = e.currentTarget.getBoundingClientRect();
             openMenu({ clientX: r.left, clientY: r.bottom + 2 }, sessionMenu(hostId, s));
@@ -182,13 +184,13 @@ function useSlowClock() {
 /** Context menu for directory rows in the sidebar */
 function dirMenu(hostId: string, cwd: string, connected: boolean): (MenuItem | '-')[] {
   return [
-    { label: tr('搜索此目录的历史会话', 'Search History in Directory'), icon: 'history', disabled: !connected, run: () => navigate({ kind: 'history', hostId, cwd }) },
-    { label: tr('在此目录新建会话', 'New Session in Directory'), icon: 'plus', disabled: !connected, run: () => setState({ newSession: { hostId, cwd } }) },
-    { label: tr('浏览目录', 'Browse Directory'), icon: 'folder', disabled: !connected, run: () => navigate({ kind: 'files', hostId, path: cwd }) },
-    { label: tr('在此目录打开终端', 'Open Terminal in Directory'), icon: 'terminal', disabled: !connected, run: () => openTerminal(hostId, cwd) },
-    { label: tr('复制路径', 'Copy Path'), icon: 'copy', run: () => writeClipboard(cwd).then(() => toast(tr('已复制路径', 'Path copied'))) },
+    { label: tx('searchHistoryInDirectory'), icon: 'history', disabled: !connected, run: () => navigate({ kind: 'history', hostId, cwd }) },
+    { label: tx('newSessionInDirectory'), icon: 'plus', disabled: !connected, run: () => setState({ newSession: { hostId, cwd } }) },
+    { label: tx('browseDirectory'), icon: 'folder', disabled: !connected, run: () => navigate({ kind: 'files', hostId, path: cwd }) },
+    { label: tx('openTerminalInDirectory'), icon: 'terminal', disabled: !connected, run: () => openTerminal(hostId, cwd) },
+    { label: tx('copyPath'), icon: 'copy', run: () => writeClipboard(cwd).then(() => toast(tx('pathCopied'))) },
     '-',
-    { label: tr('删除此目录的所有会话…', 'Delete All Sessions in Directory…'), icon: 'trash', danger: true, disabled: !connected, run: () => deleteDirSessions(hostId, cwd) },
+    { label: tx('deleteAllSessionsInDirectory'), icon: 'trash', danger: true, disabled: !connected, run: () => deleteDirSessions(hostId, cwd) },
   ];
 }
 
@@ -198,22 +200,22 @@ function hostMenu(h: HostEntry, connect: () => void): (MenuItem | '-')[] {
   const connected = h.status.status === 'connected';
   if (!connected) {
     return [
-      { label: tr('连接', 'Connect'), icon: 'power', run: connect },
-      { label: tr('编辑主机', 'Edit Host'), icon: 'edit', run: () => navigate({ kind: 'hosts', editId: id }) },
+      { label: tx('connect'), icon: 'power', run: connect },
+      { label: tx('editHost'), icon: 'edit', run: () => navigate({ kind: 'hosts', editId: id }) },
     ];
   }
   return [
-    { label: tr('新建会话', 'New Session'), icon: 'plus', hint: `${MOD}+N`, run: () => setState({ newSession: { hostId: id } }) },
-    { label: tr('历史会话', 'Session History'), icon: 'history', run: () => navigate({ kind: 'history', hostId: id }) },
-    { label: tr('浏览文件', 'Browse Files'), icon: 'folder', run: () => navigate({ kind: 'files', hostId: id }) },
-    { label: tr('打开终端', 'Open Terminal'), icon: 'terminal', run: () => openTerminal(id) },
-    { label: tr('用量统计', 'Usage Stats'), icon: 'chart', run: () => navigate({ kind: 'stats', hostId: id }) },
-    { label: tr('端口转发', 'Port Forwarding'), icon: 'external', run: () => navigate({ kind: 'ports', hostId: id }) },
+    { label: tx('newSession2'), icon: 'plus', hint: `${MOD}+N`, run: () => setState({ newSession: { hostId: id } }) },
+    { label: tx('sessionHistory'), icon: 'history', run: () => navigate({ kind: 'history', hostId: id }) },
+    { label: tx('browseFiles'), icon: 'folder', run: () => navigate({ kind: 'files', hostId: id }) },
+    { label: tx('openTerminal'), icon: 'terminal', run: () => openTerminal(id) },
+    { label: tx('usageStats'), icon: 'chart', run: () => navigate({ kind: 'stats', hostId: id }) },
+    { label: tx('portForwarding'), icon: 'external', run: () => navigate({ kind: 'ports', hostId: id }) },
     '-',
-    { label: tr('主机设置', 'Host Settings'), icon: 'settings', run: () => navigate({ kind: 'settings', hostId: id }) },
-    { label: tr('编辑连接', 'Edit Connection'), icon: 'edit', run: () => navigate({ kind: 'hosts', editId: id }) },
+    { label: tx('hostSettings'), icon: 'settings', run: () => navigate({ kind: 'settings', hostId: id }) },
+    { label: tx('editConnection'), icon: 'edit', run: () => navigate({ kind: 'hosts', editId: id }) },
     ...(h.config.kind !== 'local'
-      ? [{ label: tr('断开连接', 'Disconnect'), icon: 'power', run: () => hubCall('hosts.disconnect', { id }).catch(errorToast) }]
+      ? [{ label: tx('disconnect'), icon: 'power', run: () => hubCall('hosts.disconnect', { id }).catch(errorToast) }]
       : []),
   ];
 }
@@ -249,15 +251,15 @@ function OldList({
         className="old-toggle"
         title={
           open
-            ? tr('收起空闲较久的会话', 'Hide sessions idle for a while')
-            : tr(`还有 ${old.length} 个空闲较久的会话`, `${old.length} more sessions idle for a while`)
+            ? tx('hideSessionsIdleForA')
+            : tx('moreSessionsIdleForA', { length: old.length })
         }
         onClick={() => onToggle(k)}
       >
         <span className={`old-toggle-icon ${open ? 'up' : ''}`}>
           <Icon name="chevron" size={12} />
         </span>
-        {open ? tr('收起', 'Show less') : tr(`显示更多 (${old.length})`, `Show more (${old.length})`)}
+        {open ? tx('showLess') : tx('showMore', { length: old.length })}
       </button>
     </>
   );
@@ -360,7 +362,7 @@ function HostBlock({ h, filter }: { h: HostEntry; filter: string }) {
         {layout === 'project' && !collapsed && !q && groups.length > 1 && (
           <button
             className="host-act"
-            title={allFolded ? tr('展开所有目录', 'Expand All Directories') : tr('折叠所有目录', 'Collapse All Directories')}
+            title={allFolded ? tx('expandAllDirectories') : tx('collapseAllDirectories')}
             onClick={() => setAllFolded(allFolded ? [] : groups.map((g) => g.cwd))}
           >
             <Icon name={allFolded ? 'unfold-all' : 'fold-all'} size={14} />
@@ -369,23 +371,23 @@ function HostBlock({ h, filter }: { h: HostEntry; filter: string }) {
         {/* Layout switch sits in the header for one-click toggling; the icon shows the layout a click switches to */}
         <button
           className="host-act"
-          title={layout === 'time' ? tr('改为按目录分组', 'Group by directory') : tr('改为按时间排列', 'Sort by time')}
+          title={layout === 'time' ? tx('groupByDirectory') : tx('sortByTime')}
           onClick={() => setSidePrefs({ layout: layout === 'time' ? 'project' : 'time' })}
         >
           <Icon name={layout === 'time' ? 'folder' : 'clock'} size={14} />
         </button>
         {connected ? (
-          <button className="host-act" title={tr('新建会话', 'New Session')} onClick={() => setState({ newSession: { hostId: id } })}>
+          <button className="host-act" title={tx('newSession2')} onClick={() => setState({ newSession: { hostId: id } })}>
             <Icon name="plus" size={15} />
           </button>
         ) : (
           <button className="host-connect" onClick={connect}>
-            {tr('连接', 'Connect')}
+            {tx('connect')}
           </button>
         )}
         <button
           className="host-act"
-          title={tr('更多', 'More')}
+          title={tx('more')}
           onClick={(e) => {
             const r = e.currentTarget.getBoundingClientRect();
             openMenu({ clientX: r.left, clientY: r.bottom + 2 }, hostMenu(h, connect));
@@ -403,7 +405,7 @@ function HostBlock({ h, filter }: { h: HostEntry; filter: string }) {
           )}
           {pinned.length > 0 && (
             <div className="project">
-              <div className="project-name">{tr('置顶', 'Pinned')}</div>
+              <div className="project-name">{tx('pinned')}</div>
               {pinned.map((s) => (
                 <SessionRow key={s.id} hostId={id} s={s} active={isActive(s)} showDir />
               ))}
@@ -411,7 +413,7 @@ function HostBlock({ h, filter }: { h: HostEntry; filter: string }) {
           )}
           {layout === 'time' ? (
             <div className="project">
-              {pinned.length > 0 && flat.recent.length + flat.old.length > 0 && <div className="project-name">{tr('最近', 'Recent')}</div>}
+              {pinned.length > 0 && flat.recent.length + flat.old.length > 0 && <div className="project-name">{tx('recent')}</div>}
               {flat.recent.map((s) => (
                 <SessionRow key={s.id} hostId={id} s={s} active={isActive(s)} showDir />
               ))}
@@ -428,7 +430,7 @@ function HostBlock({ h, filter }: { h: HostEntry; filter: string }) {
                   <div className="project-head">
                     <button
                       className={`project-add ${connected ? '' : 'hidden'}`}
-                      title={tr(`在 ${basename(cwd)} 新建会话`, `New session in ${basename(cwd)}`)}
+                      title={tx('newSessionIn', { v: basename(cwd) })}
                       onClick={() => setState({ newSession: { hostId: id, cwd } })}
                     >
                       <Icon name="plus" size={13} />
@@ -453,7 +455,7 @@ function HostBlock({ h, filter }: { h: HostEntry; filter: string }) {
                           {sum && (
                             <span
                               className={`sdot sdot-${sum}`}
-                              title={sum === 'attn' ? tr('有会话等待审批', 'Session waiting for approval') : tr('有会话在运行', 'Session running')}
+                              title={sum === 'attn' ? tx('sessionWaitingForApproval') : tx('sessionRunning')}
                             />
                           )}
                         </span>
@@ -475,7 +477,7 @@ function HostBlock({ h, filter }: { h: HostEntry; filter: string }) {
             })
           )}
           {connected && sessions && !sessions.some((s) => !s.parentId) && (
-            <div className="muted small pad-x">{tr('还没有会话，点 + 新建，或从历史里继续', 'No sessions yet. Click + to create one or resume from history.')}</div>
+            <div className="muted small pad-x">{tx('noSessionsYetClickTo')}</div>
           )}
         </div>
       )}
@@ -519,7 +521,7 @@ export function Sidebar() {
       <aside className={`sidebar ${open ? 'open' : ''}`} style={{ '--side-w': `${sideW}px` } as React.CSSProperties}>
         <div
           className="side-resizer hide-mobile"
-          title={tr('拖动调整宽度，双击还原', 'Drag to resize, double-click to reset')}
+          title={tx('dragToResizeDoubleClick')}
           onPointerDown={dragSide}
           onDoubleClick={() => (setSideW(SIDE_MIN), lsSet('side-w', SIDE_MIN))}
         />
@@ -527,20 +529,20 @@ export function Sidebar() {
           <button
             className="nav-item"
             disabled={!firstConnected}
-            title={firstConnected ? '' : tr('先连上一台主机', 'Connect to a host first')}
+            title={firstConnected ? '' : tx('connectToAHostFirst')}
             onClick={() => firstConnected && setState({ newSession: { hostId: firstConnected } })}
           >
-            <Icon name="edit" size={15} /> {tr('新的会话', 'New Session')}
+            <Icon name="edit" size={15} /> {tx('newSession3')}
           </button>
           <button className={`nav-item ${view.kind === 'home' ? 'active' : ''}`} onClick={() => navigate({ kind: 'home' })}>
-            <Icon name="home" size={15} /> {tr('总览', 'Overview')}
+            <Icon name="home" size={15} /> {tx('overview')}
           </button>
         </div>
         <div className="side-search">
           <Icon name="search" size={14} />
           <input
             value={filter}
-            placeholder={tr('搜索会话和消息', 'Search sessions & messages')}
+            placeholder={tx('searchSessionsMessages')}
             onChange={(e) => setFilter(e.target.value)}
             onKeyDown={(e) => {
               if (e.key === 'Escape') setFilter('');
@@ -548,13 +550,13 @@ export function Sidebar() {
             }}
           />
           {filter ? (
-            <button className="icon-btn" title={tr('清除', 'Clear')} onClick={() => setFilter('')}>
+            <button className="icon-btn" title={tx('clear')} onClick={() => setFilter('')}>
               <Icon name="x" size={13} />
             </button>
           ) : (
             <button
               className="kbd-btn hide-mobile"
-              title={tr('命令面板：跳到任意会话、执行操作', 'Command Palette: jump to session or run action')}
+              title={tx('commandPaletteJumpToSession')}
               onClick={() => setState({ palette: true })}
             >
               {MOD}K
@@ -564,7 +566,7 @@ export function Sidebar() {
         {filter.trim() && (
           <button className={`nav-item search-msgs ${view.kind === 'search' ? 'active' : ''}`} onClick={searchMessages}>
             <Icon name="search" size={14} />
-            <span className="truncate">{tr(`在消息里搜索「${filter.trim()}」`, `Search messages for "${filter.trim()}"`)}</span>
+            <span className="truncate">{tx('searchMessagesFor', { v: filter.trim() })}</span>
             <span className="kbd-hint">Enter</span>
           </button>
         )}
@@ -574,7 +576,7 @@ export function Sidebar() {
           ))}
           {!filter && (
             <button className={`add-host ${view.kind === 'hosts' ? 'active' : ''}`} onClick={() => navigate({ kind: 'hosts' })}>
-              <Icon name="plus" size={13} /> {tr('添加 / 管理主机', 'Add / Manage Hosts')}
+              <Icon name="plus" size={13} /> {tx('addManageHosts')}
             </button>
           )}
         </div>
@@ -582,18 +584,18 @@ export function Sidebar() {
           <div className="brand">
             <img src="/icon.svg" alt="" width={20} height={20} />
             <span className="truncate">Yi Console</span>
-            {transport === 'closed' && <span className="pill pill-err">{tr('离线', 'Offline')}</span>}
+            {transport === 'closed' && <span className="pill pill-err">{tx('offline')}</span>}
           </div>
           <button
             className={`icon-btn ${view.kind === 'hosts' ? 'active' : ''}`}
-            title={tr('主机管理', 'Hosts')}
+            title={tx('hosts')}
             onClick={() => navigate({ kind: 'hosts' })}
           >
             <Icon name="server" size={16} />
           </button>
           <button
             className={`icon-btn ${view.kind === 'prefs' ? 'active' : ''}`}
-            title={tr('系统设置（外观、语言、通知、网络代理）', 'Preferences (Appearance, Language, Notifications, Proxy)')}
+            title={tx('preferencesAppearanceLanguageNotificationsProxy')}
             onClick={() => navigate({ kind: 'prefs' })}
           >
             <Icon name="settings" size={16} />

@@ -1,0 +1,17 @@
+{
+  "input": "Input",
+  "output": "Output",
+  "cacheRead": "Cache read",
+  "cacheWrite": "Cache write",
+  "total": "Total",
+  "cost": "Cost",
+  "context": "Context",
+  "model": "Model",
+  "usage": "Usage",
+  "thisSession": "This session",
+  "terminalModeDoesNotReport": "Terminal mode does not report token usage. Turns after switching to chat are counted.",
+  "cursorDoesNotReportPer": "Cursor does not report per-turn tokens. Account quota is below.",
+  "quota": "quota",
+  "refresh": "Refresh",
+  "thisToolDidNotReport": "This tool did not report quota"
+}

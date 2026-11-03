@@ -1,7 +1,9 @@
 import { useState } from 'react';
-import { isEn, tr } from '../i18n';
+import { getT, isEn } from '../i18n';
 import type { Question, QuestionAnswer } from '../types';
 import { Icon } from './Icon';
+
+const t = getT('questionCard');
 
 // Card for questions from the AI: one or more questions, each answered by clicking options (single / multiple choice), with free text if allowed; submit or skip.
 // Used for question requests from Claude, Codex and Cursor, and for numbered options in Kiro's reply text
@@ -60,12 +62,12 @@ export function QuestionCard({
       <div className="q-head" onClick={compact ? () => setFolded(!folded) : undefined}>
         <Icon name="chat" size={15} />
         <span className="q-title">{title}</span>
-        {questions.length > 1 && <span className="muted small">{tr(`共 ${questions.length} 个问题`, `${questions.length} questions`)}</span>}
+        {questions.length > 1 && <span className="muted small">{t('questions', { length: questions.length })}</span>}
         {compact && (
           <button
             type="button"
             className="icon-btn card-fold-btn"
-            title={folded ? tr('展开问题', 'Expand') : tr('暂时收起', 'Collapse')}
+            title={folded ? t('expand') : t('collapse')}
             onClick={(e) => {
               e.stopPropagation();
               setFolded(!folded);
@@ -86,7 +88,7 @@ export function QuestionCard({
                 {questions.length > 1 && <span className="q-num">{qi + 1}</span>}
                 {q.header && <span className="q-header">{q.header}</span>}
                 <span>{q.question}</span>
-                {q.multiSelect && !/多选|multi/i.test(q.question) && <span className="muted small">{tr('（可多选）', ' (Multi-select)')}</span>}
+                {q.multiSelect && !/多选|multi/i.test(q.question) && <span className="muted small">{t('multiSelect')}</span>}
               </div>
               {q.options.length > 0 && (
                 <div className="q-options" role={q.multiSelect ? 'group' : 'radiogroup'}>
@@ -116,7 +118,7 @@ export function QuestionCard({
                   className="q-other"
                   type={q.secret ? 'password' : 'text'}
                   value={cur.text}
-                  placeholder={q.options.length ? tr('其他，自己填写…', 'Other (type your answer)…') : tr('输入你的回答…', 'Type your answer…')}
+                  placeholder={q.options.length ? t('otherTypeYourAnswer') : t('typeYourAnswer')}
                   onChange={(e) => set(q, { selected: q.multiSelect ? cur.selected : [], text: e.target.value })}
                   onKeyDown={(e) => {
                     if (e.key === 'Enter' && !e.nativeEvent.isComposing && ready) submit();
@@ -130,16 +132,16 @@ export function QuestionCard({
       <div className="q-actions">
         {onSkip && (
           <button className="btn small" disabled={busy} onClick={() => run(onSkip)}>
-            {tr('跳过', 'Skip')}
+            {t('skip')}
           </button>
         )}
         <button
           className="btn primary small"
           disabled={busy || !ready}
           onClick={submit}
-          title={ready ? '' : tr('每个问题都要回答', 'Please answer all questions')}
+          title={ready ? '' : t('pleaseAnswerAllQuestions')}
         >
-          {submitLabel ?? tr('提交', 'Submit')}
+          {submitLabel ?? t('submit')}
         </button>
       </div>
         </>
@@ -157,7 +159,7 @@ export function answerLabel(q: Question, a?: QuestionAnswer) {
 }
 
 function Resolved({ title, questions, resolved }: { title: string; questions: Question[]; resolved: { optionId: string; answers: QuestionAnswer[] } }) {
-  const how = resolved.optionId === 'answer' ? '' : resolved.optionId === 'cancelled' ? tr('已取消', 'Cancelled') : tr('已跳过', 'Skipped');
+  const how = resolved.optionId === 'answer' ? '' : resolved.optionId === 'cancelled' ? t('cancelled') : t('skipped');
   return (
     <div className="q-card resolved">
       <div className="q-head">
@@ -170,7 +172,7 @@ function Resolved({ title, questions, resolved }: { title: string; questions: Qu
           {questions.map((q) => (
             <div key={q.id} className="q-sum-row">
               <span className="muted">{q.header || q.question}</span>
-              <span>{q.secret ? '••••' : answerLabel(q, resolved.answers.find((a) => a.questionId === q.id)) || tr('（未回答）', '(Unanswered)')}</span>
+              <span>{q.secret ? '••••' : answerLabel(q, resolved.answers.find((a) => a.questionId === q.id)) || t('unanswered')}</span>
             </div>
           ))}
         </div>
@@ -195,7 +197,7 @@ export function parseTextQuestions(text: string): Question[] {
       let q = qs[qs.length - 1];
       // A single question without a number: the line before the options is the question
       if (!q) {
-        q = { id: '1', question: clean(lastLine) || tr('请选择', 'Please select'), options: [], allowOther: true };
+        q = { id: '1', question: clean(lastLine) || t('pleaseSelect'), options: [], allowOther: true };
         qs.push(q);
       }
       const label = clean(opt[2]);

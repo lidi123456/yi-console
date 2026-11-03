@@ -1,0 +1,13 @@
+{
+  "defaultModel": "Default Model",
+  "chooseModel": "Choose Model",
+  "close": "Close",
+  "searchModels": "Search models",
+  "loading": "Loading…",
+  "noModelsReportedYetTry": "No models reported yet. Try again after sending a message.",
+  "reasoningEffort": "Reasoning Effort",
+  "toolDefault": "Tool default ({{v}})",
+  "toolDefault2": "Tool default",
+  "default": "Default",
+  "switchModel": "Switch Model"
+}

@@ -1,0 +1,20 @@
+{
+  "firstRowIsAHeader": "第一行是表头",
+  "filterRows": "筛选行…",
+  "showingTheFirstRowsSwitch": "只显示前 {{MAX_ROWS}} 行，完整内容切到「源码」看。",
+  "pdfPreview": "PDF 预览",
+  "pdfPreviewIsNotAvailable": "这个系统上不能直接预览 PDF",
+  "download": "下载到本机",
+  "couldNotLoadImage": "读不到图片：{{raw}}",
+  "imagePreview": "图片预览：{{name}}",
+  "zoomOut": "缩小（-）",
+  "clickToToggleFitActual": "点一下切换适应窗口 / 原始大小",
+  "zoomIn": "放大（+）",
+  "fit0": "适应窗口（0）",
+  "rotateLeftShiftR": "向左旋转（Shift+R）",
+  "rotateRightR": "向右旋转（R）",
+  "flipHorizontal": "水平翻转",
+  "fullScreen": "全屏查看",
+  "csvSize": "{{rows}} 行 · {{cols}} 列",
+  "csvShown": " · 筛出 {{n}} 行"
+}

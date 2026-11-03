@@ -1,0 +1,17 @@
+{
+  "input": "输入",
+  "output": "输出",
+  "cacheRead": "缓存读取",
+  "cacheWrite": "缓存写入",
+  "total": "合计",
+  "cost": "费用",
+  "context": "上下文",
+  "model": "模型",
+  "usage": "用量",
+  "thisSession": "这个会话",
+  "terminalModeDoesNotReport": "终端模式拿不到 token 用量，切到对话模式后的回合才会统计。",
+  "cursorDoesNotReportPer": "Cursor 不回传单轮 token 用量，只能看下面的账号额度。",
+  "quota": "账号额度",
+  "refresh": "刷新",
+  "thisToolDidNotReport": "这个工具没有报告额度信息"
+}

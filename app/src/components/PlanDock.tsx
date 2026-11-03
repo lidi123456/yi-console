@@ -1,9 +1,11 @@
 import { useMemo, useState } from 'react';
-import { tr } from '../i18n';
+import { getT } from '../i18n';
 import { currentEntry, latestPlan, viewEntries } from '../plan';
 import type { HubEvent } from '../types';
 import { PlanList } from './ChatView';
 import { Icon } from './Icon';
+
+const t = getT('planDock');
 
 /** Task progress above the input box: while tasks remain, one line "Tasks 3/7 · Now: …", click for the full list; disappears when all are done */
 export function PlanDock({ events, busy }: { events: HubEvent[]; busy: boolean }) {
@@ -18,9 +20,9 @@ export function PlanDock({ events, busy }: { events: HubEvent[]; busy: boolean }
     <div className={`bg-tasks plan-dock ${open ? 'open' : ''}`}>
       <button className="bg-tasks-head" onClick={() => setOpen(!open)} title={plan.title}>
         {cur.active && busy ? <span className="spinner" /> : <span className="plan-dock-icon">☐</span>}
-        <span className="bg-tasks-count">{tr(`任务 ${done}/${entries.length}`, `Tasks ${done}/${entries.length}`)}</span>
+        <span className="bg-tasks-count">{t('tasks', { done, length: entries.length })}</span>
         <span className="bg-tasks-sum plan-dock-cur truncate" title={cur.entry.content}>
-          {(cur.active ? tr('正在：', 'Now: ') : tr('下一项：', 'Next: ')) + cur.entry.content}
+          {(cur.active ? t('now') : t('next')) + cur.entry.content}
         </span>
         <span className={`chev ${open ? 'open' : ''}`}>
           <Icon name="chevron" size={12} />

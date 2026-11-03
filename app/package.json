@@ -6,8 +6,9 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc --noEmit && vite build",
-    "tauri": "tauri"
+    "build": "npm run i18n:check && tsc --noEmit && vite build",
+    "tauri": "tauri",
+    "i18n:check": "i18next-cli types && i18next-cli status && i18next-cli lint"
   },
   "dependencies": {
     "@codemirror/autocomplete": "^6.20.4",
@@ -28,6 +29,7 @@
     "@xterm/xterm": "^5.5",
     "diff": "^8",
     "dompurify": "^3",
+    "i18next": "^26.7.1",
     "jsqr": "^1.4.0",
     "marked": "^16",
     "qrcode": "^1.5",
@@ -40,6 +42,7 @@
     "@types/react": "^19",
     "@types/react-dom": "^19",
     "@vitejs/plugin-react": "^5",
+    "i18next-cli": "^1.82.4",
     "typescript": "^5.9",
     "vite": "^7"
   }

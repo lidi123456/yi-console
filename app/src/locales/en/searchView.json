@@ -1,0 +1,12 @@
+{
+  "daemonIsTooOldRestart": "Daemon is too old. Restart it to search.",
+  "searchMessages": "Search messages",
+  "searchUserMessagesAndReplies": "Search user messages and replies on all hosts",
+  "noMatches": "No matches",
+  "onlyYiConsoleSessionsAre": "Only Yi Console sessions are searched. Open a tool history from History first if it has not been imported.",
+  "newSession": "New session",
+  "me": "Me",
+  "more": "{{v}} more",
+  "hitsInSessions": "{{total}} hits in {{sessions}} sessions",
+  "upTo100PerHost": " (up to 100 per host)"
+}

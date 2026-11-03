@@ -1,8 +1,10 @@
 import { useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import { useBack } from '../back';
-import { tr } from '../i18n';
+import { getT } from '../i18n';
 import { Icon } from './Icon';
 import { imageMenu, saveImage } from './ImageMenu';
+
+const t = getT('lightbox');
 
 // Enlarged image view: wheel to zoom, drag to pan, rotate; Esc or clicking empty space closes it
 
@@ -119,25 +121,25 @@ function Viewer({ src }: { src: string }) {
         onContextMenu={(e) => imageMenu(e, src, { zoom: false })}
       />
       <div className="lightbox-bar" onMouseDown={(e) => e.stopPropagation()} onMouseUp={(e) => e.stopPropagation()}>
-        <button title={tr('缩小（-）', 'Zoom out (-)')} onClick={() => zoom(0.8)}>
+        <button title={t('zoomOut')} onClick={() => zoom(0.8)}>
           <Icon name="win-min" size={16} />
         </button>
-        <button className="lightbox-pct" title={tr('原始比例（0）', 'Original size (0)')} onClick={reset}>
+        <button className="lightbox-pct" title={t('originalSize0')} onClick={reset}>
           {Math.round(scale * 100)}%
         </button>
-        <button title={tr('放大（+）', 'Zoom in (+)')} onClick={() => zoom(1.25)}>
+        <button title={t('zoomIn')} onClick={() => zoom(1.25)}>
           <Icon name="plus" size={16} />
         </button>
-        <button title={tr('向左旋转（Shift+R）', 'Rotate left (Shift+R)')} onClick={() => setRot((r) => r - 90)}>
+        <button title={t('rotateLeftShiftR')} onClick={() => setRot((r) => r - 90)}>
           <Icon name="rotate-l" size={16} />
         </button>
-        <button title={tr('向右旋转（R）', 'Rotate right (R)')} onClick={() => setRot((r) => r + 90)}>
+        <button title={t('rotateRightR')} onClick={() => setRot((r) => r + 90)}>
           <Icon name="rotate-r" size={16} />
         </button>
-        <button title={tr('另存为', 'Save as')} onClick={() => saveImage(src)}>
+        <button title={t('saveAs')} onClick={() => saveImage(src)}>
           <Icon name="download" size={16} />
         </button>
-        <button title={tr('关闭（Esc）', 'Close (Esc)')} onClick={close}>
+        <button title={t('closeEsc')} onClick={close}>
           <Icon name="x" size={16} />
         </button>
       </div>

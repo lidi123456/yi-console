@@ -3,10 +3,12 @@ import { lsGet, lsSet } from './util';
 // each session's event stream is stored separately (large, changes often) and subscribers are notified per session.
 
 import { useSyncExternalStore } from 'react';
-import { getLang, onLangChange, tr, trErr } from './i18n';
+import { getLang, getT, onLangChange, trErr } from './i18n';
 import { fmtAt } from './limit';
 import { hubCall, onHubEvent, rpc, isTauri } from './transport';
 import type { ClientSettings, HostConfig, HostStatus, HubEvent, NotifyPrefs, SessionInfo, Snippet, ToolKind } from './types';
+
+const t = getT('store');
 
 export type View =
   | { kind: 'home' }
@@ -647,7 +649,7 @@ export function startEventLoop() {
         });
         if (phase === 'done') {
           const name = state.hosts.find((h) => h.config.id === hostId)?.config.name ?? hostId;
-          toast(tr(`${name} 的 yi-agentd 已升级到新版本`, `yi-agentd on ${name} has been upgraded`));
+          toast(t('yiAgentdOnHasBeen', { name }));
         }
         break;
       }
@@ -705,14 +707,14 @@ function onNotification(hostId: string, method: string, p: any) {
         // Usage limit: built here so it follows this device's language
         const at: number | null = p.limit.resumeAt ?? null;
         const sess = state.sessions[hostId]?.find((x) => x.id === p.sessionId);
-        title = tr(`${p.limit.name} 额度已用完`, `${p.limit.name}: usage limit reached`);
+        title = t('usageLimitReached', { name: p.limit.name });
         body = [
           sess?.title,
           at
-            ? tr(`${fmtAt(at)} 自动继续`, `Continues automatically at ${fmtAt(at)}`)
+            ? t('continuesAutomaticallyAt', { v: fmtAt(at) })
             : p.limit.probing
-              ? tr('额度恢复后会自动继续', 'Continues automatically once the limit resets')
-              : tr('不会自动继续', "Won't continue automatically"),
+              ? t('continuesAutomaticallyOnceTheLimit')
+              : t('wonTContinueAutomatically'),
         ]
           .filter(Boolean)
           .join(' · ');
@@ -721,7 +723,7 @@ function onNotification(hostId: string, method: string, p: any) {
       // In-app toast: remind the user when they're in another session
       if (!viewing) {
         toast(title, 'info', {
-          label: tr('查看', 'View'),
+          label: t('view'),
           run: () => navigate({ kind: 'session', hostId, sessionId: p.sessionId }),
         });
       }

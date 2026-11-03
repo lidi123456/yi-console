@@ -10,8 +10,10 @@ import { initLang } from './i18n';
 import { isMobileApp, openUrl, openUrlExternal } from './components/PortsView';
 import { openMenu } from './components/Overlay';
 import { writeClipboard } from './clipboard';
-import { tr } from './i18n';
+import { getT } from './i18n';
 import { startUpdateChecks } from './update';
+
+const t = getT('main');
 
 // Links in the page (AI replies, Markdown preview, etc.) never navigate inside the app window: external URLs open in the system browser,
 // anything else (relative paths, file:, etc.) is blocked, otherwise the whole app would be replaced by that page.
@@ -36,10 +38,10 @@ function linkMenu(e: MouseEvent) {
   const url = a.href;
   const sel = window.getSelection()?.toString() ?? '';
   openMenu(e, [
-    { label: isMobileApp ? tr('在应用内打开', 'Open in app') : tr('在浏览器中打开', 'Open in browser'), icon: 'globe', run: () => openUrl(url) },
-    ...(isMobileApp ? [{ label: tr('用其他浏览器打开', 'Open in another browser'), icon: 'external', run: () => openUrlExternal(url) }] : []),
-    { label: tr('复制链接', 'Copy link'), icon: 'copy', run: () => writeClipboard(url) },
-    ...(sel.trim() ? ['-' as const, { label: tr('复制', 'Copy'), icon: 'copy', run: () => writeClipboard(sel) }] : []),
+    { label: isMobileApp ? t('openInApp') : t('openInBrowser'), icon: 'globe', run: () => openUrl(url) },
+    ...(isMobileApp ? [{ label: t('openInAnotherBrowser'), icon: 'external', run: () => openUrlExternal(url) }] : []),
+    { label: t('copyLink'), icon: 'copy', run: () => writeClipboard(url) },
+    ...(sel.trim() ? ['-' as const, { label: t('copy'), icon: 'copy', run: () => writeClipboard(sel) }] : []),
   ]);
 }
 document.addEventListener('contextmenu', linkMenu, true);

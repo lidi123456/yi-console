@@ -1,7 +1,9 @@
 import DOMPurify from 'dompurify';
 import { Marked, marked } from 'marked';
-import { isEn, tr } from './i18n';
+import { getT, isEn } from './i18n';
 import type { HubEvent, SessionInfo, SessionStatus, Usage } from './types';
+
+const tx = getT('util');
 
 marked.setOptions({ gfm: true, breaks: true });
 
@@ -66,7 +68,7 @@ export function shortPath(p: string, home?: string): string {
 export function timeAgo(ms: number): string {
   if (!ms) return '';
   const d = (Date.now() - ms) / 1000;
-  if (d < 60) return tr('刚刚', 'Just now');
+  if (d < 60) return tx('justNow');
   if (d < 3600) return isEn() ? `${Math.floor(d / 60)}m ago` : `${Math.floor(d / 60)} 分钟前`;
   if (d < 86400) return isEn() ? `${Math.floor(d / 3600)}h ago` : `${Math.floor(d / 3600)} 小时前`;
   if (d < 86400 * 7) return isEn() ? `${Math.floor(d / 86400)}d ago` : `${Math.floor(d / 86400)} 天前`;
@@ -164,7 +166,7 @@ function fullTime(ms: number): string {
 
 /** Export a session as Markdown: user messages, reply text and tool call summaries; thinking and tool output are not exported */
 export function sessionMarkdown(info: SessionInfo, events: HubEvent[], toolLabel: string): string {
-  const out: string[] = [`# ${info.title || tr('未命名会话', 'Untitled session')}`, ''];
+  const out: string[] = [`# ${info.title || tx('untitledSession')}`, ''];
   out.push(isEn() ? `- Tool: ${toolLabel}${info.model ? ` (${info.model})` : ''}` : `- 工具：${toolLabel}${info.model ? `（${info.model}）` : ''}`);
   out.push(isEn() ? `- Directory: \`${info.cwd}\`` : `- 目录：\`${info.cwd}\``);
   out.push(isEn() ? `- Time: ${fullTime(info.createdAt)} – ${fullTime(info.updatedAt)}` : `- 时间：${fullTime(info.createdAt)} ～ ${fullTime(info.updatedAt)}`);
@@ -175,7 +177,7 @@ export function sessionMarkdown(info: SessionInfo, events: HubEvent[], toolLabel
   const tools = new Set<string>();
   for (const e of events) {
     if (e.kind === 'user_message') {
-      out.push('---', '', `### 🧑 ${tr('用户', 'User')} · ${fullTime(e.ts)}`, '', e.text, '');
+      out.push('---', '', `### 🧑 ${tx('user')} · ${fullTime(e.ts)}`, '', e.text, '');
       if (e.images?.length) out.push(isEn() ? `*(${e.images.length} image(s) attached)*` : `*（附 ${e.images.length} 张图片）*`, '');
       lastRole = 'user';
     } else if (e.kind === 'assistant_text') {

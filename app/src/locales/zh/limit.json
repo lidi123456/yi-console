@@ -1,0 +1,21 @@
+{
+  "n5HourLimit": "5 小时额度",
+  "weeklyLimit": "每周额度",
+  "weeklyOpusLimit": "每周 Opus 额度",
+  "weeklySonnetLimit": "每周 Sonnet 额度",
+  "resets": "{{v}} 恢复",
+  "lookingUpWhenItResets": "正在查询恢复时间…",
+  "willContinueAutomaticallyAt": "将在 {{v}} 自动继续",
+  "automaticContinueIsTurnedOff": "自动继续已在设置中关闭",
+  "couldnTFindWhenIt": "查不到恢复时间，不会自动继续",
+  "resetsMoreThanADay": "恢复时间超过一天，不会自动继续",
+  "hitTheLimitAgainSeveral": "连续多次碰到额度上限，已停止自动继续",
+  "wonTContinueAutomatically": "不会自动继续",
+  "continuedNowByHand": "已手动立即继续",
+  "limitResetSentContinueAutomatically": "额度已恢复，已自动发送继续",
+  "automaticContinueCancelled": "已取消自动继续",
+  "youSentAMessageAutomatic": "你发送了消息，不再自动继续",
+  "switchedToTheTerminalUi": "切换到了终端界面，不再自动继续",
+  "theSessionWasBusyAutomatic": "会话正在运行，跳过了自动继续",
+  "automaticContinueCancelled2": "自动继续已取消"
+}

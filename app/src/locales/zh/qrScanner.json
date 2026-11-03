@@ -1,0 +1,9 @@
+{
+  "noCameraPermissionAllowYi": "没有相机权限。请在系统设置里允许 Yi Console 使用相机，或者直接粘贴配对链接。",
+  "noCameraFound": "没有找到可用的相机",
+  "theCameraIsInUse": "相机被其他应用占用，或者打不开",
+  "couldNotOpenTheCamera": "打不开相机：{{v}}",
+  "close": "关闭",
+  "fitThePairingQrCode": "把电脑上的配对二维码放进框里",
+  "openingTheCamera": "正在打开相机…"
+}

@@ -1,10 +1,12 @@
 import { useEffect, useState } from 'react';
-import { tr } from '../i18n';
+import { getT } from '../i18n';
 import { errorToast, toast, useStore } from '../store';
 import { hubCall, isTauri, onHubEvent, rpc } from '../transport';
 import { writeClipboard } from '../clipboard';
 import { Icon } from './Icon';
 import { errText } from './StatsView';
+
+const t = getT('portsView');
 
 // Port forwarding: connect a port on the host to 127.0.0.1 on this machine so dev servers on remote machines open in the local browser.
 // SSH hosts use SSH's own port forwarding; relay hosts go through a relay channel, with yi-agentd connecting to its local port (yi-agentd itself listens on no ports).
@@ -100,7 +102,7 @@ export function PortsView({ hostId }: { hostId: string }) {
       setLocalPort('');
       await loadForwards();
       if (open) openUrl(forwardUrl(f));
-      else if (!f.direct) toast(tr(`已转发：localhost:${f.localPort} → ${host?.config.name ?? ''} 的 ${p} 端口`, `Forwarded localhost:${f.localPort} → ${host?.config.name ?? ''} port ${p}`));
+      else if (!f.direct) toast(t('forwardedLocalhostPort', { localPort: f.localPort, v: host?.config.name ?? '', p }));
     } catch (e) {
       errorToast(e);
     } finally {
@@ -114,8 +116,8 @@ export function PortsView({ hostId }: { hostId: string }) {
   const submit = () => {
     const p = Number(port);
     const lp = localPort ? Number(localPort) : undefined;
-    if (!Number.isInteger(p) || p < 1 || p > 65535) return errorToast(tr('端口号要在 1–65535 之间', 'Port must be between 1 and 65535'));
-    if (lp !== undefined && (!Number.isInteger(lp) || lp < 1 || lp > 65535)) return errorToast(tr('本机端口号要在 1–65535 之间', 'Local port must be between 1 and 65535'));
+    if (!Number.isInteger(p) || p < 1 || p > 65535) return errorToast(t('portMustBeBetween1'));
+    if (lp !== undefined && (!Number.isInteger(lp) || lp < 1 || lp > 65535)) return errorToast(t('localPortMustBeBetween'));
     add(p, lp);
   };
 
@@ -125,64 +127,61 @@ export function PortsView({ hostId }: { hostId: string }) {
   return (
     <div className="page ports">
       <div className="page-head">
-        <h2>{tr('端口转发', 'Port forwarding')} · {host?.config.name ?? hostId}</h2>
+        <h2>{t('portForwarding')} · {host?.config.name ?? hostId}</h2>
         <button className="btn small" onClick={() => (loadForwards(), connected && loadListening())}>
-          <Icon name="refresh" size={14} /> {tr('刷新', 'Refresh')}
+          <Icon name="refresh" size={14} /> {t('refresh')}
         </button>
       </div>
       <p className="muted small">
         {isLocal
-          ? tr('这是本机，端口不用转发，可以直接在浏览器里打开。', 'This is the local machine. Open ports directly in the browser.')
-          : tr(
-              `把 ${host?.config.name ?? '主机'} 上的端口接到本机的 localhost，在本机浏览器里打开远程机器上跑的网页、接口。只转发到主机自己的 127.0.0.1，本机这边也只监听 127.0.0.1，别的电脑连不进来。转发在关闭 App 后结束。`,
-              `Connect a port on ${host?.config.name ?? 'the host'} to localhost so you can open remote pages and APIs in this browser. Traffic only reaches 127.0.0.1 on the host, and this side only listens on 127.0.0.1. Forwards end when the app closes.`,
-            )}
-        {!isTauri && tr(' 浏览器版里，本机端口开在运行 yi-web 的那台机器上。', ' In the browser build, the local port is opened on the machine running yi-web.')}
+          ? t('thisIsTheLocalMachine')
+          : t('remoteIntro', { name: host?.config.name ?? t('theHostFallback') })}
+        {!isTauri && t('inTheBrowserBuildThe')}
       </p>
 
       {!isLocal && (
         <div className="card ports-add">
           <div className="row">
             <label className="ports-field">
-              <span>{tr('主机端口', 'Host port')}</span>
-              <input value={port} onChange={(e) => setPort(e.target.value.replace(/\D/g, ''))} placeholder={tr('如 3000', 'e.g. 3000')} inputMode="numeric" onKeyDown={(e) => e.key === 'Enter' && submit()} />
+              <span>{t('hostPort')}</span>
+              <input value={port} onChange={(e) => setPort(e.target.value.replace(/\D/g, ''))} placeholder={t('eG3000')} inputMode="numeric" onKeyDown={(e) => e.key === 'Enter' && submit()} />
             </label>
             <label className="ports-field">
-              <span>{tr('本机端口（可不填）', 'Local port (optional)')}</span>
-              <input value={localPort} onChange={(e) => setLocalPort(e.target.value.replace(/\D/g, ''))} placeholder={tr('默认同号，被占用时自动换', 'Same number by default; picks another if busy')} inputMode="numeric" onKeyDown={(e) => e.key === 'Enter' && submit()} />
+              <span>{t('localPortOptional')}</span>
+              <input value={localPort} onChange={(e) => setLocalPort(e.target.value.replace(/\D/g, ''))} placeholder={t('sameNumberByDefaultPicks')} inputMode="numeric" onKeyDown={(e) => e.key === 'Enter' && submit()} />
             </label>
             <button className="btn primary" disabled={busy || !port || !connected} onClick={submit}>
-              {tr('转发', 'Forward')}
+              {t('forward')}
             </button>
           </div>
-          {!connected && <div className="muted small">{tr('主机未连接，连上后才能转发。', 'Host is offline. Connect it before forwarding.')}</div>}
+          {!connected && <div className="muted small">{t('hostIsOfflineConnectIt')}</div>}
         </div>
       )}
 
       {!isLocal && (
         <>
-          <div className="section-title">{tr('已转发', 'Forwarded')}</div>
+          <div className="section-title">{t('forwarded')}</div>
           {forwards.length === 0 ? (
-            <div className="muted small ports-none">{tr('还没有转发的端口。在上面填端口号，或者在下面的列表里点「转发」。', 'Nothing forwarded yet. Enter a port above, or click Forward in the list.')}</div>
+            <div className="muted small ports-none">{t('nothingForwardedYetEnterA')}</div>
           ) : (
             <div className="ports-list">
               {forwards.map((f) => (
                 <div key={f.port} className="ports-row">
                   <span className="ports-port mono">{f.port}</span>
                   <Icon name="forward" size={12} />
-                  <button className="link-btn mono" title={tr('在浏览器里打开', 'Open in browser')} onClick={() => openUrl(forwardUrl(f))}>
+                  <button className="link-btn mono" title={t('openInBrowser')} onClick={() => openUrl(forwardUrl(f))}>
                     localhost:{f.localPort}
                   </button>
                   <span className="grow ports-note truncate">
-                    {f.error ? <span className="ports-err" title={f.error}>{f.error}</span> : f.conns > 0 ? <span className="muted">{tr(`${f.conns} 个连接`, `${f.conns} connections`)}</span> : null}
+                    {f.error ? <span className="ports-err" title={f.error}>{f.error}</span> : f.conns > 0 ? <span className="muted">{t('connections', { conns: f.conns })}</span> : null}
                   </span>
-                  <button className="icon-btn" title={tr('在浏览器里打开', 'Open in browser')} onClick={() => openUrl(forwardUrl(f))}>
+                  <button className="icon-btn" title={t('openInBrowser')} onClick={() => openUrl(forwardUrl(f))}>
                     <Icon name="external" size={14} />
                   </button>
-                  <button className="icon-btn" title={tr('复制地址', 'Copy address')} onClick={() => writeClipboard(forwardUrl(f)).then(() => toast(tr('已复制', 'Copied')))}>
+                  <button className="icon-btn" title={t('copyAddress')} onClick={() => writeClipboard(forwardUrl(f)).then(() => toast(t('copied')))}>
                     <Icon name="copy" size={14} />
                   </button>
-                  <button className="icon-btn" title={tr('停止转发', 'Stop forwarding')} onClick={() => stop(f)}>
+                  <button className="icon-btn" title={t('stopForwarding')} onClick={() => stop(f)}>
                     <Icon name="x" size={14} />
                   </button>
                 </div>
@@ -192,15 +191,15 @@ export function PortsView({ hostId }: { hostId: string }) {
         </>
       )}
 
-      <div className="section-title">{tr('主机上正在监听的端口', 'Ports listening on the host')}</div>
+      <div className="section-title">{t('portsListeningOnTheHost')}</div>
       {!connected ? (
-        <div className="muted small ports-none">{tr('主机未连接。', 'Host is offline.')}</div>
+        <div className="muted small ports-none">{t('hostIsOffline')}</div>
       ) : listErr ? (
         <div className="muted small ports-none">{listErr}</div>
       ) : listening === null ? (
-        <div className="muted small ports-none">{tr('正在读取…', 'Loading…')}</div>
+        <div className="muted small ports-none">{t('loading')}</div>
       ) : listening.length === 0 ? (
-        <div className="muted small ports-none">{tr('没有找到监听中的端口。', 'No listening ports found.')}</div>
+        <div className="muted small ports-none">{t('noListeningPortsFound')}</div>
       ) : (
         <div className="ports-list">
           {listening.map((l) => {
@@ -208,25 +207,25 @@ export function PortsView({ hostId }: { hostId: string }) {
             return (
               <div key={l.port} className="ports-row">
                 <span className="ports-port mono">{l.port}</span>
-                <span className="ports-proc truncate" title={l.pid ? tr(`进程 ${l.pid}`, `pid ${l.pid}`) : undefined}>
-                  {l.process || <span className="muted">{tr('未知进程', 'Unknown process')}</span>}
+                <span className="ports-proc truncate" title={l.pid ? t('pid', { pid: l.pid }) : undefined}>
+                  {l.process || <span className="muted">{t('unknownProcess')}</span>}
                 </span>
-                <span className="grow muted small mono truncate">{loopback(l.addr) ? tr('仅本机', 'Local only') : l.addr === '::' || l.addr === '0.0.0.0' ? tr('所有地址', 'All addresses') : l.addr}</span>
+                <span className="grow muted small mono truncate">{loopback(l.addr) ? t('localOnly') : l.addr === '::' || l.addr === '0.0.0.0' ? t('allAddresses') : l.addr}</span>
                 {isLocal ? (
                   <button className="btn small" onClick={() => openUrl(`http://localhost:${l.port}/`)}>
-                    {tr('打开', 'Open')}
+                    {t('open')}
                   </button>
                 ) : f ? (
-                  <button className="btn small" onClick={() => openUrl(forwardUrl(f))} title={tr(`已转发到 localhost:${f.localPort}`, `Forwarded to localhost:${f.localPort}`)}>
-                    {tr('打开', 'Open')}
+                  <button className="btn small" onClick={() => openUrl(forwardUrl(f))} title={t('forwardedToLocalhost', { localPort: f.localPort })}>
+                    {t('open')}
                   </button>
                 ) : (
                   <>
                     <button className="btn small" disabled={busy} onClick={() => add(l.port)}>
-                      {tr('转发', 'Forward')}
+                      {t('forward')}
                     </button>
-                    <button className="btn small" disabled={busy} onClick={() => add(l.port, undefined, true)} title={tr('转发后在浏览器里打开', 'Forward and open in the browser')}>
-                      {tr('转发并打开', 'Forward and open')}
+                    <button className="btn small" disabled={busy} onClick={() => add(l.port, undefined, true)} title={t('forwardAndOpenInThe')}>
+                      {t('forwardAndOpen')}
                     </button>
                   </>
                 )}

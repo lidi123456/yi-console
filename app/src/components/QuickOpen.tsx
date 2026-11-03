@@ -1,10 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { tr, useLang } from '../i18n';
+import { getT, useLang } from '../i18n';
 import { rpc } from '../transport';
 import { fuzzyScore } from '../util';
 import { KIND_LABEL, outline } from '../outline';
 import { FileIcon } from './FilePanel';
 import { Icon } from './Icon';
+
+const t = getT('quickOpen');
 
 // Quick open in the file panel (Ctrl+P), following VS Code:
 //   plain text: fuzzy match on file names; starting with @: functions, classes, headings in the current file; starting with :: go to a line
@@ -81,9 +83,9 @@ export function QuickOpen({
     if (mode === ':') {
       const n = parseInt(term, 10);
       if (!current) return [];
-      if (!n) return [{ key: 'tip', label: tr(`输入行号（1–${current.lines}）`, `Enter a line (1–${current.lines})`), run: () => {} }];
+      if (!n) return [{ key: 'tip', label: t('enterALine1', { lines: current.lines }), run: () => {} }];
       const line = Math.min(Math.max(1, n), current.lines);
-      return [{ key: 'line', label: tr(`跳到第 ${line} 行`, `Go to line ${line}`), detail: current.name, run: () => onGoto(line) }];
+      return [{ key: 'line', label: t('goToLine', { line }), detail: current.name, run: () => onGoto(line) }];
     }
     if (mode === '@') {
       const hits = term
@@ -96,7 +98,7 @@ export function QuickOpen({
       return hits.slice(0, 300).map((s) => ({
         key: `${s.line}:${s.name}`,
         label: s.name,
-        detail: tr(`第 ${s.line} 行`, `Line ${s.line}`),
+        detail: t('line', { line: s.line }),
         badge: KIND_LABEL[s.kind] ?? s.kind[0],
         depth: term ? 0 : s.depth,
         run: () => onGoto(s.line),
@@ -120,27 +122,27 @@ export function QuickOpen({
   const empty =
     mode === '@'
       ? !current
-        ? tr('先打开一个文件', 'Open a file first')
+        ? t('openAFileFirst')
         : symbols.length === 0
-          ? tr('这个文件里没找到函数、类或标题', 'No functions, classes, or headings in this file')
-          : tr('没有匹配的符号', 'No matching symbols')
+          ? t('noFunctionsClassesOrHeadings')
+          : t('noMatchingSymbols')
       : mode === ':'
-        ? tr('先打开一个文件', 'Open a file first')
+        ? t('openAFileFirst')
         : term
           ? files === null
-            ? tr('查找中…', 'Searching…')
-            : tr('没有匹配的文件', 'No matching files')
-          : tr('输入文件名查找', 'Type a file name');
+            ? t('searching')
+            : t('noMatchingFiles')
+          : t('typeAFileName');
 
   return (
     <div className="qo-scrim" onMouseDown={onClose}>
-      <div className="qo" onMouseDown={(e) => e.stopPropagation()} role="dialog" aria-label={tr('快速打开', 'Quick open')}>
+      <div className="qo" onMouseDown={(e) => e.stopPropagation()} role="dialog" aria-label={t('quickOpen')}>
         <div className="qo-input">
           <Icon name="search" size={14} />
           <input
             ref={input}
             value={q}
-            placeholder={tr('按文件名查找；@ 找函数和标题；: 跳到行', 'File name; @ symbols; : line')}
+            placeholder={t('fileNameSymbolsLine')}
             onChange={(e) => setQ(e.target.value)}
             onKeyDown={(e) => {
               if (e.key === 'Escape') {
@@ -162,9 +164,9 @@ export function QuickOpen({
         <div className="qo-modes">
           {(
             [
-              ['', tr('文件', 'Files')],
-              ['@', tr('@ 符号', '@ Symbols')],
-              [':', tr(': 行号', ': Line')],
+              ['', t('files')],
+              ['@', t('symbols')],
+              [':', t('line2')],
             ] as [QuickMode, string][]
           ).map(([m, l]) => (
             <button
@@ -178,7 +180,7 @@ export function QuickOpen({
               {l}
             </button>
           ))}
-          {!term && mode === '' && recent.length > 0 && <span className="muted small qo-hint">{tr('最近打开', 'Recent')}</span>}
+          {!term && mode === '' && recent.length > 0 && <span className="muted small qo-hint">{t('recent')}</span>}
         </div>
         <div className="qo-list" ref={list}>
           {items.length === 0 ? (

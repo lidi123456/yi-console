@@ -1,0 +1,8 @@
+{
+  "yiAgentdOnHasBeen": "yi-agentd on {{name}} has been upgraded",
+  "usageLimitReached": "{{name}}: usage limit reached",
+  "continuesAutomaticallyAt": "Continues automatically at {{v}}",
+  "continuesAutomaticallyOnceTheLimit": "Continues automatically once the limit resets",
+  "wonTContinueAutomatically": "Won't continue automatically",
+  "view": "View"
+}

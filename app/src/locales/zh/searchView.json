@@ -1,0 +1,12 @@
+{
+  "daemonIsTooOldRestart": "守护进程版本太旧，重启后才能搜索",
+  "searchMessages": "搜索消息",
+  "searchUserMessagesAndReplies": "搜索所有主机上会话里的用户消息和回复",
+  "noMatches": "没有找到",
+  "onlyYiConsoleSessionsAre": "只搜 Yi Console 里的会话；还没导入的工具历史，可以在「历史」里先打开。",
+  "newSession": "新会话",
+  "me": "我",
+  "more": "还有 {{v}} 处",
+  "hitsInSessions": "{{sessions}} 个会话里找到 {{total}} 处",
+  "upTo100PerHost": "（每台主机最多显示 100 处）"
+}

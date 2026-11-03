@@ -29,7 +29,7 @@ English: [Adding a new AI coding tool](adding-a-tool.en.md)
 | 工具配色 `--c-<tool>`（亮色、暗色两套都要看） | `app/src/styles.css` 顶部 |
 | 系统设置里的工具列表（路径、额外参数） | `app/src/components/SettingsView.tsx` |
 | 历史页、用量页里的工具列表 | `HistoryView.tsx` 的 `HISTORY_TOOLS`，`StatsView.tsx` 的颜色和 `QUOTA_TOOLS` |
-| 显示名在中英文界面都要对 | 用 `tr()` 写两种语言的字符串 |
+| 显示名在中英文界面都要对 | 字符串加到 `app/src/locales/zh/*.json` 和 `en/*.json`，代码里用 `getT()` 取 |
 
 ## 2. 对话模式（适配器）
 

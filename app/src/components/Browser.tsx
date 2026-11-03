@@ -1,10 +1,12 @@
 import { useEffect, useRef, useState } from 'react';
-import { tr } from '../i18n';
+import { getT } from '../i18n';
 import { toast, useStore } from '../store';
 import { hubCall, isTauri, rpc } from '../transport';
 import { writeClipboard } from '../clipboard';
 import { Icon } from './Icon';
 import { forwardPort, openUrlExternal } from './PortsView';
+
+const tx = getT('browser');
 
 // Browser tab (iframe) in the file panel.
 // - localhost addresses on a remote host are first port-forwarded to this machine, then opened in the iframe;
@@ -21,7 +23,7 @@ export const webTabFile = (t: string) => (webTabUrl(t).startsWith('file:') ? web
 /** Name shown on the tab */
 export function webTabTitle(t: string): string {
   const u = webTabUrl(t);
-  if (!u) return tr('新标签', 'New tab');
+  if (!u) return tx('newTab');
   const f = webTabFile(t);
   if (f) return f.slice(Math.max(f.lastIndexOf('/'), f.lastIndexOf('\\')) + 1);
   try {
@@ -58,7 +60,7 @@ export async function previewUrl(hostId: string, root: string, abs: string): Pro
   const norm = (p: string) => p.replace(/\\/g, '/').replace(/\/+$/, '');
   const r = norm(root);
   const a = norm(abs);
-  if (a !== r && !a.toLowerCase().startsWith(r.toLowerCase() + '/')) throw new Error(tr('只能预览工作目录里的文件', 'Only files inside the workspace can be previewed'));
+  if (a !== r && !a.toLowerCase().startsWith(r.toLowerCase() + '/')) throw new Error(tx('onlyFilesInsideTheWorkspace'));
   const rel = a.slice(r.length + 1).split('/').map(encodeURIComponent).join('/');
   let base = `${location.origin}/fsv/`;
   if (isTauri) {
@@ -111,20 +113,20 @@ export function BrowserPane({
       try {
         u = new URL(url);
       } catch {
-        return { error: tr('地址格式不对', 'Invalid address') };
+        return { error: tx('invalidAddress') };
       }
-      if (!/^https?:$/.test(u.protocol)) return { error: tr('只能打开 http / https 地址', 'Only http and https addresses can be opened') };
+      if (!/^https?:$/.test(u.protocol)) return { error: tx('onlyHttpAndHttpsAddresses') };
       // localhost on a remote host is that machine itself, so forward it to this machine first
       if (!isLocal && LOOPBACK.has(u.hostname)) {
         const port = Number(u.port || (u.protocol === 'https:' ? 443 : 80));
         const f = await forwardPort(hostId, port);
-        const remote = tr(`${host?.config.name ?? '主机'} 的 ${port} 端口`, `${host?.config.name ?? 'host'} port ${port}`);
+        const remote = tx('hostPort', { name: host?.config.name ?? tx('hostFallback'), port });
         u.hostname = 'localhost';
         u.port = String(f.localPort);
         return { src: u.toString(), sandboxed: false, via: `${remote} → localhost:${f.localPort}` };
       }
       // Pages on the app's own origin could call the app's APIs directly; don't open them here
-      if (u.origin === location.origin) return { error: tr('这个地址是 Yi Console 自己，不能在标签里打开', 'This address is Yi Console itself and cannot be opened in a tab') };
+      if (u.origin === location.origin) return { error: tx('thisAddressIsYiConsole') };
       return { src: u.toString(), sandboxed: false };
     })()
       .then((r) => alive && (setRes(r), setLoading(!('error' in r))))
@@ -152,7 +154,7 @@ export function BrowserPane({
   return (
     <div className="wb">
       <div className="wb-bar">
-        <button className="icon-btn" title={tr('重新加载', 'Reload')} disabled={!src} onClick={() => setN((x) => x + 1)}>
+        <button className="icon-btn" title={tx('reload')} disabled={!src} onClick={() => setN((x) => x + 1)}>
           <Icon name="refresh" size={14} />
         </button>
         <form
@@ -168,28 +170,28 @@ export function BrowserPane({
             value={input}
             onChange={(e) => setInput(e.target.value)}
             onFocus={(e) => e.target.select()}
-            placeholder={isLocal ? tr('输入地址或端口号，如 3000', 'Address or port, e.g. 3000') : tr(`输入地址或端口号，localhost 指 ${host?.config.name ?? '主机'}`, `Address or port. localhost means ${host?.config.name ?? 'the host'}`)}
-            aria-label={tr('地址', 'Address')}
+            placeholder={isLocal ? tx('addressOrPortEG') : tx('addressOrPortRemote', { name: host?.config.name ?? tx('theHostFallback') })}
+            aria-label={tx('address')}
             spellCheck={false}
           />
         </form>
         {res && 'via' in res && res.via && (
-          <span className="wb-via truncate" title={tr(`已经端口转发：${res.via}`, `Forwarded: ${res.via}`)}>
-            <Icon name="forward" size={11} /> {tr('已转发', 'Forwarded')}
+          <span className="wb-via truncate" title={tx('forwarded', { via: res.via })}>
+            <Icon name="forward" size={11} /> {tx('forwarded2')}
           </span>
         )}
-        <button className="icon-btn" title={tr('复制地址', 'Copy address')} disabled={!external} onClick={() => writeClipboard(external).then(() => toast(tr('已复制', 'Copied')))}>
+        <button className="icon-btn" title={tx('copyAddress')} disabled={!external} onClick={() => writeClipboard(external).then(() => toast(tx('copied')))}>
           <Icon name="copy" size={14} />
         </button>
-        <button className="icon-btn" title={tr('用系统浏览器打开', 'Open in system browser')} disabled={!external} onClick={() => openUrlExternal(external)}>
+        <button className="icon-btn" title={tx('openInSystemBrowser')} disabled={!external} onClick={() => openUrlExternal(external)}>
           <Icon name="external" size={14} />
         </button>
       </div>
       {remoteHint && src && (
         <div className="wb-tip">
-          {tr('页面空白？有的网站不允许被嵌入，', 'Blank page? Some sites refuse to be embedded. ')}
+          {tx('blankPageSomeSitesRefuse')}
           <button className="link-btn" onClick={() => openUrlExternal(src)}>
-            {tr('用系统浏览器打开', 'Open in system browser')}
+            {tx('openInSystemBrowser')}
           </button>
         </div>
       )}
@@ -198,7 +200,7 @@ export function BrowserPane({
           <StartPage hostId={hostId} isLocal={isLocal} onOpen={(u) => onNavigate(WEB_PREFIX + u)} />
         ) : res && 'error' in res ? (
           <div className="wp-empty">
-            <div className="wp-empty-title">{tr('打不开这个地址', 'Cannot open this address')}</div>
+            <div className="wp-empty-title">{tx('cannotOpenThisAddress')}</div>
             <div className="muted small">{res.error}</div>
           </div>
         ) : src ? (
@@ -240,15 +242,15 @@ function StartPage({ hostId, isLocal, onOpen }: { hostId: string; isLocal: boole
   }, [hostId]);
   return (
     <div className="wb-start">
-      <div className="wb-start-title">{tr('打开网页', 'Open a page')}</div>
+      <div className="wb-start-title">{tx('openAPage')}</div>
       <div className="muted small">
-        {tr('在上面输入地址或端口号。', 'Enter an address or port above. ')}
-        {isLocal ? '' : tr('localhost 指的是这台主机，会自动转发到本机。', 'localhost means this host and is forwarded automatically. ')}
-        {tr('主机上的 HTML 文件可以在文件树里右键「在浏览器标签中打开」。', 'Right-click an HTML file in the tree and choose Open in browser tab.')}
+        {tx('enterAnAddressOrPort')}
+        {isLocal ? '' : tx('localhostMeansThisHostAnd')}
+        {tx('rightClickAnHtmlFile')}
       </div>
       {ports && ports.length > 0 && (
         <>
-          <div className="section-title">{tr('主机上正在监听的端口', 'Ports listening on the host')}</div>
+          <div className="section-title">{tx('portsListeningOnTheHost')}</div>
           <div className="wb-ports">
             {ports.map((p) => (
               <button key={p.port} className="wb-port" onClick={() => onOpen(`http://localhost:${p.port}/`)}>

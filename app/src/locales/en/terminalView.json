@@ -1,0 +1,14 @@
+{
+  "switchToLightTheme": "Switch to light theme",
+  "switchToDarkTheme": "Switch to dark theme",
+  "light": "☀ Light",
+  "dark": "☾ Dark",
+  "decreaseFontSize": "Decrease font size",
+  "increaseFontSize": "Increase font size",
+  "copy": "Copy",
+  "paste": "Paste",
+  "selectAll": "Select All",
+  "clear": "Clear",
+  "jumpToBottomTypingAlso": "Jump to bottom (typing also returns to bottom)",
+  "bottomLines": "↓ Bottom · +{{position}} lines"
+}
