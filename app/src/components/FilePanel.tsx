@@ -15,7 +15,7 @@ import { GrepPanel } from './GrepPanel';
 import { QuickOpen, type QuickMode } from './QuickOpen';
 import { OPEN_CHANGES } from './SessionActions';
 import { BrowserPane, isWebTab, WEB_PREFIX, webTabFile, webTabTitle } from './Browser';
-import { GitHistory, isCommitTab, parseCommitTab } from './GitHistory';
+import { CommitDetails, GitHistory, isCommitTab, parseCommitTab } from './GitHistory';
 
 // The "workspace files" panel on the right of the session page, modeled on the VS Code / Cursor explorer:
 // - on desktop the panel always shows the preview area on the left and the tree on the right (collapsible), with a placeholder until a file is opened;
@@ -49,7 +49,7 @@ interface OpenFile {
   /** Browser tab (path is web:url) */
   web?: boolean;
   /** A file in a commit (path is git:<hash>:<rel>): read-only diff against the commit's first parent */
-  commit?: { hash: string; rel: string; subject: string; author: string; time: number; status: string; diff: string };
+  commit?: { hash: string; rel: string; subject: string; message: string; author: string; time: number; status: string; diff: string };
 }
 
 /** Dragging a file from the file panel to the input box: the value is "@relative-path " */
@@ -482,6 +482,8 @@ export function FilePanel({
   const [compare, setCompare] = useState<{ path: string; text: string; replace?: boolean } | null>(null);
   // "Find in folder" from the tree: the search view fills "files to include" with it
   const [grepInclude, setGrepInclude] = useState<{ value: string; n: number } | null>(null);
+  // Commit file tab: the title toggles the full commit details (there's no hover tooltip on phones)
+  const [commitInfo, setCommitInfo] = useState(false);
   const [dropDir, setDropDir] = useState<string | null>(null);
   const [uploading, setUploading] = useState(0);
   const isLocal = useStore((st) => st.hosts.find((h) => h.config.id === hostId)?.config.kind === 'local');
@@ -667,7 +669,7 @@ export function FilePanel({
           paths: [ct.rel],
         });
         const f = r.files.find((x) => x.path === ct.rel);
-        const commit = { hash: r.hash, rel: ct.rel, subject: r.message.split('\n')[0], author: r.author, time: r.time, status: f?.status ?? '', diff: f?.diff ?? '' };
+        const commit = { hash: r.hash, rel: ct.rel, subject: r.message.split('\n')[0], message: r.message, author: r.author, time: r.time, status: f?.status ?? '', diff: f?.diff ?? '' };
         return { path, content: '', draft: '', binary: true, truncated: false, size: 0, modified: 0, rev: Date.now(), commit };
       } catch (e) {
         if (!quiet) errorToast(e);
@@ -1986,11 +1988,19 @@ export function FilePanel({
 
       {file?.commit && (
         <div className="wp-head">
-          <div className="wp-commit-title truncate" title={`${file.commit.hash}\n${file.commit.author} · ${new Date(file.commit.time * 1000).toLocaleString()}\n\n${file.commit.subject}\n${file.commit.rel}`}>
+          <button
+            className="wp-commit-title truncate"
+            aria-expanded={commitInfo}
+            title={tr('查看提交详情', 'Show commit details')}
+            onClick={() => setCommitInfo(!commitInfo)}
+          >
             <span className="pd-tag">{file.commit.hash.slice(0, 7)}</span>
             <span className="truncate">{file.commit.subject}</span>
             <span className="muted truncate">{file.commit.rel}</span>
-          </div>
+            <span className={`chev ${commitInfo ? 'open' : ''}`}>
+              <Icon name="chevron" size={12} />
+            </span>
+          </button>
           <div className="wp-actions">
             <span className="hide-mobile">{tr('只读', 'Read-only')}</span>
             {wide() && (
@@ -2008,6 +2018,11 @@ export function FilePanel({
               </button>
             )}
           </div>
+        </div>
+      )}
+      {file?.commit && commitInfo && (
+        <div className="wp-commit-detail">
+          <CommitDetails hash={file.commit.hash} author={file.commit.author} time={file.commit.time} message={file.commit.message} />
         </div>
       )}
       {file && !file.web && !file.commit && (

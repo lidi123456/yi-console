@@ -25,8 +25,8 @@ const PAGE = 50;
 
 /** Pages already loaded per host + directory, shown at once when the box mounts again and refreshed in the background */
 const logCache = new Map<string, { commits: CommitInfo[]; more: boolean }>();
-/** Files of a commit never change, so they are kept for good (per host + directory + hash) */
-const showCache = new Map<string, CommitFile[]>();
+/** Files and full message of a commit never change, so they are kept for good (per host + directory + hash) */
+const showCache = new Map<string, { files: CommitFile[]; message: string }>();
 const cacheKey = (hostId: string, cwd: string) => `${hostId}\n${cwd}`;
 const HEAD_MIN = 28;
 
@@ -38,6 +38,40 @@ function refLabels(refs: string[]): string[] {
 }
 
 const baseName = (p: string) => p.slice(p.lastIndexOf('/') + 1);
+
+/** Full commit message, author, time and hash: hover tooltips don't exist on phones, so this is shown inline
+ *  (under an expanded commit, and when the title of a commit file tab is tapped). Long messages fold to a few lines */
+export function CommitDetails({ hash, author, time, message }: { hash: string; author: string; time: number; message?: string }) {
+  const [full, setFull] = useState(false);
+  const text = (message ?? '').trim();
+  const long = text.split('\n').length > 6 || text.length > 400;
+  const copyHash = async (e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (await writeClipboard(hash)) toast(tr('提交号已复制', 'Commit hash copied'));
+  };
+  return (
+    <div className="wp-commit-info">
+      {text && (
+        <div className={`wp-commit-msg ${long && !full ? 'clamp' : ''}`} onClick={long ? () => setFull(!full) : undefined}>
+          {text}
+        </div>
+      )}
+      {long && (
+        <button className="link-btn wp-commit-more" onClick={() => setFull(!full)}>
+          {full ? tr('收起', 'Show less') : tr('展开全部', 'Show all')}
+        </button>
+      )}
+      <div className="wp-commit-meta">
+        <span className="truncate">{author}</span>
+        <span>{new Date(time * 1000).toLocaleString()}</span>
+        <button className="pd-tag wp-commit-hash" title={tr('复制提交号', 'Copy commit hash')} onClick={copyHash}>
+          {hash.slice(0, 7)}
+          <Icon name="copy" size={11} />
+        </button>
+      </div>
+    </div>
+  );
+}
 const dirName = (p: string) => (p.includes('/') ? p.slice(0, p.lastIndexOf('/')) : '');
 
 export function GitHistory({
@@ -72,6 +106,7 @@ export function GitHistory({
   const [notRepo, setNotRepo] = useState(false);
   const [expanded, setExpanded] = useState<string | null>(null);
   const [files, setFiles] = useState<Record<string, CommitFile[] | 'loading' | 'error'>>({});
+  const [messages, setMessages] = useState<Record<string, string>>({});
   const box = useRef<HTMLDivElement>(null);
   // Bumped on every reload so a slow older page doesn't land on top of the new list
   const gen = useRef(0);
@@ -122,11 +157,15 @@ export function GitHistory({
     if (Array.isArray(files[c.hash]) || files[c.hash] === 'loading') return;
     const sk = `${key}\n${c.hash}`;
     const hit = showCache.get(sk);
-    if (hit) return setFiles((m) => ({ ...m, [c.hash]: hit }));
+    if (hit) {
+      setMessages((m) => ({ ...m, [c.hash]: hit.message }));
+      return setFiles((m) => ({ ...m, [c.hash]: hit.files }));
+    }
     setFiles((m) => ({ ...m, [c.hash]: 'loading' }));
-    rpc<{ files: CommitFile[] }>(hostId, 'git.show', { cwd, hash: c.hash })
+    rpc<{ files: CommitFile[]; message?: string }>(hostId, 'git.show', { cwd, hash: c.hash })
       .then((r) => {
-        showCache.set(sk, r.files);
+        showCache.set(sk, { files: r.files, message: r.message ?? c.subject });
+        setMessages((m) => ({ ...m, [c.hash]: r.message ?? c.subject }));
         setFiles((m) => ({ ...m, [c.hash]: r.files }));
       })
       .catch(() => setFiles((m) => ({ ...m, [c.hash]: 'error' })));
@@ -139,7 +178,7 @@ export function GitHistory({
     e.preventDefault();
     openMenu(e, [
       { label: tr('复制提交号', 'Copy commit hash'), icon: 'copy', run: () => copy(c.hash) },
-      { label: tr('复制提交说明', 'Copy commit message'), run: () => copy(c.subject) },
+      { label: tr('复制提交说明', 'Copy commit message'), run: () => copy(messages[c.hash]?.trim() || c.subject) },
     ]);
   };
 
@@ -232,6 +271,7 @@ export function GitHistory({
                       ))}
                       <span className="wp-commit-time">{timeAgo(c.time * 1000)}</span>
                     </div>
+                    {isOpen && <CommitDetails hash={c.hash} author={c.author} time={c.time} message={messages[c.hash] ?? c.subject} />}
                     {isOpen &&
                       (fl === 'loading' || !fl ? (
                         <div className="wp-limit wp-commit-sub">{tr('正在读取…', 'Loading…')}</div>
