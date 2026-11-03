@@ -564,11 +564,21 @@ function TmuxScrollbar({
   const thumbTop = (topLine / total) * 100;
   const drag = useRef<{ y: number; pos: number } | null>(null);
   const linesPerPx = () => total / (track.current?.clientHeight || 1);
+  // Like the other scrollbars: the thumb shows only for a moment after the position changes (or while hovered / dragged)
+  const [scrolling, setScrolling] = useState(false);
+  const seen = useRef(position);
+  useEffect(() => {
+    if (seen.current === position) return;
+    seen.current = position;
+    setScrolling(true);
+    const t = setTimeout(() => setScrolling(false), 800);
+    return () => clearTimeout(t);
+  }, [position]);
 
   return (
     <>
       <div
-        className="tmux-scroll"
+        className={scrolling ? 'tmux-scroll scrolling' : 'tmux-scroll'}
         ref={track}
         onPointerDown={(e) => {
           if (e.target !== track.current) return;

@@ -4,6 +4,7 @@ import { errorToast, loadClientSettings, refreshHosts, restoreView, startEventLo
 import { initTransport } from './transport';
 import './styles.css';
 import './back';
+import './scrollbars';
 import { initTheme } from './theme';
 import { initLang } from './i18n';
 import { isMobileApp, openUrl, openUrlExternal } from './components/PortsView';

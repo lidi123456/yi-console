@@ -39,6 +39,10 @@
   --shadow: 0 8px 30px rgba(20, 24, 33, 0.12);
   --panel-shadow: 0 0 0 1px rgba(31, 35, 40, 0.06), 0 2px 12px rgba(31, 35, 40, 0.05);
   --radius: 12px;
+  /* Scrollbar slider */
+  --sb-thumb: rgba(0, 0, 0, 0.18);
+  --sb-thumb-hover: rgba(0, 0, 0, 0.3);
+  --sb-thumb-active: rgba(0, 0, 0, 0.4);
   /* System UI font: on Chinese Windows use Microsoft YaHei UI for both Chinese and English, PingFang on macOS;
      on English Windows, Segoe UI for English with CJK falling back to YaHei UI. Don't put Segoe UI first, mixing two fonts for CJK and Latin looks uneven */
   --font: system-ui, -apple-system, BlinkMacSystemFont, 'Microsoft YaHei UI', 'PingFang SC', 'Hiragino Sans GB',
@@ -81,6 +85,9 @@
     --del-fg: #f48771;
     --code-bg: #181818;
     --shadow: 0 8px 30px rgba(0, 0, 0, 0.5);
+    --sb-thumb: rgba(255, 255, 255, 0.16);
+    --sb-thumb-hover: rgba(255, 255, 255, 0.28);
+    --sb-thumb-active: rgba(255, 255, 255, 0.38);
     color-scheme: dark;
   }
 }
@@ -119,9 +126,43 @@
   --del-fg: #f48771;
   --code-bg: #181818;
   --shadow: 0 8px 30px rgba(0, 0, 0, 0.5);
+  --sb-thumb: rgba(255, 255, 255, 0.16);
+  --sb-thumb-hover: rgba(255, 255, 255, 0.28);
+  --sb-thumb-active: rgba(255, 255, 255, 0.38);
   color-scheme: dark;
 }
 
+/* Scrollbars: thin rounded slider (4px drawn inside an 8px bar, inset by a transparent border), no track.
+   The slider is hidden until the element scrolls
+   (scrollbars.ts sets data-scrolling for a moment; a :hover rule wouldn't work, Chromium doesn't repaint the scrollbar
+   on hover), or until the pointer is on the slider itself. Desktop only: on touch devices ::-webkit-scrollbar would turn the overlay scrollbar into a fixed one.
+   Don't set scrollbar-width / scrollbar-color on these elements: in Chromium the standard properties override ::-webkit-scrollbar */
+@media (hover: hover) and (pointer: fine) {
+  ::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+  ::-webkit-scrollbar-track,
+  ::-webkit-scrollbar-corner {
+    background: transparent;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: transparent;
+    background-clip: padding-box;
+    border: 2px solid transparent;
+    border-radius: 4px;
+    min-height: 28px;
+  }
+  [data-scrolling]::-webkit-scrollbar-thumb {
+    background: var(--sb-thumb);
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: var(--sb-thumb-hover);
+  }
+  ::-webkit-scrollbar-thumb:active {
+    background: var(--sb-thumb-active);
+  }
+}
 
 * {
   box-sizing: border-box;
@@ -2262,9 +2303,11 @@ textarea {
   overflow: clip;
 }
 
+/* Terminal follows the terminal theme rather than the app theme */
 .term .xterm-viewport {
-  scrollbar-width: thin;
-  scrollbar-color: color-mix(in srgb, var(--term-fg) 28%, transparent) transparent;
+  --sb-thumb: color-mix(in srgb, var(--term-fg) 22%, transparent);
+  --sb-thumb-hover: color-mix(in srgb, var(--term-fg) 35%, transparent);
+  --sb-thumb-active: color-mix(in srgb, var(--term-fg) 45%, transparent);
 }
 
 .term-tools {
@@ -4792,13 +4835,18 @@ body.resizing-y {
   top: 10px;
   right: 2px;
   bottom: 4px;
-  width: 10px;
+  width: 8px;
   z-index: 5;
-  border-radius: 5px;
 }
 
-.tmux-scroll:hover {
-  background: color-mix(in srgb, var(--term-fg) 8%, transparent);
+.tmux-thumb {
+  opacity: 0;
+  transition: opacity 0.3s;
+}
+.tmux-scroll.scrolling .tmux-thumb,
+.tmux-scroll:hover .tmux-thumb {
+  opacity: 1;
+  transition: none;
 }
 
 .tmux-thumb {
@@ -4806,8 +4854,8 @@ body.resizing-y {
   left: 2px;
   right: 2px;
   min-height: 24px;
-  border-radius: 4px;
-  background: color-mix(in srgb, var(--term-fg) 28%, transparent);
+  border-radius: 2px;
+  background: color-mix(in srgb, var(--term-fg) 22%, transparent);
   cursor: default;
 }
 
