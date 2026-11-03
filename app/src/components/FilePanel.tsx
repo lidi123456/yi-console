@@ -34,6 +34,8 @@ interface OpenFile {
   draft: string;
   binary: boolean;
   truncated: boolean;
+  /** Not valid UTF-8 (GBK and the like): shown lossily, so read-only to keep saving from corrupting it */
+  notUtf8?: boolean;
   size: number;
   modified: number;
   /** Image: data URL */
@@ -95,6 +97,8 @@ interface GitInfo {
   files: Map<string, GitFile>;
   /** Directories containing changes */
   dirs: Set<string>;
+  /** Total changed files when yi-agentd returned only the first 10000 */
+  total?: number | null;
 }
 
 /** Older yi-agentd on Windows returned child paths with a \\?\ prefix (and they got stored in tab records); strip it everywhere */
@@ -248,6 +252,7 @@ interface TreeRow {
 function Rows({
   rows,
   selected,
+  focused,
   git,
   onToggle,
   onOpen,
@@ -261,6 +266,8 @@ function Rows({
   /** Changes view: show lines added/removed to the right of file rows */
   stats?: boolean;
   selected?: string;
+  /** Keyboard cursor (row key), separate from the opened file as in VS Code */
+  focused?: string | null;
   git?: GitInfo | null;
   /** Start dragging a row (dropping into the input box inserts a reference) */
   onDragRow?: (e: React.DragEvent, r: TreeRow) => void;
@@ -285,8 +292,9 @@ function Rows({
           aria-expanded={r.isDir ? !!r.expanded : undefined}
           aria-selected={selected === r.path}
           data-path={r.path}
+          data-key={r.key}
           data-dir={r.isDir ? '1' : undefined}
-          className={`wp-row ${selected === r.path ? 'sel' : ''} ${mark ? mark[1] : ''} ${dirChanged ? 'g-dir' : ''} ${
+          className={`wp-row ${selected === r.path ? 'sel' : ''} ${focused === r.key ? 'kfocus' : ''} ${mark ? mark[1] : ''} ${dirChanged ? 'g-dir' : ''} ${
             dropDir && r.isDir && r.path === dropDir ? 'drop' : ''
           }`}
           draggable={!r.loading && !!onDragRow}
@@ -437,7 +445,12 @@ export function FilePanel({
     const c = rootCache.get(rootKey(hostId, cwd, hidden));
     return c ? { [c.path]: c.entries } : {};
   });
-  const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  // Expanded folders are remembered per host + directory (VS Code keeps them in workspace storage)
+  const expKey = `wp-exp-${hostId}/${cwd}`;
+  const [expanded, setExpanded] = useState<Set<string>>(() => new Set(lsGet<string[]>(expKey, [])));
+  const expandedRef = useRef(expanded);
+  expandedRef.current = expanded;
+  const expLoaded = useRef(expKey);
   const [file, setFile] = useState<OpenFile | null>(null);
   const [saveState, setSaveState] = useState<SaveState>(null);
   const [saveError, setSaveError] = useState('');
@@ -493,14 +506,22 @@ export function FilePanel({
   const fileRef = useRef(file);
   fileRef.current = file;
 
+  /** quiet: restoring remembered folders; one that no longer exists is just forgotten */
   const load = useCallback(
-    async (dir: string) => {
+    async (dir: string, quiet = false) => {
       try {
         const r = await rpc<{ path: string; entries: DirEntry[] }>(hostId, 'fs.list', { path: dir, showHidden: hidden });
         setKids((k) => ({ ...k, [dir]: r.entries }));
         return r.path;
       } catch (e) {
-        errorToast(e);
+        if (quiet) {
+          setExpanded((x) => {
+            if (!x.has(dir)) return x;
+            const n = new Set(x);
+            n.delete(dir);
+            return n;
+          });
+        } else errorToast(e);
         return null;
       }
     },
@@ -513,15 +534,29 @@ export function FilePanel({
     const c = rootCache.get(key);
     setKids(c ? { [c.path]: c.entries } : {});
     if (c) setRoot(c.path);
-    setExpanded(new Set());
+    // Switched to another directory without remounting: take that directory's remembered folders
+    let want = expandedRef.current;
+    if (expLoaded.current !== expKey) {
+      expLoaded.current = expKey;
+      want = new Set(lsGet<string[]>(expKey, []));
+      setExpanded(want);
+    }
     rpc<{ path: string; entries: DirEntry[] }>(hostId, 'fs.list', { path: cwd, showHidden: hidden })
       .then((r) => {
         rootCache.set(key, { path: r.path, entries: r.entries });
         setRoot(r.path);
         setKids((k) => ({ ...k, [r.path]: r.entries }));
+        // Reload the remembered folders (also after toggling hidden files, which reset the listings above)
+        const pre = norm(r.path) + '/';
+        const stale = [...want].filter((d) => !norm(d).startsWith(pre));
+        for (const d of want) if (!stale.includes(d)) load(d, true);
+        if (stale.length) setExpanded((x) => new Set([...x].filter((d) => !stale.includes(d))));
       })
       .catch(errorToast);
-  }, [hostId, cwd, hidden]);
+  }, [hostId, cwd, hidden]); // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => {
+    if (expLoaded.current === expKey) lsSet(expKey, [...expanded].slice(-300));
+  }, [expanded, expKey]);
 
   // Until git status comes back we don't know whether this is a repo, so the snippets recorded in the session can't be shown as a diff yet
   const [gitReady, setGitReady] = useState(() => gitCache.has(gitKey(hostId, cwd)));
@@ -532,7 +567,7 @@ export function FilePanel({
   /** quiet: background refresh (timer / window refocus); if the status didn't change, just quietly refetch the current file's diff */
   const loadGit = useCallback((quiet = false) => {
     // Without diffs: in a big repo with many changed files, running git diff for each takes ages, so fetch only the file that gets opened
-    rpc<{ repo: string | null; branch?: string; head?: string | null; files: { path: string; status: string; diff: string; added?: number | null; deleted?: number | null }[] }>(hostId, 'git.changes', { cwd, diff: false })
+    rpc<{ repo: string | null; branch?: string; head?: string | null; total?: number | null; files: { path: string; status: string; diff: string; added?: number | null; deleted?: number | null }[] }>(hostId, 'git.changes', { cwd, diff: false })
       .then((r) => {
         setGitReady(true);
         const sig = `${r.repo}|${r.branch}|${r.head}|${r.files.map((f) => `${f.status} ${f.path} ${f.added ?? ''}/${f.deleted ?? ''}`).join('|')}`;
@@ -554,7 +589,7 @@ export function FilePanel({
             dirs.add(d);
           }
         }
-        const info = { repo: r.repo, branch: r.branch ?? '', head: r.head, files, dirs };
+        const info = { repo: r.repo, branch: r.branch ?? '', head: r.head, total: r.total, files, dirs };
         gitCache.set(gitKey(hostId, cwd), { git: info, sig });
         setGit(info);
       })
@@ -971,9 +1006,19 @@ export function FilePanel({
     const to = join(parentOf(path), name.trim());
     try {
       await rpc(hostId, 'fs.rename', { from: path, to });
-      if (file?.path === path) setFile({ ...file, path: to });
-      setTabs((t) => t.map((x) => (x === path ? to : x)));
+      // A renamed folder moves everything inside it: open tabs (including HTML previews), the current file and expanded folders
+      const sep = sepOf(path);
+      const move = (p: string) => (p === path ? to : p.startsWith(path + sep) ? to + p.slice(path.length) : p);
+      const moveTab = (t: string) => {
+        const f = isWebTab(t) ? webTabFile(t) : null;
+        return f ? (move(f) === f ? t : t.slice(0, t.length - f.length) + move(f)) : isWebTab(t) ? t : move(t);
+      };
+      setFile((cur) => (cur && moveTab(cur.path) !== cur.path ? { ...cur, path: moveTab(cur.path) } : cur));
+      setTabs((t) => t.map(moveTab));
+      const moved = [...expandedRef.current].filter((d) => move(d) !== d).map(move);
+      setExpanded((x) => new Set([...x].map(move)));
       await load(parentOf(path));
+      for (const d of moved) load(d, true);
     } catch (err) {
       errorToast(err);
     }
@@ -1132,6 +1177,55 @@ export function FilePanel({
       setDropDir(null);
       upload(dir, e.dataTransfer.files);
     },
+  };
+
+  // ---------- Keyboard in the tree (VS Code's list bindings) ----------
+  const [focusKey, setFocusKey] = useState<string | null>(null);
+  const treeBox = useRef<HTMLDivElement>(null);
+  const moveFocus = (r: TreeRow | undefined) => {
+    if (!r) return;
+    setFocusKey(r.key);
+    lastRow.current = { path: r.path, isDir: r.isDir };
+    requestAnimationFrame(() =>
+      treeBox.current?.querySelector(`[data-key="${CSS.escape(r.key)}"]`)?.scrollIntoView({ block: 'nearest' }),
+    );
+  };
+  const treeKey = (e: React.KeyboardEvent) => {
+    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'c' && lastRow.current && !window.getSelection()?.toString()) {
+      e.preventDefault();
+      return copyRef(lastRow.current.path, lastRow.current.isDir);
+    }
+    if (e.target !== e.currentTarget || e.ctrlKey || e.metaKey || e.altKey) return;
+    const list = view === 'all' && q ? sRows : view === 'changes' ? cRows : view === 'all' ? rows : [];
+    if (!list.length) return;
+    let i = list.findIndex((r) => r.key === focusKey);
+    if (i < 0) i = Math.max(0, list.findIndex((r) => r.path === file?.path));
+    const r = list[i];
+    const flip = (x: TreeRow) => (view === 'all' && !q ? toggle(x.path) : toggleCollapsed(x));
+    const page = Math.max(1, Math.floor((treeBox.current?.clientHeight ?? 300) / 28) - 1);
+    const go: Record<string, () => void> = {
+      ArrowDown: () => moveFocus(list[focusKey == null ? i : Math.min(list.length - 1, i + 1)]),
+      ArrowUp: () => moveFocus(list[Math.max(0, i - 1)]),
+      PageDown: () => moveFocus(list[Math.min(list.length - 1, i + page)]),
+      PageUp: () => moveFocus(list[Math.max(0, i - page)]),
+      Home: () => moveFocus(list[0]),
+      End: () => moveFocus(list[list.length - 1]),
+      // Right: expand a folder, or step into it when already open; Left: collapse, or go to the parent folder
+      ArrowRight: () => (r.isDir ? (r.expanded ? list[i + 1]?.depth > r.depth && moveFocus(list[i + 1]) : flip(r)) : undefined),
+      ArrowLeft: () => {
+        if (r.isDir && r.expanded) return flip(r);
+        for (let j = i - 1; j >= 0; j--) if (list[j].depth < r.depth) return moveFocus(list[j]);
+      },
+      Enter: () => (r.isDir ? flip(r) : openFile(r.path, view === 'changes')),
+      ' ': () => (r.isDir ? flip(r) : openFile(r.path, view === 'changes')),
+      F2: () => !q && view === 'all' && rename(r.path),
+      Delete: () => !q && view === 'all' && remove(r.path, r.isDir),
+    };
+    const f = go[e.key];
+    if (!f) return;
+    e.preventDefault();
+    setFocusKey(r.key);
+    f();
   };
 
   const rowMenu = (ev: React.MouseEvent, r: TreeRow) => {
@@ -1405,18 +1499,17 @@ export function FilePanel({
             className={`wp-tree ${dropDir === root ? 'drop' : ''} ${histGrow ? 'shrink' : ''}`}
             role="tree"
             aria-label={tr('文件树', 'File tree')}
-            tabIndex={-1}
+            tabIndex={0}
+            ref={treeBox}
             {...treeDrop}
             onPointerDownCapture={(e) => {
               const row = (e.target as Element).closest<HTMLElement>('[data-path]');
-              if (row) lastRow.current = { path: row.dataset.path!, isDir: row.dataset.dir === '1' };
-            }}
-            onKeyDown={(e) => {
-              if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'c' && lastRow.current && !window.getSelection()?.toString()) {
-                e.preventDefault();
-                copyRef(lastRow.current.path, lastRow.current.isDir);
+              if (row) {
+                lastRow.current = { path: row.dataset.path!, isDir: row.dataset.dir === '1' };
+                setFocusKey(row.dataset.key ?? null);
               }
             }}
+            onKeyDown={treeKey}
             onContextMenu={(e) =>
               root &&
               !q &&
@@ -1449,6 +1542,7 @@ export function FilePanel({
                     rows={sRows}
                     git={git}
                     selected={file?.path}
+                    focused={focusKey}
                     onToggle={toggleCollapsed}
                     onOpen={(r) => openFile(r.path)}
                     onMenu={rowMenu}
@@ -1469,6 +1563,14 @@ export function FilePanel({
                   </label>
                 )}
                 {!git && <div className="wp-limit">{tr('不是 git 仓库：下面是这个会话里工具改过的文件，只能查看。', 'Not a git repo. Files below were changed by tools in this session and are view-only.')}</div>}
+                {git?.total && (
+                  <div className="wp-limit">
+                    {tr(
+                      `改动太多（${git.total} 个），只列出前 ${git.files.size} 个。可以把不需要跟踪的目录写进 .gitignore。`,
+                      `Too many changes (${git.total}); showing the first ${git.files.size}. Add folders you don't track to .gitignore.`,
+                    )}
+                  </div>
+                )}
                 {totals && changed.length > 0 && (
                   <div className="wp-totals">
                     {tr(`${changed.length} 个文件`, `${changed.length} files`)}
@@ -1481,6 +1583,7 @@ export function FilePanel({
                     stats
                     git={git}
                     selected={file?.path}
+                    focused={focusKey}
                     onToggle={toggleCollapsed}
                     onOpen={(r) => openFile(r.path, true)}
                     onMenu={rowMenu}
@@ -1501,6 +1604,7 @@ export function FilePanel({
                   rows={rows}
                   git={git}
                   selected={file?.path}
+                  focused={focusKey}
                   onToggle={(r) => toggle(r.path)}
                   onOpen={(r) => openFile(r.path)}
                   onMenu={rowMenu}
@@ -1542,7 +1646,7 @@ export function FilePanel({
       docKey={`${file.path}#${file.rev}`}
       value={file.content}
       filename={baseName(file.path)}
-      readOnly={file.truncated}
+      readOnly={file.truncated || !!file.notUtf8}
       wrap={wrap || (md && mdSplit && wide())}
       goto={goto}
       onChange={(draft) => setFile((cur) => cur && { ...cur, draft })}
@@ -1898,6 +2002,11 @@ export function FilePanel({
               </span>
             )}
             {file.truncated && <span>{tr('只读 · 前 1MB', 'Read-only · first 1MB')}</span>}
+            {!file.truncated && file.notUtf8 && (
+              <span title={tr('按 UTF-8 显示会有乱码，保存会损坏原文件，所以只能查看', 'Shown as UTF-8 with replacement characters; saving would corrupt the file, so it is view-only')}>
+                {tr('只读 · 不是 UTF-8 编码', 'Read-only · not UTF-8')}
+              </span>
+            )}
             {dirty &&
               (saveState === 'conflict' ? (
                 <button className="btn small primary" onClick={conflictMenu}>

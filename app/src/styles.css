@@ -4603,6 +4603,14 @@ button.wp-crumb:hover {
   color: var(--text);
 }
 
+/* Keyboard cursor: outlined only while the tree has focus, as in VS Code */
+.wp-tree:focus {
+  outline: none;
+}
+.wp-tree:focus .wp-row.kfocus {
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+
 .wp-twist {
   width: 20px;
   height: 20px;
@@ -6503,6 +6511,27 @@ body.resizing .side-resizer::after {
   background: var(--accent-soft);
   color: var(--text);
   box-shadow: inset 0 0 0 1px var(--border-2);
+}
+/* Files to include / exclude, under the search box */
+.grep-scope {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 0 8px 6px;
+}
+.grep-scope input {
+  height: 26px;
+  padding: 0 10px;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  background: var(--bg-3);
+  box-shadow: none !important;
+  font-size: 12px;
+  outline: none;
+}
+.grep-scope input:focus {
+  background: var(--bg);
+  border-color: var(--border-2);
 }
 .grep-sum {
   display: flex;

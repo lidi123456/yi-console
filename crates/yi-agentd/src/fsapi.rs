@@ -65,12 +65,16 @@ pub fn read(path: &str, tail: bool) -> Result<Value> {
     }
     f.take(MAX_READ).read_to_end(&mut buf)?;
     let binary = buf.iter().take(8000).any(|&b| b == 0);
+    // Not valid UTF-8 (GBK and the like): shown lossily, so saving would write U+FFFD over the original bytes.
+    // An incomplete sequence at the very end only means the 1MB cut fell inside a character
+    let not_utf8 = !binary && std::str::from_utf8(&buf).is_err_and(|e| e.error_len().is_some());
     Ok(json!({
         "path": p.display().to_string(),
         "size": meta.len(),
         "modified": mtime(&meta),
         "truncated": meta.len() > MAX_READ,
         "binary": binary,
+        "notUtf8": not_utf8,
         "content": if binary { String::new() } else { String::from_utf8_lossy(&buf).to_string() },
     }))
 }
@@ -248,9 +252,108 @@ pub fn open_native(path: &str, reveal: bool) -> Result<Value> {
     Ok(Value::Null)
 }
 
-/// Content search: under root (git ls-files in a git repo), find lines containing query file by file.
-/// Skips binaries and files over 2MB; keeps only the first 300 characters of each line, at most limit hits
-pub fn grep(root: &str, query: &str, case_sensitive: bool, whole_word: bool, limit: usize) -> Result<Value> {
+/// Options for [`grep`]. include / exclude are comma-separated globs (VS Code's "files to include / exclude")
+#[derive(Default)]
+pub struct GrepOpts {
+    pub case_sensitive: bool,
+    pub whole_word: bool,
+    pub regex: bool,
+    pub include: String,
+    pub exclude: String,
+}
+
+/// Turn "a, b" into one regex over /-separated relative paths, following VS Code's search globs: `*` `?` stay
+/// within a path segment, `**` crosses them, `{a,b}` alternates, `[..]` is a class. A pattern starting with `/` or `./`
+/// is anchored at the root, anything else may match at any depth; a match on a folder also covers everything inside it
+fn glob_set(list: &str) -> Result<Option<regex::Regex>> {
+    let mut alts = vec![];
+    for pat in split_globs(list) {
+        let anchored = pat.starts_with('/') || pat.starts_with("./");
+        let pat = pat.trim_start_matches("./").trim_start_matches('/').trim_end_matches('/');
+        if pat.is_empty() {
+            continue;
+        }
+        let mut re = String::from(if anchored { "" } else { "(?:.*/)?" });
+        let cs: Vec<char> = pat.chars().collect();
+        let mut i = 0;
+        let mut depth = 0;
+        while i < cs.len() {
+            match cs[i] {
+                '*' if cs.get(i + 1) == Some(&'*') => {
+                    i += 1;
+                    if cs.get(i + 1) == Some(&'/') {
+                        i += 1;
+                        re.push_str("(?:.*/)?");
+                    } else {
+                        re.push_str(".*");
+                    }
+                }
+                '*' => re.push_str("[^/]*"),
+                '?' => re.push_str("[^/]"),
+                '{' => {
+                    depth += 1;
+                    re.push_str("(?:");
+                }
+                '}' if depth > 0 => {
+                    depth -= 1;
+                    re.push(')');
+                }
+                ',' if depth > 0 => re.push('|'),
+                '[' => match cs[i + 1..].iter().position(|&c| c == ']') {
+                    Some(n) if n > 0 => {
+                        let body: String = cs[i + 1..i + 1 + n].iter().collect();
+                        let body = body.replacen('!', "^", usize::from(body.starts_with('!')));
+                        re.push('[');
+                        re.push_str(&body.replace('\\', "\\\\"));
+                        re.push(']');
+                        i += n + 1;
+                    }
+                    _ => re.push_str("\\["),
+                },
+                c => re.push_str(&regex::escape(&c.to_string())),
+            }
+            i += 1;
+        }
+        for _ in 0..depth {
+            re.push(')');
+        }
+        alts.push(format!("(?:{re})"));
+    }
+    if alts.is_empty() {
+        return Ok(None);
+    }
+    let src = format!("^(?:{})(?:/.*)?$", alts.join("|"));
+    // Windows paths are case-insensitive, so are the globs there
+    let re = regex::RegexBuilder::new(&src)
+        .case_insensitive(cfg!(windows))
+        .build()
+        .map_err(|e| anyhow::anyhow!("文件范围写法有误: {e}"))?;
+    Ok(Some(re))
+}
+
+/// Split on commas that aren't inside {..}
+fn split_globs(list: &str) -> Vec<&str> {
+    let (mut out, mut depth, mut from) = (vec![], 0i32, 0);
+    for (i, c) in list.char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => depth -= 1,
+            ',' if depth <= 0 => {
+                out.push(list[from..i].trim());
+                from = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(list[from..].trim());
+    out.retain(|s| !s.is_empty());
+    out
+}
+
+/// Content search: under root (git ls-files in a git repo), find lines matching query file by file.
+/// The query is literal text unless `regex` is set; matching is per line. Skips binaries and files over 2MB;
+/// keeps only the first 300 characters of each line, at most limit hits
+pub fn grep(root: &str, query: &str, o: &GrepOpts, limit: usize) -> Result<Value> {
     let dir = crate::paths::expand(root);
     if !dir.is_dir() {
         bail!("目录不存在: {}", dir.display());
@@ -258,9 +361,18 @@ pub fn grep(root: &str, query: &str, case_sensitive: bool, whole_word: bool, lim
     if query.is_empty() {
         return Ok(json!({ "hits": [], "truncated": false, "files": 0 }));
     }
+    let body = if o.regex { query.to_string() } else { regex::escape(query) };
+    // Whole word: the characters next to the match must not be letters, digits or _. The regex crate has no lookaround,
+    // so those neighbours are matched outside group 1, which holds the actual match
+    let src = if o.whole_word { format!(r"(?:^|[^\w])({body})(?:[^\w]|$)") } else { format!("({body})") };
+    let re = regex::RegexBuilder::new(&src)
+        .case_insensitive(!o.case_sensitive)
+        .size_limit(1 << 22)
+        .build()
+        .map_err(|e| anyhow::anyhow!("正则表达式有误: {e}"))?;
+    let include = glob_set(&o.include)?;
+    let exclude = glob_set(&o.exclude)?;
     let files = file_list(&dir);
-    let q = if case_sensitive { query.to_string() } else { query.to_lowercase() };
-    let is_word = |c: char| c.is_alphanumeric() || c == '_';
     let started = std::time::Instant::now();
     let mut hits = vec![];
     let mut matched_files = 0usize;
@@ -270,6 +382,9 @@ pub fn grep(root: &str, query: &str, case_sensitive: bool, whole_word: bool, lim
         if started.elapsed() > std::time::Duration::from_secs(8) {
             truncated = true;
             break;
+        }
+        if include.as_ref().is_some_and(|g| !g.is_match(rel)) || exclude.as_ref().is_some_and(|g| g.is_match(rel)) {
+            continue;
         }
         let full = dir.join(rel);
         let Ok(meta) = std::fs::metadata(&full) else { continue };
@@ -283,29 +398,11 @@ pub fn grep(root: &str, query: &str, case_sensitive: bool, whole_word: bool, lim
         let text = String::from_utf8_lossy(&buf);
         let mut any = false;
         for (i, line) in text.lines().enumerate() {
-            let hay = if case_sensitive { line.to_string() } else { line.to_lowercase() };
-            let mut from = 0;
-            let mut col = None;
-            while let Some(pos) = hay[from..].find(&q) {
-                let at = from + pos;
-                let ok = !whole_word || {
-                    let before = hay[..at].chars().next_back();
-                    let after = hay[at + q.len()..].chars().next();
-                    !before.is_some_and(is_word) && !after.is_some_and(is_word)
-                };
-                if ok {
-                    col = Some(at);
-                    break;
-                }
-                from = at + q.len().max(1);
-                if from >= hay.len() {
-                    break;
-                }
-            }
-            let Some(at) = col else { continue };
-            // Columns are counted in characters and the frontend highlights by character; to_lowercase may change byte lengths, so convert by character position in the original line
-            let ch = hay[..at].chars().count();
-            let qlen = q.chars().count();
+            // First non-empty match (a pattern like `a*` matches the empty string everywhere)
+            let Some(m) = re.captures_iter(line).filter_map(|c| c.get(1)).find(|m| !m.is_empty()) else { continue };
+            // Columns are counted in characters (the frontend highlights by character)
+            let ch = line[..m.start()].chars().count();
+            let qlen = m.as_str().chars().count();
             let chars: Vec<char> = line.chars().collect();
             // When the match is far into the line, cut off the beginning so the match stays visible
             let start = ch.saturating_sub(60);
@@ -314,7 +411,7 @@ pub fn grep(root: &str, query: &str, case_sensitive: bool, whole_word: bool, lim
                 "path": rel,
                 "line": i + 1,
                 "col": ch - start,
-                "len": qlen,
+                "len": qlen.min(300usize.saturating_sub(ch - start)),
                 "offset": start,
                 "text": shown,
             }));
@@ -367,6 +464,25 @@ pub fn write(
     Ok(json!({ "path": p.display().to_string(), "size": m.len(), "modified": mtime(&m) }))
 }
 
+/// Whether two paths name the same file on disk (not just equal strings)
+fn same_file(a: &std::path::Path, b: &std::path::Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        match (std::fs::symlink_metadata(a), std::fs::symlink_metadata(b)) {
+            (Ok(x), Ok(y)) => x.dev() == y.dev() && x.ino() == y.ino(),
+            _ => false,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+            (Ok(x), Ok(y)) => x == y,
+            _ => false,
+        }
+    }
+}
+
 pub fn mkdir(path: &str) -> Result<Value> {
     let p = crate::paths::expand(path);
     if p.exists() {
@@ -378,7 +494,8 @@ pub fn mkdir(path: &str) -> Result<Value> {
 
 pub fn rename(from: &str, to: &str) -> Result<Value> {
     let (a, b) = (crate::paths::expand(from), crate::paths::expand(to));
-    if b.exists() {
+    // On case-insensitive file systems (Windows, macOS) readme.md -> README.md finds "itself" at the target
+    if b.exists() && !same_file(&a, &b) {
         bail!("目标已存在：{}", b.display());
     }
     std::fs::rename(&a, &b)?;
@@ -613,15 +730,72 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("a.txt"), "hello World\nfoo bar\nworldwide\n").unwrap();
         std::fs::write(d.path().join("b.bin"), b"world\0\0").unwrap();
-        let r = grep(&d.path().display().to_string(), "world", false, false, 10).unwrap();
+        let root = d.path().display().to_string();
+        let o = |cs, ww, regex| GrepOpts { case_sensitive: cs, whole_word: ww, regex, ..Default::default() };
+        let r = grep(&root, "world", &o(false, false, false), 10).unwrap();
         let hits = r["hits"].as_array().unwrap();
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0]["line"], 1);
         assert_eq!(hits[0]["col"], 6);
-        let r = grep(&d.path().display().to_string(), "world", false, true, 10).unwrap();
+        let r = grep(&root, "world", &o(false, true, false), 10).unwrap();
         assert_eq!(r["hits"].as_array().unwrap().len(), 1);
-        let r = grep(&d.path().display().to_string(), "World", true, false, 10).unwrap();
+        let r = grep(&root, "World", &o(true, false, false), 10).unwrap();
         assert_eq!(r["hits"].as_array().unwrap().len(), 1);
+        // Literal mode escapes regex syntax; regex mode reports the matched length
+        assert_eq!(grep(&root, "o.b", &o(false, false, false), 10).unwrap()["hits"].as_array().unwrap().len(), 0);
+        let r = grep(&root, "o+ b", &o(false, false, true), 10).unwrap();
+        assert_eq!(r["hits"][0]["col"], 1);
+        assert_eq!(r["hits"][0]["len"], 4);
+        assert!(grep(&root, "(", &o(false, false, true), 10).is_err());
+    }
+
+    #[test]
+    fn read_flags_non_utf8() {
+        let d = tempfile::tempdir().unwrap();
+        let (gbk, utf) = (d.path().join("gbk.txt"), d.path().join("utf.txt"));
+        std::fs::write(&gbk, b"\xc4\xe3\xba\xc3\n").unwrap(); // "你好" in GBK
+        std::fs::write(&utf, "你好\r\n").unwrap();
+        assert_eq!(read(&gbk.display().to_string(), false).unwrap()["notUtf8"], true);
+        let r = read(&utf.display().to_string(), false).unwrap();
+        assert_eq!(r["notUtf8"], false);
+        assert_eq!(r["content"], "你好\r\n");
+    }
+
+    #[test]
+    fn rename_refuses_existing_but_allows_case_change() {
+        let d = tempfile::tempdir().unwrap();
+        let (a, b) = (d.path().join("a.txt"), d.path().join("b.txt"));
+        std::fs::write(&a, "1").unwrap();
+        std::fs::write(&b, "2").unwrap();
+        assert!(rename(&a.display().to_string(), &b.display().to_string()).is_err());
+        let up = d.path().join("A.txt");
+        rename(&a.display().to_string(), &up.display().to_string()).unwrap();
+        let names: Vec<String> = std::fs::read_dir(d.path()).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into()).collect();
+        assert!(names.contains(&"A.txt".to_string()), "{names:?}");
+    }
+
+    #[test]
+    fn grep_include_exclude() {
+        let d = tempfile::tempdir().unwrap();
+        for f in ["src/a.ts", "src/deep/b.ts", "lib/c.ts", "src/d.rs", "docs/src/e.ts"] {
+            let p = d.path().join(f);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, "needle\n").unwrap();
+        }
+        let root = d.path().display().to_string();
+        let files = |inc: &str, exc: &str| {
+            let o = GrepOpts { include: inc.into(), exclude: exc.into(), ..Default::default() };
+            let r = grep(&root, "needle", &o, 100).unwrap();
+            let mut v: Vec<String> = r["hits"].as_array().unwrap().iter().map(|h| h["path"].as_str().unwrap().to_string()).collect();
+            v.sort();
+            v
+        };
+        assert_eq!(files("*.rs", ""), ["src/d.rs"]);
+        assert_eq!(files("src", ""), ["docs/src/e.ts", "src/a.ts", "src/d.rs", "src/deep/b.ts"]);
+        assert_eq!(files("./src", "**/deep"), ["src/a.ts", "src/d.rs"]);
+        assert_eq!(files("src/*.{ts,rs}", ""), ["docs/src/e.ts", "src/a.ts", "src/d.rs"]);
+        assert_eq!(files("", "src, lib"), Vec::<String>::new());
+        assert_eq!(files("", "*.ts"), ["src/d.rs"]);
     }
 
     #[cfg(unix)]

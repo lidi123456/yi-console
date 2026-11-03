@@ -42,6 +42,11 @@ export function GrepPanel({
   const [q, setQ] = useState(() => lsGet('wp-grep-q', ''));
   const [cs, setCs] = useState(() => lsGet('wp-grep-cs', false));
   const [ww, setWw] = useState(() => lsGet('wp-grep-ww', false));
+  const [re, setRe] = useState(() => lsGet('wp-grep-re', false));
+  // Files to include / exclude (comma-separated globs, as in VS Code); the row is hidden until asked for
+  const [scope, setScope] = useState(() => lsGet('wp-grep-scope', false));
+  const [inc, setInc] = useState(() => lsGet('wp-grep-inc', ''));
+  const [exc, setExc] = useState(() => lsGet('wp-grep-exc', ''));
   const [res, setRes] = useState<Result | null>(null);
   const [busy, setBusy] = useState(false);
   const [folded, setFolded] = useState<Set<string>>(new Set());
@@ -52,6 +57,8 @@ export function GrepPanel({
 
   useEffect(() => {
     lsSet('wp-grep-q', q);
+    lsSet('wp-grep-inc', inc);
+    lsSet('wp-grep-exc', exc);
     if (!term) {
       setRes(null);
       return;
@@ -59,7 +66,8 @@ export function GrepPanel({
     let alive = true;
     const t = setTimeout(() => {
       setBusy(true);
-      rpc<Omit<Result, 'q'>>(hostId, 'fs.grep', { root, query: term, caseSensitive: cs, wholeWord: ww, limit: 1000 })
+      const range = scope ? { include: inc.trim(), exclude: exc.trim() } : {};
+      rpc<Omit<Result, 'q'>>(hostId, 'fs.grep', { root, query: term, caseSensitive: cs, wholeWord: ww, regex: re, ...range, limit: 1000 })
         .then((r) => alive && (setRes({ ...r, q: term }), setFolded(new Set())))
         .catch((e) =>
           alive &&
@@ -77,7 +85,7 @@ export function GrepPanel({
       alive = false;
       clearTimeout(t);
     };
-  }, [hostId, root, term, cs, ww]);
+  }, [hostId, root, term, cs, ww, re, scope, inc, exc]);
 
   const groups = useMemo(() => {
     const m = new Map<string, Hit[]>();
@@ -88,14 +96,10 @@ export function GrepPanel({
     return [...m.entries()];
   }, [res]);
 
-  const toggle = (k: 'cs' | 'ww') => {
-    if (k === 'cs') {
-      lsSet('wp-grep-cs', !cs);
-      setCs(!cs);
-    } else {
-      lsSet('wp-grep-ww', !ww);
-      setWw(!ww);
-    }
+  const toggle = (k: 'cs' | 'ww' | 're' | 'scope') => {
+    const [v, set] = { cs: [cs, setCs], ww: [ww, setWw], re: [re, setRe], scope: [scope, setScope] }[k] as [boolean, (b: boolean) => void];
+    lsSet(`wp-grep-${k}`, !v);
+    set(!v);
   };
 
   return (
@@ -116,7 +120,36 @@ export function GrepPanel({
         <button className={`grep-opt ${ww ? 'on' : ''}`} title={tr('全词匹配', 'Whole word')} onClick={() => toggle('ww')}>
           <u>ab</u>
         </button>
+        <button className={`grep-opt ${re ? 'on' : ''}`} title={tr('使用正则表达式', 'Use regular expression')} onClick={() => toggle('re')}>
+          .*
+        </button>
+        <button
+          className={`grep-opt ${scope ? 'on' : ''}`}
+          title={tr('限定文件范围', 'Files to include / exclude')}
+          aria-expanded={scope}
+          onClick={() => toggle('scope')}
+        >
+          <Icon name="more" size={13} />
+        </button>
       </div>
+      {scope && (
+        <div className="grep-scope">
+          <input
+            value={inc}
+            onChange={(e) => setInc(e.target.value)}
+            placeholder={tr('包含的文件，例如 src, *.ts', 'Files to include, e.g. src, *.ts')}
+            aria-label={tr('包含的文件', 'Files to include')}
+            spellCheck={false}
+          />
+          <input
+            value={exc}
+            onChange={(e) => setExc(e.target.value)}
+            placeholder={tr('排除的文件，例如 **/test/**', 'Files to exclude, e.g. **/test/**')}
+            aria-label={tr('排除的文件', 'Files to exclude')}
+            spellCheck={false}
+          />
+        </div>
+      )}
       <div className="grep-sum">
         {busy ? (
           <span className="spinner" />

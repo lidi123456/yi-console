@@ -684,7 +684,7 @@ pub mod methods {
     pub const FS_DELETE: &str = "fs.delete";
     /// Drive list on Windows; ["/"] on other systems
     pub const FS_ROOTS: &str = "fs.roots";
-    /// {root, query, caseSensitive?, wholeWord?, limit?} -> {hits: [{path(relative), line, col, len, offset, text}], truncated, files}: search file contents
+    /// {root, query, caseSensitive?, wholeWord?, regex?, include?, exclude?(comma-separated globs), limit?} -> {hits: [{path(relative), line, col, len, offset, text}], truncated, files}: search file contents
     pub const FS_GREP: &str = "fs.grep";
     /// {path, data(base64), overwrite?} -> {path, size, modified}: upload a file
     pub const FS_UPLOAD: &str = "fs.upload";
@@ -728,7 +728,7 @@ pub mod methods {
     pub const FS_SEARCH: &str = "fs.search";
     /// {query, limit} -> [{sessionId, seq, ts, kind, snippet}]: search messages across all sessions
     pub const SEARCH_MESSAGES: &str = "search.messages";
-    /// {cwd, diff?, paths?} -> {repo, branch, head, files:[{path, status, diff}]}; diff=false skips diffs, paths returns only those files
+    /// {cwd, diff?, paths?} -> {repo, branch, head, total?, files:[{path, status, diff}]}; diff=false skips diffs, paths returns only those files; at most 10000 files, total is set when more were left out
     pub const GIT_CHANGES: &str = "git.changes";
     /// {cwd, paths}: discard changes to these files
     pub const GIT_DISCARD: &str = "git.discard";

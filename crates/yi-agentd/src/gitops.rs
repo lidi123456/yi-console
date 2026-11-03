@@ -7,10 +7,18 @@ use std::process::{Command, Stdio};
 
 /// Size limit for a single file's diff; larger ones just get a notice
 const DIFF_MAX: usize = 200 * 1024;
+/// At most this many changed files are returned (VS Code's git.statusLimit default): a repo without a .gitignore for
+/// node_modules and the like can list hundreds of thousands, and the panel polls every 10 s
+const STATUS_MAX: usize = 10_000;
+/// New files beyond this many don't get their lines counted (that reads each file)
+const COUNT_MAX: usize = 2_000;
 
 fn git(cwd: &Path, args: &[&str]) -> Result<std::process::Output> {
     let mut cmd = Command::new("git");
     cmd.args(["-c", "core.quotepath=false"]).args(args).current_dir(cwd);
+    // Read-only commands like status may otherwise take index.lock to refresh the index; the panel polls status, and an
+    // agent's git commit landing at the same moment would fail with "index.lock exists" (VS Code sets the same)
+    cmd.env("GIT_OPTIONAL_LOCKS", "0");
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -64,18 +72,20 @@ pub fn changes_with(cwd: &str, with_diff: bool, only: Option<&[String]>) -> Resu
     let status = git_ok(&root, &["status", "--porcelain=v1", "-z", "-uall"])?;
     let stats = numstat(&root);
     let mut files = vec![];
+    let (mut total, mut counted) = (0usize, 0usize);
     let mut it = status.split('\0').filter(|s| !s.is_empty());
     while let Some(entry) = it.next() {
         if entry.len() < 4 {
             continue;
         }
+        total += 1;
         let (code, path) = entry.split_at(3);
         let code = code.trim().to_string();
         // Rename entries are followed by the original path
         if code.starts_with('R') || code.starts_with('C') {
             it.next();
         }
-        if only.is_some_and(|o| !o.iter().any(|x| x == path)) {
+        if only.is_some_and(|o| !o.iter().any(|x| x == path)) || files.len() >= STATUS_MAX {
             continue;
         }
         let untracked = code == "??";
@@ -109,7 +119,8 @@ pub fn changes_with(cwd: &str, with_diff: bool, only: Option<&[String]>) -> Resu
         };
         // Lines added / removed: null for binaries, files too large, and repos without HEAD
         let (added, deleted) = if untracked {
-            (count_lines(&root.join(path)), Some(0))
+            counted += 1;
+            (if counted <= COUNT_MAX { count_lines(&root.join(path)) } else { None }, Some(0))
         } else {
             stats.get(path).copied().unwrap_or((None, None))
         };
@@ -125,6 +136,8 @@ pub fn changes_with(cwd: &str, with_diff: bool, only: Option<&[String]>) -> Resu
         "repo": root.display().to_string(),
         "branch": branch.trim(),
         "head": head,
+        // Total number of changed files, set only when more than STATUS_MAX were left out
+        "total": if only.is_none() && total > files.len() { Some(total) } else { None },
         "files": files,
     }))
 }

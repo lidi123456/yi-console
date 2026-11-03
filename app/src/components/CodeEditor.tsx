@@ -2,6 +2,7 @@ import { useEffect, useRef } from 'react';
 import { isEn, useLang } from '../i18n';
 import { Compartment, EditorState } from '@codemirror/state';
 import {
+  crosshairCursor,
   drawSelection,
   EditorView,
   highlightActiveLine,
@@ -9,14 +10,18 @@ import {
   highlightSpecialChars,
   keymap,
   lineNumbers,
+  rectangularSelection,
 } from '@codemirror/view';
+import { closeBrackets, closeBracketsKeymap } from '@codemirror/autocomplete';
 import { defaultKeymap, history, historyKeymap, indentWithTab } from '@codemirror/commands';
-import { bracketMatching, HighlightStyle, indentOnInput, LanguageDescription, syntaxHighlighting } from '@codemirror/language';
+import { bracketMatching, foldGutter, foldKeymap, HighlightStyle, indentOnInput, indentUnit, LanguageDescription, syntaxHighlighting } from '@codemirror/language';
 import { highlightSelectionMatches, searchKeymap } from '@codemirror/search';
 import { languages } from '@codemirror/language-data';
 import { tags as t } from '@lezer/highlight';
+import { detectEol, detectIndent } from '../textFormat';
 
-// Code editor in the file panel (CodeMirror 6): syntax highlighting, line numbers, current line, find/replace, Ctrl+S to save.
+// Code editor in the file panel (CodeMirror 6): syntax highlighting, line numbers, current line, find/replace, Ctrl+S to save,
+// folding, auto-closed brackets and multiple cursors (VS Code's bindings: Alt+click, Shift+Alt+drag for a column, Ctrl+Alt+Up/Down, Ctrl+D).
 // Language packs are lazy-loaded by file name and stay out of the main bundle
 
 /** Colors use CSS variables; dark mode swaps them in styles.css */
@@ -38,13 +43,28 @@ const highlight = HighlightStyle.define([
   { tag: [t.invalid], color: 'var(--err)' },
 ]);
 
+/** Fold gutter arrow: a chevron pointing down when open, right when folded */
+function foldMarker(open: boolean) {
+  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  svg.setAttribute('viewBox', '0 0 16 16');
+  svg.setAttribute('class', open ? 'cm-fold-mk' : 'cm-fold-mk closed');
+  svg.innerHTML = '<path d="M4 6l4 4 4-4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>';
+  return svg as unknown as HTMLElement;
+}
+
 const theme = EditorView.theme({
   '&': { height: '100%', fontSize: '12px', backgroundColor: 'var(--bg)', color: 'var(--text)' },
   '&.cm-focused': { outline: 'none' },
   '.cm-scroller': { fontFamily: 'var(--mono)', lineHeight: '20px' },
   '.cm-content': { padding: '4px 0', caretColor: 'var(--text)' },
   '.cm-gutters': { backgroundColor: 'var(--bg)', color: 'var(--text-3)', border: 'none' },
-  '.cm-lineNumbers .cm-gutterElement': { padding: '0 12px 0 16px', minWidth: '44px' },
+  '.cm-lineNumbers .cm-gutterElement': { padding: '0 4px 0 16px', minWidth: '36px' },
+  // Fold arrows: hidden until the gutter is hovered (as in VS Code); folded ranges always show theirs
+  '.cm-foldGutter .cm-gutterElement': { width: '16px', display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer' },
+  '.cm-fold-mk': { width: '10px', height: '10px', color: 'var(--text-3)', opacity: 0, transition: 'opacity .15s' },
+  '.cm-fold-mk.closed, .cm-gutters:hover .cm-fold-mk': { opacity: 1 },
+  '.cm-fold-mk.closed': { transform: 'rotate(-90deg)' },
+  '.cm-foldPlaceholder': { backgroundColor: 'var(--cm-match)', border: 'none', color: 'var(--text-2)', padding: '0 4px', margin: '0 2px' },
   '.cm-activeLine': { backgroundColor: 'var(--cm-active)' },
   '.cm-activeLineGutter': { backgroundColor: 'transparent', color: 'var(--text)' },
   '&.cm-focused .cm-selectionBackground, .cm-selectionBackground, ::selection': { backgroundColor: 'var(--cm-sel) !important' },
@@ -151,36 +171,48 @@ export function CodeEditor({
 
   useEffect(() => {
     const c = comp.current;
+    const eol = detectEol(value);
+    const ind = detectIndent(value);
     const v = new EditorView({
       parent: host.current!,
       state: EditorState.create({
         doc: value,
         extensions: [
           lineNumbers(),
+          foldGutter({ markerDOM: foldMarker }),
           highlightActiveLineGutter(),
           highlightSpecialChars(),
           history(),
           drawSelection(),
+          EditorState.allowMultipleSelections.of(true),
+          // VS Code: Alt+click adds a cursor, Shift+Alt+drag selects a column
+          EditorView.clickAddsSelectionRange.of((e) => e.altKey),
+          rectangularSelection({ eventFilter: (e) => e.altKey && e.shiftKey }),
+          crosshairCursor({ key: 'Shift' }),
           indentOnInput(),
           bracketMatching(),
+          closeBrackets(),
           highlightActiveLine(),
           highlightSelectionMatches(),
           syntaxHighlighting(highlight),
           keymap.of([
             { key: 'Mod-s', preventDefault: true, run: () => (cb.current.onSave(), true) },
+            ...closeBracketsKeymap,
             ...defaultKeymap,
             ...historyKeymap,
             ...searchKeymap,
+            ...foldKeymap,
             indentWithTab,
           ]),
-          EditorState.tabSize.of(4),
+          EditorState.tabSize.of(ind.tabSize),
+          indentUnit.of(ind.unit),
           c.phrases.of(searchPhrases()),
           theme,
           c.lang.of([]),
           c.ro.of([EditorState.readOnly.of(readOnly), EditorView.editable.of(!readOnly)]),
           c.wrap.of(wrap ? EditorView.lineWrapping : []),
           EditorView.updateListener.of((u) => {
-            if (u.docChanged) cb.current.onChange(u.state.doc.toString());
+            if (u.docChanged) cb.current.onChange(u.state.doc.sliceString(0, u.state.doc.length, eol));
           }),
         ],
       }),

@@ -497,10 +497,15 @@ pub async fn dispatch(
         FS_GREP => {
             let root = s(&p, "root")?.to_string();
             let q = p["query"].as_str().unwrap_or("").to_string();
-            let cs = p["caseSensitive"].as_bool().unwrap_or(false);
-            let ww = p["wholeWord"].as_bool().unwrap_or(false);
+            let o = crate::fsapi::GrepOpts {
+                case_sensitive: p["caseSensitive"].as_bool().unwrap_or(false),
+                whole_word: p["wholeWord"].as_bool().unwrap_or(false),
+                regex: p["regex"].as_bool().unwrap_or(false),
+                include: p["include"].as_str().unwrap_or("").to_string(),
+                exclude: p["exclude"].as_str().unwrap_or("").to_string(),
+            };
             let limit = p["limit"].as_u64().unwrap_or(500).min(2000) as usize;
-            tokio::task::spawn_blocking(move || crate::fsapi::grep(&root, &q, cs, ww, limit)).await??
+            tokio::task::spawn_blocking(move || crate::fsapi::grep(&root, &q, &o, limit)).await??
         }
         FS_UPLOAD => {
             let path = s(&p, "path")?.to_string();
