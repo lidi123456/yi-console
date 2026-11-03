@@ -8086,3 +8086,12 @@ body.resizing-y .wp-hist-split {
   font-size: 13px;
   user-select: none;
 }
+
+/* Directory layout: sessions sit one step in from their directory heading (row highlight stays full width) */
+.dir-group .session-row {
+  padding-left: 18px;
+}
+
+.dir-group .old-toggle {
+  padding-left: 42px;
+}

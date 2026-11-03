@@ -408,7 +408,7 @@ function HostBlock({ h, filter }: { h: HostEntry; filter: string }) {
               const cls = list.map(sessionStatusClass);
               const sum = cls.includes('attn') ? 'attn' : cls.includes('busy') ? 'busy' : null;
               return (
-                <div className="project" key={cwd}>
+                <div className="project dir-group" key={cwd}>
                   <div className="project-head">
                     <button
                       className={`project-add ${connected ? '' : 'hidden'}`}
