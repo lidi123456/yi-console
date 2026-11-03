@@ -12,29 +12,29 @@ import { lsGet, lsSet, toB64 } from '../util';
 import { openMenu } from './Overlay';
 import { isAppDark, onThemeChange, useTheme } from '../theme';
 
-// Color schemes from Windows Terminal: One Half Dark for dark, One Half Light for light
+// Dark: VS Code's integrated terminal (Dark Modern background, default ANSI colors); light: Windows Terminal's One Half Light
 const DARK: ITheme = {
-  background: '#1e1f22',
-  foreground: '#dcdfe4',
-  cursor: '#dcdfe4',
-  cursorAccent: '#1e1f22',
-  selectionBackground: '#3e4451',
-  black: '#282c34',
-  red: '#e06c75',
-  green: '#98c379',
-  yellow: '#e5c07b',
-  blue: '#61afef',
-  magenta: '#c678dd',
-  cyan: '#56b6c2',
-  white: '#dcdfe4',
-  brightBlack: '#5a6374',
-  brightRed: '#e06c75',
-  brightGreen: '#98c379',
-  brightYellow: '#e5c07b',
-  brightBlue: '#61afef',
-  brightMagenta: '#c678dd',
-  brightCyan: '#56b6c2',
-  brightWhite: '#ffffff',
+  background: '#1f1f1f',
+  foreground: '#cccccc',
+  cursor: '#aeafad',
+  cursorAccent: '#1f1f1f',
+  selectionBackground: '#264f78',
+  black: '#000000',
+  red: '#cd3131',
+  green: '#0dbc79',
+  yellow: '#e5e510',
+  blue: '#2472c8',
+  magenta: '#bc3fbc',
+  cyan: '#11a8cd',
+  white: '#e5e5e5',
+  brightBlack: '#666666',
+  brightRed: '#f14c4c',
+  brightGreen: '#23d18b',
+  brightYellow: '#f5f543',
+  brightBlue: '#3b8eea',
+  brightMagenta: '#d670d6',
+  brightCyan: '#29b8db',
+  brightWhite: '#e5e5e5',
 };
 
 const LIGHT: ITheme = {

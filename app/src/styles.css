@@ -49,33 +49,37 @@
 
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme='light']) {
-    --bg: #0f1115;
-    --bg-2: #15181e;
-    --bg-3: #1c2028;
-    --panel: #15181e;
-    --border: #262b34;
-    --border-2: #333a46;
-    --text: #e4e6eb;
-    --text-2: #a3a9b5;
-    --text-3: #727a87;
-    --accent: #e4e6eb;
+    /* Neutral greys after VS Code's Dark Modern: chrome #181818, editor #1f1f1f, borders #2b2b2b / #3c3c3c, text #cccccc / #9d9d9d */
+    --bg: #1f1f1f;
+    --bg-2: #252525;
+    --bg-3: #2b2b2b;
+    --panel: #222222;
+    --border: #2b2b2b;
+    --border-2: #3c3c3c;
+    --text: #cccccc;
+    --text-2: #9d9d9d;
+    --text-3: #858585;
+    --accent: #d7d7d7;
     --accent-2: #ffffff;
-    --accent-soft: #23272f;
-    --focus: rgba(228, 230, 235, 0.1);
-    --link: #7aa7f5;
-    --unread: #60a5fa;
-    --shell-bg: #0f1115;
+    --accent-soft: #2b2b2b;
+    --focus: rgba(204, 204, 204, 0.1);
+    --link: #4daafc;
+    --unread: #4daafc;
+    --shell-bg: #181818;
     --side-hover: rgba(255, 255, 255, 0.05);
-    --side-active: rgba(255, 255, 255, 0.09);
-    --bubble: #20242c;
-    --panel-shadow: 0 0 0 1px rgba(255, 255, 255, 0.06), 0 2px 12px rgba(0, 0, 0, 0.3);
-    --warn-soft: #2d2617;
-    --err-soft: #331b1a;
-    --add-bg: #12301f;
-    --add-fg: #6fd69a;
-    --del-bg: #3a1716;
-    --del-fg: #f08b83;
-    --code-bg: #0b0d11;
+    --side-active: rgba(255, 255, 255, 0.1);
+    --bubble: #2b2b2b;
+    --panel-shadow: 0 0 0 1px #2b2b2b, 0 2px 12px rgba(0, 0, 0, 0.3);
+    --ok: #3fb950;
+    --warn: #cca700;
+    --warn-soft: #2b2714;
+    --err: #f85149;
+    --err-soft: #351d1c;
+    --add-bg: #1d3323;
+    --add-fg: #7ee2a0;
+    --del-bg: #3b1f1e;
+    --del-fg: #f48771;
+    --code-bg: #181818;
     --shadow: 0 8px 30px rgba(0, 0, 0, 0.5);
     color-scheme: dark;
   }
@@ -83,33 +87,37 @@
 
 /* Dark chosen manually (also applies when the system is light) */
 :root[data-theme='dark'] {
-  --bg: #0f1115;
-  --bg-2: #15181e;
-  --bg-3: #1c2028;
-  --panel: #15181e;
-  --border: #262b34;
-  --border-2: #333a46;
-  --text: #e4e6eb;
-  --text-2: #a3a9b5;
-  --text-3: #727a87;
-  --accent: #e4e6eb;
+  /* Neutral greys after VS Code's Dark Modern: chrome #181818, editor #1f1f1f, borders #2b2b2b / #3c3c3c, text #cccccc / #9d9d9d */
+  --bg: #1f1f1f;
+  --bg-2: #252525;
+  --bg-3: #2b2b2b;
+  --panel: #222222;
+  --border: #2b2b2b;
+  --border-2: #3c3c3c;
+  --text: #cccccc;
+  --text-2: #9d9d9d;
+  --text-3: #858585;
+  --accent: #d7d7d7;
   --accent-2: #ffffff;
-  --accent-soft: #23272f;
-  --focus: rgba(228, 230, 235, 0.1);
-  --link: #7aa7f5;
-  --unread: #60a5fa;
-  --shell-bg: #0f1115;
+  --accent-soft: #2b2b2b;
+  --focus: rgba(204, 204, 204, 0.1);
+  --link: #4daafc;
+  --unread: #4daafc;
+  --shell-bg: #181818;
   --side-hover: rgba(255, 255, 255, 0.05);
-  --side-active: rgba(255, 255, 255, 0.09);
-  --bubble: #20242c;
-  --panel-shadow: 0 0 0 1px rgba(255, 255, 255, 0.06), 0 2px 12px rgba(0, 0, 0, 0.3);
-  --warn-soft: #2d2617;
-  --err-soft: #331b1a;
-  --add-bg: #12301f;
-  --add-fg: #6fd69a;
-  --del-bg: #3a1716;
-  --del-fg: #f08b83;
-  --code-bg: #0b0d11;
+  --side-active: rgba(255, 255, 255, 0.1);
+  --bubble: #2b2b2b;
+  --panel-shadow: 0 0 0 1px #2b2b2b, 0 2px 12px rgba(0, 0, 0, 0.3);
+  --ok: #3fb950;
+  --warn: #cca700;
+  --warn-soft: #2b2714;
+  --err: #f85149;
+  --err-soft: #351d1c;
+  --add-bg: #1d3323;
+  --add-fg: #7ee2a0;
+  --del-bg: #3b1f1e;
+  --del-fg: #f48771;
+  --code-bg: #181818;
   --shadow: 0 8px 30px rgba(0, 0, 0, 0.5);
   color-scheme: dark;
 }
@@ -2237,8 +2245,8 @@ textarea {
 }
 
 .term-wrap.term-dark {
-  background: #1e1f22;
-  --term-fg: #dcdfe4;
+  background: #1f1f1f;
+  --term-fg: #cccccc;
 }
 
 .term-wrap.term-light {
@@ -3752,21 +3760,21 @@ button.md-rimg-ph:hover {
 
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme='light']) {
-    --text: #e6e8ec;
-    --text-strong: #eeeeeb;
-    --inline-code-bg: #23272e;
-    --text-2: #a8afba;
-    --text-3: #757d8a;
+    --text: #cccccc;
+    --text-strong: #e7e7e7;
+    --inline-code-bg: #313131;
+    --text-2: #9d9d9d;
+    --text-3: #858585;
   }
 }
 
 /* Dark chosen manually (also applies when the system is light) */
 :root[data-theme='dark'] {
-  --text: #e6e8ec;
-  --text-strong: #eeeeeb;
-  --inline-code-bg: #23272e;
-  --text-2: #a8afba;
-  --text-3: #757d8a;
+  --text: #cccccc;
+  --text-strong: #e7e7e7;
+  --inline-code-bg: #313131;
+  --text-2: #9d9d9d;
+  --text-3: #858585;
 }
 
 
@@ -4179,28 +4187,38 @@ button.md-rimg-ph:hover {
 
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme='light']) .file-panel {
-    --hl-keyword: #ff7b72;
-    --hl-string: #a5d6ff;
-    --hl-number: #79c0ff;
-    --hl-comment: #8b949e;
-    --hl-func: #d2a8ff;
-    --hl-type: #ffa657;
-    --hl-prop: #79c0ff;
-    --hl-var: #e6edf3;
+    /* VS Code Dark+ token colors */
+    --hl-keyword: #569cd6;
+    --hl-string: #ce9178;
+    --hl-number: #b5cea8;
+    --hl-comment: #6a9955;
+    --hl-func: #dcdcaa;
+    --hl-type: #4ec9b0;
+    --hl-prop: #9cdcfe;
+    --hl-var: #cccccc;
     --cm-active: rgba(255, 255, 255, 0.04);
+    --cm-sel: #264f78;
+    --cm-match: rgba(173, 214, 255, 0.15);
+    --cm-find: rgba(234, 92, 0, 0.33);
+    --cm-find-cur: #9e6a03;
   }
 }
 
 :root[data-theme='dark'] .file-panel {
-  --hl-keyword: #ff7b72;
-  --hl-string: #a5d6ff;
-  --hl-number: #79c0ff;
-  --hl-comment: #8b949e;
-  --hl-func: #d2a8ff;
-  --hl-type: #ffa657;
-  --hl-prop: #79c0ff;
-  --hl-var: #e6edf3;
+  /* VS Code Dark+ token colors */
+  --hl-keyword: #569cd6;
+  --hl-string: #ce9178;
+  --hl-number: #b5cea8;
+  --hl-comment: #6a9955;
+  --hl-func: #dcdcaa;
+  --hl-type: #4ec9b0;
+  --hl-prop: #9cdcfe;
+  --hl-var: #cccccc;
   --cm-active: rgba(255, 255, 255, 0.04);
+  --cm-sel: #264f78;
+  --cm-match: rgba(173, 214, 255, 0.15);
+  --cm-find: rgba(234, 92, 0, 0.33);
+  --cm-find-cur: #9e6a03;
 }
 
 /* Full screen: covers the chat area */
