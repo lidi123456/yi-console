@@ -728,12 +728,17 @@ pub mod methods {
     pub const FS_SEARCH: &str = "fs.search";
     /// {query, limit} -> [{sessionId, seq, ts, kind, snippet}]: search messages across all sessions
     pub const SEARCH_MESSAGES: &str = "search.messages";
-    /// {cwd, diff?, paths?} -> {repo, branch, files:[{path, status, diff}]}; diff=false skips diffs, paths returns only those files
+    /// {cwd, diff?, paths?} -> {repo, branch, head, files:[{path, status, diff}]}; diff=false skips diffs, paths returns only those files
     pub const GIT_CHANGES: &str = "git.changes";
     /// {cwd, paths}: discard changes to these files
     pub const GIT_DISCARD: &str = "git.discard";
     /// {cwd, paths, message}: commit these files
     pub const GIT_COMMIT: &str = "git.commit";
+    /// {cwd, skip?, limit?} -> {repo, commits:[{hash, short, parents, author, time, refs, subject}], more}: commit history of HEAD, newest first
+    pub const GIT_LOG: &str = "git.log";
+    /// {cwd, hash, paths?} -> {hash, parent, message, author, time, files:[{path, status, added, deleted, diff}]}:
+    /// files a commit changed relative to its first parent; diffs only for the files in paths
+    pub const GIT_SHOW: &str = "git.show";
     /// Parts of the status line computed on the host {sessionId} → {git: {branch, ahead, behind, changed}?, command: {text, source}?, error?}
     pub const SESSION_STATUS_LINE: &str = "session.statusLine";
     /// Page back to older events: {sessionId, beforeSeq, limit} → {events, hasMore}

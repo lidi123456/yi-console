@@ -34,13 +34,19 @@ function numbered(raw: Line[]): Line[] {
 export function diffLines(d: FileDiff): Line[] {
   if (d.unified) {
     return numbered(
-      d.unified.split('\n').map((l): Line => {
-        if (l.startsWith('@@')) return { t: 'hunk', text: l };
-        if (l.startsWith('+++') || l.startsWith('---')) return { t: 'hunk', text: l };
-        if (l.startsWith('+')) return { t: 'add', text: l.slice(1) };
-        if (l.startsWith('-')) return { t: 'del', text: l.slice(1) };
-        return { t: 'ctx', text: l.startsWith(' ') ? l.slice(1) : l };
-      }),
+      // A patch ends with a newline: drop it so it doesn't show up as an extra empty context line
+      d.unified
+        .replace(/\n$/, '')
+        .split('\n')
+        // "\ No newline at end of file" is a marker, not a line of the file
+        .filter((l) => !l.startsWith('\\'))
+        .map((l): Line => {
+          if (l.startsWith('@@')) return { t: 'hunk', text: l };
+          if (l.startsWith('+++') || l.startsWith('---')) return { t: 'hunk', text: l };
+          if (l.startsWith('+')) return { t: 'add', text: l.slice(1) };
+          if (l.startsWith('-')) return { t: 'del', text: l.slice(1) };
+          return { t: 'ctx', text: l.startsWith(' ') ? l.slice(1) : l };
+        }),
     );
   }
   const p = structuredPatch(d.path, d.path, d.oldText ?? '', d.newText ?? '', '', '', { context: 3 });

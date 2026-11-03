@@ -15,12 +15,15 @@ import { GrepPanel } from './GrepPanel';
 import { QuickOpen, type QuickMode } from './QuickOpen';
 import { OPEN_CHANGES } from './SessionActions';
 import { BrowserPane, isWebTab, WEB_PREFIX, webTabFile, webTabTitle } from './Browser';
+import { GitHistory, isCommitTab, parseCommitTab } from './GitHistory';
 
 // The "workspace files" panel on the right of the session page, modeled on the VS Code / Cursor explorer:
-// - with no file open it's a single narrow file tree that doesn't take space from the chat; opening a file widens it, editor on the left, tree on the right (collapsible)
+// - on desktop the panel always shows the preview area on the left and the tree on the right (collapsible), with a placeholder until a file is opened;
+//   on mobile, with no file open it's just the file tree
 // - the tree marks git changes (M / U / D); the "Changes" view lists only files changed in this workspace, and opening a changed file shows its diff
 // - above the editor are tabs for opened files, then a clickable path; clicking a directory pops up that directory's tree
 // - three sidebar views: all files / changes / search (file contents); Ctrl+P quick open, @ for symbols, : to go to a line
+// - under Changes, a collapsible commit history box; a file in a commit opens as a read-only diff tab (git:<hash>:<path>)
 // - files can be dragged into the input box (inserts @path), and system files dropped on the tree are uploaded to that directory
 // - another file can be opened side by side on the right, or two files compared; diffs can be side by side or unified
 
@@ -43,6 +46,8 @@ interface OpenFile {
   pdf?: string;
   /** Browser tab (path is web:url) */
   web?: boolean;
+  /** A file in a commit (path is git:<hash>:<rel>): read-only diff against the commit's first parent */
+  commit?: { hash: string; rel: string; subject: string; author: string; time: number; status: string; diff: string };
 }
 
 /** Dragging a file from the file panel to the input box: the value is "@relative-path " */
@@ -71,7 +76,7 @@ const isHtml = (p: string) => ['html', 'htm'].includes(extOf(p));
 type GitFile = { status: string; diff: string; path: string; rel: string; added?: number | null; deleted?: number | null };
 
 /** "+12 −3": shown only in the Changes view */
-function LineStat({ a, d }: { a?: number | null; d?: number | null }) {
+export function LineStat({ a, d }: { a?: number | null; d?: number | null }) {
   if (a == null && d == null) return null;
   return (
     <span className="wp-stat">
@@ -84,6 +89,8 @@ function LineStat({ a, d }: { a?: number | null; d?: number | null }) {
 interface GitInfo {
   repo: string;
   branch: string;
+  /** Current HEAD commit (older yi-agentd doesn't send it) */
+  head?: string | null;
   /** Keyed by norm(absolute path); rel is the path relative to the repo root (used for git operations) */
   files: Map<string, GitFile>;
   /** Directories containing changes */
@@ -100,7 +107,7 @@ const norm = (p: string) => {
 };
 
 /** porcelain status code -> letter and color to display */
-function gitMark(status: string): [string, string] {
+export function gitMark(status: string): [string, string] {
   if (status === 'new' || status === '??') return ['U', 'g-new'];
   if (status.includes('U')) return ['!', 'g-del'];
   if (status.includes('D')) return ['D', 'g-del'];
@@ -109,7 +116,7 @@ function gitMark(status: string): [string, string] {
   return ['M', 'g-mod'];
 }
 
-function gitText(code: string): string {
+export function gitText(code: string): string {
   if (code === 'U') return tr('新文件（未跟踪）', 'Untracked');
   if (code === 'A') return tr('新增', 'Added');
   if (code === 'D') return tr('已删除', 'Deleted');
@@ -143,6 +150,11 @@ const parentOf = (p: string) => {
 };
 const baseName = (p: string) => p.slice(Math.max(p.lastIndexOf('/'), p.lastIndexOf('\\')) + 1);
 const extOf = (name: string) => (name.includes('.') ? name.slice(name.lastIndexOf('.') + 1).toLowerCase() : '');
+/** Title of a commit file tab: "name @abc1234"; null if t isn't one */
+const commitTabLabel = (t: string) => {
+  const c = parseCommitTab(t);
+  return c ? `${baseName(c.rel)} @${c.hash.slice(0, 7)}` : null;
+};
 
 const IMAGE_MIME: Record<string, string> = {
   png: 'image/png',
@@ -503,10 +515,10 @@ export function FilePanel({
   /** quiet: background refresh (timer / window refocus); if the status didn't change, just quietly refetch the current file's diff */
   const loadGit = useCallback((quiet = false) => {
     // Without diffs: in a big repo with many changed files, running git diff for each takes ages, so fetch only the file that gets opened
-    rpc<{ repo: string | null; branch?: string; files: { path: string; status: string; diff: string; added?: number | null; deleted?: number | null }[] }>(hostId, 'git.changes', { cwd, diff: false })
+    rpc<{ repo: string | null; branch?: string; head?: string | null; files: { path: string; status: string; diff: string; added?: number | null; deleted?: number | null }[] }>(hostId, 'git.changes', { cwd, diff: false })
       .then((r) => {
         setGitReady(true);
-        const sig = `${r.repo}|${r.branch}|${r.files.map((f) => `${f.status} ${f.path} ${f.added ?? ''}/${f.deleted ?? ''}`).join('|')}`;
+        const sig = `${r.repo}|${r.branch}|${r.head}|${r.files.map((f) => `${f.status} ${f.path} ${f.added ?? ''}/${f.deleted ?? ''}`).join('|')}`;
         if (quiet && sig === gitSig.current) return refreshCurDiff.current();
         gitSig.current = sig;
         setFileDiffs({});
@@ -522,7 +534,7 @@ export function FilePanel({
             dirs.add(d);
           }
         }
-        setGit({ repo: r.repo, branch: r.branch ?? '', files, dirs });
+        setGit({ repo: r.repo, branch: r.branch ?? '', head: r.head, files, dirs });
       })
       .catch(() => (setGitReady(true), quiet || setGit(null)));
   }, [hostId, cwd]);
@@ -586,6 +598,22 @@ export function FilePanel({
 
   const readFile = async (path: string, quiet = false): Promise<OpenFile | null> => {
     if (isWebTab(path)) return { path, content: '', draft: '', binary: true, truncated: false, size: 0, modified: 0, rev: Date.now(), web: true };
+    const ct = parseCommitTab(path);
+    if (ct) {
+      try {
+        const r = await rpc<{ hash: string; author: string; time: number; message: string; files: { path: string; status: string; diff: string }[] }>(hostId, 'git.show', {
+          cwd,
+          hash: ct.hash,
+          paths: [ct.rel],
+        });
+        const f = r.files.find((x) => x.path === ct.rel);
+        const commit = { hash: r.hash, rel: ct.rel, subject: r.message.split('\n')[0], author: r.author, time: r.time, status: f?.status ?? '', diff: f?.diff ?? '' };
+        return { path, content: '', draft: '', binary: true, truncated: false, size: 0, modified: 0, rev: Date.now(), commit };
+      } catch (e) {
+        if (!quiet) errorToast(e);
+        return null;
+      }
+    }
     const mime = IMAGE_MIME[extOf(path)];
     try {
       if (mime) {
@@ -627,7 +655,7 @@ export function FilePanel({
   const hasChange = (path: string) => !!gitOf(path) || sessionDiffsOf(path).length > 0;
 
   // Fetch the diff when a changed file is opened
-  const curKey = file && !file.web ? norm(file.path) : '';
+  const curKey = file && !file.web && !file.commit ? norm(file.path) : '';
   const curGit = file ? gitOf(file.path) : undefined;
   useEffect(() => {
     if (!curKey || !curGit || curGit.diff || curKey in fileDiffs) return;
@@ -738,9 +766,9 @@ export function FilePanel({
     openMenu(
       { clientX: r.right - 260, clientY: r.bottom + 4 },
       [...tabs].reverse().map((t) => ({
-        label: isWebTab(t) ? webTabTitle(t) : baseName(t),
-        icon: isWebTab(t) ? 'globe' : 'file',
-        hint: isWebTab(t) || rel(parentOf(t)) === '.' ? undefined : rel(parentOf(t)),
+        label: isWebTab(t) ? webTabTitle(t) : commitTabLabel(t) ?? baseName(t),
+        icon: isWebTab(t) ? 'globe' : isCommitTab(t) ? 'diff' : 'file',
+        hint: isWebTab(t) || isCommitTab(t) || rel(parentOf(t)) === '.' ? undefined : rel(parentOf(t)),
         active: t === file?.path,
         run: () => openFile(t),
       })),
@@ -797,7 +825,18 @@ export function FilePanel({
     ];
   };
 
-  useEffect(() => onFileOpen?.(!!file), [!!file]); // eslint-disable-line react-hooks/exhaustive-deps
+  // On desktop, keep the preview area next to the tree even with no file open (mobile shows only the tree)
+  const [desktop, setDesktop] = useState(() => !window.matchMedia('(max-width: 760px)').matches);
+  useEffect(() => {
+    const mq = window.matchMedia('(max-width: 760px)');
+    const on = () => setDesktop(!mq.matches);
+    mq.addEventListener('change', on);
+    return () => mq.removeEventListener('change', on);
+  }, []);
+  const emptyPane = desktop && !file;
+  // The panel is wide whenever the preview area shows (a file is open, or the empty placeholder on desktop)
+  const paneShown = !!file || emptyPane;
+  useEffect(() => onFileOpen?.(paneShown), [paneShown]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Remember opened files (per host + working directory; Files sessions per session) and restore the tabs and current file next time the panel opens
   const tabsKey = standalone ? `wp-open-s-${hostId}/${sessionId}` : `wp-open-${hostId}/${cwd}`;
@@ -870,7 +909,7 @@ export function FilePanel({
     if (!(was === 'running' || was === 'waiting-permission') || status === 'running') return;
     refreshTree();
     const f = fileRef.current;
-    if (f && f.draft === f.content && !f.image && !f.web) {
+    if (f && f.draft === f.content && !f.image && !f.web && !f.commit) {
       rpc<Omit<OpenFile, 'draft' | 'rev'>>(hostId, 'fs.read', { path: f.path })
         .then((r) => {
           if (r.modified === f.modified) return;
@@ -994,15 +1033,6 @@ export function FilePanel({
 
   // ---------- Side by side, compare ----------
   const wide = () => !window.matchMedia('(max-width: 900px)').matches;
-  // Files session on desktop: keep the preview area next to the tree even with no file open (mobile shows only the tree)
-  const [desktop, setDesktop] = useState(() => !window.matchMedia('(max-width: 760px)').matches);
-  useEffect(() => {
-    const mq = window.matchMedia('(max-width: 760px)');
-    const on = () => setDesktop(!mq.matches);
-    mq.addEventListener('change', on);
-    return () => mq.removeEventListener('change', on);
-  }, []);
-  const emptyPane = !!standalone && desktop && !file;
   const openSecond = async (path: string) => {
     if (!file) return openFile(path);
     if (path === file.path) return;
@@ -1084,7 +1114,7 @@ export function FilePanel({
   const rowMenu = (ev: React.MouseEvent, r: TreeRow) => {
     if (r.loading) return;
     const dir = r.isDir ? r.path : parentOf(r.path);
-    const canSide = !r.isDir && !!file && !file.web && file.path !== r.path && wide();
+    const canSide = !r.isDir && !!file && !file.web && !file.commit && file.path !== r.path && wide();
     openMenu(ev, [
       r.isDir
         ? { label: r.expanded ? tr('收起', 'Collapse') : tr('展开', 'Expand'), icon: 'folder', run: () => toggle(r.path) }
@@ -1203,8 +1233,9 @@ export function FilePanel({
   const changed = useMemo(() => {
     if (!root) return [];
     const r = norm(root);
-    return changedKeys.map((k) => k.slice(r.length + 1));
-  }, [changedKeys, root]);
+    // Keys are normalized (lowercased on Windows drives): take the original spelling from git status when there is one
+    return changedKeys.map((k) => (git?.files.get(k)?.path.replace(/\\/g, '/') ?? k).slice(r.length + 1));
+  }, [changedKeys, root, git]);
   const otherCount = allChanged.length - changedKeys.length;
   // Totals at the top of the Changes view: lines added/removed across the listed files (files that can't be computed are skipped)
   const totals = useMemo(() => {
@@ -1290,6 +1321,8 @@ export function FilePanel({
     </button>
   );
 
+  // Changes view with nothing uncommitted: the commit history box below takes the remaining height
+  const histGrow = view === 'changes' && !!git && gitReady && cRows.length === 0;
   const tree = (
     <div className="wp-side" style={file || emptyPane ? { width: treeW } : undefined}>
       <div className="wp-side-head">
@@ -1345,7 +1378,7 @@ export function FilePanel({
             </div>
           )}
           <div
-            className={`wp-tree ${dropDir === root ? 'drop' : ''}`}
+            className={`wp-tree ${dropDir === root ? 'drop' : ''} ${histGrow ? 'shrink' : ''}`}
             role="tree"
             aria-label={tr('文件树', 'File tree')}
             tabIndex={-1}
@@ -1458,6 +1491,9 @@ export function FilePanel({
               <div className="wp-tip">{tr('正在加载…', 'Loading…')}</div>
             )}
           </div>
+          {view === 'changes' && git && (
+            <GitHistory hostId={hostId} cwd={cwd} head={git.head} selected={file?.path} grow={histGrow} onOpen={(t) => openFile(t)} />
+          )}
           {(dropDir || uploading > 0) && (
             <div className="wp-dropbar">
               {uploading > 0 ? (
@@ -1492,7 +1528,18 @@ export function FilePanel({
   );
 
   // Content of the editor column: file / changes / compare
-  const mainView = !file ? null : file.web ? (
+  const mainView = !file ? null : file.commit ? (
+    file.commit.diff ? (
+      <div className="wp-diff">
+        <PaneDiff diff={{ path: file.commit.rel, unified: file.commit.diff.slice(Math.max(0, file.commit.diff.indexOf('@@'))) }} layout={layout} />
+      </div>
+    ) : (
+      <div className="wp-empty">
+        <div className="wp-empty-title">{tr('没有可显示的改动', 'No changes to show')}</div>
+        <div className="muted small">{tr('文件太大、是二进制文件，或只改了权限。', 'File is too large, binary, or only its mode changed.')}</div>
+      </div>
+    )
+  ) : file.web ? (
     <BrowserPane hostId={hostId} root={root ?? cwd} tab={file.path} onNavigate={(t) => navigateWeb(file.path, t)} />
   ) : html && preview && viewing === 'file' ? (
     <BrowserPane hostId={hostId} root={root ?? cwd} tab={`${WEB_PREFIX}file:${file.path}`} reload={file.modified} onNavigate={(t) => openFile(t)} />
@@ -1647,6 +1694,41 @@ export function FilePanel({
           >
             {tabs.map((t) => {
               const cur = t === file.path;
+              const ct = parseCommitTab(t);
+              if (ct)
+                return (
+                  <div
+                    key={t}
+                    role="tab"
+                    aria-selected={cur}
+                    className={`wp-ftab ${cur ? 'active' : ''}`}
+                    title={`${ct.rel}\n${tr('提交', 'Commit')} ${ct.hash.slice(0, 10)}${cur && file.commit ? ` · ${file.commit.subject}` : ''}`}
+                    onClick={() => openFile(t)}
+                    onAuxClick={(e) => e.button === 1 && closeTab(t)}
+                    onContextMenu={(e) =>
+                      openMenu(e, [
+                        { label: tr('关闭', 'Close'), icon: 'x', run: () => closeTab(t) },
+                        ...closeItems(t),
+                        '-',
+                        { label: tr('复制提交号', 'Copy commit hash'), icon: 'copy', run: () => copy(ct.hash, tr('提交号已复制', 'Commit hash copied')) },
+                      ])
+                    }
+                  >
+                    <Icon name="diff" size={13} />
+                    <span className="truncate">{baseName(ct.rel)}</span>
+                    <span className="wp-ftab-hash">{ct.hash.slice(0, 7)}</span>
+                    <button
+                      className="wp-ftab-x"
+                      title={tr('关闭', 'Close')}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        closeTab(t);
+                      }}
+                    >
+                      <Icon name="x" size={11} />
+                    </button>
+                  </div>
+                );
               if (isWebTab(t))
                 return (
                   <div
@@ -1747,7 +1829,33 @@ export function FilePanel({
         </div>
       )}
 
-      {file && !file.web && (
+      {file?.commit && (
+        <div className="wp-head">
+          <div className="wp-commit-title truncate" title={`${file.commit.hash}\n${file.commit.author} · ${new Date(file.commit.time * 1000).toLocaleString()}\n\n${file.commit.subject}\n${file.commit.rel}`}>
+            <span className="pd-tag">{file.commit.hash.slice(0, 7)}</span>
+            <span className="truncate">{file.commit.subject}</span>
+            <span className="muted truncate">{file.commit.rel}</span>
+          </div>
+          <div className="wp-actions">
+            <span className="hide-mobile">{tr('只读', 'Read-only')}</span>
+            {wide() && (
+              <button className="icon-btn" title={layout === 'split' ? tr('改成上下对照', 'Switch to stacked') : tr('改成左右并排', 'Switch to side by side')} onClick={flipLayout}>
+                <Icon name={layout === 'split' ? 'rows' : 'columns'} size={14} />
+              </button>
+            )}
+            {git && !gitMark(file.commit.status)[0].includes('D') && (
+              <button
+                className="icon-btn"
+                title={tr('打开工作区里的这个文件', 'Open this file in the workspace')}
+                onClick={() => openFile(join(git.repo, file.commit!.rel.split('/').join(sepOf(git.repo))))}
+              >
+                <Icon name="file" size={14} />
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+      {file && !file.web && !file.commit && (
         <div className="wp-head">
           {compare ? (
             <div className="wp-compare-title truncate" title={`${file.path}\n${compare.path}`}>
@@ -1852,7 +1960,11 @@ export function FilePanel({
         {emptyPane && (
           <div className="wp-main wp-empty">
             <Icon name="file" size={28} />
-            <div>{tr('在右侧文件树里选一个文件打开', 'Pick a file in the tree on the right')}</div>
+            <div>
+              {view === 'changes'
+                ? tr('在右侧选一个改动的文件或提交查看差异', 'Pick a changed file or a commit on the right to see the diff')
+                : tr('在右侧文件树里选一个文件打开', 'Pick a file in the tree on the right')}
+            </div>
             <div className="muted small">
               {tr(`${navigator.platform.includes('Mac') ? '⌘' : 'Ctrl+'}P 按文件名快速打开`, `${navigator.platform.includes('Mac') ? '⌘' : 'Ctrl+'}P to open a file by name`)}
             </div>
@@ -1870,7 +1982,7 @@ export function FilePanel({
           hostId={hostId}
           root={root}
           initial={quick}
-          recent={[...tabs].reverse().filter((t) => !isWebTab(t)).map(rel)}
+          recent={[...tabs].reverse().filter((t) => !isWebTab(t) && !isCommitTab(t)).map(rel)}
           current={file && !file.binary ? { name: baseName(file.path), text: file.draft, lines: file.draft.split('\n').length } : null}
           onOpen={(r) => openFile(relOpen(r))}
           onGoto={(line) => {

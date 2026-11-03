@@ -301,6 +301,26 @@ export interface DirEntry {
   modified: number;
 }
 
+/** One commit from git.log (time is in seconds; refs come from %D, e.g. "HEAD -> main", "tag: v1") */
+export interface CommitInfo {
+  hash: string;
+  short: string;
+  parents: string[];
+  author: string;
+  time: number;
+  refs: string[];
+  subject: string;
+}
+
+/** A file changed by a commit, from git.show: status is the --name-status letter; diff is only filled for the requested paths */
+export interface CommitFile {
+  path: string;
+  status: string;
+  added?: number | null;
+  deleted?: number | null;
+  diff: string;
+}
+
 export interface StatusLineSettings {
   items: string[];
   template: string;

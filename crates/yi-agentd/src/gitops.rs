@@ -59,6 +59,8 @@ pub fn changes_with(cwd: &str, with_diff: bool, only: Option<&[String]>) -> Resu
         return Ok(json!({ "repo": null, "files": [] }));
     };
     let branch = git_ok(&root, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap_or_default();
+    // Current commit: the frontend refreshes the commit history when it changes (null in a repo with no commits yet)
+    let head = git_ok(&root, &["rev-parse", "--verify", "-q", "HEAD"]).ok().map(|s| s.trim().to_string());
     let status = git_ok(&root, &["status", "--porcelain=v1", "-z", "-uall"])?;
     let stats = numstat(&root);
     let mut files = vec![];
@@ -122,6 +124,7 @@ pub fn changes_with(cwd: &str, with_diff: bool, only: Option<&[String]>) -> Resu
     Ok(json!({
         "repo": root.display().to_string(),
         "branch": branch.trim(),
+        "head": head,
         "files": files,
     }))
 }
@@ -155,6 +158,109 @@ fn count_lines(full: &Path) -> Option<u64> {
     }
     let n = b.iter().filter(|&&c| c == b'\n').count() + usize::from(b.last().is_some_and(|&c| c != b'\n'));
     Some(n as u64)
+}
+
+/// Field / record separators for git log --format (control characters that can't appear in a commit subject)
+const FS: char = '\x1f';
+const RS: char = '\x1e';
+
+/// Commit history of HEAD, newest first; skip/limit page through it, more says whether there are older commits
+pub fn log(cwd: &str, skip: usize, limit: usize) -> Result<Value> {
+    let dir = crate::paths::expand(cwd);
+    let Some(root) = repo_root(&dir) else {
+        return Ok(json!({ "repo": null, "commits": [], "more": false }));
+    };
+    let repo = root.display().to_string();
+    // New repo with no commits yet: no HEAD
+    if !git(&root, &["rev-parse", "--verify", "-q", "HEAD"])?.status.success() {
+        return Ok(json!({ "repo": repo, "commits": [], "more": false }));
+    }
+    let fmt = format!("--format=%H{FS}%h{FS}%P{FS}%an{FS}%at{FS}%D{FS}%s{RS}");
+    let (skip, n) = (format!("--skip={skip}"), format!("-n{}", limit + 1));
+    let out = git_ok(&root, &["log", &fmt, &skip, &n, "HEAD", "--"])?;
+    let mut commits: Vec<Value> = out
+        .split(RS)
+        .map(|r| r.trim_start_matches('\n'))
+        .filter(|r| !r.is_empty())
+        .filter_map(|r| {
+            let f: Vec<&str> = r.splitn(7, FS).collect();
+            let [hash, short, parents, author, time, refs, subject] = f[..] else {
+                return None;
+            };
+            Some(json!({
+                "hash": hash,
+                "short": short,
+                "parents": parents.split(' ').filter(|p| !p.is_empty()).collect::<Vec<_>>(),
+                "author": author,
+                "time": time.parse::<i64>().unwrap_or(0),
+                "refs": refs.split(", ").filter(|x| !x.is_empty()).collect::<Vec<_>>(),
+                "subject": subject,
+            }))
+        })
+        .collect();
+    let more = commits.len() > limit;
+    commits.truncate(limit);
+    Ok(json!({ "repo": repo, "commits": commits, "more": more }))
+}
+
+/// A commit's changes relative to its first parent (a merge shows what it brought into the current branch; the first commit is compared with the empty tree).
+/// Without paths only statuses and line counts are listed; diffs are returned for the files in paths (relative to the repo root)
+pub fn show(cwd: &str, hash: &str, only: Option<&[String]>) -> Result<Value> {
+    if hash.len() < 4 || hash.len() > 64 || !hash.bytes().all(|c| c.is_ascii_hexdigit()) {
+        bail!("提交号无效: {hash}");
+    }
+    if let Some(o) = only {
+        check_paths(o)?;
+    }
+    let dir = crate::paths::expand(cwd);
+    let root = repo_root(&dir).ok_or_else(|| anyhow!("不是 git 仓库"))?;
+    let full = git_ok(&root, &["rev-parse", "--verify", &format!("{hash}^{{commit}}")])?.trim().to_string();
+    let parent = git_ok(&root, &["rev-parse", "--verify", "-q", &format!("{full}^1")]).ok().map(|s| s.trim().to_string());
+    // No parent: compare with the empty tree (hash-object computes it in the repo's own hash format)
+    let base = match &parent {
+        Some(p) => p.clone(),
+        None => git_ok(&root, &["hash-object", "-t", "tree", "--stdin"])?.trim().to_string(),
+    };
+    let info = git_ok(&root, &["log", "-1", &format!("--format=%an{FS}%at{FS}%B"), &full, "--"])?;
+    let mut it = info.splitn(3, FS);
+    let (author, time, message) = (it.next().unwrap_or(""), it.next().unwrap_or("0"), it.next().unwrap_or(""));
+
+    let mut stats = std::collections::HashMap::new();
+    for rec in git_ok(&root, &["diff", "--numstat", "-z", "--no-renames", &base, &full])?.split('\0').filter(|s| !s.is_empty()) {
+        let mut f = rec.splitn(3, '\t');
+        if let (Some(a), Some(d), Some(path)) = (f.next(), f.next(), f.next()) {
+            stats.insert(path.to_string(), (a.parse::<u64>().ok(), d.parse::<u64>().ok()));
+        }
+    }
+    let names = git_ok(&root, &["diff", "--name-status", "-z", "--no-renames", &base, &full])?;
+    let mut files = vec![];
+    let mut parts = names.split('\0').filter(|s| !s.is_empty());
+    while let (Some(code), Some(path)) = (parts.next(), parts.next()) {
+        if only.is_some_and(|o| !o.iter().any(|x| x == path)) {
+            continue;
+        }
+        let diff = if only.is_some() {
+            let d = git_ok(&root, &["diff", "--no-color", &base, &full, "--", path]).unwrap_or_default();
+            if d.len() > DIFF_MAX {
+                String::new()
+            } else {
+                d
+            }
+        } else {
+            String::new()
+        };
+        let (added, deleted) = stats.get(path).copied().unwrap_or((None, None));
+        files.push(json!({ "path": path, "status": code, "added": added, "deleted": deleted, "diff": diff }));
+    }
+    Ok(json!({
+        "repo": root.display().to_string(),
+        "hash": full,
+        "parent": parent,
+        "author": author,
+        "time": time.trim().parse::<i64>().unwrap_or(0),
+        "message": message.trim_end(),
+        "files": files,
+    }))
 }
 
 /// Discard changes: tracked files are restored to HEAD, new files are deleted
@@ -241,5 +347,56 @@ mod tests {
         assert_eq!(std::fs::read_to_string(p.join("a.txt")).unwrap(), "1\n");
         assert_eq!(changes(&cwd).unwrap()["files"].as_array().unwrap().len(), 0);
         assert!(discard(&cwd, &["../x".into()]).is_err());
+    }
+
+    #[test]
+    fn log_and_show() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path();
+        let run = |a: &[&str]| assert!(git(p, a).unwrap().status.success(), "{a:?}");
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "t@t"]);
+        run(&["config", "user.name", "t"]);
+        let cwd = p.display().to_string();
+        // No commits yet: empty history, not an error
+        assert_eq!(log(&cwd, 0, 10).unwrap()["commits"].as_array().unwrap().len(), 0);
+        std::fs::write(p.join("a.txt"), "1\n").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-qm", "first"]);
+        std::fs::write(p.join("a.txt"), "1\n2\n").unwrap();
+        std::fs::write(p.join("b.txt"), "b\n").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-qm", "second\n\nbody line"]);
+
+        let l = log(&cwd, 0, 1).unwrap();
+        let c = l["commits"].as_array().unwrap();
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0]["subject"], "second");
+        assert_eq!(l["more"], true);
+        let l2 = log(&cwd, 1, 10).unwrap();
+        assert_eq!(l2["commits"][0]["subject"], "first");
+        assert_eq!(l2["more"], false);
+
+        let head = c[0]["hash"].as_str().unwrap();
+        let s = show(&cwd, head, None).unwrap();
+        assert_eq!(s["message"], "second\n\nbody line");
+        let files = s["files"].as_array().unwrap();
+        assert_eq!(files.len(), 2);
+        let a = files.iter().find(|f| f["path"] == "a.txt").unwrap();
+        assert_eq!((a["status"].as_str(), a["added"].as_u64(), a["deleted"].as_u64()), (Some("M"), Some(1), Some(0)));
+        assert!(files.iter().any(|f| f["path"] == "b.txt" && f["status"] == "A"));
+        assert!(files.iter().all(|f| f["diff"] == ""));
+        let one = show(&cwd, head, Some(&["a.txt".to_string()])).unwrap();
+        assert_eq!(one["files"].as_array().unwrap().len(), 1);
+        assert!(one["files"][0]["diff"].as_str().unwrap().contains("+2"));
+
+        // First commit: compared with the empty tree
+        let first = l2["commits"][0]["short"].as_str().unwrap();
+        let s = show(&cwd, first, None).unwrap();
+        assert!(s["parent"].is_null());
+        assert_eq!(s["files"][0]["status"], "A");
+
+        assert!(show(&cwd, "HEAD; rm", None).is_err());
+        assert!(show(&cwd, head, Some(&["../x".to_string()])).is_err());
     }
 }

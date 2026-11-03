@@ -6012,7 +6012,8 @@ body.resizing .side-resizer::after {
 
 /* ======================================================================
    Workspace file panel (modeled on the VS Code / Cursor explorer):
-   with no file open it's a single tree column (--tree-w, 300px by default); with a file open it's --panel-w,
+   on desktop it's --panel-w (preview area, or a placeholder when no file is open, plus the tree);
+   the single tree column (--tree-w, 300px by default) is only used on mobile,
    editor on the left, tree on the right. The chat area keeps at least 420px
    ====================================================================== */
 @media (min-width: 761px) {
@@ -6940,6 +6941,125 @@ body.resizing .side-resizer::after {
   border-radius: 6px;
   color: var(--text-3);
   font-size: 12px;
+}
+
+/* ---------- File panel "Changes": commit history box below the changed files ---------- */
+.wp-tree.shrink {
+  flex: none;
+}
+.wp-hist {
+  flex: none;
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  border-top: 1px solid var(--border);
+}
+.wp-hist.open.grow {
+  flex: 1;
+}
+.wp-hist-split {
+  position: absolute;
+  top: -3px;
+  left: 0;
+  right: 0;
+  height: 6px;
+  z-index: 1;
+  cursor: row-resize;
+}
+.wp-hist-split:hover,
+body.resizing-y .wp-hist-split {
+  background: var(--border-2);
+}
+.wp-hist-head {
+  display: flex;
+  align-items: center;
+  height: 30px;
+  flex: none;
+  padding: 0 6px 0 4px;
+}
+.wp-hist-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  height: 24px;
+  padding: 0 6px 0 2px;
+  border-radius: 6px;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-2);
+}
+.wp-hist-title:hover {
+  color: var(--text);
+}
+.wp-hist-head .icon-btn {
+  width: 22px;
+  height: 22px;
+  color: var(--text-3);
+}
+.wp-hist-list {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 0 6px 8px;
+}
+.wp-commit {
+  padding-left: 4px;
+}
+.wp-commit.open {
+  font-weight: 500;
+}
+.wp-ref {
+  flex: none;
+  max-width: 96px;
+  height: 16px;
+  padding: 0 5px;
+  border-radius: 8px;
+  font: 10.5px/16px var(--mono);
+  font-weight: 400;
+  background: var(--bg-3);
+  color: var(--link);
+}
+.wp-commit-time {
+  flex: none;
+  margin-left: 4px;
+  font-size: 11px;
+  font-weight: 400;
+  color: var(--text-3);
+  white-space: nowrap;
+}
+.wp-commit-file {
+  padding-left: 22px;
+}
+.wp-commit-sub {
+  padding-left: 30px;
+}
+.wp-dir {
+  margin-left: 4px;
+  font-size: 11px;
+  color: var(--text-3) !important;
+  text-decoration: none;
+}
+.wp-ftab-hash {
+  flex: none;
+  font: 10.5px var(--mono);
+  color: var(--text-3);
+}
+.wp-commit-title {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+}
+.wp-commit-title .pd-tag {
+  flex: none;
+  background: var(--bg-3);
+  color: var(--link);
+}
+.wp-commit-title .muted {
+  flex: 0 1 auto;
 }
 
 /* ---------- File panel "Changes": checkboxes, this session only, commit ---------- */

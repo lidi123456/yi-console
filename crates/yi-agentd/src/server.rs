@@ -306,6 +306,18 @@ pub async fn dispatch(
             let msg = s(&p, "message")?.to_string();
             tokio::task::spawn_blocking(move || crate::gitops::commit(&cwd, &paths, &msg)).await??
         }
+        GIT_LOG => {
+            let cwd = s(&p, "cwd")?.to_string();
+            let skip = p["skip"].as_u64().unwrap_or(0) as usize;
+            let limit = p["limit"].as_u64().unwrap_or(50).clamp(1, 500) as usize;
+            tokio::task::spawn_blocking(move || crate::gitops::log(&cwd, skip, limit)).await??
+        }
+        GIT_SHOW => {
+            let cwd = s(&p, "cwd")?.to_string();
+            let hash = s(&p, "hash")?.to_string();
+            let only: Option<Vec<String>> = p["paths"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect());
+            tokio::task::spawn_blocking(move || crate::gitops::show(&cwd, &hash, only.as_deref())).await??
+        }
         FS_SEARCH => {
             let root = s(&p, "root")?.to_string();
             let q = p["query"].as_str().unwrap_or("").to_string();
