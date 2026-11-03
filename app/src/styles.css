@@ -2406,6 +2406,11 @@ textarea {
   flex: none;
 }
 
+.toast .spinner {
+  border-color: color-mix(in srgb, var(--bg) 35%, transparent);
+  border-top-color: var(--bg);
+}
+
 .toast-error {
   background: var(--err);
   color: #fff;

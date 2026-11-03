@@ -59,15 +59,24 @@ export async function exportSession(hostId: string, info: SessionInfo, how: 'cop
  *  open the new session dialog, and have the first message ask the new tool to read the log and report back */
 export async function handoffSession(hostId: string, info: SessionInfo) {
   try {
-    // A session with no conversation yet has nothing to hand off (the menu already filters most by externalId; this catches cases like after /clear)
-    const events = await allEvents(hostId, info.id);
-    if (!events.some((e) => e.kind === 'user_message')) {
+    // The daemon also says whether there's any user message: a session with no conversation yet has nothing to hand off
+    // (the menu already filters most by externalId; this catches ACP sessions created before anything was said, and after /clear).
+    // Older daemons don't send hasUser; skip the check then
+    let { path, hasUser } = await rpc<{ path: string | null; hasUser?: boolean }>(hostId, 'session.logFile', { sessionId: info.id });
+    if (hasUser === false) {
       toast(tr('这个会话还没有对话内容', 'This session has no conversation yet'));
       return;
     }
-    let { path } = await rpc<{ path: string | null }>(hostId, 'session.logFile', { sessionId: info.id });
     const exported = !path;
     if (!path) {
+      // No readable log file (Cursor): export the whole conversation as Markdown, which needs all events
+      const done = toast(tr('正在读取会话内容…', 'Loading conversation…'), 'loading');
+      let events: HubEvent[];
+      try {
+        events = await allEvents(hostId, info.id);
+      } finally {
+        done();
+      }
       const md = sessionMarkdown(info, events, TOOL_LABEL[info.tool]);
       const name = `${safeFileName(info.title)}.md`;
       path = (await rpc<{ path: string }>(hostId, 'session.attachFile', { sessionId: info.id, name, data: toB64(md) })).path;

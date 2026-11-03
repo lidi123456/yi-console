@@ -29,7 +29,7 @@ export interface HostEntry {
 export interface Toast {
   id: number;
   text: string;
-  kind: 'info' | 'error';
+  kind: 'info' | 'error' | 'loading';
   action?: { label: string; run: () => void };
 }
 
@@ -423,10 +423,13 @@ export function invalidateSnippets(hostId: string) {
 
 let toastId = 1;
 
-export function toast(text: string, kind: Toast['kind'] = 'info', action?: Toast['action']) {
+/** Shows a toast. A 'loading' toast stays until dismissed; the returned function removes it. info/error auto-dismiss. */
+export function toast(text: string, kind: Toast['kind'] = 'info', action?: Toast['action']): () => void {
   const t: Toast = { id: toastId++, text, kind, action };
   setState((s) => ({ toasts: [...s.toasts.slice(-3), t] }));
-  setTimeout(() => setState((s) => ({ toasts: s.toasts.filter((x) => x.id !== t.id) })), kind === 'error' ? 8000 : 4000);
+  const close = () => setState((s) => ({ toasts: s.toasts.filter((x) => x.id !== t.id) }));
+  if (kind !== 'loading') setTimeout(close, kind === 'error' ? 8000 : 4000);
+  return close;
 }
 
 /// Turn all kinds of errors into one sentence: Tauri mobile plugins reject with objects like {message, code}

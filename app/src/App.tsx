@@ -26,6 +26,7 @@ function Toasts() {
     <div className="toasts">
       {toasts.map((t) => (
         <div key={t.id} className={`toast toast-${t.kind}`}>
+          {t.kind === 'loading' && <span className="spinner" />}
           <span>{t.text}</span>
           {t.action && (
             <button

@@ -323,11 +323,13 @@ pub async fn dispatch(
         }
         SESSION_LOG_FILE => {
             let info = hub.info(s(&p, "sessionId")?)?;
+            // Whether there is anything to hand off, so the client doesn't have to fetch events to find out
+            let has_user = hub.store.count_user_messages(&info.id)? > 0;
             let path = match info.external_id {
                 Some(ext) => tokio::task::spawn_blocking(move || crate::history::session_file(info.tool, &ext)).await?,
                 None => None,
             };
-            json!({ "path": path.map(|p| p.display().to_string()) })
+            json!({ "path": path.map(|p| p.display().to_string()), "hasUser": has_user })
         }
         SESSION_MODELS => hub.session_models(s(&p, "sessionId")?)?,
         SESSION_SET_MODEL => {

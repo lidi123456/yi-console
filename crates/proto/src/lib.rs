@@ -681,7 +681,8 @@ pub mod methods {
     pub const SESSION_ATTACH_FILE: &str = "session.attachFile";
     /// {sessionId, path, data(base64)} -> {path, size}: a subsequent chunk of a chunked upload, appended to the file created by attachFile
     pub const SESSION_ATTACH_APPEND: &str = "session.attachAppend";
-    /// Continue with another tool: the tool's own session log file {sessionId} -> {path: string | null} (null when there's no readable file)
+    /// Continue with another tool: the tool's own session log file {sessionId} -> {path: string | null, hasUser: bool}
+    /// (path null when there's no readable file; hasUser: the session has at least one user message)
     pub const SESSION_LOG_FILE: &str = "session.logFile";
     /// Models a tool offers (for new sessions) {tool} -> [ModelOption]
     pub const TOOLS_MODELS: &str = "tools.models";
