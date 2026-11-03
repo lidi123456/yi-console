@@ -203,6 +203,7 @@ fn serve(foreground: bool) -> Result<()> {
         info!("yi-agentd {} starting, pid {}", yi_proto::DAEMON_VERSION, std::process::id());
         tokio::spawn(relay::run(hub.clone()));
         hub.reattach_terminals();
+        hub.arm_pending_resumes();
         {
             let hub = hub.clone();
             tokio::spawn(async move {

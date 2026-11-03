@@ -120,6 +120,10 @@ Below a session's input box is a status line. Configure it under "Host Settings 
   plus tool, usage and git information under `yi_console`). The first line of its output is shown, ANSI colors are supported, and it times out after 3 seconds. On Windows it runs under cmd.
 - With no command set, Claude Code sessions use the `statusLine` configured in `~/.claude/settings.json` by default, run with Git Bash on Windows. A project's `.claude/settings*.json` is used only if you've already marked that directory (or a parent) as trusted in Claude Code, so opening someone else's repo never runs their commands.
 
+## Continuing after a usage limit
+
+When Claude Code or Codex stops in the chat UI because the account's usage limit is used up, Yi Console records when the limit resets and, one minute after that, sends "continue" automatically (in Chinese or English, following the UI language) so the task carries on. While it waits, a countdown above the input box offers "Continue now" and "Cancel", and the sidebar row shows when it will continue. Sending a message yourself, `/clear`, or switching to the terminal UI cancels it. It doesn't wait for limits that reset more than a day out, or after hitting the limit again right after continuing several times in a row. You can turn it off under "Host Settings → Session processes". The background service on the host keeps the timer, so it works with the app closed.
+
 ## Notifications
 
 While the app is open, it shows a system notification when an AI reply finishes or is waiting for approval, including the start of the reply. Under "Preferences → Notifications" at the bottom left you can turn each kind on or off, and choose between notifying only "When away from session" (the default; a minimized window, a window behind others, or viewing another session all count) or always. You can also send a test notification to check system permissions. These are per-device settings, stored in `client-settings.json` in the client data directory.

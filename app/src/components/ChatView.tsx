@@ -1,6 +1,6 @@
 import { createContext, memo, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { hydrateImages, type ImgCtx } from '../chatImages';
-import { isEn, tr, useLang } from '../i18n';
+import { isEn, tr, trErr, useLang } from '../i18n';
 import { rpc } from '../transport';
 import type { FileDiff, HubEvent, ImageRef, PermissionOption, PlanEntry, Question, QuestionAnswer, SessionInfo, Usage } from '../types';
 import { clock, fmtTokens, isMobile, lsGet, lsSet, renderMarkdown } from '../util';
@@ -12,6 +12,7 @@ import { imageMenu } from './ImageMenu';
 import { Icon } from './Icon';
 import { parseTextQuestions, QuestionCard, textAnswer } from './QuestionCard';
 import { PLAN_TOOLS, PlanTracker, viewEntries, type PlanState } from '../plan';
+import { limitHead, limitOutcome, type LimitEvent } from '../limit';
 
 type Item =
   | { k: 'user'; key: string; text: string; ts: number; images: ImageRef[] }
@@ -43,6 +44,8 @@ type Item =
   | { k: 'note'; key: string; text: string; tone: 'err' | 'muted' }
   | { k: 'bgdone'; key: string; status: 'done' | 'failed' | 'stopped' | 'other'; label: string; what: string }
   | { k: 'compact'; key: string; ev: HubEvent & { kind: 'compact' } }
+  /** One usage-limit episode: the hit plus the latest decision about the automatic continue */
+  | { k: 'limit'; key: string; hit?: LimitEvent; last: LimitEvent }
   | {
       k: 'turn';
       key: string;
@@ -141,7 +144,8 @@ function buildItems(events: HubEvent[], hideCompactCmd = false): Item[] {
         break;
       }
       case 'error':
-        items.push({ k: 'note', key, text: e.message, tone: 'err' });
+        // yi-agentd's own wording for a failed automatic continue is Chinese; tool errors are shown as they are
+        items.push({ k: 'note', key, text: e.message.startsWith('自动继续失败') ? trErr(e.message) : e.message, tone: 'err' });
         break;
       case 'system': {
         // yi-agentd records Claude's task_notification as "后台任务完成：<command>"; draw it as a single line
@@ -155,6 +159,18 @@ function buildItems(events: HubEvent[], hideCompactCmd = false): Item[] {
             : tr(`后台任务 ${bg[1].trim()}`, `Background task ${bg[1].trim()}`);
           items.push({ k: 'bgdone', key, status: s, label, what: bg[2].replace(/\s+/g, ' ').trim() });
         } else if (e.text.trim()) items.push({ k: 'note', key, text: e.text, tone: 'muted' });
+        break;
+      }
+      case 'rate_limit': {
+        // Later phases update the line of the last hit in place
+        let last: (Item & { k: 'limit' }) | undefined;
+        for (let i = items.length - 1; i >= 0 && !last; i--) {
+          const x = items[i];
+          if (x.k === 'limit') last = x;
+          else if (x.k === 'user') break;
+        }
+        if (e.phase === 'hit' || !last) items.push({ k: 'limit', key, hit: e.phase === 'hit' ? e : undefined, last: e });
+        else last.last = e;
         break;
       }
       case 'compact': {
@@ -613,6 +629,22 @@ function Waiting({ since, starting }: { since: number; starting?: boolean }) {
 
 /** Thinking: folded into one "✻ Thinking" line, click to see it all; shows the last few lines while streaming */
 const ktok = (n: number) => (n >= 1000 ? `${(n / 1000).toFixed(n >= 10000 ? 0 : 1)}k` : String(n));
+
+/** Usage limit line in the timeline; the countdown and buttons live in `LimitDock` above the input box */
+function LimitNote({ it, live }: { it: Extract<Item, { k: 'limit' }>; live: boolean }) {
+  const resets = it.last.resetsAt ?? it.hit?.resetsAt;
+  const tail = limitOutcome(it.last, live);
+  const ok = it.last.phase === 'resumed';
+  return (
+    <div className={`note limit-note ${ok ? 'note-muted' : 'limit-note-warn'}`}>
+      <Icon name="clock" size={13} />
+      <span>
+        {limitHead(it.hit ?? it.last, resets)}
+        {tail && (isEn() ? `; ${tail}` : `，${tail}`)}
+      </span>
+    </div>
+  );
+}
 
 /** Context compaction: a spinner while running, replaced in place with the result when done (auto/manual, tokens before/after, duration) */
 function CompactNote({ ev, live }: { ev: HubEvent & { kind: 'compact' }; live: boolean }) {
@@ -1252,6 +1284,10 @@ export function ChatView({
     return modern ? groupRuns(list) : foldRuns(list);
   }, [items, limit, modern]);
   // Only tools in the last turn (which has no turn end yet) can still be running
+  const lastLimitKey = useMemo(() => {
+    for (let i = items.length - 1; i >= 0; i--) if (items[i].k === 'limit') return items[i].key;
+    return null;
+  }, [items]);
   const lastTurnEnd = useMemo(() => shown.map((x) => x.k).lastIndexOf('turn'), [shown]);
   const liveKeys = useMemo(() => new Set(shown.slice(lastTurnEnd + 1).map((x) => x.key)), [shown, lastTurnEnd]);
   const busy = info && (info.status === 'running' || info.status === 'starting');
@@ -1488,6 +1524,8 @@ export function ChatView({
               );
             case 'compact':
               return <CompactNote key={it.key} ev={it.ev} live={!!busy} />;
+            case 'limit':
+              return <LimitNote key={it.key} it={it} live={it.key === lastLimitKey} />;
           }
         })}
         {textAsk && onSendText && (

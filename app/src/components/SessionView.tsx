@@ -11,6 +11,7 @@ import { FilePanel } from './FilePanel';
 import { TermPanel } from './TermPanel';
 import { ChatView, PermissionCard, setChatStyle, useChatStyle } from './ChatView';
 import { PlanDock } from './PlanDock';
+import { LimitDock } from './LimitDock';
 import { Composer } from './Composer';
 import { Icon, ToolBadge } from './Icon';
 import { TermTools, TerminalView } from './TerminalView';
@@ -350,6 +351,7 @@ export function SessionView({ hostId, sessionId, seq }: { hostId: string; sessio
           <div className="composer-wrap">
             <BgTasks hostId={hostId} info={info} />
             <PlanDock events={data.events} busy={info.status === 'running' || info.status === 'starting'} />
+            <LimitDock hostId={hostId} info={info} connected={connected} />
             {info.status === 'error' && (
               <div className="session-recover" role="status">
                 <span className="session-recover-text">

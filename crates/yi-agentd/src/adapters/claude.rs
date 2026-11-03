@@ -108,6 +108,8 @@ struct State {
     in_turn: bool,
     /// Background tasks, per the list from background_tasks_changed
     tasks: Vec<BackgroundTask>,
+    /// Last rate_limit_event said rejected: (resets at ms, limit type). Reported when the turn fails
+    rejected: Option<(Option<i64>, Option<String>)>,
 }
 
 pub async fn run(spec: StartSpec, em: Emitter, mut rx: mpsc::UnboundedReceiver<AdapterCmd>) {
@@ -444,6 +446,7 @@ fn handle(st: &mut State, v: &Value, em: &Emitter) -> Vec<Value> {
                 }
             }
         }
+        "rate_limit_event" => st.rejected = rejected_limit(&v["rate_limit_info"]),
         "result" => {
             st.in_turn = false;
             let u = &v["usage"];
@@ -472,7 +475,14 @@ fn handle(st: &mut State, v: &Value, em: &Emitter) -> Vec<Value> {
                     .or(v["subtype"].as_str())
                     .unwrap_or("执行出错")
                     .to_string();
-                em.event(EventBody::Error { message: msg });
+                let rejected = st.rejected.take();
+                if rejected.is_some() || super::is_usage_limit_text(&msg) {
+                    let (resets_at, limit) = rejected.unwrap_or_default();
+                    em.event(EventBody::Error { message: msg });
+                    em.event(super::limit_hit(resets_at, limit));
+                } else {
+                    em.event(EventBody::Error { message: msg });
+                }
             }
             em.event(EventBody::TurnEnd {
                 stop_reason: if interrupted {
@@ -551,6 +561,17 @@ fn system_notice(v: &Value) -> Option<String> {
         }
         _ => None,
     }
+}
+
+/// rate_limit_event's rate_limit_info: Some((reset time ms, limit type)) when requests are rejected, None once allowed again.
+/// `{"status":"rejected","resetsAt":1793118000,"rateLimitType":"five_hour",…}`; allowed_warning is only a warning
+fn rejected_limit(info: &Value) -> Option<(Option<i64>, Option<String>)> {
+    if info["status"] != "rejected" {
+        return None;
+    }
+    let resets = info["resetsAt"].as_i64().map(|s| s * 1000);
+    let kind = info["rateLimitType"].as_str().map(str::to_string);
+    Some((resets, kind))
 }
 
 fn compact_event(phase: &str) -> EventBody {
@@ -784,6 +805,18 @@ mod tests {
 
         let n = json!({"type":"system","subtype":"task_notification","task_id":"bheoe6moo","status":"stopped","summary":"x"});
         assert_eq!(task_notice(&tasks, &n).as_deref(), Some("后台任务已停止：Sleep 4 seconds"));
+    }
+
+    #[test]
+    fn rate_limit_rejected() {
+        // Format observed from real stream-json (allowed / allowed_warning don't count)
+        let ok = json!({"status":"allowed_warning","resetsAt":1793520000,"rateLimitType":"seven_day","utilization":0.75});
+        assert!(rejected_limit(&ok).is_none());
+        let no = json!({"status":"rejected","resetsAt":1793118000,"rateLimitType":"five_hour","overageStatus":"rejected"});
+        assert_eq!(rejected_limit(&no), Some((Some(1793118000000), Some("five_hour".into()))));
+
+        assert!(rejected_limit(&json!({})).is_none());
+        assert!(crate::adapters::is_usage_limit_text("You've hit your limit · resets 3pm (Asia/Shanghai)"));
     }
 
     #[test]

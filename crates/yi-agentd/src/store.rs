@@ -279,6 +279,8 @@ mod tests {
             pinned: false,
             parent_id: None,
             synced_users: None,
+            auto_resume: None,
+            limit_hits: 0,
             queued: vec![],
             background_tasks: vec![],
         }

@@ -267,6 +267,14 @@ pub async fn dispatch(
             hub.set_mode(s(&p, "sessionId")?, mode).await?;
             Value::Null
         }
+        SESSION_AUTO_RESUME => {
+            hub.auto_resume_action(s(&p, "sessionId")?, s(&p, "action")?)?;
+            Value::Null
+        }
+        SETTINGS_UI_LANG => {
+            hub.set_ui_lang(s(&p, "lang")?)?;
+            Value::Null
+        }
         SESSION_PIN => {
             hub.pin(s(&p, "sessionId")?, p["pinned"].as_bool().unwrap_or(true))?;
             Value::Null

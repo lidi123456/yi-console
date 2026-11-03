@@ -23,6 +23,19 @@ To show the user an image file on this machine (a screenshot, chart or generated
 Markdown image syntax and its absolute path, e.g. ![chart](/abs/path/chart.png); wrap a path containing \
 spaces in angle brackets: ![chart](</abs/path/my chart.png>).";
 
+/// The tool's turn failed because the account's usage limit is used up. The hub decides whether and when to continue automatically.
+/// Adapters for other tools only need to emit this before `TurnEnd` to get automatic continue (`resets_at` ms; None lets the hub ask the quota probe)
+pub fn limit_hit(resets_at: Option<i64>, limit: Option<String>) -> yi_proto::EventBody {
+    yi_proto::EventBody::RateLimit { phase: "hit".into(), resets_at, limit, resume_at: None, reason: None }
+}
+
+/// Fallback when the tool gives no structured signal: Claude "You've hit your limit · resets 3pm",
+/// "Claude AI usage limit reached|<epoch>" from older versions, Codex "You’ve hit your usage limit. Try again at …"
+pub fn is_usage_limit_text(msg: &str) -> bool {
+    let m = msg.to_lowercase().replace('’', "'");
+    m.contains("you've hit your") && m.contains("limit") || m.contains("usage limit reached")
+}
+
 /// One piece of user input
 #[derive(Debug, Clone)]
 pub struct Prompt {

@@ -104,6 +104,17 @@ export function SettingsView({ hostId }: { hostId: string }) {
               'Run terminal sessions in tmux so they survive daemon restarts and upgrades, and reconnect when opened (needs tmux 3.2+; not supported on Windows)',
             )}
           </label>
+          <label className="check">
+            <input
+              type="checkbox"
+              checked={s.autoResume ?? true}
+              onChange={(e) => setS({ ...s, autoResume: e.target.checked })}
+            />
+            {tr(
+              '额度用完后自动继续：Claude Code、Codex 在对话界面因额度用完停下时，等额度恢复后自动发送“继续”（恢复时间超过一天或连续多次碰到额度时不会自动继续）',
+              'Continue after usage limits: when Claude Code or Codex stops on its usage limit in the chat UI, send "continue" automatically once the limit resets (not when it resets more than a day out, or after hitting the limit several times in a row)',
+            )}
+          </label>
         </div>
       </div>
       <SnippetsCard list={s.snippets} onChange={(snippets) => setS({ ...s, snippets })} />

@@ -3,7 +3,8 @@ import { lsGet, lsSet } from './util';
 // each session's event stream is stored separately (large, changes often) and subscribers are notified per session.
 
 import { useSyncExternalStore } from 'react';
-import { tr, trErr } from './i18n';
+import { getLang, onLangChange, tr, trErr } from './i18n';
+import { fmtAt } from './limit';
 import { hubCall, onHubEvent, rpc, isTauri } from './transport';
 import type { ClientSettings, HostConfig, HostStatus, HubEvent, NotifyPrefs, SessionInfo, Snippet, ToolKind } from './types';
 
@@ -359,8 +360,16 @@ export async function refreshHosts() {
   const r = await hubCall<{ hosts: HostEntry[]; localSupported: boolean }>('hosts.list');
   const hosts = r.hosts.map((h) => ({ ...h, status: h.status ?? { status: 'disconnected' as const } }));
   setState({ hosts, localSupported: r.localSupported });
-  for (const h of hosts) if (h.status.status === 'connected') refreshSessions(h.config.id);
+  for (const h of hosts) if (h.status.status === 'connected') {
+    refreshSessions(h.config.id);
+    reportLang(h.config.id);
+  }
   return hosts;
+}
+
+/** Tell yi-agentd the UI language, so the "continue" it sends by itself after a usage limit matches it. Older daemons lack the method */
+function reportLang(hostId: string) {
+  rpc(hostId, 'settings.uiLang', { lang: getLang() }).catch(() => {});
 }
 
 export async function refreshSessions(hostId: string) {
@@ -601,6 +610,9 @@ function show(view: View) {
 // ---------- Event entry point ----------
 
 export function startEventLoop() {
+  onLangChange(() => {
+    for (const h of state.hosts) if (h.status.status === 'connected') reportLang(h.config.id);
+  });
   onHubEvent((ev) => {
     switch (ev.type) {
       case 'transport':
@@ -618,6 +630,7 @@ export function startEventLoop() {
         if (status.status === 'connected') {
           refreshSessions(hostId);
           catchUpHost(hostId);
+          reportLang(hostId);
         }
         break;
       }
@@ -686,10 +699,28 @@ function onNotification(hostId: string, method: string, p: any) {
       // A window behind others (covered, minimized) also counts as not watching, hence hasFocus rather than just hidden
       const away = document.hidden || !document.hasFocus() || !viewing;
       const want = p.kind === 'permission' ? prefs.onPermission : prefs.onTurnEnd;
-      if (prefs.enabled && want && (prefs.when === 'always' || away)) systemNotify(p.title, p.body || '', { hostId, sessionId: p.sessionId });
+      let title: string = p.title;
+      let body: string = p.body || '';
+      if (p.kind === 'rate_limit' && p.limit) {
+        // Usage limit: built here so it follows this device's language
+        const at: number | null = p.limit.resumeAt ?? null;
+        const sess = state.sessions[hostId]?.find((x) => x.id === p.sessionId);
+        title = tr(`${p.limit.name} 额度已用完`, `${p.limit.name}: usage limit reached`);
+        body = [
+          sess?.title,
+          at
+            ? tr(`${fmtAt(at)} 自动继续`, `Continues automatically at ${fmtAt(at)}`)
+            : p.limit.probing
+              ? tr('额度恢复后会自动继续', 'Continues automatically once the limit resets')
+              : tr('不会自动继续', "Won't continue automatically"),
+        ]
+          .filter(Boolean)
+          .join(' · ');
+      }
+      if (prefs.enabled && want && (prefs.when === 'always' || away)) systemNotify(title, body, { hostId, sessionId: p.sessionId });
       // In-app toast: remind the user when they're in another session
       if (!viewing) {
-        toast(p.title, 'info', {
+        toast(title, 'info', {
           label: tr('查看', 'View'),
           run: () => navigate({ kind: 'session', hostId, sessionId: p.sessionId }),
         });

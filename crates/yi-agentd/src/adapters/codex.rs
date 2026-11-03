@@ -52,6 +52,10 @@ struct State {
     resumed: bool,
     /// Parameters for starting a new thread, reused when resuming fails and we start a new one
     thread_params: Value,
+    /// Latest rateLimits from account/rateLimits/updated (Codex sends one right before a usage limit error)
+    rate_limits: Value,
+    /// This turn's error was usageLimitExceeded
+    usage_limited: bool,
 }
 
 impl State {
@@ -399,8 +403,11 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Vec<Valu
                 out.push(st.req(Pending::Thread, "thread/start", params));
                 return out;
             }
-            em.event(EventBody::Error { message: msg });
+            em.event(EventBody::Error { message: msg.clone() });
             if kind == Pending::Turn {
+                if is_usage_limit(&err["data"]) || super::is_usage_limit_text(&msg) {
+                    em.event(super::limit_hit(limit_reset(&st.rate_limits), None));
+                }
                 st.turn_id = None;
                 em.event(EventBody::TurnEnd {
                     stop_reason: Some("error".into()),
@@ -620,6 +627,7 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Vec<Valu
             }
         }
         "turn/started" => {
+            st.usage_limited = false;
             if let Some(t) = params["turn"]["id"].as_str() {
                 st.turn_id = Some(t.to_string());
             }
@@ -629,10 +637,14 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Vec<Valu
             st.turn_id = None;
             let turn = &params["turn"];
             if turn["status"] == "failed" {
-                if let Some(m) = turn["error"]["message"].as_str() {
+                let msg = turn["error"]["message"].as_str().unwrap_or("");
+                if !msg.is_empty() {
                     em.event(EventBody::Error {
-                        message: m.to_string(),
+                        message: msg.to_string(),
                     });
+                }
+                if std::mem::take(&mut st.usage_limited) || is_usage_limit(&turn["error"]) || super::is_usage_limit_text(msg) {
+                    em.event(super::limit_hit(limit_reset(&st.rate_limits), None));
                 }
             }
             em.event(EventBody::TurnEnd {
@@ -688,7 +700,11 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Vec<Valu
                 },
             });
         }
+        "account/rateLimits/updated" => st.rate_limits = params["rateLimits"].clone(),
         "error" => {
+            if is_usage_limit(&params["error"]) && !params["willRetry"].as_bool().unwrap_or(false) {
+                st.usage_limited = true;
+            }
             if !params["willRetry"].as_bool().unwrap_or(false) {
                 if let Some(m) = params["error"]["message"].as_str() {
                     em.event(EventBody::Error {
@@ -917,9 +933,41 @@ fn strip_shell_wrapper(cmd: &str) -> String {
     cmd.to_string()
 }
 
+/// TurnError.codexErrorInfo is "usageLimitExceeded" (also covers QuotaExceeded / UsageNotIncluded, which have no reset time)
+fn is_usage_limit(err: &Value) -> bool {
+    err["codexErrorInfo"] == "usageLimitExceeded"
+}
+
+/// When the exhausted window resets (ms): the latest resetsAt among windows at 100%. None if no window is full
+/// (credits depleted, plan doesn't include usage), and the hub falls back to the quota probe
+fn limit_reset(rl: &Value) -> Option<i64> {
+    ["primary", "secondary"]
+        .iter()
+        .map(|k| &rl[*k])
+        .filter(|w| w["usedPercent"].as_f64().is_some_and(|p| p >= 100.0))
+        .filter_map(|w| w["resetsAt"].as_i64())
+        .max()
+        .map(|s| s * 1000)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn usage_limit_reset() {
+        // Shapes from codex-rs app-server-protocol v2 (RateLimitSnapshot / TurnError)
+        let rl = json!({"limitId":"codex","primary":{"usedPercent":100,"windowDurationMins":300,"resetsAt":1793177589},
+            "secondary":{"usedPercent":63,"windowDurationMins":10080,"resetsAt":1793604850}});
+        assert_eq!(limit_reset(&rl), Some(1793177589000));
+        let both = json!({"primary":{"usedPercent":100,"resetsAt":10},"secondary":{"usedPercent":100,"resetsAt":20}});
+        assert_eq!(limit_reset(&both), Some(20000));
+        assert_eq!(limit_reset(&json!({"primary":{"usedPercent":40,"resetsAt":10}})), None);
+        assert_eq!(limit_reset(&Value::Null), None);
+        assert!(is_usage_limit(&json!({"message":"x","codexErrorInfo":"usageLimitExceeded"})));
+        assert!(!is_usage_limit(&json!({"codexErrorInfo":{"httpConnectionFailed":{"httpStatusCode":429}}})));
+        assert!(crate::adapters::is_usage_limit_text("You’ve hit your usage limit. Try again at 3:05 PM."));
+    }
 
     #[test]
     fn review_targets() {

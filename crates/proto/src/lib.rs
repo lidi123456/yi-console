@@ -196,14 +196,45 @@ pub struct SessionInfo {
     pub queued: Vec<QueuedMessage>,
     /// Tasks the tool runs in the background (in memory only, cleared when the process exits)
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub background_tasks: Vec<BackgroundTask>,    /// Terminal opened in the session page's bottom panel: id of the chat session it belongs to. Not listed separately in the sidebar; deleted along with the chat
+    pub background_tasks: Vec<BackgroundTask>,
+    /// Terminal opened in the session page's bottom panel: id of the chat session it belongs to. Not listed separately in the sidebar; deleted along with the chat
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_id: Option<String>,
     /// Number of user messages already in the tool session when switching from chat to terminal mode. Switching back to chat only imports the part after this
     /// (i.e. what was said in the terminal); no value means the session started in terminal mode, and everything is imported on switching back
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub synced_users: Option<u32>,
+    /// The tool hit its usage limit; "continue" goes out automatically at `at` (chat mode, Claude / Codex). Persisted, so it survives daemon restarts
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_resume: Option<AutoResume>,
+    /// Usage limit hits in a row since the last turn that ended normally; past `MAX_AUTO_RESUMES` no more automatic continues
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub limit_hits: u32,
 }
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
+}
+
+/// Pending automatic continue after a usage limit
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AutoResume {
+    /// When the continue message is sent (ms)
+    pub at: i64,
+    /// When the tool says the limit resets (ms)
+    pub resets_at: i64,
+    /// Which limit was hit (five_hour / seven_day / …), if the tool says
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<String>,
+}
+
+/// Automatic continues in a row before giving up (the limit keeps coming back right after it resets)
+pub const MAX_AUTO_RESUMES: u32 = 3;
+/// Limits that reset further out than this aren't waited for automatically (same as Claude Code's own auto-continue)
+pub const AUTO_RESUME_HORIZON_MS: i64 = 24 * 3600 * 1000;
+/// Wait this long after the reset time before continuing, so the first request isn't rejected again
+pub const AUTO_RESUME_DELAY_MS: i64 = 60 * 1000;
 
 /// Background tasks: Claude's background shells, background subagents, etc.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -432,6 +463,23 @@ pub enum EventBody {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         duration_ms: Option<u64>,
     },
+    /// Usage limit. phase:
+    /// - hit: reported by the adapter (`resets_at` ms and `limit` when known)
+    /// - scheduled: the hub will send "continue" at `resume_at`
+    /// - skipped: no automatic continue; `reason` = off / unknown / far / repeated
+    /// - resumed: "continue" was sent (`reason` = auto / now)
+    /// - cancelled: `reason` = user / manual (the user sent a message) / off / busy
+    RateLimit {
+        phase: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resets_at: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resume_at: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
     /// /clear: all events before this one were deleted; on receipt the client drops events it holds with a smaller seq
     Cleared {},
 }
@@ -546,6 +594,12 @@ pub struct DaemonSettings {
     /// Run terminal sessions inside tmux (survives daemon restarts); on if unset, no effect without tmux installed
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_tmux: Option<bool>,
+    /// After a usage limit, send "continue" automatically once it resets (chat mode, Claude / Codex); on if unset
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_resume: Option<bool>,
+    /// UI language last reported by a client (zh / en), used for the automatic continue message
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ui_lang: Option<String>,
 }
 
 pub const DEFAULT_IDLE_RELEASE_MINUTES: u32 = 30;
@@ -697,6 +751,10 @@ pub mod methods {
     pub const TOOLS_MODELS: &str = "tools.models";
     /// Tool account quota {tool, refresh?}
     pub const TOOLS_QUOTA: &str = "tools.quota";
+    /// Pending automatic continue after a usage limit {sessionId, action: cancel | now}
+    pub const SESSION_AUTO_RESUME: &str = "session.autoResume";
+    /// The client's UI language {lang: zh | en}, remembered for messages the daemon sends by itself
+    pub const SETTINGS_UI_LANG: &str = "settings.uiLang";
 
     // Notifications
     pub const EV_SESSION_EVENT: &str = "session.event";

@@ -122,6 +122,12 @@ struct SessionRt {
     launched_mode: Mutex<String>,
     /// Permission mode changed but needs a process restart to apply (Claude switching to allow-all); restart once this turn ends
     restart_pending: Mutex<bool>,
+    /// Bumped whenever the pending automatic continue changes; a timer only fires while its token is still current
+    resume_token: Mutex<u64>,
+    /// This turn ended on the usage limit: hold queued messages and send a usage-limit notification instead of "turn finished"
+    limited: Mutex<bool>,
+    /// Asking the quota probe when the limit resets; the decision comes after the turn-end notification
+    limit_probing: Mutex<bool>,
 }
 
 struct Queued {
@@ -339,6 +345,8 @@ impl Hub {
             background_tasks: vec![],
             parent_id: p.parent_id.clone(),
             synced_users: None,
+            auto_resume: None,
+            limit_hits: 0,
         };
         self.store.save_session(&info)?;
         let rt = Arc::new(new_rt(info.clone()));
@@ -469,6 +477,8 @@ impl Hub {
     /// (anything that misses that is handled by the tool after the turn ends); other tools queue it and send in order after the turn
     pub fn send(self: &Arc<Self>, id: &str, text: &str, images: Vec<IncomingImage>, queue: bool) -> Result<()> {
         let rt = self.get(id)?;
+        // The user carried on by hand: the automatic continue is no longer needed
+        self.cancel_resume(id, "manual");
         let info = rt.info.lock().unwrap().clone();
         if !info.tool.has_process() {
             bail!("文件会话不能发送消息");
@@ -648,8 +658,12 @@ impl Hub {
             i.pending_permissions = 0;
             i.queued.clear();
             i.background_tasks.clear();
+            i.auto_resume = None;
+            i.limit_hits = 0;
             i.clone()
         };
+        *rt.resume_token.lock().unwrap() += 1;
+        *rt.limited.lock().unwrap() = false;
         rt.pending.lock().unwrap().clear();
         rt.queue.lock().unwrap().clear();
         rt.term.lock().unwrap().clear();
@@ -772,6 +786,8 @@ impl Hub {
         if info.mode == mode {
             return Ok(());
         }
+        // Automatic continue only works in chat mode
+        self.cancel_resume(id, "mode");
         // Codex / Cursor / Kiro in the terminal that haven't recorded a tool session id yet: look it up in the tool history first
         self.guess_terminal_session(id).await;
         // End the current process. Invalidate the generation first so the old process's exit status and code aren't recorded on the session
@@ -930,6 +946,10 @@ impl Hub {
         };
         let was_interrupted = std::mem::take(&mut *rt.interrupted.lock().unwrap())
             || matches!(stop_reason, Some("interrupted" | "cancelled"));
+        let limited = std::mem::take(&mut *rt.limited.lock().unwrap());
+        if !limited && !was_interrupted {
+            self.set_info(sid, gen, |i| std::mem::take(&mut i.limit_hits) > 0);
+        }
         if std::mem::take(&mut *rt.restart_pending.lock().unwrap()) {
             if let Err(e) = self.relaunch(&rt) {
                 self.emit(sid, 0, EventBody::Error { message: format!("重启会话失败: {e}") });
@@ -938,6 +958,8 @@ impl Hub {
         let next = {
             let mut q = rt.queue.lock().unwrap();
             match q.front() {
+                // Queued messages would only hit the limit again; they go after the automatic continue (or the user's next message)
+                _ if limited => None,
                 Some(f) if f.now || !was_interrupted => q.pop_front(),
                 _ => None,
             }
@@ -1293,6 +1315,216 @@ impl Hub {
         );
     }
 
+    // ---- Automatic continue after a usage limit (chat mode; the adapter reports `RateLimit { phase: "hit" }` before TurnEnd) ----
+
+    /// The tool's turn failed on the usage limit
+    fn limit_hit(self: &Arc<Self>, sid: &str, gen: u64, resets_at: Option<i64>, limit: Option<String>) {
+        let Some(rt) = self.alive(sid, gen) else {
+            return;
+        };
+        *rt.limited.lock().unwrap() = true;
+        let tool = {
+            let mut i = rt.info.lock().unwrap();
+            i.limit_hits += 1;
+            i.tool
+        };
+        if let Some(r) = resets_at {
+            return self.plan_resume(sid, r, limit, false);
+        }
+        // The tool didn't say when it resets: ask the quota probe for the exhausted window
+        *rt.limit_probing.lock().unwrap() = true;
+        let hub = self.clone();
+        let sid = sid.to_string();
+        tokio::spawn(async move {
+            let settings = hub.settings.read().unwrap().clone();
+            let reset = crate::probe::quota(&hub, tool, &settings, true)
+                .await
+                .ok()
+                .and_then(|q| exhausted_reset(&q, now_ms()));
+            *rt.limit_probing.lock().unwrap() = false;
+            match reset {
+                Some(r) => hub.plan_resume(&sid, r, limit, true),
+                None => hub.emit(&sid, 0, limit_event("skipped", None, limit, None, Some("unknown"))),
+            }
+        });
+    }
+
+    /// Decide whether to continue automatically and arm the timer. `late`: decided after the turn already ended (via the probe),
+    /// so if the user has carried on meanwhile, leave it alone
+    fn plan_resume(self: &Arc<Self>, sid: &str, resets_at: i64, limit: Option<String>, late: bool) {
+        let Ok(rt) = self.get(sid) else {
+            return;
+        };
+        let enabled = self.settings.read().unwrap().auto_resume.unwrap_or(true);
+        let (info, decision) = {
+            let mut i = rt.info.lock().unwrap();
+            if i.mode != SessionMode::Structured
+                || late && matches!(i.status, SessionStatus::Running | SessionStatus::WaitingPermission)
+            {
+                return;
+            }
+            let d = resume_decision(enabled, resets_at, i.limit_hits, now_ms());
+            if let Ok(at) = d {
+                i.auto_resume = Some(AutoResume { at, resets_at, limit: limit.clone() });
+            }
+            (i.clone(), d)
+        };
+        match decision {
+            Ok(at) => {
+                let _ = self.store.save_session(&info);
+                self.broadcast_updated(&info);
+                self.emit(sid, 0, limit_event("scheduled", Some(resets_at), limit, Some(at), None));
+                self.arm_resume(sid);
+            }
+            Err(why) => self.emit(sid, 0, limit_event("skipped", Some(resets_at), limit, None, Some(why))),
+        }
+    }
+
+    /// Start the timer for the session's pending automatic continue. Sleeps in short steps against the wall clock,
+    /// because the monotonic clock stops while the computer is suspended
+    fn arm_resume(self: &Arc<Self>, sid: &str) {
+        let Ok(rt) = self.get(sid) else {
+            return;
+        };
+        let Some(at) = rt.info.lock().unwrap().auto_resume.as_ref().map(|a| a.at) else {
+            return;
+        };
+        let token = {
+            let mut t = rt.resume_token.lock().unwrap();
+            *t += 1;
+            *t
+        };
+        let hub = self.clone();
+        let sid = sid.to_string();
+        tokio::spawn(async move {
+            loop {
+                let left = at - now_ms();
+                if left <= 0 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(left.min(30_000) as u64)).await;
+                if *rt.resume_token.lock().unwrap() != token {
+                    return;
+                }
+            }
+            if let Err(e) = hub.fire_resume(&sid, Some(token), "auto") {
+                hub.emit(&sid, 0, EventBody::Error { message: format!("自动继续失败: {e}") });
+            }
+        });
+    }
+
+    /// Re-arm pending automatic continues after a daemon restart (ones already due fire right away)
+    pub fn arm_pending_resumes(self: &Arc<Self>) {
+        let ids: Vec<String> = self
+            .sessions
+            .lock()
+            .unwrap()
+            .values()
+            .filter_map(|rt| {
+                let i = rt.info.lock().unwrap();
+                i.auto_resume.is_some().then(|| i.id.clone())
+            })
+            .collect();
+        for id in ids {
+            self.arm_resume(&id);
+        }
+    }
+
+    /// Send the continue message. `token` is the timer's (None: the user clicked "Continue now")
+    fn fire_resume(self: &Arc<Self>, sid: &str, token: Option<u64>, reason: &str) -> Result<()> {
+        let rt = self.get(sid)?;
+        {
+            let mut t = rt.resume_token.lock().unwrap();
+            if token.is_some_and(|tk| tk != *t) {
+                return Ok(());
+            }
+            *t += 1;
+        }
+        let (info, pending) = {
+            let mut i = rt.info.lock().unwrap();
+            let p = i.auto_resume.take();
+            (i.clone(), p)
+        };
+        let Some(pending) = pending else {
+            if token.is_some() {
+                return Ok(());
+            }
+            bail!("这个会话没有在等待额度恢复");
+        };
+        let _ = self.store.save_session(&info);
+        self.broadcast_updated(&info);
+        let cancel = |why: &str| {
+            self.emit(sid, 0, limit_event("cancelled", Some(pending.resets_at), pending.limit.clone(), None, Some(why)));
+        };
+        if token.is_some() && !self.settings.read().unwrap().auto_resume.unwrap_or(true) {
+            cancel("off");
+            return Ok(());
+        }
+        if matches!(info.status, SessionStatus::Running | SessionStatus::WaitingPermission) {
+            cancel("busy");
+            return Ok(());
+        }
+        self.emit(sid, 0, limit_event("resumed", Some(pending.resets_at), pending.limit, None, Some(reason)));
+        self.send(sid, &self.continue_text(&info), vec![], false)
+    }
+
+    /// Drop the pending automatic continue; returns whether there was one
+    pub fn cancel_resume(&self, sid: &str, reason: &str) -> bool {
+        let Ok(rt) = self.get(sid) else {
+            return false;
+        };
+        let (info, pending) = {
+            let mut i = rt.info.lock().unwrap();
+            let Some(p) = i.auto_resume.take() else {
+                return false;
+            };
+            (i.clone(), p)
+        };
+        *rt.resume_token.lock().unwrap() += 1;
+        let _ = self.store.save_session(&info);
+        self.broadcast_updated(&info);
+        self.emit(sid, 0, limit_event("cancelled", Some(pending.resets_at), pending.limit, None, Some(reason)));
+        true
+    }
+
+    /// `session.autoResume`: cancel / now
+    pub fn auto_resume_action(self: &Arc<Self>, sid: &str, action: &str) -> Result<()> {
+        match action {
+            "cancel" => {
+                if !self.cancel_resume(sid, "user") {
+                    bail!("这个会话没有在等待额度恢复");
+                }
+                Ok(())
+            }
+            "now" => self.fire_resume(sid, None, "now"),
+            _ => bail!("未知操作: {action}"),
+        }
+    }
+
+    /// Remember the client's UI language for the continue message
+    pub fn set_ui_lang(&self, lang: &str) -> Result<()> {
+        if !matches!(lang, "zh" | "en") {
+            bail!("未知语言: {lang}");
+        }
+        let mut s = self.settings.write().unwrap();
+        if s.ui_lang.as_deref() != Some(lang) {
+            s.ui_lang = Some(lang.to_string());
+            crate::settings::save(&s)?;
+        }
+        Ok(())
+    }
+
+    /// The continue message, in the UI language last reported by a client; before any client reported one, guess from the session title
+    fn continue_text(&self, info: &SessionInfo) -> String {
+        let lang = self.settings.read().unwrap().ui_lang.clone();
+        let zh = match lang.as_deref() {
+            Some("zh") => true,
+            Some("en") => false,
+            _ => info.title.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c)),
+        };
+        if zh { CONTINUE_ZH } else { CONTINUE_EN }.to_string()
+    }
+
     fn alive(&self, sid: &str, gen: u64) -> Option<Arc<SessionRt>> {
         let rt = self.get(sid).ok()?;
         let cur = *rt.generation.lock().unwrap();
@@ -1320,6 +1552,7 @@ impl Hub {
         }
 
         let mut notify: Option<(String, String)> = None;
+        let mut limit_notice: Option<Value> = None;
         let (ev, info, changed) = {
             let mut info = rt.info.lock().unwrap();
             let mut changed = false;
@@ -1390,7 +1623,18 @@ impl Hub {
                         format!("{} {what}：{}", display_name(&info), snippet(&info.title, 60))
                     };
                     let reply = std::mem::take(&mut *rt.last_text.lock().unwrap());
-                    notify = Some((title, snippet(&reply, 240)));
+                    if *rt.limited.lock().unwrap() {
+                        // The client builds the text in its own language from these fields
+                        let at = info.auto_resume.as_ref().map(|a| a.at);
+                        let probing = *rt.limit_probing.lock().unwrap() && self.settings.read().unwrap().auto_resume.unwrap_or(true);
+                        notify = Some((
+                            format!("{} 额度已用完", display_name(&info)),
+                            if at.is_some() || probing { "额度恢复后会自动继续".into() } else { "不会自动继续".into() },
+                        ));
+                        limit_notice = Some(json!({ "name": display_name(&info), "tool": info.tool, "resumeAt": at, "probing": probing }));
+                    } else {
+                        notify = Some((title, snippet(&reply, 240)));
+                    }
                 }
                 _ => {}
             }
@@ -1421,12 +1665,13 @@ impl Hub {
         }
         // In-app notifications: the client decides whether to show them based on its own preferences
         if let Some((title, body)) = notify {
-            self.publish(
-                None,
-                methods::EV_NOTIFY,
-                json!({ "sessionId": sid, "title": title, "body": body,
-                        "kind": if kind_turn_end { "turn_end" } else { "permission" } }),
-            );
+            let mut p = json!({ "sessionId": sid, "title": title, "body": body,
+                        "kind": if kind_turn_end { "turn_end" } else { "permission" } });
+            if let Some(n) = limit_notice {
+                p["kind"] = json!("rate_limit");
+                p["limit"] = n;
+            }
+            self.publish(None, methods::EV_NOTIFY, p);
         }
     }
 
@@ -1586,7 +1831,44 @@ fn new_rt(info: SessionInfo) -> SessionRt {
         interrupted: Mutex::new(false),
         launched_mode: Mutex::new(String::new()),
         restart_pending: Mutex::new(false),
+        resume_token: Mutex::new(0),
+        limited: Mutex::new(false),
+        limit_probing: Mutex::new(false),
     }
+}
+
+/// What the automatic continue sends (wording follows Claude Code's own auto-continue)
+const CONTINUE_ZH: &str = "额度已恢复。请继续完成额度用完时正在做的任务，已经完成的部分不要重复做。";
+const CONTINUE_EN: &str =
+    "Your usage limit has reset. Continue the task you were working on when the limit was reached; do not repeat work that is already complete.";
+
+fn limit_event(phase: &str, resets_at: Option<i64>, limit: Option<String>, resume_at: Option<i64>, reason: Option<&str>) -> EventBody {
+    EventBody::RateLimit { phase: phase.into(), resets_at, limit, resume_at, reason: reason.map(str::to_string) }
+}
+
+/// When to send the continue message, or why not: off (turned off in settings) / repeated (hit again right after continuing
+/// `MAX_AUTO_RESUMES` times) / far (resets more than a day out)
+fn resume_decision(enabled: bool, resets_at: i64, hits: u32, now: i64) -> Result<i64, &'static str> {
+    if !enabled {
+        Err("off")
+    } else if hits > MAX_AUTO_RESUMES {
+        Err("repeated")
+    } else if resets_at - now > AUTO_RESUME_HORIZON_MS {
+        Err("far")
+    } else {
+        Ok(resets_at.max(now) + AUTO_RESUME_DELAY_MS)
+    }
+}
+
+/// From a `tools.quota` result: when the exhausted window (usedPercent ≥ 100) resets, in ms. resetsAt is ms or an ISO string
+fn exhausted_reset(q: &Value, now: i64) -> Option<i64> {
+    q["windows"]
+        .as_array()?
+        .iter()
+        .filter(|w| w["usedPercent"].as_f64().is_some_and(|p| p >= 100.0))
+        .filter_map(|w| w["resetsAt"].as_i64().or_else(|| w["resetsAt"].as_str().and_then(crate::util::parse_iso)))
+        .filter(|&r| r > now)
+        .max()
 }
 
 /// Handle adapters use to report events to the hub
@@ -1603,7 +1885,14 @@ impl Emitter {
             EventBody::TurnEnd { stop_reason, .. } => Some(stop_reason.clone()),
             _ => None,
         };
+        let hit = match &body {
+            EventBody::RateLimit { phase, resets_at, limit, .. } if phase == "hit" => Some((*resets_at, limit.clone())),
+            _ => None,
+        };
         self.hub.emit(&self.sid, self.gen, body);
+        if let Some((resets_at, limit)) = hit {
+            self.hub.limit_hit(&self.sid, self.gen, resets_at, limit);
+        }
         if let Some(r) = end {
             self.hub.after_turn(&self.sid, self.gen, r.as_deref());
         }
@@ -1776,12 +2065,95 @@ mod tests {
             background_tasks: vec![],
             parent_id: None,
             synced_users: None,
+            auto_resume: None,
+            limit_hits: 0,
         };
         let rt = new_rt(info);
         let (tx, rx) = mpsc::unbounded_channel();
         *rt.cmd.lock().unwrap() = Some(tx);
         hub.sessions.lock().unwrap().insert(id.into(), Arc::new(rt));
         rx
+    }
+
+    #[test]
+    fn resume_decisions() {
+        let now = 1_000_000_000;
+        assert_eq!(resume_decision(true, now + 5000, 1, now), Ok(now + 5000 + AUTO_RESUME_DELAY_MS));
+        // Reset time already passed: continue shortly
+        assert_eq!(resume_decision(true, now - 5000, 1, now), Ok(now + AUTO_RESUME_DELAY_MS));
+        assert_eq!(resume_decision(false, now + 5000, 1, now), Err("off"));
+        assert_eq!(resume_decision(true, now + AUTO_RESUME_HORIZON_MS + 1, 1, now), Err("far"));
+        assert_eq!(resume_decision(true, now + 5000, MAX_AUTO_RESUMES + 1, now), Err("repeated"));
+    }
+
+    #[test]
+    fn exhausted_window_from_quota() {
+        // tools.quota shapes: Codex resetsAt in ms, Claude as an ISO string
+        let q = json!({"windows":[{"usedPercent":100,"resetsAt":2000},{"usedPercent":40,"resetsAt":9000}]});
+        assert_eq!(exhausted_reset(&q, 1000), Some(2000));
+        let q = json!({"windows":[{"usedPercent":100.0,"resetsAt":"2026-10-28T05:29:59Z"}]});
+        assert_eq!(exhausted_reset(&q, 0), crate::util::parse_iso("2026-10-28T05:29:59Z"));
+        assert_eq!(exhausted_reset(&q, i64::MAX), None);
+        assert_eq!(exhausted_reset(&json!({"windows":[{"usedPercent":99,"resetsAt":5}]}), 0), None);
+    }
+
+    fn limit_phases(hub: &Hub, id: &str) -> Vec<String> {
+        hub.store
+            .events_since(id, 0, 1000)
+            .unwrap()
+            .into_iter()
+            .filter_map(|e| match e.body {
+                EventBody::RateLimit { phase, reason, .. } => Some(format!("{phase}{}", reason.map(|r| format!(":{r}")).unwrap_or_default())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn auto_resume_flow() {
+        let hub = Hub::new(crate::store::Store::open_memory().unwrap(), DaemonSettings::default());
+        let mut rx = live(&hub, "s", SessionMode::Structured, SessionStatus::Running, 0);
+        let em = Emitter { hub: hub.clone(), sid: "s".into(), gen: 0 };
+        hub.get("s").unwrap().queue.lock().unwrap().push_back(Queued { id: "q".into(), text: "later".into(), images: vec![], now: false });
+
+        // The turn fails on the limit: scheduled, the queue is held
+        let resets = now_ms() + 3_600_000;
+        em.event(crate::adapters::limit_hit(Some(resets), Some("five_hour".into())));
+        em.event(EventBody::TurnEnd { stop_reason: Some("error".into()), model: None });
+        let info = hub.info("s").unwrap();
+        assert_eq!(info.auto_resume.as_ref().map(|a| a.at), Some(resets + AUTO_RESUME_DELAY_MS));
+        assert_eq!(info.limit_hits, 1);
+        assert!(rx.try_recv().is_err(), "queued message must wait");
+        assert_eq!(limit_phases(&hub, "s"), ["hit", "scheduled"]);
+
+        // The user sends a message by hand: cancelled
+        hub.send("s", "hi", vec![], false).unwrap();
+        assert!(hub.info("s").unwrap().auto_resume.is_none());
+        assert!(matches!(rx.try_recv(), Ok(AdapterCmd::Send(p)) if p.text == "hi"));
+        assert_eq!(limit_phases(&hub, "s"), ["hit", "scheduled", "cancelled:manual"]);
+
+        // Hit again, then "Continue now" sends the continue message (English: no CJK in the title, no language reported)
+        em.event(crate::adapters::limit_hit(Some(resets), None));
+        em.event(EventBody::TurnEnd { stop_reason: Some("error".into()), model: None });
+        assert_eq!(hub.info("s").unwrap().limit_hits, 2);
+        hub.auto_resume_action("s", "now").unwrap();
+        assert!(matches!(rx.try_recv(), Ok(AdapterCmd::Send(p)) if p.text == CONTINUE_EN));
+        assert!(hub.auto_resume_action("s", "cancel").is_err());
+
+        // A normal turn end resets the counter and releases the queue
+        em.event(EventBody::TurnEnd { stop_reason: Some("end_turn".into()), model: None });
+        assert_eq!(hub.info("s").unwrap().limit_hits, 0);
+        assert!(matches!(rx.try_recv(), Ok(AdapterCmd::Send(p)) if p.text == "later"));
+
+        // Language follows the client; past MAX_AUTO_RESUMES it gives up
+        hub.settings.write().unwrap().ui_lang = Some("zh".into());
+        assert_eq!(hub.continue_text(&hub.info("s").unwrap()), CONTINUE_ZH);
+        for _ in 0..=MAX_AUTO_RESUMES {
+            em.event(crate::adapters::limit_hit(Some(resets), None));
+            em.event(EventBody::TurnEnd { stop_reason: Some("error".into()), model: None });
+            hub.cancel_resume("s", "user");
+        }
+        assert!(limit_phases(&hub, "s").last().unwrap() == "skipped:repeated");
     }
 
     #[tokio::test]

@@ -3,7 +3,7 @@ import { isEn, tr } from '../i18n';
 import { hubCall, rpc } from '../transport';
 import { errorToast, navigate, setState, toast, useStore, type HostEntry } from '../store';
 import type { SessionInfo } from '../types';
-import { basename, fuzzyScore, lsGet, lsSet } from '../util';
+import { basename, clock, fuzzyScore, lsGet, lsSet } from '../util';
 import { openMenu, type MenuItem } from './Overlay';
 import { writeClipboard } from '../clipboard';
 import { deleteDirSessions, openTerminal, renameSession, sessionMenu } from './SessionActions';
@@ -83,6 +83,11 @@ function SessionRow({ hostId, s, active, showDir }: { hostId: string; s: Session
       <span className="pill pill-attn">{s.pendingPermissions}</span>
     ) : cls === 'attn' || cls === 'busy' || cls === 'err' ? (
       <span className={`sdot sdot-${cls}`} />
+    ) : s.autoResume ? (
+      <span className="row-time row-wait">
+        <Icon name="clock" size={11} />
+        {clock(s.autoResume.at)}
+      </span>
     ) : (
       <span className="row-time">{shortAgo(s.updatedAt)}</span>
     );
@@ -98,7 +103,7 @@ function SessionRow({ hostId, s, active, showDir }: { hostId: string; s: Session
             renameSession(hostId, s);
           }
         }}
-        title={`${s.title || tr('新会话', 'New Session')}\n${s.cwd}\n${s.tool === 'files' ? tr('文件', 'Files') : statusText(cls)}${s.mode === 'terminal' ? tr(' · 终端模式', ' · Terminal mode') : ''}${s.mode === 'terminal' && cls !== 'off' && cls !== 'err' ? tr('\n进程不会自动结束，不用时请停止进程', '\nNot stopped automatically; stop the process when done') : ''}`}
+        title={`${s.title || tr('新会话', 'New Session')}\n${s.cwd}\n${s.tool === 'files' ? tr('文件', 'Files') : s.autoResume ? tr(`额度已用完，${clock(s.autoResume.at)} 自动继续`, `Usage limit reached, continues at ${clock(s.autoResume.at)}`) : statusText(cls)}${s.mode === 'terminal' ? tr(' · 终端模式', ' · Terminal mode') : ''}${s.mode === 'terminal' && cls !== 'off' && cls !== 'err' ? tr('\n进程不会自动结束，不用时请停止进程', '\nNot stopped automatically; stop the process when done') : ''}`}
       >
         <span className="row-badge">
           <ToolBadge tool={s.tool} size={16} />

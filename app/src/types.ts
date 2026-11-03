@@ -44,6 +44,19 @@ export interface SessionInfo {
   parentId?: string;
   /** Number of user messages already in the tool session when switching from chat to terminal (switching back only imports the ones after) */
   syncedUsers?: number;
+  /** The tool hit its usage limit; "continue" is sent automatically at `at` (chat mode, Claude / Codex) */
+  autoResume?: AutoResume;
+  /** Usage limit hits in a row since the last normal turn end */
+  limitHits?: number;
+}
+
+export interface AutoResume {
+  /** When the continue message is sent (ms) */
+  at: number;
+  /** When the tool says the limit resets (ms) */
+  resetsAt: number;
+  /** five_hour / seven_day / … when the tool says */
+  limit?: string;
 }
 
 export interface BackgroundTask {
@@ -191,6 +204,16 @@ export type EventBody =
   | { kind: 'system'; text: string }
   /** /clear: all events before this one have been deleted on yi-agentd */
   | { kind: 'cleared' }
+  /** Usage limit: hit (from the adapter) / scheduled / skipped (reason off|unknown|far|repeated) /
+   *  resumed (reason auto|now) / cancelled (reason user|manual|mode|off|busy) */
+  | {
+      kind: 'rate_limit';
+      phase: 'hit' | 'scheduled' | 'skipped' | 'resumed' | 'cancelled';
+      resetsAt?: number;
+      limit?: string;
+      resumeAt?: number;
+      reason?: string;
+    }
   | {
       kind: 'compact';
       phase: 'start' | 'done' | 'failed';
@@ -295,6 +318,10 @@ export interface DaemonSettings {
   maxLiveProcesses?: number;
   /** Run terminal sessions in tmux; on if unset */
   terminalTmux?: boolean;
+  /** Send "continue" automatically after a usage limit resets; on if unset */
+  autoResume?: boolean;
+  /** UI language last reported by a client (zh / en) */
+  uiLang?: string;
 }
 
 export const TOOL_LABEL: Record<ToolKind, string> = new Proxy(

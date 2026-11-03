@@ -78,6 +78,10 @@ const ERR_PATTERNS: [RegExp, string | ((...m: string[]) => string)][] = [
   [/认证失败/, 'Authentication failed'],
   [/权限不足|拒绝访问/, 'Permission denied'],
   [/超时/, 'Timed out'],
+  [/这个会话没有在等待额度恢复/, 'This session is not waiting for a usage limit to reset'],
+  [/^自动继续失败[:：]\s*(.+)$/, (_, m) => `Automatic continue failed: ${m}`],
+  [/^未知语言[:：]\s*(.+)$/, (_, m) => `Unknown language: ${m}`],
+  [/^未知操作[:：]\s*(.+)$/, (_, m) => `Unknown action: ${m}`],
 ];
 
 /** Translate Chinese error messages from the backend or runtime (applies in the English UI) */

@@ -69,6 +69,7 @@ const paths: Record<string, string> = {
   diff: 'M6 3h8l4 4v14H6zM14 3v4h4M12 9v5M9.5 11.5h5M9.5 17h5',
   external: 'M14 4h6v6M20 4l-9 9M18 14v6H4V6h6',
   upload: 'M12 16V5M7 10l5-5 5 5M5 20h14',
+  clock: 'M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18zM12 7v5l3 2',
 };
 
 export function Icon({ name, size = 18 }: { name: keyof typeof paths | string; size?: number }) {

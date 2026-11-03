@@ -7743,6 +7743,83 @@ body.resizing .side-resizer::after {
   align-self: flex-start;
 }
 
+/* Usage limit: timeline line and the countdown bar above the input box */
+.limit-note {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+}
+.limit-note > svg {
+  flex: none;
+}
+.limit-note-warn {
+  color: var(--warn);
+}
+.limit-dock {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+  padding: 6px 6px 6px 12px;
+  border-radius: 8px;
+  background: var(--warn-soft);
+  color: var(--warn);
+  font-size: 13px;
+}
+.limit-dock > svg,
+.limit-dock .btn {
+  flex: none;
+}
+.limit-dock-text {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-wrap: wrap;
+  column-gap: 8px;
+}
+.limit-dock-when {
+  font-variant-numeric: tabular-nums;
+}
+.row-wait {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  color: var(--warn);
+}
+@media (max-width: 760px) {
+  /* Wrapped lines read better left-aligned, with the icon next to the first line */
+  .limit-note {
+    align-items: flex-start;
+    justify-content: flex-start;
+    text-align: left;
+  }
+  .limit-note > svg {
+    margin-top: 3px;
+  }
+  .limit-dock {
+    gap: 6px;
+    padding-left: 10px;
+  }
+  .limit-dock-when {
+    min-width: 0;
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+  }
+  /* Reply footer: wrap instead of squeezing "Error" into a vertical column */
+  .m-actions {
+    flex-wrap: wrap;
+  }
+  .m-act-time {
+    white-space: nowrap;
+  }
+}
+.m-actions > .attn-text {
+  flex: none;
+  white-space: nowrap;
+}
+
 /* Files session: the file panel fills the session page below the header (desktop and mobile), above the bottom terminal panel */
 .file-panel.standalone,
 .file-panel.standalone.browse,
