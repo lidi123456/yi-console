@@ -82,6 +82,17 @@ const ERR_PATTERNS: [RegExp, string | ((...m: string[]) => string)][] = [
   [/^自动继续失败[:：]\s*(.+)$/, (_, m) => `Automatic continue failed: ${m}`],
   [/^未知语言[:：]\s*(.+)$/, (_, m) => `Unknown language: ${m}`],
   [/^未知操作[:：]\s*(.+)$/, (_, m) => `Unknown action: ${m}`],
+  // App self-update (updater.rs / MainActivity.kt)
+  [/^检查更新失败[:：]\s*(.+)$/, (_, m) => `Update check failed: ${m}`],
+  [/^安装更新失败[:：]\s*(.+)$/, (_, m) => `Update install failed: ${m}`],
+  [/^下载失败[:：]\s*(.+)$/, (_, m) => `Download failed: ${m}`],
+  [/^无法打开安装程序[:：]\s*(.+)$/, (_, m) => `Cannot open the installer: ${m}`],
+  [/正在安装更新/, 'An update is being installed'],
+  [/没有可安装的更新|请先检查更新/, 'No update to install, check for updates first'],
+  [/没有找到发布的版本/, 'No published release found'],
+  [/下载的安装包校验失败/, 'The downloaded package failed verification, please try again'],
+  [/已经是最新版本/, 'Already up to date'],
+  [/这种安装方式不支持自动更新/, 'This kind of install cannot update itself; download the new version from the releases page'],
 ];
 
 /** Translate Chinese error messages from the backend or runtime (applies in the English UI) */

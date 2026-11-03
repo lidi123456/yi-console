@@ -14,6 +14,7 @@ import { setTermPrefs, useTermPrefs, type TermScheme } from './TerminalView';
 import { setChatStyle, useChatStyle, type ChatStyle } from './ChatView';
 import { historyTail, setHistoryTail, TAIL_OPTIONS } from '../store';
 import { HandoffCard } from './HandoffCard';
+import { UpdateSection } from './AppUpdate';
 import { setSidePrefs, STALE_OPTIONS, useSidePrefs, type SideLayout } from './Sidebar';
 import { Icon } from './Icon';
 import { setTheme, useTheme, type Theme } from '../theme';
@@ -435,6 +436,7 @@ function AboutCard() {
         Yi Console {local?.status.clientVersion ?? ''}
         {local?.status.hello && ` · ${tr('本机', 'Local')} yi-agentd ${local.status.hello.daemonVersion}`}
       </div>
+      <UpdateSection Switch={Switch} />
     </div>
   );
 }

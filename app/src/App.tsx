@@ -18,6 +18,7 @@ import { Overlays, useContextMenu } from './components/Overlay';
 import { customFrame, TitleBar } from './components/TitleBar';
 import { Lightbox } from './components/Lightbox';
 import { UpgradeOverlay } from './components/Upgrade';
+import { AppUpdateNotice } from './components/AppUpdate';
 import { tr, useLang } from './i18n';
 
 function Toasts() {
@@ -107,6 +108,7 @@ export function App() {
       <Lightbox />
       <Overlays />
       <UpgradeOverlay />
+      <AppUpdateNotice />
     </div>
   );
 }

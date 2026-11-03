@@ -75,7 +75,23 @@ For end-to-end tests, set `YI_CONSOLE_HOME=<temp dir>` so yi-agentd runs isolate
 
 Installers for every platform, the per-platform yi-agentd binaries and the Android APK are built by `.github/workflows/build.yml`. It runs when a `v*` tag is pushed (and can be triggered manually); tagged builds are published to GitHub Releases.
 
-Android signing uses two repository secrets: `ANDROID_KEYSTORE_B64` (the base64-encoded `.jks`) and `ANDROID_KEYSTORE_PASSWORD`; the key alias must be `app`. Builds work without them, but each build is then signed with a different key, so users have to uninstall the old version before upgrading.
+To publish a version:
+
+```bash
+git tag -a v0.2.0 -m "What changed"   # the tag message becomes the release notes and shows in the app's update prompt
+git push origin v0.2.0
+```
+
+The version comes only from the tag; the version in the repository is never edited by hand. CI runs `scripts/set-version.mjs` to write the tag's version into `Cargo.toml`, `tauri.conf.json` and so on (on the build machine only, not committed). The format must be `v<major>.<minor>.<patch>`; any part may go up, but each release must be higher than the last, and minor and patch can't exceed 999 (Android's versionCode is derived from them).
+
+Self-update: the release job runs `scripts/release-manifest.mjs` to write `latest.json` (desktop, in tauri-plugin-updater's format) and `latest-android.json` (Android, with the APK's sha256), uploaded with the installers. The app reads both from `releases/latest/download/`, so the repository must be public, otherwise the download fails (and the app treats it as no update). On the desktop, Windows updates through the NSIS installer, macOS through `.app.tar.gz`, and on Linux only the AppImage can update itself. Android downloads the APK and hands it to the system installer; the first time, the user has to allow "install unknown apps".
+
+Repository secrets:
+
+- `TAURI_SIGNING_PRIVATE_KEY` / `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`: private key and password that sign the desktop update bundles (made with `npx tauri signer generate`); the public key is `plugins.updater.pubkey` in `tauri.conf.json`. Installed versions stop receiving updates if the key changes, so keep the private key safe.
+- `ANDROID_KEYSTORE_B64` (the base64-encoded `.jks`) and `ANDROID_KEYSTORE_PASSWORD`; the key alias must be `app`. The in-app updater can only install an APK signed with the same key, so releases require it; without it only manually triggered builds can be signed with a throwaway key.
+
+Tagged builds fail if these secrets are missing.
 
 Desktop installers are not code-signed yet.
 

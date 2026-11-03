@@ -5,19 +5,52 @@ package dev.yiconsole.app
 
 import android.content.Intent
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
+import android.provider.Settings
 import android.view.View
 import android.webkit.JavascriptInterface
 import android.webkit.WebView
 import androidx.activity.OnBackPressedCallback
 import androidx.activity.enableEdgeToEdge
+import androidx.core.content.FileProvider
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
+import java.io.File
+import java.net.HttpURLConnection
+import java.net.URL
+import java.security.MessageDigest
+import org.json.JSONObject
+
+// Self-update: the release job writes latest-android.json next to the APK (scripts/release-manifest.mjs).
+// The URLs are fixed here rather than taken from the page, so nothing in the WebView can make the app install another APK.
+private const val UPDATE_MANIFEST = "https://github.com/lidi123456/yi-console/releases/latest/download/latest-android.json"
+private const val UPDATE_URL_PREFIX = "https://github.com/lidi123456/yi-console/releases/download/"
 
 class MainActivity : TauriActivity() {
+  private var webView: WebView? = null
+  /** From the last check: what updateDownload fetches */
+  private var updateUrl: String? = null
+  private var updateSha256: String? = null
+  private var updateVersionCode = 0L
+  @Volatile private var downloading = false
+  /** Downloaded APK waiting for the user to allow "install unknown apps" (installed in onResume once allowed) */
+  private var pendingApk: File? = null
+
   override fun onCreate(savedInstanceState: Bundle?) {
     enableEdgeToEdge()
     super.onCreate(savedInstanceState)
+  }
+
+  override fun onResume() {
+    super.onResume()
+    val apk = pendingApk ?: return
+    if (canInstall()) {
+      pendingApk = null
+      installApk(apk)
+    } else {
+      emitUpdate(JSONObject().put("type", "permission").put("granted", false))
+    }
   }
 
   // In edge-to-edge mode (enforced from targetSdk 35) the system no longer shrinks the window for the IME,
@@ -45,7 +78,28 @@ class MainActivity : TauriActivity() {
           try { startActivity(chooser) } catch (_: Exception) {}
         }
       }
+
+      @JavascriptInterface
+      fun appVersion(): String = currentVersion().first
+
+      /** Fetch latest-android.json; answers with an `update` event {type: "check", ok, current, available, version, notes} */
+      @JavascriptInterface
+      fun updateCheck() {
+        Thread { checkUpdate() }.start()
+      }
+
+      /** Download the APK found by the last check, verify its sha256, then open the system installer.
+       *  Events: {type: "progress", got, total} / {type: "downloaded"} / {type: "permission"} / {type: "error", message} */
+      @JavascriptInterface
+      fun updateDownload() {
+        if (downloading) return
+        downloading = true
+        Thread {
+          try { downloadUpdate() } finally { downloading = false }
+        }.start()
+      }
     }, "YiConsoleAndroid")
+    this.webView = webView
 
     // The back key / back gesture is handed to the page (back.ts): close a dialog or panel, or go back a page;
     // when there's nothing left, the page first shows "press again to exit"; it only exits on a second press within 2 s (or if the page hasn't loaded yet).
@@ -56,5 +110,133 @@ class MainActivity : TauriActivity() {
         }
       }
     })
+  }
+
+  // ---------- Self-update ----------
+
+  private fun currentVersion(): Pair<String, Long> {
+    val info = packageManager.getPackageInfo(packageName, 0)
+    @Suppress("DEPRECATION")
+    val code = if (Build.VERSION.SDK_INT >= 28) info.longVersionCode else info.versionCode.toLong()
+    return Pair(info.versionName ?: "", code)
+  }
+
+  /** Send an event to app/src/update.ts (JSON is valid JS; org.json escapes U+2028/2029) */
+  private fun emitUpdate(ev: JSONObject) {
+    val js = "window.__yiUpdate && window.__yiUpdate(${ev})"
+    runOnUiThread { webView?.evaluateJavascript(js, null) }
+  }
+
+  private fun emitError(message: String) = emitUpdate(JSONObject().put("type", "error").put("message", message))
+
+  private fun open(url: String): HttpURLConnection {
+    val conn = URL(url).openConnection() as HttpURLConnection
+    conn.connectTimeout = 15000
+    conn.readTimeout = 30000
+    conn.instanceFollowRedirects = true
+    conn.setRequestProperty("User-Agent", "Yi-Console-Android")
+    val code = conn.responseCode
+    if (code != 200) {
+      conn.disconnect()
+      throw RuntimeException(if (code == 404) "没有找到发布的版本" else "HTTP $code")
+    }
+    return conn
+  }
+
+  private fun checkUpdate() {
+    val (current, currentCode) = currentVersion()
+    try {
+      val conn = open(UPDATE_MANIFEST)
+      val text = conn.inputStream.bufferedReader().use { it.readText() }
+      conn.disconnect()
+      val j = JSONObject(text)
+      val url = j.getString("url")
+      if (!url.startsWith(UPDATE_URL_PREFIX)) throw RuntimeException("更新地址不对: $url")
+      val code = j.getLong("versionCode")
+      updateUrl = url
+      updateSha256 = j.getString("sha256").lowercase()
+      updateVersionCode = code
+      emitUpdate(
+        JSONObject()
+          .put("type", "check")
+          .put("ok", true)
+          .put("current", current)
+          .put("available", code > currentCode)
+          .put("version", j.optString("version"))
+          .put("notes", j.optString("notes"))
+          .put("size", j.optLong("size"))
+      )
+    } catch (e: Exception) {
+      emitUpdate(JSONObject().put("type", "check").put("ok", false).put("current", current).put("message", e.message ?: e.toString()))
+    }
+  }
+
+  private fun downloadUpdate() {
+    val url = updateUrl
+    val sha = updateSha256
+    if (url == null || sha == null) return emitError("请先检查更新")
+    if (updateVersionCode <= currentVersion().second) return emitError("已经是最新版本")
+    // cache/update is covered by <cache-path> in the FileProvider paths Tauri generates (res/xml/file_paths.xml)
+    val dir = File(cacheDir, "update").apply { mkdirs() }
+    val file = File(dir, "yi-console.apk")
+    try {
+      val conn = open(url)
+      val total = conn.contentLengthLong
+      val digest = MessageDigest.getInstance("SHA-256")
+      var got = 0L
+      var last = 0L
+      conn.inputStream.use { input ->
+        file.outputStream().use { out ->
+          val buf = ByteArray(64 * 1024)
+          while (true) {
+            val n = input.read(buf)
+            if (n < 0) break
+            out.write(buf, 0, n)
+            digest.update(buf, 0, n)
+            got += n
+            if (got - last >= 256 * 1024) {
+              last = got
+              emitUpdate(JSONObject().put("type", "progress").put("got", got).put("total", total))
+            }
+          }
+        }
+      }
+      conn.disconnect()
+      val hex = digest.digest().joinToString("") { "%02x".format(it) }
+      if (hex != sha) {
+        file.delete()
+        return emitError("下载的安装包校验失败，请重试")
+      }
+      emitUpdate(JSONObject().put("type", "downloaded"))
+      runOnUiThread { installApk(file) }
+    } catch (e: Exception) {
+      file.delete()
+      emitError("下载失败: ${e.message ?: e}")
+    }
+  }
+
+  private fun canInstall() = Build.VERSION.SDK_INT < 26 || packageManager.canRequestPackageInstalls()
+
+  /** Open the system installer (it always asks the user to confirm). The first time, the user has to allow
+   *  "install unknown apps" for Yi Console; we open that settings page and continue in onResume */
+  private fun installApk(file: File) {
+    if (!canInstall()) {
+      pendingApk = file
+      emitUpdate(JSONObject().put("type", "permission"))
+      try {
+        startActivity(Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:$packageName")))
+      } catch (_: Exception) {}
+      return
+    }
+    try {
+      val uri = FileProvider.getUriForFile(this, "$packageName.fileprovider", file)
+      val intent = Intent(Intent.ACTION_VIEW)
+        .setDataAndType(uri, "application/vnd.android.package-archive")
+        .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+      startActivity(intent)
+      emitUpdate(JSONObject().put("type", "installing"))
+    } catch (e: Exception) {
+      emitError("无法打开安装程序: ${e.message ?: e}")
+    }
   }
 }

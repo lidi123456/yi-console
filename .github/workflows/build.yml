@@ -65,6 +65,12 @@ jobs:
       - name: build stamp
         shell: bash
         run: echo "YI_CONSOLE_BUILD_TIME=$(git log -1 --format=%ct)" >> "$GITHUB_ENV"
+      # Release version from the tag (v1.2.3 -> 1.2.3) written into Cargo.toml / tauri.conf.json; other builds keep the checked-in version
+      - name: version
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then v=$(node scripts/set-version.mjs "$GITHUB_REF_NAME"); else v=$(node -p "require('./app/src-tauri/tauri.conf.json').version"); fi
+          echo "VERSION=$v" >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -106,6 +112,12 @@ jobs:
       - name: build stamp
         shell: bash
         run: echo "YI_CONSOLE_BUILD_TIME=$(git log -1 --format=%ct)" >> "$GITHUB_ENV"
+      # Release version from the tag (v1.2.3 -> 1.2.3) written into Cargo.toml / tauri.conf.json; other builds keep the checked-in version
+      - name: version
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then v=$(node scripts/set-version.mjs "$GITHUB_REF_NAME"); else v=$(node -p "require('./app/src-tauri/tauri.conf.json').version"); fi
+          echo "VERSION=$v" >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -138,18 +150,45 @@ jobs:
           chmod +x app/src-tauri/binaries/* app/src-tauri/resources/yi-agentd/* || true
       - run: npm ci
         working-directory: app
-      - run: npx tauri build --target ${{ matrix.target }}
+      # Updater bundles (NSIS setup / .app.tar.gz / AppImage plus .sig) need the updater signing key; releases must have it,
+      # other builds without the secret just skip them
+      - name: build
         working-directory: app
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          if [ -n "$TAURI_SIGNING_PRIVATE_KEY" ]; then
+            npx tauri build --target ${{ matrix.target }} --config '{"bundle":{"createUpdaterArtifacts":true}}'
+          elif [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            echo "::error::Releases need the TAURI_SIGNING_PRIVATE_KEY secret (updater signing key)"
+            exit 1
+          else
+            npx tauri build --target ${{ matrix.target }}
+          fi
+      # Fixed names per platform (both macOS builds would otherwise produce the same "Yi Console.app.tar.gz");
+      # scripts/release-manifest.mjs looks the updater bundles up by these names
+      - name: collect
+        shell: bash
+        run: |
+          shopt -s nullglob
+          b=app/src-tauri/target/${{ matrix.target }}/release/bundle
+          n="out/yi-console_${VERSION}_${{ matrix.daemon }}"
+          mkdir -p out
+          put() { cp "$1" "$2"; if [ -f "$1.sig" ]; then cp "$1.sig" "$2.sig"; fi; }
+          for f in "$b"/nsis/*-setup.exe; do put "$f" "$n-setup.exe"; done
+          for f in "$b"/msi/*.msi; do cp "$f" "$n.msi"; done
+          for f in "$b"/dmg/*.dmg; do cp "$f" "$n.dmg"; done
+          for f in "$b"/macos/*.app.tar.gz; do put "$f" "$n.app.tar.gz"; done
+          for f in "$b"/appimage/*.AppImage; do put "$f" "$n.AppImage"; done
+          for f in "$b"/deb/*.deb; do cp "$f" "$n.deb"; done
+          for f in "$b"/rpm/*.rpm; do cp "$f" "$n.rpm"; done
+          ls -la out
       - uses: actions/upload-artifact@v4
         with:
           name: desktop-${{ matrix.target }}
-          path: |
-            app/src-tauri/target/${{ matrix.target }}/release/bundle/**/*.deb
-            app/src-tauri/target/${{ matrix.target }}/release/bundle/**/*.AppImage
-            app/src-tauri/target/${{ matrix.target }}/release/bundle/**/*.rpm
-            app/src-tauri/target/${{ matrix.target }}/release/bundle/**/*.dmg
-            app/src-tauri/target/${{ matrix.target }}/release/bundle/**/*.msi
-            app/src-tauri/target/${{ matrix.target }}/release/bundle/**/*-setup.exe
+          path: out/*
 
   android:
     if: ${{ !inputs.only_daemons && !inputs.windows_only }}
@@ -160,6 +199,12 @@ jobs:
       - name: build stamp
         shell: bash
         run: echo "YI_CONSOLE_BUILD_TIME=$(git log -1 --format=%ct)" >> "$GITHUB_ENV"
+      # Release version from the tag (v1.2.3 -> 1.2.3) written into Cargo.toml / tauri.conf.json; other builds keep the checked-in version
+      - name: version
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then v=$(node scripts/set-version.mjs "$GITHUB_REF_NAME"); else v=$(node -p "require('./app/src-tauri/tauri.conf.json').version"); fi
+          echo "VERSION=$v" >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
@@ -195,7 +240,12 @@ jobs:
           KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
           KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
         run: |
-          # No signing key configured: generate a throwaway one. It installs, but the signature changes every build, so uninstall the old version before upgrading
+          # No signing key configured: generate a throwaway one. It installs, but the signature changes every build, so uninstall the old version before upgrading.
+          # Releases must use the fixed key: the in-app updater can only install an APK signed by the same key
+          if [ -z "$KEYSTORE_B64" ] && [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            echo "::error::Releases need the ANDROID_KEYSTORE_B64 / ANDROID_KEYSTORE_PASSWORD secrets"
+            exit 1
+          fi
           if [ -n "$KEYSTORE_B64" ]; then
             echo "$KEYSTORE_B64" | base64 -d > release.jks
             pass="$KEYSTORE_PASSWORD"
@@ -207,11 +257,12 @@ jobs:
           apk=$(find app/src-tauri/gen/android -name '*-release-unsigned.apk' | head -1)
           bt=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
           "$bt/zipalign" -f 4 "$apk" aligned.apk
-          "$bt/apksigner" sign --ks release.jks --ks-pass pass:$pass --ks-key-alias app --out yi-console.apk aligned.apk
+          mkdir -p out
+          "$bt/apksigner" sign --ks release.jks --ks-pass pass:$pass --ks-key-alias app --out "out/yi-console_${VERSION}_android.apk" aligned.apk
       - uses: actions/upload-artifact@v4
         with:
           name: android-apk
-          path: yi-console.apk
+          path: out/*.apk
 
   release:
     if: startsWith(github.ref, 'refs/tags/')
@@ -220,10 +271,21 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v5
+      # Release notes = the tag message (checkout turns an annotated tag into a lightweight one, so fetch it again)
+      - name: notes
+        run: |
+          git fetch --force origin "refs/tags/$GITHUB_REF_NAME:refs/tags/$GITHUB_REF_NAME"
+          git for-each-ref --format='%(contents)' "refs/tags/$GITHUB_REF_NAME" > notes.md
+          cat notes.md
       - uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
+      # latest.json (desktop updater) and latest-android.json (Android updater); the app reads them from releases/latest/download/
+      - name: manifests
+        run: node scripts/release-manifest.mjs dist "$GITHUB_REF_NAME" "$GITHUB_REPOSITORY" notes.md
       - uses: softprops/action-gh-release@v2
         with:
-          files: dist/**/*
+          body_path: notes.md
+          files: dist/*

@@ -28,6 +28,8 @@ yi-client = { path = "../../crates/client" }
 tauri-plugin-dialog = "2"
 # Remember window size and position
 tauri-plugin-window-state = "2"
+# Self-update from GitHub Releases (latest.json), see src/updater.rs; Android has its own in MainActivity.kt
+tauri-plugin-updater = "2"
 
 # Read file paths from the clipboard (CF_HDROP) when pasting local files, see src/clipfiles.rs
 [target.'cfg(windows)'.dependencies]

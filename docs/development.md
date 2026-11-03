@@ -75,7 +75,23 @@ cd app && npm run build             # 先跑 tsc --noEmit，再 vite build
 
 各平台安装包、各平台的 yi-agentd 和 Android APK 由 `.github/workflows/build.yml` 构建：推送 `v*` 标签时触发（也可以手动触发），打标签的构建会发布到 GitHub Releases。
 
-Android 签名用两个仓库 secrets：`ANDROID_KEYSTORE_B64`（base64 编码的 `.jks`）和 `ANDROID_KEYSTORE_PASSWORD`，密钥别名必须是 `app`。不配也能构建，但每次构建签名都不同，用户升级前要先卸载旧版。
+发一个版本：
+
+```bash
+git tag -a v0.2.0 -m "这次的更新说明"   # 标签说明就是 Release 说明，也会显示在应用的更新提示里
+git push origin v0.2.0
+```
+
+版本号只来自标签，仓库里的版本号不用改：CI 用 `scripts/set-version.mjs` 把标签版本写进 `Cargo.toml`、`tauri.conf.json` 等（只在构建机上改，不提交）。格式必须是 `v主.次.修订`，哪一位都可以涨，但必须比上一个版本大；次版本号和修订号不能超过 999（Android 的 versionCode 由它们算出）。
+
+应用自更新：release 任务用 `scripts/release-manifest.mjs` 生成 `latest.json`（桌面端，tauri-plugin-updater 的格式）和 `latest-android.json`（Android，带 APK 的 sha256），和安装包一起上传。应用从 `releases/latest/download/` 读取这两个文件，所以仓库必须是公开的，否则下载会失败（应用会当作没有新版本）。桌面端在 Windows 上用 NSIS 安装包更新，macOS 用 `.app.tar.gz`，Linux 只有 AppImage 能自更新；Android 下载 APK 后交给系统安装器，第一次需要用户允许"安装未知应用"。
+
+需要的仓库 secrets：
+
+- `TAURI_SIGNING_PRIVATE_KEY` / `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`：桌面更新包的签名私钥和密码（`npx tauri signer generate` 生成），公钥写在 `tauri.conf.json` 的 `plugins.updater.pubkey`。换密钥后旧版本就收不到更新了，私钥要妥善保存。
+- `ANDROID_KEYSTORE_B64`（base64 编码的 `.jks`）和 `ANDROID_KEYSTORE_PASSWORD`，密钥别名必须是 `app`。应用内更新只能装同一密钥签名的 APK，所以发布版本必须配置；不配时只有手动触发的构建能用临时密钥打包。
+
+打标签的构建缺少这些 secrets 时会直接失败。
 
 桌面安装包目前没有做代码签名。
 

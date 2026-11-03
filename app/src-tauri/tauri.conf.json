@@ -45,5 +45,16 @@
     },
     "category": "DeveloperTool",
     "shortDescription": "Use and manage all your AI coding tools in one place"
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEVEQUIyQjE5OTY3RjVBQTYKUldTbVduK1dHU3VyN2I2b1Y5OFcwaGJLQnpnVkJxNkd5RFZRdlh1ZjJJdjNoeW9zNHFFZCthZHgK",
+      "endpoints": [
+        "https://github.com/lidi123456/yi-console/releases/latest/download/latest.json"
+      ],
+      "windows": {
+        "installMode": "passive"
+      }
+    }
   }
 }

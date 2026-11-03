@@ -4964,6 +4964,50 @@ body.resizing-y {
   box-shadow: var(--shadow);
 }
 
+/* App self-update (AppUpdate.tsx): corner notice reuses .upgrade-toast; above the daemon-upgrade notice if both show */
+.app-update {
+  bottom: 60px;
+  min-width: 260px;
+}
+.app-update .upgrade-bar {
+  margin-top: 6px;
+}
+.app-update .link-btn.muted {
+  color: var(--text-2);
+}
+.app-update-section {
+  margin-top: 10px;
+  border-top: 1px solid var(--border);
+}
+.app-update-row {
+  align-items: center;
+  margin-top: 4px;
+}
+.app-update-section .upgrade-bar {
+  margin-top: 8px;
+}
+.app-update-notes {
+  margin-top: 8px;
+  padding: 8px 10px;
+  max-height: 160px;
+  overflow: auto;
+  white-space: pre-wrap;
+  color: var(--text-2);
+  background: var(--code-bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+/* Phones: at the top, clear of the input box */
+@media (max-width: 760px) {
+  .app-update {
+    left: 12px;
+    right: 12px;
+    bottom: auto;
+    top: calc(env(safe-area-inset-top, 0px) + 56px);
+    max-width: none;
+  }
+}
+
 /* ======================================================================
    Sidebar: placed last to override sidebar settings elsewhere. Make sidebar changes here.
    Two-level structure: host header (icon tile + name + connection status, slightly bolder) → directory subheading (small light-grey text) → sessions.

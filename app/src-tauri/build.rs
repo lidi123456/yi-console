@@ -19,6 +19,13 @@ fn main() {
             .join("\n"),
         )
         .expect("更新 AndroidManifest.xml 失败");
+        // Self-update (MainActivity.kt) hands the downloaded APK to the system installer, which needs this permission
+        tauri_utils::build::update_android_manifest(
+            "yi-console-update",
+            "manifest",
+            r#"<uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />"#.to_string(),
+        )
+        .expect("更新 AndroidManifest.xml 失败");
     }
     tauri_build::build()
 }

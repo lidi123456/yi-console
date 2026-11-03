@@ -2,6 +2,21 @@
 //! Browser mode (yi-web) goes through the same ClientHub.call, so both behave the same.
 
 mod clipfiles;
+#[cfg(desktop)]
+mod updater;
+
+/// No tauri-plugin-updater on mobile: Android updates itself in MainActivity.kt (YiConsoleAndroid.update*), these only keep the handler list the same
+#[cfg(mobile)]
+mod updater {
+    #[tauri::command]
+    pub async fn update_check() -> Result<serde_json::Value, String> {
+        Err("手机上不支持".into())
+    }
+    #[tauri::command]
+    pub async fn update_install() -> Result<(), String> {
+        Err("手机上不支持".into())
+    }
+}
 
 use std::sync::Arc;
 
@@ -72,7 +87,9 @@ pub fn run() {
     let builder = builder
         .plugin(tauri_plugin_dialog::init())
         // Remember window size and position and reopen with them next time
-        .plugin(tauri_plugin_window_state::Builder::default().build());
+        .plugin(tauri_plugin_window_state::Builder::default().build())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .manage(updater::Pending::default());
     builder
         // Browser tabs previewing web pages on the host: ahfs://localhost/<token>/<relative path> (http://ahfs.localhost/… on Windows / Android)
         .register_asynchronous_uri_scheme_protocol("ahfs", |ctx, req, responder| {
@@ -116,7 +133,13 @@ pub fn run() {
             app.manage(Hub(hub));
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![hub_call, save_file, clipfiles::clipboard_files])
+        .invoke_handler(tauri::generate_handler![
+            hub_call,
+            save_file,
+            clipfiles::clipboard_files,
+            updater::update_check,
+            updater::update_install
+        ])
         .run(tauri::generate_context!())
         .expect("启动 Yi Console 失败");
 }

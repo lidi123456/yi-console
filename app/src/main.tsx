@@ -11,6 +11,7 @@ import { isMobileApp, openUrl, openUrlExternal } from './components/PortsView';
 import { openMenu } from './components/Overlay';
 import { writeClipboard } from './clipboard';
 import { tr } from './i18n';
+import { startUpdateChecks } from './update';
 
 // Links in the page (AI replies, Markdown preview, etc.) never navigate inside the app window: external URLs open in the system browser,
 // anything else (relative paths, file:, etc.) is blocked, otherwise the whole app would be replaced by that page.
@@ -47,6 +48,7 @@ initTheme();
 initLang();
 startEventLoop();
 restoreView();
+startUpdateChecks();
 createRoot(document.getElementById('root')!).render(<App />);
 
 initTransport()
