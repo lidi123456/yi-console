@@ -13,7 +13,7 @@ import { PaneDiff } from './DiffView';
 import { CsvView, ImageView, MdPreview, PdfView } from './FilePreview';
 import { GrepPanel } from './GrepPanel';
 import { QuickOpen, type QuickMode } from './QuickOpen';
-import { OPEN_CHANGES } from './SessionActions';
+import { OPEN_CHANGES, takeOpenChanges } from './SessionActions';
 import { BrowserPane, isWebTab, WEB_PREFIX, webTabFile, webTabTitle } from './Browser';
 import { CommitDetails, GitHistory, isCommitTab, parseCommitTab } from './GitHistory';
 
@@ -905,6 +905,8 @@ export function FilePanel({
   // Remember opened files (per host + working directory; Files sessions per session) and restore the tabs and current file next time the panel opens
   const tabsKey = standalone ? `wp-open-s-${hostId}/${sessionId}` : `wp-open-${hostId}/${cwd}`;
   const restored = useRef(false);
+  /** The panel was opened by "View changes": keep the side column visible when tabs are restored */
+  const forChanges = useRef(false);
   const restoring = useRef(false);
   useEffect(() => {
     if (!root || restored.current) return;
@@ -925,7 +927,8 @@ export function FilePanel({
       setTabs(keep);
       setFile(f);
       previewFor(cur);
-      if (window.matchMedia('(max-width: 760px)').matches) setTreeOpen(false);
+      // On phones a restored file normally takes the screen; not when the panel was opened for "Changes"
+      if (!forChanges.current && window.matchMedia('(max-width: 760px)').matches) setTreeOpen(false);
     });
   }, [root]); // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => {
@@ -1388,18 +1391,24 @@ export function FilePanel({
     setView(v);
     setCollapsed(new Set());
   };
-  // "View changes" from the session menu
+  // "View changes": switch the side column to "Changes" and make sure it's visible; the editor keeps whatever it shows
+  // (like VS Code's Source Control view). Taken on mount too, since a closed panel mounts after the event has fired
   useEffect(() => {
-    const on = (e: Event) => {
-      const d = (e as CustomEvent<{ hostId: string; sessionId: string }>).detail;
-      if (d.hostId !== hostId || d.sessionId !== sessionId) return;
+    const take = () => {
+      if (!takeOpenChanges(hostId, sessionId)) return;
+      forChanges.current = true;
       pickView('changes');
       setTreeOpen(true);
       loadGit();
     };
+    take();
+    const on = (e: Event) => {
+      const d = (e as CustomEvent<{ hostId: string; sessionId: string }>).detail;
+      if (d.hostId === hostId && d.sessionId === sessionId) take();
+    };
     window.addEventListener(OPEN_CHANGES, on);
     return () => window.removeEventListener(OPEN_CHANGES, on);
-  }, [hostId, sessionId, loadGit]);
+  }, [hostId, sessionId, loadGit]); // eslint-disable-line react-hooks/exhaustive-deps
   const showTree = treeOpen || !file;
   // On mobile, after opening a file from the tree, back returns to the tree first; pressing again closes the whole file panel
   useBack(!!file && !treeOpen && window.matchMedia('(max-width: 760px)').matches, () => setTreeOpen(true));

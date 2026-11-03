@@ -12,10 +12,16 @@ const tx = getT('sessionActions');
 /** When the session page receives this, it opens the file panel on "Changes" */
 export const OPEN_CHANGES = 'yi-console:open-changes';
 
+/** Sessions whose file panel should switch to "Changes". The event alone isn't enough: a panel that was closed
+ *  mounts only after the event fired, so it takes the request from here when it mounts */
+const pendingChanges = new Set<string>();
+export const takeOpenChanges = (hostId: string, sessionId: string) => pendingChanges.delete(skey(hostId, sessionId));
+
 /** View changes: go to the session page and open the "Changes" view of the file panel on the right */
 export function showChanges(hostId: string, sessionId: string) {
   lsSet(`file-panel-${skey(hostId, sessionId)}`, true);
   lsSet('wp-view', 'changes');
+  pendingChanges.add(skey(hostId, sessionId));
   navigate({ kind: 'session', hostId, sessionId });
   setTimeout(() => window.dispatchEvent(new CustomEvent(OPEN_CHANGES, { detail: { hostId, sessionId } })), 0);
 }
