@@ -489,8 +489,6 @@ export function FilePanel({
   const [dropDir, setDropDir] = useState<string | null>(null);
   const [uploading, setUploading] = useState(0);
   const isLocal = useStore((st) => st.hosts.find((h) => h.config.id === hostId)?.config.kind === 'local');
-  // "Changes": only what this session changed
-  const [onlyMine, setOnlyMine] = useState(true);
   const sdata = useSessionData(skey(hostId, sessionId));
   // Files changed by tools in this session: norm(absolute path) -> each edit made to that file
   const touched = useMemo(() => {
@@ -1350,33 +1348,30 @@ export function FilePanel({
   const rows = useMemo(() => (root ? flatten(root, 0, kids, expanded) : []), [root, kids, expanded, lang]);
   const sRows = useMemo(() => (root && search ? searchRows(root, search.paths, collapsed) : []), [root, search, collapsed]);
   // "Changes": files changed under this working directory, arranged as a tree by directory
-  // When the session recorded changed files, list only those by default (what ChangesView used to call "only files changed in this session")
-  const mineFilter = onlyMine && touched.size > 0;
+  // Outside a git repo, the files tools changed in this session stand in for git status
   const allChanged = useMemo(() => {
     if (!root) return [];
     const keys = git ? [...git.files.keys()] : gitReady ? [...touched.keys()] : [];
     const r = norm(root);
     return keys.filter((k) => k.startsWith(r + '/'));
   }, [git, gitReady, touched, root]);
-  const changedKeys = useMemo(() => allChanged.filter((k) => !git || !mineFilter || touched.has(k)), [allChanged, git, mineFilter, touched]);
   const changed = useMemo(() => {
     if (!root) return [];
     const r = norm(root);
     // Keys are normalized (lowercased on Windows drives): take the original spelling from git status when there is one
-    return changedKeys.map((k) => (git?.files.get(k)?.path.replace(/\\/g, '/') ?? k).slice(r.length + 1));
-  }, [changedKeys, root, git]);
-  const otherCount = allChanged.length - changedKeys.length;
+    return allChanged.map((k) => (git?.files.get(k)?.path.replace(/\\/g, '/') ?? k).slice(r.length + 1));
+  }, [allChanged, root, git]);
   // Totals at the top of the Changes view: lines added/removed across the listed files (files that can't be computed are skipped)
   const totals = useMemo(() => {
     let a = 0, d = 0, any = false;
-    for (const k of changedKeys) {
+    for (const k of allChanged) {
       const f = git?.files.get(k);
       if (f?.added != null || f?.deleted != null) any = true;
       a += f?.added ?? 0;
       d += f?.deleted ?? 0;
     }
     return any ? { a, d } : null;
-  }, [changedKeys, git]);
+  }, [allChanged, git]);
   const cRows = useMemo(() => (root ? searchRows(root, changed, collapsed) : []), [root, changed, collapsed]);
   const toggleCollapsed = (r: TreeRow) =>
     setCollapsed((s) => {
@@ -1594,13 +1589,6 @@ export function FilePanel({
               <div className="wp-tip">{tx('readingChanges')}</div>
             ) : view === 'changes' && (git || touched.size > 0) ? (
               <>
-                {git && touched.size > 0 && (
-                  <label className="wp-mine">
-                    <input type="checkbox" checked={onlyMine} onChange={(e) => setOnlyMine(e.target.checked)} />
-                    {tx('onlyThisSession')}
-                    {mineFilter && otherCount > 0 && <span className="muted">{tx('more', { otherCount })}</span>}
-                  </label>
-                )}
                 {!git && <div className="wp-limit">{tx('notAGitRepoFiles')}</div>}
                 {git?.total && (
                   <div className="wp-limit">
@@ -1628,9 +1616,7 @@ export function FilePanel({
                 ) : (
                   <div className="wp-tip">
                     <b>{tx('noChanges')}</b>
-                    {otherCount > 0
-                      ? tx('filesChangedInThisSession')
-                      : tx('workingTreeMatchesTheLast')}
+                    {tx('workingTreeMatchesTheLast')}
                   </div>
                 )}
               </>
