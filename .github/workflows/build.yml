@@ -284,6 +284,10 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+      # The standalone yi-agentd binaries are already bundled in every app (and deployed over SSH from there), so they aren't
+      # release assets: people kept downloading and opening them. yi-relay stays, it's what relay operators install
+      - name: drop daemons
+        run: rm -f dist/yi-agentd-*
       # latest.json (desktop updater) and latest-android.json (Android updater); the app reads them from releases/latest/download/
       - name: manifests
         run: node scripts/release-manifest.mjs dist "$GITHUB_REF_NAME" "$GITHUB_REPOSITORY" notes.md
