@@ -351,9 +351,7 @@ function Rows({
             )}
           </span>
           <span className="truncate wp-name">{r.name}</span>
-          {stats && g && <LineStat a={g.added} d={g.deleted} />}
-          {mark && <span className="wp-git">{mark[0]}</span>}
-          {dirChanged && <span className="wp-git-dot" />}
+          {/* Touch screens only (see .wp-row-more); before the counts and letter so those stay right-aligned */}
           {onMenu && !r.loading && (
             <button
               className="wp-row-more"
@@ -367,6 +365,9 @@ function Rows({
               <Icon name="more" size={13} />
             </button>
           )}
+          {stats && g && <LineStat a={g.added} d={g.deleted} />}
+          {mark && <span className="wp-git">{mark[0]}</span>}
+          {dirChanged && <span className="wp-git-dot" />}
         </div>
         );
       })}

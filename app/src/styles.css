@@ -59,6 +59,9 @@
   /* Chat and editor fonts: overridden per device by fontPrefs.ts */
   --font-chat: var(--font);
   --font-editor: var(--mono);
+  /* Minimal-style replies use Segoe UI for Latin text; the chat font goes in front of it too */
+  --font-modern: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Microsoft YaHei UI', 'PingFang SC', 'Noto Sans CJK SC', sans-serif;
+  --font-reply: var(--font-modern);
   color-scheme: light;
 }
 
@@ -5555,8 +5558,7 @@ body.resizing .side-resizer::after {
   --m-fs: var(--fs-chat, 14px);
   --m-lh: calc(var(--m-fs) + 12px);
   --m-gap: 14px;
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Microsoft YaHei UI', 'PingFang SC', 'Noto Sans CJK SC',
-    sans-serif;
+  font-family: var(--font-reply);
   font-size: var(--m-fs);
   line-height: var(--m-lh);
   color: var(--text-strong);
@@ -7759,7 +7761,8 @@ button.wp-commit-title .chev {
   touch-action: none;
 }
 
-/* "More" button on the right of each file tree row: appears on hover on desktop, always shown on touch/mobile, for actions like "Add to chat" */
+/* "More" button on file tree rows, touch screens only (they have no right click and the tree has no long press); with a mouse
+   the context menu has the same actions, like VS Code's explorer */
 .wp-row-more {
   flex: none;
   width: 22px;
@@ -7773,9 +7776,6 @@ button.wp-commit-title .chev {
 .wp-row-more:hover {
   background: var(--side-active);
   color: var(--text);
-}
-.wp-row:hover .wp-row-more {
-  display: inline-flex;
 }
 
 /* Collapse button for pending approval / AI question cards */
@@ -7825,7 +7825,6 @@ button.wp-commit-title .chev {
 
   /* Larger touch targets */
   .wp-row-more {
-    display: inline-flex;
     width: 28px;
     height: 28px;
   }

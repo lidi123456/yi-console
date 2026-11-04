@@ -9,7 +9,7 @@ import { lsGet, lsSet } from './util';
 // --fs-code (code blocks in replies); editor size drives --fs-editor (CodeMirror, diffs, Markdown preview).
 // Font families (chat.fontFamily / editor.fontFamily / terminal.integrated.fontFamily in VS Code) are comma lists the
 // user types; they go in front of the built-in stacks, which stay as fallbacks, so an unknown or missing font only
-// falls back to today's look. Empty means the default. Chat font: --font-chat; editor font: --font-editor (CodeMirror,
+// falls back to today's look. Empty means the default. Chat font: --font-chat and --font-reply (minimal-style replies, whose default stack differs); editor font: --font-editor (CodeMirror,
 // diffs, code in replies and the Markdown preview); terminal font: xterm's fontFamily.
 // Zoom is the desktop app's page zoom.
 
@@ -82,6 +82,7 @@ function apply() {
   }
   for (const [v, list, base] of [
     ['--font-chat', p.chatFont, 'var(--font)'],
+    ['--font-reply', p.chatFont, 'var(--font-modern)'],
     ['--font-editor', p.editorFont, 'var(--mono)'],
   ] as const) {
     const u = fontList(list);
