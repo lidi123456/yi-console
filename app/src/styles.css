@@ -56,6 +56,9 @@
   --font: system-ui, -apple-system, BlinkMacSystemFont, 'Microsoft YaHei UI', 'PingFang SC', 'Hiragino Sans GB',
     'Noto Sans CJK SC', 'Noto Sans SC', sans-serif;
   --mono: 'Cascadia Mono', 'JetBrains Mono', ui-monospace, 'SF Mono', Menlo, Consolas, 'Microsoft YaHei UI', monospace;
+  /* Chat and editor fonts: overridden per device by fontPrefs.ts */
+  --font-chat: var(--font);
+  --font-editor: var(--mono);
   color-scheme: light;
 }
 
@@ -1333,6 +1336,7 @@ textarea {
    Code blocks, tables and diffs each scroll horizontally on their own */
 .chat {
   flex: 1;
+  font-family: var(--font-chat);
   overflow-y: auto;
   overflow-x: hidden;
   min-height: 0;
@@ -1430,7 +1434,7 @@ textarea {
 }
 
 .md code {
-  font-family: var(--mono);
+  font-family: var(--font-editor);
   font-size: 0.92em;
   background: var(--bg-3);
   padding: 1px 5px;
@@ -4139,6 +4143,7 @@ button.md-rimg-ph:hover {
 }
 
 .composer textarea {
+  font-family: var(--font-chat);
   font-size: var(--fs-input, 14px);
   line-height: calc(var(--fs-input, 14px) + 8px);
   min-height: 66px;
@@ -6828,6 +6833,7 @@ body.resizing .side-resizer::after {
   border-left: 1px solid var(--border);
 }
 .pd {
+  font-family: var(--font-editor);
   font-size: var(--fs-editor);
   line-height: 20px;
   min-width: max-content;
@@ -8106,6 +8112,76 @@ button.wp-commit-title .chev {
   flex: none;
   width: auto;
   min-width: 96px;
+}
+/* Preferences: table of contents on the left, all sections in one scroll on the right (like VS Code's settings editor) */
+.page.prefs {
+  padding-left: max(28px, calc((100% - 1060px) / 2));
+  padding-right: max(28px, calc((100% - 1060px) / 2));
+}
+.prefs-body {
+  display: flex;
+  align-items: flex-start;
+  gap: 28px;
+}
+.prefs-toc {
+  position: sticky;
+  top: 8px;
+  flex: none;
+  width: 148px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding-top: 6px;
+}
+.prefs-toc button {
+  text-align: left;
+  padding: 6px 10px;
+  border-radius: 6px;
+  color: var(--text-2);
+  background: none;
+  border: none;
+}
+.prefs-toc button:hover {
+  background: var(--bg-2);
+  color: var(--text);
+}
+.prefs-toc button.active {
+  background: var(--bg-3);
+  color: var(--text);
+  font-weight: 600;
+}
+.prefs-main {
+  flex: 1;
+  min-width: 0;
+}
+.prefs-main section {
+  scroll-margin-top: 8px;
+}
+.prefs-sec-title {
+  margin: 18px 0 10px;
+  font-size: 15px;
+  font-weight: 600;
+}
+.prefs-main section:first-child .prefs-sec-title {
+  margin-top: 6px;
+}
+@media (max-width: 760px) {
+  .prefs-toc {
+    display: none;
+  }
+}
+/* Font name inputs in the font card */
+.pref-row > .font-input {
+  flex: 0 1 240px;
+  min-width: 140px;
+}
+@media (max-width: 760px) {
+  .pref-row:has(> .font-input) {
+    flex-wrap: wrap;
+  }
+  .pref-row > .font-input {
+    flex: 1 1 100%;
+  }
 }
 /* "Resume session" bar above the input box after the tool process exited abnormally */
 .session-recover {

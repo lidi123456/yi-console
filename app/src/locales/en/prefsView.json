@@ -73,5 +73,16 @@
   "editorFontSizeDesc": "Text size of the workspace file editor, diffs and Markdown preview",
   "defaultSize": "Default ({{size}})",
   "uiZoom": "UI zoom",
-  "uiZoomDesc": "Zoom the whole interface in or out; shortcuts {{mod}} + = / {{mod}} + - / {{mod}} + 0 (reset)"
+  "uiZoomDesc": "Zoom the whole interface in or out; shortcuts {{mod}} + = / {{mod}} + - / {{mod}} + 0 (reset)",
+  "chatFont": "Chat font",
+  "chatFontDesc": "Font of AI replies, your messages and the input box. Separate several fonts with commas, earlier ones win; fonts that aren't installed are skipped. Empty uses the system font",
+  "editorFont": "Editor font",
+  "editorFontDesc": "Font of the file editor, diffs and code in replies. Separate several fonts with commas. Empty uses the default monospace fonts such as Cascadia Mono",
+  "terminalFont": "Terminal font",
+  "terminalFontDesc": "Font of the terminal; a monospace font is recommended. Separate several fonts with commas. Empty uses the default monospace fonts such as Cascadia Mono",
+  "fontPlaceholder": "Default, e.g. {{example}}",
+  "catAppearance": "Appearance",
+  "catTerminal": "Terminal",
+  "catSessions": "Sessions",
+  "catNetwork": "Network"
 }

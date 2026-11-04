@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import {
   DEFAULT_NOTIFY,
   errorToast,
@@ -23,26 +23,86 @@ import { getT, setLangPref, type LangPref, useLang } from '../i18n';
 
 const tx = getT('prefsView');
 
+type Section = { id: string; title: () => string; body: () => React.ReactNode };
+
+// Like VS Code's settings editor: every section on one scrolling page, with a table of contents on the left that
+// jumps to a section and highlights the one being read. The contents are hidden on narrow screens.
+const SECTIONS: Section[] = [
+  {
+    id: 'appearance',
+    title: () => tx('catAppearance'),
+    body: () => (
+      <>
+        <ThemeCard />
+        <FontCard />
+        <ChatStyleCard />
+        <SidebarCard />
+      </>
+    ),
+  },
+  { id: 'terminal', title: () => tx('catTerminal'), body: () => <TermCard /> },
+  { id: 'sessions', title: () => tx('catSessions'), body: () => <HandoffCard /> },
+  { id: 'notifications', title: () => tx('notifications'), body: () => <NotifyCard /> },
+  { id: 'network', title: () => tx('catNetwork'), body: () => <ProxyCard /> },
+  { id: 'about', title: () => tx('about'), body: () => <AboutCard /> },
+];
+
 /** System settings: this device's own preferences (notifications, network proxy), not tied to a host */
 export function PrefsView() {
   useLang();
+  const page = useRef<HTMLDivElement>(null);
+  const [active, setActive] = useState(SECTIONS[0].id);
+  // After a click, keep the clicked entry highlighted while the page scrolls there: a short last section can't
+  // reach the top, so the scroll position alone would pick the one above it
+  const pinned = useRef(0);
+
+  useEffect(() => {
+    const el = page.current;
+    if (!el) return;
+    const onScroll = () => {
+      if (Date.now() < pinned.current) return;
+      const top = el.getBoundingClientRect().top + 48;
+      let cur = SECTIONS[0].id;
+      for (const s of SECTIONS) {
+        const sec = el.querySelector<HTMLElement>(`[data-sec="${s.id}"]`);
+        if (sec && sec.getBoundingClientRect().top <= top) cur = s.id;
+      }
+      if (el.scrollTop + el.clientHeight >= el.scrollHeight - 2) cur = SECTIONS[SECTIONS.length - 1].id;
+      setActive(cur);
+    };
+    el.addEventListener('scroll', onScroll, { passive: true });
+    return () => el.removeEventListener('scroll', onScroll);
+  }, []);
+
+  const jump = (id: string) => {
+    setActive(id);
+    pinned.current = Date.now() + 800;
+    page.current?.querySelector(`[data-sec="${id}"]`)?.scrollIntoView({ block: 'start', behavior: 'smooth' });
+  };
+
   return (
-    <div className="page">
+    <div className="page prefs" ref={page}>
       <div className="page-head">
         <h2>{tx('preferences')}</h2>
       </div>
-      <p className="muted small">
-        {tx('theseSettingsApplyOnlyTo')}
-      </p>
-      <ThemeCard />
-      <FontCard />
-      <NotifyCard />
-      <ChatStyleCard />
-      <SidebarCard />
-      <HandoffCard />
-      <TermCard />
-      <ProxyCard />
-      <AboutCard />
+      <p className="muted small">{tx('theseSettingsApplyOnlyTo')}</p>
+      <div className="prefs-body">
+        <nav className="prefs-toc">
+          {SECTIONS.map((s) => (
+            <button key={s.id} className={active === s.id ? 'active' : ''} onClick={() => jump(s.id)}>
+              {s.title()}
+            </button>
+          ))}
+        </nav>
+        <div className="prefs-main">
+          {SECTIONS.map((s) => (
+            <section key={s.id} data-sec={s.id}>
+              <h3 className="prefs-sec-title">{s.title()}</h3>
+              {s.body()}
+            </section>
+          ))}
+        </div>
+      </div>
     </div>
   );
 }
@@ -118,10 +178,16 @@ function FontCard() {
           {sizes(CHAT_SIZES, '14px')}
         </select>
       </PrefRow>
+      <PrefRow title={tx('chatFont')} desc={tx('chatFontDesc')}>
+        <FontInput value={p.chatFont} example="LXGW WenKai" onSave={(chatFont) => setFontPrefs({ chatFont })} />
+      </PrefRow>
       <PrefRow title={tx('editorFontSize')} desc={tx('editorFontSizeDesc')}>
         <select value={p.editor} onChange={(e) => setFontPrefs({ editor: Number(e.target.value) })}>
           {sizes(EDITOR_SIZES, '12px')}
         </select>
+      </PrefRow>
+      <PrefRow title={tx('editorFont')} desc={tx('editorFontDesc')}>
+        <FontInput value={p.editorFont} example="JetBrains Mono" onSave={(editorFont) => setFontPrefs({ editorFont })} />
       </PrefRow>
       {canZoom && (
         <PrefRow title={tx('uiZoom')} desc={tx('uiZoomDesc', { mod })}>
@@ -139,6 +205,27 @@ function FontCard() {
         </PrefRow>
       )}
     </div>
+  );
+}
+
+/** Comma-separated font names, saved on blur or Enter so the terminal doesn't re-measure on every keystroke */
+function FontInput({ value, example, onSave }: { value: string; example: string; onSave: (v: string) => void }) {
+  const [v, setV] = useState(value);
+  useEffect(() => setV(value), [value]);
+  const save = () => {
+    const next = v.trim();
+    if (next !== value) onSave(next);
+  };
+  return (
+    <input
+      className="font-input"
+      value={v}
+      spellCheck={false}
+      placeholder={tx('fontPlaceholder', { example })}
+      onChange={(e) => setV(e.target.value)}
+      onBlur={save}
+      onKeyDown={(e) => e.key === 'Enter' && (e.currentTarget as HTMLInputElement).blur()}
+    />
   );
 }
 
@@ -240,40 +327,40 @@ function SidebarCard() {
 
 function TermCard() {
   const p = useTermPrefs();
+  const f = useFontPrefs();
   return (
     <div className="card">
       <div className="card-title">{tx('terminalAppearance')}</div>
       <p className="muted small">
         {tx('colorSchemeAndFontSize')}
       </p>
-      <div className="form">
-        <div className="field">
-          <span>{tx('colorScheme')}</span>
-          <div className="seg">
-            {(
-              [
-                ['auto', tx('followUi')],
-                ['dark', tx('dark')],
-                ['light', tx('light')],
-              ] as [TermScheme, string][]
-            ).map(([v, l]) => (
-              <button key={v} className={p.scheme === v ? 'active' : ''} onClick={() => setTermPrefs({ scheme: v })}>
-                {l}
-              </button>
-            ))}
-          </div>
+      <PrefRow title={tx('colorScheme')}>
+        <div className="seg">
+          {(
+            [
+              ['auto', tx('followUi')],
+              ['dark', tx('dark')],
+              ['light', tx('light')],
+            ] as [TermScheme, string][]
+          ).map(([v, l]) => (
+            <button key={v} className={p.scheme === v ? 'active' : ''} onClick={() => setTermPrefs({ scheme: v })}>
+              {l}
+            </button>
+          ))}
         </div>
-        <label>
-          {tx('fontSize')}
-          <select value={p.fontSize} onChange={(e) => setTermPrefs({ fontSize: Number(e.target.value) })}>
-            {[11, 12, 13, 14, 15, 16, 18, 20].map((n) => (
-              <option key={n} value={n}>
-                {`${n}px`}
-              </option>
-            ))}
-          </select>
-        </label>
-      </div>
+      </PrefRow>
+      <PrefRow title={tx('fontSize')}>
+        <select value={p.fontSize} onChange={(e) => setTermPrefs({ fontSize: Number(e.target.value) })}>
+          {[11, 12, 13, 14, 15, 16, 18, 20].map((n) => (
+            <option key={n} value={n}>
+              {`${n}px`}
+            </option>
+          ))}
+        </select>
+      </PrefRow>
+      <PrefRow title={tx('terminalFont')} desc={tx('terminalFontDesc')}>
+        <FontInput value={f.termFont} example="Sarasa Term SC" onSave={(termFont) => setFontPrefs({ termFont })} />
+      </PrefRow>
     </div>
   );
 }
@@ -342,9 +429,6 @@ function NotifyCard() {
   const off = !n.enabled;
   return (
     <div className="card">
-      <div className="card-title">
-        <Icon name="bell" size={16} /> {tx('notifications')}
-      </div>
       <PrefRow
         title={tx('systemNotifications')}
         desc={tx('showSystemNotificationsWhenAi')}
@@ -455,7 +539,6 @@ function AboutCard() {
   const local = hosts.find((h) => h.config.kind === 'local');
   return (
     <div className="card">
-      <div className="card-title">{tx('about')}</div>
       <div className="small">
         Yi Console {local?.status.clientVersion ?? ''}
         {local?.status.hello && ` · ${tx('local')} yi-agentd ${local.status.hello.daemonVersion}`}

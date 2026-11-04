@@ -11,6 +11,7 @@ import { rpc } from '../transport';
 import { lsGet, lsSet, toB64 } from '../util';
 import { openMenu } from './Overlay';
 import { isAppDark, onThemeChange, useTheme } from '../theme';
+import { termFontFamily, useFontPrefs } from '../fontPrefs';
 
 const t = getT('terminalView');
 
@@ -135,6 +136,7 @@ export function TerminalView({ hostId, sessionId, running }: { hostId: string; s
   const el = useRef<HTMLDivElement>(null);
   const termRef = useRef<Terminal | null>(null);
   const prefs = useTermPrefs();
+  const { termFont } = useFontPrefs();
   useTheme();
   const dark = isDark(prefs.scheme);
   const fitRef = useRef<() => void>(() => {});
@@ -211,9 +213,7 @@ export function TerminalView({ hostId, sessionId, running }: { hostId: string; s
   useEffect(() => {
     const p = termPrefs();
     const term = new Terminal({
-      // Like Windows Terminal, prefer Cascadia Mono, with CJK falling back to YaHei / PingFang
-      fontFamily:
-        '"Cascadia Mono", "Cascadia Code", Consolas, "SF Mono", Menlo, "JetBrains Mono", "Microsoft YaHei UI", "PingFang SC", monospace',
+      fontFamily: termFontFamily(),
       fontSize: p.fontSize,
       lineHeight: 1.2,
       cursorBlink: true,
@@ -404,16 +404,18 @@ export function TerminalView({ hostId, sessionId, running }: { hostId: string; s
     if (scroll.inTmux && termRef.current) termRef.current.options.scrollback = 0;
   }, [scroll.inTmux]);
 
-  // Settings changed: switch color scheme and font size
+  // Settings changed: switch color scheme, font size and font
   useEffect(() => {
     const t = termRef.current;
     if (!t) return;
     t.options.theme = dark ? DARK : LIGHT;
-    if (t.options.fontSize !== prefs.fontSize) {
+    const family = termFontFamily();
+    if (t.options.fontSize !== prefs.fontSize || t.options.fontFamily !== family) {
       t.options.fontSize = prefs.fontSize;
+      t.options.fontFamily = family;
       fitRef.current();
     }
-  }, [dark, prefs.fontSize]);
+  }, [dark, prefs.fontSize, termFont]);
 
   const copy = () => {
     const t = termRef.current?.getSelection();

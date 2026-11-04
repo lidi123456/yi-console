@@ -72,5 +72,16 @@
   "editorFontSizeDesc": "工作区文件编辑器、diff 和 Markdown 预览的文字大小",
   "defaultSize": "默认（{{size}}）",
   "uiZoom": "界面缩放",
-  "uiZoomDesc": "整个界面一起放大缩小，快捷键 {{mod}} + = / {{mod}} + - / {{mod}} + 0（还原）"
+  "uiZoomDesc": "整个界面一起放大缩小，快捷键 {{mod}} + = / {{mod}} + - / {{mod}} + 0（还原）",
+  "chatFont": "对话字体",
+  "chatFontDesc": "AI 回复、你的消息和输入框的字体。逗号分隔多个字体，排在前面的优先；找不到的字体会跳过，留空用系统字体",
+  "editorFont": "编辑器字体",
+  "editorFontDesc": "文件编辑器、diff 和回复里代码的字体。逗号分隔多个字体，留空用 Cascadia Mono 等默认等宽字体",
+  "terminalFont": "终端字体",
+  "terminalFontDesc": "终端的字体，建议用等宽字体。逗号分隔多个字体，留空用 Cascadia Mono 等默认等宽字体",
+  "fontPlaceholder": "默认，例如 {{example}}",
+  "catAppearance": "外观",
+  "catTerminal": "终端",
+  "catSessions": "会话",
+  "catNetwork": "网络"
 }

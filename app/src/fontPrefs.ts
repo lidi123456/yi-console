@@ -7,9 +7,20 @@ import { lsGet, lsSet } from './util';
 // plus window zoom. A size of 0 means the stylesheet default (chat text is a little larger on phones).
 // Chat size drives the reply text, headings, user bubbles and input box (--fs-body / --fs-chat / --fs-input) and
 // --fs-code (code blocks in replies); editor size drives --fs-editor (CodeMirror, diffs, Markdown preview).
+// Font families (chat.fontFamily / editor.fontFamily / terminal.integrated.fontFamily in VS Code) are comma lists the
+// user types; they go in front of the built-in stacks, which stay as fallbacks, so an unknown or missing font only
+// falls back to today's look. Empty means the default. Chat font: --font-chat; editor font: --font-editor (CodeMirror,
+// diffs, code in replies and the Markdown preview); terminal font: xterm's fontFamily.
 // Zoom is the desktop app's page zoom.
 
-export type FontPrefs = { chat: number; editor: number; zoom: number };
+export type FontPrefs = {
+  chat: number;
+  editor: number;
+  zoom: number;
+  chatFont: string;
+  editorFont: string;
+  termFont: string;
+};
 
 const KEY = 'ui-font';
 const EVENT = 'ah:font';
@@ -22,7 +33,29 @@ export const ZOOM_MAX = 6;
 export const canZoom = isTauri && !isMobileApp;
 
 export function getFontPrefs(): FontPrefs {
-  return { chat: 0, editor: 0, zoom: 0, ...lsGet<Partial<FontPrefs>>(KEY, {}) };
+  return { chat: 0, editor: 0, zoom: 0, chatFont: '', editorFont: '', termFont: '', ...lsGet<Partial<FontPrefs>>(KEY, {}) };
+}
+
+const GENERIC = new Set(['serif', 'sans-serif', 'monospace', 'cursive', 'fantasy', 'system-ui', 'ui-monospace', 'ui-sans-serif', 'ui-serif']);
+
+/** "JetBrains Mono, 'Sarasa Mono SC'" -> `"JetBrains Mono", "Sarasa Mono SC"`; names are quoted so nothing else in the
+ * input can reach the CSS value. Empty input gives "". */
+export function fontList(input: string): string {
+  return input
+    .split(',')
+    .map((f) => f.trim().replace(/^["']|["']$/g, '').trim())
+    .filter(Boolean)
+    .map((f) => (GENERIC.has(f.toLowerCase()) ? f.toLowerCase() : `"${f.replace(/["\\]/g, '')}"`))
+    .join(', ');
+}
+
+// Like Windows Terminal, prefer Cascadia Mono, with CJK falling back to YaHei / PingFang
+const TERM_FONT = '"Cascadia Mono", "Cascadia Code", Consolas, "SF Mono", Menlo, "JetBrains Mono", "Microsoft YaHei UI", "PingFang SC", monospace';
+
+/** xterm's fontFamily: the user's fonts, then the built-in stack */
+export function termFontFamily(): string {
+  const u = fontList(getFontPrefs().termFont);
+  return u ? `${u}, ${TERM_FONT}` : TERM_FONT;
 }
 
 export const zoomFactor = (level: number) => Math.pow(1.2, level);
@@ -46,6 +79,14 @@ function apply() {
   } else {
     s.removeProperty('--fs-editor');
     s.removeProperty('--lh-editor');
+  }
+  for (const [v, list, base] of [
+    ['--font-chat', p.chatFont, 'var(--font)'],
+    ['--font-editor', p.editorFont, 'var(--mono)'],
+  ] as const) {
+    const u = fontList(list);
+    if (u) s.setProperty(v, `${u}, ${base}`);
+    else s.removeProperty(v);
   }
   if (canZoom) {
     import('@tauri-apps/api/webview')

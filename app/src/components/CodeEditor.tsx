@@ -56,7 +56,7 @@ export const theme = EditorView.theme({
   // Editor font size and line height are per-device preferences (fontPrefs.ts)
   '&': { height: '100%', fontSize: 'var(--fs-editor)', backgroundColor: 'var(--bg)', color: 'var(--text)' },
   '&.cm-focused': { outline: 'none' },
-  '.cm-scroller': { fontFamily: 'var(--mono)', lineHeight: 'var(--lh-editor)' },
+  '.cm-scroller': { fontFamily: 'var(--font-editor)', lineHeight: 'var(--lh-editor)' },
   '.cm-content': { padding: '4px 0', caretColor: 'var(--text)' },
   '.cm-gutters': { backgroundColor: 'var(--bg)', color: 'var(--text-3)', border: 'none' },
   '.cm-lineNumbers .cm-gutterElement': { padding: '0 4px 0 16px', minWidth: '36px' },
