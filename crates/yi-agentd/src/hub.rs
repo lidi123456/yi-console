@@ -443,7 +443,9 @@ impl Hub {
             extra_args,
             cols,
             rows,
-            tmux: (info.mode == SessionMode::Terminal || info.tool == ToolKind::Shell)
+            // tmux keeps AI terminal sessions and standalone shells alive across daemon restarts. Bottom-panel shells
+            // (parent_id set) run as plain ptys, like VS Code's integrated terminal
+            tmux: ((info.mode == SessionMode::Terminal || info.tool == ToolKind::Shell) && info.parent_id.is_none())
                 .then_some(())
                 .filter(|_| settings.terminal_tmux.unwrap_or(true) && crate::tmux::program().is_some())
                 .map(|_| crate::tmux::session_name(&info.id)),

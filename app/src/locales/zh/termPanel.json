@@ -11,5 +11,9 @@
   "retry": "重试",
   "openingTerminal": "正在打开终端…",
   "noTerminals": "还没有终端",
-  "openATerminalInThe": "在当前会话的工作目录中打开一个终端。"
+  "openATerminalInThe": "在当前会话的工作目录中打开一个终端。",
+  "processExited": "终端进程已退出：{{reason}}",
+  "unknownReason": "原因未知",
+  "restart": "重新启动",
+  "close": "关闭"
 }

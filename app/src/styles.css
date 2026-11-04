@@ -4900,6 +4900,21 @@ body.resizing-y {
 .term-panel-empty b {
   font-weight: 500;
 }
+/* Bar over a terminal whose process exited abnormally, like VS Code's "terminal process terminated with exit code" */
+.term-panel-exit {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  border-top: 1px solid var(--border);
+  background: var(--err-soft);
+  color: var(--err);
+  font-size: 12px;
+}
+.term-panel-exit span {
+  flex: 1;
+  min-width: 0;
+}
 
 @media (max-width: 760px) {
   .term-panel {

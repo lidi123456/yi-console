@@ -1238,6 +1238,7 @@ export default interface Resources {
     "yiAgentdOnHasBeen": "{{name}} 的 yi-agentd 已升级到新版本"
   },
   "termPanel": {
+    "close": "关闭",
     "closeTerminal": "删除终端 {{title}}",
     "exited": "{{title}}（已退出）",
     "exited2": "已退出",
@@ -1247,10 +1248,13 @@ export default interface Resources {
     "noTerminals": "还没有终端",
     "openATerminalInThe": "在当前会话的工作目录中打开一个终端。",
     "openingTerminal": "正在打开终端…",
+    "processExited": "终端进程已退出：{{reason}}",
+    "restart": "重新启动",
     "retry": "重试",
     "terminal": "终端",
     "terminalPanel": "终端面板",
-    "terminalTabs": "终端列表"
+    "terminalTabs": "终端列表",
+    "unknownReason": "原因未知"
   },
   "terminalView": {
     "bottomLines": "↓ 回到底部 · 上翻 {{position}} 行",

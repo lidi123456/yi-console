@@ -11,5 +11,9 @@
   "retry": "Retry",
   "openingTerminal": "Opening terminal…",
   "noTerminals": "No terminals",
-  "openATerminalInThe": "Open a terminal in the session working directory."
+  "openATerminalInThe": "Open a terminal in the session working directory.",
+  "processExited": "The terminal process exited: {{reason}}",
+  "unknownReason": "unknown reason",
+  "restart": "Restart",
+  "close": "Close"
 }

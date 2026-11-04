@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { getT } from '../i18n';
-import { errorToast, loadSession, useStore } from '../store';
+import { errorToast, getSession, loadSession, skey, useStore } from '../store';
 import { rpc } from '../transport';
 import type { SessionInfo } from '../types';
 import { lsGet, lsSet } from '../util';
@@ -10,13 +10,18 @@ import { TermTools, TerminalView } from './TerminalView';
 const tx = getT('termPanel');
 
 // Terminal panel at the bottom of the session page: opens shells in the chat's working directory; several can be open, switched with tabs.
-// Each terminal is a shell session whose parentId points at the chat session; not listed separately in the sidebar, deleted along with the chat
+// Each terminal is a shell session whose parentId points at the chat session; not listed separately in the sidebar, deleted along with the chat.
+// Like VS Code's integrated terminal these are plain ptys, not tmux (yi-agentd skips tmux when parentId is set), so they
+// end when yi-agentd restarts. Exits follow VS Code: a clean exit (`exit`, Ctrl+D, or a daemon restart) closes the tab,
+// an abnormal one keeps it with the reason and a restart button; opening the panel with no live terminal starts one.
 
 const EMPTY: SessionInfo[] = [];
 
 export function TermPanel({ hostId, info, onClose }: { hostId: string; info: SessionInfo; onClose: () => void }) {
   const all = useStore((s) => s.sessions[hostId]) ?? EMPTY;
-  const tabs = all.filter((s) => s.parentId === info.id).sort((a, b) => a.createdAt - b.createdAt);
+  const mine = all.filter((s) => s.parentId === info.id).sort((a, b) => a.createdAt - b.createdAt);
+  // Cleanly exited terminals are being closed (below): leave them out right away
+  const tabs = mine.filter((s) => s.status !== 'exited');
   const [active, setActive] = useState<string>(() => lsGet(`term-tab-${info.id}`, ''));
   const [creating, setCreating] = useState(false);
   const [error, setError] = useState('');
@@ -51,6 +56,18 @@ export function TermPanel({ hostId, info, onClose }: { hostId: string; info: Ses
   };
 
   const remove = (id: string) => rpc(hostId, 'session.delete', { sessionId: id }).catch(errorToast);
+
+  // Close cleanly exited terminals, like VS Code closing the tab when the shell exits with code 0
+  const closing = useRef(new Set<string>());
+  useEffect(() => {
+    for (const s of mine) {
+      if (s.status !== 'exited' || closing.current.has(s.id)) continue;
+      closing.current.add(s.id);
+      rpc(hostId, 'session.delete', { sessionId: s.id }).catch(() => closing.current.delete(s.id));
+    }
+  });
+
+  const restart = (id: string) => rpc(hostId, 'session.resume', { sessionId: id, cols: 120, rows: 12 }).catch(errorToast);
 
   // Open one automatically the first time if there are no terminals
   const auto = useRef(false);
@@ -95,7 +112,7 @@ export function TermPanel({ hostId, info, onClose }: { hostId: string; info: Ses
       <div className="term-panel-head">
         <div className="term-tabs" role="tablist" aria-label={tx('terminalTabs')}>
           {tabs.map((t) => {
-            const exited = t.status === 'exited' || t.status === 'error';
+            const exited = t.status === 'error';
             return (
               <div
                 key={t.id}
@@ -132,12 +149,20 @@ export function TermPanel({ hostId, info, onClose }: { hostId: string; info: Ses
       </div>
       <div className="term-panel-body">
         {cur ? (
-          <TerminalView
-            key={cur.id}
-            hostId={hostId}
-            sessionId={cur.id}
-            running={cur.status !== 'exited' && cur.status !== 'error'}
-          />
+          <>
+            <TerminalView key={cur.id} hostId={hostId} sessionId={cur.id} running={cur.status !== 'error'} />
+            {cur.status === 'error' && (
+              <div className="term-panel-exit">
+                <span>{tx('processExited', { reason: lastError(hostId, cur.id) || tx('unknownReason') })}</span>
+                <button className="btn small" onClick={() => restart(cur.id)}>
+                  {tx('restart')}
+                </button>
+                <button className="btn small" onClick={() => remove(cur.id)}>
+                  {tx('close')}
+                </button>
+              </div>
+            )}
+          </>
         ) : error ? (
           <div className="term-panel-empty">
             <b>{tx('failedToCreateTerminal')}</b>
@@ -160,4 +185,14 @@ export function TermPanel({ hostId, info, onClose }: { hostId: string; info: Ses
       </div>
     </div>
   );
+}
+
+/** The error yi-agentd recorded when the process exited (e.g. "进程退出，退出码 1") */
+function lastError(hostId: string, sid: string): string {
+  const ev = getSession(skey(hostId, sid)).events;
+  for (let i = ev.length - 1; i >= 0; i--) {
+    const e = ev[i];
+    if (e.kind === 'error') return e.message;
+  }
+  return '';
 }
