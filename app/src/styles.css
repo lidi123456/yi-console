@@ -5557,7 +5557,7 @@ body.resizing .side-resizer::after {
 
 /* ---- Compact chat style: steps folded into groups, no timeline dots on the body ---- */
 .chat.modern .chat-inner {
-  /* Body column 768px wide, same as Qoder */
+  /* Body column 768px wide */
   max-width: calc(768px + 56px);
   gap: 16px;
 }
@@ -5569,7 +5569,7 @@ body.resizing .side-resizer::after {
   display: none;
 }
 /* Body typography: 14px / 26px line height, 14px between blocks, lists indented 20px with 6px between items, inline code 13px on light grey,
-   system UI font (Chinese falls back to Microsoft YaHei on Windows). YaHei strokes get cramped at 13px, so this is one size up from Qoder's "small" setting */
+   Segoe UI for Latin text with Chinese in Microsoft YaHei on Windows (--font-reply). YaHei strokes get cramped at 13px, hence 14px */
 .chat.modern .msg-assistant {
   --m-fs: var(--fs-chat, 14px);
   --m-lh: calc(var(--m-fs) + 12px);
