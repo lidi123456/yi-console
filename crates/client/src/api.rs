@@ -517,6 +517,14 @@ impl ClientHub {
             ("session.unsubscribe", Some(sid)) => {
                 c.subs.lock().unwrap().remove(&sid);
             }
+            // Keep the cached host status in step, so a later host.status replay doesn't bring back the old tool list.
+            // No event here: a connected host.status makes the frontend refetch sessions; the caller updates its own state
+            ("tools.detect", _) => {
+                let mut st = c.status.lock().unwrap();
+                if st["hello"].is_object() {
+                    st["hello"]["tools"] = r.clone();
+                }
+            }
             _ => {}
         }
         Ok(r)

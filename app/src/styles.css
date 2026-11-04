@@ -930,6 +930,25 @@ textarea {
   color: var(--text-2);
 }
 
+.field-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.tool-redetect {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+}
+
+.tool-redetect .spinner {
+  width: 11px;
+  height: 11px;
+}
+
 .form label.check {
   flex-direction: row;
   align-items: center;

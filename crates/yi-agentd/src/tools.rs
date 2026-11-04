@@ -19,7 +19,10 @@ fn binary_names(kind: ToolKind) -> &'static [&'static str] {
 
 /// Processes started by systemd / launchd have a short PATH without directories like nvm or ~/.local/bin,
 /// and don't get API keys exported in rc files (e.g. CURSOR_API_KEY) either.
-/// At startup, fetch the environment once from a login shell: merge PATH, and only fill in other variables that are missing; then add common install directories.
+/// Fetch the environment from a login shell: merge PATH, and only fill in other variables that are missing; then add common install directories.
+/// On Windows, merge the current user and system PATH from the registry instead, since the daemon's inherited PATH
+/// predates any installer that ran after it started.
+/// Runs at startup and again on `tools.detect`, so tools installed while the daemon runs are found without restarting it.
 pub fn fix_path() {
     #[cfg(unix)]
     let login = login_shell_env();
@@ -45,6 +48,11 @@ pub fn fix_path() {
         for p in std::env::split_paths(login) {
             push_unique(&mut parts, p);
         }
+    }
+
+    #[cfg(windows)]
+    for p in registry_path() {
+        push_unique(&mut parts, p);
     }
 
     let home = crate::paths::home();
@@ -76,15 +84,65 @@ pub fn fix_path() {
             push_unique(&mut parts, p);
         }
     }
+    // Only write when something changed: on refresh other threads are running, and set_var races with C code calling getenv
     if let Ok(joined) = std::env::join_paths(parts) {
-        std::env::set_var("PATH", joined);
+        if std::env::var_os("PATH").as_deref() != Some(joined.as_os_str()) {
+            std::env::set_var("PATH", joined);
+        }
     }
 }
 
 fn push_unique(v: &mut Vec<PathBuf>, p: PathBuf) {
-    if !p.as_os_str().is_empty() && !v.contains(&p) {
+    // Windows paths are case-insensitive, and PATH entries often differ only by a trailing backslash
+    let key = |p: &Path| {
+        let s = p.to_string_lossy();
+        let s = s.trim_end_matches(['\\', '/']);
+        if cfg!(windows) { s.to_lowercase() } else { s.to_string() }
+    };
+    if p.as_os_str().is_empty() {
+        return;
+    }
+    let k = key(&p);
+    if !v.iter().any(|x| key(x) == k) {
         v.push(p);
     }
+}
+
+/// System PATH followed by user PATH from the registry (the order Windows uses for new processes), with %VARS% expanded
+#[cfg(windows)]
+fn registry_path() -> Vec<PathBuf> {
+    use windows_sys::Win32::System::Registry::{RegGetValueW, HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ};
+    fn wide(s: &str) -> Vec<u16> {
+        s.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+    fn read(root: HKEY, sub: &str) -> Option<String> {
+        const ERROR_MORE_DATA: u32 = 234;
+        let (sub, name) = (wide(sub), wide("Path"));
+        let mut buf = vec![0u16; 4096];
+        loop {
+            let mut len = (buf.len() * 2) as u32;
+            // Without RRF_NOEXPAND, REG_EXPAND_SZ values are expanded and returned as REG_SZ
+            let r = unsafe {
+                RegGetValueW(root, sub.as_ptr(), name.as_ptr(), RRF_RT_REG_SZ, std::ptr::null_mut(), buf.as_mut_ptr().cast(), &mut len)
+            };
+            match r {
+                0 => {
+                    let n = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+                    return Some(String::from_utf16_lossy(&buf[..n]));
+                }
+                ERROR_MORE_DATA if buf.len() < 1 << 20 => buf.resize(buf.len() * 4, 0),
+                _ => return None,
+            }
+        }
+    }
+    [
+        read(HKEY_LOCAL_MACHINE, r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment"),
+        read(HKEY_CURRENT_USER, "Environment"),
+    ]
+    .into_iter()
+    .flatten()
+    .flat_map(|s| s.split(';').map(str::trim).filter(|x| !x.is_empty()).map(PathBuf::from).collect::<Vec<_>>())
+    .collect()
 }
 
 /// Variables that belong only to that shell process and shouldn't be carried into the daemon
@@ -273,5 +331,30 @@ mod tests {
             v,
             vec![("A".into(), "1".into()), ("KEY".into(), "x=y".into()), ("MULTI".into(), "a\nb".into())]
         );
+    }
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::*;
+
+    #[test]
+    fn push_unique_ignores_trailing_slash() {
+        let mut v = vec![PathBuf::from("/a/bin")];
+        push_unique(&mut v, PathBuf::from("/a/bin/"));
+        push_unique(&mut v, PathBuf::new());
+        assert_eq!(v.len(), 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn registry_path_is_read_and_expanded() {
+        let p = registry_path();
+        // The system PATH always has System32; %SystemRoot% must have been expanded
+        assert!(p.iter().any(|x| x.to_string_lossy().to_lowercase().ends_with(r"\system32")), "{p:?}");
+        assert!(p.iter().all(|x| !x.to_string_lossy().contains('%')), "{p:?}");
+        let mut v = vec![PathBuf::from(r"C:\Windows\System32")];
+        push_unique(&mut v, PathBuf::from(r"c:\windows\system32\"));
+        assert_eq!(v.len(), 1);
     }
 }

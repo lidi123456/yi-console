@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { useBack } from '../back';
 import { getT, isEn } from '../i18n';
-import { errorToast, hostStatus, navigate, setState, useStore } from '../store';
+import { errorToast, hostStatus, navigate, redetectTools, setState, useStore } from '../store';
 import { rpc } from '../transport';
 import { TOOL_LABEL, type DirEntry, type ModelOption, type SessionInfo, type SessionMode, type ToolKind } from '../types';
 import { lsGet, lsSet, shortPath } from '../util';
@@ -137,6 +137,7 @@ export function NewSessionDialog() {
   const [command, setCommand] = useState('');
   const [picking, setPicking] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [detecting, setDetecting] = useState(false);
   const [models, setModels] = useState<ModelOption[] | null>(null);
   const [customModel, setCustomModel] = useState(false);
 
@@ -297,7 +298,28 @@ export function NewSessionDialog() {
               </label>
             )}
             <div className="field">
-              <span>{tx('tool')}</span>
+              <span className="field-head">
+                {tx('tool')}
+                <button
+                  type="button"
+                  className="link-btn tool-redetect"
+                  disabled={detecting || !hostId}
+                  title={tx('redetectToolsHint')}
+                  onClick={async () => {
+                    setDetecting(true);
+                    try {
+                      await redetectTools(hostId);
+                    } catch (e) {
+                      errorToast(e);
+                    } finally {
+                      setDetecting(false);
+                    }
+                  }}
+                >
+                  {detecting ? <span className="spinner" /> : <Icon name="refresh" size={12} />}
+                  {detecting ? tx('redetecting') : tx('redetectTools')}
+                </button>
+              </span>
               <div className="tool-grid">
                 {tools.map((t) => (
                   <button

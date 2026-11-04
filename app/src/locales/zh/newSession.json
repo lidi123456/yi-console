@@ -33,5 +33,8 @@
   "starting": "启动中…",
   "creating": "创建中…",
   "resume": "继续",
-  "create": "创建"
+  "create": "创建",
+  "redetectTools": "重新检测",
+  "redetecting": "检测中…",
+  "redetectToolsHint": "刚装好的工具没出现时点这里：重新读取 PATH 并扫描这台主机上的工具"
 }

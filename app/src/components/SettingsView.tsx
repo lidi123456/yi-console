@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { getT, isEn } from '../i18n';
 import { Icon } from './Icon';
-import { errorToast, invalidateSnippets, toast, useStore } from '../store';
+import { errorToast, invalidateSnippets, redetectTools, toast, useStore } from '../store';
 import { rpc } from '../transport';
 import { TOOL_LABEL, type DaemonSettings, type Snippet, type StatusLineSettings, type ToolKind } from '../types';
 import { DEFAULT_STATUS_LINE, getStatusFields, invalidateStatusLine, TEMPLATE_VARS } from './StatusLine';
@@ -42,7 +42,7 @@ export function SettingsView({ hostId }: { hostId: string }) {
       const snippets = s.snippets.filter((x) => x.name.trim() && x.text.trim()).map((x) => ({ name: x.name.trim(), text: x.text }));
       await rpc(hostId, 'settings.set', { ...s, tools, snippets });
       invalidateSnippets(hostId);
-      await rpc(hostId, 'tools.detect');
+      await redetectTools(hostId);
       invalidateStatusLine(hostId);
       toast(t('saved'));
     } catch (e) {

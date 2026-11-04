@@ -33,5 +33,8 @@
   "starting": "Starting…",
   "creating": "Creating…",
   "resume": "Resume",
-  "create": "Create"
+  "create": "Create",
+  "redetectTools": "Re-detect",
+  "redetecting": "Detecting…",
+  "redetectToolsHint": "Just installed a tool and it isn't listed? Rereads PATH and scans this host for tools again"
 }

@@ -198,7 +198,14 @@ pub async fn dispatch(
         }
         TOOLS_DETECT => {
             let hub2 = hub.clone();
-            serde_json::to_value(tokio::task::spawn_blocking(move || tools(&hub2, true)).await?)?
+            // Rebuild PATH first so tools installed after the daemon started are found
+            serde_json::to_value(
+                tokio::task::spawn_blocking(move || {
+                    crate::tools::fix_path();
+                    tools(&hub2, true)
+                })
+                .await?,
+            )?
         }
         SESSION_LIST => serde_json::to_value(hub.list())?,
         SESSION_CREATE => {

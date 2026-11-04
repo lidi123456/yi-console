@@ -6,7 +6,7 @@ import { useSyncExternalStore } from 'react';
 import { getLang, getT, onLangChange, trErr } from './i18n';
 import { fmtAt } from './limit';
 import { hubCall, onHubEvent, rpc, isTauri } from './transport';
-import type { ClientSettings, HostConfig, HostStatus, HubEvent, NotifyPrefs, SessionInfo, Snippet, ToolKind } from './types';
+import type { ClientSettings, HostConfig, HostStatus, HubEvent, NotifyPrefs, SessionInfo, Snippet, ToolInfo, ToolKind } from './types';
 
 const t = getT('store');
 
@@ -396,6 +396,16 @@ function upsertSession(hostId: string, info: SessionInfo) {
 
 export function hostStatus(hostId: string): HostStatus {
   return state.hosts.find((h) => h.config.id === hostId)?.status ?? {};
+}
+
+/** Re-detect installed tools on a host (yi-agentd rebuilds its PATH first) and update the host's tool list */
+export async function redetectTools(hostId: string): Promise<void> {
+  const tools = await rpc<ToolInfo[]>(hostId, 'tools.detect');
+  setState((s) => ({
+    hosts: s.hosts.map((h) =>
+      h.config.id === hostId && h.status.hello ? { ...h, status: { ...h.status, hello: { ...h.status.hello, tools } } } : h,
+    ),
+  }));
 }
 
 export function sessionInfo(hostId: string, sid: string): SessionInfo | undefined {
