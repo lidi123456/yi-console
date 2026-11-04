@@ -163,9 +163,9 @@
 }
 
 /* Scrollbars: thin rounded slider (4px drawn inside an 8px bar, inset by a transparent border), no track.
-   The slider is hidden until the element scrolls
-   (scrollbars.ts sets data-scrolling for a moment; a :hover rule wouldn't work, Chromium doesn't repaint the scrollbar
-   on hover), or until the pointer is on the slider itself. Desktop only: on touch devices ::-webkit-scrollbar would turn the overlay scrollbar into a fixed one.
+   Like VS Code, the slider shows while the mouse is over the scrollable element and while it scrolls, and fades shortly after
+   (scrollbars.ts sets data-scroll-hover / data-scrolling; a :hover rule wouldn't work, Chromium doesn't repaint the scrollbar
+   on hover). Desktop only: on touch devices ::-webkit-scrollbar would turn the overlay scrollbar into a fixed one.
    Don't set scrollbar-width / scrollbar-color on these elements: in Chromium the standard properties override ::-webkit-scrollbar */
 @media (hover: hover) and (pointer: fine) {
   ::-webkit-scrollbar {
@@ -183,7 +183,8 @@
     border-radius: 4px;
     min-height: 28px;
   }
-  [data-scrolling]::-webkit-scrollbar-thumb {
+  [data-scrolling]::-webkit-scrollbar-thumb,
+  [data-scroll-hover]::-webkit-scrollbar-thumb {
     background: var(--sb-thumb);
   }
   ::-webkit-scrollbar-thumb:hover {
