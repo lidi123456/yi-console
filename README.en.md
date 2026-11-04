@@ -8,6 +8,10 @@
 
 ---
 
+https://github.com/user-attachments/assets/52adcbc2-4c73-4164-8b36-76c213bd91c9
+
+*56-second walkthrough: create a tool session, describe a task, review the Git diff and page preview, then switch to the mobile layout. English interface and captions; no audio.*
+
 AI coding tools like Claude Code and Codex live in the terminal. Several sessions mean several terminal windows; switch computers or close the terminal and a half-finished task is out of sight; checking progress from your phone is a hassle.
 
 Yi Console brings them together:
