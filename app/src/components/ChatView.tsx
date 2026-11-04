@@ -11,7 +11,7 @@ import { openImage } from './Lightbox';
 import { imageMenu } from './ImageMenu';
 import { Icon } from './Icon';
 import { parseTextQuestions, QuestionCard, textAnswer } from './QuestionCard';
-import { PLAN_TOOLS, PlanTracker, viewEntries, type PlanState } from '../plan';
+import { isPlanTool, PlanTracker, viewEntries, type PlanState } from '../plan';
 import { limitHead, limitOutcome, type LimitEvent } from '../limit';
 
 const t = getT('chatView');
@@ -1276,7 +1276,7 @@ export function ChatView({
   const modern = useChatStyle() === 'modern';
   const blocks: (Block | MBlock)[] = useMemo(() => {
     // Task-type tool calls are shown by the task list instead; failed ones are shown as usual
-    const list = shown.filter((x) => !(x.k === 'tool' && PLAN_TOOLS.has(x.name) && !x.result?.isError));
+    const list = shown.filter((x) => !(x.k === 'tool' && isPlanTool(x.name, x.input) && !x.result?.isError));
     return modern ? groupRuns(list) : foldRuns(list);
   }, [items, limit, modern]);
   // Only tools in the last turn (which has no turn end yet) can still be running

@@ -1,6 +1,8 @@
 // Task lists: normalize every tool's task list into { title, entries }.
 // - Claude TodoWrite, Codex turn/plan/updated, ACP plan: yi-agentd already turns these into plan events, use them directly
 // - Kiro's todo_list tool: each call's result is the full list (only done / not done), and it's cleared once everything is done
+// - Cursor ACP: a plain tool call whose rawInput is {_toolName:"updateTodos", todos:[{id, content, status:"TODO_STATUS_*"}]};
+//   each call carries only the items it changes (merged by id), and the same call is resent while its input streams in
 // - Newer Claude TaskCreate / TaskUpdate: creation returns a number in the result ("Task #N created successfully: …"), later updates change status by number
 import type { HubEvent, PlanEntry } from './types';
 
@@ -15,6 +17,12 @@ export interface PlanState {
 export const PLAN_TOOLS = new Set(['TodoWrite', 'todo_list', 'TaskCreate', 'TaskUpdate']);
 
 type Rec = Record<string, unknown>;
+
+const isCursorTodos = (input: unknown) => !!input && typeof input === 'object' && (input as Rec)._toolName === 'updateTodos';
+
+/** Tool calls that the task list shows instead (by name, or Cursor's updateTodos by its input) */
+export const isPlanTool = (name: string, input: unknown) => PLAN_TOOLS.has(name) || isCursorTodos(input);
+
 const str = (v: unknown) => (typeof v === 'string' ? v : v == null ? '' : String(v));
 
 /** Kiro todo_list result: {"items":[{"Json":{description, tasks:[{id, task_description, completed}]}}]}, possibly wrapped in another string */
@@ -43,6 +51,10 @@ export class PlanTracker {
   private calls = new Map<string, { name: string; input: Rec }>();
   /** Tasks created by Claude TaskCreate, keyed by number, in creation order */
   private tasks = new Map<string, PlanEntry>();
+  /** Cursor's list keyed by todo id, in first-seen order */
+  private todos = new Map<string, PlanEntry>();
+  /** Cursor: the list as it was before each updateTodos call, so a resent (growing) call is merged once, not again on top of itself */
+  private todoBase = new Map<string, Map<string, PlanEntry>>();
 
   /** Process one event; returns true if the task list changed */
   feed(e: HubEvent): boolean {
@@ -51,11 +63,14 @@ export class PlanTracker {
         this.plan = null;
         this.calls.clear();
         this.tasks.clear();
+        this.todos.clear();
+        this.todoBase.clear();
         return false;
       case 'plan':
         this.plan = { entries: e.entries };
         return true;
       case 'tool_call': {
+        if (isCursorTodos(e.input)) return this.cursorTodos(e.id, e.input as Rec);
         if (!PLAN_TOOLS.has(e.name)) return false;
         const input = (e.input && typeof e.input === 'object' ? e.input : {}) as Rec;
         this.calls.set(e.id, { name: e.name, input });
@@ -103,6 +118,31 @@ export class PlanTracker {
       }
     }
     return false;
+  }
+
+  private cursorTodos(callId: string, input: Rec): boolean {
+    const items = Array.isArray(input.todos) ? (input.todos as Rec[]) : [];
+    let base = this.todoBase.get(callId);
+    if (!base) {
+      base = new Map([...this.todos].map(([k, v]) => [k, { ...v }]));
+      this.todoBase.set(callId, base);
+    }
+    const status = (v: unknown) => str(v).replace(/^TODO_STATUS_/, '').toLowerCase();
+    // Once every item is done, a call bringing unfinished items starts a new plan (Cursor reuses ids like "1", "2")
+    const done = [...base.values()].every((x) => x.status === 'completed' || x.status === 'cancelled');
+    const fresh = done && items.some((t) => !['completed', 'cancelled'].includes(status(t.status)));
+    const next = new Map(fresh ? [] : [...base].map(([k, v]) => [k, { ...v }]));
+    for (const t of items) {
+      const id = str(t.id) || str(t.content);
+      if (!id) continue;
+      const old = next.get(id);
+      next.set(id, { content: str(t.content) || old?.content || '', status: status(t.status) || old?.status || 'pending' });
+    }
+    if (!items.length && !this.todos.size) return false;
+    this.todos = next;
+    const entries = [...next.values()].filter((x) => x.status !== 'cancelled');
+    this.plan = entries.length ? { entries } : null;
+    return true;
   }
 
   private syncTasks() {
