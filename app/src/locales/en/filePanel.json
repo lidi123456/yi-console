@@ -156,5 +156,7 @@
   "previousChange": "Previous change (Shift+Alt+F5)",
   "nextChange": "Next change (Alt+F5)",
   "showUnchangedRegions": "Show unchanged regions",
-  "collapseUnchangedRegions": "Collapse unchanged regions"
+  "collapseUnchangedRegions": "Collapse unchanged regions",
+  "saveAs": "Save As",
+  "pathRelativeToOrAbsolute": "Path relative to {{v}}, or an absolute path"
 }

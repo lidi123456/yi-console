@@ -53,6 +53,8 @@ interface OpenFile {
   web?: boolean;
   /** A file in a commit (path is git:<hash>:<rel>): read-only diff against the commit's first parent */
   commit?: { hash: string; rel: string; subject: string; message: string; author: string; time: number; status: string; diff: string };
+  /** Untitled tab (path is untitled:Untitled-N): not on disk yet; saving asks for a path */
+  untitled?: boolean;
 }
 
 /** Dragging a file from the file panel to the input box: the value is "@relative-path " */
@@ -77,6 +79,23 @@ const isCsv = (p: string) => ['csv', 'tsv'].includes(extOf(p));
 const isHtml = (p: string) => ['html', 'htm'].includes(extOf(p));
 
 /** git changes: keyed by normalized absolute path */
+/** Untitled tabs, as in VS Code (double-click the empty tab bar): key untitled:Untitled-N; the text stays in memory until saved */
+const UNTITLED = 'untitled:';
+const isUntitled = (t: string) => t.startsWith(UNTITLED);
+/** Untitled text per panel (keyed like the remembered tabs), so it survives the panel remounting; it isn't kept across app restarts */
+const untitledCache = new Map<string, Map<string, string>>();
+const untitledStore = (key: string) => {
+  let m = untitledCache.get(key);
+  if (!m) untitledCache.set(key, (m = new Map()));
+  return m;
+};
+/** VS Code's label for an untitled file: its first line (whitespace collapsed, at most 40 characters, needs a letter or digit), else Untitled-N */
+const untitledLabel = (t: string, text: string) => {
+  const first = text.split(/\r?\n/, 1)[0].slice(0, 400).trim().replace(/\s+/g, ' ');
+  return /[\p{L}\p{N}]/u.test(first) ? [...first].slice(0, 40).join('') : t.slice(UNTITLED.length);
+};
+const isAbsPath = (p: string) => /^([a-zA-Z]:)?[\\/]/.test(p);
+
 /** A file's content at a revision (git.blob) */
 type GitBlob = { exists: boolean; text?: string; binary: boolean; tooLarge: boolean; notUtf8: boolean };
 const blobKey = (rev: string, rel: string) => `${rev}\n${rel}`;
@@ -671,6 +690,8 @@ export function FilePanel({
 
   const readFile = async (path: string, quiet = false): Promise<OpenFile | null> => {
     if (isWebTab(path)) return { path, content: '', draft: '', binary: true, truncated: false, size: 0, modified: 0, rev: Date.now(), web: true };
+    if (isUntitled(path))
+      return { path, content: '', draft: untitled.get(path) ?? '', binary: false, truncated: false, size: 0, modified: 0, rev: Date.now(), untitled: true };
     const ct = parseCommitTab(path);
     if (ct) {
       try {
@@ -708,7 +729,7 @@ export function FilePanel({
   const confirmDiscard = async () =>
     !dirty ||
     (await askConfirm({
-      title: tx('discardChangesTo', { v: baseName(file!.path) }),
+      title: tx('discardChangesTo', { v: nameOf(file!.path) }),
       message: tx('unsavedEditsWillBeDiscarded'),
       okText: tx('discard'),
       danger: true,
@@ -783,7 +804,8 @@ export function FilePanel({
       if (window.matchMedia('(max-width: 760px)').matches) setTreeOpen(false);
       return;
     }
-    if (!(await confirmDiscard())) return;
+    // An untitled tab keeps its text in memory when you switch away (it's written to untitled on every edit)
+    if (!file?.untitled && !(await confirmDiscard())) return;
     const g = gitOf(path);
     const f: OpenFile | null =
       g && gitMark(g.status)[0] === 'D'
@@ -839,9 +861,9 @@ export function FilePanel({
     openMenu(
       { clientX: r.right - 260, clientY: r.bottom + 4 },
       [...tabs].reverse().map((t) => ({
-        label: isWebTab(t) ? webTabTitle(t) : commitTabLabel(t) ?? baseName(t),
+        label: isWebTab(t) ? webTabTitle(t) : commitTabLabel(t) ?? nameOf(t),
         icon: isWebTab(t) ? 'globe' : isCommitTab(t) ? 'diff' : 'file',
-        hint: isWebTab(t) || isCommitTab(t) || rel(parentOf(t)) === '.' ? undefined : rel(parentOf(t)),
+        hint: isWebTab(t) || isCommitTab(t) || isUntitled(t) || rel(parentOf(t)) === '.' ? undefined : rel(parentOf(t)),
         active: t === file?.path,
         run: () => openFile(t),
       })),
@@ -863,8 +885,13 @@ export function FilePanel({
   const closeTab = async (path: string) => {
     const i = tabs.indexOf(path);
     const rest = tabs.filter((t) => t !== path);
-    if (file?.path !== path) return setTabs(rest);
+    if (file?.path !== path) {
+      if (!(await confirmLoseUntitled([path]))) return;
+      untitled.delete(path);
+      return setTabs(rest);
+    }
     if (!(await confirmDiscard())) return;
+    untitled.delete(path);
     setTabs(rest);
     const next = rest[Math.min(i, rest.length - 1)];
     if (next) {
@@ -879,8 +906,12 @@ export function FilePanel({
 
   /** Keep only the tabs in keep; if the current file gets closed, switch to the right-clicked tab t (like VS Code) */
   const keepTabs = async (t: string, keep: string[]) => {
-    if (!file || keep.includes(file.path)) return setTabs(keep);
+    const closing = tabs.filter((x) => !keep.includes(x));
+    if (!(await confirmLoseUntitled(closing.filter((x) => x !== file?.path)))) return;
+    const dropUntitled = () => closing.forEach((x) => untitled.delete(x));
+    if (!file || keep.includes(file.path)) return dropUntitled(), setTabs(keep);
     if (!(await confirmDiscard())) return;
+    dropUntitled();
     setTabs(keep);
     const f = await readFile(t);
     setFile(f);
@@ -913,6 +944,30 @@ export function FilePanel({
 
   // Remember opened files (per host + working directory; Files sessions per session) and restore the tabs and current file next time the panel opens
   const tabsKey = standalone ? `wp-open-s-${hostId}/${sessionId}` : `wp-open-${hostId}/${cwd}`;
+  const untitled = untitledStore(tabsKey);
+  /** Tab title: untitled tabs are named after their first line, like VS Code */
+  const nameOf = (t: string) => (isUntitled(t) ? untitledLabel(t, t === file?.path ? file.draft : untitled.get(t) ?? '') : baseName(t));
+  /** Closing untitled tabs (other than the current one) that have text: ask first, since nothing is on disk */
+  const confirmLoseUntitled = async (list: string[]) => {
+    const lost = list.filter((x) => isUntitled(x) && untitled.get(x));
+    return (
+      !lost.length ||
+      askConfirm({
+        title: tx('discardChangesTo', { v: lost.map(nameOf).join(', ') }),
+        message: tx('unsavedEditsWillBeDiscarded'),
+        okText: tx('discard'),
+        danger: true,
+      })
+    );
+  };
+  /** Like VS Code's double-click on the empty tab bar: a new Untitled-N tab (the lowest number not open) */
+  const newUntitled = () => {
+    let n = 1;
+    while (tabs.includes(`${UNTITLED}Untitled-${n}`)) n++;
+    const t = `${UNTITLED}Untitled-${n}`;
+    untitled.set(t, '');
+    openFile(t);
+  };
   const restored = useRef(false);
   /** The panel was opened by "View changes": keep the side column visible when tabs are restored */
   const forChanges = useRef(false);
@@ -924,7 +979,9 @@ export function FilePanel({
     if (!saved?.tabs?.length) return;
     const r = norm(root);
     const inRoot = (p: string) => norm(p).startsWith(r + '/');
-    const keep = [...new Set(saved.tabs.map((t) => (isWebTab(t) ? t : unverbatim(t))))].filter((t) => (isWebTab(t) ? !webTabFile(t) || inRoot(webTabFile(t)!) : inRoot(t)));
+    const keep = [...new Set(saved.tabs.map((t) => (isWebTab(t) || isUntitled(t) ? t : unverbatim(t))))].filter((t) =>
+      isUntitled(t) ? untitled.has(t) : isWebTab(t) ? !webTabFile(t) || inRoot(webTabFile(t)!) : inRoot(t),
+    );
     const cur = saved.current && keep.includes(saved.current) ? saved.current : keep[keep.length - 1];
     if (!cur) return;
     restoring.current = true;
@@ -955,8 +1012,52 @@ export function FilePanel({
     }
   };
 
+  /** Saving an untitled tab: ask for a path (relative to the workspace or absolute), write it, then the tab becomes that file */
+  const saveUntitled = async (f: OpenFile) => {
+    if (!root) return;
+    const label = untitledLabel(f.path, f.draft).replace(/[\\/:*?"<>|]+/g, ' ').trim() || f.path.slice(UNTITLED.length);
+    const name = (
+      await askText({ title: tx('saveAs'), label: tx('pathRelativeToOrAbsolute', { v: root }), value: /\.[^.\s]+$/.test(label) ? label : `${label}.txt`, okText: tx('save') })
+    )?.trim();
+    if (!name) return;
+    const path = isAbsPath(name) ? name : join(root, name.split(/[\\/]/).join(sepOf(root)));
+    const write = (overwrite: boolean) => rpc(hostId, 'fs.write', { path, content: f.draft, createOnly: !overwrite });
+    setSaveState('saving');
+    try {
+      const dir = parentOf(path);
+      // Saving into a folder that doesn't exist yet: create it (fs.mkdir refuses an existing one, which is fine)
+      if (norm(dir) !== norm(root)) await rpc(hostId, 'fs.mkdir', { path: dir }).catch(() => {});
+      try {
+        await write(false);
+      } catch (e) {
+        if (!String((e as Error)?.message ?? e).includes('已经存在同名文件')) throw e;
+        const ok = await askConfirm({
+          title: tx('overwrite', { name: baseName(path) }),
+          message: tx('alreadyHasAFileWith', { dir: rel(dir) }),
+          okText: tx('overwrite2'),
+          danger: true,
+        });
+        if (!ok) return setSaveState(null);
+        await write(true);
+      }
+      const nf = await readFile(path);
+      untitled.delete(f.path);
+      setTabs((t) => [...new Set(t.map((x) => (x === f.path ? path : x)))]);
+      // Stay in the editor even for Markdown / HTML (no switch to the preview)
+      if (nf) setFile((cur) => (cur?.path === f.path ? nf : cur));
+      setSaveState(null);
+      refreshTree();
+      toast(tx('saved', { v: baseName(path) }));
+    } catch (e) {
+      setSaveState(null);
+      errorToast(e);
+    }
+  };
+
   const save = async (overwrite = false) => {
     const f = fileRef.current;
+    // As in VS Code, Ctrl+S on an untitled tab asks where to save it even when it's empty
+    if (f?.untitled) return saveState === 'saving' ? undefined : saveUntitled(f);
     if (!f || f.draft === f.content || saveState === 'saving') return;
     setSaveState('saving');
     try {
@@ -985,7 +1086,7 @@ export function FilePanel({
     if (!(was === 'running' || was === 'waiting-permission') || status === 'running') return;
     refreshTree();
     const f = fileRef.current;
-    if (f && f.draft === f.content && !f.image && !f.web && !f.commit) {
+    if (f && f.draft === f.content && !f.image && !f.web && !f.commit && !f.untitled) {
       rpc<Omit<OpenFile, 'draft' | 'rev'>>(hostId, 'fs.read', { path: f.path })
         .then((r) => {
           if (r.modified === f.modified) return;
@@ -996,8 +1097,9 @@ export function FilePanel({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [status]);
 
+  // An untitled tab's text stays in memory when the panel closes, so there's nothing to confirm for it
   const closePanel = async () => {
-    if (await confirmDiscard()) onClose();
+    if (file?.untitled || (await confirmDiscard())) onClose();
   };
 
   // ---------- New, rename, delete ----------
@@ -1282,7 +1384,17 @@ export function FilePanel({
 
   const fileMenu = (e: React.MouseEvent<HTMLElement>) => {
     const r = e.currentTarget.getBoundingClientRect();
-    const items: (MenuItem | '-')[] = file
+    const items: (MenuItem | '-')[] = file?.untitled
+      ? [
+          { label: tx('goToSymbol'), icon: 'search', hint: `${navigator.platform.includes('Mac') ? '⌘' : 'Ctrl+'}Shift+O`, run: () => setQuick('@') },
+          { label: tx('goToLine'), hint: `${navigator.platform.includes('Mac') ? '⌘' : 'Ctrl+'}G`, run: () => setQuick(':') },
+          '-',
+          { label: tx('saveAs'), icon: 'save', run: () => save() },
+          { label: tx('copyFileContents'), icon: 'copy', run: () => copy(file.draft, tx('fileContentsCopied')) },
+          '-',
+          { label: wrap ? tx('disableWordWrap') : tx('enableWordWrap'), icon: 'wrap', run: () => (lsSet('wp-wrap', !wrap), setWrap(!wrap)) },
+        ]
+      : file
       ? [
           { label: tx('goToSymbol'), icon: 'search', hint: `${navigator.platform.includes('Mac') ? '⌘' : 'Ctrl+'}Shift+O`, run: () => setQuick('@') },
           { label: tx('goToLine'), hint: `${navigator.platform.includes('Mac') ? '⌘' : 'Ctrl+'}G`, run: () => setQuick(':') },
@@ -1746,7 +1858,10 @@ export function FilePanel({
       readOnly={file.truncated || !!file.notUtf8}
       wrap={wrap || (md && mdSplit && wide())}
       goto={goto}
-      onChange={(draft) => setFile((cur) => cur && { ...cur, draft })}
+      onChange={(draft) => {
+        if (file.untitled) untitled.set(file.path, draft);
+        setFile((cur) => cur && { ...cur, draft });
+      }}
       onSave={() => save()}
       scrollLine={md && mdSplit ? editorAt : null}
       onTopLine={md && mdSplit ? (line, frac) => syncFrom.current === 'editor' && setPreviewAt({ line, frac, n: Date.now() }) : undefined}
@@ -1927,6 +2042,8 @@ export function FilePanel({
             onWheel={(e) => {
               if (Math.abs(e.deltaY) > Math.abs(e.deltaX)) e.currentTarget.scrollLeft += e.deltaY;
             }}
+            // Like VS Code: double-clicking the empty part of the tab bar opens a new untitled file
+            onDoubleClick={(e) => e.target === e.currentTarget && newUntitled()}
           >
             {tabs.map((t) => {
               const cur = t === file.path;
@@ -1965,6 +2082,39 @@ export function FilePanel({
                     </button>
                   </div>
                 );
+              if (isUntitled(t)) {
+                const unsaved = cur ? dirty : !!untitled.get(t);
+                return (
+                  <div
+                    key={t}
+                    role="tab"
+                    aria-selected={cur}
+                    className={`wp-ftab ${cur ? 'active' : ''}`}
+                    title={nameOf(t)}
+                    onClick={() => openFile(t)}
+                    onAuxClick={(e) => e.button === 1 && closeTab(t)}
+                    onContextMenu={(e) =>
+                      openMenu(e, [
+                        { label: tx('close'), icon: 'x', run: () => closeTab(t) },
+                        ...closeItems(t),
+                      ])
+                    }
+                  >
+                    <Icon name="file" size={13} />
+                    <span className="truncate">{nameOf(t)}</span>
+                    <button
+                      className={`wp-ftab-x ${unsaved ? 'dirty' : ''}`}
+                      title={tx('close')}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        closeTab(t);
+                      }}
+                    >
+                      <Icon name="x" size={11} />
+                    </button>
+                  </div>
+                );
+              }
               if (isWebTab(t))
                 return (
                   <div
@@ -2114,7 +2264,11 @@ export function FilePanel({
               <span className="pd-tag add">{compare.replace ? tx('afterReplace') : rel(compare.path)}</span>
             </div>
           ) : (
-            <Breadcrumbs hostId={hostId} root={root ?? cwd} path={file.path} hidden={hidden} onOpen={openFile} dirty={dirty} />
+            file.untitled ? (
+              <span className="wp-untitled-title truncate">{nameOf(file.path)}</span>
+            ) : (
+              <Breadcrumbs hostId={hostId} root={root ?? cwd} path={file.path} hidden={hidden} onOpen={openFile} dirty={dirty} />
+            )
           )}
           <div className="wp-actions">
             {state && (
@@ -2214,7 +2368,7 @@ export function FilePanel({
           </div>
         )}
         {emptyPane && (
-          <div className="wp-main wp-empty">
+          <div className="wp-main wp-empty" onDoubleClick={newUntitled}>
             <Icon name="file" size={28} />
             <div>
               {view === 'changes'
@@ -2238,7 +2392,7 @@ export function FilePanel({
           hostId={hostId}
           root={root}
           initial={quick}
-          recent={[...tabs].reverse().filter((t) => !isWebTab(t) && !isCommitTab(t)).map(rel)}
+          recent={[...tabs].reverse().filter((t) => !isWebTab(t) && !isCommitTab(t) && !isUntitled(t)).map(rel)}
           current={file && !file.binary ? { name: baseName(file.path), text: file.draft, lines: file.draft.split('\n').length } : null}
           onOpen={(r) => openFile(relOpen(r))}
           onGoto={(line) => {

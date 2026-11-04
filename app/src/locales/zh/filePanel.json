@@ -156,5 +156,7 @@
   "previousChange": "上一个更改 (Shift+Alt+F5)",
   "nextChange": "下一个更改 (Alt+F5)",
   "showUnchangedRegions": "显示未更改的区域",
-  "collapseUnchangedRegions": "折叠未更改的区域"
+  "collapseUnchangedRegions": "折叠未更改的区域",
+  "saveAs": "另存为",
+  "pathRelativeToOrAbsolute": "相对于 {{v}} 的路径，也可以填绝对路径"
 }
