@@ -152,5 +152,9 @@
   "filePath": "File path",
   "unsavedChanges": "Unsaved changes",
   "folderContents": "Folder contents",
-  "loadingFiles": "Loading files…"
+  "loadingFiles": "Loading files…",
+  "previousChange": "Previous change (Shift+Alt+F5)",
+  "nextChange": "Next change (Alt+F5)",
+  "showUnchangedRegions": "Show unchanged regions",
+  "collapseUnchangedRegions": "Collapse unchanged regions"
 }

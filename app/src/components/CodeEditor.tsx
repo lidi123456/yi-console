@@ -25,7 +25,7 @@ import { detectEol, detectIndent } from '../textFormat';
 // Language packs are lazy-loaded by file name and stay out of the main bundle
 
 /** Colors use CSS variables; dark mode swaps them in styles.css */
-const highlight = HighlightStyle.define([
+export const highlight = HighlightStyle.define([
   { tag: [t.keyword, t.controlKeyword, t.moduleKeyword, t.operatorKeyword, t.modifier], color: 'var(--hl-keyword)' },
   { tag: [t.string, t.special(t.string), t.regexp, t.character], color: 'var(--hl-string)' },
   { tag: [t.number, t.bool, t.null, t.atom, t.unit], color: 'var(--hl-number)' },
@@ -52,7 +52,7 @@ function foldMarker(open: boolean) {
   return svg as unknown as HTMLElement;
 }
 
-const theme = EditorView.theme({
+export const theme = EditorView.theme({
   '&': { height: '100%', fontSize: '12px', backgroundColor: 'var(--bg)', color: 'var(--text)' },
   '&.cm-focused': { outline: 'none' },
   '.cm-scroller': { fontFamily: 'var(--mono)', lineHeight: '20px' },
@@ -113,7 +113,7 @@ const theme = EditorView.theme({
   '.cm-panel.cm-search [name=close]': { top: '6px', right: '8px', fontSize: '16px', color: 'var(--text-3)', cursor: 'pointer' },
 });
 
-function searchPhrases() {
+export function searchPhrases() {
   if (isEn()) return [];
   return EditorState.phrases.of({
     Find: '查找',

@@ -152,5 +152,9 @@
   "filePath": "文件路径",
   "unsavedChanges": "有未保存的修改",
   "folderContents": "目录内容",
-  "loadingFiles": "正在加载文件…"
+  "loadingFiles": "正在加载文件…",
+  "previousChange": "上一个更改 (Shift+Alt+F5)",
+  "nextChange": "下一个更改 (Alt+F5)",
+  "showUnchangedRegions": "显示未更改的区域",
+  "collapseUnchangedRegions": "折叠未更改的区域"
 }

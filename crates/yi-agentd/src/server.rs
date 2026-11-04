@@ -325,6 +325,12 @@ pub async fn dispatch(
             let only: Option<Vec<String>> = p["paths"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect());
             tokio::task::spawn_blocking(move || crate::gitops::show(&cwd, &hash, only.as_deref())).await??
         }
+        GIT_BLOB => {
+            let cwd = s(&p, "cwd")?.to_string();
+            let path = s(&p, "path")?.to_string();
+            let rev = s(&p, "rev")?.to_string();
+            tokio::task::spawn_blocking(move || crate::gitops::blob(&cwd, &path, &rev)).await??
+        }
         FS_SEARCH => {
             let root = s(&p, "root")?.to_string();
             let q = p["query"].as_str().unwrap_or("").to_string();

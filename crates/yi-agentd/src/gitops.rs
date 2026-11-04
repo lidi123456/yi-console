@@ -276,6 +276,43 @@ pub fn show(cwd: &str, hash: &str, only: Option<&[String]>) -> Result<Value> {
     }))
 }
 
+/// Size limit for git.blob (same as fs.read's text limit): larger files fall back to the hunk-only diff
+const BLOB_MAX: u64 = 1024 * 1024;
+
+/// A file's full content at `rev` ("HEAD", a commit hash, or a hash + "^" for its first parent).
+/// A path missing at that revision (added / deleted files, or a root commit's parent) gives exists=false
+pub fn blob(cwd: &str, path: &str, rev: &str) -> Result<Value> {
+    check_paths(&[path.to_string()])?;
+    let hash = rev.strip_suffix('^').unwrap_or(rev);
+    if rev != "HEAD" && (hash.len() < 4 || hash.len() > 64 || !hash.bytes().all(|c| c.is_ascii_hexdigit())) {
+        bail!("提交号无效: {rev}");
+    }
+    let dir = crate::paths::expand(cwd);
+    let root = repo_root(&dir).ok_or_else(|| anyhow!("不是 git 仓库"))?;
+    // Backslashes from Windows paths aren't separators in a tree path
+    let spec = format!("{rev}:{}", path.replace('\\', "/"));
+    let Some(oid) = git_ok(&root, &["rev-parse", "--verify", "-q", &spec]).ok().map(|s| s.trim().to_string()) else {
+        return Ok(json!({ "exists": false, "binary": false, "tooLarge": false, "notUtf8": false }));
+    };
+    let size: u64 = git_ok(&root, &["cat-file", "-s", &oid])?.trim().parse().unwrap_or(0);
+    if size > BLOB_MAX {
+        return Ok(json!({ "exists": true, "binary": false, "tooLarge": true, "notUtf8": false, "size": size }));
+    }
+    let out = git(&root, &["cat-file", "blob", &oid])?;
+    if !out.status.success() {
+        bail!("{}", String::from_utf8_lossy(&out.stderr).trim());
+    }
+    let b = out.stdout;
+    if b.iter().take(8000).any(|&c| c == 0) {
+        return Ok(json!({ "exists": true, "binary": true, "tooLarge": false, "notUtf8": false, "size": size }));
+    }
+    let (text, not_utf8) = match String::from_utf8(b) {
+        Ok(s) => (s, false),
+        Err(e) => (String::from_utf8_lossy(e.as_bytes()).into_owned(), true),
+    };
+    Ok(json!({ "exists": true, "text": text, "binary": false, "tooLarge": false, "notUtf8": not_utf8, "size": size }))
+}
+
 /// Discard changes: tracked files are restored to HEAD, new files are deleted
 pub fn discard(cwd: &str, paths: &[String]) -> Result<()> {
     check_paths(paths)?;
@@ -360,6 +397,40 @@ mod tests {
         assert_eq!(std::fs::read_to_string(p.join("a.txt")).unwrap(), "1\n");
         assert_eq!(changes(&cwd).unwrap()["files"].as_array().unwrap().len(), 0);
         assert!(discard(&cwd, &["../x".into()]).is_err());
+    }
+
+    #[test]
+    fn blob_at_revisions() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path();
+        let run = |a: &[&str]| assert!(git(p, a).unwrap().status.success(), "{a:?}");
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "t@t"]);
+        run(&["config", "user.name", "t"]);
+        run(&["config", "core.autocrlf", "false"]);
+        std::fs::create_dir(p.join("src")).unwrap();
+        std::fs::write(p.join("src/a.txt"), "one\n").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-qm", "first"]);
+        std::fs::write(p.join("src/a.txt"), "two\n").unwrap();
+        std::fs::write(p.join("bin.dat"), [0u8, 1, 2]).unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-qm", "second"]);
+        let cwd = p.display().to_string();
+        let head = git_ok(p, &["rev-parse", "HEAD"]).unwrap().trim().to_string();
+        let first = git_ok(p, &["rev-parse", "HEAD^"]).unwrap().trim().to_string();
+
+        assert_eq!(blob(&cwd, "src/a.txt", "HEAD").unwrap()["text"], "two\n");
+        assert_eq!(blob(&cwd, "src/a.txt", &format!("{head}^")).unwrap()["text"], "one\n");
+        // Windows-style separators are accepted
+        assert_eq!(blob(&cwd, "src\\a.txt", &first).unwrap()["text"], "one\n");
+        // Added in the second commit: missing in its parent; a root commit has no parent at all
+        assert_eq!(blob(&cwd, "bin.dat", &format!("{head}^")).unwrap()["exists"], false);
+        assert_eq!(blob(&cwd, "src/a.txt", &format!("{first}^")).unwrap()["exists"], false);
+        assert_eq!(blob(&cwd, "bin.dat", "HEAD").unwrap()["binary"], true);
+        assert!(blob(&cwd, "../x", "HEAD").is_err());
+        assert!(blob(&cwd, "src/a.txt", "HEAD; rm").is_err());
+        assert!(blob(&cwd, "src/a.txt", "--output=x").is_err());
     }
 
     #[test]

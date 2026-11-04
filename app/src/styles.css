@@ -28,6 +28,14 @@
   --add-fg: #116b35;
   --del-bg: #fdecec;
   --del-fg: #a3261d;
+  /* Full-file diff: VS Code's diffEditor.* defaults (light) */
+  --df-add-line: rgba(155, 185, 85, 0.2);
+  --df-del-line: rgba(255, 0, 0, 0.2);
+  --df-add-text: rgba(156, 204, 44, 0.25);
+  --df-del-text: rgba(255, 0, 0, 0.2);
+  --df-add-mark: #2ea043;
+  --df-del-mark: #e5534b;
+  --df-diag: rgba(34, 34, 34, 0.2);
   --code-bg: #f6f7f9;
   --c-claude: #d97757;
   --c-codex: #10a37f;
@@ -83,6 +91,14 @@
     --add-fg: #7ee2a0;
     --del-bg: #3b1f1e;
     --del-fg: #f48771;
+    /* Full-file diff: VS Code's diffEditor.* defaults (dark) */
+    --df-add-line: rgba(155, 185, 85, 0.2);
+    --df-del-line: rgba(255, 0, 0, 0.2);
+    --df-add-text: rgba(156, 204, 44, 0.2);
+    --df-del-text: rgba(255, 0, 0, 0.2);
+    --df-add-mark: #3fb950;
+    --df-del-mark: #f85149;
+    --df-diag: rgba(204, 204, 204, 0.2);
     --code-bg: #181818;
     --shadow: 0 8px 30px rgba(0, 0, 0, 0.5);
     --sb-thumb: rgba(255, 255, 255, 0.16);
@@ -124,6 +140,14 @@
   --add-fg: #7ee2a0;
   --del-bg: #3b1f1e;
   --del-fg: #f48771;
+  /* Full-file diff: VS Code's diffEditor.* defaults (dark) */
+  --df-add-line: rgba(155, 185, 85, 0.2);
+  --df-del-line: rgba(255, 0, 0, 0.2);
+  --df-add-text: rgba(156, 204, 44, 0.2);
+  --df-del-text: rgba(255, 0, 0, 0.2);
+  --df-add-mark: #3fb950;
+  --df-del-mark: #f85149;
+  --df-diag: rgba(204, 204, 204, 0.2);
   --code-bg: #181818;
   --shadow: 0 8px 30px rgba(0, 0, 0, 0.5);
   --sb-thumb: rgba(255, 255, 255, 0.16);
@@ -6777,6 +6801,23 @@ body.resizing .side-resizer::after {
   min-height: 0;
   overflow: auto;
   padding: 0;
+}
+/* Full-file diff (MergeDiff): fills the column; side by side, the outer .cm-mergeView scrolls both editors together */
+.wp-diff.wp-diff-full {
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+.wp-merge {
+  flex: 1;
+  min-height: 0;
+}
+.wp-merge .cm-mergeView,
+.wp-merge-unified .cm-editor {
+  height: 100%;
+}
+.wp-merge-split .cm-mergeViewEditor + .cm-mergeViewEditor {
+  border-left: 1px solid var(--border);
 }
 .pd {
   font-size: 12px;

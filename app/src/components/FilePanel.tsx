@@ -10,6 +10,7 @@ import { Icon } from './Icon';
 import { askConfirm, askText, openMenu, type MenuItem } from './Overlay';
 import { CodeEditor } from './CodeEditor';
 import { PaneDiff } from './DiffView';
+import { MergeDiff, type MergeDiffHandle } from './MergeDiff';
 import { CsvView, ImageView, MdPreview, PdfView } from './FilePreview';
 import { GrepPanel } from './GrepPanel';
 import { QuickOpen, type QuickMode } from './QuickOpen';
@@ -76,6 +77,10 @@ const isCsv = (p: string) => ['csv', 'tsv'].includes(extOf(p));
 const isHtml = (p: string) => ['html', 'htm'].includes(extOf(p));
 
 /** git changes: keyed by normalized absolute path */
+/** A file's content at a revision (git.blob) */
+type GitBlob = { exists: boolean; text?: string; binary: boolean; tooLarge: boolean; notUtf8: boolean };
+const blobKey = (rev: string, rel: string) => `${rev}\n${rel}`;
+
 /** added / deleted: lines added/removed relative to HEAD; null when not computable (binary etc.); older yi-agentd doesn't send these fields */
 type GitFile = { status: string; diff: string; path: string; rel: string; added?: number | null; deleted?: number | null };
 
@@ -476,6 +481,9 @@ export function FilePanel({
   const [view, setView] = useState<'all' | 'changes' | 'search'>(() => lsGet('wp-view', 'all'));
   const [showDiff, setShowDiff] = useState(false);
   const [diffLayout, setDiffLayout] = useState<'split' | 'unified'>(() => lsGet('wp-diff-layout', 'split'));
+  // Collapse unchanged regions in the full-file diff. VS Code's own default is off; ours is on, since the hunk-only diff we had before showed just the changes
+  const [diffCollapse, setDiffCollapse] = useState(() => lsGet('wp-diff-collapse', true));
+  const mergeRef = useRef<MergeDiffHandle>(null);
   // Make the editor jump to a line (search results, outline, : line number)
   const [goto, setGoto] = useState<{ line: number; col?: number; len?: number; n: number } | null>(null);
   const [quick, setQuick] = useState<QuickMode | null>(null);
@@ -566,6 +574,8 @@ export function FilePanel({
   const [gitReady, setGitReady] = useState(() => gitCache.has(gitKey(hostId, cwd)));
   // Diff of a single file (git.changes only lists statuses; the diff is fetched when the file is opened), keyed by norm(absolute path)
   const [fileDiffs, setFileDiffs] = useState<Record<string, string | null>>({});
+  // Whole files at a revision for the full-file diff (git.blob), keyed by `rev\nrel`; null = couldn't be read
+  const [blobs, setBlobs] = useState<Record<string, GitBlob | null>>({});
   // Summary of the last git status: periodic refreshes leave the UI alone if nothing changed, so an open diff doesn't flicker
   const gitSig = useRef(gitCache.get(gitKey(hostId, cwd))?.sig ?? '');
   /** quiet: background refresh (timer / window refocus); if the status didn't change, just quietly refetch the current file's diff */
@@ -578,6 +588,7 @@ export function FilePanel({
         if (quiet && sig === gitSig.current) return refreshCurDiff.current();
         gitSig.current = sig;
         setFileDiffs({});
+        setBlobs({});
         if (!r.repo) {
           gitCache.set(gitKey(hostId, cwd), { git: null, sig });
           return setGit(null);
@@ -1424,6 +1435,70 @@ export function FilePanel({
   };
   const viewing = compare ? 'compare' : showDiff ? 'diff' : 'file';
 
+  // ---------- Full-file diff (VS Code style): both whole files, falling back to the hunk-only diff ----------
+  /** Revisions to fetch for the current view: the working tree is compared with HEAD, a commit with its first parent */
+  const blobSpecs: [string, string][] = !file
+    ? []
+    : file.commit
+      ? [[`${file.commit.hash}^`, file.commit.rel], [file.commit.hash, file.commit.rel]]
+      : viewing === 'diff' && curGit && !file.truncated && (!file.binary || file.deleted)
+        ? [['HEAD', curGit.rel]]
+        : [];
+  const blobWant = blobSpecs.map(([r, p]) => blobKey(r, p)).join('|');
+  useEffect(() => {
+    for (const [r, p] of blobSpecs) {
+      const k = blobKey(r, p);
+      if (k in blobs) continue;
+      rpc<GitBlob>(hostId, 'git.blob', { cwd, path: p, rev: r })
+        .then((b) => setBlobs((m) => ({ ...m, [k]: b })))
+        // Older yi-agentd without git.blob, or a read error: use the hunk-only diff
+        .catch(() => setBlobs((m) => ({ ...m, [k]: null })));
+    }
+  }, [blobWant, blobs]); // eslint-disable-line react-hooks/exhaustive-deps
+  const blobText = (b: GitBlob | null | undefined): string | null | undefined =>
+    b === undefined ? undefined : !b || b.binary || b.tooLarge ? null : b.exists ? (b.text ?? '') : '';
+  /** {a, b} for MergeDiff; undefined while loading; null to fall back to PaneDiff */
+  const full: { a: string; b: string } | null | undefined = (() => {
+    if (!file) return null;
+    if (viewing === 'compare') return compare && !file.truncated && !file.binary ? { a: file.draft, b: compare.text } : null;
+    if (!blobSpecs.length) return null;
+    const texts = blobSpecs.map(([r, p]) => blobText(blobs[blobKey(r, p)]));
+    if (texts.some((x) => x === null)) return null;
+    if (texts.some((x) => x === undefined)) return undefined;
+    // Working tree: the editor's current text, so unsaved edits show too (as in VS Code); a deleted file is empty
+    return file.commit ? { a: texts[0]!, b: texts[1]! } : { a: texts[0]!, b: file.deleted ? '' : file.draft };
+  })();
+  const flipCollapse = () => {
+    lsSet('wp-diff-collapse', !diffCollapse);
+    setDiffCollapse(!diffCollapse);
+  };
+  const mergeView = (f: { a: string; b: string }, name: string) => (
+    <div className="wp-diff wp-diff-full">
+      <MergeDiff ref={mergeRef} a={f.a} b={f.b} filename={name} layout={layout} collapse={diffCollapse} wrap={wrap} />
+    </div>
+  );
+  /** Toolbar buttons for the full-file diff: previous / next change and collapsing unchanged regions */
+  const mergeBtns = full ? (
+    <>
+      <button className="icon-btn" title={tx('previousChange')} onClick={() => mergeRef.current?.prev()}>
+        <Icon name="up" size={14} />
+      </button>
+      <button className="icon-btn" title={tx('nextChange')} onClick={() => mergeRef.current?.next()}>
+        <Icon name="down" size={14} />
+      </button>
+      <button className="icon-btn" title={diffCollapse ? tx('showUnchangedRegions') : tx('collapseUnchangedRegions')} onClick={flipCollapse}>
+        <Icon name={diffCollapse ? 'unfold-all' : 'fold-all'} size={14} />
+      </button>
+    </>
+  ) : null;
+  const loadingChanges = (
+    <div className="wp-empty">
+      <div className="muted small">
+        <span className="spinner" /> {tx('readingChanges')}
+      </div>
+    </div>
+  );
+
   const toggleHidden = () => (lsSet('wp-hidden', !hidden), setHidden(!hidden));
   const newMenu = (e: React.MouseEvent<HTMLElement>) => {
     const r = e.currentTarget.getBoundingClientRect();
@@ -1680,7 +1755,11 @@ export function FilePanel({
 
   // Content of the editor column: file / changes / compare
   const mainView = !file ? null : file.commit ? (
-    file.commit.diff ? (
+    full ? (
+      mergeView(full, baseName(file.commit.rel))
+    ) : full === undefined ? (
+      loadingChanges
+    ) : file.commit.diff ? (
       <div className="wp-diff">
         <PaneDiff diff={{ path: file.commit.rel, unified: file.commit.diff.slice(Math.max(0, file.commit.diff.indexOf('@@'))) }} layout={layout} />
       </div>
@@ -1694,12 +1773,18 @@ export function FilePanel({
     <BrowserPane hostId={hostId} root={root ?? cwd} tab={file.path} onNavigate={(t) => navigateWeb(file.path, t)} />
   ) : html && preview && viewing === 'file' ? (
     <BrowserPane hostId={hostId} root={root ?? cwd} tab={`${WEB_PREFIX}file:${file.path}`} reload={file.modified} onNavigate={(t) => openFile(t)} />
+  ) : viewing === 'compare' && full ? (
+    mergeView(full, baseName(file.path))
   ) : viewing === 'compare' ? (
     <div className="wp-diff">
       <PaneDiff diff={{ path: rel(file.path), oldText: file.draft, newText: compare!.text }} layout={layout} />
     </div>
   ) : viewing === 'diff' ? (
-    fileDiff ? (
+    full ? (
+      mergeView(full, baseName(file.path))
+    ) : full === undefined ? (
+      loadingChanges
+    ) : fileDiff ? (
       <div className="wp-diff">
         <PaneDiff diff={{ ...fileDiff, path: rel(file.path) }} layout={layout} />
       </div>
@@ -1997,6 +2082,7 @@ export function FilePanel({
           </button>
           <div className="wp-actions">
             <span className="hide-mobile">{tx('readOnly')}</span>
+            {mergeBtns}
             {wide() && (
               <button className="icon-btn" title={layout === 'split' ? tx('switchToStacked') : tx('switchToSideBySide')} onClick={flipLayout}>
                 <Icon name={layout === 'split' ? 'rows' : 'columns'} size={14} />
@@ -2067,6 +2153,7 @@ export function FilePanel({
                 </button>
               </div>
             )}
+            {viewing !== 'file' && mergeBtns}
             {viewing !== 'file' && wide() && (
               <button className="icon-btn" title={layout === 'split' ? tx('switchToStacked') : tx('switchToSideBySide')} onClick={flipLayout}>
                 <Icon name={layout === 'split' ? 'rows' : 'columns'} size={14} />

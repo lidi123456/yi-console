@@ -743,6 +743,9 @@ pub mod methods {
     /// {cwd, hash, paths?} -> {hash, parent, message, author, time, files:[{path, status, added, deleted, diff}]}:
     /// files a commit changed relative to its first parent; diffs only for the files in paths
     pub const GIT_SHOW: &str = "git.show";
+    /// {cwd, path, rev} -> {exists, text?, binary, tooLarge, notUtf8}: a file's full content at a revision, for the side-by-side diff.
+    /// rev is "HEAD", a commit hash, or a hash followed by "^" (its first parent); path is relative to the repo root
+    pub const GIT_BLOB: &str = "git.blob";
     /// Parts of the status line computed on the host {sessionId} → {git: {branch, ahead, behind, changed}?, command: {text, source}?, error?}
     pub const SESSION_STATUS_LINE: &str = "session.statusLine";
     /// Page back to older events: {sessionId, beforeSeq, limit} → {events, hasMore}
