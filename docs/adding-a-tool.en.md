@@ -101,7 +101,7 @@ If the tool has todos / plans:
 
 - Report the tool's slash commands to the UI through `commands()`.
 - `/clear` is handled by the hub (events cleared, `external_id` reset, a new session next time); adapters don't need to do anything.
-- `/compact` is equivalent to sending a `/compact` message. If the tool doesn't understand `/` commands, translate it to the matching API in the adapter (see `start_turn` in `codex.rs`). If the tool reports compaction events, convert them to `EventBody::Compact`; if not, keep the user bubble and note it in `AGENTS.md`.
+- `/compact` is equivalent to sending a `/compact` message. If the tool doesn't understand `/` commands, translate it to the matching API in the adapter (see `start_turn` in `codex.rs`). If the tool reports compaction events, convert them to `EventBody::Compact`; if not, keep the user bubble and note it in `docs/internals/tools.md`.
 
 ### 2.8 Error messages
 
@@ -115,7 +115,7 @@ If the tool has todos / plans:
 Chat mode should tell the model "reference absolute paths on the host as Markdown images in replies and the client will display them":
 - The content is `adapters::IMAGE_HINT`.
 - If the tool has a system prompt entry point, pass it there: Claude uses `--append-system-prompt`, Codex uses `developerInstructions`.
-- If it has none, skip it for now and note that in `AGENTS.md`.
+- If it has none, skip it for now and note that in `docs/internals/tools.md`.
 
 ## 3. Terminal mode
 
@@ -159,7 +159,7 @@ Chat mode should tell the model "reference absolute paths on the host as Markdow
 
 ## 8. Documentation and tests
 
-- `AGENTS.md`: add an entry on what's special about the tool (integration method, session file location, how it differs from the others) and which features it doesn't support.
+- `docs/internals/tools.md`: add an entry on what's special about the tool (integration method, session file location, how it differs from the others) and which features it doesn't support.
 - Unit tests: protocol parsing, error detection and history file parsing, using samples cut from real output (see the tests at the end of `acp.rs`).
 - Do end-to-end tests in an isolated environment (`YI_CONSOLE_HOME=<temp dir>`); leave `~/.yi-console` alone.
 
@@ -191,4 +191,4 @@ History and the rest:
 - [ ] Usage and quota are shown correctly, and the explanatory text states what is counted
 - [ ] Badge and colors look right in light and dark; both the Chinese and English UI are correct
 - [ ] The executable is found on Windows, Linux and macOS
-- [ ] `AGENTS.md` is updated
+- [ ] `docs/internals/tools.md` is updated

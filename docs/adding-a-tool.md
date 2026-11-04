@@ -101,7 +101,7 @@ English: [Adding a new AI coding tool](adding-a-tool.en.md)
 
 - 工具的斜杠命令通过 `commands()` 报给界面。
 - `/clear` 由 hub 统一处理（清空事件、`external_id` 置空、下次新开），适配器不用管。
-- `/compact` 等同发一条 `/compact` 消息。工具不认 `/` 命令的，要在适配器里转成对应的接口（参考 `codex.rs` 的 `start_turn`）。有压缩事件的转成 `EventBody::Compact`。没有的话保留用户气泡，并在 `AGENTS.md` 里注明。
+- `/compact` 等同发一条 `/compact` 消息。工具不认 `/` 命令的，要在适配器里转成对应的接口（参考 `codex.rs` 的 `start_turn`）。有压缩事件的转成 `EventBody::Compact`。没有的话保留用户气泡，并在 `docs/internals/tools.md` 里注明。
 
 ### 2.8 错误提示
 
@@ -115,7 +115,7 @@ English: [Adding a new AI coding tool](adding-a-tool.en.md)
 对话模式要告诉模型「回复里用 Markdown 图片引用主机上的绝对路径，客户端会显示」：
 - 内容是 `adapters::IMAGE_HINT`。
 - 工具有系统提示词入口的就传进去：Claude 用 `--append-system-prompt`，Codex 用 `developerInstructions`。
-- 没有入口的，目前不加，并在 `AGENTS.md` 里注明。
+- 没有入口的，目前不加，并在 `docs/internals/tools.md` 里注明。
 
 ## 3. 终端模式
 
@@ -159,7 +159,7 @@ English: [Adding a new AI coding tool](adding-a-tool.en.md)
 
 ## 8. 文档和测试
 
-- `AGENTS.md`：写一条这个工具的特殊之处（接入方式、会话文件位置、和其他工具不一样的地方），以及不支持的功能。
+- `docs/internals/tools.md`：写一条这个工具的特殊之处（接入方式、会话文件位置、和其他工具不一样的地方），以及不支持的功能。
 - 单元测试：协议解析、错误识别、历史文件解析，用真实输出截取的样例写成测试（参考 `acp.rs` 末尾的 tests）。
 - 端到端测试在隔离环境里做（`YI_CONSOLE_HOME=<临时目录>`），不要动 `~/.yi-console`。
 
@@ -191,4 +191,4 @@ English: [Adding a new AI coding tool](adding-a-tool.en.md)
 - [ ] 用量页、额度显示正确，说明文字写清楚统计口径
 - [ ] 徽标、颜色在亮色和暗色下都正常；中英文界面都正常
 - [ ] Windows、Linux、macOS 上都能找到可执行文件
-- [ ] `AGENTS.md` 已更新
+- [ ] `docs/internals/tools.md` 已更新
