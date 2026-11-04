@@ -6818,7 +6818,9 @@ body.resizing .side-resizer::after {
   overflow: auto;
   padding: 0;
 }
-/* Full-file diff (MergeDiff): fills the column; side by side, the outer .cm-mergeView scrolls both editors together */
+/* Full-file diff (MergeDiff): fills the column. Side by side, each editor scrolls itself (MergeDiff syncs them, like VS Code),
+   overriding MergeView's default of one outer scroller with editors at full content height, which put the horizontal
+   scrollbars below the last line */
 .wp-diff.wp-diff-full {
   overflow: hidden;
   display: flex;
@@ -6831,6 +6833,23 @@ body.resizing .side-resizer::after {
 .wp-merge .cm-mergeView,
 .wp-merge-unified .cm-editor {
   height: 100%;
+}
+.wp-merge.wp-merge-split .cm-mergeView {
+  overflow: hidden;
+}
+.wp-merge.wp-merge-split .cm-mergeViewEditors,
+.wp-merge.wp-merge-split .cm-mergeViewEditor {
+  height: 100%;
+}
+.wp-merge.wp-merge-split .cm-mergeViewEditor {
+  min-width: 0;
+}
+.wp-merge.wp-merge-split .cm-mergeView .cm-editor,
+.wp-merge.wp-merge-split .cm-mergeView .cm-scroller {
+  height: 100% !important;
+}
+.wp-merge.wp-merge-split .cm-mergeView .cm-scroller {
+  overflow: auto !important;
 }
 .wp-merge-split .cm-mergeViewEditor + .cm-mergeViewEditor {
   border-left: 1px solid var(--border);

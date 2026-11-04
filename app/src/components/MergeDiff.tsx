@@ -13,7 +13,8 @@ const t = getT('diffView');
 
 // Full-file diff in the file panel, modelled on VS Code's diff editor: both whole files with syntax highlighting,
 // changed lines plus character-level marks inside them, and unchanged stretches collapsed.
-// - Side by side is two CodeMirror editors (MergeView) aligned line by line; stacked is one editor with the deleted
+// - Side by side is two CodeMirror editors (MergeView) aligned line by line, each scrolling itself with the scroll
+//   positions synced (syncScroll), as in VS Code; stacked is one editor with the deleted
 //   lines shown above the new ones (unifiedMergeView), like VS Code's inline view.
 // - Colors are VS Code's diffEditor.* defaults (variables in styles.css).
 // - Performance: CodeMirror only renders the visible lines of either side; the diff runs on the main thread, so it
@@ -55,6 +56,34 @@ const mergeTheme = EditorView.theme({
 function phrases() {
   const p = isEn() ? { '$ unchanged lines': '$ unchanged lines' } : { '$ unchanged lines': '$ 行未改动' };
   return [searchPhrases(), EditorState.phrases.of(p)];
+}
+
+/** Side by side, each editor scrolls itself (so its horizontal scrollbar sits at the bottom of the pane) and the two
+ *  follow each other both ways, like VS Code's diff editor (diffEditorViewZones.ts syncs scrollTop and scrollLeft).
+ *  MergeView's spacers give both sides the same line positions, so equal offsets keep lines aligned. */
+function syncScroll(a: EditorView, b: EditorView): () => void {
+  let applying: HTMLElement | null = null;
+  const follow = (from: HTMLElement, to: HTMLElement) => () => {
+    // Ignore the scroll event caused by our own assignment
+    if (applying === from) {
+      applying = null;
+      return;
+    }
+    const top = to.scrollTop;
+    const left = to.scrollLeft;
+    to.scrollTop = from.scrollTop;
+    to.scrollLeft = from.scrollLeft;
+    // Only an actual change fires a scroll event (a narrower side clamps scrollLeft)
+    applying = to.scrollTop !== top || to.scrollLeft !== left ? to : null;
+  };
+  const fa = follow(a.scrollDOM, b.scrollDOM);
+  const fb = follow(b.scrollDOM, a.scrollDOM);
+  a.scrollDOM.addEventListener('scroll', fa, { passive: true });
+  b.scrollDOM.addEventListener('scroll', fb, { passive: true });
+  return () => {
+    a.scrollDOM.removeEventListener('scroll', fa);
+    b.scrollDOM.removeEventListener('scroll', fb);
+  };
 }
 
 export interface MergeDiffHandle {
@@ -134,7 +163,8 @@ export const MergeDiff = forwardRef<
         diffConfig: DIFF_CONFIG,
       });
       views = [mv.a, mv.b];
-      destroy = () => mv.destroy();
+      const unsync = syncScroll(mv.a, mv.b);
+      destroy = () => (unsync(), mv.destroy());
     } else {
       const v = new EditorView({
         parent: el,
