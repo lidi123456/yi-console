@@ -128,6 +128,20 @@ struct SessionRt {
     limited: Mutex<bool>,
     /// Asking the quota probe when the limit resets; the decision comes after the turn-end notification
     limit_probing: Mutex<bool>,
+    /// Terminal-mode process runs (memory only), for matching the tool session each run created (`guess_terminal_session`)
+    runs: Mutex<Vec<TermRun>>,
+}
+
+/// One terminal-mode process run
+#[derive(Debug, Clone, Default)]
+pub(crate) struct TermRun {
+    gen: u64,
+    start: i64,
+    end: Option<i64>,
+    /// Started with an existing tool session (`codex resume <id>`), so it creates none at startup
+    resumed: bool,
+    /// The run's process tree as sampled while running (Kiro only)
+    pids: HashSet<u32>,
 }
 
 struct Queued {
@@ -453,6 +467,18 @@ impl Hub {
         *rt.cmd.lock().unwrap() = Some(tx);
         *rt.launched_mode.lock().unwrap() = spec.permission_mode.clone();
         *rt.restart_pending.lock().unwrap() = false;
+        if spec.mode == SessionMode::Terminal && matches!(spec.tool, ToolKind::Codex | ToolKind::Kiro) {
+            let mut runs = rt.runs.lock().unwrap();
+            let now = now_ms();
+            for r in runs.iter_mut().filter(|r| r.end.is_none()) {
+                r.end = Some(now);
+            }
+            runs.push(TermRun { gen, start: now, resumed: spec.resume.is_some(), ..Default::default() });
+            let n = runs.len();
+            if n > 20 {
+                runs.drain(..n - 20);
+            }
+        }
         let em = Emitter {
             hub: self.clone(),
             sid,
@@ -1237,35 +1263,109 @@ impl Hub {
         self.broadcast_updated(&info);
     }
 
-    /// Before restarting Codex / Cursor / Kiro in terminal mode: if no tool session id was recorded, look in the tool's history sessions
-    /// for the newest one in the same directory, used after this session was created and not claimed by another session; record it and continue it on restart
+    /// Which tool session a Codex / Cursor / Kiro terminal session is on (they can't be given an id at launch the way
+    /// Claude's --session-id does). Runs before restarting, before switching to chat mode, before "continue with another
+    /// tool", and every minute while running (`track_terminal_sessions`, so the id survives a daemon restart).
+    /// Codex and Kiro are matched to this session's own process runs (`TermRun`): Codex by when the rollout was created
+    /// (`codex_owners`), Kiro by the pid in its .lock (`kiro_owned`). Either may move the id to a newer session the same
+    /// process opened (Codex /new). With no match the recorded id stays. Cursor, and sessions with no recorded runs
+    /// (from before a daemon restart), fall back to the newest session in the same directory, only while no id is recorded
     pub async fn guess_terminal_session(&self, id: &str) {
         let Ok(rt) = self.get(id) else { return };
         let info = rt.info.lock().unwrap().clone();
-        if info.mode != SessionMode::Terminal
-            || info.external_id.is_some()
-            || !matches!(info.tool, ToolKind::Codex | ToolKind::Cursor | ToolKind::Kiro)
-        {
+        if info.mode != SessionMode::Terminal || !matches!(info.tool, ToolKind::Codex | ToolKind::Cursor | ToolKind::Kiro) {
             return;
         }
+        let own_runs = rt.runs.lock().unwrap().clone();
+        // Ids held by other sessions
+        let mut others: Vec<RunRef> = vec![];
+        let mut taken: HashSet<String> = HashSet::new();
+        for r in self.sessions.lock().unwrap().values() {
+            let i = r.info.lock().unwrap();
+            if i.id == info.id {
+                continue;
+            }
+            if let Some(e) = &i.external_id {
+                taken.insert(e.clone());
+            }
+            if i.tool == info.tool && i.mode == SessionMode::Terminal {
+                others.extend(r.runs.lock().unwrap().iter().map(|run| RunRef {
+                    sid: i.id.clone(),
+                    cwd: norm_cwd(&i.cwd),
+                    run: run.clone(),
+                }));
+            }
+        }
+        let pick = if info.tool == ToolKind::Cursor || own_runs.is_empty() {
+            if info.external_id.is_some() {
+                return;
+            }
+            self.newest_in_dir(&info, &taken).await
+        } else {
+            let cwd = norm_cwd(&info.cwd);
+            let mine: Vec<RunRef> =
+                own_runs.iter().map(|run| RunRef { sid: info.id.clone(), cwd: cwd.clone(), run: run.clone() }).collect();
+            let owned: Vec<crate::history::TermCandidate> = if info.tool == ToolKind::Codex {
+                let since = own_runs.iter().map(|r| r.start).min().unwrap_or(0) - 60_000;
+                let cands = tokio::task::spawn_blocking(move || crate::history::codex_term_candidates(since))
+                    .await
+                    .unwrap_or_default();
+                let all: Vec<RunRef> = mine.into_iter().chain(others).collect();
+                let owners = codex_owners(&all, &cands);
+                cands.into_iter().filter(|c| owners.get(&c.id) == Some(&info.id)).collect()
+            } else {
+                let pids: HashSet<u32> = own_runs.iter().flat_map(|r| r.pids.iter().copied()).collect();
+                if pids.is_empty() {
+                    return;
+                }
+                let cands = tokio::task::spawn_blocking(move || crate::history::kiro_term_candidates(&pids))
+                    .await
+                    .unwrap_or_default();
+                kiro_owned(&mine, &cands)
+            };
+            owned.into_iter().filter(|c| !taken.contains(&c.id)).max_by_key(|c| c.updated).map(|c| c.id)
+        };
+        if let Some(ext) = pick.filter(|e| info.external_id.as_deref() != Some(e.as_str())) {
+            crate::info!("终端会话 {id} 对应 {} 会话 {ext}（原来 {:?}）", info.tool.as_str(), info.external_id);
+            self.set_external_id(id, &ext);
+        }
+    }
+
+    /// The old rule: newest tool session in the same directory, used since this session was created and not claimed elsewhere
+    async fn newest_in_dir(&self, info: &SessionInfo, taken: &HashSet<String>) -> Option<String> {
         let settings = self.settings.read().unwrap().clone();
         let list = crate::history::list(Some(info.tool), &settings).await;
-        let taken: HashSet<String> = self
+        let cwd = norm_cwd(&info.cwd);
+        list.into_iter()
+            .filter(|h| norm_cwd(&h.cwd) == cwd && h.updated_at >= info.created_at - 10_000 && !taken.contains(&h.id))
+            .max_by_key(|h| h.updated_at)
+            .map(|h| h.id)
+    }
+
+    /// Every minute: keep the tool session id of running Codex / Kiro terminal sessions current
+    pub async fn track_terminal_sessions(&self) {
+        let ids: Vec<String> = self
             .sessions
             .lock()
             .unwrap()
             .values()
-            .filter_map(|r| r.info.lock().unwrap().external_id.clone())
+            .filter(|rt| self.running_tx(rt).is_some())
+            .filter_map(|rt| {
+                let i = rt.info.lock().unwrap();
+                (i.mode == SessionMode::Terminal && matches!(i.tool, ToolKind::Codex | ToolKind::Kiro)).then(|| i.id.clone())
+            })
             .collect();
-        let norm = |p: &str| p.replace('\\', "/").trim_end_matches('/').to_lowercase();
-        let cwd = norm(&info.cwd);
-        let hit = list
-            .into_iter()
-            .filter(|h| norm(&h.cwd) == cwd && h.updated_at >= info.created_at - 10_000 && !taken.contains(&h.id))
-            .max_by_key(|h| h.updated_at);
-        if let Some(h) = hit {
-            crate::info!("终端会话 {id} 接着 {} 会话 {}", info.tool.as_str(), h.id);
-            self.set_external_id(id, &h.id);
+        for id in ids {
+            self.guess_terminal_session(&id).await;
+        }
+    }
+
+    /// Process tree sampled by the pty adapter (Kiro)
+    fn note_pids(&self, sid: &str, gen: u64, pids: Vec<u32>) {
+        if let Ok(rt) = self.get(sid) {
+            if let Some(r) = rt.runs.lock().unwrap().iter_mut().find(|r| r.gen == gen) {
+                r.pids.extend(pids);
+            }
         }
     }
 
@@ -1713,6 +1813,12 @@ impl Hub {
 
     /// Adapter exited: clear pending approvals and mark exited
     fn exited(&self, sid: &str, gen: u64, message: Option<String>) {
+        // Close the run even for an old generation (a process swap invalidates it before the old process exits)
+        if let Ok(rt) = self.get(sid) {
+            if let Some(r) = rt.runs.lock().unwrap().iter_mut().find(|r| r.gen == gen && r.end.is_none()) {
+                r.end = Some(now_ms());
+            }
+        }
         let Some(rt) = self.alive(sid, gen) else {
             return;
         };
@@ -1834,6 +1940,7 @@ fn new_rt(info: SessionInfo) -> SessionRt {
         resume_token: Mutex::new(0),
         limited: Mutex::new(false),
         limit_probing: Mutex::new(false),
+        runs: Mutex::new(vec![]),
     }
 }
 
@@ -2007,14 +2114,160 @@ impl Emitter {
         self.hub.exited(&self.sid, self.gen, message);
     }
 
+    /// Pids in the process tree of a terminal-mode run (for matching Kiro's .lock files)
+    pub fn tool_pids(&self, pids: Vec<u32>) {
+        self.hub.note_pids(&self.sid, self.gen, pids);
+    }
+
     pub fn session_id(&self) -> &str {
         &self.sid
     }
 }
 
+/// Directory key for matching: separators unified, no trailing slash, case-insensitive
+fn norm_cwd(p: &str) -> String {
+    p.trim_start_matches(r"\\?\").replace('\\', "/").trim_end_matches('/').to_lowercase()
+}
+
+/// A terminal run with the session it belongs to
+#[derive(Debug, Clone)]
+pub(crate) struct RunRef {
+    sid: String,
+    cwd: String,
+    run: TermRun,
+}
+
+/// How long after our launch the Codex TUI writes its session_meta (measured 2-4 s on Windows, plus the wait for the first resize)
+const CODEX_START_WINDOW: i64 = 30_000;
+
+/// Codex: which Yi session created each rollout (candidate id -> session id). A rollout's creation time falls inside a
+/// run of exactly one process in that directory, or right after the start of exactly one run that hasn't been given its
+/// startup session yet (each fresh TUI creates one at startup; `codex resume` runs create none). Anything ambiguous,
+/// such as two sessions launched in the same directory within the window, stays unassigned
+pub(crate) fn codex_owners(runs: &[RunRef], cands: &[crate::history::TermCandidate]) -> HashMap<String, String> {
+    let mut cands: Vec<&crate::history::TermCandidate> = cands.iter().collect();
+    cands.sort_by_key(|c| c.started);
+    let mut started: HashSet<usize> = (0..runs.len()).filter(|&i| runs[i].run.resumed).collect();
+    let mut out = HashMap::new();
+    for c in cands {
+        let cwd = norm_cwd(&c.cwd);
+        let running: Vec<usize> = (0..runs.len())
+            .filter(|&i| {
+                let r = &runs[i];
+                r.cwd == cwd && r.run.start <= c.started + 1000 && r.run.end.map_or(true, |e| c.started <= e + 2000)
+            })
+            .collect();
+        let fresh: Vec<usize> = running
+            .iter()
+            .copied()
+            .filter(|&i| !started.contains(&i) && c.started - runs[i].run.start <= CODEX_START_WINDOW)
+            .collect();
+        let owner = match fresh.as_slice() {
+            [i] => {
+                started.insert(*i);
+                Some(*i)
+            }
+            [] => {
+                let sids: HashSet<&str> = running.iter().map(|&i| runs[i].sid.as_str()).collect();
+                (sids.len() == 1).then(|| running[0])
+            }
+            _ => None,
+        };
+        if let Some(i) = owner {
+            out.insert(c.id.clone(), runs[i].sid.clone());
+        }
+    }
+    out
+}
+
+/// Kiro: sessions whose .lock pid was in one of these runs' process trees while the run was alive
+pub(crate) fn kiro_owned(runs: &[RunRef], cands: &[crate::history::TermCandidate]) -> Vec<crate::history::TermCandidate> {
+    cands
+        .iter()
+        .filter(|c| {
+            (c.cwd.is_empty() || runs.iter().any(|r| r.cwd == norm_cwd(&c.cwd)))
+                && runs.iter().any(|r| {
+                    // The pid was alive during the run, so a lock naming it that was written before the run ended is that process
+                    // (after a daemon restart a reattached run may begin after the process started)
+                    c.pid.is_some_and(|p| r.run.pids.contains(&p)) && r.run.end.map_or(true, |e| c.started <= e + 2000)
+                })
+        })
+        .cloned()
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn run(sid: &str, cwd: &str, start: i64, end: Option<i64>, resumed: bool, pids: &[u32]) -> RunRef {
+        RunRef {
+            sid: sid.into(),
+            cwd: norm_cwd(cwd),
+            run: TermRun { gen: 0, start, end, resumed, pids: pids.iter().copied().collect() },
+        }
+    }
+    fn cand(id: &str, cwd: &str, started: i64, updated: i64, pid: Option<u32>) -> crate::history::TermCandidate {
+        crate::history::TermCandidate { id: id.into(), cwd: cwd.into(), started, pid, updated }
+    }
+
+    /// Times (s) from the runs measured with codex 0.163.0 on Windows
+    #[test]
+    fn codex_owner_by_creation_time() {
+        let s = |x: f64| (x * 1000.0) as i64;
+        // Two sessions 7 s apart in one directory; A talked first, so "newest in the directory" swapped them
+        let runs = vec![
+            run("A", r"D:\w\par", s(8.7), Some(s(60.0)), false, &[]),
+            run("B", "d:/w/par/", s(16.3), Some(s(62.0)), false, &[]),
+        ];
+        let cands = vec![cand("ra", r"D:\w\par", s(11.1), s(78.0), None), cand("rb", r"D:\w\par", s(18.6), s(69.0), None)];
+        let o = codex_owners(&runs, &cands);
+        assert_eq!(o.get("ra").map(String::as_str), Some("A"));
+        assert_eq!(o.get("rb").map(String::as_str), Some("B"));
+
+        // Launched within the same second: can't tell, so neither is assigned
+        let runs = vec![run("A", "/w", s(0.0), None, false, &[]), run("B", "/w", s(0.5), None, false, &[])];
+        let o = codex_owners(&runs, &[cand("r1", "/w", s(3.0), 1, None), cand("r2", "/w", s(3.4), 1, None)]);
+        assert!(o.is_empty(), "{o:?}");
+
+        // /new 30 s into the only run in the directory: also this session's
+        let runs = vec![run("A", "/w", s(0.0), None, false, &[])];
+        let o = codex_owners(&runs, &[cand("r1", "/w", s(2.5), 1, None), cand("r2", "/w", s(40.0), 2, None)]);
+        assert_eq!(o.len(), 2);
+
+        // /new while another session runs in the same directory: ambiguous
+        let runs = vec![run("A", "/w", s(0.0), None, false, &[]), run("B", "/w", s(10.0), None, false, &[])];
+        let o = codex_owners(&runs, &[cand("ra", "/w", s(2.5), 1, None), cand("rb", "/w", s(12.5), 1, None), cand("rn", "/w", s(90.0), 1, None)]);
+        assert_eq!(o.get("ra").map(String::as_str), Some("A"));
+        assert_eq!(o.get("rb").map(String::as_str), Some("B"));
+        assert!(!o.contains_key("rn"));
+
+        // A `codex resume` run creates nothing at startup, so a session started next to it belongs to the other run
+        let runs = vec![run("A", "/w", s(0.0), None, true, &[]), run("B", "/w", s(5.0), None, false, &[])];
+        let o = codex_owners(&runs, &[cand("rb", "/w", s(7.5), 1, None)]);
+        assert_eq!(o.get("rb").map(String::as_str), Some("B"));
+
+        // Other directories, and sessions started after the run ended, don't count
+        let runs = vec![run("A", "/w", s(0.0), Some(s(20.0)), false, &[])];
+        let o = codex_owners(&runs, &[cand("x", "/other", s(2.0), 1, None), cand("y", "/w", s(40.0), 1, None)]);
+        assert!(o.is_empty(), "{o:?}");
+    }
+
+    #[test]
+    fn kiro_owned_by_lock_pid() {
+        let runs = vec![run("A", r"D:\w\k", 1000, Some(90_000), false, &[36436, 16300, 48656]), run("A", r"D:\w\k", 100_000, None, true, &[35220])];
+        let cands = vec![
+            cand("first", r"D:\w\k", 2_000, 10, Some(48656)),
+            cand("resumed", r"D:\w\k", 107_000, 20, Some(35220)),
+            // Another session in the same directory
+            cand("other", r"D:\w\k", 3_000, 30, Some(14192)),
+            // Same pid, but the lock was written after that run ended (pid reused)
+            cand("late", r"D:\w\k", 95_000, 40, Some(48656)),
+        ];
+        let mut ids: Vec<String> = kiro_owned(&runs, &cands).into_iter().map(|c| c.id).collect();
+        ids.sort();
+        assert_eq!(ids, ["first", "resumed"]);
+    }
 
     fn user(t: &str) -> EventBody {
         EventBody::UserMessage { text: t.into(), images: vec![] }

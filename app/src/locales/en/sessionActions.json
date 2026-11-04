@@ -53,5 +53,6 @@
   "browseWorkingDirectory": "Browse Working Directory",
   "stopProcess": "Stop Process",
   "stopped": "Stopped",
-  "reload": "Reload"
+  "reload": "Reload",
+  "noReadableLogForThisTerminalSession": "Couldn't find the tool's log for this terminal session. Nothing may have been said yet, or several sessions of this tool are open in the same folder and it can't tell which one is this."
 }

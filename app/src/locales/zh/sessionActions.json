@@ -53,5 +53,6 @@
   "browseWorkingDirectory": "浏览工作目录",
   "stopProcess": "停止进程",
   "stopped": "已停止",
-  "reload": "重新加载"
+  "reload": "重新加载",
+  "noReadableLogForThisTerminalSession": "找不到这个终端会话对应的工具日志，可能还没说过话，或者同一目录里同时开着多个同类会话、无法确定是哪一个"
 }

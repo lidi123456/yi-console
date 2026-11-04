@@ -229,6 +229,7 @@ fn serve(foreground: bool) -> Result<()> {
                 loop {
                     t.tick().await;
                     hub.release_idle();
+                    hub.track_terminal_sessions().await;
                 }
             });
         }

@@ -284,6 +284,104 @@ pub fn pins_session_id(tool: ToolKind) -> bool {
     matches!(tool, ToolKind::Claude | ToolKind::Qoder | ToolKind::Codebuddy)
 }
 
+/// A tool session that a terminal-mode process may have created, for `Hub::guess_terminal_session`
+#[derive(Debug, Clone)]
+pub struct TermCandidate {
+    pub id: String,
+    pub cwd: String,
+    /// Codex: session creation time (session_meta.timestamp, written when the TUI starts, not at the first message).
+    /// Kiro: when the process holding the session started (.lock started_at, rewritten on every resume)
+    pub started: i64,
+    /// Kiro: pid of the `kiro-cli acp` process in .lock
+    pub pid: Option<u32>,
+    /// Last write to the log, ms
+    pub updated: i64,
+}
+
+fn mtime_ms(p: &Path) -> Option<i64> {
+    let t = std::fs::metadata(p).ok()?.modified().ok()?;
+    Some(t.duration_since(std::time::UNIX_EPOCH).ok()?.as_millis() as i64)
+}
+
+/// Codex TUI sessions whose rollout was written since `since` (ms). Only `source: cli` (the interactive TUI):
+/// `codex exec` runs, app-server (chat mode) threads and sub-agents can't belong to a terminal session
+pub fn codex_term_candidates(since: i64) -> Vec<TermCandidate> {
+    codex_files()
+        .into_iter()
+        .filter_map(|p| {
+            let updated = mtime_ms(&p)?;
+            if updated < since {
+                return None;
+            }
+            let mut first = String::new();
+            BufReader::new(std::fs::File::open(&p).ok()?).read_line(&mut first).ok()?;
+            let v: Value = serde_json::from_str(&first).ok()?;
+            if v["type"] != "session_meta" {
+                return None;
+            }
+            let m = &v["payload"];
+            if !(m["source"].is_null() || m["source"] == "cli") {
+                return None;
+            }
+            Some(TermCandidate {
+                id: m["id"].as_str()?.to_string(),
+                cwd: m["cwd"].as_str()?.to_string(),
+                started: m["timestamp"].as_str().and_then(parse_iso)?,
+                pid: None,
+                updated,
+            })
+        })
+        .collect()
+}
+
+/// Kiro sessions whose .lock names one of `pids`: `~/.kiro/sessions/cli/<id>.lock` is {"pid", "started_at"} of the
+/// process holding it and stays after exit; `<id>.json` has the cwd (its session_created_reason says "subagent" even for
+/// the main chat, so it can't be used to filter)
+pub fn kiro_term_candidates(pids: &std::collections::HashSet<u32>) -> Vec<TermCandidate> {
+    let dir = crate::paths::home().join(".kiro").join("sessions").join("cli");
+    let Ok(rd) = std::fs::read_dir(&dir) else { return vec![] };
+    rd.filter_map(|e| {
+        let p = e.ok()?.path();
+        if p.extension()? != "lock" {
+            return None;
+        }
+        let id = p.file_stem()?.to_str()?.to_string();
+        let lock: Value = serde_json::from_str(&std::fs::read_to_string(&p).ok()?).ok()?;
+        let pid = lock["pid"].as_u64()? as u32;
+        if !pids.contains(&pid) {
+            return None;
+        }
+        let meta: Value = std::fs::read_to_string(dir.join(format!("{id}.json")))
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or(Value::Null);
+        let log = dir.join(format!("{id}.jsonl"));
+        Some(TermCandidate {
+            cwd: meta["cwd"].as_str().unwrap_or("").trim_start_matches(r"\\?\").to_string(),
+            started: lock["started_at"].as_str().and_then(parse_iso)?,
+            pid: Some(pid),
+            updated: mtime_ms(&log).or_else(|| mtime_ms(&p))?,
+            id,
+        })
+    })
+    .collect()
+}
+
+/// Whether the tool's own session log has a user message (for "continue with another tool" in terminal mode,
+/// where messages typed into the terminal aren't in our event log)
+pub fn has_user(tool: ToolKind, id: &str, path: &Path) -> bool {
+    match tool {
+        ToolKind::Claude | ToolKind::Codex | ToolKind::Qoder => read(tool, id)
+            .map(|evs| evs.iter().any(|e| matches!(e, EventBody::UserMessage { .. })))
+            .unwrap_or(false),
+        _ => {
+            let Ok(f) = std::fs::File::open(path) else { return false };
+            let needle = if tool == ToolKind::Kiro { "\"kind\":\"Prompt\"" } else { "\"role\":\"user\"" };
+            BufReader::new(f).lines().map_while(Result::ok).any(|l| l.contains(needle))
+        }
+    }
+}
+
 fn find_claude_file(id: &str) -> Option<PathBuf> {
     claude_files()
         .into_iter()

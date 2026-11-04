@@ -5,6 +5,9 @@ use crate::hub::Emitter;
 use yi_proto::{SessionStatus, ToolKind};
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use std::io::{Read, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc;
 
 /// Launch arguments for each tool's interactive mode (including resume)
@@ -176,6 +179,35 @@ pub fn start(spec: StartSpec, em: Emitter, mut rx: mpsc::UnboundedReceiver<Adapt
     let mut killer = child.clone_killer();
     em.status(SessionStatus::Running, None);
 
+    // Kiro writes the pid of its `kiro-cli acp` process (a grandchild: kiro-cli chat -> bun tui.js -> kiro-cli acp) into
+    // ~/.kiro/sessions/cli/<id>.lock; sampling the process tree lets the hub tell which Kiro session this process owns
+    let sampling = Arc::new(AtomicBool::new(spec.tool == ToolKind::Kiro));
+    if sampling.load(Ordering::Relaxed) {
+        let (em_p, on) = (em.clone(), sampling.clone());
+        let root = child.process_id();
+        let pane = tmux.as_ref().map(|(_, n)| n.clone());
+        std::thread::spawn(move || {
+            let waits = [3u64, 3, 4, 10, 20, 40, 80];
+            let mut i = 0;
+            while on.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_secs(waits.get(i).copied().unwrap_or(120)));
+                i += 1;
+                if !on.load(Ordering::Relaxed) {
+                    break;
+                }
+                let root = match &pane {
+                    Some(n) => crate::tmux::pane_pid(n).map(|p| p as u32),
+                    None => root,
+                };
+                if let Some(r) = root {
+                    let mut pids = crate::proctree::descendants(r);
+                    pids.push(r);
+                    em_p.tool_pids(pids);
+                }
+            }
+        });
+    }
+
     // Reading output: blocking thread
     let em_r = em.clone();
     let (reply_tx, mut reply_rx) = mpsc::unbounded_channel::<Vec<u8>>();
@@ -210,6 +242,7 @@ pub fn start(spec: StartSpec, em: Emitter, mut rx: mpsc::UnboundedReceiver<Adapt
     let (done_tx, mut done_rx) = tokio::sync::oneshot::channel::<()>();
     std::thread::spawn(move || {
         let status = child.wait();
+        sampling.store(false, Ordering::Relaxed);
         let msg = match status {
             Ok(s) if s.success() => None,
             Ok(s) => Some(format!("进程退出，退出码 {}", s.exit_code())),

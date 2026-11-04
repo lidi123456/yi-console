@@ -71,6 +71,11 @@ export async function handoffSession(hostId: string, info: SessionInfo) {
     // (the menu already filters most by externalId; this catches ACP sessions created before anything was said, and after /clear).
     // Older daemons don't send hasUser; skip the check then
     let { path, hasUser } = await rpc<{ path: string | null; hasUser?: boolean }>(hostId, 'session.logFile', { sessionId: info.id });
+    if (!path && info.mode === 'terminal') {
+      // Exporting needs our event log, which has no messages for a terminal session
+      toast(tx('noReadableLogForThisTerminalSession'));
+      return;
+    }
     if (hasUser === false) {
       toast(tx('thisSessionHasNoConversation'));
       return;
@@ -306,8 +311,11 @@ export function sessionMenu(
         ]
       : []),
     ...(info.tool !== 'shell' && info.mode !== 'terminal' ? [{ label: tx('clearConversation'), icon: 'trash', run: () => clearSession(hostId, info) }] : []),
-    // No tool session id means nothing has been said yet (or just /clear-ed), so there's nothing to hand off
-    ...(info.tool !== 'shell' && info.mode === 'structured' && !info.parentId && info.externalId
+    // Chat mode: no tool session id means nothing has been said yet (or just /clear-ed), so there's nothing to hand off.
+    // Terminal mode: the daemon works out the tool session when asked (session.logFile); Cursor's terminal sessions have no readable log
+    ...(info.tool !== 'shell' &&
+    !info.parentId &&
+    (info.mode === 'structured' ? !!info.externalId : info.mode === 'terminal' && info.tool !== 'cursor')
       ? [{ label: tx('continueInAnotherTool'), icon: 'forward', run: () => handoffSession(hostId, info) }]
       : []),
     '-',

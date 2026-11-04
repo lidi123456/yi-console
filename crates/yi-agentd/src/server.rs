@@ -355,12 +355,28 @@ pub async fn dispatch(
             tokio::task::spawn_blocking(move || crate::hub::attach_append(&sid, &path, &data)).await??
         }
         SESSION_LOG_FILE => {
-            let info = hub.info(s(&p, "sessionId")?)?;
-            // Whether there is anything to hand off, so the client doesn't have to fetch events to find out
-            let has_user = hub.store.count_user_messages(&info.id)? > 0;
-            let path = match info.external_id {
-                Some(ext) => tokio::task::spawn_blocking(move || crate::history::session_file(info.tool, &ext)).await?,
-                None => None,
+            let sid = s(&p, "sessionId")?.to_string();
+            // Terminal mode: make sure the recorded tool session is still the one this process is on
+            hub.guess_terminal_session(&sid).await;
+            let info = hub.info(&sid)?;
+            let terminal = info.mode == SessionMode::Terminal;
+            // Whether there is anything to hand off, so the client doesn't have to fetch events to find out.
+            // Messages typed into a terminal aren't in our event log, so terminal mode asks the tool's own log
+            let logged = if terminal { 0 } else { hub.store.count_user_messages(&info.id)? };
+            let (path, has_user) = match info.external_id {
+                Some(ext) => {
+                    let tool = info.tool;
+                    tokio::task::spawn_blocking(move || {
+                        let path = crate::history::session_file(tool, &ext);
+                        let has = match &path {
+                            Some(f) if terminal => crate::history::has_user(tool, &ext, f),
+                            _ => logged > 0,
+                        };
+                        (path, has)
+                    })
+                    .await?
+                }
+                None => (None, logged > 0),
             };
             json!({ "path": path.map(|p| p.display().to_string()), "hasUser": has_user })
         }

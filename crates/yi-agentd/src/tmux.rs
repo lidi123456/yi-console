@@ -143,7 +143,7 @@ fn parse_scroll(s: &str) -> Option<(u64, u64)> {
 }
 
 /// PID of the program running directly in the pane
-fn pane_pid(name: &str) -> Option<i32> {
+pub(crate) fn pane_pid(name: &str) -> Option<i32> {
     let out = Command::new(program()?)
         .args(["-L", SOCKET, "display-message", "-p", "-t", &format!("={name}:"), "#{pane_pid}"])
         .stdin(std::process::Stdio::null())

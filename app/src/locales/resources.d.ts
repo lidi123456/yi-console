@@ -1018,6 +1018,7 @@ export default interface Resources {
     "hideTerminalPanel": "收起终端面板",
     "loadingConversation": "正在读取会话内容…",
     "newSession": "新会话",
+    "noReadableLogForThisTerminalSession": "找不到这个终端会话对应的工具日志，可能还没说过话，或者同一目录里同时开着多个同类会话、无法确定是哪一个",
     "ofThemAreRunningAnd": "\n其中 {{busy}} 个正在运行，会被中断。",
     "onlyRemovesTheRecordIn": "只删除 Yi Console 里的记录，工具自己的历史不受影响。",
     "onlyRemovesTheRecordsIn": "只删除 Yi Console 里的记录，工具自己的历史不受影响。",
