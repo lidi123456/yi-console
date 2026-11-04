@@ -212,6 +212,7 @@ export default interface Resources {
   },
   "diffView": {
     "bothSidesAreTheSame": "两边内容一样，没有差异。",
+    "dragToResizeDoubleClick": "拖动调整左右宽度，双击恢复一半一半",
     "moreLines": "… 还有 {{v}} 行",
     "moreLinesNotShown": "… 还有 {{more}} 行没显示",
     "newFile": "新文件"

@@ -6849,8 +6849,32 @@ body.resizing .side-resizer::after {
 .wp-merge-unified .cm-editor {
   height: 100%;
 }
+.wp-merge {
+  position: relative;
+}
+.wp-merge-host {
+  height: 100%;
+}
 .wp-merge.wp-merge-split .cm-mergeView {
   overflow: hidden;
+}
+/* Draggable divider between the two panes (left share in --split), like VS Code's diff editor sash */
+.wp-merge.wp-merge-split .cm-mergeViewEditor:first-child {
+  flex: 0 0 calc(var(--split, 0.5) * 100%);
+}
+.wp-merge-sash {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: calc(var(--split, 0.5) * 100% - 2px);
+  width: 4px;
+  z-index: 5;
+  cursor: col-resize;
+  touch-action: none;
+}
+.wp-merge-sash:hover,
+body.resizing .wp-merge-sash {
+  background: var(--link);
 }
 .wp-merge.wp-merge-split .cm-mergeViewEditors,
 .wp-merge.wp-merge-split .cm-mergeViewEditor {

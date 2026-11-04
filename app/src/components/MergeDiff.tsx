@@ -1,4 +1,4 @@
-import { forwardRef, useEffect, useImperativeHandle, useRef } from 'react';
+import { forwardRef, useEffect, useImperativeHandle, useRef, useState } from 'react';
 import { EditorState, type Extension } from '@codemirror/state';
 import { drawSelection, EditorView, highlightSpecialChars, keymap, lineNumbers } from '@codemirror/view';
 import { defaultKeymap } from '@codemirror/commands';
@@ -20,6 +20,10 @@ const t = getT('diffView');
 // - Performance: CodeMirror only renders the visible lines of either side; the diff runs on the main thread, so it
 //   gets a 1 s budget (VS Code runs it in a worker with 5 s) and falls back to a coarser diff past that.
 //   The caller limits file size (git.blob and fs.read stop at 1 MB) and uses the hunk-only PaneDiff beyond it.
+// - Added and deleted files (one side empty) show just the one file, as VS Code's git extension opens untracked / added
+//   files directly and deleted ones as their old content (oneSided).
+// - Side by side, the divider drags to resize the two panes (VS Code's enableSplitViewResizing); double-click resets to
+//   half and half. Like VS Code the ratio isn't saved.
 // Differences from VS Code: collapsed regions expand all at once (VS Code reveals 20 lines at a time), whitespace
 // changes at line ends are not ignored, and the stacked view only numbers the new file's lines.
 
@@ -86,6 +90,12 @@ function syncScroll(a: EditorView, b: EditorView): () => void {
   };
 }
 
+const norm = (s: string) => s.replace(/\r\n/g, '\n');
+/** One side empty: an added or deleted file, shown as the single file instead of a diff */
+export const oneSided = (a: string, b: string) => (norm(a) === '') !== (norm(b) === '');
+/** Narrowest a pane may be dragged, in px */
+const MIN_PANE = 120;
+
 export interface MergeDiffHandle {
   next(): void;
   prev(): void;
@@ -114,7 +124,11 @@ export const MergeDiff = forwardRef<
     prev: () => nav.current && goToPreviousChunk(nav.current),
   }));
 
-  const same = a.replace(/\r\n/g, '\n') === b.replace(/\r\n/g, '\n');
+  const same = norm(a) === norm(b);
+  const single = oneSided(a, b);
+  const split = layout === 'split' && !single;
+  // Share of the width for the left pane
+  const [ratio, setRatio] = useState(0.5);
 
   useEffect(() => {
     const el = host.current;
@@ -131,7 +145,7 @@ export const MergeDiff = forwardRef<
       nav.current = null;
       destroy();
     };
-  }, [a, b, filename, layout, collapse, wrap, lang, same]);
+  }, [a, b, filename, layout, collapse, wrap, lang, same, single]);
 
   const build = (el: HTMLElement, language: Extension): (() => void) => {
     const ext = (): Extension[] => [
@@ -150,6 +164,10 @@ export const MergeDiff = forwardRef<
       language,
     ];
     const collapseUnchanged = collapse ? COLLAPSE : undefined;
+    if (single) {
+      const v = new EditorView({ parent: el, state: EditorState.create({ doc: norm(a) === '' ? b : a, extensions: ext() }) });
+      return () => v.destroy();
+    }
     let views: EditorView[];
     let destroy: () => void;
     if (layout === 'split') {
@@ -192,6 +210,36 @@ export const MergeDiff = forwardRef<
     };
   };
 
+  const box = useRef<HTMLDivElement>(null);
+  const drag = (e: React.PointerEvent<HTMLDivElement>) => {
+    const r = box.current?.getBoundingClientRect();
+    if (!r || e.button !== 0) return;
+    e.preventDefault();
+    const sash = e.currentTarget;
+    sash.setPointerCapture(e.pointerId);
+    document.body.classList.add('resizing');
+    const lo = Math.min(0.5, MIN_PANE / r.width);
+    const move = (ev: PointerEvent) => setRatio(Math.min(1 - lo, Math.max(lo, (ev.clientX - r.left) / r.width)));
+    const up = () => {
+      sash.removeEventListener('pointermove', move);
+      sash.removeEventListener('pointerup', up);
+      sash.removeEventListener('pointercancel', up);
+      document.body.classList.remove('resizing');
+    };
+    sash.addEventListener('pointermove', move);
+    sash.addEventListener('pointerup', up);
+    sash.addEventListener('pointercancel', up);
+  };
+
   if (same) return <div className="pd-empty muted small">{t('bothSidesAreTheSame')}</div>;
-  return <div className={`wp-merge wp-merge-${layout}`} ref={host} />;
+  return (
+    <div
+      ref={box}
+      className={`wp-merge wp-merge-${split ? 'split' : 'unified'}`}
+      style={split ? ({ '--split': ratio } as React.CSSProperties) : undefined}
+    >
+      <div className="wp-merge-host" ref={host} />
+      {split && <div className="wp-merge-sash" title={t('dragToResizeDoubleClick')} onPointerDown={drag} onDoubleClick={() => setRatio(0.5)} />}
+    </div>
+  );
 });

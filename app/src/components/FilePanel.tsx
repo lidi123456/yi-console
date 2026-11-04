@@ -10,7 +10,7 @@ import { Icon } from './Icon';
 import { askConfirm, askText, openMenu, type MenuItem } from './Overlay';
 import { CodeEditor } from './CodeEditor';
 import { PaneDiff } from './DiffView';
-import { MergeDiff, type MergeDiffHandle } from './MergeDiff';
+import { MergeDiff, oneSided, type MergeDiffHandle } from './MergeDiff';
 import { CsvView, ImageView, MdPreview, PdfView } from './FilePreview';
 import { GrepPanel } from './GrepPanel';
 import { QuickOpen, type QuickMode } from './QuickOpen';
@@ -1638,8 +1638,10 @@ export function FilePanel({
       <MergeDiff ref={mergeRef} a={f.a} b={f.b} filename={name} layout={layout} collapse={diffCollapse} wrap={wrap} />
     </div>
   );
-  /** Toolbar buttons for the full-file diff: previous / next change and collapsing unchanged regions */
-  const mergeBtns = full ? (
+  /** Toolbar buttons for the full-file diff: previous / next change and collapsing unchanged regions (none for an added /
+   *  deleted file, which MergeDiff shows as the single file) */
+  const singleFile = !!full && oneSided(full.a, full.b);
+  const mergeBtns = full && !singleFile ? (
     <>
       <button className="icon-btn" title={tx('previousChange')} onClick={() => mergeRef.current?.prev()}>
         <Icon name="up" size={14} />
@@ -2285,7 +2287,7 @@ export function FilePanel({
           <div className="wp-actions">
             <span className="hide-mobile">{tx('readOnly')}</span>
             {mergeBtns}
-            {wide() && (
+            {wide() && !singleFile && (
               <button className="icon-btn" title={layout === 'split' ? tx('switchToStacked') : tx('switchToSideBySide')} onClick={flipLayout}>
                 <Icon name={layout === 'split' ? 'rows' : 'columns'} size={14} />
               </button>
@@ -2360,7 +2362,7 @@ export function FilePanel({
               </div>
             )}
             {viewing !== 'file' && mergeBtns}
-            {viewing !== 'file' && wide() && (
+            {viewing !== 'file' && wide() && !singleFile && (
               <button className="icon-btn" title={layout === 'split' ? tx('switchToStacked') : tx('switchToSideBySide')} onClick={flipLayout}>
                 <Icon name={layout === 'split' ? 'rows' : 'columns'} size={14} />
               </button>

@@ -2,5 +2,6 @@
   "newFile": "新文件",
   "moreLines": "… 还有 {{v}} 行",
   "bothSidesAreTheSame": "两边内容一样，没有差异。",
-  "moreLinesNotShown": "… 还有 {{more}} 行没显示"
+  "moreLinesNotShown": "… 还有 {{more}} 行没显示",
+  "dragToResizeDoubleClick": "拖动调整左右宽度，双击恢复一半一半"
 }
