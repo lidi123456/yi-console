@@ -275,8 +275,14 @@ interface TreeRow {
   loading?: boolean;
 }
 
+/** Lists longer than this render only the rows in view (plus OVERSCAN above and below), like VS Code's list view:
+ *  a repo with 10,000 changed files would otherwise put ~150,000 elements on the page */
+const VIRTUAL_MIN = 150;
+const OVERSCAN = 20;
+
 function Rows({
   rows,
+  scroller,
   selected,
   focused,
   git,
@@ -289,6 +295,8 @@ function Rows({
   stats,
 }: {
   rows: TreeRow[];
+  /** The scrolling element the rows sit in; given, long lists are virtualized (rows all share one height) */
+  scroller?: React.RefObject<HTMLElement | null>;
   /** Changes view: show lines added/removed to the right of file rows */
   stats?: boolean;
   selected?: string;
@@ -305,9 +313,49 @@ function Rows({
   onOpen: (r: TreeRow) => void;
   onMenu?: (e: React.MouseEvent, r: TreeRow) => void;
 }) {
+  const box = useRef<HTMLDivElement>(null);
+  const virtual = !!scroller && rows.length > VIRTUAL_MIN;
+  // Row height comes from CSS (taller on phones), measured from a rendered row
+  const [rowH, setRowH] = useState(26);
+  const [win, setWin] = useState<[number, number]>([0, 2 * OVERSCAN]);
+  /** Where the rows start inside the scroller (notices and totals may sit above them) */
+  const offsetIn = (el: HTMLElement) => box.current!.getBoundingClientRect().top - el.getBoundingClientRect().top + el.scrollTop;
+  useLayoutEffect(() => {
+    const el = scroller?.current;
+    if (!virtual || !el || !box.current) return;
+    const update = () => {
+      if (!box.current) return;
+      const h = box.current.querySelector<HTMLElement>('.wp-row')?.offsetHeight || rowH;
+      if (h !== rowH) return setRowH(h);
+      const y = el.scrollTop - offsetIn(el);
+      const from = Math.max(0, Math.floor(y / h) - OVERSCAN);
+      const to = Math.min(rows.length, Math.ceil((y + el.clientHeight) / h) + OVERSCAN);
+      setWin((w) => (w[0] === from && w[1] === to ? w : [from, to]));
+    };
+    update();
+    el.addEventListener('scroll', update, { passive: true });
+    const ro = new ResizeObserver(update);
+    ro.observe(el);
+    return () => {
+      el.removeEventListener('scroll', update);
+      ro.disconnect();
+    };
+  }, [virtual, rows.length, rowH, scroller]); // eslint-disable-line react-hooks/exhaustive-deps
+  // The keyboard cursor may move to a row that isn't rendered: scroll it into view by position
+  useEffect(() => {
+    const el = scroller?.current;
+    if (!virtual || !el || !box.current || focused == null) return;
+    const i = rows.findIndex((r) => r.key === focused);
+    if (i < 0) return;
+    const top = offsetIn(el) + i * rowH;
+    if (top < el.scrollTop) el.scrollTop = top;
+    else if (top + rowH > el.scrollTop + el.clientHeight) el.scrollTop = top + rowH - el.clientHeight;
+  }, [focused]); // eslint-disable-line react-hooks/exhaustive-deps
+  const from = virtual ? Math.min(win[0], rows.length) : 0;
+  const to = virtual ? Math.min(Math.max(win[1], from), rows.length) : rows.length;
   return (
-    <>
-      {rows.map((r) => {
+    <div ref={box} style={virtual ? { paddingTop: from * rowH, paddingBottom: (rows.length - to) * rowH } : undefined}>
+      {rows.slice(from, to).map((r) => {
         const g = git && !r.isDir ? git.files.get(norm(r.path)) : undefined;
         const mark = g ? gitMark(g.status) : null;
         const dirChanged = !!git && r.isDir && !r.expanded && git.dirs.has(norm(r.path));
@@ -371,7 +419,7 @@ function Rows({
         </div>
         );
       })}
-    </>
+    </div>
   );
 }
 
@@ -1762,6 +1810,7 @@ export function FilePanel({
                 <>
                   <Rows
                     rows={sRows}
+                    scroller={treeBox}
                     git={git}
                     selected={file?.path}
                     focused={focusKey}
@@ -1792,6 +1841,7 @@ export function FilePanel({
                 {cRows.length ? (
                   <Rows
                     rows={cRows}
+                    scroller={treeBox}
                     stats
                     git={git}
                     selected={file?.path}
@@ -1812,6 +1862,7 @@ export function FilePanel({
               rows.length ? (
                 <Rows
                   rows={rows}
+                  scroller={treeBox}
                   git={git}
                   selected={file?.path}
                   focused={focusKey}
