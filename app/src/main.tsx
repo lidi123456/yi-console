@@ -6,6 +6,7 @@ import './styles.css';
 import './back';
 import './scrollbars';
 import { initTheme } from './theme';
+import { initFontPrefs } from './fontPrefs';
 import { initLang } from './i18n';
 import { isMobileApp, openUrl, openUrlExternal } from './components/PortsView';
 import { openMenu } from './components/Overlay';
@@ -47,6 +48,7 @@ function linkMenu(e: MouseEvent) {
 document.addEventListener('contextmenu', linkMenu, true);
 
 initTheme();
+initFontPrefs();
 initLang();
 startEventLoop();
 restoreView();

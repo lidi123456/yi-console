@@ -65,5 +65,13 @@
   "about": "About",
   "local": "Local",
   "dayCount_one": "{{count}} day",
-  "dayCount_other": "{{count}} days"
+  "dayCount_other": "{{count}} days",
+  "fontAndZoom": "Font and Zoom",
+  "chatFontSize": "Chat font size",
+  "chatFontSizeDesc": "Text size of AI replies, your messages and the input box; code blocks follow it",
+  "editorFontSize": "Editor font size",
+  "editorFontSizeDesc": "Text size of the workspace file editor, diffs and Markdown preview",
+  "defaultSize": "Default ({{size}})",
+  "uiZoom": "UI zoom",
+  "uiZoomDesc": "Zoom the whole interface in or out; shortcuts {{mod}} + = / {{mod}} + - / {{mod}} + 0 (reset)"
 }

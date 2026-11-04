@@ -53,9 +53,10 @@ function foldMarker(open: boolean) {
 }
 
 export const theme = EditorView.theme({
-  '&': { height: '100%', fontSize: '12px', backgroundColor: 'var(--bg)', color: 'var(--text)' },
+  // Editor font size and line height are per-device preferences (fontPrefs.ts)
+  '&': { height: '100%', fontSize: 'var(--fs-editor)', backgroundColor: 'var(--bg)', color: 'var(--text)' },
   '&.cm-focused': { outline: 'none' },
-  '.cm-scroller': { fontFamily: 'var(--mono)', lineHeight: '20px' },
+  '.cm-scroller': { fontFamily: 'var(--mono)', lineHeight: 'var(--lh-editor)' },
   '.cm-content': { padding: '4px 0', caretColor: 'var(--text)' },
   '.cm-gutters': { backgroundColor: 'var(--bg)', color: 'var(--text-3)', border: 'none' },
   '.cm-lineNumbers .cm-gutterElement': { padding: '0 4px 0 16px', minWidth: '36px' },

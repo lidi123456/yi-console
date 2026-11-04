@@ -13,6 +13,7 @@ const paths: Record<string, string> = {
   'win-max': 'M6 6h12v12H6z',
   'win-restore': 'M8 8h10v10H8zM6 16V6h10',
   'arrow-down': 'M12 5v14M6 13l6 6 6-6',
+  text: 'M4 7V4h16v3M9 20h6M12 4v16',
   zoom: 'M11 18a7 7 0 1 0 0-14 7 7 0 0 0 0 14zM20 20l-4-4M8 11h6M11 8v6',
   plus: 'M12 5v14M5 12h14',
   server: 'M4 5h16v6H4zM4 13h16v6H4zM8 8h.01M8 16h.01',

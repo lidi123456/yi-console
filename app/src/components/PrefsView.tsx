@@ -18,6 +18,7 @@ import { UpdateSection } from './AppUpdate';
 import { setSidePrefs, STALE_OPTIONS, useSidePrefs, type SideLayout } from './Sidebar';
 import { Icon } from './Icon';
 import { setTheme, useTheme, type Theme } from '../theme';
+import { canZoom, CHAT_SIZES, EDITOR_SIZES, setFontPrefs, useFontPrefs, zoomFactor, ZOOM_MAX, ZOOM_MIN } from '../fontPrefs';
 import { getT, setLangPref, type LangPref, useLang } from '../i18n';
 
 const tx = getT('prefsView');
@@ -34,6 +35,7 @@ export function PrefsView() {
         {tx('theseSettingsApplyOnlyTo')}
       </p>
       <ThemeCard />
+      <FontCard />
       <NotifyCard />
       <ChatStyleCard />
       <SidebarCard />
@@ -89,6 +91,53 @@ function ThemeCard() {
           ))}
         </div>
       </PrefRow>
+    </div>
+  );
+}
+
+function FontCard() {
+  const p = useFontPrefs();
+  const mod = /Mac|iPhone|iPad/.test(navigator.platform) ? '⌘' : 'Ctrl';
+  const sizes = (list: number[], def: string) => [
+    <option key={0} value={0}>
+      {tx('defaultSize', { size: def })}
+    </option>,
+    ...list.map((n) => (
+      <option key={n} value={n}>
+        {`${n}px`}
+      </option>
+    )),
+  ];
+  return (
+    <div className="card">
+      <div className="card-title">
+        <Icon name="text" size={16} /> {tx('fontAndZoom')}
+      </div>
+      <PrefRow title={tx('chatFontSize')} desc={tx('chatFontSizeDesc')}>
+        <select value={p.chat} onChange={(e) => setFontPrefs({ chat: Number(e.target.value) })}>
+          {sizes(CHAT_SIZES, '14px')}
+        </select>
+      </PrefRow>
+      <PrefRow title={tx('editorFontSize')} desc={tx('editorFontSizeDesc')}>
+        <select value={p.editor} onChange={(e) => setFontPrefs({ editor: Number(e.target.value) })}>
+          {sizes(EDITOR_SIZES, '12px')}
+        </select>
+      </PrefRow>
+      {canZoom && (
+        <PrefRow title={tx('uiZoom')} desc={tx('uiZoomDesc', { mod })}>
+          <div className="seg">
+            <button disabled={p.zoom <= ZOOM_MIN} onClick={() => setFontPrefs({ zoom: p.zoom - 1 })} title={`${mod} -`}>
+              −
+            </button>
+            <button onClick={() => setFontPrefs({ zoom: 0 })} title={`${mod} 0`}>
+              {Math.round(zoomFactor(p.zoom) * 100)}%
+            </button>
+            <button disabled={p.zoom >= ZOOM_MAX} onClick={() => setFontPrefs({ zoom: p.zoom + 1 })} title={`${mod} =`}>
+              +
+            </button>
+          </div>
+        </PrefRow>
+      )}
     </div>
   );
 }
@@ -219,7 +268,7 @@ function TermCard() {
           <select value={p.fontSize} onChange={(e) => setTermPrefs({ fontSize: Number(e.target.value) })}>
             {[11, 12, 13, 14, 15, 16, 18, 20].map((n) => (
               <option key={n} value={n}>
-                {n}px
+                {`${n}px`}
               </option>
             ))}
           </select>

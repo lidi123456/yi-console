@@ -1425,7 +1425,7 @@ textarea {
   border-radius: 8px;
   padding: 10px 12px;
   overflow-x: auto;
-  font-size: 12px;
+  font-size: var(--fs-code);
   line-height: 1.6;
 }
 
@@ -3844,6 +3844,10 @@ button.md-rimg-ph:hover {
 
 :root {
   --fs-body: 14px;
+  /* Code blocks in replies, and the editor (CodeMirror, diffs, Markdown preview); set per device in fontPrefs.ts */
+  --fs-code: 12px;
+  --fs-editor: 12px;
+  --lh-editor: 20px;
   --lh-body: 1.75;
   --fs-ui: 13px;
   --fs-aux: 12px;
@@ -3922,19 +3926,19 @@ button.md-rimg-ph:hover {
 }
 
 .md h1 {
-  font-size: 17px;
+  font-size: calc(var(--fs-chat, 14px) + 3px);
 }
 
 .md h2 {
-  font-size: 15px;
+  font-size: calc(var(--fs-chat, 14px) + 1px);
 }
 
 .md h3 {
-  font-size: 14px;
+  font-size: var(--fs-chat, 14px);
 }
 
 .md h4 {
-  font-size: 13px;
+  font-size: calc(var(--fs-chat, 14px) - 1px);
 }
 
 .md ul,
@@ -3973,7 +3977,7 @@ button.md-rimg-ph:hover {
 .md pre {
   margin: 1em 0;
   padding: 12px 14px;
-  font-size: 12px;
+  font-size: var(--fs-code);
   line-height: 1.6;
   border-radius: 10px;
 }
@@ -3986,7 +3990,7 @@ button.md-rimg-ph:hover {
 /* Tables: rounded border around the outside, only horizontal lines inside */
 .md table {
   margin: 1em 0;
-  font-size: 13px;
+  font-size: calc(var(--fs-chat, 14px) - 1px);
   line-height: 1.6;
   border: 1px solid var(--border);
   border-radius: 10px;
@@ -4135,8 +4139,8 @@ button.md-rimg-ph:hover {
 }
 
 .composer textarea {
-  font-size: 14px;
-  line-height: 22px;
+  font-size: var(--fs-input, 14px);
+  line-height: calc(var(--fs-input, 14px) + 8px);
   min-height: 66px;
 }
 
@@ -4206,7 +4210,7 @@ button.md-rimg-ph:hover {
   }
 
   .composer textarea {
-    font-size: 15px;
+    font-size: var(--fs-input, 15px);
   }
 
   .chat-inner {
@@ -4222,7 +4226,7 @@ button.md-rimg-ph:hover {
 
   .composer textarea {
     min-height: 24px;
-    line-height: 24px;
+    line-height: max(24px, calc(var(--fs-input, 15px) + 9px));
   }
 
   .composer-tools .add-btn {
@@ -4521,6 +4525,10 @@ button.wp-crumb:hover {
   min-height: 0;
   overflow: auto;
   padding: 20px 28px 40px;
+  /* Follows the editor size; headings use --fs-chat, two sizes above the editor like the defaults 12 / 14 */
+  font-size: calc(var(--fs-editor) + 1px);
+  --fs-chat: calc(var(--fs-editor) + 2px);
+  --fs-code: var(--fs-editor);
 }
 
 .wp-image {
@@ -5539,8 +5547,8 @@ body.resizing .side-resizer::after {
 /* Body typography: 14px / 26px line height, 14px between blocks, lists indented 20px with 6px between items, inline code 13px on light grey,
    system UI font (Chinese falls back to Microsoft YaHei on Windows). YaHei strokes get cramped at 13px, so this is one size up from Qoder's "small" setting */
 .chat.modern .msg-assistant {
-  --m-fs: 14px;
-  --m-lh: 26px;
+  --m-fs: var(--fs-chat, 14px);
+  --m-lh: calc(var(--m-fs) + 12px);
   --m-gap: 14px;
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Microsoft YaHei UI', 'PingFang SC', 'Noto Sans CJK SC',
     sans-serif;
@@ -5585,20 +5593,20 @@ body.resizing .side-resizer::after {
   font-weight: 600;
 }
 .chat.modern .msg-assistant .md h1 {
-  font-size: 20px;
-  line-height: 28px;
+  font-size: calc(var(--m-fs) + 6px);
+  line-height: calc(var(--m-fs) + 14px);
 }
 .chat.modern .msg-assistant .md h2 {
-  font-size: 18px;
-  line-height: 26px;
+  font-size: calc(var(--m-fs) + 4px);
+  line-height: calc(var(--m-fs) + 12px);
 }
 .chat.modern .msg-assistant .md h3 {
-  font-size: 16px;
-  line-height: 24px;
+  font-size: calc(var(--m-fs) + 2px);
+  line-height: calc(var(--m-fs) + 10px);
 }
 .chat.modern .msg-assistant .md h4 {
-  font-size: 15px;
-  line-height: 26px;
+  font-size: calc(var(--m-fs) + 1px);
+  line-height: calc(var(--m-fs) + 12px);
 }
 .chat.modern .msg-assistant .md :is(ul, ol) {
   padding-left: 20px;
@@ -5630,16 +5638,16 @@ body.resizing .side-resizer::after {
   font-family: ui-monospace, SFMono-Regular, 'SF Mono', Consolas, 'Liberation Mono', Menlo, 'Microsoft YaHei UI', monospace;
 }
 .chat.modern .msg-assistant .md :not(pre) > code {
-  font-size: 13px;
-  line-height: 20px;
+  font-size: calc(var(--m-fs) - 1px);
+  line-height: calc(var(--m-fs) + 6px);
   padding: 2px 4px;
   border-radius: 4px;
   background: var(--inline-code-bg);
   color: var(--text-strong);
 }
 .chat.modern .msg-assistant .md pre {
-  font-size: 12px;
-  line-height: 20px;
+  font-size: var(--fs-code);
+  line-height: calc(var(--fs-code) + 8px);
 }
 .chat.modern .msg-assistant .md blockquote {
   border-left-width: 2px;
@@ -5649,8 +5657,8 @@ body.resizing .side-resizer::after {
   max-width: min(752px, 86%);
 }
 .chat.modern .msg-user .bubble {
-  font-size: 14px;
-  line-height: 24px;
+  font-size: var(--fs-chat, 14px);
+  line-height: calc(var(--fs-chat, 14px) + 10px);
   border-radius: 16px;
   padding: 8px 14px;
 }
@@ -6820,7 +6828,7 @@ body.resizing .side-resizer::after {
   border-left: 1px solid var(--border);
 }
 .pd {
-  font-size: 12px;
+  font-size: var(--fs-editor);
   line-height: 20px;
   min-width: max-content;
   padding-bottom: 24px;
