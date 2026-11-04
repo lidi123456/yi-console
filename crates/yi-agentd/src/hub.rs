@@ -368,8 +368,8 @@ impl Hub {
             .lock()
             .unwrap()
             .insert(info.id.clone(), rt.clone());
-        self.broadcast_updated(&info);
         if !tool.has_process() {
+            self.broadcast_updated(&info);
             return Ok(info);
         }
 
@@ -387,8 +387,14 @@ impl Hub {
             }
         }
 
-        let spec = self.spec_for(&info, replay, p.cols.unwrap_or(120), p.rows.unwrap_or(32))?;
-        self.launch(&rt, spec)?;
+        // Announce the session only once launch has opened its command channel: the frontend mounts a terminal on this
+        // broadcast and sends pty.resize at once. Announced earlier, that resize could arrive before the channel existed,
+        // was dropped ("not running"), and the shell only started after start_when_sized's 3 s timeout
+        let started = self
+            .spec_for(&info, replay, p.cols.unwrap_or(120), p.rows.unwrap_or(32))
+            .and_then(|spec| self.launch(&rt, spec));
+        self.broadcast_updated(&self.info(&info.id)?);
+        started?;
         if let Some(prompt) = p.prompt.filter(|s| !s.trim().is_empty()) {
             self.send(&info.id, &prompt, vec![], false)?;
         }
