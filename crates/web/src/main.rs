@@ -180,6 +180,26 @@ fn mime(p: &Path) -> &'static str {
     }
 }
 
+/// The app's Content-Security-Policy, the same one Tauri sends (`app.security.csp` in tauri.conf.json), plus
+/// `frame-ancestors`, which only a header can carry: other sites must not frame the page that holds the token.
+/// Sent on the app's HTML only; host files under /fsv/ are previewed in a sandboxed frame and keep their own rules.
+fn csp() -> &'static str {
+    static CSP: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    CSP.get_or_init(|| {
+        let conf: Value = serde_json::from_str(include_str!("../../../app/src-tauri/tauri.conf.json")).expect("tauri.conf.json");
+        let map = conf["app"]["security"]["csp"].as_object().expect("app.security.csp is a directive map");
+        let mut parts: Vec<String> = map
+            .iter()
+            .map(|(k, v)| match v {
+                Value::Array(a) => format!("{k} {}", a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(" ")),
+                v => format!("{k} {}", v.as_str().unwrap_or_default()),
+            })
+            .collect();
+        parts.push("frame-ancestors 'none'".into());
+        parts.join("; ")
+    })
+}
+
 async fn serve_file(mut s: TcpStream, dist: &Path, path: &str) -> Result<()> {
     // Consume the request headers
     let mut buf = vec![0u8; 8192];
@@ -195,12 +215,21 @@ async fn serve_file(mut s: TcpStream, dist: &Path, path: &str) -> Result<()> {
         file = dist.join("index.html");
     }
     match tokio::fs::read(&file).await {
-        Ok(body) => http(s, 200, mime(&file), body).await,
+        Ok(body) => {
+            let ctype = mime(&file);
+            let extra = if ctype.starts_with("text/html") { format!("Content-Security-Policy: {}\r\n", csp()) } else { String::new() };
+            respond(s, 200, ctype, &extra, body).await
+        }
         Err(_) => http(s, 404, "text/plain", b"not found (build the frontend first)".to_vec()).await,
     }
 }
 
-async fn http(mut s: TcpStream, code: u16, ctype: &str, body: Vec<u8>) -> Result<()> {
+async fn http(s: TcpStream, code: u16, ctype: &str, body: Vec<u8>) -> Result<()> {
+    respond(s, code, ctype, "", body).await
+}
+
+/// `extra`: additional header lines, each ending in \r\n
+async fn respond(mut s: TcpStream, code: u16, ctype: &str, extra: &str, body: Vec<u8>) -> Result<()> {
     let reason = match code {
         200 => "OK",
         400 => "Bad Request",
@@ -208,11 +237,23 @@ async fn http(mut s: TcpStream, code: u16, ctype: &str, body: Vec<u8>) -> Result
         _ => "Not Found",
     };
     let head = format!(
-        "HTTP/1.1 {code} {reason}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {code} {reason}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nCache-Control: no-cache\r\n{extra}Connection: close\r\n\r\n",
         body.len()
     );
     s.write_all(head.as_bytes()).await?;
     s.write_all(&body).await?;
     s.flush().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn csp_comes_from_tauri_conf() {
+        let p = super::csp();
+        assert!(p.starts_with("default-src 'self'") || p.contains("default-src 'self'"));
+        assert!(p.contains("script-src 'self'"));
+        assert!(p.ends_with("frame-ancestors 'none'"));
+        assert!(!p.contains("unsafe-eval"));
+    }
 }

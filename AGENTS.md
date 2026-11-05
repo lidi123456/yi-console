@@ -43,6 +43,7 @@ Frontend
 - No `prompt` / `confirm` / browser context menu: use `askText`, `askConfirm`, `openMenu` from `components/Overlay.tsx`. Session actions live in `components/SessionActions.ts`.
 - Anything new that covers the page (dialog, menu, panel) registers with `useBack(active, close)` so Android back closes it.
 - Links: clicks are handled by `guardLink` in `main.tsx`; nothing may navigate inside the app window.
+- The main window has a CSP (`app.security.csp` in `tauri.conf.json`, reused by yi-web): no inline `<script>`, `on*=` handlers, `eval` / `new Function`, workers or wasm. Loading a new kind of source means extending the policy; details in [frontend-ui.md](docs/internals/frontend-ui.md).
 - Dark-theme CSS variables are written twice (the `prefers-color-scheme` block and `:root[data-theme='dark']`); in JS use `isAppDark()`.
 - Text in chat / editor areas uses the font-size variables (`--fs-chat`, `--fs-editor`, …), not fixed px. No bundled web fonts.
 - Sidebar styles are changed only in the "Sidebar" section at the end of `styles.css`. Host-related entries go into the host row's menu, not new buttons.
