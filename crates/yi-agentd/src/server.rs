@@ -13,7 +13,7 @@ use tokio::sync::{broadcast, mpsc};
 
 static TOOLS: Mutex<Option<Vec<ToolInfo>>> = Mutex::new(None);
 
-fn tools(hub: &Hub, refresh: bool) -> Vec<ToolInfo> {
+pub(crate) fn tools(hub: &Hub, refresh: bool) -> Vec<ToolInfo> {
     let mut g = TOOLS.lock().unwrap();
     if refresh || g.is_none() {
         *g = Some(crate::tools::detect(&hub.settings.read().unwrap()));
@@ -421,6 +421,15 @@ pub async fn dispatch(
             } else {
                 serde_json::to_value(cached)?
             }
+        }
+        TOOLS_LATEST => {
+            let hub2 = hub.clone();
+            let refresh = p["refresh"].as_bool().unwrap_or(false);
+            tokio::task::spawn_blocking(move || crate::toolupdate::latest(&hub2, refresh)).await?
+        }
+        TOOLS_UPDATE => {
+            let tool = ToolKind::parse(s(&p, "tool")?).ok_or_else(|| anyhow!("未知工具"))?;
+            crate::toolupdate::start(hub, tool).await?
         }
         TOOLS_QUOTA => {
             let tool = ToolKind::parse(s(&p, "tool")?).ok_or_else(|| anyhow!("未知工具"))?;

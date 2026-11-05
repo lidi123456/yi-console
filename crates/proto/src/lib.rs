@@ -763,6 +763,11 @@ pub mod methods {
     pub const TOOLS_MODELS: &str = "tools.models";
     /// Tool account quota {tool, refresh?}
     pub const TOOLS_QUOTA: &str = "tools.quota";
+    /// {refresh?} -> {tools: {<tool>: {latest?, error?, via?, canUpdate}}, jobs: {<tool>: ToolJob}, info: [ToolInfo]}: the newest published
+    /// version of each tool (npm registry, where the tool is published there), how it was installed, and upgrade jobs
+    pub const TOOLS_LATEST: &str = "tools.latest";
+    /// {tool} -> {started}: upgrade a tool with its own update command; progress arrives as `tools.updating` events
+    pub const TOOLS_UPDATE: &str = "tools.update";
     /// Pending automatic continue after a usage limit {sessionId, action: cancel | now}
     pub const SESSION_AUTO_RESUME: &str = "session.autoResume";
     /// The client's UI language {lang: zh | en}, remembered for messages the daemon sends by itself
@@ -774,6 +779,8 @@ pub mod methods {
     pub const EV_SESSION_REMOVED: &str = "session.removed";
     pub const EV_PTY_OUTPUT: &str = "pty.output";
     pub const EV_NOTIFY: &str = "notify";
+    /// {tool, job: ToolJob, line?, tools?}: an upgrade started, printed a line, or ended (then with the re-detected tools)
+    pub const EV_TOOLS_UPDATING: &str = "tools.updating";
 }
 
 #[cfg(test)]

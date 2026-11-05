@@ -290,14 +290,20 @@ pub fn detect(settings: &DaemonSettings) -> Vec<ToolInfo> {
         .collect()
 }
 
+static NO_DAEMON: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<PathBuf, bool>>> = std::sync::OnceLock::new();
+
+/// Drop what was learned from a tool's --help, after an upgrade may have changed it
+pub fn forget_probes() {
+    if let Some(c) = NO_DAEMON.get() {
+        c.lock().unwrap().clear();
+    }
+}
+
 /// Whether terminal-mode Codex needs --no-daemon. Newer Codex's interactive UI connects to a shared background service by default,
 /// which keeps holding the session after exit, so chat mode's app-server later fails to continue it with "already has an active writer".
 /// Older versions don't recognize the flag, so check --help first (cached by path)
 pub fn codex_no_daemon(p: &Path) -> bool {
-    use std::collections::HashMap;
-    use std::sync::{Mutex, OnceLock};
-    static CACHE: OnceLock<Mutex<HashMap<PathBuf, bool>>> = OnceLock::new();
-    let cache = CACHE.get_or_init(Default::default);
+    let cache = NO_DAEMON.get_or_init(Default::default);
     if let Some(v) = cache.lock().unwrap().get(p) {
         return *v;
     }

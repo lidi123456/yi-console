@@ -1,0 +1,20 @@
+{
+  "tools": "工具",
+  "checkForUpdates": "检查更新",
+  "checking": "正在检查…",
+  "needsNewerDaemon": "升级这台主机的 yi-agentd 后才能查看和升级工具版本",
+  "notInstalled": "未安装",
+  "updating": "正在升级…",
+  "updateFailed": "升级失败",
+  "updatedFromTo": "已从 {{from}} 升级到 {{to}}",
+  "updateFinished": "升级命令已完成，版本没有变化",
+  "newVersion": "有新版本 {{v}}",
+  "upToDate": "已是最新",
+  "couldNotCheck": "查不到最新版本",
+  "showOutput": "查看输出",
+  "hideOutput": "收起输出",
+  "update": "升级",
+  "runsCommand": "在这台主机上运行 {{cmd}}",
+  "summary": "已安装 {{n}} 个",
+  "summaryWithUpdates": "已安装 {{n}} 个 · {{m}} 个有新版本"
+}

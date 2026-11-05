@@ -21,6 +21,7 @@ import zhHandoff from './zh/handoff.json';
 import zhHandoffCard from './zh/handoffCard.json';
 import zhHistoryView from './zh/historyView.json';
 import zhHome from './zh/home.json';
+import zhHostTools from './zh/hostTools.json';
 import zhHostsView from './zh/hostsView.json';
 import zhImageMenu from './zh/imageMenu.json';
 import zhLightbox from './zh/lightbox.json';
@@ -71,6 +72,7 @@ import enHandoff from './en/handoff.json';
 import enHandoffCard from './en/handoffCard.json';
 import enHistoryView from './en/historyView.json';
 import enHome from './en/home.json';
+import enHostTools from './en/hostTools.json';
 import enHostsView from './en/hostsView.json';
 import enImageMenu from './en/imageMenu.json';
 import enLightbox from './en/lightbox.json';
@@ -124,6 +126,7 @@ export const resources = {
     handoffCard: zhHandoffCard,
     historyView: zhHistoryView,
     home: zhHome,
+    hostTools: zhHostTools,
     hostsView: zhHostsView,
     imageMenu: zhImageMenu,
     lightbox: zhLightbox,
@@ -176,6 +179,7 @@ export const resources = {
     handoffCard: enHandoffCard,
     historyView: enHistoryView,
     home: enHome,
+    hostTools: enHostTools,
     hostsView: enHostsView,
     imageMenu: enImageMenu,
     lightbox: enLightbox,

@@ -133,7 +133,6 @@
   "restartDaemon": "Restart daemon",
   "upgradeYiAgentd": "Upgrade yi-agentd",
   "theTurnInProgressWill": "(The turn in progress will be interrupted. Sessions are kept, and the next message resumes the context.)",
-  "notInstalled": "Not installed",
   "disconnect": "Disconnect",
   "connect": "Connect",
   "edit2": "Edit",

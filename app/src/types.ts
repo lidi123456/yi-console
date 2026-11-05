@@ -233,6 +233,26 @@ export interface ToolInfo {
   structured: boolean;
 }
 
+/** A tool upgrade on a host (`tools.update`); versions are what `--version` printed before and after */
+export interface ToolJob {
+  running: boolean;
+  ok: boolean | null;
+  error: string | null;
+  from: string | null;
+  to: string | null;
+  startedAt: number;
+  finishedAt: number | null;
+  output: string[];
+}
+
+/** `tools.latest`, per tool: newest published version (npm tools only), install method, and whether it can be upgraded */
+export interface ToolLatest {
+  latest?: string;
+  error?: string;
+  via?: 'npm' | 'native';
+  canUpdate: boolean;
+}
+
 export interface Hello {
   protocol: number;
   daemonVersion: string;

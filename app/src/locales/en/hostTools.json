@@ -1,0 +1,20 @@
+{
+  "tools": "Tools",
+  "checkForUpdates": "Check for updates",
+  "checking": "Checking…",
+  "needsNewerDaemon": "Upgrade yi-agentd on this host to see and upgrade tool versions",
+  "notInstalled": "Not installed",
+  "updating": "Upgrading…",
+  "updateFailed": "Upgrade failed",
+  "updatedFromTo": "Upgraded from {{from}} to {{to}}",
+  "updateFinished": "The update command finished; the version didn't change",
+  "newVersion": "{{v}} available",
+  "upToDate": "Up to date",
+  "couldNotCheck": "Couldn't check the latest version",
+  "showOutput": "Show output",
+  "hideOutput": "Hide output",
+  "update": "Upgrade",
+  "runsCommand": "Runs {{cmd}} on this host",
+  "summary": "{{n}} installed",
+  "summaryWithUpdates": "{{n}} installed · {{m}} with updates"
+}

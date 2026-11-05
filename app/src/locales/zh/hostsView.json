@@ -133,7 +133,6 @@
   "restartDaemon": "重启守护进程",
   "upgradeYiAgentd": "升级 yi-agentd",
   "theTurnInProgressWill": "（正在进行的回合会被中断；会话保留，之后发消息会自动接上上下文）",
-  "notInstalled": "未安装",
   "disconnect": "断开",
   "connect": "连接",
   "edit2": "编辑",

@@ -1167,6 +1167,34 @@ impl Hub {
         }
     }
 
+    /// Before upgrading `tool`: how many of its sessions can't let go of the executable (chat sessions mid-turn, queued
+    /// or with background tasks; on Windows also live terminal sessions, since a running .exe can't be replaced), and,
+    /// with `release`, end the processes of its idle chat sessions (they restart on the next message, as with
+    /// `release_idle`). Returns the busy count and the command channels of the released ones, closed once they exit
+    pub fn tool_in_use(&self, tool: ToolKind, release: bool) -> (usize, Vec<mpsc::UnboundedSender<AdapterCmd>>) {
+        let list: Vec<Arc<SessionRt>> = self.sessions.lock().unwrap().values().cloned().collect();
+        let (mut busy, mut released) = (0, vec![]);
+        for rt in list {
+            let Some(tx) = self.running_tx(&rt) else { continue };
+            let info = rt.info.lock().unwrap().clone();
+            if info.tool != tool {
+                continue;
+            }
+            if info.mode == SessionMode::Structured {
+                if !Self::releasable(&rt, &info, false) {
+                    busy += 1;
+                } else if release {
+                    crate::info!("升级 {} 前结束闲置会话 {} 的进程", tool.as_str(), info.id);
+                    let _ = tx.send(AdapterCmd::Kill);
+                    released.push(tx);
+                }
+            } else if cfg!(windows) {
+                busy += 1;
+            }
+        }
+        (busy, released)
+    }
+
     /// End tool processes idle for too long (each takes about 100–250MB of memory); the session log and tool session id remain,
     /// and send restarts the original session automatically on the next message. Processes waiting too long for approval, or errored but not exited, are ended too
     pub fn release_idle(&self) {
@@ -2515,6 +2543,26 @@ mod tests {
         hub.release_idle();
         assert!(killed(&mut idle) && killed(&mut asking) && killed(&mut err));
         assert!(!killed(&mut busy) && !killed(&mut term) && !killed(&mut recent) && !killed(&mut queued));
+    }
+
+    #[test]
+    fn tool_in_use_counts_busy_and_releases_idle() {
+        use SessionMode::*;
+        use SessionStatus::*;
+        let hub = Hub::new(crate::store::Store::open_memory().unwrap(), Default::default());
+        let now = crate::util::now_ms();
+        let mut idle = live(&hub, "idle", Structured, Idle, now);
+        let mut busy = live(&hub, "busy", Structured, Running, now);
+        let mut term = live(&hub, "term", Terminal, Idle, now);
+        // Another tool's session is never touched
+        let mut other = live(&hub, "other", Structured, Idle, now);
+        hub.get("other").unwrap().info.lock().unwrap().tool = ToolKind::Claude;
+        let (n, released) = hub.tool_in_use(ToolKind::Kiro, false);
+        assert_eq!((n, released.len()), (if cfg!(windows) { 2 } else { 1 }, 0));
+        assert!(!killed(&mut idle));
+        let (n, released) = hub.tool_in_use(ToolKind::Kiro, true);
+        assert_eq!((n, released.len()), (if cfg!(windows) { 2 } else { 1 }, 1));
+        assert!(killed(&mut idle) && !killed(&mut busy) && !killed(&mut term) && !killed(&mut other));
     }
 
     #[test]

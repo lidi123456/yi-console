@@ -6,6 +6,7 @@ import type { HostConfig, SshTarget } from '../types';
 import { readClipboard, writeClipboard } from '../clipboard';
 import { getT, useLang } from '../i18n';
 import { askConfirm, askText } from './Overlay';
+import { HostTools } from './HostTools';
 import { Icon } from './Icon';
 import { QrScanner, canScanQr } from './QrScanner';
 
@@ -838,17 +839,6 @@ function HostCard({ h, onEdit }: { h: HostEntry; onEdit: () => void }) {
           ))}
         </div>
       )}
-      {hello && (
-        <div className="tool-chips">
-          {hello.tools
-            .filter((t) => t.kind !== 'shell' && t.kind !== 'files')
-            .map((t) => (
-              <span key={t.kind} className={`pill ${t.available ? '' : 'pill-off'}`} title={t.path ?? ''}>
-                {t.kind} {t.available ? (t.version?.split(' ')[0] ?? '') : tx('notInstalled')}
-              </span>
-            ))}
-        </div>
-      )}
       <div className="row wrap">
         {connected ? (
           <button className="btn small" disabled={!!busy} onClick={() => run('dis', () => hubCall('hosts.disconnect', { id }))}>
@@ -891,6 +881,7 @@ function HostCard({ h, onEdit }: { h: HostEntry; onEdit: () => void }) {
         )}
       </div>
       {h.config.kind === 'local' && connected && <RelayPanel hostId={id} />}
+      {hello && connected && <HostTools hostId={id} tools={hello.tools} />}
     </div>
   );
 }

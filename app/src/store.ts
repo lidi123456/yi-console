@@ -6,7 +6,7 @@ import { useSyncExternalStore } from 'react';
 import { getLang, getT, onLangChange, trErr } from './i18n';
 import { fmtAt } from './limit';
 import { hubCall, onHubEvent, rpc, isTauri } from './transport';
-import type { ClientSettings, HostConfig, HostStatus, HubEvent, NotifyPrefs, SessionInfo, Snippet, ToolInfo, ToolKind } from './types';
+import type { ClientSettings, HostConfig, HostStatus, HubEvent, NotifyPrefs, SessionInfo, Snippet, ToolInfo, ToolJob, ToolKind } from './types';
 
 const t = getT('store');
 
@@ -51,6 +51,8 @@ export interface State {
   deploy: Record<string, string[]>;
   /** yi-agentd upgrade progress, per host */
   upgrades: Record<string, Upgrade>;
+  /** Tool upgrade jobs (`tools.updating`), per host and tool */
+  toolJobs: Record<string, Record<string, ToolJob>>;
   toasts: Toast[];
   transport: 'open' | 'closed' | 'connecting';
   sidebarOpen: boolean;
@@ -82,6 +84,7 @@ let state: State = {
   view: { kind: 'home' },
   deploy: {},
   upgrades: {},
+  toolJobs: {},
   toasts: [],
   transport: 'connecting',
   sidebarOpen: false,
@@ -400,7 +403,10 @@ export function hostStatus(hostId: string): HostStatus {
 
 /** Re-detect installed tools on a host (yi-agentd rebuilds its PATH first) and update the host's tool list */
 export async function redetectTools(hostId: string): Promise<void> {
-  const tools = await rpc<ToolInfo[]>(hostId, 'tools.detect');
+  setHostTools(hostId, await rpc<ToolInfo[]>(hostId, 'tools.detect'));
+}
+
+export function setHostTools(hostId: string, tools: ToolInfo[]) {
   setState((s) => ({
     hosts: s.hosts.map((h) =>
       h.config.id === hostId && h.status.hello ? { ...h, status: { ...h.status, hello: { ...h.status.hello, tools } } } : h,
@@ -674,8 +680,22 @@ export function startEventLoop() {
   });
 }
 
+/** Merge a tool upgrade job from `tools.latest` or a `tools.updating` event */
+export function setToolJob(hostId: string, tool: string, job: ToolJob, line?: string) {
+  setState((s) => {
+    const prev = s.toolJobs[hostId]?.[tool];
+    // Line events carry the job without its output, so keep appending to what we have
+    const output = line !== undefined ? [...(prev?.output ?? []), line].slice(-200) : job.output;
+    return { toolJobs: { ...s.toolJobs, [hostId]: { ...s.toolJobs[hostId], [tool]: { ...job, output } } } };
+  });
+}
+
 function onNotification(hostId: string, method: string, p: any) {
   switch (method) {
+    case 'tools.updating':
+      setToolJob(hostId, p.tool, p.job, p.line);
+      if (Array.isArray(p.tools)) setHostTools(hostId, p.tools);
+      break;
     case 'session.updated':
       upsertSession(hostId, p);
       break;

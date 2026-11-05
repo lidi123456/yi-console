@@ -29,6 +29,7 @@ mod settings;
 mod stats;
 mod store;
 mod tools;
+mod toolupdate;
 mod transport;
 mod util;
 

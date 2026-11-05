@@ -110,6 +110,14 @@ const ERR_PATTERNS: [RegExp, string | ((...m: string[]) => string)][] = [
   [/下载的安装包校验失败/, 'The downloaded package failed verification, please try again'],
   [/已经是最新版本/, 'Already up to date'],
   [/这种安装方式不支持自动更新/, 'This kind of install cannot update itself; download the new version from the releases page'],
+  // Tool upgrades (toolupdate.rs)
+  [/^有 (\d+) 个 (\S+) 会话正在使用，等它们结束后再升级$/, (_, n, t) => `${n} ${t} session(s) are in use; upgrade once they finish`],
+  [/另一个工具正在升级，等它完成后再试/, 'Another tool is being upgraded; try again when it finishes'],
+  [/^这台机器上没有安装 (.+)$/, (_, t) => `${t} is not installed on this host`],
+  [/这个工具不能升级/, 'This tool cannot be upgraded'],
+  [/^升级命令超过 (\d+) 分钟没有结束，已停止$/, (_, m) => `The update command was stopped after running for ${m} minutes`],
+  [/^启动升级命令失败[:：]\s*(.+)$/, (_, m) => `Could not start the update command: ${m}`],
+  [/^查询最新版本失败[:：]\s*(.+)$/, (_, m) => `Could not look up the latest version: ${m}`],
 ];
 
 /** Translate Chinese error messages from the backend or runtime (applies in the English UI) */
