@@ -50,9 +50,58 @@ const chatOptions = {
 };
 const chatMarked = new Marked(chatOptions);
 
+// Raw HTML in replies keeps its formatting (<br>, <details>, <kbd>, tables…) but loads nothing by itself: <img> becomes
+// the same click-to-load placeholder as ![](…), and the other ways HTML fetches resources are dropped (<style>, srcset,
+// poster, background, src / href on anything but <img> / <a>, url() and image-set() in style attributes).
+// A separate DOMPurify instance, so these hooks don't touch the file preview's or Mermaid's sanitizing.
+const chatPurify = DOMPurify(window);
+const LOADS_IN_CSS = /(?:url|image-set|image|cross-fade)\s*\(|@import/i;
+chatPurify.addHook('afterSanitizeAttributes', (node) => {
+  const el = node as Element;
+  if (!el.getAttribute) return;
+  for (const a of ['srcset', 'poster', 'background', 'ping', 'xlink:href']) el.removeAttribute(a);
+  const tag = el.tagName.toLowerCase();
+  if (tag !== 'a') el.removeAttribute('href');
+  if (LOADS_IN_CSS.test(el.getAttribute('style') ?? '')) el.removeAttribute('style');
+  const src = el.getAttribute('src');
+  if (src == null) return;
+  if (tag !== 'img') return el.removeAttribute('src');
+  const c = classifyImageSrc(src);
+  if (c.kind === 'data') return;
+  // Swapped for a placeholder below; the src attribute must not survive into a live document
+  el.removeAttribute('src');
+  el.setAttribute('data-yi-kind', c.kind);
+  el.setAttribute('data-yi-src', c.src);
+});
+
+/** Sanitize rendered chat Markdown (see chatPurify) */
+function sanitizeChat(html: string): string {
+  const frag = chatPurify.sanitize(html, { FORBID_TAGS: ['style'], RETURN_DOM_FRAGMENT: true });
+  // Inputs other than task-list checkboxes have no place in a reply (an <input type=image> without its src is an empty button)
+  for (const el of frag.querySelectorAll('input:not([type="checkbox"])')) el.remove();
+  for (const img of frag.querySelectorAll('img[data-yi-kind]')) {
+    const kind = img.getAttribute('data-yi-kind')!;
+    const alt = img.getAttribute('alt') ?? '';
+    if (kind === 'other') {
+      img.replaceWith(alt);
+      continue;
+    }
+    const span = document.createElement('span');
+    span.className = 'md-rimg';
+    span.dataset.kind = kind;
+    span.dataset.src = img.getAttribute('data-yi-src')!;
+    span.dataset.alt = alt;
+    const title = img.getAttribute('title');
+    if (title) span.dataset.title = title;
+    img.replaceWith(span);
+  }
+  const box = document.createElement('div');
+  box.append(frag);
+  return box.innerHTML;
+}
+
 export function renderMarkdown(src: string): string {
-  const html = chatMarked.parse(src, { async: false }) as string;
-  return DOMPurify.sanitize(html);
+  return sanitizeChat(chatMarked.parse(src, { async: false }) as string);
 }
 
 /** Preserve code token boundaries (including fences nested in lists/quotes) during streaming. */
@@ -71,7 +120,7 @@ export function renderDiagramMarkdown(src: string) {
       return `<div data-diagram="${marker}" data-index="${index}"></div>`;
     },
   }});
-  return { html: DOMPurify.sanitize(parser.parse(src, { async: false }) as string), diagrams, marker };
+  return { html: sanitizeChat(parser.parse(src, { async: false }) as string), diagrams, marker };
 }
 
 export function basename(p: string): string {

@@ -130,8 +130,23 @@ await page.evaluate(async () => {
     if (!rejected) throw new Error('Oversized source accepted');
   }
 });
+// Raw HTML in a reply keeps its formatting but loads nothing by itself; <img> becomes a click-to-load placeholder
+await set('A <b>bold</b> <kbd>Ctrl</kbd> <img src="https://example.com/raw.png" alt="raw" srcset="https://example.com/s.png 2x">\n\n<div style="background:url(https://example.com/bg.png)">bg</div>\n\n<style>body{display:none}</style>\n\n<video poster="https://example.com/p.png" src="https://example.com/v.mp4"></video>\n\n<details><summary>more</summary>x<br>y</details>\n\n<svg><image href="https://example.com/i.png"/></svg>', false);
+await page.locator('.md-rimg[data-kind="web"]').waitFor();
+const raw = await page.evaluate(() => {
+  const r = document.getElementById('root');
+  return {
+    kept: ['b', 'kbd', 'details', 'br'].every((t) => r.querySelector(t)),
+    loaders: [...r.querySelectorAll('[src], [srcset], [poster], [href]:not(a), style, [style*="url"]')].map((e) => e.outerHTML),
+    img: r.querySelectorAll('img').length,
+  };
+});
+assert.ok(raw.kept, 'formatting tags stay');
+assert.deepEqual(raw.loaders, [], 'nothing in raw HTML loads by itself');
+assert.equal(raw.img, 0);
+assert.equal(await page.evaluate(() => getComputedStyle(document.body).display), 'block');
 assert.deepEqual(errors, []);
 console.log(
-  'PASS: streaming, stable portals, source/copy, SVG/PNG downloads, fullscreen zoom/pan/Escape, theme, mobile, errors, nested fences, 10 diagram types, unfiltered syntax without active content, and size limits.',
+  'PASS: streaming, stable portals, source/copy, SVG/PNG downloads, fullscreen zoom/pan/Escape, theme, mobile, errors, nested fences, 10 diagram types, unfiltered syntax without active content, size limits and raw HTML that loads nothing.',
 );
 await browser.close();

@@ -1,4 +1,4 @@
-// Images in chat replies: renderMarkdown renders ![](…) as <span class="md-rimg">, and this fills in the content based on the source.
+// Images in chat replies: renderMarkdown renders ![](…) and raw <img> as <span class="md-rimg">, and this fills in the content based on the source.
 // - Files on the host: the local host reads and shows them directly; remote hosts (SSH / relay / forwarded) show a placeholder first, and on click ask for the size, then download
 // - Public URLs: always show a placeholder first; the current device only loads them on click (opening a chat never requests third parties automatically)
 // Images that were opened / confirmed are remembered for this run and shown directly when they reappear (streaming redraws, switching away and back).
@@ -53,6 +53,8 @@ function showImg(el: HTMLElement, src: string, alt: string, onError?: () => void
   img.alt = alt;
   img.title = el.dataset.title || alt;
   img.decoding = 'async';
+  // Web images (loaded on click) don't tell the site which page showed them
+  img.referrerPolicy = 'no-referrer';
   if (onError) img.onerror = onError;
   img.src = src;
   el.className = 'md-rimg ok';
@@ -148,6 +150,7 @@ function fillWeb(el: HTMLElement, url: string, alt: string) {
     webAllowed.add(url);
     showLoading(el);
     const probe = new Image();
+    probe.referrerPolicy = 'no-referrer';
     probe.onload = () => el.isConnected && showImg(el, url, alt);
     probe.onerror = () => el.isConnected && showError(el, t('imageFailedToLoad'), url);
     probe.src = url;
