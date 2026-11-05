@@ -844,7 +844,6 @@ export function Composer({
               e.target.value = '';
             }}
           />
-          {desktopControls}
           <PermPicker hostId={hostId} info={info} open={permOpen} setOpen={setPermOpen} />
           <button
             className="tool-chip"
@@ -880,6 +879,7 @@ export function Composer({
           >
             @
           </button>
+          {desktopControls}
           <span className="composer-spacer" />
           <ModelPicker hostId={hostId} info={info} />
           {running && !hasText ? (

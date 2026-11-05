@@ -15,7 +15,7 @@ The Windows daemon embeds a pinned MIT `cua-driver`. There is no runtime driver 
 ## Use
 
 1. Start Yi Console normally on the target Windows computer and open a Claude Code, Codex, Cursor, Kiro, Qoder or CodeBuddy chat session.
-2. Click Computer use in the composer toolbar, refresh the window list and select the window the AI may operate.
+2. Click the computer icon (Computer use) right of @ in the composer toolbar, refresh the window list and select the window the AI may operate.
 3. With no reply in progress, enable computer use. The tool connects to a session-scoped MCP entry and continues the existing tool session ID where possible.
 4. Give a specific task, such as: “Read this test window, enter the validation text, click Apply, then inspect a screenshot to verify the result.”
 5. Review activity and screenshots in chat. Click an image to enlarge or save it, or use Capture in the control bar to inspect the target on demand. On phones, the computer icon opens capture and pause controls; the status dot and stop button remain in the toolbar.

@@ -97,7 +97,7 @@ export function ComputerUsePanel({
     <>
       <div className="computer-use-bar">
         <button
-          className={`btn small ${state?.enabled ? 'active' : ''}`}
+          className={`tool-chip computer-use-btn ${state?.enabled ? 'active' : ''}`}
           disabled={!connected}
           aria-label={t('title')}
           title={state?.enabled ? t('activeTitle', { title: state.target?.title ?? '', status: statusLabel }) : t('title')}
@@ -106,7 +106,7 @@ export function ComputerUsePanel({
             void refresh();
           }}
         >
-          <Icon name="laptop" size={14} /> <span className="computer-use-label">{t('title')}</span>
+          <Icon name="laptop" size={15} />
         </button>
         {state?.enabled ? (
           <>
