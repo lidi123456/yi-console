@@ -139,7 +139,7 @@ async fn codex(settings: &DaemonSettings, want_quota: bool) -> Result<Probe> {
     let (mut account, mut limits) = (Value::Null, Value::Null);
     let mut waiting = 0;
     let init = json!({"id":1,"method":"initialize",
-        "params":{"clientInfo":{"name":"yi-console","title":"Yi Console","version":DAEMON_VERSION}}});
+        "params":{"clientInfo":{"name":crate::adapters::codex::CLIENT_NAME,"title":"Yi Console","version":DAEMON_VERSION}}});
     converse(ToolKind::Codex, settings, &["app-server"], vec![init], |v| {
         let Some(id) = v["id"].as_u64().filter(|_| v.get("method").is_none()) else {
             return Step::Wait;

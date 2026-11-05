@@ -94,6 +94,10 @@ fn sandbox_type(s: &str) -> &'static str {
     }
 }
 
+/// clientInfo.name for `codex app-server`. Codex sends it as the `originator` header on every model request, and some
+/// API gateways only accept Codex's own clients, so use the Codex CLI's name (403 "restricted to ... codex" otherwise)
+pub const CLIENT_NAME: &str = "codex_cli_rs";
+
 pub async fn run(spec: StartSpec, em: Emitter, mut rx: mpsc::UnboundedReceiver<AdapterCmd>) {
     let mut args = vec!["app-server".to_string()];
     args.extend(spec.extra_args.iter().cloned());
@@ -108,7 +112,7 @@ pub async fn run(spec: StartSpec, em: Emitter, mut rx: mpsc::UnboundedReceiver<A
     let init = st.req(
         Pending::Init,
         "initialize",
-        json!({"clientInfo":{"name":"yi-console","title":"Yi Console","version":DAEMON_VERSION},
+        json!({"clientInfo":{"name":CLIENT_NAME,"title":"Yi Console","version":DAEMON_VERSION},
                "capabilities":null}),
     );
     let _ = p.send(&init).await;
