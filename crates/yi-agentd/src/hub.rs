@@ -383,7 +383,7 @@ impl Hub {
 
     pub fn desktop_event(&self, sid: &str, event: EventBody) { self.emit(sid, 0, event); }
 
-    pub async fn computer_use(self: &Arc<Self>, sid: &str, action: &str, target: Option<crate::computer_use::Target>) -> Result<Value> {
+    pub async fn computer_use(self: &Arc<Self>, sid: &str, action: &str) -> Result<Value> {
         let rt = self.get(sid)?;
         let info = rt.info.lock().unwrap().clone();
         if info.mode != SessionMode::Structured || !crate::mcp::supported(info.tool) {
@@ -395,9 +395,8 @@ impl Hub {
         }
         if action == "enable" {
             if info.status == SessionStatus::Running || info.status == SessionStatus::WaitingPermission { bail!("请先停止当前回复，再开启操作电脑"); }
-            let target = target.ok_or_else(|| anyhow!("请选择目标窗口"))?;
-            let target = self.desktop.targets().await?.into_iter().find(|t| t.pid == target.pid && t.window_id == target.window_id).ok_or_else(|| anyhow!("目标窗口已关闭，请刷新"))?;
-            self.desktop.configure(sid, target)?;
+            // The whole desktop, as in OpenBot: the model picks windows itself
+            self.desktop.configure(sid)?;
         } else { self.desktop.change(sid, action)?; self.desktop.close_if_idle().await; }
         let updated = {
             let mut info = rt.info.lock().unwrap();

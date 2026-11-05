@@ -2,7 +2,7 @@
 
 [English](computer-use.en.md)
 
-让 Claude Code、Codex、Cursor、Kiro、Qoder 或 CodeBuddy 的聊天会话操作目标主机上的一个真实窗口，查看界面、点击、输入，并把操作记录和关键截图带回聊天。
+让 Claude Code、Codex、Cursor、Kiro、Qoder 或 CodeBuddy 的聊天会话操作目标主机上已登录的 Windows 桌面：打开应用、切换窗口、查看界面、点击、输入，并把操作记录和关键截图带回聊天。
 
 ## 支持范围
 
@@ -15,12 +15,12 @@ Windows daemon 已内置固定版本的 MIT `cua-driver`，运行时不额外下
 ## 使用
 
 1. 在目标 Windows 上正常启动 Yi Console，打开上述任一 AI 工具的聊天会话。
-2. 点输入框工具栏 @ 右边的电脑图标（操作电脑），点「刷新窗口」，选择允许 AI 操作的窗口。
-3. 当前没有正在进行的回复时，点「开启操作电脑」。工具会连接新的会话级 MCP 入口，已有工具会话尽量继续使用原来的会话 ID。
-4. 发送具体任务，例如：“读取这个测试窗口，在输入框中输入验证文本，点击应用，然后截图核验结果。”
-5. 在聊天中查看操作记录和截图。点截图可放大、另存为，也可以通过控制栏的「截图」按钮按需查看当前目标。手机上点电脑图标打开控制面板，使用截图和暂停；工具栏保留状态点和停止按钮。
+2. 点输入框工具栏 @ 右边的电脑图标（操作电脑）。
+3. 当前没有正在进行的回复时，点「开启操作电脑」。开启后 AI 可以操作这台电脑上的所有应用，由它自己找窗口或启动应用，不需要先选窗口。工具会连接新的会话级 MCP 入口，已有工具会话尽量继续使用原来的会话 ID。
+4. 发送具体任务，例如：“打开记事本，输入一段文字，不要保存。”或“在飞书里给某人发一条消息”。
+5. 在聊天中查看操作记录和截图。点截图可放大、另存为，也可以通过控制栏的「截图」按钮按需查看整个桌面。手机上点电脑图标打开控制面板，使用截图和暂停；工具栏保留状态点和停止按钮。
 
-同一桌面同时只有一个会话控制。另一个会话使用前，先暂停或停止当前会话。切换目标窗口需要重新选择并开启；仅授权所选窗口，不会自动扩大为整个桌面。
+同一桌面同时只有一个会话控制。另一个会话使用前，先暂停或停止当前会话。授权范围是整个桌面，和 OpenBot 一样：请只在信任当前任务时开启，需要你接手时随时暂停或停止。AI 被要求在发送消息、删除、支付这类难以撤销的操作前确认是你要求的。
 
 Kiro CLI 当前不能直接把 MCP 图片交给模型，因此 Yi Console 会提供本次窗口截图的文件路径，由 Kiro 的内置图片读取工具查看。若工具要求文件审批，请核对并仅允许读取该会话截图。
 
@@ -42,17 +42,18 @@ Kiro CLI 当前不能直接把 MCP 图片交给模型，因此 Yi Console 会提
 
 ## 与 OpenBot 的覆盖范围
 
-对照 [OpenBot 的 Computer Use 架构](https://github.com/nightly-labs/openbot/blob/480dcbb30ba9aca8d5d52082b09c0f230d958d49/docs/architecture/computer-use.md)及同版 cua-driver 0.34.0：OpenBot 透传驱动的 59 个工具；Yi Console 当前按所选窗口授权开放 11 个。
+对照 [OpenBot 的 Computer Use 架构](https://github.com/nightly-labs/openbot/blob/480dcbb30ba9aca8d5d52082b09c0f230d958d49/docs/architecture/computer-use.md)及同版 cua-driver 0.34.0：OpenBot 透传驱动的 59 个工具；Yi Console 开放其中面向桌面和应用的 25 个。
 
 | 场景 | Yi Console |
 | --- | --- |
-| 截图、控件树、状态核验 | `get_window_state`、`verify_state`、`zoom` |
-| 输入、赋值、快捷键、菜单 | `type_text`、`set_value`、`press_key`、`invoke_menu` |
-| 点击、双击、右键、拖拽、滚动 | `click`（按钮和次数参数）、`drag`、`scroll`、`move_cursor` |
-| 启动/切换应用、整个桌面、全局剪贴板 | 当前不开放，需要扩大授权范围与新的控制界面 |
-| 浏览器扩展、导航、下载、文件选择器 | 当前不开放，跨窗口对话框也不自动获得授权 |
-| 驱动安装、升级、运行时配置、会话提权 | 由应用管理，不交给模型调用 |
+| 找窗口、启动和切换应用、调整窗口 | `list_apps`、`list_windows`、`launch_app`、`bring_to_front`、`set_window_frame` |
+| 截图、控件树、状态核验 | `get_window_state`、`get_desktop_state`、`verify_state`、`zoom`、`get_accessibility_tree`、`get_screen_size`、`get_cursor_position` |
+| 输入、赋值、快捷键、菜单 | `type_text`、`set_value`、`press_key`、`hotkey`、`invoke_menu` |
+| 点击、双击、右键、拖拽、滚动 | `click`、`double_click`、`right_click`、`drag`、`scroll`、`move_cursor` |
+| 剪贴板 | `clipboard_read`、`clipboard_write` |
+| 浏览器 CDP 工具（`browser_*`、`page`） | 不开放，网页任务用 AI 工具自己的浏览器能力 |
+| 结束进程、录制回放、驱动会话、配置、安装和升级 | 不开放，由应用管理 |
 
-目前足以完成单窗口内的读取、表单填写、按钮点击和结果核验。跨应用工作流与独立顶层弹窗仍有缺口。工具数量不直接代表实际可操作性，具体应用的 UIA/自绘控件适配需要实测。
+可以完成跨应用工作流、原生文件对话框和弹窗。工具数量不直接代表实际可操作性，具体应用的 UIA/自绘控件适配需要实测。
 
-OpenBot 把开关放在 Agent 设置中；Yi Console 的权限随会话和目标窗口变化，因此入口放在输入框工具栏，启用后才展开截图、暂停和停止按钮。外接 MCP 使用单独的[通用配置](mcp.md)，与桌面工具共用接入层。
+OpenBot 把开关放在 Agent 设置中，也不让用户选窗口；Yi Console 按会话开启，因此入口放在输入框工具栏，启用后才展开截图、暂停和停止按钮。OpenBot 还会给 AI 正在操作的窗口画高亮边框，Yi Console 目前没有，在聊天的工具行里标出每次操作的窗口。外接 MCP 使用单独的[通用配置](mcp.md)，与桌面工具共用接入层。

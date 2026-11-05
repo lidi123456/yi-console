@@ -1,11 +1,7 @@
 {
   "title": "Computer use",
-  "description": "Allow this AI session to operate the real, signed-in desktop on the session host. Select one window; activity and checkpoint screenshots appear in chat.",
-  "targetWindow": "Target window",
-  "checking": "Reading…",
-  "refreshWindows": "Refresh windows",
-  "chooseWindow": "Refresh and select a window",
-  "scope": "Only the selected window is authorized. One session can control the desktop at a time; pause or stop to release it.",
+  "description": "Allow this AI session to operate the signed-in Windows desktop on the session host: open apps, switch windows, click and type. Activity and screenshots appear in chat.",
+  "scope": "The AI can operate every app on this computer; turn this on only for tasks you trust. One session controls the desktop at a time; pause or stop at any time.",
   "occupied": "Another session is using this desktop. Pause or stop that session first.",
   "enable": "Enable computer use",
   "cancel": "Cancel",

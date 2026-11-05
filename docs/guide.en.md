@@ -85,7 +85,7 @@ Model lists and quotas come from yi-agentd briefly starting the tool and asking 
 
 ## Computer use (Windows)
 
-The Computer use control in the composer toolbar of all six AI chat tools selects a real window on the signed-in target host. The driver is bundled with the Windows daemon. It supports screenshots, interface reads, clicks and typing; one session controls the desktop at a time, with pause and stop controls. Activity and screenshots appear in chat. See [Computer use](computer-use.en.md) for support and instructions.
+The Computer use control in the composer toolbar of all six AI chat tools lets the AI operate the signed-in Windows desktop of the target host, opening apps and switching windows itself. The driver is bundled with the Windows daemon. It supports screenshots, interface reads, clicks and typing; one session controls the desktop at a time, with pause and stop controls. Activity and screenshots appear in chat. See [Computer use](computer-use.en.md) for support and instructions.
 
 Host settings manage external [MCP servers](mcp.en.md) shared across providers, independently of Computer Use platform restrictions.
 

@@ -2,7 +2,7 @@
 
 [简体中文](computer-use.md)
 
-Let a Claude Code, Codex, Cursor, Kiro, Qoder or CodeBuddy chat session inspect and operate a real window on its host, with activity and checkpoint screenshots in the conversation.
+Let a Claude Code, Codex, Cursor, Kiro, Qoder or CodeBuddy chat session operate the signed-in Windows desktop on its host (open apps, switch windows, read, click and type), with activity and checkpoint screenshots in the conversation.
 
 ## Support
 
@@ -15,14 +15,14 @@ The Windows daemon embeds a pinned MIT `cua-driver`. There is no runtime driver 
 ## Use
 
 1. Start Yi Console normally on the target Windows computer and open a Claude Code, Codex, Cursor, Kiro, Qoder or CodeBuddy chat session.
-2. Click the computer icon (Computer use) right of @ in the composer toolbar, refresh the window list and select the window the AI may operate.
-3. With no reply in progress, enable computer use. The tool connects to a session-scoped MCP entry and continues the existing tool session ID where possible.
-4. Give a specific task, such as: “Read this test window, enter the validation text, click Apply, then inspect a screenshot to verify the result.”
-5. Review activity and screenshots in chat. Click an image to enlarge or save it, or use Capture in the control bar to inspect the target on demand. On phones, the computer icon opens capture and pause controls; the status dot and stop button remain in the toolbar.
+2. Click the computer icon (Computer use) right of @ in the composer toolbar.
+3. With no reply in progress, enable computer use. The AI can then operate every app on this computer; it finds windows or launches apps itself, with no window to pick first. The tool connects to a session-scoped MCP entry and continues the existing tool session ID where possible.
+4. Give a specific task, such as: “Open Notepad and type a line, don't save.” or “Send someone a message in Feishu.”
+5. Review activity and screenshots in chat. Click an image to enlarge or save it, or use Capture in the control bar to capture the whole desktop on demand. On phones, the computer icon opens capture and pause controls; the status dot and stop button remain in the toolbar.
 
-Only one session controls a desktop at a time. Pause or stop it before another session takes control. Select and enable again to change the target; access does not automatically expand to the entire desktop.
+Only one session controls a desktop at a time. Pause or stop it before another session takes control. Access covers the whole desktop, as in OpenBot: enable it only for tasks you trust, and pause or stop whenever you need to take over. The AI is told to make sure you asked for hard-to-undo actions such as sending messages, deleting or paying.
 
-Kiro CLI currently cannot pass MCP images directly to its model. Yi Console supplies the captured window image as a session artifact for Kiro’s built-in image reader. If file approval is requested, review and allow only that session screenshot.
+Kiro CLI currently cannot pass MCP images directly to its model. Yi Console supplies the captured image as a session artifact for Kiro’s built-in image reader. If file approval is requested, review and allow only that session screenshot.
 
 ## Pause, stop and recovery
 
@@ -42,17 +42,18 @@ This feature controls operations through the Yi Console desktop gateway. It is n
 
 ## Coverage compared with OpenBot
 
-The comparison uses the [pinned OpenBot architecture](https://github.com/nightly-labs/openbot/blob/480dcbb30ba9aca8d5d52082b09c0f230d958d49/docs/architecture/computer-use.md) and cua-driver 0.34.0. OpenBot forwards the driver's 59 tools. Yi Console exposes 11 tools under an explicitly selected-window grant.
+The comparison uses the [pinned OpenBot architecture](https://github.com/nightly-labs/openbot/blob/480dcbb30ba9aca8d5d52082b09c0f230d958d49/docs/architecture/computer-use.md) and cua-driver 0.34.0. OpenBot forwards the driver's 59 tools. Yi Console exposes the 25 that work on the desktop and apps.
 
 | Workflow | Yi Console |
 | --- | --- |
-| Screenshot, accessibility tree, verification | `get_window_state`, `verify_state`, `zoom` |
-| Text, value, shortcuts, menus | `type_text`, `set_value`, `press_key`, `invoke_menu` |
-| Click, double/right click, drag, scroll | `click` (button/count arguments), `drag`, `scroll`, `move_cursor` |
-| Launch/switch apps, full desktop, global clipboard | Not exposed; requires broader grants and controls |
-| Browser extension, navigation, downloads, file pickers | Not exposed; separate top-level dialogs do not inherit the grant |
-| Driver installation/update/configuration/escalation | Managed by the application, unavailable to the model |
+| Find windows, launch and switch apps, move windows | `list_apps`, `list_windows`, `launch_app`, `bring_to_front`, `set_window_frame` |
+| Screenshot, accessibility tree, verification | `get_window_state`, `get_desktop_state`, `verify_state`, `zoom`, `get_accessibility_tree`, `get_screen_size`, `get_cursor_position` |
+| Text, value, shortcuts, menus | `type_text`, `set_value`, `press_key`, `hotkey`, `invoke_menu` |
+| Click, double/right click, drag, scroll | `click`, `double_click`, `right_click`, `drag`, `scroll`, `move_cursor` |
+| Clipboard | `clipboard_read`, `clipboard_write` |
+| Browser CDP tools (`browser_*`, `page`) | Not exposed; web tasks use the AI tool's own browser support |
+| Kill process, recording/replay, driver sessions, config, install/update | Not exposed; managed by the application |
 
-The current set supports observation, forms, clicks, and verification within one window. Cross-application workflows and separate top-level dialogs remain gaps. Actual accessibility support must be tested per application.
+Cross-application workflows, native file dialogs and pop-ups work. Actual accessibility support must be tested per application.
 
-OpenBot places its switch in Agent settings. Yi Console grants access per session and target window, so the entry is in the composer toolbar; screenshot, pause, and stop controls appear only while enabled. External servers use the [generic MCP configuration](mcp.en.md) and share the same provider integration.
+OpenBot places its switch in Agent settings and does not ask for a window either. Yi Console turns it on per session, so the entry is in the composer toolbar; screenshot, pause, and stop controls appear only while enabled. OpenBot also draws a highlight around the window the AI works in; Yi Console does not yet, and names each action's window in its tool row in chat. External servers use the [generic MCP configuration](mcp.en.md) and share the same provider integration.

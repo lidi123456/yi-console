@@ -132,8 +132,7 @@ pub fn build_args(spec: &StartSpec) -> Vec<String> {
     a.extend(spec.extra_args.iter().cloned());
     if spec.tool == ToolKind::Kiro && spec.permission_mode != "bypass" && spec.mcp_servers.iter().any(|server| server["name"] == "yi_computer_use") {
         // Trust only the user-selected gateway server; its live window grant still gates every native call.
-        let names = ["get_window_state", "verify_state", "zoom", "click", "type_text", "set_value", "press_key", "scroll", "drag", "move_cursor", "invoke_menu"];
-        let rules = names.iter().map(|name| format!("@yi_computer_use/{name}")).collect::<Vec<_>>().join(",");
+        let rules = crate::computer_use::tool_names().map(|name| format!("@yi_computer_use/{name}")).collect::<Vec<_>>().join(",");
         if let Some(index) = a.iter().rposition(|arg| arg == "--trust-tools" || arg.starts_with("--trust-tools=")) {
             if a[index].contains('=') { a[index].push(','); a[index].push_str(&rules); }
             else if let Some(value) = a.get_mut(index + 1) { value.push(','); value.push_str(&rules); }

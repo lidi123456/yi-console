@@ -219,7 +219,7 @@ pub async fn dispatch(
         COMPUTER_USE_STATUS => hub.desktop.status(p["sessionId"].as_str()),
         COMPUTER_USE_TARGETS => serde_json::to_value(hub.desktop.targets().await?)?,
         SESSION_COMPUTER_USE => {
-            hub.computer_use(s(&p, "sessionId")?, s(&p, "action")?, p.get("target").map(|v| serde_json::from_value(v.clone())).transpose()?).await?
+            hub.computer_use(s(&p, "sessionId")?, s(&p, "action")?).await?
         }
         // Handled in serve_conn, which knows the peer and its process id
         COMPUTER_USE_MCP => anyhow::bail!("桌面代理只接受本机连接"),

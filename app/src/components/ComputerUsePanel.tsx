@@ -18,7 +18,7 @@ interface DesktopState {
   enabled: boolean;
   paused: boolean;
   status: string;
-  target?: Target;
+  lastWindow?: Target;
   ownerSessionId?: string;
 }
 
@@ -35,8 +35,6 @@ export function ComputerUsePanel({
 }) {
   const [open, setOpen] = useState(false);
   const [state, setState] = useState<DesktopState>();
-  const [targets, setTargets] = useState<Target[]>([]);
-  const [selected, setSelected] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const dialog = useRef<HTMLElement>(null);
@@ -65,25 +63,11 @@ export function ComputerUsePanel({
     const timer = window.setInterval(() => void refresh(), 5000);
     return () => window.clearInterval(timer);
   }, [state?.enabled, connected, refresh]);
-  const scan = async () => {
-    setBusy(true);
-    setError('');
-    try {
-      const list = await rpc<Target[]>(hostId, 'computerUse.targets');
-      setTargets(list);
-      setSelected((old) => (list.some((item) => String(item.windowId) === old) ? old : String(list[0]?.windowId ?? '')));
-    } catch (e) {
-      setError(trErr(e instanceof Error ? e.message : String(e)));
-    } finally {
-      setBusy(false);
-    }
-  };
   const change = async (action: string) => {
     setBusy(true);
     setError('');
     try {
-      const target = targets.find((item) => String(item.windowId) === selected);
-      setState(await rpc(hostId, 'session.computerUse', { sessionId: info.id, action, ...(action === 'enable' ? { target } : {}) }));
+      setState(await rpc(hostId, 'session.computerUse', { sessionId: info.id, action }));
       if (action === 'enable') setOpen(false);
     } catch (e) {
       setError(trErr(e instanceof Error ? e.message : String(e)));
@@ -100,7 +84,7 @@ export function ComputerUsePanel({
           className={`tool-chip computer-use-btn ${state?.enabled ? 'active' : ''}`}
           disabled={!connected}
           aria-label={t('title')}
-          title={state?.enabled ? t('activeTitle', { title: state.target?.title ?? '', status: statusLabel }) : t('title')}
+          title={state?.enabled ? (state.lastWindow?.title ? t('activeTitle', { title: state.lastWindow.title, status: statusLabel }) : statusLabel) : t('title')}
           onClick={() => {
             setOpen(true);
             void refresh();
@@ -159,7 +143,7 @@ export function ComputerUsePanel({
             onKeyDown={(e) => {
               if (e.key === 'Escape') setOpen(false);
               if (e.key === 'Tab') {
-                const controls = Array.from(e.currentTarget.querySelectorAll<HTMLElement>('button:not(:disabled), select:not(:disabled)'));
+                const controls = Array.from(e.currentTarget.querySelectorAll<HTMLElement>('button:not(:disabled)'));
                 const first = controls[0];
                 const last = controls[controls.length - 1];
                 if (e.shiftKey && (document.activeElement === first || document.activeElement === e.currentTarget)) {
@@ -181,20 +165,6 @@ export function ComputerUsePanel({
             <p className="muted">{t('description')}</p>
             {state?.supported ? (
               <>
-                <div className="computer-use-select">
-                  <label htmlFor="cu-target">{t('targetWindow')}</label>
-                  <button className="btn small" disabled={busy} onClick={() => void scan()}>
-                    {busy ? t('checking') : t('refreshWindows')}
-                  </button>
-                </div>
-                <select id="cu-target" value={selected} onChange={(e) => setSelected(e.target.value)} disabled={busy}>
-                  <option value="">{t('chooseWindow')}</option>
-                  {targets.map((target) => (
-                    <option key={target.windowId} value={String(target.windowId)}>
-                      {target.title}
-                    </option>
-                  ))}
-                </select>
                 <p className="muted small">{t('scope')}</p>
                 {state.status === 'busy' && <p role="status">{t('occupied')}</p>}
                 {error && (
@@ -217,15 +187,17 @@ export function ComputerUsePanel({
                 )}
                 <div className="dlg-actions">
                   <button className="btn" onClick={() => setOpen(false)}>
-                    {t('cancel')}
+                    {state.enabled ? t('close') : t('cancel')}
                   </button>
-                  <button
-                    className="btn primary"
-                    disabled={busy || !selected || info.status === 'running' || info.status === 'waiting-permission'}
-                    onClick={() => void change('enable')}
-                  >
-                    {t('enable')}
-                  </button>
+                  {!state.enabled && (
+                    <button
+                      className="btn primary"
+                      disabled={busy || info.status === 'running' || info.status === 'waiting-permission'}
+                      onClick={() => void change('enable')}
+                    >
+                      {t('enable')}
+                    </button>
+                  )}
                 </div>
                 {(info.status === 'running' || info.status === 'waiting-permission') && <p className="muted small">{t('waitForTurn')}</p>}
               </>

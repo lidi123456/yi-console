@@ -16,27 +16,55 @@ use yi_proto::{EventBody, ImageRef};
 const VERSION: &str = "0.34.0";
 const BINARY_SHA: &str = "77f5cac754b42b6a8bae126414fc8f7487432ace93466967965188e24e9e53fb";
 const SERVER: &str = "yi_computer_use";
-const READ_TOOLS: &[&str] = &["get_window_state", "verify_state", "zoom"];
-const WRITE_TOOLS: &[&str] = &[
-    "click",
-    "type_text",
-    "set_value",
-    "press_key",
-    "scroll",
-    "drag",
-    "move_cursor",
-    "invoke_menu",
+/// The whole desktop, as in OpenBot. Left out: browser CDP tools (use the browser tools), recording/replay, driver
+/// sessions, config, cursor themes, installers/updates, diagnostics, and kill_app (close a window instead).
+const READ_TOOLS: &[&str] = &[
+    "list_apps",
+    "list_windows",
+    "get_window_state",
+    "verify_state",
+    "zoom",
+    "get_desktop_state",
+    "get_screen_size",
+    "get_cursor_position",
+    "get_accessibility_tree",
+    "clipboard_read",
 ];
+const WRITE_TOOLS: &[&str] = &[
+    "launch_app",
+    "bring_to_front",
+    "set_window_frame",
+    "invoke_menu",
+    "click",
+    "double_click",
+    "right_click",
+    "drag",
+    "type_text",
+    "press_key",
+    "hotkey",
+    "set_value",
+    "scroll",
+    "move_cursor",
+    "clipboard_write",
+];
+
+/// Every desktop tool the gateway exposes (Kiro's trust list needs the names)
+pub fn tool_names() -> impl Iterator<Item = &'static str> {
+    READ_TOOLS.iter().chain(WRITE_TOOLS).copied()
+}
 /// Shared by the MCP initialize instructions, the CLI system prompts and the ACP first-prompt notice.
 /// Modeled on OpenBot's guidance: short path, few reads, read structuredContent, no workarounds.
 macro_rules! guide {
     () => {
-        "Operate only the window the user selected in Yi Console; the gateway fills in pid and window_id, so never pass them. \
-Take the shortest path: read the window once with get_window_state, then act. To find one element, pass query (and include_screenshot: false when you only need its element_token); \
-do not read the whole window again after every action. Prefer element_token from the latest read; x and y are pixels of the latest screenshot. \
+        "You may operate any app on this Windows desktop; act only on the windows the task needs. \
+Find windows with list_windows (or launch_app to open one) and choose by title and size, never the first match: many windows are small empty helpers. \
+Pass that window's pid and window_id to every window tool. \
+Take the shortest path: read a window once with get_window_state, then act. To find one element, pass query (and include_screenshot: false when you only need its element_token); \
+do not read the whole window again after every action. Prefer element_token from the latest read; x and y are pixels of the latest screenshot of that window. \
 After each action read its structuredContent: refused or suspected_noop means it did not happen; unverifiable means check once, with a query for the expected text, before you report it as done. \
 Chromium and Electron windows (Feishu, Slack, VS Code, browsers) drop background input: use delivery_mode \"foreground\" there from the first input; it briefly takes the focus. \
 To submit typed text, press_key return is more reliable than clicking a send button. \
+Before an action that is hard to undo (sending to other people, deleting, paying, closing unsaved work), make sure the user asked for it. \
 A paused, stopped or busy error means the user took control: stop and tell them. \
 Never start your own MCP client, read Yi Console ticket files, or drive the desktop through shell scripts or other desktop tools. \
 When a direct API, CLI, file or browser tool can do the task, use that instead."
@@ -55,10 +83,14 @@ pub struct Target {
 #[derive(Clone)]
 struct Grant {
     ticket: String,
-    target: Target,
     paused: bool,
-    tokens: HashSet<String>,
-    capture: Option<String>,
+    /// Element tokens and capture id from the latest read of each window (0: the full desktop)
+    tokens: HashMap<u64, HashSet<String>>,
+    captures: HashMap<u64, String>,
+    /// Window titles seen in list_windows, for the timeline
+    titles: HashMap<u64, String>,
+    /// The window the last action went to, for the status line
+    last: Option<Target>,
     /// The proxy process allowed to use the ticket, and the process that started it (the AI tool)
     proxy: Option<(u32, Option<u32>)>,
 }
@@ -96,7 +128,7 @@ impl Desktop {
                 else if control.owner.as_deref().is_some_and(|owner| Some(owner) != sid) { "busy" }
                 else if grant.is_some() { "ready" } else { "disabled" },
             "enabled": grant.is_some(), "paused": grant.is_some_and(|g| g.paused),
-            "ownerSessionId": control.owner, "target": grant.map(|g| &g.target),
+            "ownerSessionId": control.owner, "lastWindow": grant.and_then(|g| g.last.as_ref()),
         })
     }
 
@@ -106,15 +138,12 @@ impl Desktop {
             .join(format!("{sid}.json"))
     }
 
-    pub fn configure(&self, sid: &str, target: Target) -> Result<()> {
+    pub fn configure(&self, sid: &str) -> Result<()> {
         if !cfg!(all(windows, target_arch = "x86_64")) {
             bail!("操作电脑首版仅支持 Windows x64");
         }
         if !desktop_available() {
             bail!("桌面不可用，请在已登录且解锁的 Windows 用户会话中运行 Yi Console");
-        }
-        if target.pid == 0 || target.window_id == 0 {
-            bail!("请选择有效的目标窗口");
         }
         let mut control = self.control.lock().unwrap();
         if control.owner.as_deref().is_some_and(|owner| owner != sid) {
@@ -123,10 +152,11 @@ impl Desktop {
         // Replacing a grant invalidates old proxies even when their CLI has not exited yet.
         let grant = Grant {
             ticket: uuid::Uuid::new_v4().to_string(),
-            target,
             paused: false,
-            tokens: HashSet::new(),
-            capture: None,
+            tokens: HashMap::new(),
+            captures: HashMap::new(),
+            titles: HashMap::new(),
+            last: None,
             proxy: None,
         };
         let path = Self::ticket_path(sid);
@@ -190,7 +220,7 @@ impl Desktop {
                     .ok_or_else(|| anyhow!("当前会话未开启操作电脑"))?;
                 grant.paused = true;
                 grant.tokens.clear();
-                grant.capture = None;
+                grant.captures.clear();
                 if control.owner.as_deref() == Some(sid) {
                     control.owner = None;
                 }
@@ -323,9 +353,9 @@ impl Desktop {
             .ok_or_else(|| anyhow!("当前会话未开启操作电脑"))?
             .ticket
             .clone();
-        let result = self.mcp(hub, sid, &ticket, json!({"method":"tools/call","params":{"name":"get_window_state","arguments":{"include_screenshot":true}}})).await?;
+        let result = self.mcp(hub, sid, &ticket, json!({"method":"tools/call","params":{"name":"get_desktop_state","arguments":{"max_image_dimension":1600}}})).await?;
         if result["isError"] == true {
-            bail!("无法读取目标窗口，请刷新后重试");
+            bail!("无法截取桌面，请确认 Windows 已登录并解锁");
         }
         Ok(())
     }
@@ -363,13 +393,13 @@ impl Desktop {
         match method {
             "initialize" => Ok(
                 json!({"protocolVersion": params["protocolVersion"].as_str().unwrap_or("2025-06-18"),
-                "serverInfo":{"name":SERVER,"version":"1"},"capabilities":{"tools":{},"resources":{}},"instructions":format!("{GUIDE} Selected window: pid={}, window_id={}, title={}", grant.target.pid, grant.target.window_id, grant.target.title)}),
+                "serverInfo":{"name":SERVER,"version":"1"},"capabilities":{"tools":{},"resources":{}},"instructions":GUIDE}),
             ),
             "tools/list" => {
                 let mut response = self.request("tools/list", json!({})).await?;
                 if let Some(tools) = response["tools"].as_array_mut() {
                     tools.retain(|tool| tool["name"].as_str().is_some_and(allowed));
-                    tools.iter_mut().for_each(hide_target_args);
+                    tools.iter_mut().for_each(hide_gateway_args);
                 }
                 Ok(response)
             }
@@ -398,11 +428,17 @@ impl Desktop {
                 if serde_json::to_vec(&args)?.len() > 64 * 1024 {
                     bail!("桌面工具参数过大");
                 }
-                enforce_target(&mut args, &grant.target)?;
+                // An agent cannot attach its request to a different driver lifecycle session.
+                args.remove("session");
                 if args.contains_key("screenshot_out_file") {
                     bail!("截图只能保存在当前会话的产物目录");
                 }
                 validate_snapshot(&json!(args), &grant, tool)?;
+                let window = args.get("window_id").and_then(Value::as_u64);
+                let label = window
+                    .and_then(|w| grant.titles.get(&w).cloned())
+                    .or_else(|| (tool == "launch_app").then(|| args.get("name").and_then(Value::as_str).unwrap_or("").to_string()))
+                    .unwrap_or_default();
                 let id = uuid::Uuid::new_v4().to_string();
                 hub.desktop_event(
                     sid,
@@ -410,7 +446,7 @@ impl Desktop {
                         action_id: id.clone(),
                         tool: tool.into(),
                         status: "running".into(),
-                        message: grant.target.title.clone(),
+                        message: label.clone(),
                         duration_ms: 0,
                         images: vec![],
                     },
@@ -426,21 +462,11 @@ impl Desktop {
                     .await;
                 // No cancelled call is reported as successful, even if its response raced with revocation.
                 let response = response.and_then(|r| self.grant(sid, ticket, true).map(|_| r));
-                if tool == "get_window_state" {
-                    if let Ok(value) = &response {
-                        let snapshot = structured(value);
-                        let mut control = self.control.lock().unwrap();
-                        if let Some(current) =
-                            control.grants.get_mut(sid).filter(|g| g.ticket == ticket)
-                        {
-                            if let Some(elements) = snapshot["elements"].as_array() {
-                                current.tokens = elements
-                                    .iter()
-                                    .filter_map(|e| e["element_token"].as_str().map(String::from))
-                                    .collect();
-                            }
-                            current.capture = snapshot["capture_id"].as_str().map(String::from);
-                        }
+                if let Ok(value) = &response {
+                    let data = structured(value);
+                    let mut control = self.control.lock().unwrap();
+                    if let Some(current) = control.grants.get_mut(sid).filter(|g| g.ticket == ticket) {
+                        remember(current, tool, window, &args, &data);
                     }
                 }
                 let (status, images) = match &response {
@@ -454,7 +480,7 @@ impl Desktop {
                         action_id: id,
                         tool: tool.into(),
                         status: status.into(),
-                        message: grant.target.title,
+                        message: label,
                         duration_ms: start.elapsed().as_millis() as u64,
                         images,
                     },
@@ -467,7 +493,7 @@ impl Desktop {
                             content.retain(|item| item["type"] != "image");
                             for image in &model_images {
                                 let path = crate::paths::base_dir().join("uploads").join(sid).join(&image.id);
-                                content.push(json!({"type":"text","text":format!("Yi Console captured the authorized window. Screenshot artifact: {}. Kiro CLI cannot view MCP image blocks directly: use your built-in read/fs_read image mode to open this exact image file before judging pixels. Read only this returned screenshot artifact, not other files. Do not infer screenshot contents from the accessibility tree.", path.display())}));
+                                content.push(json!({"type":"text","text":format!("Yi Console captured the screenshot. Screenshot artifact: {}. Kiro CLI cannot view MCP image blocks directly: use your built-in read/fs_read image mode to open this exact image file before judging pixels. Read only this returned screenshot artifact, not other files. Do not infer screenshot contents from the accessibility tree.", path.display())}));
                             }
                         }
                     }
@@ -513,51 +539,63 @@ fn allowed(name: &str) -> bool {
 
 /// Recheck after queueing: another read or a pause may have invalidated an input's snapshot.
 fn validate_snapshot(args: &Value, grant: &Grant, tool: &str) -> Result<()> {
+    let window = args["window_id"].as_u64();
     if let Some(token) = args["element_token"].as_str() {
-        if !grant.tokens.contains(token) {
-            bail!("界面元素已失效或不属于当前授权窗口，请先重新读取窗口");
+        let known = match window {
+            Some(w) => grant.tokens.get(&w).is_some_and(|t| t.contains(token)),
+            None => grant.tokens.values().any(|t| t.contains(token)),
+        };
+        if !known {
+            bail!("界面元素已失效，请先重新读取窗口");
         }
     }
     if WRITE_TOOLS.contains(&tool)
         && (args.get("x").is_some() || args.get("from_x").is_some())
-        && grant.capture.is_none()
+        && grant.captures.is_empty()
     {
-        bail!("坐标操作前请先读取当前目标窗口截图");
+        bail!("坐标操作前请先读取窗口截图");
     }
     if let Some(capture) = args["capture_id"].as_str() {
-        if grant.capture.as_deref() != Some(capture) {
+        if !grant.captures.values().any(|c| c == capture) {
             bail!("界面截图已失效，请先重新读取窗口");
         }
     }
     Ok(())
 }
 
-fn enforce_target(args: &mut serde_json::Map<String, Value>, target: &Target) -> Result<()> {
-    if args
-        .get("pid")
-        .is_some_and(|p| p.as_u64() != Some(target.pid))
-        || args
-            .get("window_id")
-            .is_some_and(|w| w.as_u64() != Some(target.window_id))
-    {
-        bail!("操作目标与用户选择的窗口不一致");
-    }
-    if args.get("scope").is_some_and(|v| v != "window") {
-        bail!("当前会话仅授权指定窗口");
-    }
-    if let Some(t) = args.get("target") {
-        if t["kind"] != "window"
-            || t["pid"].as_u64() != Some(target.pid)
-            || t["window_id"].as_u64() != Some(target.window_id)
-        {
-            bail!("操作目标与用户选择的窗口不一致");
+/// What a successful call teaches the gateway: tokens and capture of the window it read, window titles, and the
+/// window the last action went to.
+fn remember(grant: &mut Grant, tool: &str, window: Option<u64>, args: &serde_json::Map<String, Value>, data: &Value) {
+    if matches!(tool, "list_windows" | "launch_app" | "get_window_state" | "bring_to_front") {
+        let mut found = vec![];
+        collect_targets(data, None, &mut found);
+        for t in found.into_iter().filter(|t| !t.title.is_empty()) {
+            grant.titles.insert(t.window_id, t.title);
         }
     }
-    // An agent cannot attach its request to a different lifecycle session.
-    args.remove("session");
-    args.insert("pid".into(), json!(target.pid));
-    args.insert("window_id".into(), json!(target.window_id));
-    Ok(())
+    match tool {
+        "get_window_state" => {
+            if let Some(w) = window {
+                if let Some(elements) = data["elements"].as_array() {
+                    grant.tokens.insert(w, elements.iter().filter_map(|e| e["element_token"].as_str().map(String::from)).collect());
+                }
+                match data["capture_id"].as_str() {
+                    Some(c) => grant.captures.insert(w, c.to_string()),
+                    None => grant.captures.remove(&w),
+                };
+            }
+        }
+        "get_desktop_state" => {
+            if let Some(c) = data["capture_id"].as_str() {
+                grant.captures.insert(0, c.to_string());
+            }
+        }
+        _ => {}
+    }
+    if let (Some(w), Some(pid)) = (window, args.get("pid").and_then(Value::as_u64)) {
+        let title = grant.titles.get(&w).cloned().unwrap_or_default();
+        grant.last = Some(Target { pid, window_id: w, title });
+    }
 }
 
 fn structured(value: &Value) -> Value {
@@ -786,14 +824,10 @@ impl Peer {
     }
 }
 
-/// Drop the target arguments the gateway fills in. Uses get_mut only: indexing a Value mutably inserts null for a missing
+/// Drop the arguments the gateway owns. Uses get_mut only: indexing a Value mutably inserts null for a missing
 /// key, and a tool with `"required": null` makes strict clients (Qoder) reject the whole tool list.
-fn hide_target_args(tool: &mut Value) {
-    const HIDDEN: [&str; 6] = ["pid", "window_id", "scope", "target", "screenshot_out_file", "session"];
-    let description = tool.get("description").and_then(Value::as_str).unwrap_or("").to_string();
-    if let Some(map) = tool.as_object_mut() {
-        map.insert("description".into(), json!(format!("Yi Console automatically supplies the user's authorized window. Do not supply pid, window_id, scope or target. {description}")));
-    }
+fn hide_gateway_args(tool: &mut Value) {
+    const HIDDEN: [&str; 2] = ["screenshot_out_file", "session"];
     let Some(schema) = tool.get_mut("inputSchema").and_then(Value::as_object_mut) else { return };
     if let Some(properties) = schema.get_mut("properties").and_then(Value::as_object_mut) {
         for key in HIDDEN {
@@ -990,19 +1024,21 @@ mod tests {
     }
 
     #[test]
-    fn hide_target_args_never_adds_null() {
-        let mut no_required = json!({"name":"zoom","inputSchema":{"type":"object","properties":{"pid":{},"factor":{}}}});
-        hide_target_args(&mut no_required);
+    fn hide_gateway_args_never_adds_null() {
+        let mut no_required = json!({"name":"zoom","inputSchema":{"type":"object","properties":{"pid":{},"session":{}}}});
+        hide_gateway_args(&mut no_required);
         assert!(no_required["inputSchema"].get("required").is_none(), "{no_required}");
-        assert!(no_required["inputSchema"]["properties"].get("pid").is_none());
+        assert!(no_required["inputSchema"]["properties"].get("session").is_none());
+        // The model picks the window now: pid and window_id stay
+        assert!(no_required["inputSchema"]["properties"].get("pid").is_some());
         let mut bare = json!({"name":"verify_state"});
-        hide_target_args(&mut bare);
+        hide_gateway_args(&mut bare);
         assert!(bare.get("inputSchema").is_none());
-        let mut both = json!({"name":"click","inputSchema":{"type":"object","properties":{"pid":{},"element_token":{}},"required":["pid","element_token"]}});
-        hide_target_args(&mut both);
-        assert_eq!(both["inputSchema"]["required"], json!(["element_token"]));
+        let mut both = json!({"name":"click","inputSchema":{"type":"object","properties":{"session":{},"pid":{}},"required":["session","pid"]}});
+        hide_gateway_args(&mut both);
+        assert_eq!(both["inputSchema"]["required"], json!(["pid"]));
         let mut null = json!({"name":"x","inputSchema":{"type":"object","required":null}});
-        hide_target_args(&mut null);
+        hide_gateway_args(&mut null);
         assert!(null["inputSchema"].get("required").is_none());
     }
 
@@ -1021,26 +1057,41 @@ mod tests {
             title: "Validation".into(),
         }
     }
-    #[test]
-    fn target_restriction_rejects_nested_desktop_and_foreign_windows() {
-        for args in [
-            json!({"pid":41}),
-            json!({"window_id":78}),
-            json!({"scope":"desktop"}),
-            json!({"target":{"kind":"desktop","display_id":"primary"}}),
-            json!({"target":{"kind":"window","pid":41,"window_id":77}}),
-        ] {
-            let mut args = args.as_object().unwrap().clone();
-            assert!(enforce_target(&mut args, &target()).is_err());
+    fn grant() -> Grant {
+        Grant {
+            ticket: "valid".into(),
+            paused: false,
+            tokens: HashMap::new(),
+            captures: HashMap::new(),
+            titles: HashMap::new(),
+            last: None,
+            proxy: None,
         }
-        let mut args = json!({"text":"test","session":"foreign"})
-            .as_object()
-            .unwrap()
-            .clone();
-        enforce_target(&mut args, &target()).unwrap();
-        assert_eq!(args["pid"], 42);
-        assert_eq!(args["window_id"], 77);
-        assert!(!args.contains_key("session"));
+    }
+    #[test]
+    fn desktop_tools_cover_apps_but_not_driver_management() {
+        for tool in ["list_windows", "launch_app", "hotkey", "get_desktop_state", "double_click", "clipboard_write"] {
+            assert!(allowed(tool), "{tool}");
+        }
+        for tool in ["kill_app", "set_config", "install_extension", "replay_trajectory", "page", "browser_navigate", "start_session"] {
+            assert!(!allowed(tool), "{tool}");
+        }
+    }
+    #[test]
+    fn reads_are_remembered_per_window() {
+        let mut g = grant();
+        let args = |w: u64| json!({"pid":42,"window_id":w}).as_object().unwrap().clone();
+        remember(&mut g, "list_windows", None, &Default::default(), &json!({"windows":[{"pid":42,"window_id":77,"title":"Validation"}]}));
+        remember(&mut g, "get_window_state", Some(77), &args(77), &json!({"elements":[{"element_token":"s1:0"}],"capture_id":"c77"}));
+        remember(&mut g, "get_window_state", Some(78), &args(78), &json!({"elements":[{"element_token":"s2:0"}],"capture_id":"c78"}));
+        assert_eq!(g.last, Some(Target { pid: 42, window_id: 78, title: String::new() }));
+        remember(&mut g, "click", Some(77), &args(77), &json!({}));
+        assert_eq!(g.last, Some(target()));
+        // A token from one window is not valid for another
+        assert!(validate_snapshot(&json!({"window_id":77,"element_token":"s1:0"}), &g, "click").is_ok());
+        assert!(validate_snapshot(&json!({"window_id":77,"element_token":"s2:0"}), &g, "click").is_err());
+        assert!(validate_snapshot(&json!({"window_id":78,"capture_id":"c77","x":1,"y":1}), &g, "click").is_ok());
+        assert!(validate_snapshot(&json!({"capture_id":"old","x":1,"y":1}), &g, "click").is_err());
     }
     #[test]
     fn refused_and_noop_are_not_success_and_display_copy_has_no_image_bytes() {
@@ -1067,14 +1118,7 @@ mod tests {
             control.owner = Some(sid.clone());
             control.grants.insert(
                 sid.clone(),
-                Grant {
-                    ticket: "valid".into(),
-                    target: target(),
-                    paused: false,
-                    tokens: HashSet::new(),
-                    capture: None,
-                    proxy: None,
-                },
+                grant(),
             );
         }
         assert!(desktop.grant(&sid, "wrong", true).is_err());
@@ -1119,31 +1163,14 @@ mod tests {
     }
     #[test]
     fn input_requires_current_elements_and_coordinate_capture() {
-        let grant = Grant {
-            ticket: "t".into(),
-            target: target(),
-            paused: false,
-            tokens: HashSet::from(["s00000001:0".into()]),
-            capture: Some("current".into()),
-            proxy: None,
-        };
-        assert!(
-            validate_snapshot(&json!({"element_token":"s00000001:0"}), &grant, "click").is_ok()
-        );
-        assert!(
-            validate_snapshot(&json!({"element_token":"s00000000:0"}), &grant, "click").is_err()
-        );
-        assert!(
-            validate_snapshot(&json!({"x":10,"y":20,"capture_id":"old"}), &grant, "click").is_err()
-        );
-        let mut empty = grant.clone();
-        empty.capture = None;
-        assert!(validate_snapshot(
-            &json!({"from_x":10,"from_y":20,"to_x":30,"to_y":40}),
-            &empty,
-            "drag"
-        )
-        .is_err());
+        let mut g = grant();
+        g.tokens.insert(77, HashSet::from(["s00000001:0".into()]));
+        g.captures.insert(77, "current".into());
+        assert!(validate_snapshot(&json!({"element_token":"s00000001:0"}), &g, "click").is_ok());
+        assert!(validate_snapshot(&json!({"element_token":"s00000000:0"}), &g, "click").is_err());
+        assert!(validate_snapshot(&json!({"x":10,"y":20,"capture_id":"old"}), &g, "click").is_err());
+        let empty = grant();
+        assert!(validate_snapshot(&json!({"from_x":10,"from_y":20,"to_x":30,"to_y":40}), &empty, "drag").is_err());
     }
 }
 
@@ -1201,7 +1228,7 @@ fn desktop_available() -> bool {
 
 pub fn model_hint(extra_args: &[String]) -> &'static str {
     if extra_args.iter().any(|arg| arg.contains("yi_computer_use")) {
-        concat!(" For GUI tasks in the desktop window the user authorized, call the yi_computer_use MCP tools directly. ", guide!())
+        concat!(" For GUI tasks on this computer's desktop, call the yi_computer_use MCP tools directly. ", guide!())
     } else {
         ""
     }
@@ -1212,7 +1239,7 @@ pub fn model_hint(extra_args: &[String]) -> &'static str {
 pub fn acp_notice() -> &'static str {
     concat!(
         "<system-reminder>Yi Console turned on computer use for this session. The yi_computer_use MCP tools ",
-        "(get_window_state, click, type_text, set_value, press_key, scroll, drag, move_cursor, invoke_menu, verify_state, zoom) ",
+        "(list_windows, launch_app, get_window_state, click, type_text, press_key, hotkey and more) ",
         "are in your tool list now; earlier messages saying they are missing or broken are outdated. Use them only when the task needs the desktop. ",
         guide!(),
         "</system-reminder>"
