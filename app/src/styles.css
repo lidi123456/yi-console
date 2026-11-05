@@ -8719,3 +8719,37 @@ button.wp-commit-title .chev {
   pointer-events: none;
   transform-origin: center;
 }
+
+/* Session-scoped desktop control and checkpoint images. */
+.computer-use-bar { display: inline-flex; align-items: center; gap: 4px; flex: none; }
+.computer-use-bar .btn { display: inline-flex; align-items: center; gap: 5px; }
+.computer-use-target { max-width: 140px; font-size: var(--fs-ui); }
+@media (max-width: 760px) { .computer-use-target { display: none; } }
+.computer-use-setup { width: min(560px, calc(100vw - 32px)); padding: 20px; }
+.computer-use-heading, .computer-use-select { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.computer-use-select { margin: 20px 0 8px; }
+.computer-use-setup select { width: 100%; padding: 8px; border: 1px solid var(--border); background: var(--bg); color: var(--text); border-radius: 6px; }
+.computer-use-action { margin: 8px 0; padding: 10px 12px; border: 1px solid var(--border); border-radius: 8px; font-size: var(--fs-chat, 14px); }
+.computer-use-action-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.computer-use-images { margin-top: 8px; display: flex; gap: 8px; flex-wrap: wrap; }
+.computer-use-images .msg-img { width: min(420px, 100%); height: auto; max-height: 320px; }
+.computer-use-images .msg-img img { display: block; width: 100%; height: auto; max-height: 320px; object-fit: contain; }
+
+.computer-use-dot { width: 6px; height: 6px; border-radius: 50%; background: #2da44e; flex: none; }
+.computer-use-dot.paused { background: #bf8700; }
+.computer-use-bar .icon-btn { width: 26px; height: 26px; }
+
+/* Host-owned MCP definitions. */
+.mcp-server-row { gap: 8px; padding: 8px 0; border-top: 1px solid var(--border); flex-wrap: wrap; }
+.mcp-editor { width: min(620px, calc(100vw - 32px)); padding: 20px; max-height: 90vh; overflow: auto; }
+.mcp-editor textarea { width: 100%; box-sizing: border-box; resize: vertical; font-family: var(--mono); }
+.mcp-tool-scopes { display: flex; gap: 12px; flex-wrap: wrap; }
+
+.computer-use-dialog-controls { display: flex; gap: 8px; flex-wrap: wrap; margin: 12px 0; }
+@media (max-width: 760px) {
+  .computer-use-bar .computer-use-label,
+  .computer-use-bar .computer-use-capture,
+  .computer-use-bar .computer-use-pause { display: none; }
+  .computer-use-bar .btn { width: 26px; height: 26px; padding: 0; justify-content: center; }
+  .composer-tools:has(.computer-use-bar) .model-btn { max-width: 100px; min-width: 0; }
+}

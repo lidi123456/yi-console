@@ -128,6 +128,15 @@ pub fn build_args(spec: &StartSpec) -> Vec<String> {
         }
     }
     a.extend(spec.extra_args.iter().cloned());
+    if spec.tool == ToolKind::Kiro && spec.permission_mode != "bypass" && spec.mcp_servers.iter().any(|server| server["name"] == "yi_computer_use") {
+        // Trust only the user-selected gateway server; its live window grant still gates every native call.
+        let names = ["get_window_state", "verify_state", "zoom", "click", "type_text", "set_value", "press_key", "scroll", "drag", "move_cursor", "invoke_menu"];
+        let rules = names.iter().map(|name| format!("@yi_computer_use/{name}")).collect::<Vec<_>>().join(",");
+        if let Some(index) = a.iter().rposition(|arg| arg == "--trust-tools" || arg.starts_with("--trust-tools=")) {
+            if a[index].contains('=') { a[index].push(','); a[index].push_str(&rules); }
+            else if let Some(value) = a.get_mut(index + 1) { value.push(','); value.push_str(&rules); }
+        } else { a.extend(["--trust-tools".into(), rules]); }
+    }
     a
 }
 
@@ -419,6 +428,9 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Result<V
         let r = &v["result"];
         match kind {
             Pending::Init => {
+                if spec.mcp_servers.iter().any(|server| server["type"] == "http") && r["agentCapabilities"]["mcpCapabilities"]["http"] != true {
+                    return Err("该工具未声明支持 HTTP MCP，请改用 stdio 或调整服务的工具范围".into());
+                }
                 st.image_ok = r["agentCapabilities"]["promptCapabilities"]["image"]
                     .as_bool()
                     .unwrap_or(false);
@@ -674,7 +686,7 @@ fn new_or_load(st: &mut State, spec: &StartSpec) -> Value {
             st.req(
                 Pending::Load,
                 "session/load",
-                json!({"sessionId":sid,"cwd":cwd,"mcpServers":[]}),
+                json!({"sessionId":sid,"cwd":cwd,"mcpServers":spec.mcp_servers}),
             )
         }
         None => new_session(st, spec),
@@ -683,7 +695,7 @@ fn new_or_load(st: &mut State, spec: &StartSpec) -> Value {
 
 fn new_session(st: &mut State, spec: &StartSpec) -> Value {
     let cwd = spec.cwd.display().to_string();
-    st.req(Pending::Session, "session/new", json!({"cwd":cwd,"mcpServers":[]}))
+    st.req(Pending::Session, "session/new", json!({"cwd":cwd,"mcpServers":spec.mcp_servers}))
 }
 
 /// Kiro writes ~/.kiro/sessions/cli/<id>.lock ({"pid":..,"started_at":..}) when it opens a session and deletes it on exit.
@@ -917,7 +929,7 @@ fn update(st: &mut State, em: &Emitter, u: &Value) {
                 st.subagents.remove(&id);
                 let mut output = texts.join("\n");
                 if output.is_empty() && !u["rawOutput"].is_null() {
-                    output = raw_output_text(&u["rawOutput"]);
+                    output = raw_output_text(&crate::computer_use::display_value(&u["rawOutput"]));
                 }
                 em.event(EventBody::ToolResult {
                     id: id.clone(),

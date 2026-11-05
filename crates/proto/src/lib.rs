@@ -219,6 +219,9 @@ pub struct SessionInfo {
     /// Usage limit hits in a row since the last turn that ended normally; past `MAX_AUTO_RESUMES` no more automatic continues
     #[serde(default, skip_serializing_if = "is_zero")]
     pub limit_hits: u32,
+    /// Optional desktop control; disabled again after daemon restart.
+    #[serde(default)]
+    pub computer_use: bool,
 }
 
 fn is_zero(n: &u32) -> bool {
@@ -404,6 +407,16 @@ pub enum EventBody {
     ThinkingDelta {
         id: String,
         delta: String,
+    },
+    /// Desktop action metadata; images use the session's existing image endpoint.
+    ComputerUse {
+        action_id: String,
+        tool: String,
+        status: String,
+        message: String,
+        duration_ms: u64,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<ImageRef>,
     },
     ToolCall {
         id: String,
@@ -596,6 +609,9 @@ pub struct ToolOverride {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DaemonSettings {
+    /// Host-owned MCP definitions shared by AI chat adapters; an empty tool list selects all AI tools.
+    #[serde(default)]
+    pub mcp_servers: Vec<McpServerConfig>,
     #[serde(default)]
     pub tools: std::collections::BTreeMap<String, ToolOverride>,
     #[serde(default)]
@@ -620,6 +636,36 @@ pub struct DaemonSettings {
     /// UI language last reported by a client (zh / en), used for the automatic continue message
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ui_lang: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum McpTransport {
+    #[default]
+    Stdio,
+    Http,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct McpServerConfig {
+    pub name: String,
+    #[serde(default = "yes")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub transport: McpTransport,
+    #[serde(default)]
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    pub url: String,
+    #[serde(default)]
+    pub headers: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    pub tools: Vec<ToolKind>,
 }
 
 pub const DEFAULT_IDLE_RELEASE_MINUTES: u32 = 30;
@@ -676,6 +722,11 @@ pub mod methods {
     pub const HELLO: &str = "hello";
     pub const TOOLS_DETECT: &str = "tools.detect";
     pub const SESSION_LIST: &str = "session.list";
+    pub const COMPUTER_USE_STATUS: &str = "computerUse.status";
+    pub const COMPUTER_USE_TARGETS: &str = "computerUse.targets";
+    pub const SESSION_COMPUTER_USE: &str = "session.computerUse";
+    /// Private, locally authenticated MCP proxy traffic; remote peers cannot invoke it.
+    pub const COMPUTER_USE_MCP: &str = "computerUse.mcp";
     pub const SESSION_CREATE: &str = "session.create";
     pub const SESSION_SUBSCRIBE: &str = "session.subscribe";
     pub const SESSION_UNSUBSCRIBE: &str = "session.unsubscribe";

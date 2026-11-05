@@ -1,3 +1,5 @@
+import { ComputerUsePanel } from './ComputerUsePanel';
+import { canUseComputer } from '../computerUse';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useBack } from '../back';
 import { getT, isEn } from '../i18n';
@@ -30,6 +32,7 @@ export function SessionView({ hostId, sessionId, seq }: { hostId: string; sessio
     Object.values(s.sessions).reduce((n, l) => n + l.filter((x) => x.pendingPermissions > 0).length, 0),
   );
   const home = hostStatus(hostId).hello?.home;
+  const desktopRevision = useMemo(() => data.events.reduce((seq, event) => event.kind === 'computer_use' && event.status === 'control' ? event.seq : seq, 0), [data.events, data.events.length]);
   const style = useChatStyle();
   // Files session: no process and no chat, the page is the file panel (plus the bottom terminal)
   const filesOnly = info?.tool === 'files';
@@ -373,6 +376,7 @@ export function SessionView({ hostId, sessionId, seq }: { hostId: string; sessio
               hostId={hostId}
               info={info}
               connected={connected}
+              desktopControls={canUseComputer(hostStatus(hostId).hello, info) ? <ComputerUsePanel hostId={hostId} info={info} connected={connected} revision={desktopRevision} /> : undefined}
               onPrewarm={prewarm}
               onInterrupt={() => act('session.interrupt')}
               onExport={() => exportSession(hostId, info, 'download')}

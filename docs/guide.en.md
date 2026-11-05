@@ -83,6 +83,12 @@ Model lists and quotas come from yi-agentd briefly starting the tool and asking 
 - You can select and copy text while the AI is still writing. The reply pauses updating while text is selected and catches up when you release or clear the selection.
 - Sending a message scrolls to the bottom. When you've scrolled far up, a "Jump to bottom" button appears at the bottom right (with a blue dot while a reply is in progress).
 
+## Computer use (Windows)
+
+The Computer use control in the composer toolbar of all six AI chat tools selects a real window on the signed-in target host. The driver is bundled with the Windows daemon. It supports screenshots, interface reads, clicks and typing; one session controls the desktop at a time, with pause and stop controls. Activity and screenshots appear in chat. See [Computer use](computer-use.en.md) for support and instructions.
+
+Host settings manage external [MCP servers](mcp.en.md) shared across providers, independently of Computer Use platform restrictions.
+
 ## Terminal sessions
 
 - The look follows Windows Terminal: Cascadia Mono (falling back to Microsoft YaHei / PingFang for CJK), One Half Dark / One Half Light colors, GPU rendering, and double-width CJK alignment. Pick follow-UI / dark / light and the font size under "Preferences → Terminal Appearance"; you can also switch from the right end of the status bar under the terminal.

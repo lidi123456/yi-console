@@ -309,6 +309,7 @@ mod tests {
             synced_users: None,
             auto_resume: None,
             limit_hits: 0,
+            computer_use: false,
             queued: vec![],
             queue_paused: None,
             restart_interrupted: false,

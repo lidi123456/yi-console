@@ -120,6 +120,7 @@ struct SessionRt {
     interrupted: Mutex<bool>,
     /// Permission mode when the current process started
     launched_mode: Mutex<String>,
+    mcp_fingerprint: Mutex<String>,
     /// Permission mode changed but needs a process restart to apply (Claude switching to allow-all); restart once this turn ends
     restart_pending: Mutex<bool>,
     /// Bumped whenever the pending automatic continue changes; a timer only fires while its token is still current
@@ -225,6 +226,7 @@ pub struct Hub {
     pub bus: broadcast::Sender<Arc<Outbound>>,
     pub settings: RwLock<DaemonSettings>,
     pub shutdown: tokio::sync::Notify,
+    pub desktop: crate::computer_use::Desktop,
     /// Each tool's most recently reported model list (persisted, used for new sessions)
     tool_models: Mutex<HashMap<String, Vec<ModelOption>>>,
     /// Each tool's most recently reported slash commands (memory only)
@@ -276,6 +278,7 @@ impl Hub {
             bus,
             settings: RwLock::new(settings),
             shutdown: tokio::sync::Notify::new(),
+            desktop: crate::computer_use::Desktop::new(),
             tool_models: Mutex::new(
                 std::fs::read(models_path())
                     .ok()
@@ -324,6 +327,7 @@ impl Hub {
             } else {
                 info.queue_paused.take().or_else(|| Some("restart".to_string()))
             };
+            if info.computer_use { info.computer_use = false; let _ = self.store.save_session(&info); }
             info.last_seq = self.store.max_seq(&info.id).unwrap_or(info.last_seq);
             if !info.tool.has_process() {
                 // Files sessions have no process: always idle
@@ -366,6 +370,62 @@ impl Hub {
             .collect();
         v.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
         v
+    }
+
+    fn revoke_desktop(&self, sid: &str) {
+        let _ = self.desktop.change(sid, "stop");
+        if let Ok(rt) = self.get(sid) {
+            let updated = { let mut info = rt.info.lock().unwrap(); if !info.computer_use { return; } info.computer_use = false; info.clone() };
+            let _ = self.store.save_session(&updated);
+            self.broadcast_updated(&updated);
+        }
+    }
+
+    pub fn desktop_event(&self, sid: &str, event: EventBody) { self.emit(sid, 0, event); }
+
+    pub async fn computer_use(self: &Arc<Self>, sid: &str, action: &str, target: Option<crate::computer_use::Target>) -> Result<Value> {
+        let rt = self.get(sid)?;
+        let info = rt.info.lock().unwrap().clone();
+        if info.mode != SessionMode::Structured || !crate::mcp::supported(info.tool) {
+            bail!("操作电脑仅支持 AI 工具的聊天模式");
+        }
+        if action == "capture" {
+            self.desktop.capture(self, sid).await?;
+            return Ok(self.desktop.status(Some(sid)));
+        }
+        if action == "enable" {
+            if info.status == SessionStatus::Running || info.status == SessionStatus::WaitingPermission { bail!("请先停止当前回复，再开启操作电脑"); }
+            let target = target.ok_or_else(|| anyhow!("请选择目标窗口"))?;
+            let target = self.desktop.targets().await?.into_iter().find(|t| t.pid == target.pid && t.window_id == target.window_id).ok_or_else(|| anyhow!("目标窗口已关闭，请刷新"))?;
+            self.desktop.configure(sid, target)?;
+        } else { self.desktop.change(sid, action)?; self.desktop.close_if_idle().await; }
+        let updated = {
+            let mut info = rt.info.lock().unwrap();
+            info.computer_use = self.desktop.status(Some(sid))["enabled"] == true;
+            info.clone()
+        };
+        self.store.save_session(&updated)?;
+        self.broadcast_updated(&updated);
+        if action == "enable" {
+            // Attach the new MCP entry while continuing the same CLI session.
+            if let Err(error) = self.relaunch(&rt) { self.revoke_desktop(sid); self.desktop.close_if_idle().await; return Err(error); }
+        }
+        if matches!(action, "stop" | "disable") {
+            if let Some(tx) = self.running_tx(&rt) { let _ = tx.send(AdapterCmd::Interrupt); }
+        }
+        self.desktop_event(sid, EventBody::ComputerUse { action_id: uuid::Uuid::new_v4().to_string(), tool: action.into(), status: "control".into(), message: String::new(), duration_ms: 0, images: vec![] });
+        Ok(self.desktop.status(Some(sid)))
+    }
+
+    /// Refresh after the current turn, or lazily before the next message of an idle session.
+    pub fn mcp_settings_changed(&self, old: &DaemonSettings, new: &DaemonSettings) {
+        for rt in self.sessions.lock().unwrap().values() {
+            let info = rt.info.lock().unwrap();
+            if info.mode == SessionMode::Structured && matches!(info.status, SessionStatus::Running | SessionStatus::WaitingPermission)
+                && crate::mcp::selected(old, info.tool) != crate::mcp::selected(new, info.tool) {
+                *rt.restart_pending.lock().unwrap() = true;
+            }
+        }
     }
 
     pub fn info(&self, id: &str) -> Result<SessionInfo> {
@@ -416,6 +476,7 @@ impl Hub {
             synced_users: None,
             auto_resume: None,
             limit_hits: 0,
+            computer_use: false,
         };
         self.store.save_session(&info)?;
         let rt = Arc::new(new_rt(info.clone()));
@@ -521,6 +582,12 @@ impl Hub {
         if info.mode == SessionMode::Terminal && info.tool == ToolKind::Codex && crate::tools::codex_no_daemon(&program) {
             extra_args.push("--no-daemon".into());
         }
+        let mut servers = if info.mode == SessionMode::Structured { crate::mcp::selected(&settings, info.tool) } else { vec![] };
+        let mcp_fingerprint = crate::mcp::fingerprint(&servers);
+        if info.mode == SessionMode::Structured && info.computer_use {
+            if let Some(config) = self.desktop.mcp_config(&info.id) { servers.push(crate::mcp::desktop(config)?); }
+        }
+        let mcp_servers = crate::mcp::inject(info.tool, &servers, &mut extra_args);
         Ok(StartSpec {
             tool: info.tool,
             mode: info.mode,
@@ -535,6 +602,8 @@ impl Hub {
             command: info.command.clone(),
             program,
             extra_args,
+            mcp_servers,
+            mcp_fingerprint,
             cols,
             rows,
             // tmux keeps AI terminal sessions and standalone shells alive across daemon restarts. Bottom-panel shells
@@ -562,6 +631,7 @@ impl Hub {
         let (tx, rx) = mpsc::unbounded_channel();
         *rt.cmd.lock().unwrap() = Some(tx);
         *rt.launched_mode.lock().unwrap() = spec.permission_mode.clone();
+        *rt.mcp_fingerprint.lock().unwrap() = spec.mcp_fingerprint.clone();
         *rt.restart_pending.lock().unwrap() = false;
         if spec.mode == SessionMode::Terminal && matches!(spec.tool, ToolKind::Codex | ToolKind::Kiro) {
             let mut runs = rt.runs.lock().unwrap();
@@ -609,6 +679,10 @@ impl Hub {
             bail!("终端模式不支持发送图片");
         }
         let busy = matches!(info.status, SessionStatus::Running | SessionStatus::WaitingPermission);
+        if !busy && info.mode == SessionMode::Structured && self.running_tx(&rt).is_some() {
+            let expected = crate::mcp::fingerprint(&crate::mcp::selected(&self.settings.read().unwrap(), info.tool));
+            if *rt.mcp_fingerprint.lock().unwrap() != expected { self.relaunch(&rt)?; }
+        }
         // If the process must restart at turn end (permission mode change), messages the tool hasn't read would be lost with it, so queue in that case too
         let steer = matches!(info.tool, ToolKind::Claude | ToolKind::Codex)
             && rt.queue.lock().unwrap().is_empty()
@@ -741,9 +815,9 @@ impl Hub {
     pub fn image(&self, sid: &str, image_id: &str) -> Result<Value> {
         use base64::Engine;
         self.get(sid)?;
-        // We generate ids (hex + extension); reject any other characters to prevent path traversal
+        // Generated attachment and desktop checkpoint ids contain only letters, digits, dots and hyphens.
         let ok = !image_id.is_empty()
-            && image_id.chars().all(|c| c.is_ascii_alphanumeric() || c == '.')
+            && image_id.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
             && !image_id.starts_with('.');
         if !ok {
             bail!("图片 id 无效");
@@ -795,6 +869,7 @@ impl Hub {
     /// /clear: end the tool process, delete the chat history, reset usage and forget the tool session id; the next message starts a new tool session.
     /// The Yi Console session (id, title, directory, model, permission mode, bottom terminal) stays; a reply in progress is interrupted
     pub async fn clear(self: &Arc<Self>, id: &str) -> Result<()> {
+        self.revoke_desktop(id);
         let rt = self.get(id)?;
         {
             let i = rt.info.lock().unwrap();
@@ -947,6 +1022,7 @@ impl Hub {
     /// To terminal: record how many user messages the tool session already has, and resume in the tool's interactive UI;
     /// back to chat: import only what was said in the terminal (Claude / Codex read the tool log; Cursor / Kiro replay and skip the earlier part)
     pub async fn set_mode(self: &Arc<Self>, id: &str, mode: SessionMode) -> Result<()> {
+        self.revoke_desktop(id);
         let rt = self.get(id)?;
         let info = rt.info.lock().unwrap().clone();
         if info.tool == ToolKind::Shell || info.parent_id.is_some() {
@@ -1248,6 +1324,7 @@ impl Hub {
     }
 
     pub fn interrupt(&self, id: &str) -> Result<()> {
+        let _ = self.desktop.change(id, "pause");
         let rt = self.get(id)?;
         let tx = self.running_tx(&rt).ok_or_else(|| anyhow!("会话未在运行"))?;
         *rt.interrupted.lock().unwrap() = true;
@@ -1478,6 +1555,7 @@ impl Hub {
     }
 
     pub fn kill(&self, id: &str) -> Result<()> {
+        self.revoke_desktop(id);
         let rt = self.get(id)?;
         if let Some(tx) = self.running_tx(&rt) {
             let _ = tx.send(AdapterCmd::Kill);
@@ -1486,6 +1564,7 @@ impl Hub {
     }
 
     pub fn delete(&self, id: &str) -> Result<()> {
+        self.revoke_desktop(id);
         // The id comes from the client and is later used in a path for remove_dir_all: only handle sessions that really exist
         self.get(id)?;
         // First delete its terminals in the bottom terminal panel
@@ -2239,6 +2318,7 @@ fn new_rt(info: SessionInfo) -> SessionRt {
         queue: Mutex::new(VecDeque::new()),
         interrupted: Mutex::new(false),
         launched_mode: Mutex::new(String::new()),
+        mcp_fingerprint: Mutex::new(crate::mcp::fingerprint(&[])),
         restart_pending: Mutex::new(false),
         resume_token: Mutex::new(0),
         limited: Mutex::new(false),
@@ -2302,6 +2382,10 @@ pub struct Emitter {
 }
 
 impl Emitter {
+    pub fn desktop_tool_allowed(&self, name: &str) -> bool {
+        self.hub.desktop.authorizes(&self.sid, name)
+    }
+
     pub fn event(&self, body: EventBody) {
         let end = match &body {
             EventBody::TurnEnd { stop_reason, .. } => Some(stop_reason.clone()),
@@ -2637,6 +2721,7 @@ mod tests {
             synced_users: None,
             auto_resume: None,
             limit_hits: 0,
+            computer_use: false,
         };
         let rt = new_rt(info);
         let (tx, rx) = mpsc::unbounded_channel();

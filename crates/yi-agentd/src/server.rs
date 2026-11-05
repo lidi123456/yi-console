@@ -132,7 +132,9 @@ where
         tokio::spawn(async move {
             let id = req.id;
             // Host credentials can only be written by the desktop client on this machine, not by devices coming in through the relay or SSH
-            let r = if req.method == methods::PROXY_SET_HOSTS && !local {
+            let r = if req.method == methods::COMPUTER_USE_MCP && !local {
+                Err(anyhow!("桌面代理只接受本机连接"))
+            } else if req.method == methods::PROXY_SET_HOSTS && !local {
                 Err(anyhow!("只能由本机客户端同步主机"))
             } else if req.method == methods::FS_OPEN && !local {
                 // Remote devices can't launch programs on this computer
@@ -207,6 +209,12 @@ pub async fn dispatch(
                 .await?,
             )?
         }
+        COMPUTER_USE_STATUS => hub.desktop.status(p["sessionId"].as_str()),
+        COMPUTER_USE_TARGETS => serde_json::to_value(hub.desktop.targets().await?)?,
+        SESSION_COMPUTER_USE => {
+            hub.computer_use(s(&p, "sessionId")?, s(&p, "action")?, p.get("target").map(|v| serde_json::from_value(v.clone())).transpose()?).await?
+        }
+        COMPUTER_USE_MCP => hub.desktop.mcp(hub, s(&p, "sessionId")?, s(&p, "ticket")?, p["packet"].clone()).await?,
         SESSION_LIST => serde_json::to_value(hub.list())?,
         SESSION_CREATE => {
             let params: CreateParams = serde_json::from_value(p)?;
@@ -599,13 +607,18 @@ pub async fn dispatch(
             let (days, tz) = (p["days"].as_i64().unwrap_or(30), p["tzOffset"].as_i64().unwrap_or(0));
             tokio::task::spawn_blocking(move || crate::stats::usage(&h.store, days, tz)).await??
         }
-        SETTINGS_GET => serde_json::to_value(hub.settings.read().unwrap().clone())?,
+        SETTINGS_GET => serde_json::to_value(crate::mcp::redact(hub.settings.read().unwrap().clone()))?,
         SETTINGS_SET => {
-            let new: DaemonSettings = serde_json::from_value(p)?;
+            let old = hub.settings.read().unwrap().clone();
+            let mut new: DaemonSettings = serde_json::from_value(p.clone())?;
+            if p.get("mcpServers").is_none() { new.mcp_servers = old.mcp_servers.clone(); }
+            crate::mcp::keep_secrets(&mut new, &old)?;
+            crate::mcp::validate(&new)?;
             crate::settings::save(&new)?;
             *hub.settings.write().unwrap() = new.clone();
+            hub.mcp_settings_changed(&old, &new);
             *TOOLS.lock().unwrap() = None;
-            serde_json::to_value(new)?
+            serde_json::to_value(crate::mcp::redact(new))?
         }
         "relay.pairing" => crate::relay::pairing_info()?,
         "relay.configure" => crate::relay::configure(
@@ -640,5 +653,31 @@ fn grep_opts(p: &Value) -> crate::fsapi::GrepOpts {
         paths: p["paths"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect()),
         replace: p["replace"].as_str().map(str::to_string),
         preserve_case: p["preserveCase"].as_bool().unwrap_or(false),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn desktop_proxy_rejects_remote_peers_and_forwarded_local_connections() {
+        for (peer, marker) in [("ssh", ""), ("relay", ""), ("local", yi_proto::BRIDGE_REMOTE_MARK)] {
+            let hub = Hub::new(crate::store::Store::open_memory().unwrap(), DaemonSettings::default());
+            let (mut client, server) = tokio::io::duplex(4096);
+            let (r, w) = tokio::io::split(server);
+            let task = tokio::spawn(serve_conn(hub, r, w, peer));
+            let request = json!({"id":1,"method":methods::COMPUTER_USE_MCP,"params":{}});
+            let packet = format!("{}{}{}\n", marker, if marker.is_empty() { "" } else { "\n" }, request);
+            client.write_all(packet.as_bytes()).await.unwrap();
+            let mut reader = BufReader::new(client);
+            let mut response = String::new();
+            tokio::time::timeout(std::time::Duration::from_secs(2), reader.read_line(&mut response)).await.unwrap().unwrap();
+            let response: Value = serde_json::from_str(&response).unwrap();
+            assert_eq!(response["id"], 1);
+            assert_eq!(response["error"]["message"], "桌面代理只接受本机连接");
+            drop(reader);
+            task.await.unwrap();
+        }
     }
 }

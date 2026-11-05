@@ -10,6 +10,8 @@ import zhBgTasks from './zh/bgTasks.json';
 import zhBrowser from './zh/browser.json';
 import zhChatImages from './zh/chatImages.json';
 import zhChatView from './zh/chatView.json';
+import zhComputerUse from './zh/computerUse.json';
+import zhMcpSettings from './zh/mcpSettings.json';
 import zhComposer from './zh/composer.json';
 import zhDiffView from './zh/diffView.json';
 import zhFilePanel from './zh/filePanel.json';
@@ -61,6 +63,8 @@ import enBgTasks from './en/bgTasks.json';
 import enBrowser from './en/browser.json';
 import enChatImages from './en/chatImages.json';
 import enChatView from './en/chatView.json';
+import enComputerUse from './en/computerUse.json';
+import enMcpSettings from './en/mcpSettings.json';
 import enComposer from './en/composer.json';
 import enDiffView from './en/diffView.json';
 import enFilePanel from './en/filePanel.json';
@@ -115,6 +119,8 @@ export const resources = {
     browser: zhBrowser,
     chatImages: zhChatImages,
     chatView: zhChatView,
+    computerUse: zhComputerUse,
+    mcpSettings: zhMcpSettings,
     composer: zhComposer,
     diffView: zhDiffView,
     filePanel: zhFilePanel,
@@ -168,6 +174,8 @@ export const resources = {
     browser: enBrowser,
     chatImages: enChatImages,
     chatView: enChatView,
+    computerUse: enComputerUse,
+    mcpSettings: enMcpSettings,
     composer: enComposer,
     diffView: enDiffView,
     filePanel: enFilePanel,

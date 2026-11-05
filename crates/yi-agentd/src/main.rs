@@ -17,6 +17,8 @@ mod history;
 mod hub;
 mod install;
 mod log;
+mod computer_use;
+mod mcp;
 mod paths;
 mod ports;
 mod probe;
@@ -48,6 +50,7 @@ fn main() {
     }
     let cmd = args.first().map(String::as_str).unwrap_or("help");
     let res = match cmd {
+        "computer-use-mcp" => computer_use::proxy_main(&args[1..]),
         "serve" => serve(args.iter().any(|a| a == "-f" || a == "--foreground")),
         "bridge" => bridge(args.iter().any(|a| a == "--local")),
         "install" => install::install().map(|m| println!("{m}")),

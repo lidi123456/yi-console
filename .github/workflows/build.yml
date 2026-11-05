@@ -77,6 +77,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
+      - name: prepare bundled Computer Use driver
+        if: runner.os == 'Windows'
+        run: python scripts/prepare-computer-use.py
       - name: build (cross)
         if: matrix.cross
         run: |

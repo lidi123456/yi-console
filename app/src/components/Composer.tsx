@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { type ReactNode, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { useBack } from '../back';
 import { getT, isEn, useLang } from '../i18n';
 import { errorToast, hostSnippets, navigate, setState, toast, useStore } from '../store';
@@ -198,6 +198,7 @@ export function Composer({
   onInterrupt,
   onExport,
   onRename,
+  desktopControls,
 }: {
   hostId: string;
   info: SessionInfo;
@@ -206,6 +207,7 @@ export function Composer({
   onInterrupt: () => void;
   onExport: () => void;
   onRename: () => void;
+  desktopControls?: ReactNode;
 }) {
   const key = `${hostId}::${info.id}`;
   const [, lang] = useLang();
@@ -842,6 +844,7 @@ export function Composer({
               e.target.value = '';
             }}
           />
+          {desktopControls}
           <PermPicker hostId={hostId} info={info} open={permOpen} setOpen={setPermOpen} />
           <button
             className="tool-chip"

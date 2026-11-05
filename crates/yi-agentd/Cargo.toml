@@ -23,6 +23,7 @@ ureq = "3"
 gethostname = "1"
 md5 = "0.7"
 regex = "1"
+sha2 = "0.10"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

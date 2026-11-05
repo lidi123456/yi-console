@@ -19,6 +19,7 @@ import { limitHead, limitOutcome, type LimitEvent } from '../limit';
 const t = getT('chatView');
 
 type Item =
+  | { k: 'desktop'; key: string; ev: HubEvent & { kind: 'computer_use' } }
   | { k: 'user'; key: string; text: string; ts: number; images: ImageRef[] }
   | { k: 'text'; key: string; ts: number; text: string }
   | { k: 'thinking'; key: string; ts: number; text: string }
@@ -85,6 +86,12 @@ function buildItems(events: HubEvent[], hideCompactCmd = false): Item[] {
       planIdx = items.length - 1;
     }
     switch (e.kind) {
+      case 'computer_use': {
+        const old = items.findIndex((item) => item.k === 'desktop' && item.ev.actionId === e.actionId);
+        const next: Item = { k: 'desktop', key: `desktop-${e.actionId}`, ev: e };
+        if (old >= 0) items[old] = next; else items.push(next);
+        break;
+      }
       case 'user_message':
         if (!(hideCompactCmd && e.text.trim() === '/compact')) {
           items.push({ k: 'user', key, text: e.text, ts: e.ts, images: e.images ?? [] });
@@ -1546,6 +1553,8 @@ export function ChatView({
               return modern ? <ModernTurnFooter key={it.key} it={it} latest={it.key === lastTurnKey} /> : <TurnFooter key={it.key} it={it} />;
             case 'bgdone':
               return <BgTaskNote key={it.key} it={it} />;
+            case 'desktop':
+              return <DesktopAction key={it.key} ev={it.ev} hostId={hostId} sessionId={info?.id} />;
             case 'note':
               return (
                 <div key={it.key} className={`note note-${it.tone}`}>
@@ -1610,4 +1619,16 @@ function BgTaskNote({ it }: { it: Extract<Item, { k: 'bgdone' }> }) {
       {it.what && <code className="bgdone-what">{it.what}</code>}
     </button>
   );
+}
+
+function DesktopAction({ ev, hostId, sessionId }: { ev: HubEvent & { kind: 'computer_use' }; hostId?: string; sessionId?: string }) {
+  const tx = getT('computerUse');
+  useLang();
+  const status = ev.status === 'running' ? tx('running') : ev.status === 'completed' ? tx('completed') : ev.status === 'failed' ? tx('failed') : ev.status === 'control' ? tx('control') : ev.status === 'unverified' ? tx('unverified') : tx('interrupted');
+  return <div className="computer-use-action">
+    <div className="computer-use-action-head"><Icon name="laptop" size={15} /><strong>{tx('action', { tool: ev.tool })}</strong><span className="muted small">{status}</span></div>
+    {ev.message && <div className="muted small truncate">{ev.message}</div>}
+    {!!ev.durationMs && <div className="muted small">{tx('elapsed', { seconds: (ev.durationMs / 1000).toFixed(1) })}</div>}
+    {!!ev.images?.length && hostId && sessionId && <div className="computer-use-images">{ev.images.map((img) => <MsgImage key={img.id} hostId={hostId} sessionId={sessionId} img={img} />)}</div>}
+  </div>;
 }

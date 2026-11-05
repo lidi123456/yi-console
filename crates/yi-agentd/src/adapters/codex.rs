@@ -434,7 +434,7 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Vec<Valu
                     params["model"] = json!(m);
                 }
                 // Overrides developer_instructions in config.toml
-                params["developerInstructions"] = json!(super::IMAGE_HINT);
+                params["developerInstructions"] = json!(format!("{}{}", super::IMAGE_HINT, crate::computer_use::model_hint(&spec.extra_args)));
                 // Only sent for auto; older Codex versions don't have this field
                 if spec.permission_mode == "auto" {
                     params["approvalsReviewer"] = json!("auto_review");
@@ -897,7 +897,7 @@ pub fn item_events(item: &Value, with_user: bool) -> Vec<EventBody> {
             if status == "completed" || status == "failed" {
                 v.push(EventBody::ToolResult {
                     id,
-                    output: crate::util::truncate(&item["result"].to_string(), 64 * 1024),
+                    output: if s("server") == "yi_computer_use" { crate::computer_use::display_result(&item["result"]) } else { crate::util::truncate(&item["result"].to_string(), 64 * 1024) },
                     is_error: status == "failed",
                 });
             }
