@@ -325,29 +325,7 @@ impl Desktop {
                 let mut response = self.request("tools/list", json!({})).await?;
                 if let Some(tools) = response["tools"].as_array_mut() {
                     tools.retain(|tool| tool["name"].as_str().is_some_and(allowed));
-                    for tool in tools {
-                        let hidden = [
-                            "pid",
-                            "window_id",
-                            "scope",
-                            "target",
-                            "screenshot_out_file",
-                            "session",
-                        ];
-                        let description = tool["description"].as_str().unwrap_or("");
-                        tool["description"] = json!(format!("Yi Console automatically supplies the user's authorized window. Do not supply pid, window_id, scope or target. {description}"));
-                        if let Some(properties) = tool["inputSchema"]["properties"].as_object_mut()
-                        {
-                            for key in hidden {
-                                properties.remove(key);
-                            }
-                        }
-                        if let Some(required) = tool["inputSchema"]["required"].as_array_mut() {
-                            required.retain(|value| {
-                                !value.as_str().is_some_and(|key| hidden.contains(&key))
-                            });
-                        }
-                    }
+                    tools.iter_mut().for_each(hide_target_args);
                 }
                 Ok(response)
             }
@@ -441,7 +419,7 @@ impl Desktop {
                     let mut value = model_result(value);
                     // Kiro CLI v2 serializes MCP images as text. Its native file reader handles vision correctly.
                     if info.tool == yi_proto::ToolKind::Kiro {
-                        if let Some(content) = value["content"].as_array_mut() {
+                        if let Some(content) = value.get_mut("content").and_then(Value::as_array_mut) {
                             content.retain(|item| item["type"] != "image");
                             for image in &model_images {
                                 let path = crate::paths::base_dir().join("uploads").join(sid).join(&image.id);
@@ -462,7 +440,7 @@ fn model_result(mut value: Value) -> Value {
     if value["structuredContent"].is_object() {
         let text = value["structuredContent"].to_string();
         if text.len() <= 64 * 1024 {
-            if let Some(content) = value["content"].as_array_mut() {
+            if let Some(content) = value.get_mut("content").and_then(Value::as_array_mut) {
                 content.push(json!({"type":"text","text":text}));
             }
         }
@@ -764,6 +742,29 @@ impl Peer {
     }
 }
 
+/// Drop the target arguments the gateway fills in. Uses get_mut only: indexing a Value mutably inserts null for a missing
+/// key, and a tool with `"required": null` makes strict clients (Qoder) reject the whole tool list.
+fn hide_target_args(tool: &mut Value) {
+    const HIDDEN: [&str; 6] = ["pid", "window_id", "scope", "target", "screenshot_out_file", "session"];
+    let description = tool.get("description").and_then(Value::as_str).unwrap_or("").to_string();
+    if let Some(map) = tool.as_object_mut() {
+        map.insert("description".into(), json!(format!("Yi Console automatically supplies the user's authorized window. Do not supply pid, window_id, scope or target. {description}")));
+    }
+    let Some(schema) = tool.get_mut("inputSchema").and_then(Value::as_object_mut) else { return };
+    if let Some(properties) = schema.get_mut("properties").and_then(Value::as_object_mut) {
+        for key in HIDDEN {
+            properties.remove(key);
+        }
+    }
+    match schema.get_mut("required") {
+        Some(Value::Array(required)) => required.retain(|v| !v.as_str().is_some_and(|k| HIDDEN.contains(&k))),
+        Some(_) => {
+            schema.remove("required");
+        }
+        None => {}
+    }
+}
+
 /// The proxy must reach this daemon's pipe. --home switches to a hashed pipe name (see paths::pipe_name), so pass it
 /// only when the daemon itself runs with YI_CONSOLE_HOME; otherwise the proxy would look for a different daemon.
 fn proxy_args(home: Option<std::ffi::OsString>, sid: &str, ticket: &std::path::Path) -> Vec<String> {
@@ -854,6 +855,23 @@ pub fn display_result(value: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hide_target_args_never_adds_null() {
+        let mut no_required = json!({"name":"zoom","inputSchema":{"type":"object","properties":{"pid":{},"factor":{}}}});
+        hide_target_args(&mut no_required);
+        assert!(no_required["inputSchema"].get("required").is_none(), "{no_required}");
+        assert!(no_required["inputSchema"]["properties"].get("pid").is_none());
+        let mut bare = json!({"name":"verify_state"});
+        hide_target_args(&mut bare);
+        assert!(bare.get("inputSchema").is_none());
+        let mut both = json!({"name":"click","inputSchema":{"type":"object","properties":{"pid":{},"element_token":{}},"required":["pid","element_token"]}});
+        hide_target_args(&mut both);
+        assert_eq!(both["inputSchema"]["required"], json!(["element_token"]));
+        let mut null = json!({"name":"x","inputSchema":{"type":"object","required":null}});
+        hide_target_args(&mut null);
+        assert!(null["inputSchema"].get("required").is_none());
+    }
 
     #[test]
     fn proxy_args_follow_daemon_home() {
