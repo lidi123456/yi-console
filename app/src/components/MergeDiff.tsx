@@ -1,11 +1,11 @@
 import { forwardRef, useEffect, useImperativeHandle, useRef, useState } from 'react';
-import { EditorState, type Extension } from '@codemirror/state';
+import { ChangeSet, EditorState, type Extension } from '@codemirror/state';
 import { drawSelection, EditorView, highlightSpecialChars, keymap, lineNumbers } from '@codemirror/view';
 import { defaultKeymap } from '@codemirror/commands';
 import { LanguageDescription, syntaxHighlighting } from '@codemirror/language';
 import { languages } from '@codemirror/language-data';
 import { highlightSelectionMatches, searchKeymap } from '@codemirror/search';
-import { getChunks, goToNextChunk, goToPreviousChunk, MergeView, unifiedMergeView } from '@codemirror/merge';
+import { getChunks, getOriginalDoc, goToNextChunk, goToPreviousChunk, MergeView, originalDocChangeEffect, unifiedMergeView } from '@codemirror/merge';
 import { getT, isEn, useLang } from '../i18n';
 import { highlight, searchPhrases, theme } from './CodeEditor';
 
@@ -22,6 +22,9 @@ const t = getT('diffView');
 //   The caller limits file size (git.blob and fs.read stop at 1 MB) and uses the hunk-only PaneDiff beyond it.
 // - Added and deleted files (one side empty) show just the one file, as VS Code's git extension opens untracked / added
 //   files directly and deleted ones as their old content (oneSided).
+// - When the text changes while open (the agent edits the file, the status refresh brings a new HEAD), the editors are
+//   patched in place with the changed span instead of rebuilt, so the scroll position stays put; only opening the diff
+//   jumps to the first change, as in VS Code.
 // - Side by side, the divider drags to resize the two panes (VS Code's enableSplitViewResizing); double-click resets to
 //   half and half. Like VS Code the ratio isn't saved.
 // Differences from VS Code: collapsed regions expand all at once (VS Code reveals 20 lines at a time), whitespace
@@ -91,6 +94,33 @@ function syncScroll(a: EditorView, b: EditorView): () => void {
 }
 
 const norm = (s: string) => s.replace(/\r\n/g, '\n');
+
+/** The change turning `old` into `text`: one replacement of the span between their common prefix and suffix */
+function spanChange(old: string, text: string): { from: number; to: number; insert: string } | null {
+  if (old === text) return null;
+  const max = Math.min(old.length, text.length);
+  let start = 0;
+  while (start < max && old.charCodeAt(start) === text.charCodeAt(start)) start++;
+  let end = 0;
+  while (end < max - start && old.charCodeAt(old.length - 1 - end) === text.charCodeAt(text.length - 1 - end)) end++;
+  return { from: start, to: old.length - end, insert: text.slice(start, text.length - end) };
+}
+
+/** Replace a view's document with `text`, touching only what changed (programmatic changes pass readOnly) */
+function patchDoc(view: EditorView, text: string) {
+  const c = spanChange(view.state.doc.toString(), norm(text));
+  if (c) view.dispatch({ changes: c });
+}
+
+/** Same for the original document a unified merge view compares against */
+function patchOriginal(view: EditorView, text: string) {
+  const old = getOriginalDoc(view.state);
+  const c = spanChange(old.toString(), norm(text));
+  if (c) view.dispatch({ effects: originalDocChangeEffect(view.state, ChangeSet.of(c, old.length)) });
+}
+
+/** The editors of a built diff, for patching them when the text changes */
+type Live = { kind: 'split'; a: EditorView; b: EditorView } | { kind: 'unified' | 'single'; view: EditorView };
 /** One side empty: an added or deleted file, shown as the single file instead of a diff */
 export const oneSided = (a: string, b: string) => (norm(a) === '') !== (norm(b) === '');
 /** Narrowest a pane may be dragged, in px */
@@ -129,6 +159,12 @@ export const MergeDiff = forwardRef<
   const split = layout === 'split' && !single;
   // Share of the width for the left pane
   const [ratio, setRatio] = useState(0.5);
+  // Latest texts for a build that finishes after they changed (the language loads asynchronously)
+  const text = useRef({ a, b });
+  text.current = { a, b };
+  const live = useRef<Live | null>(null);
+  // Which file a one-sided diff shows: switching sides needs a rebuild, edits to it don't
+  const side = single ? (norm(a) === '' ? 'b' : 'a') : '';
 
   useEffect(() => {
     const el = host.current;
@@ -143,11 +179,26 @@ export const MergeDiff = forwardRef<
     return () => {
       alive = false;
       nav.current = null;
+      live.current = null;
       destroy();
     };
-  }, [a, b, filename, layout, collapse, wrap, lang, same, single]);
+  }, [filename, layout, collapse, wrap, lang, same, side]);
+
+  // Text changed with the same layout: patch the open editors so the scroll position and expanded regions stay
+  useEffect(() => {
+    const l = live.current;
+    if (!l) return;
+    if (l.kind === 'split') {
+      patchDoc(l.a, a);
+      patchDoc(l.b, b);
+    } else if (l.kind === 'unified') {
+      patchOriginal(l.view, a);
+      patchDoc(l.view, b);
+    } else patchDoc(l.view, side === 'b' ? b : a);
+  }, [a, b]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const build = (el: HTMLElement, language: Extension): (() => void) => {
+    const { a, b } = text.current;
     const ext = (): Extension[] => [
       lineNumbers(),
       highlightSpecialChars(),
@@ -166,6 +217,7 @@ export const MergeDiff = forwardRef<
     const collapseUnchanged = collapse ? COLLAPSE : undefined;
     if (single) {
       const v = new EditorView({ parent: el, state: EditorState.create({ doc: norm(a) === '' ? b : a, extensions: ext() }) });
+      live.current = { kind: 'single', view: v };
       return () => v.destroy();
     }
     let views: EditorView[];
@@ -181,6 +233,7 @@ export const MergeDiff = forwardRef<
         diffConfig: DIFF_CONFIG,
       });
       views = [mv.a, mv.b];
+      live.current = { kind: 'split', a: mv.a, b: mv.b };
       const unsync = syncScroll(mv.a, mv.b);
       destroy = () => (unsync(), mv.destroy());
     } else {
@@ -195,6 +248,7 @@ export const MergeDiff = forwardRef<
         }),
       });
       views = [v];
+      live.current = { kind: 'unified', view: v };
       destroy = () => v.destroy();
     }
     const target = views[views.length - 1];

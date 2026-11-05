@@ -644,6 +644,9 @@ export function FilePanel({
   const [fileDiffs, setFileDiffs] = useState<Record<string, string | null>>({});
   // Whole files at a revision for the full-file diff (git.blob), keyed by `rev\nrel`; null = couldn't be read
   const [blobs, setBlobs] = useState<Record<string, GitBlob | null>>({});
+  // Blobs from before the last status change, shown until their refetch lands: clearing them would swap the open diff
+  // for the loading state, remounting MergeDiff (losing the divider position and scroll) every time the agent edits
+  const staleBlobs = useRef<{ key: string; blobs: Record<string, GitBlob | null> }>({ key: '', blobs: {} });
   // Summary of the last git status: periodic refreshes leave the UI alone if nothing changed, so an open diff doesn't flicker
   const gitSig = useRef(gitCache.get(gitKey(hostId, cwd))?.sig ?? '');
   /** quiet: background refresh (timer / window refocus); if the status didn't change, just quietly refetch the current file's diff */
@@ -656,7 +659,11 @@ export function FilePanel({
         if (quiet && sig === gitSig.current) return refreshCurDiff.current();
         gitSig.current = sig;
         setFileDiffs({});
-        setBlobs({});
+        setBlobs((m) => {
+          const key = gitKey(hostId, cwd);
+          staleBlobs.current = { key, blobs: staleBlobs.current.key === key ? { ...staleBlobs.current.blobs, ...m } : m };
+          return {};
+        });
         if (!r.repo) {
           gitCache.set(gitKey(hostId, cwd), { git: null, sig });
           return setGit(null);
@@ -1623,7 +1630,11 @@ export function FilePanel({
     if (!file) return null;
     if (viewing === 'compare') return compare && !file.truncated && !file.binary ? { a: file.draft, b: compare.text } : null;
     if (!blobSpecs.length) return null;
-    const texts = blobSpecs.map(([r, p]) => blobText(blobs[blobKey(r, p)]));
+    const stale = staleBlobs.current.key === gitKey(hostId, cwd) ? staleBlobs.current.blobs : {};
+    const texts = blobSpecs.map(([r, p]) => {
+      const k = blobKey(r, p);
+      return blobText(k in blobs ? blobs[k] : stale[k]);
+    });
     if (texts.some((x) => x === null)) return null;
     if (texts.some((x) => x === undefined)) return undefined;
     // Working tree: the editor's current text, so unsaved edits show too (as in VS Code); a deleted file is empty
