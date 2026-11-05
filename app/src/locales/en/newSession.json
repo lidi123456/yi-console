@@ -4,6 +4,8 @@
   "drive": "Drive",
   "cancel": "Cancel",
   "selectDirectory": "Select Directory",
+  "newFolder": "New folder",
+  "folderName": "Folder name",
   "resumeSession": "Resume Session",
   "continueInAnotherTool": "Continue in Another Tool",
   "newSession": "New Session",

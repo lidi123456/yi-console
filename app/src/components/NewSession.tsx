@@ -7,6 +7,7 @@ import { TOOL_LABEL, type DirEntry, type ModelOption, type SessionInfo, type Ses
 import { lsGet, lsSet, shortPath } from '../util';
 import { useDrives } from './FilesView';
 import { Icon, ToolBadge } from './Icon';
+import { askText } from './Overlay';
 import { EFFORT_LABEL } from './ModelPicker';
 
 const tx = getT('newSession');
@@ -42,6 +43,20 @@ export function DirPicker({
       });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [hostId, path]);
+  // New folder in the current directory, then go into it so "Select this directory" picks it (like the native
+  // folder dialogs; a nested name such as a/b creates both levels, as in VS Code)
+  const newFolder = async () => {
+    if (!list) return;
+    const name = (await askText({ title: tx('newFolder'), label: list.path, placeholder: tx('folderName') }))?.trim();
+    if (!name) return;
+    const sep = list.path.includes('\\') && !list.path.includes('/') ? '\\' : '/';
+    try {
+      const r = await rpc<{ path: string }>(hostId, 'fs.mkdir', { path: list.path.endsWith(sep) ? list.path + name : list.path + sep + name });
+      setPath(r.path);
+    } catch (e) {
+      setErr(String((e as Error).message ?? e));
+    }
+  };
   return (
     <div className="dirpicker">
       <div className="dirpicker-head">
@@ -59,6 +74,9 @@ export function DirPicker({
             ))}
           </select>
         )}
+        <button className="icon-btn" disabled={!list} onClick={newFolder} title={tx('newFolder')}>
+          <Icon name="new-folder" size={16} />
+        </button>
       </div>
       {err && <div className="error-text">{err}</div>}
       <div className="dirpicker-list">

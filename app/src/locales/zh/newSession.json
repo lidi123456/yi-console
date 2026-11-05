@@ -4,6 +4,8 @@
   "drive": "盘符",
   "cancel": "取消",
   "selectDirectory": "选择此目录",
+  "newFolder": "新建文件夹",
+  "folderName": "文件夹名称",
   "resumeSession": "继续会话",
   "continueInAnotherTool": "换个工具继续",
   "newSession": "新建会话",

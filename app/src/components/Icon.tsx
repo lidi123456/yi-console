@@ -21,6 +21,8 @@ const paths: Record<string, string> = {
   cloud: 'M7 18h10a4 4 0 0 0 .6-7.95A6 6 0 0 0 6.2 9.5 4.25 4.25 0 0 0 7 18z',
   history: 'M3 12a9 9 0 1 0 3-6.7L3 8M3 3v5h5M12 7v5l3 2',
   folder: 'M3 7h6l2 2h10v10H3z',
+  // VS Code's New Folder: a folder with a plus
+  'new-folder': 'M3 7h6l2 2h10v10H3zM15 11.5v5M12.5 14h5',
   // VS Code's Collapse All / Expand All: a box in front of another, with a minus / plus
   'fold-all': 'M4 8h12v12H4zM7 14h6M8 8V4h12v12h-4',
   'unfold-all': 'M4 8h12v12H4zM7 14h6M10 11v6M8 8V4h12v12h-4',
