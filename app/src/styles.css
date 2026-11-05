@@ -8456,3 +8456,147 @@ button.wp-commit-title .chev {
 .old-toggle-icon.up {
   transform: rotate(-90deg);
 }
+
+/* Diagrams in chat replies. SVGs are displayed as images to isolate their styles and links. */
+.mermaid-block {
+  margin: 0.75em 0;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+  font-family: var(--font-chat);
+  font-size: var(--fs-chat, 14px);
+}
+.mermaid-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  padding: 8px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg);
+}
+.mermaid-toolbar > span:first-child {
+  margin-right: auto;
+}
+.mermaid-toolbar button {
+  font: inherit;
+  font-size: var(--fs-ui, 12px);
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text);
+  background: var(--bg);
+  cursor: pointer;
+}
+.mermaid-toolbar button:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+/* Keep inline diagram actions secondary to the reply, like a code block header. */
+.mermaid-toolbar-inline {
+  flex-wrap: nowrap;
+  justify-content: space-between;
+  gap: 8px;
+  min-height: 32px;
+  padding: 3px 6px;
+  color: var(--text-2);
+  background: var(--code-bg);
+}
+.mermaid-tabs,
+.mermaid-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+.mermaid-toolbar-inline button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 24px;
+  padding: 0 7px;
+  border: 0;
+  color: var(--text-2);
+  background: transparent;
+  font-size: max(11px, calc(var(--fs-chat, 14px) - 2px));
+  white-space: nowrap;
+}
+.mermaid-toolbar-inline button:hover:not(:disabled) {
+  color: var(--text);
+  background: var(--focus);
+}
+.mermaid-tabs button[aria-pressed='true'] {
+  color: var(--text);
+  background: var(--bg);
+  box-shadow: 0 0 0 1px var(--border);
+}
+.mermaid-actions button {
+  width: 24px;
+  padding: 0;
+}
+.mermaid-toolbar-inline button:focus-visible {
+  outline: 2px solid var(--link);
+  outline-offset: -2px;
+}
+@media (pointer: coarse) {
+  .mermaid-toolbar-inline {
+    min-height: 40px;
+  }
+  .mermaid-toolbar-inline button {
+    height: 32px;
+    min-width: 32px;
+  }
+}
+.mermaid-status {
+  padding: 10px;
+  color: var(--text-2);
+}
+.mermaid-scroll {
+  overflow: auto;
+  max-height: 70vh;
+  padding: 12px;
+}
+.md .mermaid-scroll img {
+  display: block;
+  max-height: none;
+  cursor: zoom-in;
+  margin: 0 auto;
+}
+.md .mermaid-block pre {
+  margin: 0;
+  border: 0;
+  border-radius: 0;
+  max-height: 60vh;
+  overflow: auto;
+}
+.diagram-viewer {
+  position: fixed;
+  inset: 0;
+  z-index: 1500;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-chat);
+  font-size: var(--fs-chat, 14px);
+}
+.diagram-viewport {
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  touch-action: none;
+  cursor: grab;
+}
+.diagram-viewport:active {
+  cursor: grabbing;
+}
+.diagram-viewport img {
+  flex: none;
+  max-width: none;
+  max-height: none;
+  user-select: none;
+  pointer-events: none;
+  transform-origin: center;
+}

@@ -1,0 +1,23 @@
+{
+  "diagram": "图表",
+  "showDiagram": "查看图表",
+  "showSource": "查看源码",
+  "copySource": "复制源码",
+  "copied": "已复制",
+  "copyFailed": "复制失败",
+  "fullscreen": "全屏查看",
+  "saveSvg": "导出 SVG",
+  "savePng": "导出 PNG",
+  "exportFailed": "图表导出失败",
+  "waiting": "正在等待图表代码输出完整…",
+  "incomplete": "图表代码块未闭合，已保留源码。",
+  "loading": "正在绘制图表…",
+  "restricted": "图表包含不支持的语法、外部资源、自定义样式或超出大小限制，已保留源码。",
+  "failed": "图表渲染失败，请检查源码语法。",
+  "zoomOut": "缩小",
+  "zoomIn": "放大",
+  "fit": "适应窗口",
+  "close": "关闭",
+  "source": "源码",
+  "exportDiagram": "导出图片"
+}

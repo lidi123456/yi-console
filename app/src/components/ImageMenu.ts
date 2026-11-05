@@ -38,7 +38,7 @@ export async function copyImage(src: string) {
   }
 }
 
-const EXT: Record<string, string> = { 'image/png': 'png', 'image/jpeg': 'jpg', 'image/gif': 'gif', 'image/webp': 'webp' };
+const EXT: Record<string, string> = { 'image/svg+xml': 'svg', 'image/png': 'png', 'image/jpeg': 'jpg', 'image/gif': 'gif', 'image/webp': 'webp' };
 
 /** Take the raw data straight from data: URLs; download other URLs */
 async function imageData(src: string): Promise<{ mime: string; base64: string }> {

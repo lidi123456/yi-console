@@ -1,5 +1,5 @@
 import DOMPurify from 'dompurify';
-import { Marked, marked } from 'marked';
+import { Marked, marked, type Tokens } from 'marked';
 import { getT, isEn } from './i18n';
 import type { HubEvent, SessionInfo, SessionStatus, Usage } from './types';
 
@@ -35,11 +35,11 @@ export function classifyImageSrc(href: string): { kind: 'web' | 'file' | 'data' 
 }
 
 /** For chat replies only: images aren't loaded by the browser right away but rendered as placeholder spans; ChatView decides per host and source whether to show them directly or on click */
-const chatMarked = new Marked({
+const chatOptions = {
   gfm: true,
   breaks: true,
   renderer: {
-    image({ href, text, title }) {
+    image({ href, text, title }: Tokens.Image) {
       const c = classifyImageSrc(href ?? '');
       if (c.kind === 'data') return false;
       if (c.kind === 'other') return escAttr(text || href || '');
@@ -47,11 +47,31 @@ const chatMarked = new Marked({
       return `<span class="md-rimg" data-kind="${c.kind}" data-src="${escAttr(c.src)}" data-alt="${escAttr(text ?? '')}"${t}></span>`;
     },
   },
-});
+};
+const chatMarked = new Marked(chatOptions);
 
 export function renderMarkdown(src: string): string {
   const html = chatMarked.parse(src, { async: false }) as string;
   return DOMPurify.sanitize(html);
+}
+
+/** Preserve code token boundaries (including fences nested in lists/quotes) during streaming. */
+export function renderDiagramMarkdown(src: string) {
+  const diagrams: { source: string; closed: boolean }[] = [];
+  const marker = `yi-${Array.from(crypto.getRandomValues(new Uint32Array(4)), (n) => n.toString(16)).join('')}`;
+  const parser = new Marked({ ...chatOptions, renderer: {
+    ...chatOptions.renderer,
+    code(token: Tokens.Code) {
+      if (token.lang?.trim().split(/\s+/)[0].toLowerCase() !== 'mermaid') return false;
+      const lines = token.raw.trimEnd().split('\n');
+      const fence = /^ {0,3}(`{3,}|~{3,})/.exec(lines[0]);
+      const closed = !!fence && lines.length > 1 &&
+        new RegExp(`^ {0,3}${fence[1][0]}{${fence[1].length},}[ \t]*$`).test(lines[lines.length - 1]);
+      const index = diagrams.push({ source: token.text, closed }) - 1;
+      return `<div data-diagram="${marker}" data-index="${index}"></div>`;
+    },
+  }});
+  return { html: DOMPurify.sanitize(parser.parse(src, { async: false }) as string), diagrams, marker };
 }
 
 export function basename(p: string): string {

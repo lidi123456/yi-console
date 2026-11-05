@@ -1,0 +1,23 @@
+{
+  "diagram": "Diagram",
+  "showDiagram": "Show diagram",
+  "showSource": "Show source",
+  "copySource": "Copy source",
+  "copied": "Copied",
+  "copyFailed": "Copy failed",
+  "fullscreen": "View fullscreen",
+  "saveSvg": "Export SVG",
+  "savePng": "Export PNG",
+  "exportFailed": "Failed to export diagram",
+  "waiting": "Waiting for the diagram code to finish…",
+  "incomplete": "The diagram code fence is unclosed. Source preserved.",
+  "loading": "Rendering diagram…",
+  "restricted": "The diagram contains unsupported syntax, external resources, custom styles, or exceeds size limits. Source preserved.",
+  "failed": "Could not render the diagram. Check the source syntax.",
+  "zoomOut": "Zoom out",
+  "zoomIn": "Zoom in",
+  "fit": "Fit to window",
+  "close": "Close",
+  "source": "Source",
+  "exportDiagram": "Export image"
+}

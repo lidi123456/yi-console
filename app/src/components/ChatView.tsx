@@ -1,9 +1,10 @@
+import { ChatMarkdown } from './ChatMarkdown';
 import { createContext, memo, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import { hydrateImages, type ImgCtx } from '../chatImages';
+import { type ImgCtx } from '../chatImages';
 import { getT, isEn, trErr, useLang } from '../i18n';
 import { rpc } from '../transport';
 import type { FileDiff, HubEvent, ImageRef, PermissionOption, PlanEntry, Question, QuestionAnswer, SessionInfo, Usage } from '../types';
-import { clock, fmtTokens, isMobile, lsGet, lsSet, renderMarkdown } from '../util';
+import { clock, fmtTokens, isMobile, lsGet, lsSet } from '../util';
 import { writeClipboard } from '../clipboard';
 import { toast, useStore } from '../store';
 import { DiffView, diffLines } from './DiffView';
@@ -311,15 +312,10 @@ function reasonText(r: string) {
 /** Which host and directory images in replies are loaded from (chatImages.ts) */
 const ImgContext = createContext<ImgCtx | null>(null);
 
-const Markdown = memo(function Markdown({ text }: { text: string }) {
-  const html = useMemo(() => renderMarkdown(text), [text]);
-  const ref = useRef<HTMLDivElement>(null);
+function Markdown({ text, streaming = false }: { text: string; streaming?: boolean }) {
   const ctx = useContext(ImgContext);
-  useLayoutEffect(() => {
-    if (ref.current) hydrateImages(ref.current, ctx);
-  }, [html, ctx]);
-  return <div ref={ref} className="md" dangerouslySetInnerHTML={{ __html: html }} />;
-});
+  return <ChatMarkdown text={text} streaming={streaming} ctx={ctx} />;
+}
 
 /** The user is selecting text in this element (or is dragging with the mouse down) */
 function selectingIn(el: HTMLElement | null, mouseDown: boolean) {
@@ -361,7 +357,7 @@ function LiveMarkdown({ text }: { text: string }) {
       onMouseDown={() => (down.current = true)}
     >
       <span className="tl-dot" />
-      <Markdown text={shown} />
+      <Markdown text={shown} streaming />
     </div>
   );
 }
@@ -1343,7 +1339,11 @@ export function ChatView({
       if (stick.current && keepFrom.current == null && !selectingIn(el, false)) el.scrollTop = el.scrollHeight;
     });
     ro.observe(el);
-    return () => ro.disconnect();
+    const diagramResize = () => {
+      if (stick.current && keepFrom.current == null && !selectingIn(el, false)) el.scrollTop = el.scrollHeight;
+    };
+    el.addEventListener('yi-diagram-resize', diagramResize);
+    return () => { ro.disconnect(); el.removeEventListener('yi-diagram-resize', diagramResize); };
   }, []);
 
   // A message we just sent: go back to the bottom wherever we are
@@ -1429,11 +1429,11 @@ export function ChatView({
       onClick={(e) => {
         // Click an image in a reply to enlarge it
         const t = e.target as HTMLElement;
-        if (t.tagName === 'IMG' && t.closest('.md')) openImage((t as HTMLImageElement).src);
+        if (t.tagName === 'IMG' && t.closest('.md') && !t.closest('.mermaid-block')) openImage((t as HTMLImageElement).src);
       }}
       onContextMenu={(e) => {
         const t = e.target as HTMLElement;
-        if (t.tagName === 'IMG' && t.closest('.md')) imageMenu(e, (t as HTMLImageElement).src);
+        if (t.tagName === 'IMG' && t.closest('.md') && !t.closest('.mermaid-block')) imageMenu(e, (t as HTMLImageElement).src);
       }}
     >
       <div className="chat-inner">

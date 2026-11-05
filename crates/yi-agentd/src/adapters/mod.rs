@@ -16,12 +16,15 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::mpsc;
 
-/// Tells the model in chat mode how to show the user images: Yi Console displays Markdown images in replies that reference local files on the host.
+/// Tells the model in chat mode how to show diagrams and images: Yi Console displays Markdown images in replies that reference local files on the host.
 /// Claude gets it via `--append-system-prompt`, Codex via `developerInstructions`; ACP has no system prompt entry point, so it's not added
 pub const IMAGE_HINT: &str = "Your replies are shown in the Yi Console app, which renders Markdown. \
 To show the user an image file on this machine (a screenshot, chart or generated picture), embed it with \
 Markdown image syntax and its absolute path, e.g. ![chart](/abs/path/chart.png); wrap a path containing \
-spaces in angle brackets: ![chart](</abs/path/my chart.png>).";
+spaces in angle brackets: ![chart](</abs/path/my chart.png>). \
+For flowcharts and other supported diagrams, use fenced code blocks with the language mermaid; \
+Yi Console renders them inline. Start with the diagram type, use plain text labels, close the code fence, \
+and omit configuration directives, HTML, external resources, click actions and custom style statements.";
 
 /// The tool's turn failed because the account's usage limit is used up. The hub decides whether and when to continue automatically.
 /// Adapters for other tools only need to emit this before `TurnEnd` to get automatic continue (`resets_at` ms; None lets the hub ask the quota probe)
