@@ -30,5 +30,9 @@
   "capture": "截图",
   "desktopUnavailable": "桌面不可用",
   "unverified": "结果待核验",
-  "activeTitle": "{{title}} · {{status}}"
+  "activeTitle": "{{title}} · {{status}}",
+  "noteEnabled": "已开启操作电脑",
+  "notePaused": "已暂停操作电脑",
+  "noteResumed": "已恢复操作电脑",
+  "noteStopped": "已停止操作电脑"
 }
