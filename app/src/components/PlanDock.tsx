@@ -7,7 +7,8 @@ import { Icon } from './Icon';
 
 const t = getT('planDock');
 
-/** Task progress above the input box: while tasks remain, one line "Tasks 3/7 · Now: …", click for the full list; disappears when all are done */
+/** Task progress above the input box: while tasks remain, one line "Tasks 3/7 · Now: …", click for the full list;
+ *  disappears when all are done or the list's turn ends (`latestPlan`) */
 export function PlanDock({ events, busy }: { events: HubEvent[]; busy: boolean }) {
   const plan = useMemo(() => latestPlan(events), [events, events.length]);
   const [open, setOpen] = useState(false);

@@ -11,6 +11,10 @@ export interface PlanState {
   entries: PlanEntry[];
   /** The tool itself has no "in progress" (Kiro): while the turn runs, treat the first unfinished item as in progress */
   infer?: boolean;
+  /** The turn that last updated the list has ended. Tools often stop without ticking the last items (Kiro's "Report to
+   *  user"), so such a list is left behind: no bar above the input box, and no inferred "in progress" in later turns.
+   *  Set in place, so the timeline card holding this object sees it; every update makes a new object */
+  ended?: boolean;
 }
 
 /** These tool calls are shown by the task list instead (failed ones are shown as usual) */
@@ -59,6 +63,9 @@ export class PlanTracker {
   /** Process one event; returns true if the task list changed */
   feed(e: HubEvent): boolean {
     switch (e.kind) {
+      case 'turn_end':
+        if (this.plan) this.plan.ended = true;
+        return false;
       case 'cleared':
         this.plan = null;
         this.calls.clear();
@@ -151,21 +158,17 @@ export class PlanTracker {
   }
 }
 
-/** The session's current task list (for the bar above the input box) */
+/** The task list of the turn in progress (for the bar above the input box). One left by an ended turn, finished,
+ *  interrupted or not, isn't shown until the tool updates the list again; the timeline card still shows it */
 export function latestPlan(events: HubEvent[]): PlanState | null {
   const t = new PlanTracker();
-  // A turn the user interrupted abandons its list: hide it until the tool updates the list again
-  let stopped = false;
-  for (const e of events) {
-    if (t.feed(e)) stopped = false;
-    else if (e.kind === 'turn_end' && (e.stopReason === 'cancelled' || e.stopReason === 'interrupted')) stopped = true;
-  }
-  return stopped ? null : t.plan;
+  for (const e of events) t.feed(e);
+  return t.plan && !t.plan.ended ? t.plan : null;
 }
 
-/** Status for display: with infer, while the turn runs, the first unfinished item counts as in progress */
+/** Status for display: with infer, while the list's own turn runs, the first unfinished item counts as in progress */
 export function viewEntries(p: PlanState, busy: boolean): PlanEntry[] {
-  if (!p.infer || !busy) return p.entries;
+  if (!p.infer || !busy || p.ended) return p.entries;
   const i = p.entries.findIndex((x) => x.status !== 'completed');
   return i < 0 ? p.entries : p.entries.map((x, j) => (j === i ? { ...x, status: 'in_progress' } : x));
 }
