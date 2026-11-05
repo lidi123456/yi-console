@@ -15,11 +15,49 @@ export function validateDiagram(source: string) {
   )
     throw new Error('unsupported');
   if (
-    /%%\s*\{|^\s*---|(?:https?|file|data|javascript):|(?:src|href)\s*=|<\s*\/?[a-z]|\b(?:image|icon|img)\s*:|@\{|(?:^|[;\n])\s*(?:click|style|classDef|linkStyle)\b/im.test(
+    /%%\s*\{|^\s*---|(?:https?|file|data|javascript):|(?:src|href)\s*=|<\s*\/?[a-z]|\b(?:image|icon|img)\s*:|@\{|(?:^|[;\n])\s*click\b/im.test(
       source,
     )
   )
     throw new Error('unsafe');
+  checkStyles(source);
+}
+
+// Styling statements are CSS underneath: only plain colour/stroke/font properties with simple values pass.
+const STYLE_PROPS = new Set([
+  'fill',
+  'stroke',
+  'color',
+  'stroke-width',
+  'stroke-dasharray',
+  'stroke-opacity',
+  'fill-opacity',
+  'opacity',
+  'font-weight',
+  'font-style',
+  'font-size',
+]);
+const NUM = String.raw`-?\d+(?:\.\d+)?(?:px|em|%)?`;
+const STYLE_VALUE = new RegExp(
+  String.raw`^(?:#[0-9a-f]{3,8}|[a-z]+|${NUM}(?:\s+${NUM})*)$`,
+  'i',
+);
+
+function checkStyles(source: string) {
+  for (const stmt of source.split(/[;\n]/)) {
+    const head = /^\s*(style|classDef|linkStyle)\b/.exec(stmt);
+    if (!head) continue;
+    const m =
+      head[1] === 'linkStyle'
+        ? /^\s*linkStyle\s+(?:default|\d+(?:\s*,\s*\d+)*)\s+(?:interpolate\s+[a-zA-Z]+\s*)?(.*?)\s*$/.exec(stmt)
+        : /^\s*(?:style|classDef)\s+[\w-]+(?:\s*,\s*[\w-]+)*\s+(.*?)\s*$/.exec(stmt);
+    if (!m) throw new Error('unsafe');
+    if (!m[1]) continue; // linkStyle with only interpolate
+    for (const decl of m[1].split(',')) {
+      const d = /^\s*([a-z-]+)\s*:\s*(.*?)\s*$/i.exec(decl);
+      if (!d || !STYLE_PROPS.has(d[1].toLowerCase()) || !STYLE_VALUE.test(d[2])) throw new Error('unsafe');
+    }
+  }
 }
 
 export function renderDiagram(source: string, dark: boolean, font: string, fontSize: number): Promise<Diagram> {

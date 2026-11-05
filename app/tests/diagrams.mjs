@@ -89,6 +89,8 @@ await page.evaluate(async () => {
     'mindmap\n root((Root))\n  Child',
     'timeline\n 2026 : Start',
     'gitGraph\n commit',
+    'flowchart TB\r\n subgraph L1["用户层"]\r\n  U1["Web"]\r\n end\r\n U1 -. 调用 .-> S1\r\n classDef user fill:#E8F1FF,stroke:#4A78C2,color:#1F3B6D\r\n class U1 user\r\n style S1 fill:#FFF4E5,stroke-width:2px,stroke-dasharray: 5 5\r\n linkStyle 0 stroke:#888',
+    'stateDiagram-v2\n [*] --> A\n classDef hot fill:#f00,font-weight:bold\n class A hot',
   ];
   for (const source of cases) {
     const d = await window.renderDiagram(source, false, 'system-ui', 14);
@@ -100,7 +102,12 @@ await page.evaluate(async () => {
   for (const bad of [
     '---\nconfig: {}\n---\nflowchart LR\nA-->B',
     'flowchart LR\nA@{img: "https://example.com/x"}',
-    'flowchart LR\nclassDef x fill:red',
+    'flowchart LR\nclassDef x fill:url(#p)',
+    'flowchart LR\nclassDef x fill:red,background-image:none',
+    'flowchart LR\nstyle A fill:red}svg{display:none',
+    'flowchart LR\nstyle A fill:"red"',
+    'flowchart LR\nlinkStyle 0 stroke:red !important',
+    'flowchart LR\nstyle',
     'flowchart LR\n%%{init: {}}%%',
     'flowchart LR\n' + 'x'.repeat(30001),
   ]) {
@@ -115,6 +122,6 @@ await page.evaluate(async () => {
 });
 assert.deepEqual(errors, []);
 console.log(
-  'PASS: streaming, stable portals, source/copy, SVG/PNG downloads, fullscreen zoom/pan/Escape, theme, mobile, errors, nested fences, 10 diagram types and resource/config limits.',
+  'PASS: streaming, stable portals, source/copy, SVG/PNG downloads, fullscreen zoom/pan/Escape, theme, mobile, errors, nested fences, 10 diagram types, colour styles and resource/config/CSS limits.',
 );
 await browser.close();
