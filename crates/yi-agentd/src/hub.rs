@@ -2014,6 +2014,15 @@ fn exhausted_reset(q: &Value, now: i64) -> Option<i64> {
         .max()
 }
 
+/// An emitter for a running chat session "s" in a fresh in-memory hub, for adapter tests; keep the receiver alive
+#[cfg(test)]
+pub(crate) fn test_emitter() -> (Arc<Hub>, Emitter, mpsc::UnboundedReceiver<AdapterCmd>) {
+    let hub = Hub::new(Store::open_memory().unwrap(), DaemonSettings::default());
+    let rx = tests::live(&hub, "s", SessionMode::Structured, SessionStatus::Running, 0);
+    let em = Emitter { hub: hub.clone(), sid: "s".into(), gen: 0 };
+    (hub, em, rx)
+}
+
 /// Handle adapters use to report events to the hub
 #[derive(Clone)]
 pub struct Emitter {
@@ -2330,7 +2339,7 @@ mod tests {
     }
 
     /// Insert a session with a "running process" into the hub; returns a receiver showing which commands it gets
-    fn live(hub: &Hub, id: &str, mode: SessionMode, status: SessionStatus, updated_at: i64) -> mpsc::UnboundedReceiver<AdapterCmd> {
+    pub(super) fn live(hub: &Hub, id: &str, mode: SessionMode, status: SessionStatus, updated_at: i64) -> mpsc::UnboundedReceiver<AdapterCmd> {
         let info = SessionInfo {
             id: id.into(),
             tool: ToolKind::Kiro,

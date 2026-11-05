@@ -6,7 +6,7 @@ use crate::hub::Emitter;
 use crate::util::now_ms;
 use yi_proto::*;
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tokio::sync::mpsc;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -54,6 +54,14 @@ struct State {
     seg_n: u64,
     tools: HashMap<String, ToolState>,
     perms: HashMap<String, Value>,
+    /// Subagent (Agent / Task) tool calls still running in the foreground. Qoder's ACP bridge forwards every subagent's
+    /// streamed text, thinking and tool calls as the parent session's own updates, with nothing to tell them apart, so
+    /// parallel subagents came out as one reply cut mid-word by "thinking" blocks. The parent is blocked on these calls,
+    /// so while any runs, chunks and new tool calls belong to subagents: they are dropped like Claude's subagent
+    /// messages (`parent_tool_use_id`), and the subagent's report arrives as the Agent call's result
+    subagents: HashSet<String>,
+    /// Tool calls started by subagents, hidden along with their updates
+    hidden: HashSet<String>,
     /// During session/load replay
     loading: bool,
     record_replay: bool,
@@ -86,6 +94,12 @@ impl State {
         self.next_id += 1;
         self.pending.insert(self.next_id, kind);
         json!({"jsonrpc":"2.0","id": self.next_id, "method": method, "params": params})
+    }
+
+    /// A turn ended: a subagent call the tool never reported as finished mustn't swallow the next turn
+    fn end_subagents(&mut self) {
+        self.subagents.clear();
+        self.hidden.clear();
     }
 
     /// When replaying history that doesn't need recording, drop content events
@@ -293,6 +307,9 @@ fn flush(st: &mut State, em: &Emitter) {
 }
 
 fn chunk(st: &mut State, em: &Emitter, seg: Seg, text: &str) {
+    if seg != Seg::User && !st.loading && !st.subagents.is_empty() {
+        return;
+    }
     let same = matches!(&st.seg, Some((s, _, _)) if *s == seg);
     if !same {
         flush(st, em);
@@ -380,6 +397,7 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Result<V
                 Pending::Auth | Pending::Session | Pending::Load | Pending::Init => Err(login_hint(spec, &msg)),
                 Pending::Prompt => {
                     st.prompting = false;
+                    st.end_subagents();
                     flush(st, em);
                     em.event(EventBody::Error { message: msg });
                     em.event(EventBody::TurnEnd {
@@ -473,6 +491,7 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Result<V
             }
             Pending::Prompt => {
                 st.prompting = false;
+                st.end_subagents();
                 flush(st, em);
                 if let Some(msg) = meta_error(r) {
                     em.event(EventBody::Error { message: login_hint(spec, &msg) });
@@ -833,6 +852,10 @@ fn update(st: &mut State, em: &Emitter, u: &Value) {
                 return;
             }
             let id = u["toolCallId"].as_str().unwrap_or("").to_string();
+            if st.hidden.contains(&id) {
+                return;
+            }
+            let known = st.tools.contains_key(&id);
             let mut t = st.tools.get(&id).cloned().unwrap_or_default();
             let before = (t.title.clone(), t.diffs.len(), t.input.clone());
             if let Some(title) = u["title"].as_str() {
@@ -846,6 +869,15 @@ fn update(st: &mut State, em: &Emitter, u: &Value) {
             }
             if !u["rawInput"].is_null() {
                 t.input = u["rawInput"].clone();
+            }
+            let is_agent = matches!(t.name.as_str(), "Agent" | "Task");
+            if !known && !st.loading && !is_agent && !st.subagents.is_empty() {
+                st.hidden.insert(id);
+                return;
+            }
+            // Background subagents return at once, and the parent keeps talking while they run
+            if is_agent && !t.done && !st.loading && t.input["run_in_background"] != json!(true) {
+                st.subagents.insert(id.clone());
             }
             let mut texts = vec![];
             for c in u["content"].as_array().into_iter().flatten() {
@@ -882,6 +914,7 @@ fn update(st: &mut State, em: &Emitter, u: &Value) {
             let status = u["status"].as_str().unwrap_or("");
             if (status == "completed" || status == "failed") && !t.done {
                 t.done = true;
+                st.subagents.remove(&id);
                 let mut output = texts.join("\n");
                 if output.is_empty() && !u["rawOutput"].is_null() {
                     output = raw_output_text(&u["rawOutput"]);
@@ -971,6 +1004,64 @@ fn codebuddy_bash_text(t: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::clean_diff_texts;
+
+    /// Qoder streams its subagents' text, thinking and tool calls as the parent's own updates
+    #[test]
+    fn subagent_updates_are_dropped() {
+        use super::*;
+        let (hub, em, _rx) = crate::hub::test_emitter();
+        let mut st = State::default();
+        let up = |st: &mut State, u: Value| update(st, &em, &u);
+        let chunk = |kind: &str, t: &str| json!({"sessionUpdate": kind, "content": {"type": "text", "text": t}});
+        let agent = |id: &str, status: Option<&str>, bg: bool| {
+            let mut u = json!({"sessionUpdate": if status.is_some() { "tool_call_update" } else { "tool_call" }, "toolCallId": id,
+                "title": "Agent", "_meta": {"qoder": {"toolName": "Agent"}}, "rawInput": {"description": "d", "run_in_background": bg}});
+            if let Some(s) = status {
+                u["status"] = json!(s);
+                u["content"] = json!([{"type": "content", "content": {"type": "text", "text": format!("report {id}")}}]);
+            }
+            u
+        };
+        up(&mut st, chunk("agent_message_chunk", "Let me look."));
+        up(&mut st, agent("a1", None, false));
+        up(&mut st, agent("a2", None, false));
+        // Two subagents interleaving, plus a tool call of theirs
+        up(&mut st, chunk("agent_message_chunk", "and `mp"));
+        up(&mut st, chunk("agent_thought_chunk", "Now"));
+        up(&mut st, json!({"sessionUpdate": "tool_call", "toolCallId": "r1", "title": "Read x", "_meta": {"qoder": {"toolName": "Read"}}}));
+        up(&mut st, chunk("agent_message_chunk", "-bsserver"));
+        up(&mut st, json!({"sessionUpdate": "tool_call_update", "toolCallId": "r1", "status": "completed"}));
+        up(&mut st, agent("a1", Some("completed"), false));
+        up(&mut st, chunk("agent_message_chunk", "still a2"));
+        up(&mut st, agent("a2", Some("completed"), false));
+        // A background subagent returns at once and doesn't hold the parent's text back
+        up(&mut st, agent("b1", None, true));
+        up(&mut st, chunk("agent_message_chunk", "Summary."));
+        up(&mut st, chunk("agent_thought_chunk", "done"));
+        flush(&mut st, &em);
+        let evs: Vec<String> = hub
+            .store
+            .events_since("s", 0, 100)
+            .unwrap()
+            .into_iter()
+            .map(|e| match e.body {
+                EventBody::AssistantText { text, .. } => format!("text:{text}"),
+                EventBody::Thinking { text, .. } => format!("think:{text}"),
+                EventBody::ToolCall { id, .. } => format!("call:{id}"),
+                EventBody::ToolResult { id, output, .. } => format!("result:{id}:{output}"),
+                _ => String::new(),
+            })
+            .filter(|s| !s.is_empty())
+            .collect();
+        assert_eq!(
+            evs,
+            ["text:Let me look.", "call:a1", "call:a2", "result:a1:report a1", "result:a2:report a2", "call:b1", "text:Summary.", "think:done"]
+        );
+        // The end of a turn releases a subagent the tool never finished
+        up(&mut st, agent("a3", None, false));
+        st.end_subagents();
+        assert!(st.subagents.is_empty());
+    }
 
     #[test]
     fn codebuddy_bash() {
