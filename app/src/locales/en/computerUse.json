@@ -1,7 +1,6 @@
 {
   "title": "Computer use",
   "description": "Allow this AI session to operate the real, signed-in desktop on the session host. Select one window; activity and checkpoint screenshots appear in chat.",
-  "bundledDriver": "cua-driver {{version}} is bundled. No extra download is needed.",
   "targetWindow": "Target window",
   "checking": "Reading…",
   "refreshWindows": "Refresh windows",

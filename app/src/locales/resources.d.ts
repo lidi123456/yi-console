@@ -238,7 +238,6 @@ export default interface Resources {
   "computerUse": {
     "action": "桌面操作：{{tool}}",
     "activeTitle": "{{title}} · {{status}}",
-    "bundledDriver": "已内置 cua-driver {{version}}，无需额外下载。",
     "cancel": "取消",
     "capture": "截图",
     "checking": "正在读取…",

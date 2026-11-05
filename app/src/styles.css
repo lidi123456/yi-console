@@ -8726,7 +8726,8 @@ button.wp-commit-title .chev {
 .computer-use-btn.active { color: var(--accent); background: var(--accent-soft); }
 .computer-use-target { max-width: 140px; font-size: var(--fs-ui); }
 @media (max-width: 760px) { .computer-use-target { display: none; } }
-.computer-use-setup { width: min(560px, calc(100vw - 32px)); padding: 20px; }
+/* Rendered inside the composer toolbar, which is nowrap: let the dialog text wrap again */
+.computer-use-setup { width: min(560px, calc(100vw - 32px)); padding: 20px; white-space: normal; text-align: left; }
 .computer-use-heading, .computer-use-select { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .computer-use-select { margin: 20px 0 8px; }
 .computer-use-setup select { width: 100%; padding: 8px; border: 1px solid var(--border); background: var(--bg); color: var(--text); border-radius: 6px; }

@@ -181,7 +181,6 @@ export function ComputerUsePanel({
             <p className="muted">{t('description')}</p>
             {state?.supported ? (
               <>
-                <p className="small muted">{t('bundledDriver', { version: state.driverVersion })}</p>
                 <div className="computer-use-select">
                   <label htmlFor="cu-target">{t('targetWindow')}</label>
                   <button className="btn small" disabled={busy} onClick={() => void scan()}>

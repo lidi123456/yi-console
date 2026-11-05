@@ -1,7 +1,6 @@
 {
   "title": "操作电脑",
   "description": "允许当前 AI 会话操作会话所在主机上已登录的真实桌面。请选择一个窗口，操作记录和关键截图会显示在聊天中。",
-  "bundledDriver": "已内置 cua-driver {{version}}，无需额外下载。",
   "targetWindow": "目标窗口",
   "checking": "正在读取…",
   "refreshWindows": "刷新窗口",
