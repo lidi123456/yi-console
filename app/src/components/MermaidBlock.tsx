@@ -136,10 +136,12 @@ export function MermaidBlock({ source, closed, streaming }: { source: string; cl
           </button>
         </div>
       </div>
-      {!closed && <div className="mermaid-status">{streaming ? t('waiting') : t('incomplete')}</div>}
-      {closed && !result && (
-        <div className="mermaid-status" role="status">
-          {t('loading')}
+      {!closed && !streaming && <div className="mermaid-status">{t('incomplete')}</div>}
+      {/* While the code is still streaming, or rendering, show a spinner instead of the half-written source (the Source tab still has it) */}
+      {((!closed && streaming) || (closed && !result)) && !showSource && (
+        <div className="mermaid-status busy" role="status">
+          <span className="spinner" />
+          {closed ? t('loading') : t('waiting')}
         </div>
       )}
       {error !== undefined && (
@@ -147,7 +149,7 @@ export function MermaidBlock({ source, closed, streaming }: { source: string; cl
           {['unsafe', 'unsupported', 'limit'].includes(error) ? t('restricted') : t('failed')}
         </div>
       )}
-      {showSource || !closed || error !== undefined ? (
+      {showSource || (!closed && !streaming) || error !== undefined ? (
         <pre>
           <code>{source}</code>
         </pre>

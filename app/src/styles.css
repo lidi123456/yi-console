@@ -8669,6 +8669,11 @@ button.wp-commit-title .chev {
   padding: 10px;
   color: var(--text-2);
 }
+.mermaid-status.busy {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
 .mermaid-scroll {
   overflow: auto;
   max-height: 70vh;

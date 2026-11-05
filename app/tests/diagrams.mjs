@@ -14,8 +14,12 @@ const source = 'flowchart TD\n A[开始] --> B{成功?}\n B -->|是| C[完成]\n
 const fence = '```mermaid\n' + source;
 const set = (text, streaming = true) => page.evaluate((v) => window.setMessage(v), { text, streaming });
 await set(fence);
-await page.getByText('Waiting for the diagram code to finish…').waitFor();
+await page.getByText('Generating diagram…').waitFor();
 assert.equal(await page.locator('.mermaid-scroll img').count(), 0);
+assert.equal(await page.locator('.mermaid-block pre').count(), 0, 'half-written source stays hidden while streaming');
+await page.getByRole('button', { name: 'Show source', exact: true }).click();
+assert.equal(await page.locator('.mermaid-block pre').count(), 1, 'the Source tab still shows streaming code');
+await page.getByRole('button', { name: 'Show diagram', exact: true }).click();
 await set(fence + '\n```\n');
 await page.locator('.mermaid-scroll img').waitFor();
 await page.waitForFunction(() => document.querySelector('.mermaid-scroll img')?.naturalWidth > 0);
