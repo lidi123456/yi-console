@@ -409,9 +409,7 @@ impl Hub {
             // Attach the new MCP entry while continuing the same CLI session.
             if let Err(error) = self.relaunch(&rt) { self.revoke_desktop(sid); self.desktop.close_if_idle().await; return Err(error); }
         }
-        if matches!(action, "stop" | "disable") {
-            if let Some(tx) = self.running_tx(&rt) { let _ = tx.send(AdapterCmd::Interrupt); }
-        }
+        // Turning off does not interrupt the reply (the user stops it if they want); the revoked ticket refuses further desktop calls.
         self.desktop_event(sid, EventBody::ComputerUse { action_id: uuid::Uuid::new_v4().to_string(), tool: action.into(), status: "control".into(), message: String::new(), duration_ms: 0, images: vec![] });
         Ok(self.desktop.status(Some(sid)))
     }
@@ -1320,11 +1318,13 @@ impl Hub {
 
     /// End the current process and start it again with the session's current settings (continuing the same tool session)
     fn relaunch(self: &Arc<Self>, rt: &Arc<SessionRt>) -> Result<()> {
-        if let Some(tx) = self.running_tx(rt) {
-            let _ = tx.send(AdapterCmd::Kill);
-        }
         let info = rt.info.lock().unwrap().clone();
         let spec = self.spec_for(&info, false, 120, 32)?;
+        if let Some(tx) = self.running_tx(rt) {
+            // Retire the old generation first: its exit would otherwise show "process ended" before the new process starts
+            *rt.generation.lock().unwrap() += 1;
+            let _ = tx.send(AdapterCmd::Kill);
+        }
         self.launch(rt, spec)
     }
 
