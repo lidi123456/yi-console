@@ -3239,6 +3239,37 @@ textarea {
   min-width: 0;
 }
 
+/* The queue is held (after a restart, an interrupt, a hand-off or by hand) */
+.queue-held {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 6px 4px 12px;
+  border-radius: 10px;
+  color: var(--text-2);
+  font-size: 13px;
+  background: color-mix(in srgb, var(--warn, #d29922) 12%, var(--bg-2));
+}
+
+.queue-item.drop {
+  border-color: var(--accent);
+  border-style: solid;
+}
+
+.queue-grip {
+  display: inline-flex;
+  color: var(--text-3);
+  cursor: grab;
+  margin-left: -6px;
+}
+
+.queue-edit {
+  flex: 1;
+  min-width: 0;
+  font: inherit;
+  padding: 2px 6px;
+}
+
 .send-btn.queue-send {
   background: var(--bg-3);
   color: var(--text);
@@ -8416,6 +8447,16 @@ button.wp-commit-title .chev {
 }
 .limit-note-warn {
   color: var(--warn);
+}
+/* Continue with another tool: where the work went / came from */
+.handoff-note {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+}
+.handoff-note > svg {
+  flex: none;
 }
 .limit-dock {
   display: flex;

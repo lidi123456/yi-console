@@ -99,6 +99,12 @@ const ERR_PATTERNS: [RegExp, string | ((...m: string[]) => string)][] = [
   [/^自动继续失败[:：]\s*(.+)$/, (_, m) => `Automatic continue failed: ${m}`],
   [/^未知语言[:：]\s*(.+)$/, (_, m) => `Unknown language: ${m}`],
   [/^未知操作[:：]\s*(.+)$/, (_, m) => `Unknown action: ${m}`],
+  // Queued messages (hub.rs queue_action)
+  [/这条消息已经发出去了/, 'That message has already been sent'],
+  [/排队消息里的图片已经不在了/, 'An image in the queued message is gone'],
+  [/^消息不能为空$/, 'The message is empty'],
+  [/这个会话没有被重启打断的回合/, 'This session has no turn cut off by a restart'],
+  [/^发送排队消息失败[:：]\s*(.+)$/, (_, m) => `Could not send the queued message: ${m}`],
   // App self-update (updater.rs / MainActivity.kt)
   [/^检查更新失败[:：]\s*(.+)$/, (_, m) => `Update check failed: ${m}`],
   [/^安装更新失败[:：]\s*(.+)$/, (_, m) => `Update install failed: ${m}`],

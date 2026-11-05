@@ -71,5 +71,11 @@
   "kiroIsWaitingForYour": "Kiro 在等你选择",
   "sendAnswer": "发送回答",
   "sendAMessageToStart": "发送一条消息开始",
-  "jumpToBottom": "回到底部"
+  "jumpToBottom": "回到底部",
+  "continueInAnotherTool": "换工具继续",
+  "handedOffTo": "已交给 {{tool}} 继续",
+  "tookOverFrom": "从 {{tool}} 的会话接手",
+  "openNewSession": "打开新会话",
+  "openOriginalSession": "打开原会话",
+  "turnCutOffByRestart": "后台服务重启，这一轮回复被打断"
 }

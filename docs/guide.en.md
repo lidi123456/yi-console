@@ -48,7 +48,7 @@ Model lists and quotas come from yi-agentd briefly starting the tool and asking 
 
 ## The input box
 
-- **Queued messages**: you can keep typing while the AI is replying. Press Enter and the message joins a queue shown above the input box; queued messages are sent in order when the current turn ends. "Send Now" interrupts the current turn and sends that message right away; × (or ↑ in an empty input box) pulls it back into the input box for editing. After a manual interrupt (Esc or the stop button), the queue isn't sent automatically. The queue lives in yi-agentd, so your phone and computer see the same one; it's cleared when the daemon restarts.
+- **Queued messages**: you can keep typing while the AI is replying. Press Enter and the message joins a queue shown above the input box; queued messages are sent in order when the current turn ends. "Send Now" interrupts the current turn and sends that message right away; × (or ↑ in an empty input box) pulls it back into the input box; the pencil (or double-clicking the text) edits it in place; drag to reorder (the up button on phones); the pause button on the first one holds the queue. The queue lives in yi-agentd, so your phone and computer see the same one, and it survives the background service restarting. After a restart or a manual interrupt (Esc or the stop button) the queue is held instead of sent: a bar above the input box says why, with "Resume" and "Clear". If a reply was running when the background service restarted (its tool process stops with it), the timeline notes that the turn was cut off, and "Continue" above the input box first asks the tool to check where things are and finish the interrupted task, then sends the queued messages.
 - **`/` commands**: type `/` at the start of the input box to list:
   - prompt snippets, maintained under "Host Settings → Prompt snippets" and stored by that machine's yi-agentd;
   - built-in Yi Console actions: switch model, switch permission mode, view changes, export, rename, new session in the same directory, and so on;
@@ -124,6 +124,8 @@ Below a session's input box is a status line. Configure it under "Host Settings 
 ## Continuing after a usage limit
 
 When Claude Code or Codex stops in the chat UI because the account's usage limit is used up, Yi Console records when the limit resets and, one minute after that, sends "continue" automatically (in Chinese or English, following the UI language) so the task carries on. While it waits, a countdown above the input box offers "Continue now" and "Cancel", and the sidebar row shows when it will continue. Sending a message yourself, `/clear`, or switching to the terminal UI cancels it. It doesn't wait for limits that reset more than a day out, or after hitting the limit again right after continuing several times in a row. You can turn it off under "Host Settings → Session processes". The background service on the host keeps the timer, so it works with the app closed.
+
+To not wait for the reset, click "Continue in another tool" on the countdown bar or on the limit line in the timeline. The "Continue in another tool" dialog opens with a tool that isn't waiting for its own limit, and the original session's permission mode (default if the new tool lacks it). The new session's first turn reads the original log and reports back; the original session no longer continues by itself, and its queued messages move to the new session, held until you've read the report. Each timeline gets a line linking to the other session.
 
 ## Notifications
 

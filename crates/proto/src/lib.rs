@@ -191,9 +191,18 @@ pub struct SessionInfo {
     /// Pinned in the sidebar
     #[serde(default)]
     pub pinned: bool,
-    /// Messages to send once the current turn ends (in memory only, cleared when the daemon restarts)
+    /// Messages to send once the current turn ends. Kept in the `queues` table, so they survive daemon restarts
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub queued: Vec<QueuedMessage>,
+    /// The queue is held: nothing is sent when a turn ends until the user resumes it. Why: restart (the daemon restarted
+    /// with messages queued), interrupt (the user interrupted the turn), user (paused by hand), handoff (moved here from
+    /// the session this one took over)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_paused: Option<String>,
+    /// A chat-mode turn was still running when the daemon stopped (its tool process went with it). Set by `restore`,
+    /// cleared by the next message or `session.interrupted`. "Resume" on the queue first asks the tool to finish that turn
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub restart_interrupted: bool,
     /// Tasks the tool runs in the background (in memory only, cleared when the process exits)
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub background_tasks: Vec<BackgroundTask>,
@@ -480,6 +489,17 @@ pub enum EventBody {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
     },
+    /// A turn was cut off because the daemon stopped (recorded when it starts again)
+    Interrupted {
+        reason: String,
+    },
+    /// Continue with another tool: `to` true in the original session (the work went to `sessionId`), false in the new
+    /// one (it took over from `sessionId`)
+    Handoff {
+        session_id: String,
+        tool: ToolKind,
+        to: bool,
+    },
     /// /clear: all events before this one were deleted; on receipt the client drops events it holds with a smaller seq
     Cleared {},
 }
@@ -707,8 +727,12 @@ pub mod methods {
     pub const SESSION_SET_PERMISSION_MODE: &str = "session.setPermissionMode";
     /// {sessionId} -> [SlashCommand]: slash commands reported by the tool
     pub const SESSION_COMMANDS: &str = "session.commands";
-    /// {sessionId, id, action: remove|sendNow}: manage queued messages
+    /// {sessionId, action, id?, text?, to?}: manage queued messages. With `id`: remove (returns {text} for the input box),
+    /// sendNow, edit {text}, move {to: index}. Whole queue: pause, resume (sends the next one if the session is idle), clear
     pub const SESSION_QUEUE: &str = "session.queue";
+    /// {sessionId, action: continue | dismiss}: a turn cut off by a daemon restart (`restart_interrupted`); continue
+    /// asks the tool to finish it, and queued messages follow after that turn
+    pub const SESSION_INTERRUPTED: &str = "session.interrupted";
     /// {sessionId, pinned}
     pub const SESSION_PIN: &str = "session.pin";
     /// {sessionId, mode: structured | terminal}: switch the same session between chat and terminal mode, continuing the same tool session

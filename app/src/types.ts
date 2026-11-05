@@ -36,8 +36,12 @@ export interface SessionInfo {
   /** Thinking level; empty means the tool's default */
   effort?: string | null;
   pinned?: boolean;
-  /** Messages to send after this turn ends */
+  /** Messages to send after this turn ends (kept across daemon restarts) */
   queued?: QueuedMessage[];
+  /** The queue is held, nothing goes out at turn end until resumed: restart / interrupt / user / handoff */
+  queuePaused?: 'restart' | 'interrupt' | 'user' | 'handoff' | string | null;
+  /** A chat turn was running when the daemon stopped and was cut off; `session.interrupted` continues or dismisses */
+  restartInterrupted?: boolean;
   /** Tasks the tool runs in the background (Claude's background shells, subagents) */
   backgroundTasks?: BackgroundTask[];
   /** Terminal opened in the session page's bottom panel: the chat session it belongs to; not listed separately in the sidebar etc. */
@@ -204,6 +208,10 @@ export type EventBody =
   | { kind: 'system'; text: string }
   /** /clear: all events before this one have been deleted on yi-agentd */
   | { kind: 'cleared' }
+  /** Continue with another tool: `to` in the original session (the work went to sessionId), else in the new one */
+  | { kind: 'handoff'; sessionId: string; tool: ToolKind; to: boolean }
+  /** A turn cut off because the daemon stopped (recorded when it started again) */
+  | { kind: 'interrupted'; reason: string }
   /** Usage limit: hit (from the adapter) / scheduled / skipped (reason off|unknown|far|repeated) /
    *  resumed (reason auto|now) / cancelled (reason user|manual|mode|off|busy) */
   | {

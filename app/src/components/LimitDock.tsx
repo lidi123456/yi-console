@@ -5,6 +5,7 @@ import { errorToast } from '../store';
 import { rpc } from '../transport';
 import type { SessionInfo } from '../types';
 import { Icon } from './Icon';
+import { handoffSession } from './SessionActions';
 
 const t = getT('limitDock');
 
@@ -51,6 +52,10 @@ export function LimitDock({ hostId, info, connected }: { hostId: string; info: S
       <button className="btn small" disabled={!connected || busy} onClick={() => act('now')} title={t('sendContinueRightAway')}>
         <span className="hide-mobile">{t('continueNow')}</span>
         <span className="show-mobile">{t('continue')}</span>
+      </button>
+      <button className="btn small" disabled={!connected || busy} onClick={() => handoffSession(hostId, info, { limit: true })} title={t('handOffToAnotherToolTitle')}>
+        <span className="hide-mobile">{t('handOffToAnotherTool')}</span>
+        <span className="show-mobile">{t('switchTool')}</span>
       </button>
       <button className="btn small" disabled={!connected || busy} onClick={() => act('cancel')}>
         {t('cancel')}

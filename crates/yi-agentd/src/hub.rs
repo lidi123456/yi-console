@@ -144,12 +144,27 @@ pub(crate) struct TermRun {
     pids: HashSet<u32>,
 }
 
+/// A queued message. Its images are saved to the session's upload directory when it's queued, so the queue can be
+/// written to the store as is (`queues` table) and survive a daemon restart
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct Queued {
     id: String,
     text: String,
-    images: Vec<IncomingImage>,
+    #[serde(default)]
+    images: Vec<ImageRef>,
     /// The user clicked "Send now"
+    #[serde(skip)]
     now: bool,
+}
+
+impl Queued {
+    fn view(&self) -> QueuedMessage {
+        QueuedMessage {
+            id: self.id.clone(),
+            text: self.text.clone(),
+            images: self.images.len() as u32,
+        }
+    }
 }
 
 /// Permission modes each tool actually supports (manually kept in sync with the frontend's `permModes`).
@@ -247,6 +262,9 @@ pub struct CreateParams {
     /// Bottom terminal panel: the chat session it belongs to
     #[serde(default)]
     pub parent_id: Option<String>,
+    /// Continue with another tool: the session this one takes over from (see `hand_over`)
+    #[serde(default)]
+    pub handoff_from: Option<String>,
 }
 
 impl Hub {
@@ -270,13 +288,42 @@ impl Hub {
         hub
     }
 
-    /// After a daemon restart, the old tool processes are all gone, so mark everything exited
+    /// After a daemon restart, the old tool processes are all gone, so mark everything exited. Queued messages come
+    /// back held (`queue_paused` = restart): what the user meant to send next may no longer fit, so they wait for "resume"
     fn restore(&self) {
         let Ok(list) = self.store.load_sessions() else {
             return;
         };
+        let mut queues: HashMap<String, VecDeque<Queued>> = self
+            .store
+            .load_queues()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|(id, items)| serde_json::from_str(&items).ok().map(|q| (id, q)))
+            .collect();
+        let mut interrupted = vec![];
         let mut map = self.sessions.lock().unwrap();
         for mut info in list {
+            let queue = queues
+                .remove(&info.id)
+                .filter(|_| info.tool.has_process() && info.mode == SessionMode::Structured)
+                .unwrap_or_default();
+            info.queued = queue.iter().map(Queued::view).collect();
+            // A chat turn still running when the daemon stopped was cut off with its process. Terminal sessions in tmux
+            // keep running, so only chat mode counts
+            let cut = info.tool.has_process()
+                && info.mode == SessionMode::Structured
+                && matches!(info.status, SessionStatus::Running | SessionStatus::WaitingPermission | SessionStatus::Starting);
+            if cut {
+                info.restart_interrupted = true;
+                interrupted.push(info.id.clone());
+            }
+            // A hold from before the restart (paused by hand, interrupted, handed off) keeps its reason
+            info.queue_paused = if queue.is_empty() {
+                None
+            } else {
+                info.queue_paused.take().or_else(|| Some("restart".to_string()))
+            };
             info.last_seq = self.store.max_seq(&info.id).unwrap_or(info.last_seq);
             if !info.tool.has_process() {
                 // Files sessions have no process: always idle
@@ -284,13 +331,19 @@ impl Hub {
                     info.status = SessionStatus::Idle;
                     let _ = self.store.save_session(&info);
                 }
-            } else if info.status != SessionStatus::Exited || !info.queued.is_empty() {
+            } else if info.status != SessionStatus::Exited || cut {
                 info.status = SessionStatus::Exited;
                 info.pending_permissions = 0;
-                info.queued.clear();
                 let _ = self.store.save_session(&info);
             }
-            map.insert(info.id.clone(), Arc::new(new_rt(info)));
+            let rt = new_rt(info);
+            *rt.queue.lock().unwrap() = queue;
+            let id = rt.info.lock().unwrap().id.clone();
+            map.insert(id, Arc::new(rt));
+        }
+        drop(map);
+        for id in interrupted {
+            self.emit(&id, 0, EventBody::Interrupted { reason: "restart".into() });
         }
     }
 
@@ -356,6 +409,8 @@ impl Hub {
             effort: p.effort.clone().filter(|e| !e.is_empty()),
             pinned: false,
             queued: vec![],
+            queue_paused: None,
+            restart_interrupted: false,
             background_tasks: vec![],
             parent_id: p.parent_id.clone(),
             synced_users: None,
@@ -395,10 +450,43 @@ impl Hub {
             .and_then(|spec| self.launch(&rt, spec));
         self.broadcast_updated(&self.info(&info.id)?);
         started?;
+        let from = p
+            .handoff_from
+            .filter(|f| *f != info.id)
+            .and_then(|f| self.get(&f).ok().map(|rt| (f, rt)));
+        if let Some((fid, frt)) = &from {
+            let tool = frt.info.lock().unwrap().tool;
+            self.emit(&info.id, 0, EventBody::Handoff { session_id: fid.clone(), tool, to: false });
+        }
         if let Some(prompt) = p.prompt.filter(|s| !s.trim().is_empty()) {
             self.send(&info.id, &prompt, vec![], false)?;
         }
+        if let Some((fid, frt)) = from {
+            self.hand_over(&fid, &frt, &info);
+        }
         Ok(self.info(&info.id)?)
+    }
+
+    /// Continue with another tool: the original session stops waiting to continue by itself, its queued messages move
+    /// to the new session (held there, since its first turn only reports back), and it records where the work went
+    fn hand_over(self: &Arc<Self>, from: &str, frt: &Arc<SessionRt>, to: &SessionInfo) {
+        self.cancel_resume(from, "handoff");
+        let items: Vec<Queued> = frt.queue.lock().unwrap().drain(..).collect();
+        self.sync_queue(frt);
+        if let (false, Ok(rt)) = (items.is_empty(), self.get(&to.id)) {
+            let dst = uploads_dir(&to.id);
+            let _ = std::fs::create_dir_all(&dst);
+            for r in items.iter().flat_map(|it| &it.images) {
+                let src = uploads_dir(from).join(&r.id);
+                if std::fs::rename(&src, dst.join(&r.id)).is_err() && std::fs::copy(&src, dst.join(&r.id)).is_ok() {
+                    let _ = std::fs::remove_file(&src);
+                }
+            }
+            rt.queue.lock().unwrap().extend(items);
+            self.set_queue_paused(&rt, Some("handoff"));
+            self.sync_queue(&rt);
+        }
+        self.emit(from, 0, EventBody::Handoff { session_id: to.id.clone(), tool: to.tool, to: true });
     }
 
     fn spec_for(
@@ -526,10 +614,11 @@ impl Hub {
             && rt.queue.lock().unwrap().is_empty()
             && !*rt.restart_pending.lock().unwrap();
         if queue && busy && !steer && info.mode == SessionMode::Structured && self.running_tx(&rt).is_some() {
+            let (refs, _) = self.save_images(id, images)?;
             rt.queue.lock().unwrap().push_back(Queued {
                 id: uuid::Uuid::new_v4().simple().to_string()[..12].to_string(),
                 text: text.to_string(),
-                images,
+                images: refs,
                 now: false,
             });
             self.sync_queue(&rt);
@@ -537,12 +626,35 @@ impl Hub {
         }
         // Validate and save images first, so a failure doesn't start the process
         let (refs, prompt_images) = self.save_images(id, images)?;
-        let tx = match self.running_tx(&rt) {
+        self.deliver(&rt, &info, text, refs, prompt_images)
+    }
+
+    /// Send a message taken off the queue (its images are already saved)
+    fn send_queued(self: &Arc<Self>, id: &str, item: Queued) -> Result<()> {
+        let rt = self.get(id)?;
+        self.cancel_resume(id, "manual");
+        let info = rt.info.lock().unwrap().clone();
+        let prompt_images = self.load_images(id, &item.images)?;
+        self.deliver(&rt, &info, &item.text, item.images, prompt_images)
+    }
+
+    /// Hand a message to the tool, starting its process if it has exited
+    fn deliver(
+        self: &Arc<Self>,
+        rt: &Arc<SessionRt>,
+        info: &SessionInfo,
+        text: &str,
+        refs: Vec<ImageRef>,
+        prompt_images: Vec<PromptImage>,
+    ) -> Result<()> {
+        let id = info.id.as_str();
+        self.clear_interrupted(rt);
+        let tx = match self.running_tx(rt) {
             Some(tx) => tx,
             None => {
-                let spec = self.spec_for(&info, false, 120, 32)?;
-                self.launch(&rt, spec)?;
-                self.running_tx(&rt).ok_or_else(|| anyhow!("启动失败"))?
+                let spec = self.spec_for(info, false, 120, 32)?;
+                self.launch(rt, spec)?;
+                self.running_tx(rt).ok_or_else(|| anyhow!("启动失败"))?
             }
         };
         if info.mode == SessionMode::Terminal {
@@ -600,6 +712,29 @@ impl Hub {
             });
         }
         Ok((refs, out))
+    }
+
+    /// Images of a queued message, read back from the upload directory
+    fn load_images(&self, sid: &str, refs: &[ImageRef]) -> Result<Vec<PromptImage>> {
+        use base64::Engine;
+        refs.iter()
+            .map(|r| {
+                let path = uploads_dir(sid).join(&r.id);
+                let bytes = std::fs::read(&path).map_err(|_| anyhow!("排队消息里的图片已经不在了"))?;
+                Ok(PromptImage {
+                    mime_type: r.mime_type.clone(),
+                    data: base64::engine::general_purpose::STANDARD.encode(bytes),
+                    path,
+                })
+            })
+            .collect()
+    }
+
+    /// Delete the saved images of queued messages that won't be sent
+    fn remove_images(&self, sid: &str, refs: &[ImageRef]) {
+        for r in refs {
+            let _ = std::fs::remove_file(uploads_dir(sid).join(&r.id));
+        }
     }
 
     /// Read an image from a user message
@@ -691,11 +826,14 @@ impl Hub {
             i.status = SessionStatus::Exited;
             i.pending_permissions = 0;
             i.queued.clear();
+            i.queue_paused = None;
+            i.restart_interrupted = false;
             i.background_tasks.clear();
             i.auto_resume = None;
             i.limit_hits = 0;
             i.clone()
         };
+        let _ = self.store.save_queue(id, "[]");
         *rt.resume_token.lock().unwrap() += 1;
         *rt.limited.lock().unwrap() = false;
         rt.pending.lock().unwrap().clear();
@@ -894,9 +1032,12 @@ impl Hub {
         info.status = SessionStatus::Exited;
         info.pending_permissions = 0;
         info.queued.clear();
+        info.queue_paused = None;
+        info.restart_interrupted = false;
         info.background_tasks.clear();
         rt.pending.lock().unwrap().clear();
         rt.queue.lock().unwrap().clear();
+        let _ = self.store.save_queue(id, "[]");
         rt.term.lock().unwrap().clear();
         rt.commands.lock().unwrap().clear();
         *rt.interrupted.lock().unwrap() = false;
@@ -916,58 +1057,139 @@ impl Hub {
         self.launch(&rt, spec)
     }
 
-    /// Sync the queue onto the session info so clients can show it
+    /// Save the queue and sync it onto the session info so clients can show it. An empty queue is no longer held
     fn sync_queue(&self, rt: &SessionRt) {
-        let list: Vec<QueuedMessage> = rt
-            .queue
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|q| QueuedMessage {
-                id: q.id.clone(),
-                text: q.text.clone(),
-                images: q.images.len() as u32,
-            })
-            .collect();
+        let (list, items) = {
+            let q = rt.queue.lock().unwrap();
+            (q.iter().map(Queued::view).collect::<Vec<_>>(), serde_json::to_string(&*q).unwrap_or_else(|_| "[]".into()))
+        };
+        let sid = rt.info.lock().unwrap().id.clone();
+        if let Err(e) = self.store.save_queue(&sid, &items) {
+            crate::warn!("保存会话 {sid} 的排队消息失败: {e}");
+        }
         let info = {
             let mut i = rt.info.lock().unwrap();
-            if i.queued == list {
+            let paused = if list.is_empty() { None } else { i.queue_paused.clone() };
+            if i.queued == list && i.queue_paused == paused {
                 return;
             }
             i.queued = list;
+            i.queue_paused = paused;
             i.clone()
         };
         self.broadcast_updated(&info);
     }
 
-    /// Queued messages: remove recalls one (returns the content; the client puts it back in the input box); sendNow interrupts the current turn and sends it immediately
-    pub fn queue_action(self: &Arc<Self>, id: &str, qid: &str, action: &str) -> Result<Value> {
+    /// Hold the queue (`why`: restart / interrupt / user / handoff) or let it go again (None). Only a non-empty queue is held
+    fn set_queue_paused(&self, rt: &SessionRt, why: Option<&str>) {
+        let empty = rt.queue.lock().unwrap().is_empty();
+        let info = {
+            let mut i = rt.info.lock().unwrap();
+            let v = why.filter(|_| !empty).map(String::from);
+            if i.queue_paused == v {
+                return;
+            }
+            i.queue_paused = v;
+            i.clone()
+        };
+        // Kept with the session, so a restart doesn't lose why it was held
+        let _ = self.store.save_session(&info);
+        self.broadcast_updated(&info);
+    }
+
+    /// `session.queue`. On one message (`id`): remove recalls it (returns the text; the client puts it back in the input
+    /// box), sendNow interrupts the current turn and sends it, edit {text}, move {to}. On the whole queue: pause, resume
+    /// (an idle session sends the next message at once), clear
+    pub fn queue_action(self: &Arc<Self>, id: &str, p: &Value) -> Result<Value> {
         let rt = self.get(id)?;
+        let action = p["action"].as_str().unwrap_or("");
+        match action {
+            "pause" => {
+                self.set_queue_paused(&rt, Some("user"));
+                return Ok(Value::Null);
+            }
+            "resume" => {
+                self.set_queue_paused(&rt, None);
+                // The turn the restart cut off goes first; the queue follows once it ends
+                if rt.info.lock().unwrap().restart_interrupted {
+                    self.interrupted_action(id, "continue")?;
+                    return Ok(Value::Null);
+                }
+                let status = rt.info.lock().unwrap().status;
+                let busy = matches!(status, SessionStatus::Running | SessionStatus::WaitingPermission | SessionStatus::Starting);
+                if !busy {
+                    let next = rt.queue.lock().unwrap().pop_front();
+                    self.sync_queue(&rt);
+                    if let Some(item) = next {
+                        self.send_queued(id, item)?;
+                    }
+                }
+                return Ok(Value::Null);
+            }
+            "clear" => {
+                let items: Vec<Queued> = rt.queue.lock().unwrap().drain(..).collect();
+                self.sync_queue(&rt);
+                for it in items {
+                    self.remove_images(id, &it.images);
+                }
+                return Ok(Value::Null);
+            }
+            _ => {}
+        }
+        let qid = p["id"].as_str().ok_or_else(|| anyhow!("缺少参数 id"))?;
+        let gone = || anyhow!("这条消息已经发出去了");
+        match action {
+            "edit" => {
+                let text = p["text"].as_str().unwrap_or("");
+                {
+                    let mut q = rt.queue.lock().unwrap();
+                    let item = q.iter_mut().find(|x| x.id == qid).ok_or_else(gone)?;
+                    if text.trim().is_empty() && item.images.is_empty() {
+                        bail!("消息不能为空");
+                    }
+                    item.text = text.to_string();
+                }
+                self.sync_queue(&rt);
+                return Ok(Value::Null);
+            }
+            "move" => {
+                let to = p["to"].as_u64().ok_or_else(|| anyhow!("缺少参数 to"))? as usize;
+                {
+                    let mut q = rt.queue.lock().unwrap();
+                    let pos = q.iter().position(|x| x.id == qid).ok_or_else(gone)?;
+                    let item = q.remove(pos).unwrap();
+                    let to = to.min(q.len());
+                    q.insert(to, item);
+                }
+                self.sync_queue(&rt);
+                return Ok(Value::Null);
+            }
+            "remove" | "sendNow" => {}
+            _ => bail!("未知操作: {action}"),
+        }
         let item = {
             let mut q = rt.queue.lock().unwrap();
-            let pos = q.iter().position(|x| x.id == qid).ok_or_else(|| anyhow!("这条消息已经发出去了"))?;
+            let pos = q.iter().position(|x| x.id == qid).ok_or_else(gone)?;
             q.remove(pos).unwrap()
         };
         let text = item.text.clone();
-        match action {
-            "remove" => {}
-            "sendNow" => {
-                let status = rt.info.lock().unwrap().status;
-                let busy = matches!(status, SessionStatus::Running | SessionStatus::WaitingPermission);
-                match self.running_tx(&rt) {
-                    Some(tx) if busy => {
-                        rt.queue.lock().unwrap().push_front(Queued { now: true, ..item });
-                        *rt.interrupted.lock().unwrap() = true;
-                        let _ = tx.send(AdapterCmd::Interrupt);
-                    }
-                    _ => {
-                        self.sync_queue(&rt);
-                        self.send(id, &item.text, item.images, false)?;
-                        return Ok(json!({ "text": text }));
-                    }
+        if action == "remove" {
+            self.remove_images(id, &item.images);
+        } else {
+            let status = rt.info.lock().unwrap().status;
+            let busy = matches!(status, SessionStatus::Running | SessionStatus::WaitingPermission);
+            match self.running_tx(&rt) {
+                Some(tx) if busy => {
+                    rt.queue.lock().unwrap().push_front(Queued { now: true, ..item });
+                    *rt.interrupted.lock().unwrap() = true;
+                    let _ = tx.send(AdapterCmd::Interrupt);
+                }
+                _ => {
+                    self.sync_queue(&rt);
+                    self.send_queued(id, item)?;
+                    return Ok(json!({ "text": text }));
                 }
             }
-            _ => bail!("未知操作: {action}"),
         }
         self.sync_queue(&rt);
         Ok(json!({ "text": text }))
@@ -989,18 +1211,27 @@ impl Hub {
                 self.emit(sid, 0, EventBody::Error { message: format!("重启会话失败: {e}") });
             }
         }
-        let next = {
+        let paused = rt.info.lock().unwrap().queue_paused.is_some();
+        let (next, hold) = {
             let mut q = rt.queue.lock().unwrap();
             match q.front() {
                 // Queued messages would only hit the limit again; they go after the automatic continue (or the user's next message)
-                _ if limited => None,
-                Some(f) if f.now || !was_interrupted => q.pop_front(),
-                _ => None,
+                _ if limited => (None, false),
+                // "Send now" goes even while the queue is held
+                Some(f) if f.now => (q.pop_front(), false),
+                Some(_) if paused => (None, false),
+                // The user interrupted: hold the rest until they resume it
+                Some(_) if was_interrupted => (None, true),
+                Some(_) => (q.pop_front(), false),
+                None => (None, false),
             }
         };
+        if hold {
+            self.set_queue_paused(&rt, Some("interrupt"));
+        }
         self.sync_queue(&rt);
         if let Some(item) = next {
-            if let Err(e) = self.send(sid, &item.text, item.images, false) {
+            if let Err(e) = self.send_queued(sid, item) {
                 self.emit(sid, 0, EventBody::Error { message: format!("发送排队消息失败: {e}") });
             }
         }
@@ -1650,6 +1881,42 @@ impl Hub {
         Ok(())
     }
 
+    /// The turn cut off by a restart is being dealt with (a message goes out, or the user dismissed it)
+    fn clear_interrupted(&self, rt: &SessionRt) {
+        let info = {
+            let mut i = rt.info.lock().unwrap();
+            if !i.restart_interrupted {
+                return;
+            }
+            i.restart_interrupted = false;
+            i.clone()
+        };
+        let _ = self.store.save_session(&info);
+        self.broadcast_updated(&info);
+    }
+
+    /// `session.interrupted`: continue sends the "finish what was cut off" message (queued messages follow after that
+    /// turn, unless the queue is held); dismiss only drops the flag
+    pub fn interrupted_action(self: &Arc<Self>, id: &str, action: &str) -> Result<()> {
+        let rt = self.get(id)?;
+        let info = rt.info.lock().unwrap().clone();
+        if !info.restart_interrupted {
+            bail!("这个会话没有被重启打断的回合");
+        }
+        match action {
+            "continue" => self.send(id, &self.restart_continue_text(&info), vec![], false),
+            "dismiss" => {
+                self.clear_interrupted(&rt);
+                Ok(())
+            }
+            _ => bail!("未知操作: {action}"),
+        }
+    }
+
+    fn restart_continue_text(&self, info: &SessionInfo) -> String {
+        if self.continue_text(info) == CONTINUE_ZH { RESTART_CONTINUE_ZH } else { RESTART_CONTINUE_EN }.to_string()
+    }
+
     /// The continue message, in the UI language last reported by a client; before any client reported one, guess from the session title
     fn continue_text(&self, info: &SessionInfo) -> String {
         let lang = self.settings.read().unwrap().ui_lang.clone();
@@ -1981,6 +2248,9 @@ fn new_rt(info: SessionInfo) -> SessionRt {
 }
 
 /// What the automatic continue sends (wording follows Claude Code's own auto-continue)
+/// What "continue" sends after a daemon restart cut a turn off
+const RESTART_CONTINUE_ZH: &str = "上一轮回复被后台服务重启打断了，进行中的命令也已经停止。请先检查当前状态，接着完成被打断的任务，已经完成的部分不要重复做。";
+const RESTART_CONTINUE_EN: &str = "Your last turn was cut off by a restart of the background service, and any command it was running has stopped. Check the current state first, then finish the interrupted task; do not repeat work that is already complete.";
 const CONTINUE_ZH: &str = "额度已恢复。请继续完成额度用完时正在做的任务，已经完成的部分不要重复做。";
 const CONTINUE_EN: &str =
     "Your usage limit has reset. Continue the task you were working on when the limit was reached; do not repeat work that is already complete.";
@@ -2360,6 +2630,8 @@ mod tests {
             effort: None,
             pinned: false,
             queued: vec![],
+            queue_paused: None,
+            restart_interrupted: false,
             background_tasks: vec![],
             parent_id: None,
             synced_users: None,
@@ -2393,6 +2665,118 @@ mod tests {
         assert_eq!(exhausted_reset(&q, 0), crate::util::parse_iso("2026-10-28T05:29:59Z"));
         assert_eq!(exhausted_reset(&q, i64::MAX), None);
         assert_eq!(exhausted_reset(&json!({"windows":[{"usedPercent":99,"resetsAt":5}]}), 0), None);
+    }
+
+    fn queue_texts(hub: &Hub, id: &str) -> Vec<String> {
+        hub.info(id).unwrap().queued.into_iter().map(|q| q.text).collect()
+    }
+
+    #[tokio::test]
+    async fn queue_kept_across_restart_and_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        {
+            let hub = Hub::new(crate::store::Store::open(&db).unwrap(), DaemonSettings::default());
+            let _rx = live(&hub, "s", SessionMode::Structured, SessionStatus::Running, 0);
+            hub.store.save_session(&hub.info("s").unwrap()).unwrap();
+            hub.send("s", "one", vec![], true).unwrap();
+            hub.send("s", "two", vec![], true).unwrap();
+            assert_eq!(queue_texts(&hub, "s"), ["one", "two"]);
+            assert_eq!(hub.info("s").unwrap().queue_paused, None);
+        }
+        let hub = Hub::new(crate::store::Store::open(&db).unwrap(), DaemonSettings::default());
+        let info = hub.info("s").unwrap();
+        assert_eq!(queue_texts(&hub, "s"), ["one", "two"]);
+        assert_eq!(info.queue_paused.as_deref(), Some("restart"));
+        assert_eq!(info.status, SessionStatus::Exited);
+        // It was mid-turn: flagged, with a line in the timeline
+        assert!(info.restart_interrupted);
+        let last = hub.store.events_since("s", 0, 1000).unwrap().pop().unwrap().body;
+        assert!(matches!(last, EventBody::Interrupted { reason } if reason == "restart"));
+        // Resume first asks the tool to finish the cut-off turn; the queue follows that turn
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        *hub.get("s").unwrap().cmd.lock().unwrap() = Some(tx);
+        hub.queue_action("s", &json!({"action": "resume"})).unwrap();
+        assert!(matches!(rx.try_recv(), Ok(AdapterCmd::Send(p)) if p.text == RESTART_CONTINUE_EN));
+        let info = hub.info("s").unwrap();
+        assert!(!info.restart_interrupted && info.queue_paused.is_none());
+        assert_eq!(queue_texts(&hub, "s"), ["one", "two"]);
+        *hub.get("s").unwrap().cmd.lock().unwrap() = None;
+        drop(rx);
+        // A hold by hand keeps its reason across the next restart
+        hub.queue_action("s", &json!({"action": "pause"})).unwrap();
+        drop(hub);
+        let hub = Hub::new(crate::store::Store::open(&db).unwrap(), DaemonSettings::default());
+        assert_eq!(hub.info("s").unwrap().queue_paused.as_deref(), Some("user"));
+        assert!(hub.interrupted_action("s", "dismiss").is_err(), "not cut off this time");
+        // Clearing removes it from the store as well
+        hub.queue_action("s", &json!({"action": "clear"})).unwrap();
+        assert!(hub.info("s").unwrap().queue_paused.is_none());
+        drop(hub);
+        let hub = Hub::new(crate::store::Store::open(&db).unwrap(), DaemonSettings::default());
+        assert!(queue_texts(&hub, "s").is_empty());
+    }
+
+    #[tokio::test]
+    async fn queue_edit_move_pause_resume() {
+        let hub = Hub::new(crate::store::Store::open_memory().unwrap(), DaemonSettings::default());
+        let mut rx = live(&hub, "s", SessionMode::Structured, SessionStatus::Running, 0);
+        let em = Emitter { hub: hub.clone(), sid: "s".into(), gen: 0 };
+        for t in ["a", "b", "c"] {
+            hub.send("s", t, vec![], true).unwrap();
+        }
+        let ids: Vec<String> = hub.info("s").unwrap().queued.into_iter().map(|q| q.id).collect();
+        hub.queue_action("s", &json!({"action": "edit", "id": ids[1], "text": "B"})).unwrap();
+        hub.queue_action("s", &json!({"action": "move", "id": ids[2], "to": 0})).unwrap();
+        assert_eq!(queue_texts(&hub, "s"), ["c", "a", "B"]);
+        assert!(hub.queue_action("s", &json!({"action": "edit", "id": ids[0], "text": "  "})).is_err());
+        assert!(hub.queue_action("s", &json!({"action": "edit", "id": "gone", "text": "x"})).is_err());
+
+        // Held by hand: the turn end sends nothing
+        hub.queue_action("s", &json!({"action": "pause"})).unwrap();
+        assert_eq!(hub.info("s").unwrap().queue_paused.as_deref(), Some("user"));
+        em.event(EventBody::TurnEnd { stop_reason: Some("end_turn".into()), model: None });
+        em.status(SessionStatus::Idle, None);
+        assert!(rx.try_recv().is_err(), "a held queue must wait");
+
+        // Resuming an idle session sends the first one at once, the rest after each turn
+        hub.queue_action("s", &json!({"action": "resume"})).unwrap();
+        assert!(matches!(rx.try_recv(), Ok(AdapterCmd::Send(p)) if p.text == "c"));
+        assert_eq!(queue_texts(&hub, "s"), ["a", "B"]);
+        em.event(EventBody::TurnEnd { stop_reason: Some("end_turn".into()), model: None });
+        assert!(matches!(rx.try_recv(), Ok(AdapterCmd::Send(p)) if p.text == "a"));
+
+        // An interrupted turn holds the rest, and says why
+        hub.interrupt("s").unwrap();
+        assert!(matches!(rx.try_recv(), Ok(AdapterCmd::Interrupt)));
+        em.event(EventBody::TurnEnd { stop_reason: Some("interrupted".into()), model: None });
+        assert!(rx.try_recv().is_err());
+        assert_eq!(hub.info("s").unwrap().queue_paused.as_deref(), Some("interrupt"));
+        // The last message leaving the queue ends the hold
+        hub.queue_action("s", &json!({"action": "remove", "id": hub.info("s").unwrap().queued[0].id})).unwrap();
+        assert!(hub.info("s").unwrap().queue_paused.is_none());
+    }
+
+    #[tokio::test]
+    async fn hand_over_moves_queue_and_cancels_resume() {
+        let hub = Hub::new(crate::store::Store::open_memory().unwrap(), DaemonSettings::default());
+        let _ra = live(&hub, "a", SessionMode::Structured, SessionStatus::Running, 0);
+        let _rb = live(&hub, "b", SessionMode::Structured, SessionStatus::Running, 0);
+        let em = Emitter { hub: hub.clone(), sid: "a".into(), gen: 0 };
+        hub.send("a", "next step", vec![], true).unwrap();
+        em.event(crate::adapters::limit_hit(Some(now_ms() + 3_600_000), None));
+        em.event(EventBody::TurnEnd { stop_reason: Some("error".into()), model: None });
+        assert!(hub.info("a").unwrap().auto_resume.is_some());
+
+        let to = hub.info("b").unwrap();
+        hub.hand_over("a", &hub.get("a").unwrap(), &to);
+        let a = hub.info("a").unwrap();
+        assert!(a.auto_resume.is_none() && a.queued.is_empty());
+        assert_eq!(limit_phases(&hub, "a").last().map(String::as_str), Some("cancelled:handoff"));
+        assert_eq!(queue_texts(&hub, "b"), ["next step"]);
+        assert_eq!(hub.info("b").unwrap().queue_paused.as_deref(), Some("handoff"));
+        let last = hub.store.events_since("a", 0, 1000).unwrap().pop().unwrap().body;
+        assert!(matches!(last, EventBody::Handoff { session_id, to: true, .. } if session_id == "b"));
     }
 
     fn limit_phases(hub: &Hub, id: &str) -> Vec<String> {

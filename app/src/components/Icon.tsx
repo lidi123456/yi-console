@@ -47,6 +47,8 @@ const paths: Record<string, string> = {
   bell: 'M6 16V11a6 6 0 1 1 12 0v5l2 2H4zM10 20a2 2 0 0 0 4 0',
   shield: 'M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6z',
   play: 'M7 5l12 7-12 7z',
+  pause: 'M8 5v14M16 5v14',
+  grip: 'M9 6h.01M15 6h.01M9 12h.01M15 12h.01M9 18h.01M15 18h.01',
   arrowUp: 'M12 19V5M6 11l6-6 6 6',
   image: 'M4 5h16v14H4zM4 16l5-5 4 4 3-3 4 4M15 9h.01',
   copy: 'M8 8h12v12H8zM4 16V4h12',

@@ -17,5 +17,6 @@
   "youSentAMessageAutomatic": "你发送了消息，不再自动继续",
   "switchedToTheTerminalUi": "切换到了终端界面，不再自动继续",
   "theSessionWasBusyAutomatic": "会话正在运行，跳过了自动继续",
-  "automaticContinueCancelled2": "自动继续已取消"
+  "automaticContinueCancelled2": "自动继续已取消",
+  "handedOffAutomaticContinueCancelled": "已交给另一个工具，不再自动继续"
 }

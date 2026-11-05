@@ -65,7 +65,7 @@ export async function exportSession(hostId: string, info: SessionInfo, how: 'cop
 
 /** Continue with another tool: find the original session's log file (for tools like Cursor with no readable file, export to Markdown into the session's upload directory),
  *  open the new session dialog, and have the first message ask the new tool to read the log and report back */
-export async function handoffSession(hostId: string, info: SessionInfo) {
+export async function handoffSession(hostId: string, info: SessionInfo, opts: { limit?: boolean } = {}) {
   try {
     // The daemon also says whether there's any user message: a session with no conversation yet has nothing to hand off
     // (the menu already filters most by externalId; this catches ACP sessions created before anything was said, and after /clear).
@@ -94,7 +94,17 @@ export async function handoffSession(hostId: string, info: SessionInfo) {
       const name = `${safeFileName(info.title)}.md`;
       path = (await rpc<{ path: string }>(hostId, 'session.attachFile', { sessionId: info.id, name, data: toB64(md) })).path;
     }
-    setState({ newSession: { hostId, cwd: info.cwd, handoff: { from: info.tool, prompt: handoffPrompt(info, path, exported) } } });
+    // From a usage limit: don't default to a tool that is itself waiting for its limit to reset on this host
+    const avoid = opts.limit
+      ? [...new Set((getState().sessions[hostId] ?? []).filter((s) => s.autoResume).map((s) => s.tool))]
+      : undefined;
+    setState({
+      newSession: {
+        hostId,
+        cwd: info.cwd,
+        handoff: { from: info.tool, prompt: handoffPrompt(info, path, exported), fromId: info.id, perm: info.permissionMode, avoid },
+      },
+    });
   } catch (e) {
     errorToast(e);
   }

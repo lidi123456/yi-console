@@ -14,6 +14,7 @@ import { openMenu } from './Overlay';
 import { copiedRef, DRAG_REF, INSERT_COMPOSER, toB64 } from './FilePanel';
 import { getPermModesList, permModes } from './NewSession';
 import { ModelPicker, OPEN_MODEL } from './ModelPicker';
+import { QueueList } from './QueueList';
 
 const t = getT('composer');
 
@@ -598,14 +599,12 @@ export function Composer({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [waitSend, uploads.length, uploadsDone, text]);
 
-  const queueAction = async (id: string, action: 'remove' | 'sendNow') => {
+  /** Recall a queued message into the input box (↑ in an empty input box) */
+  const recallQueued = async (id: string) => {
     try {
-      const r = await rpc<{ text: string }>(hostId, 'session.queue', { sessionId: info.id, id, action });
-      if (action === 'remove') {
-        // Recalled messages go back into the input box so they can be edited and resent
-        setText((t) => (t.trim() ? `${t}\n${r.text}` : r.text));
-        ta.current?.focus();
-      }
+      const r = await rpc<{ text: string }>(hostId, 'session.queue', { sessionId: info.id, id, action: 'remove' });
+      setText((t) => (t.trim() ? `${t}\n${r.text}` : r.text));
+      ta.current?.focus();
     } catch (e) {
       errorToast(e);
     }
@@ -654,7 +653,7 @@ export function Composer({
     // ↑ in an empty input box: recall the last queued message for editing
     if (e.key === 'ArrowUp' && !text && queued.length > 0) {
       e.preventDefault();
-      queueAction(queued[queued.length - 1].id, 'remove');
+      recallQueued(queued[queued.length - 1].id);
       return;
     }
     if (e.key === 'Enter' && !e.shiftKey && !isMobile()) {
@@ -680,26 +679,15 @@ export function Composer({
 
   return (
     <>
-      {queued.length > 0 && (
-        <div className="queue">
-          {queued.map((q, i) => (
-            <div key={q.id} className="queue-item">
-              <Icon name="history" size={14} />
-              <span className="queue-text truncate" title={q.text}>
-                {q.text || t('image')}
-                {q.images > 0 && <span className="muted"> · {t('imageS', { images: q.images })}</span>}
-              </span>
-              <span className="muted small hide-mobile">{i === 0 ? t('sendAfterCurrentTurn') : t('queued')}</span>
-              <button className="btn small" title={t('interruptCurrentTurnAndSend')} onClick={() => queueAction(q.id, 'sendNow')}>
-                {t('sendNow')}
-              </button>
-              <button className="icon-btn" title={t('recallToInputOrPress')} onClick={() => queueAction(q.id, 'remove')}>
-                <Icon name="x" size={14} />
-              </button>
-            </div>
-          ))}
-        </div>
-      )}
+      <QueueList
+        hostId={hostId}
+        info={info}
+        onRecall={(r) => {
+          // Recalled messages go back into the input box so they can be edited and resent
+          setText((t) => (t.trim() ? `${t}\n${r}` : r));
+          ta.current?.focus();
+        }}
+      />
       <div
         className={`composer ${drag ? 'drag' : ''}`}
         onDragOver={(e) => {

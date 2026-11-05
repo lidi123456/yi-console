@@ -1,4 +1,4 @@
-//! SQLite persistence: session metadata, event log, usage records.
+//! SQLite persistence: session metadata, event log, usage records, queued messages.
 
 use anyhow::Result;
 use yi_proto::{Event, EventBody, SessionInfo, Usage};
@@ -47,7 +47,11 @@ impl Store {
                  cost_usd REAL NOT NULL,
                  credits REAL NOT NULL
              );
-             CREATE INDEX IF NOT EXISTS usage_ts ON usage_log(ts);",
+             CREATE INDEX IF NOT EXISTS usage_ts ON usage_log(ts);
+             CREATE TABLE IF NOT EXISTS queues (
+                 session_id TEXT PRIMARY KEY,
+                 items TEXT NOT NULL
+             );",
         )?;
         Ok(Store {
             conn: Mutex::new(conn),
@@ -115,7 +119,31 @@ impl Store {
         let c = self.conn.lock().unwrap();
         c.execute("DELETE FROM sessions WHERE id = ?1", params![id])?;
         c.execute("DELETE FROM events WHERE session_id = ?1", params![id])?;
+        c.execute("DELETE FROM queues WHERE session_id = ?1", params![id])?;
         Ok(())
+    }
+
+    /// A session's queued messages (JSON array, written whole on every change); an empty queue removes the row
+    pub fn save_queue(&self, id: &str, items: &str) -> Result<()> {
+        let c = self.conn.lock().unwrap();
+        if items == "[]" {
+            c.execute("DELETE FROM queues WHERE session_id = ?1", params![id])?;
+        } else {
+            c.execute(
+                "INSERT INTO queues(session_id, items) VALUES(?1, ?2)
+                 ON CONFLICT(session_id) DO UPDATE SET items = excluded.items",
+                params![id, items],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// All saved queues: (session id, JSON array)
+    pub fn load_queues(&self) -> Result<Vec<(String, String)>> {
+        let c = self.conn.lock().unwrap();
+        let mut st = c.prepare("SELECT session_id, items FROM queues")?;
+        let rows = st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
     /// Delete all of a session's events (/clear); the session itself is kept
@@ -282,6 +310,8 @@ mod tests {
             auto_resume: None,
             limit_hits: 0,
             queued: vec![],
+            queue_paused: None,
+            restart_interrupted: false,
             background_tasks: vec![],
         }
     }

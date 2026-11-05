@@ -17,5 +17,6 @@
   "youSentAMessageAutomatic": "you sent a message, automatic continue dropped",
   "switchedToTheTerminalUi": "switched to the terminal UI, automatic continue dropped",
   "theSessionWasBusyAutomatic": "the session was busy, automatic continue skipped",
-  "automaticContinueCancelled2": "automatic continue cancelled"
+  "automaticContinueCancelled2": "automatic continue cancelled",
+  "handedOffAutomaticContinueCancelled": "handed off to another tool, no automatic continue"
 }

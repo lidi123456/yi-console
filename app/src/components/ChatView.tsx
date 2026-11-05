@@ -3,10 +3,11 @@ import { createContext, memo, useContext, useEffect, useLayoutEffect, useMemo, u
 import { type ImgCtx } from '../chatImages';
 import { getT, isEn, trErr, useLang } from '../i18n';
 import { rpc } from '../transport';
-import type { FileDiff, HubEvent, ImageRef, PermissionOption, PlanEntry, Question, QuestionAnswer, SessionInfo, Usage } from '../types';
+import { TOOL_LABEL, type FileDiff, type HubEvent, type ImageRef, type PermissionOption, type PlanEntry, type Question, type QuestionAnswer, type SessionInfo, type Usage } from '../types';
 import { clock, fmtTokens, isMobile, lsGet, lsSet } from '../util';
 import { writeClipboard } from '../clipboard';
-import { toast, useStore } from '../store';
+import { navigate, toast, useStore } from '../store';
+import { handoffSession } from './SessionActions';
 import { DiffView, diffLines } from './DiffView';
 import { openImage } from './Lightbox';
 import { imageMenu } from './ImageMenu';
@@ -49,6 +50,7 @@ type Item =
   | { k: 'compact'; key: string; ev: HubEvent & { kind: 'compact' } }
   /** One usage-limit episode: the hit plus the latest decision about the automatic continue */
   | { k: 'limit'; key: string; hit?: LimitEvent; last: LimitEvent }
+  | { k: 'handoff'; key: string; ev: HubEvent & { kind: 'handoff' } }
   | {
       k: 'turn';
       key: string;
@@ -176,6 +178,12 @@ function buildItems(events: HubEvent[], hideCompactCmd = false): Item[] {
         else last.last = e;
         break;
       }
+      case 'handoff':
+        items.push({ k: 'handoff', key, ev: e });
+        break;
+      case 'interrupted':
+        items.push({ k: 'note', key, text: t('turnCutOffByRestart'), tone: 'muted' });
+        break;
       case 'compact': {
         // On completion, replace the "compacting" line in place with the result
         let last: Item | undefined;
@@ -626,10 +634,14 @@ function Waiting({ since, starting }: { since: number; starting?: boolean }) {
 const ktok = (n: number) => (n >= 1000 ? `${(n / 1000).toFixed(n >= 10000 ? 0 : 1)}k` : String(n));
 
 /** Usage limit line in the timeline; the countdown and buttons live in `LimitDock` above the input box */
-function LimitNote({ it, live }: { it: Extract<Item, { k: 'limit' }>; live: boolean }) {
+function LimitNote({ it, live, hostId, info }: { it: Extract<Item, { k: 'limit' }>; live: boolean; hostId?: string; info?: SessionInfo }) {
   const resets = it.last.resetsAt ?? it.hit?.resetsAt;
   const tail = limitOutcome(it.last, live);
   const ok = it.last.phase === 'resumed';
+  // The latest limit with no automatic continue pending (that one has the button in LimitDock): offer another tool.
+  // Not after it was handed off already, or the user carried on in this session
+  const settled = ok || (it.last.phase === 'cancelled' && (it.last.reason === 'handoff' || it.last.reason === 'manual'));
+  const offer = live && !settled && !!hostId && !!info && !info.autoResume && info.mode === 'structured';
   return (
     <div className={`note limit-note ${ok ? 'note-muted' : 'limit-note-warn'}`}>
       <Icon name="clock" size={13} />
@@ -637,6 +649,28 @@ function LimitNote({ it, live }: { it: Extract<Item, { k: 'limit' }>; live: bool
         {limitHead(it.hit ?? it.last, resets)}
         {tail && (isEn() ? `; ${tail}` : `，${tail}`)}
       </span>
+      {offer && (
+        <button className="btn small" onClick={() => handoffSession(hostId!, info!, { limit: true })}>
+          {t('continueInAnotherTool')}
+        </button>
+      )}
+    </div>
+  );
+}
+
+/** Continue with another tool: in the original session where the work went, in the new one where it came from */
+function HandoffNote({ ev, hostId }: { ev: HubEvent & { kind: 'handoff' }; hostId?: string }) {
+  const exists = useStore((s) => !!hostId && (s.sessions[hostId] ?? []).some((x) => x.id === ev.sessionId));
+  const tool = TOOL_LABEL[ev.tool] ?? ev.tool;
+  return (
+    <div className="note note-muted handoff-note">
+      <Icon name="forward" size={13} />
+      <span>{ev.to ? t('handedOffTo', { tool }) : t('tookOverFrom', { tool })}</span>
+      {exists && (
+        <button className="btn small" onClick={() => navigate({ kind: 'session', hostId: hostId!, sessionId: ev.sessionId })}>
+          {ev.to ? t('openNewSession') : t('openOriginalSession')}
+        </button>
+      )}
     </div>
   );
 }
@@ -1522,7 +1556,9 @@ export function ChatView({
               // Kiro compacts after its /compact turn has ended, while the session is idle
               return <CompactNote key={it.key} ev={it.ev} live={!!busy || (info?.tool === 'kiro' && info.status === 'idle')} />;
             case 'limit':
-              return <LimitNote key={it.key} it={it} live={it.key === lastLimitKey} />;
+              return <LimitNote key={it.key} it={it} live={it.key === lastLimitKey} hostId={hostId} info={info} />;
+            case 'handoff':
+              return <HandoffNote key={it.key} ev={it.ev} hostId={hostId} />;
           }
         })}
         {textAsk && onSendText && (

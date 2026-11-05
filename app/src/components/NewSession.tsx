@@ -189,7 +189,16 @@ export function NewSessionDialog() {
     // Continue with another tool: default to the last tool used; if that's the original tool, pick the other of claude / codex first (switched below if not installed)
     const last = lsGet<ToolKind>('last-tool', 'claude');
     const from = ns.handoff?.from;
-    setTool((ns.tool as ToolKind) ?? (from && (last === from || last === 'shell' || last === 'files') ? (from === 'claude' ? 'codex' : 'claude') : last));
+    let pick = (ns.tool as ToolKind) ?? (from && (last === from || last === 'shell' || last === 'files') ? (from === 'claude' ? 'codex' : 'claude') : last);
+    const avoid = ns.handoff?.avoid ?? [];
+    if (ns.handoff && avoid.includes(pick)) {
+      // Waiting for its own limit to reset: the first installed tool that isn't, if any
+      const alt = hostStatus(ns.hostId).hello?.tools.find(
+        (t) => t.available && t.kind !== from && t.kind !== 'shell' && t.kind !== 'files' && !avoid.includes(t.kind),
+      );
+      if (alt) pick = alt.kind;
+    }
+    setTool(pick);
     setPrompt(ns.handoff?.prompt ?? '');
     setCommand('');
     setPicking(false);
@@ -202,7 +211,9 @@ export function NewSessionDialog() {
     // Continue with another tool only uses chat mode: the first message has to be sent through chat mode
     const m = ns.handoff ? 'structured' : (p.mode ?? lsGet<'structured' | 'terminal'>('last-mode', 'structured'));
     setMode(m);
-    setPerm(p.perm && permModes(tool, m).some((x) => x[0] === p.perm) ? p.perm : 'default');
+    // Continue with another tool keeps the original session's permission mode when this tool has it, else default
+    const want = ns.handoff ? ns.handoff.perm || 'default' : p.perm;
+    setPerm(want && permModes(tool, m).some((x) => x[0] === want) ? want : 'default');
     setModel(p.model ?? '');
     setEffort(p.effort ?? '');
   }, [ns, tool]);
@@ -248,6 +259,7 @@ export function NewSessionDialog() {
         effort: aiTool ? sendEffort || undefined : undefined,
         command: tool === 'shell' ? command || undefined : undefined,
         resumeId: ns.resumeId,
+        handoffFrom: ns.handoff?.fromId,
         title: ns.title,
         cols: 120,
         rows: 32,
@@ -260,7 +272,7 @@ export function NewSessionDialog() {
         // Continue with another tool always uses chat mode; don't record that as the user's chosen UI
         if (!ns.handoff) lsSet('last-mode', mode);
         const all = lsGet<Record<string, ToolPrefs>>(PREFS_KEY, {});
-        all[tool] = { mode: ns.handoff ? all[tool]?.mode : mode, perm, model, effort: sendEffort };
+        all[tool] = { mode: ns.handoff ? all[tool]?.mode : mode, perm: ns.handoff ? all[tool]?.perm : perm, model, effort: sendEffort };
         lsSet(PREFS_KEY, all);
       }
       close();

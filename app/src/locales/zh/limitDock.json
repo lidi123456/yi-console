@@ -5,5 +5,8 @@
   "sendContinueRightAway": "现在就发送“继续”",
   "continueNow": "立即继续",
   "continue": "立即继续",
-  "cancel": "取消"
+  "cancel": "取消",
+  "handOffToAnotherTool": "换工具继续",
+  "switchTool": "换工具",
+  "handOffToAnotherToolTitle": "不等额度恢复，交给另一个工具接着做（第一轮先汇报）"
 }

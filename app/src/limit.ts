@@ -87,6 +87,8 @@ export function limitOutcome(e: LimitEvent, live: boolean): string {
           return t('automaticContinueIsTurnedOff');
         case 'busy':
           return t('theSessionWasBusyAutomatic');
+        case 'handoff':
+          return t('handedOffAutomaticContinueCancelled');
         default:
           return t('automaticContinueCancelled2');
       }

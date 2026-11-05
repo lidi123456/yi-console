@@ -263,7 +263,19 @@ pub async fn dispatch(
             tokio::task::spawn_blocking(move || hub2.send(&sid, &text, images, queue)).await??;
             Value::Null
         }
-        SESSION_QUEUE => hub.queue_action(s(&p, "sessionId")?, s(&p, "id")?, s(&p, "action")?)?,
+        SESSION_QUEUE => {
+            let sid = s(&p, "sessionId")?.to_string();
+            let hub2 = hub.clone();
+            // resume / sendNow may start the tool process, like session.send
+            tokio::task::spawn_blocking(move || hub2.queue_action(&sid, &p)).await??
+        }
+        SESSION_INTERRUPTED => {
+            let sid = s(&p, "sessionId")?.to_string();
+            let action = s(&p, "action")?.to_string();
+            let hub2 = hub.clone();
+            tokio::task::spawn_blocking(move || hub2.interrupted_action(&sid, &action)).await??;
+            Value::Null
+        }
         SESSION_SET_PERMISSION_MODE => {
             hub.set_permission_mode(s(&p, "sessionId")?, s(&p, "mode")?)?;
             Value::Null

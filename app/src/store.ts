@@ -62,8 +62,10 @@ export interface State {
     tool?: string;
     resumeId?: string;
     title?: string;
-    /** Continue with another tool: the original session's tool (the new session can't pick it) and the prefilled first message */
-    handoff?: { from: ToolKind; prompt: string };
+    /** Continue with another tool: the original session's tool (the new session can't pick it), the prefilled first
+     *  message, the original session (`session.create` handoffFrom), its permission mode (kept if the new tool has it,
+     *  else default, never raised) and tools to avoid as the default pick (sessions of theirs wait for a limit reset) */
+    handoff?: { from: ToolKind; prompt: string; fromId?: string; perm?: string | null; avoid?: ToolKind[] };
   } | null;
   /** This device's settings (proxy, notifications), stored in the client data directory */
   client: ClientSettings | null;

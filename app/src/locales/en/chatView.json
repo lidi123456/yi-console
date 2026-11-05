@@ -71,5 +71,11 @@
   "kiroIsWaitingForYour": "Kiro is waiting for your choice",
   "sendAnswer": "Send answer",
   "sendAMessageToStart": "Send a message to start",
-  "jumpToBottom": "Jump to bottom"
+  "jumpToBottom": "Jump to bottom",
+  "continueInAnotherTool": "Continue in another tool",
+  "handedOffTo": "Handed off to {{tool}}",
+  "tookOverFrom": "Took over from a {{tool}} session",
+  "openNewSession": "Open new session",
+  "openOriginalSession": "Open original session",
+  "turnCutOffByRestart": "The background service restarted; this turn was cut off"
 }

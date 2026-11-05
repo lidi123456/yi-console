@@ -5,5 +5,8 @@
   "sendContinueRightAway": "Send \"continue\" right away",
   "continueNow": "Continue now",
   "continue": "Continue",
-  "cancel": "Cancel"
+  "cancel": "Cancel",
+  "handOffToAnotherTool": "Continue in another tool",
+  "switchTool": "Switch",
+  "handOffToAnotherToolTitle": "Don't wait for the limit: hand this to another tool (its first turn reports back)"
 }
