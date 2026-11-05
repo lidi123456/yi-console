@@ -72,7 +72,9 @@ assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= 390)
 await set('```mermaid\nflowchart TD\nA -->\n```', false);
 await page.getByText('Could not render the diagram. Check the source syntax.').waitFor();
 await set('```mermaid\nflowchart TD\nA --> B\nclick A "https://example.com"\n```', false);
-await page.getByText(/unsupported syntax/).waitFor();
+await page.waitForFunction(() => document.querySelector('.mermaid-scroll img')?.naturalWidth > 0);
+await set('```mermaid\nflowchart LR\n' + Array.from({ length: 301 }, (_, i) => `n${i} --> n${i + 1}`).join('\n') + '\n```', false);
+await page.getByText(/exceeds the size limit/).waitFor();
 await set(fence, false);
 await page.getByText('The diagram code fence is unclosed. Source preserved.').waitFor();
 await set(
@@ -103,29 +105,33 @@ await page.evaluate(async () => {
     const blob = await window.diagramPng(d);
     if (!blob.size) throw new Error('Empty PNG: ' + source);
   }
-  for (const bad of [
-    '---\nconfig: {}\n---\nflowchart LR\nA-->B',
-    'flowchart LR\nA@{img: "https://example.com/x"}',
-    'flowchart LR\nclassDef x fill:url(#p)',
-    'flowchart LR\nclassDef x fill:red,background-image:none',
-    'flowchart LR\nstyle A fill:red}svg{display:none',
-    'flowchart LR\nstyle A fill:"red"',
-    'flowchart LR\nlinkStyle 0 stroke:red !important',
-    'flowchart LR\nstyle',
-    'flowchart LR\n%%{init: {}}%%',
-    'flowchart LR\n' + 'x'.repeat(30001),
+  // Nothing is filtered by syntax any more (strict mode + CSP + sanitized <img>): these all render, with no active content
+  for (const source of [
+    '---\nconfig:\n  securityLevel: loose\n  htmlLabels: true\n---\nflowchart LR\nA["<b>bold</b><br/>next"]-->B',
+    'flowchart LR\n%%{init: {"securityLevel": "loose", "flowchart": {"htmlLabels": true}}}%%\nA["<img src=x onerror=alert(1)>"]-->B',
+    'flowchart LR\nA-->B\nclick A "javascript:alert(1)"\nclick B href "https://example.com"',
+    'flowchart LR\nA-->B\nclassDef x fill:#f00,background-image:none\nstyle A fill:red,stroke-width:4px\nlinkStyle 0 stroke:red !important\nclass B x',
+    'stateDiagram-v2\n classDef xss fill:red</style></svg><script>window.__pwn=1</script><svg><style>a:b\n [*] --> A:::xss',
+    'flowchart TB\n A["first<br/>second<br>third"] --> B["x<BR />y"]',
+    'architecture-beta\n service db(database)[DB]\n service api(server)[API]\n db:L -- R:api',
+    'sankey-beta\nA,B,10\nB,C,5',
   ]) {
+    const d = await window.renderDiagram(source, false, 'system-ui', 14);
+    if (/<script|<foreignObject|\son[a-z]+=|href=|javascript:/i.test(d.svg)) throw new Error('Active content in SVG: ' + source);
+    if (window.__pwn) throw new Error('Injected script ran: ' + source);
+  }
+  for (const big of ['flowchart LR\n' + 'x'.repeat(30001)]) {
     let rejected = false;
     try {
-      window.validateDiagram(bad);
+      window.validateDiagram(big);
     } catch {
       rejected = true;
     }
-    if (!rejected) throw new Error('Unsafe source accepted');
+    if (!rejected) throw new Error('Oversized source accepted');
   }
 });
 assert.deepEqual(errors, []);
 console.log(
-  'PASS: streaming, stable portals, source/copy, SVG/PNG downloads, fullscreen zoom/pan/Escape, theme, mobile, errors, nested fences, 10 diagram types, colour styles and resource/config/CSS limits.',
+  'PASS: streaming, stable portals, source/copy, SVG/PNG downloads, fullscreen zoom/pan/Escape, theme, mobile, errors, nested fences, 10 diagram types, unfiltered syntax without active content, and size limits.',
 );
 await browser.close();

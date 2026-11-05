@@ -5,60 +5,17 @@ const cache = new Map<string, Promise<Diagram>>();
 let queue: Promise<unknown> = Promise.resolve();
 let serial = 0;
 
-/** Sources are untrusted. Keep configuration and active/resource-bearing syntax out of the renderer. */
+/** Sources come from AI replies. No syntax is filtered: `securityLevel: 'strict'` with the `secure` keys below stops
+ *  directives / frontmatter from turning on HTML labels or click handlers, the main window's CSP stops any injected
+ *  markup from running scripts, and the SVG is sanitized and shown as an <img>. Only size is capped, since rendering
+ *  runs on the main thread. Known gap: image nodes with remote URLs (`A@{ img: "https://…" }`) are fetched while the
+ *  diagram renders, unlike chat images, which load on click. */
 export function validateDiagram(source: string) {
-  if (source.length > 30000) throw new Error('limit');
-  if (
-    !/^\s*(?:flowchart|graph|sequenceDiagram|stateDiagram(?:-v2)?|classDiagram|erDiagram|gantt|pie|mindmap|timeline|gitGraph)\b/.test(
-      source,
-    )
-  )
-    throw new Error('unsupported');
-  if (
-    /%%\s*\{|^\s*---|(?:https?|file|data|javascript):|(?:src|href)\s*=|<\s*\/?[a-z]|\b(?:image|icon|img)\s*:|@\{|(?:^|[;\n])\s*click\b/im.test(
-      source,
-    )
-  )
-    throw new Error('unsafe');
-  checkStyles(source);
+  if (source.length > MAX_TEXT) throw new Error('limit');
 }
 
-// Styling statements are CSS underneath: only plain colour/stroke/font properties with simple values pass.
-const STYLE_PROPS = new Set([
-  'fill',
-  'stroke',
-  'color',
-  'stroke-width',
-  'stroke-dasharray',
-  'stroke-opacity',
-  'fill-opacity',
-  'opacity',
-  'font-weight',
-  'font-style',
-  'font-size',
-]);
-const NUM = String.raw`-?\d+(?:\.\d+)?(?:px|em|%)?`;
-const STYLE_VALUE = new RegExp(
-  String.raw`^(?:#[0-9a-f]{3,8}|[a-z]+|${NUM}(?:\s+${NUM})*)$`,
-  'i',
-);
-
-function checkStyles(source: string) {
-  for (const stmt of source.split(/[;\n]/)) {
-    const head = /^\s*(style|classDef|linkStyle)\b/.exec(stmt);
-    if (!head) continue;
-    const m =
-      head[1] === 'linkStyle'
-        ? /^\s*linkStyle\s+(?:default|\d+(?:\s*,\s*\d+)*)\s+(?:interpolate\s+[a-zA-Z]+\s*)?(.*?)\s*$/.exec(stmt)
-        : /^\s*(?:style|classDef)\s+[\w-]+(?:\s*,\s*[\w-]+)*\s+(.*?)\s*$/.exec(stmt);
-    if (!m) throw new Error('unsafe');
-    if (!m[1]) continue; // linkStyle with only interpolate
-    for (const decl of m[1].split(',')) {
-      const d = /^\s*([a-z-]+)\s*:\s*(.*?)\s*$/i.exec(decl);
-      if (!d || !STYLE_PROPS.has(d[1].toLowerCase()) || !STYLE_VALUE.test(d[2])) throw new Error('unsafe');
-    }
-  }
-}
+const MAX_TEXT = 30000;
+const MAX_EDGES = 300;
 
 export function renderDiagram(source: string, dark: boolean, font: string, fontSize: number): Promise<Diagram> {
   const key = JSON.stringify([source, dark, font, fontSize]);
@@ -71,8 +28,8 @@ export function renderDiagram(source: string, dark: boolean, font: string, fontS
       startOnLoad: false,
       securityLevel: 'strict',
       suppressErrorRendering: true,
-      maxTextSize: 30000,
-      maxEdges: 300,
+      maxTextSize: MAX_TEXT,
+      maxEdges: MAX_EDGES,
       theme: dark ? 'dark' : 'default',
       fontFamily: font,
       themeVariables: { fontFamily: font, fontSize: `${fontSize}px` },
@@ -95,7 +52,9 @@ export function renderDiagram(source: string, dark: boolean, font: string, fontS
     host.style.cssText = 'position:fixed;left:-100000px;top:0;visibility:hidden;pointer-events:none';
     document.body.append(host);
     try {
-      const { svg } = await mermaid.render(`yiDiagram${++serial}`, source, host);
+      const { svg } = await mermaid.render(`yiDiagram${++serial}`, source, host).catch((e: unknown) => {
+        throw e instanceof Error && /Edge limit exceeded|Maximum text size/i.test(e.message) ? new Error('limit') : e;
+      });
       const clean = DOMPurify.sanitize(svg, {
         USE_PROFILES: { svg: true, svgFilters: true },
         FORBID_TAGS: ['foreignObject', 'image', 'a', 'script', 'animate', 'set'],

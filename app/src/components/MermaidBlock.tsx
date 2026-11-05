@@ -146,7 +146,7 @@ export function MermaidBlock({ source, closed, streaming }: { source: string; cl
       )}
       {error !== undefined && (
         <div className="mermaid-status" role="status">
-          {['unsafe', 'unsupported', 'limit'].includes(error) ? t('restricted') : t('failed')}
+          {error === 'limit' ? t('restricted') : t('failed')}
         </div>
       )}
       {showSource || (!closed && !streaming) || error !== undefined ? (
