@@ -184,11 +184,7 @@ impl Desktop {
     pub fn mcp_config(&self, sid: &str) -> Option<Value> {
         let control = self.control.lock().unwrap();
         control.grants.get(sid)?;
-        Some(
-            json!({"command": std::env::current_exe().ok()?.to_string_lossy(),
-            "args": ["--home", crate::paths::base_dir().to_string_lossy().as_ref(), "computer-use-mcp", "--session", sid,
-                "--ticket-file", Self::ticket_path(sid).to_string_lossy().as_ref()] }),
-        )
+        Some(json!({"command": std::env::current_exe().ok()?.to_string_lossy(), "args": proxy_args(std::env::var_os("YI_CONSOLE_HOME"), sid, &Self::ticket_path(sid))}))
     }
 
     fn grant(&self, sid: &str, ticket: &str, active: bool) -> Result<Grant> {
@@ -768,6 +764,18 @@ impl Peer {
     }
 }
 
+/// The proxy must reach this daemon's pipe. --home switches to a hashed pipe name (see paths::pipe_name), so pass it
+/// only when the daemon itself runs with YI_CONSOLE_HOME; otherwise the proxy would look for a different daemon.
+fn proxy_args(home: Option<std::ffi::OsString>, sid: &str, ticket: &std::path::Path) -> Vec<String> {
+    let mut args = vec![];
+    if let Some(home) = home.filter(|v| !v.is_empty()) {
+        args.extend(["--home".to_string(), home.to_string_lossy().into_owned()]);
+    }
+    args.extend(["computer-use-mcp", "--session", sid, "--ticket-file"].map(String::from));
+    args.push(ticket.to_string_lossy().into_owned());
+    args
+}
+
 pub fn proxy_main(args: &[String]) -> Result<()> {
     let arg = |key: &str| {
         args.iter()
@@ -793,7 +801,8 @@ pub fn proxy_main(args: &[String]) -> Result<()> {
             continue;
         }
         let id = packet["id"].clone();
-        let result = crate::daemon_call(
+        // Never start a daemon from here: a new one has no grant for this session
+        let result = crate::daemon_call_running(
             yi_proto::methods::COMPUTER_USE_MCP,
             json!({"sessionId":sid,"ticket":ticket,"packet":packet}),
         );
@@ -845,6 +854,15 @@ pub fn display_result(value: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn proxy_args_follow_daemon_home() {
+        // An installed daemon has no YI_CONSOLE_HOME: the proxy must not get --home, or it looks for a hashed pipe
+        let ticket = std::path::Path::new("t.json");
+        assert_eq!(proxy_args(None, "s1", ticket), ["computer-use-mcp", "--session", "s1", "--ticket-file", "t.json"]);
+        assert_eq!(proxy_args(Some("".into()), "s1", ticket)[0], "computer-use-mcp");
+        assert_eq!(&proxy_args(Some("/tmp/yi-iso".into()), "s1", ticket)[..3], ["--home", "/tmp/yi-iso", "computer-use-mcp"]);
+    }
     fn target() -> Target {
         Target {
             pid: 42,

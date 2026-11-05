@@ -159,6 +159,15 @@ fn relay_cmd(args: &[String]) -> Result<()> {
 
 /// Call a method on the local daemon from the command line (starting it first if not running)
 fn daemon_call(method: &str, params: serde_json::Value) -> Result<serde_json::Value> {
+    daemon_request(method, params, true)
+}
+
+/// Like daemon_call, but fails instead of starting a daemon when none is running
+fn daemon_call_running(method: &str, params: serde_json::Value) -> Result<serde_json::Value> {
+    daemon_request(method, params, false)
+}
+
+fn daemon_request(method: &str, params: serde_json::Value, start: bool) -> Result<serde_json::Value> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
     rt.block_on(async {
@@ -169,6 +178,7 @@ fn daemon_call(method: &str, params: serde_json::Value) -> Result<serde_json::Va
                     conn = Some(c);
                     break;
                 }
+                Err(_) if !start => anyhow::bail!("连不上守护进程，请重新开启操作电脑"),
                 Err(_) if i == 0 => {
                     paths::ensure_base()?;
                     spawn_detached()?;

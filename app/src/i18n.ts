@@ -103,6 +103,7 @@ const ERR_PATTERNS: [RegExp, string | ((...m: string[]) => string)][] = [
   [/目标窗口已关闭，请刷新窗口列表|目标窗口已关闭，请刷新/, 'The target window has closed. Refresh the window list'],
   [/当前会话未开启操作电脑/, 'Computer use is off for this session'],
   [/操作电脑已关闭，请由用户重新开启/, 'Computer use is off. Ask the user to enable it again'],
+  [/连不上守护进程，请重新开启操作电脑/, "Can't reach the daemon. Turn computer use off and on again"],
   [/操作电脑连接已失效，请重连会话/, 'The desktop connection has expired. Reconnect the session'],
   [/操作电脑已暂停或桌面被占用，请由用户恢复/, 'Desktop control is paused or busy. Ask the user to resume'],
   [/操作目标与用户选择的窗口不一致/, 'The requested target differs from the authorized window'],
