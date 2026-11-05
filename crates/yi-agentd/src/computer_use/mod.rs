@@ -147,7 +147,7 @@ impl Desktop {
         }
         let mut control = self.control.lock().unwrap();
         if control.owner.as_deref().is_some_and(|owner| owner != sid) {
-            bail!("桌面正在被其他会话使用，请先暂停或停止该会话");
+            bail!("桌面正在被其他会话使用，请先在该会话里关闭操作电脑");
         }
         // Replacing a grant invalidates old proxies even when their CLI has not exited yet.
         let grant = Grant {
@@ -244,7 +244,14 @@ impl Desktop {
         Ok(())
     }
 
-    /// Selecting the window is the user's authorization; avoid asking again for every MCP click.
+    /// Stopping a reply pauses the grant; the user's next message is the go-ahead again (no resume button, as in OpenBot).
+    /// Stays paused if another session has taken the desktop meanwhile.
+    pub fn resume_if_paused(&self, sid: &str) {
+        let paused = self.control.lock().unwrap().grants.get(sid).is_some_and(|g| g.paused);
+        if paused { let _ = self.change(sid, "resume"); }
+    }
+
+    /// Enabling is the user's authorization; avoid asking again for every MCP click.
     pub fn authorizes(&self, sid: &str, name: &str) -> bool {
         let Some(tool) = name.strip_prefix("mcp__yi_computer_use__") else {
             return false;
@@ -1150,6 +1157,21 @@ mod tests {
             desktop.control.lock().unwrap().owner.as_deref(),
             Some("active")
         );
+    }
+    #[test]
+    fn next_message_resumes_a_paused_grant_unless_the_desktop_was_taken() {
+        let desktop = Desktop::new();
+        let grant = || Grant { ticket: "t".into(), paused: false, tokens: HashMap::new(), captures: HashMap::new(), titles: HashMap::new(), last: None, proxy: None };
+        desktop.control.lock().unwrap().grants.insert("a".into(), grant());
+        desktop.control.lock().unwrap().owner = Some("a".into());
+        desktop.change("a", "pause").unwrap();
+        desktop.resume_if_paused("a");
+        assert!(desktop.authorizes("a", "mcp__yi_computer_use__click"));
+        desktop.change("a", "pause").unwrap();
+        desktop.control.lock().unwrap().owner = Some("b".into());
+        desktop.resume_if_paused("a");
+        assert!(!desktop.authorizes("a", "mcp__yi_computer_use__click"));
+        desktop.resume_if_paused("none");
     }
     #[test]
     fn windows_parser_does_not_treat_arbitrary_nested_metadata_as_targets() {

@@ -8735,9 +8735,6 @@ button.wp-commit-title .chev {
 .computer-use-images .msg-img { width: min(420px, 100%); height: auto; max-height: 320px; }
 .computer-use-images .msg-img img { display: block; width: 100%; height: auto; max-height: 320px; object-fit: contain; }
 
-.computer-use-dot { width: 6px; height: 6px; border-radius: 50%; background: #2da44e; flex: none; }
-.computer-use-dot.paused { background: #bf8700; }
-.computer-use-bar .icon-btn { width: 26px; height: 26px; }
 
 /* Host-owned MCP definitions. */
 .mcp-server-row { gap: 8px; padding: 8px 0; border-top: 1px solid var(--border); flex-wrap: wrap; }
@@ -8745,9 +8742,6 @@ button.wp-commit-title .chev {
 .mcp-editor textarea { width: 100%; box-sizing: border-box; resize: vertical; font-family: var(--mono); }
 .mcp-tool-scopes { display: flex; gap: 12px; flex-wrap: wrap; }
 
-.computer-use-dialog-controls { display: flex; gap: 8px; flex-wrap: wrap; margin: 12px 0; }
 @media (max-width: 760px) {
-  .computer-use-bar .computer-use-capture,
-  .computer-use-bar .computer-use-pause { display: none; }
   .composer-tools:has(.computer-use-bar) .model-btn { max-width: 100px; min-width: 0; }
 }

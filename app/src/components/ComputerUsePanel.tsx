@@ -68,7 +68,7 @@ export function ComputerUsePanel({
     setError('');
     try {
       setState(await rpc(hostId, 'session.computerUse', { sessionId: info.id, action }));
-      if (action === 'enable') setOpen(false);
+      setOpen(false);
     } catch (e) {
       setError(trErr(e instanceof Error ? e.message : String(e)));
       errorToast(e);
@@ -92,43 +92,6 @@ export function ComputerUsePanel({
         >
           <Icon name="laptop" size={15} />
         </button>
-        {state?.enabled ? (
-          <>
-            <span
-              className={`computer-use-dot ${state.paused ? 'paused' : ''}`}
-              role="status"
-              aria-label={statusLabel}
-              title={statusLabel}
-            />
-            <button
-              className="icon-btn computer-use-capture"
-              title={t('capture')}
-              aria-label={t('capture')}
-              disabled={busy || !connected || state.paused}
-              onClick={() => void change('capture')}
-            >
-              <Icon name="image" size={15} />
-            </button>
-            <button
-              className="icon-btn computer-use-pause"
-              title={state.paused ? t('resume') : t('pause')}
-              aria-label={state.paused ? t('resume') : t('pause')}
-              disabled={busy || !connected}
-              onClick={() => void change(state.paused ? 'resume' : 'pause')}
-            >
-              <Icon name={state.paused ? 'play' : 'pause'} size={15} />
-            </button>
-            <button
-              className="icon-btn"
-              title={t('stop')}
-              aria-label={t('stop')}
-              disabled={!connected}
-              onClick={() => void change('stop')}
-            >
-              <Icon name="stop" size={15} />
-            </button>
-          </>
-        ) : null}
       </div>
       {open && (
         <div className="modal-bg" onMouseDown={() => setOpen(false)}>
@@ -172,24 +135,15 @@ export function ComputerUsePanel({
                     {error}
                   </p>
                 )}
-                {state.enabled && (
-                  <div className="computer-use-dialog-controls">
-                    <button className="btn small" disabled={busy || !connected || state.paused} onClick={() => void change('capture')}>
-                      {t('capture')}
-                    </button>
-                    <button className="btn small" disabled={busy || !connected} onClick={() => void change(state.paused ? 'resume' : 'pause')}>
-                      {state.paused ? t('resume') : t('pause')}
-                    </button>
-                    <button className="btn small" disabled={!connected} onClick={() => void change('stop')}>
-                      {t('stop')}
-                    </button>
-                  </div>
-                )}
                 <div className="dlg-actions">
                   <button className="btn" onClick={() => setOpen(false)}>
                     {state.enabled ? t('close') : t('cancel')}
                   </button>
-                  {!state.enabled && (
+                  {state.enabled ? (
+                    <button className="btn danger" disabled={busy || !connected} onClick={() => void change('stop')}>
+                      {t('disable')}
+                    </button>
+                  ) : (
                     <button
                       className="btn primary"
                       disabled={busy || info.status === 'running' || info.status === 'waiting-permission'}

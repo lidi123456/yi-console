@@ -96,7 +96,7 @@ const ERR_PATTERNS: [RegExp, string | ((...m: string[]) => string)][] = [
   [/该工具未声明支持 HTTP MCP，请改用 stdio 或调整服务的工具范围/, 'This tool does not advertise HTTP MCP support; use stdio or change its tool scope'],
   [/桌面不可用，请在已登录且解锁的 Windows 用户会话中运行 Yi Console/, 'Desktop unavailable. Run Yi Console in the signed-in, unlocked Windows session'],
   [/未发现可操作窗口，请确认 daemon 运行在已登录的 Windows 桌面中/, 'No windows found. Run the daemon in the signed-in Windows desktop'],
-  [/桌面正在被其他会话使用，请先暂停或停止该会话/, 'Another session owns the desktop. Pause or stop it first'],
+  [/桌面正在被其他会话使用，请先在该会话里关闭操作电脑/, 'Another session owns the desktop. Turn computer use off there first'],
   [/桌面正在被其他会话使用/, 'Another session owns the desktop'],
   [/操作电脑首版仅支持 Windows x64/, 'Computer use currently supports Windows x64 only'],
   [/请先停止当前回复，再开启操作电脑/, 'Stop the current reply before enabling computer use'],

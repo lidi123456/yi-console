@@ -672,6 +672,7 @@ impl Hub {
         let rt = self.get(id)?;
         // The user carried on by hand: the automatic continue is no longer needed
         self.cancel_resume(id, "manual");
+        self.desktop.resume_if_paused(id);
         let info = rt.info.lock().unwrap().clone();
         if !info.tool.has_process() {
             bail!("文件会话不能发送消息");
