@@ -623,6 +623,8 @@ impl Hub {
         if spec.mode == SessionMode::Structured && spec.tool != ToolKind::Shell {
             self.make_room(&sid);
         }
+        // The new tool process starts its own desktop proxy
+        self.desktop.release_proxy(&sid);
         let gen = {
             let mut g = rt.generation.lock().unwrap();
             *g += 1;

@@ -27,7 +27,22 @@ const WRITE_TOOLS: &[&str] = &[
     "move_cursor",
     "invoke_menu",
 ];
-const GUIDE: &str = "Operate only the window selected by the user in Yi Console. Read get_window_state before input. Use element_token from the latest snapshot; do not invent tokens or infer coordinates from resized images. Verify the requested result after input. A refused, suspected_noop, cancelled or unverifiable action is not proof of success. Do not retry an uncertain action blindly. Pause/stop/busy errors require returning control to the user. Use existing API, filesystem and browser tools for tasks they can complete directly.";
+/// Shared by the MCP initialize instructions, the CLI system prompts and the ACP first-prompt notice.
+/// Modeled on OpenBot's guidance: short path, few reads, read structuredContent, no workarounds.
+macro_rules! guide {
+    () => {
+        "Operate only the window the user selected in Yi Console; the gateway fills in pid and window_id, so never pass them. \
+Take the shortest path: read the window once with get_window_state, then act. To find one element, pass query (and include_screenshot: false when you only need its element_token); \
+do not read the whole window again after every action. Prefer element_token from the latest read; x and y are pixels of the latest screenshot. \
+After each action read its structuredContent: refused or suspected_noop means it did not happen; unverifiable means check once, with a query for the expected text, before you report it as done. \
+Chromium and Electron windows (Feishu, Slack, VS Code, browsers) drop background input: use delivery_mode \"foreground\" there from the first input; it briefly takes the focus. \
+To submit typed text, press_key return is more reliable than clicking a send button. \
+A paused, stopped or busy error means the user took control: stop and tell them. \
+Never start your own MCP client, read Yi Console ticket files, or drive the desktop through shell scripts or other desktop tools. \
+When a direct API, CLI, file or browser tool can do the task, use that instead."
+    };
+}
+const GUIDE: &str = guide!();
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -44,6 +59,8 @@ struct Grant {
     paused: bool,
     tokens: HashSet<String>,
     capture: Option<String>,
+    /// The proxy process allowed to use the ticket, and the process that started it (the AI tool)
+    proxy: Option<(u32, Option<u32>)>,
 }
 
 #[derive(Default)]
@@ -110,6 +127,7 @@ impl Desktop {
             paused: false,
             tokens: HashSet::new(),
             capture: None,
+            proxy: None,
         };
         let path = Self::ticket_path(sid);
         std::fs::create_dir_all(path.parent().unwrap())?;
@@ -126,6 +144,32 @@ impl Desktop {
         control.owner = Some(sid.into());
         self.cancel.send_modify(|n| *n += 1);
         Ok(())
+    }
+
+    /// A new tool process will start its own proxy: forget the old one
+    pub fn release_proxy(&self, sid: &str) {
+        if let Some(grant) = self.control.lock().unwrap().grants.get_mut(sid) {
+            grant.proxy = None;
+        }
+    }
+
+    /// MCP traffic from a proxy process. The ticket file is readable by the model's own shell, so the ticket alone
+    /// is not enough: it binds to the first proxy, which the AI tool starts. Another process may use it only when the
+    /// same tool started it, or when the bound proxy has exited (the tool restarted its MCP servers).
+    pub async fn proxy_call(&self, hub: &crate::hub::Hub, sid: &str, ticket: &str, packet: Value, pid: Option<u32>) -> Result<Value> {
+        self.grant(sid, ticket, false)?;
+        let pid = pid.ok_or_else(|| anyhow!("无法确认桌面代理进程"))?;
+        {
+            let mut control = self.control.lock().unwrap();
+            let grant = control.grants.get_mut(sid).ok_or_else(|| anyhow!("操作电脑已关闭，请由用户重新开启"))?;
+            let parent = process::parent(pid);
+            match proxy_access(grant.proxy, pid, parent, process::alive) {
+                ProxyAccess::Deny => bail!("操作电脑只接受 AI 工具自己启动的桌面代理，请直接调用 yi_computer_use 工具"),
+                ProxyAccess::Bind => grant.proxy = Some((pid, parent)),
+                ProxyAccess::Allow => {}
+            }
+        }
+        self.mcp(hub, sid, ticket, packet).await
     }
 
     pub fn change(&self, sid: &str, action: &str) -> Result<()> {
@@ -765,6 +809,24 @@ fn hide_target_args(tool: &mut Value) {
     }
 }
 
+#[derive(Debug, PartialEq)]
+enum ProxyAccess {
+    Allow,
+    Bind,
+    Deny,
+}
+
+/// bound: the proxy pid holding the ticket and its parent (the AI tool). A second proxy of the same tool is allowed
+/// (some CLIs open the server twice); any other process only once the bound proxy has exited.
+fn proxy_access(bound: Option<(u32, Option<u32>)>, pid: u32, parent: Option<u32>, alive: impl Fn(u32) -> bool) -> ProxyAccess {
+    match bound {
+        Some((b, _)) if b == pid => ProxyAccess::Allow,
+        Some((_, Some(tool))) if parent == Some(tool) => ProxyAccess::Allow,
+        Some((b, _)) if alive(b) => ProxyAccess::Deny,
+        _ => ProxyAccess::Bind,
+    }
+}
+
 /// The proxy must reach this daemon's pipe. --home switches to a hashed pipe name (see paths::pipe_name), so pass it
 /// only when the daemon itself runs with YI_CONSOLE_HOME; otherwise the proxy would look for a different daemon.
 fn proxy_args(home: Option<std::ffi::OsString>, sid: &str, ticket: &std::path::Path) -> Vec<String> {
@@ -852,9 +914,80 @@ pub fn display_result(value: &Value) -> String {
     crate::util::truncate(&display_value(value).to_string(), 64 * 1024)
 }
 
+mod process {
+    #[cfg(windows)]
+    pub fn alive(pid: u32) -> bool {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::{GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+        const STILL_ACTIVE: u32 = 259;
+        // Safety: the handle is checked and closed here
+        unsafe {
+            let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if h.is_null() {
+                return false;
+            }
+            let mut code = 0u32;
+            let running = GetExitCodeProcess(h, &mut code) != 0 && code == STILL_ACTIVE;
+            CloseHandle(h);
+            running
+        }
+    }
+
+    #[cfg(windows)]
+    pub fn parent(pid: u32) -> Option<u32> {
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS};
+        // Safety: the snapshot handle is checked and closed; the entry is sized as the API requires
+        unsafe {
+            let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+            if snap == INVALID_HANDLE_VALUE {
+                return None;
+            }
+            let mut entry: PROCESSENTRY32W = std::mem::zeroed();
+            entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+            let mut found = None;
+            let mut ok = Process32FirstW(snap, &mut entry) != 0;
+            while ok {
+                if entry.th32ProcessID == pid {
+                    found = Some(entry.th32ParentProcessID).filter(|p| *p != 0);
+                    break;
+                }
+                ok = Process32NextW(snap, &mut entry) != 0;
+            }
+            CloseHandle(snap);
+            found
+        }
+    }
+
+    // Computer use is Windows-only; elsewhere never treat a bound proxy as gone
+    #[cfg(not(windows))]
+    pub fn alive(_pid: u32) -> bool {
+        true
+    }
+
+    #[cfg(not(windows))]
+    pub fn parent(_pid: u32) -> Option<u32> {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ticket_binds_to_the_tools_proxy() {
+        let alive = |pid: u32| pid != 9;
+        assert_eq!(proxy_access(None, 10, Some(1), alive), ProxyAccess::Bind);
+        assert_eq!(proxy_access(Some((10, Some(1))), 10, Some(1), alive), ProxyAccess::Allow);
+        // The model's own shell read the ticket and started a proxy: different parent, bound proxy still running
+        assert_eq!(proxy_access(Some((10, Some(1))), 20, Some(5), alive), ProxyAccess::Deny);
+        assert_eq!(proxy_access(Some((10, None)), 20, None, alive), ProxyAccess::Deny);
+        // Same tool opening the server again
+        assert_eq!(proxy_access(Some((10, Some(1))), 21, Some(1), alive), ProxyAccess::Allow);
+        // The bound proxy exited (the tool restarted its MCP servers)
+        assert_eq!(proxy_access(Some((9, Some(1))), 22, Some(3), alive), ProxyAccess::Bind);
+    }
 
     #[test]
     fn hide_target_args_never_adds_null() {
@@ -940,6 +1073,7 @@ mod tests {
                     paused: false,
                     tokens: HashSet::new(),
                     capture: None,
+                    proxy: None,
                 },
             );
         }
@@ -991,6 +1125,7 @@ mod tests {
             paused: false,
             tokens: HashSet::from(["s00000001:0".into()]),
             capture: Some("current".into()),
+            proxy: None,
         };
         assert!(
             validate_snapshot(&json!({"element_token":"s00000001:0"}), &grant, "click").is_ok()
@@ -1066,8 +1201,20 @@ fn desktop_available() -> bool {
 
 pub fn model_hint(extra_args: &[String]) -> &'static str {
     if extra_args.iter().any(|arg| arg.contains("yi_computer_use")) {
-        " For tasks in the desktop window authorized by the user, use the yi_computer_use MCP tools. Its initialize instructions name the exact target. Read the window first, act through its current element tokens and verify the result. Do not bypass paused, stopped, busy or denied desktop tools through shell scripts or other desktop-control tools. A tool returning is not proof that the requested UI change happened."
+        concat!(" For GUI tasks in the desktop window the user authorized, call the yi_computer_use MCP tools directly. ", guide!())
     } else {
         ""
     }
+}
+
+/// ACP tools take no system prompt from us, and a resumed session may still remember turns from before computer use
+/// was on (or from when its tools failed to load). Sent with the first prompt after each launch that has the server.
+pub fn acp_notice() -> &'static str {
+    concat!(
+        "<system-reminder>Yi Console turned on computer use for this session. The yi_computer_use MCP tools ",
+        "(get_window_state, click, type_text, set_value, press_key, scroll, drag, move_cursor, invoke_menu, verify_state, zoom) ",
+        "are in your tool list now; earlier messages saying they are missing or broken are outdated. Use them only when the task needs the desktop. ",
+        guide!(),
+        "</system-reminder>"
+    )
 }

@@ -39,6 +39,8 @@ struct ToolState {
 
 #[derive(Default)]
 struct State {
+    /// The computer use notice still has to go out with the next prompt (once per launch)
+    desktop_notice: bool,
     next_id: u64,
     pending: HashMap<u64, Pending>,
     session_id: Option<String>,
@@ -148,6 +150,7 @@ pub async fn run(spec: StartSpec, em: Emitter, mut rx: mpsc::UnboundedReceiver<A
     };
     let mut st = State {
         perm: spec.permission_mode.clone(),
+        desktop_notice: spec.mcp_servers.iter().any(|server| server["name"] == crate::mcp::DESKTOP_SERVER),
         ..Default::default()
     };
     let init = st.req(
@@ -264,6 +267,11 @@ fn prompt(st: &mut State, em: &Emitter, p: &Prompt) -> Value {
                 message: "这个工具不支持图片输入，图片没有发送".into(),
             });
         }
+    }
+    // Slash commands must stay the first block for the tool to recognize them; the notice waits for a real prompt
+    if st.desktop_notice && !p.text.trim_start().starts_with('/') {
+        st.desktop_notice = false;
+        blocks.push(json!({"type":"text","text":crate::computer_use::acp_notice()}));
     }
     if !p.text.trim().is_empty() || blocks.is_empty() {
         blocks.push(json!({"type":"text","text":p.text}));
@@ -1016,6 +1024,22 @@ fn codebuddy_bash_text(t: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::clean_diff_texts;
+
+    #[test]
+    fn desktop_notice_goes_with_the_first_real_prompt_only() {
+        use super::*;
+        let (_hub, em, _rx) = crate::hub::test_emitter();
+        let mut st = State { desktop_notice: true, ..Default::default() };
+        let ask = |text: &str| Prompt { text: text.into(), images: vec![] };
+        let texts = |v: &Value| v["params"]["prompt"].as_array().unwrap().iter().map(|b| b["text"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+        let slash = prompt(&mut st, &em, &ask("/compact"));
+        assert_eq!(texts(&slash), ["/compact"]);
+        let first = prompt(&mut st, &em, &ask("open Feishu"));
+        let first = texts(&first);
+        assert!(first[0].contains("yi_computer_use") && first[0].contains("outdated"), "{first:?}");
+        assert_eq!(first[1], "open Feishu");
+        assert_eq!(texts(&prompt(&mut st, &em, &ask("again"))), ["again"]);
+    }
 
     /// Qoder streams its subagents' text, thinking and tool calls as the parent's own updates
     #[test]

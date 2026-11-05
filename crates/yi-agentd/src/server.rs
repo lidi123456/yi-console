@@ -129,11 +129,18 @@ where
         let subs = subs.clone();
         let tx = out_tx.clone();
         let local = peer == "local";
+        let peer_pid = crate::transport::PEER_PID.try_with(|pid| *pid).ok().flatten();
         tokio::spawn(async move {
             let id = req.id;
             // Host credentials can only be written by the desktop client on this machine, not by devices coming in through the relay or SSH
             let r = if req.method == methods::COMPUTER_USE_MCP && !local {
                 Err(anyhow!("桌面代理只接受本机连接"))
+            } else if req.method == methods::COMPUTER_USE_MCP {
+                let p = &req.params;
+                match (s(p, "sessionId"), s(p, "ticket")) {
+                    (Ok(sid), Ok(ticket)) => hub.desktop.proxy_call(&hub, sid, ticket, p["packet"].clone(), peer_pid).await,
+                    (Err(e), _) | (_, Err(e)) => Err(e),
+                }
             } else if req.method == methods::PROXY_SET_HOSTS && !local {
                 Err(anyhow!("只能由本机客户端同步主机"))
             } else if req.method == methods::FS_OPEN && !local {
@@ -214,7 +221,8 @@ pub async fn dispatch(
         SESSION_COMPUTER_USE => {
             hub.computer_use(s(&p, "sessionId")?, s(&p, "action")?, p.get("target").map(|v| serde_json::from_value(v.clone())).transpose()?).await?
         }
-        COMPUTER_USE_MCP => hub.desktop.mcp(hub, s(&p, "sessionId")?, s(&p, "ticket")?, p["packet"].clone()).await?,
+        // Handled in serve_conn, which knows the peer and its process id
+        COMPUTER_USE_MCP => anyhow::bail!("桌面代理只接受本机连接"),
         SESSION_LIST => serde_json::to_value(hub.list())?,
         SESSION_CREATE => {
             let params: CreateParams = serde_json::from_value(p)?;
