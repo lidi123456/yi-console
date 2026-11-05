@@ -582,10 +582,11 @@ impl Hub {
             extra_args.push("--no-daemon".into());
         }
         let mut servers = if info.mode == SessionMode::Structured { crate::mcp::selected(&settings, info.tool) } else { vec![] };
-        let mcp_fingerprint = crate::mcp::fingerprint(&servers);
+        let mut desktop = false;
         if info.mode == SessionMode::Structured && info.computer_use {
-            if let Some(config) = self.desktop.mcp_config(&info.id) { servers.push(crate::mcp::desktop(config)?); }
+            if let Some(config) = self.desktop.mcp_config(&info.id) { servers.push(crate::mcp::desktop(config)?); desktop = true; }
         }
+        let mcp_fingerprint = mcp_fingerprint(&servers[..servers.len() - desktop as usize], desktop);
         let mcp_servers = crate::mcp::inject(info.tool, &servers, &mut extra_args);
         Ok(StartSpec {
             tool: info.tool,
@@ -682,7 +683,9 @@ impl Hub {
         }
         let busy = matches!(info.status, SessionStatus::Running | SessionStatus::WaitingPermission);
         if !busy && info.mode == SessionMode::Structured && self.running_tx(&rt).is_some() {
-            let expected = crate::mcp::fingerprint(&crate::mcp::selected(&self.settings.read().unwrap(), info.tool));
+            // Turning computer use off reloads the tool here without its MCP entry, as OpenBot reloads the session
+            let desktop = info.computer_use && self.desktop.mcp_config(id).is_some();
+            let expected = mcp_fingerprint(&crate::mcp::selected(&self.settings.read().unwrap(), info.tool), desktop);
             if *rt.mcp_fingerprint.lock().unwrap() != expected { self.relaunch(&rt)?; }
         }
         // If the process must restart at turn end (permission mode change), messages the tool hasn't read would be lost with it, so queue in that case too
@@ -2320,7 +2323,7 @@ fn new_rt(info: SessionInfo) -> SessionRt {
         queue: Mutex::new(VecDeque::new()),
         interrupted: Mutex::new(false),
         launched_mode: Mutex::new(String::new()),
-        mcp_fingerprint: Mutex::new(crate::mcp::fingerprint(&[])),
+        mcp_fingerprint: Mutex::new(mcp_fingerprint(&[], false)),
         restart_pending: Mutex::new(false),
         resume_token: Mutex::new(0),
         limited: Mutex::new(false),
@@ -2367,6 +2370,12 @@ fn exhausted_reset(q: &Value, now: i64) -> Option<i64> {
 }
 
 /// An emitter for a running chat session "s" in a fresh in-memory hub, for adapter tests; keep the receiver alive
+/// The MCP setup a tool process was started with: the user's servers and whether the desktop entry was attached
+/// (its ticket changes on every enable, so only its presence counts)
+fn mcp_fingerprint(servers: &[yi_proto::McpServerConfig], desktop: bool) -> String {
+    format!("{}{}", crate::mcp::fingerprint(servers), if desktop { "+desktop" } else { "" })
+}
+
 #[cfg(test)]
 pub(crate) fn test_emitter() -> (Arc<Hub>, Emitter, mpsc::UnboundedReceiver<AdapterCmd>) {
     let hub = Hub::new(Store::open_memory().unwrap(), DaemonSettings::default());
@@ -2600,6 +2609,12 @@ pub(crate) fn kiro_owned(runs: &[RunRef], cands: &[crate::history::TermCandidate
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn turning_computer_use_off_changes_the_mcp_fingerprint() {
+        assert_ne!(mcp_fingerprint(&[], true), mcp_fingerprint(&[], false));
+        assert_eq!(mcp_fingerprint(&[], false), crate::mcp::fingerprint(&[]));
+    }
 
     fn run(sid: &str, cwd: &str, start: i64, end: Option<i64>, resumed: bool, pids: &[u32]) -> RunRef {
         RunRef {

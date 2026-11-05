@@ -29,7 +29,7 @@ Kiro CLI currently cannot pass MCP images directly to its model. Yi Console supp
 As in OpenBot, there is only an on/off switch, with no separate pause or capture buttons.
 
 - Stopping the AI's reply pauses desktop activity: queued requests are interrupted and control is released. Your next message resumes it, and the AI has to read the screen again.
-- Clicking the computer icon and choosing Turn off computer use revokes the session's desktop authorization and interrupts the current reply; an old MCP proxy cannot continue operating. Ending a session, changing mode and `/clear` also revoke authorization.
+- Clicking the computer icon and choosing Turn off computer use revokes the session's desktop authorization and interrupts the current reply; an old MCP proxy cannot continue operating. With your next message the tool restarts in the same session without the computer use tools. Ending a session, changing mode and `/clear` also revoke authorization.
 - Actions already performed are not rolled back. Interrupted or timed-out actions may need a new screenshot or human verification and are not replayed automatically.
 - Closing a client does not automatically end a background task. The daemon can continue while the Windows desktop remains available. Re-enable computer use after a daemon restart.
 
