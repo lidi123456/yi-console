@@ -1112,6 +1112,10 @@ impl Hub {
         if m.get(tool.as_str()).map(|v| v.as_slice()) == Some(models) {
             return;
         }
+        // Cursor lists only the current model when its own model request fails; that isn't the account's list
+        if tool == ToolKind::Cursor && models.len() == 1 && m.get(tool.as_str()).is_some_and(|v| v.len() > 1) {
+            return;
+        }
         m.insert(tool.as_str().to_string(), models.to_vec());
         if let Ok(b) = serde_json::to_vec(&*m) {
             let _ = std::fs::write(models_path(), b);

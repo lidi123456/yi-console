@@ -611,7 +611,7 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Result<V
                     .or(spec.model.clone())
                     .map(|m| if st.parameterized { base_model(&m).to_string() } else { m })
                     .filter(|m| !m.is_empty());
-                let listed = |m: &str| models.is_empty() || models.iter().any(|o| o.id == m);
+                let listed = |m: &str| models.len() <= 1 || models.iter().any(|o| o.id == m);
                 if st.parameterized {
                     let use_spec = !st.spec_params_stale && want.as_deref().is_some_and(|w| listed(w));
                     // Always switch, even to the model Cursor is already on: only that answer lists the model's parameters
@@ -951,7 +951,31 @@ fn is_missing_session(msg: &str) -> bool {
 }
 
 /// models in the session/new and session/load results
+/// Cursor fills `availableModels` from a server request of its own, and when that fails lists none or only the
+/// current model; the values of its `model` option are complete, so the longer of the two is used
 pub fn parse_models(r: &Value) -> Vec<ModelOption> {
+    let listed = listed_models(r);
+    let options: Vec<ModelOption> = r["configOptions"].as_array().into_iter().flatten()
+        .filter(|o| o["id"] == "model")
+        .flat_map(|o| o["options"].as_array().into_iter().flatten())
+        // Grouped options hold their values one level down
+        .flat_map(|v| if v["options"].is_array() { v["options"].as_array().unwrap().clone() } else { vec![v.clone()] })
+        .filter_map(|v| {
+            let id = v["value"].as_str()?.to_string();
+            Some(ModelOption {
+                name: v["name"].as_str().unwrap_or(&id).to_string(),
+                description: v["description"].as_str().unwrap_or("").to_string(),
+                resolved: String::new(),
+                efforts: vec![],
+                default_effort: String::new(),
+                id,
+            })
+        })
+        .collect();
+    if options.len() > listed.len() { options } else { listed }
+}
+
+fn listed_models(r: &Value) -> Vec<ModelOption> {
     r["models"]["availableModels"]
         .as_array()
         .into_iter()
@@ -1529,6 +1553,18 @@ mod model_config_tests {
         handle(&mut st, &spec, &ok, &em).unwrap();
         assert_eq!(hub.store.model_config("grok-4.7").unwrap().unwrap()[0].id, "context");
         assert_eq!(next_config(&mut st).unwrap()["params"]["value"], "500k");
+    }
+
+    #[test]
+    fn cursor_models_come_from_the_model_option_when_the_list_is_short() {
+        let r = json!({"models":{"availableModels":[{"modelId":"grok-4.7","name":"Grok 4.7"}]},
+            "configOptions":[{"id":"model","category":"model","currentValue":"grok-4.7",
+                "options":[{"value":"auto-smart","name":"Auto"},{"value":"grok-4.7","name":"Grok 4.7"},{"value":"gemini-4-argon","name":"Gemini 4 Argon"}]}]});
+        assert_eq!(parse_models(&r).iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["auto-smart", "grok-4.7", "gemini-4-argon"]);
+        let (hub, _em, _rx) = crate::hub::test_emitter();
+        hub.remember_models(ToolKind::Cursor, &parse_models(&r));
+        hub.remember_models(ToolKind::Cursor, &listed_models(&r));
+        assert_eq!(hub.cached_models(ToolKind::Cursor).len(), 3);
     }
 
     #[test]
