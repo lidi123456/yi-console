@@ -393,6 +393,11 @@ impl Hub {
             self.desktop.capture(self, sid).await?;
             return Ok(self.desktop.status(Some(sid)));
         }
+        // macOS: open the System Settings pane of one grant ("settings:accessibility" / "settings:screenRecording")
+        if let Some(kind) = action.strip_prefix("settings:") {
+            self.desktop.open_settings(kind)?;
+            return Ok(self.desktop.status_checked(Some(sid)).await);
+        }
         if action == "enable" {
             if info.status == SessionStatus::Running || info.status == SessionStatus::WaitingPermission { bail!("请先停止当前回复，再开启操作电脑"); }
             // The whole desktop, as in OpenBot: the model picks windows itself
@@ -411,7 +416,7 @@ impl Hub {
         }
         // Turning off does not interrupt the reply (the user stops it if they want); the revoked ticket refuses further desktop calls.
         self.desktop_event(sid, EventBody::ComputerUse { action_id: uuid::Uuid::new_v4().to_string(), tool: action.into(), status: "control".into(), message: String::new(), duration_ms: 0, images: vec![] });
-        Ok(self.desktop.status(Some(sid)))
+        Ok(self.desktop.status_checked(Some(sid)).await)
     }
 
     /// Refresh after the current turn, or lazily before the next message of an idle session.

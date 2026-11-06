@@ -2,19 +2,27 @@
 
 [简体中文](computer-use.md)
 
-Let a Claude Code, Codex, Cursor, Kiro, Qoder or CodeBuddy chat session operate the signed-in Windows desktop on its host (open apps, switch windows, read, click and type), with activity and checkpoint screenshots in the conversation.
+Let a Claude Code, Codex, Cursor, Kiro, Qoder or CodeBuddy chat session operate the signed-in Windows or macOS desktop on its host (open apps, switch windows, read, click and type), with activity and checkpoint screenshots in the conversation.
 
 ## Support
 
-The first release supports a **signed-in, unlocked Windows x64 desktop**. The entry is hidden for macOS, Linux, Windows ARM, and terminal sessions. Phones and other computers can connect as clients.
+Supported: a **signed-in, unlocked desktop** on Windows x64 or macOS 13+ (Intel and Apple silicon). The entry is hidden for Linux, Windows ARM, and terminal sessions. Phones and other computers can connect as clients.
 
 The target is the session host, not the device displaying the client. Services without an interactive desktop, SSH Session 0, locked desktops and secure system desktops report unavailable. Elevated windows, custom controls and application-specific automation depend on Windows and the driver.
 
 The Windows daemon embeds a pinned MIT `cua-driver`. There is no runtime driver download or installation. First use extracts the verified executable and license into `bin/computer-use-<version>/` below the Yi Console data directory. Bundling does not change operating-system or application permissions.
 
+The macOS installer carries cua-driver's own signed `CuaDriver.app`, extracted into the same directory on first use. Computer use on a Mac therefore needs the Yi Console desktop app installed on that Mac; a daemon deployed to a Mac over SSH has no driver and reports "no desktop driver".
+
+### macOS permissions
+
+macOS requires Accessibility and Screen Recording for a program that operates the desktop. They are granted to **Cua Driver** (the driver's own signing identity), not to Yi Console: Yi Console's installer is not signed, so macOS would treat each upgrade as a new program and drop the grants, while Cua Driver has a fixed developer signature and keeps them.
+
+The first time you enable computer use, Cua Driver shows its own permission guide; the Computer use dialog also lists both permissions, and "Open System Settings" goes straight to the right pane, where you switch on "Cua Driver". The status updates by itself. If Screen Recording still shows as not allowed after you granted it, turn computer use off and on again.
+
 ## Use
 
-1. Start Yi Console normally on the target Windows computer and open a Claude Code, Codex, Cursor, Kiro, Qoder or CodeBuddy chat session.
+1. Start Yi Console normally on the target computer and open a Claude Code, Codex, Cursor, Kiro, Qoder or CodeBuddy chat session.
 2. Click the computer icon (Computer use) right of @ in the composer toolbar.
 3. With no reply in progress, enable computer use. The AI can then operate every app on this computer; it finds windows or launches apps itself, with no window to pick first. The tool connects to a session-scoped MCP entry and continues the existing tool session ID where possible.
 4. Give a specific task, such as: “Open Notepad and type a line, don't save.” or “Send someone a message in Feishu.”
@@ -31,7 +39,7 @@ As in OpenBot, there is only an on/off switch, with no separate pause or capture
 - Stopping the AI's reply pauses desktop activity: that session's queued requests are interrupted; other sessions are not affected. Your next message resumes it, and the AI has to read the screen again.
 - Clicking the computer icon and choosing Turn off computer use revokes the session's desktop authorization: a desktop request in progress is cancelled and later desktop calls are refused. The AI's reply is not interrupted; stop it yourself if you want. With your next message the tool restarts in the same session without the computer use tools. Ending a session, changing mode and `/clear` also revoke authorization.
 - Actions already performed are not rolled back. Interrupted or timed-out actions may need a new screenshot or human verification and are not replayed automatically.
-- Closing a client does not automatically end a background task. The daemon can continue while the Windows desktop remains available. Re-enable computer use after a daemon restart.
+- Closing a client does not automatically end a background task. The daemon can continue while the desktop remains available. Re-enable computer use after a daemon restart.
 
 ## Results
 

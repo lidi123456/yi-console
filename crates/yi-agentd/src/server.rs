@@ -216,7 +216,7 @@ pub async fn dispatch(
                 .await?,
             )?
         }
-        COMPUTER_USE_STATUS => hub.desktop.status(p["sessionId"].as_str()),
+        COMPUTER_USE_STATUS => hub.desktop.status_checked(p["sessionId"].as_str()).await,
         COMPUTER_USE_TARGETS => serde_json::to_value(hub.desktop.targets().await?)?,
         SESSION_COMPUTER_USE => {
             hub.computer_use(s(&p, "sessionId")?, s(&p, "action")?).await?

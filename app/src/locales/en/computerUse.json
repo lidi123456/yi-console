@@ -1,13 +1,13 @@
 {
   "title": "Computer use",
-  "description": "Allow this AI session to operate the signed-in Windows desktop on the session host: open apps, switch windows, click and type. Activity and screenshots appear in chat.",
+  "description": "Allow this AI session to operate the signed-in desktop on the session host: open apps, switch windows, click and type. Activity and screenshots appear in chat.",
   "scope": "The AI can operate every app on this computer; turn this on only for tasks you trust. Several sessions can have it on at once, but their actions may interfere; stopping a reply pauses it and your next message resumes.",
   "enable": "Enable computer use",
   "cancel": "Cancel",
   "close": "Close",
   "ready": "Ready",
   "paused": "Paused",
-  "windowsOnly": "The first release supports signed-in Windows x64 desktops",
+  "windowsOnly": "Supports signed-in Windows x64 and macOS 13+ desktops",
   "unavailable": "Cannot read status. Check the host connection and daemon version.",
   "waitForTurn": "Stop the current reply before enabling computer use.",
   "running": "Running",
@@ -25,5 +25,15 @@
   "notePaused": "Computer use paused",
   "noteResumed": "Computer use resumed",
   "noteStopped": "Computer use turned off",
-  "disable": "Turn off computer use"
+  "disable": "Turn off computer use",
+  "permissionsRequired": "Permission needed",
+  "permissionsHint": "On macOS, allow \"Cua Driver\" both permissions below in System Settings. Cua Driver is the desktop driver that ships with Yi Console; the grants stay after Yi Console upgrades.",
+  "permissionsRetry": "This updates by itself once you allow them. If Screen Recording still shows as not allowed, turn computer use off and on again.",
+  "accessibility": "Accessibility",
+  "screenRecording": "Screen Recording",
+  "granted": "Allowed",
+  "notGranted": "Not allowed",
+  "openSettings": "Open System Settings",
+  "driverMissing": "This Mac has no desktop driver. Computer use needs the Yi Console desktop app installed on this Mac; a daemon deployed over SSH has none.",
+  "driverError": "The desktop driver is not responding: {{message}}"
 }

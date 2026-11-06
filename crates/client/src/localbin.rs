@@ -38,6 +38,23 @@ pub fn sync(bundled: &Path) -> Result<PathBuf> {
     sync_to(bundled, &installed_path())
 }
 
+/// Files shipped next to the bundled yi-agentd builds that the local daemon reads from its own bin directory:
+/// CuaDriver.app for computer use, only in the macOS installer
+const EXTRAS: &[&str] = &["computer-use-macos.tgz"];
+
+/// Sync the extras present in `bundled_dir` next to the installed yi-agentd. Failures only cost the feature that
+/// needs the file, so they are logged rather than stopping the connection.
+pub fn sync_extras(bundled_dir: &Path) {
+    for name in EXTRAS {
+        let src = bundled_dir.join(name);
+        if src.is_file() {
+            if let Err(e) = sync_to(&src, &base_dir().join("bin").join(name)) {
+                eprintln!("同步 {name} 失败: {e:#}");
+            }
+        }
+    }
+}
+
 fn sync_to(bundled: &Path, target: &Path) -> Result<PathBuf> {
     let old = target.with_extension("old");
     // Old file left by the last replacement; can be deleted once its process has exited

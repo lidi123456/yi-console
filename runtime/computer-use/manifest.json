@@ -6,5 +6,10 @@
   "archiveSha256": "bcc520e50861c7092cf775846fec76ae386d7dcd6b5b408608b0ea4423a8b888",
   "binarySha256": "77f5cac754b42b6a8bae126414fc8f7487432ace93466967965188e24e9e53fb",
   "license": "MIT",
-  "licenseSha256": "c0779290c1d4783169aa3dbfb55feb505e563ef8a004bbf55298ceffcfbda8d9"
+  "licenseSha256": "c0779290c1d4783169aa3dbfb55feb505e563ef8a004bbf55298ceffcfbda8d9",
+  "macos": {
+    "asset": "cua-driver-rs-0.34.0-darwin-universal.tar.gz",
+    "archiveSha256": "2d0ade531c07b4d16e8078844fe1b63a0dfa0ee19677c9dcc079b4d3460ab387",
+    "appBinarySha256": "54e5d48128fb62323366c49b6be480ccef83cdee23bd7fc1f19431347a5df86b"
+  }
 }

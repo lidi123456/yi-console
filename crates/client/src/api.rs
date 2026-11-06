@@ -915,6 +915,9 @@ impl ClientHub {
     /// The yi-agentd used by the local daemon: first sync the one bundled in the installer to `~/.yi-console/bin`, then use that copy
     fn local_yi_agentd(&self) -> Result<PathBuf> {
         let bundled = self.bundled_yi_agentd()?;
+        if let Some(dir) = &self.yi_agentd_dir {
+            crate::localbin::sync_extras(dir);
+        }
         crate::localbin::sync(&bundled).or_else(|e| {
             // If the home directory isn't writable or similar, fall back to the bundled one
             eprintln!("同步本机 yi-agentd 失败，直接使用安装包里的: {e:#}");

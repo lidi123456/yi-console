@@ -6,8 +6,9 @@ const windows = { os: 'windows', arch: 'x86_64' };
 test('all six AI chat adapters share the Windows desktop entry', () => {
   for (const tool of ['claude', 'codex', 'cursor', 'kiro', 'qoder', 'codebuddy']) assert.equal(canUseComputer(windows, chat(tool)), true);
 });
-test('Linux and macOS target hosts never show the desktop entry', () => {
-  for (const os of ['linux', 'macos']) assert.equal(canUseComputer({ os, arch: 'x86_64' }, chat()), false);
+test('macOS hosts on either architecture show the entry, Linux hosts never do', () => {
+  for (const arch of ['x86_64', 'aarch64']) assert.equal(canUseComputer({ os: 'macos', arch }, chat()), true);
+  for (const arch of ['x86_64', 'aarch64']) assert.equal(canUseComputer({ os: 'linux', arch }, chat()), false);
 });
 test('unknown hosts, unsupported architectures and non-AI sessions are excluded', () => {
   assert.equal(canUseComputer(undefined, chat()), false);

@@ -13,7 +13,24 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::{watch, Mutex as AsyncMutex};
 use yi_proto::{EventBody, ImageRef};
 
+#[cfg(target_os = "macos")]
+mod mac;
+
 const VERSION: &str = "0.34.0";
+/// Builds that carry a driver: the Windows x64 daemon embeds it, the macOS app ships CuaDriver.app
+const SUPPORTED: bool = cfg!(any(all(windows, target_arch = "x86_64"), target_os = "macos"));
+/// Vendor telemetry and update checks off
+const DRIVER_ENV: &[(&str, &str)] = &[("CUA_DRIVER_RS_TELEMETRY_ENABLED", "0"), ("CUA_DRIVER_RS_UPDATE_CHECK", "0")];
+#[cfg(target_os = "macos")]
+const START_TIMEOUT: Duration = Duration::from_secs(45);
+#[cfg(not(target_os = "macos"))]
+const START_TIMEOUT: Duration = Duration::from_secs(15);
+const UNSUPPORTED: &str = "操作电脑仅支持 Windows x64 和 macOS";
+#[cfg(target_os = "macos")]
+const NO_DESKTOP: &str = "桌面不可用，请在这台 Mac 上登录桌面后再试";
+#[cfg(not(target_os = "macos"))]
+const NO_DESKTOP: &str = "桌面不可用，请在已登录且解锁的 Windows 用户会话中运行 Yi Console";
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 const BINARY_SHA: &str = "77f5cac754b42b6a8bae126414fc8f7487432ace93466967965188e24e9e53fb";
 const SERVER: &str = "yi_computer_use";
 /// The whole desktop, as in OpenBot. Left out: browser CDP tools (use the browser tools), recording/replay, driver
@@ -54,9 +71,21 @@ pub fn tool_names() -> impl Iterator<Item = &'static str> {
 }
 /// Shared by the MCP initialize instructions, the CLI system prompts and the ACP first-prompt notice.
 /// Modeled on OpenBot's guidance: short path, few reads, read structuredContent, no workarounds.
+#[cfg(target_os = "macos")]
+macro_rules! desktop_name {
+    () => {
+        "macOS"
+    };
+}
+#[cfg(not(target_os = "macos"))]
+macro_rules! desktop_name {
+    () => {
+        "Windows"
+    };
+}
 macro_rules! guide {
     () => {
-        "You may operate any app on this Windows desktop; act only on the windows the task needs. \
+        concat!("You may operate any app on this ", desktop_name!(), " desktop; act only on the windows the task needs. \
 Find windows with list_windows (or launch_app to open one) and choose by title and size, never the first match: many windows are small empty helpers. \
 Pass that window's pid and window_id to every window tool. \
 Take the shortest path: read a window once with get_window_state, then act. To find one element, pass query (and include_screenshot: false when you only need its element_token); \
@@ -68,7 +97,7 @@ Before an action that is hard to undo (sending to other people, deleting, paying
 A paused or stopped error means the user took control: stop and tell them. \
 Other sessions may use this desktop too: if a window changed unexpectedly, read it again before acting. \
 Never start your own MCP client, read Yi Console ticket files, or drive the desktop through shell scripts or other desktop tools. \
-When a direct API, CLI, file or browser tool can do the task, use that instead."
+When a direct API, CLI, file or browser tool can do the task, use that instead.")
     };
 }
 const GUIDE: &str = guide!();
@@ -125,8 +154,9 @@ impl Desktop {
         let control = self.control.lock().unwrap();
         let grant = sid.and_then(|s| control.grants.get(s));
         json!({
-            "supported": cfg!(all(windows, target_arch = "x86_64")), "driverVersion": VERSION,
-            "status": if !cfg!(all(windows, target_arch = "x86_64")) { "unsupported" }
+            "supported": SUPPORTED, "driverVersion": VERSION,
+            "status": if !SUPPORTED { "unsupported" }
+                else if !driver_installed() { "driverMissing" }
                 else if !desktop_available() { "desktopUnavailable" }
                 else if grant.is_some_and(|g| g.paused) { "paused" }
                 else if grant.is_some() { "ready" } else { "disabled" },
@@ -142,12 +172,15 @@ impl Desktop {
     }
 
     pub fn configure(&self, sid: &str) -> Result<()> {
-        if !cfg!(all(windows, target_arch = "x86_64")) {
-            bail!("操作电脑首版仅支持 Windows x64");
+        if !SUPPORTED {
+            bail!(UNSUPPORTED);
         }
         if !desktop_available() {
-            bail!("桌面不可用，请在已登录且解锁的 Windows 用户会话中运行 Yi Console");
+            bail!(NO_DESKTOP);
         }
+        // Unpack and verify CuaDriver.app now, so a missing driver fails the switch instead of the first action
+        #[cfg(target_os = "macos")]
+        mac::app_path()?;
         let mut control = self.control.lock().unwrap();
         // Replacing a grant invalidates old proxies even when their CLI has not exited yet.
         let grant = Grant {
@@ -304,11 +337,11 @@ impl Desktop {
                 bail!("只读规划模式不能操作桌面输入");
             }
         }
-        if !cfg!(all(windows, target_arch = "x86_64")) {
-            bail!("操作电脑首版仅支持 Windows x64");
+        if !SUPPORTED {
+            bail!(UNSUPPORTED);
         }
         if !desktop_available() {
-            bail!("桌面不可用，请在已登录且解锁的 Windows 用户会话中运行 Yi Console");
+            bail!(NO_DESKTOP);
         }
         // Only desktop actions (auth) are cancelled by pause/stop. Tool discovery must not be: a client that sees
         // tools/list fail once (Qoder) keeps an empty tool list for the whole process.
@@ -318,7 +351,7 @@ impl Desktop {
         }
         if lock.is_none() {
             *lock = Some(
-                tokio::time::timeout(Duration::from_secs(15), Peer::start())
+                tokio::time::timeout(START_TIMEOUT, Peer::start())
                     .await
                     .map_err(|_| anyhow!("桌面驱动启动超时"))??,
             );
@@ -345,6 +378,45 @@ impl Desktop {
             if let Some(mut peer) = driver.take() {
                 let _ = peer.child.kill().await;
             }
+            // The CuaDriver.app daemon is not our child
+            #[cfg(target_os = "macos")]
+            mac::stop().await;
+        }
+    }
+
+    /// Status plus, on macOS while this session has computer use on, the driver's two grants. Reading them starts
+    /// the driver, whose own first-run panel then walks the user through System Settings.
+    pub async fn status_checked(&self, sid: Option<&str>) -> Value {
+        #[allow(unused_mut)]
+        let mut value = self.status(sid);
+        #[cfg(target_os = "macos")]
+        if value["enabled"] == true && value["status"] == "ready" {
+            let check = self.request("tools/call", json!({"name":"check_permissions","arguments":{"prompt":false}}));
+            match tokio::time::timeout(Duration::from_secs(50), check).await {
+                Ok(Ok(response)) => {
+                    let data = structured(&response);
+                    let accessibility = data["accessibility"] == true;
+                    let screen = data["screen_recording"] == true;
+                    value["permissions"] = json!({"accessibility": accessibility, "screenRecording": screen});
+                    if !(accessibility && screen) {
+                        value["status"] = json!("permissionsRequired");
+                    }
+                }
+                Ok(Err(error)) => value["driverError"] = json!(format!("{error:#}")),
+                Err(_) => value["driverError"] = json!("桌面驱动启动超时"),
+            }
+        }
+        value
+    }
+
+    /// Open the System Settings pane of one macOS grant ("accessibility" / "screenRecording")
+    pub fn open_settings(&self, kind: &str) -> Result<()> {
+        #[cfg(target_os = "macos")]
+        return mac::open_settings(kind);
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = kind;
+            bail!("只有 macOS 需要在系统设置里授权")
         }
     }
 
@@ -360,7 +432,7 @@ impl Desktop {
             .clone();
         let result = self.mcp(hub, sid, &ticket, json!({"method":"tools/call","params":{"name":"get_desktop_state","arguments":{"max_image_dimension":1600}}})).await?;
         if result["isError"] == true {
-            bail!("无法截取桌面，请确认 Windows 已登录并解锁");
+            bail!("无法截取桌面，请确认已登录并解锁桌面");
         }
         Ok(())
     }
@@ -372,7 +444,7 @@ impl Desktop {
         self.close_if_idle().await;
         let response = response?;
         if response["isError"] == true {
-            bail!("无法读取桌面窗口，请确认已登录并解锁 Windows 桌面");
+            bail!("无法读取桌面窗口，请确认已登录并解锁桌面");
         }
         let value = structured(&response);
         let mut found = vec![];
@@ -380,7 +452,7 @@ impl Desktop {
         found.sort_by(|a, b| a.title.cmp(&b.title));
         found.dedup_by_key(|t| t.window_id);
         if found.is_empty() {
-            bail!("未发现可操作窗口，请确认 daemon 运行在已登录的 Windows 桌面中");
+            bail!("未发现可操作窗口，请确认 daemon 运行在已登录的桌面中");
         }
         Ok(found)
     }
@@ -724,6 +796,7 @@ fn prune_images(sid: &str) {
     }
 }
 
+#[cfg(not(target_os = "macos"))]
 fn driver_path() -> Result<PathBuf> {
     #[cfg(all(windows, target_arch = "x86_64"))]
     {
@@ -756,7 +829,7 @@ fn driver_path() -> Result<PathBuf> {
     #[cfg(not(all(windows, target_arch = "x86_64")))]
     {
         let _ = BINARY_SHA;
-        bail!("操作电脑首版仅支持 Windows x64");
+        bail!(UNSUPPORTED);
     }
 }
 
@@ -768,13 +841,25 @@ struct Peer {
 }
 impl Peer {
     async fn start() -> Result<Self> {
-        let path = driver_path()?;
-        let mut command = Command::new(path);
+        // macOS: a proxy to the CuaDriver.app daemon, which holds the grants (see mac.rs)
+        #[cfg(target_os = "macos")]
+        let mut command = {
+            let app = tokio::task::spawn_blocking(mac::app_path).await??;
+            let socket = mac::socket_path()?;
+            mac::start(&app, &socket).await?;
+            let mut command = Command::new(mac::executable(&app));
+            command.arg("mcp").arg("--socket").arg(&socket);
+            command
+        };
+        // Windows: the driver runs inside this MCP process
+        #[cfg(not(target_os = "macos"))]
+        let mut command = {
+            let mut command = Command::new(driver_path()?);
+            command.args(["mcp", "--direct"]).env("CUA_DRIVER_EMBEDDED", "1");
+            command
+        };
         command
-            .args(["mcp", "--direct"])
-            .env("CUA_DRIVER_EMBEDDED", "1")
-            .env("CUA_DRIVER_RS_TELEMETRY_ENABLED", "0")
-            .env("CUA_DRIVER_RS_UPDATE_CHECK", "0")
+            .envs(DRIVER_ENV.iter().copied())
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
@@ -998,15 +1083,29 @@ mod process {
         }
     }
 
-    // Computer use is Windows-only; elsewhere never treat a bound proxy as gone
-    #[cfg(not(windows))]
-    pub fn alive(_pid: u32) -> bool {
-        true
+    #[cfg(unix)]
+    pub fn alive(pid: u32) -> bool {
+        let Ok(pid) = i32::try_from(pid) else { return false };
+        // Safety: signal 0 only checks that the process exists; EPERM means it exists under another user
+        unsafe { libc::kill(pid, 0) == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM) }
     }
 
-    #[cfg(not(windows))]
-    pub fn parent(_pid: u32) -> Option<u32> {
-        None
+    #[cfg(target_os = "macos")]
+    pub fn parent(pid: u32) -> Option<u32> {
+        // Safety: proc_bsdinfo is plain data; the buffer and its size are passed together
+        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of::<libc::proc_bsdinfo>() as i32;
+        let n = unsafe {
+            libc::proc_pidinfo(i32::try_from(pid).ok()?, libc::PROC_PIDTBSDINFO, 0, (&mut info as *mut libc::proc_bsdinfo).cast(), size)
+        };
+        (n == size).then_some(info.pbi_ppid).filter(|p| *p != 0)
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    pub fn parent(pid: u32) -> Option<u32> {
+        // /proc/<pid>/stat: "pid (comm) state ppid ..."; comm may contain spaces, so split after the last ')'
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        stat.rsplit_once(')')?.1.split_whitespace().nth(1)?.parse().ok().filter(|p| *p != 0)
     }
 }
 
@@ -1233,7 +1332,19 @@ fn desktop_available() -> bool {
             .eq_ignore_ascii_case("default")
     }
 }
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+fn driver_installed() -> bool {
+    mac::installed()
+}
+#[cfg(not(target_os = "macos"))]
+fn driver_installed() -> bool {
+    true
+}
+#[cfg(target_os = "macos")]
+fn desktop_available() -> bool {
+    mac::desktop_available()
+}
+#[cfg(not(any(windows, target_os = "macos")))]
 fn desktop_available() -> bool {
     false
 }

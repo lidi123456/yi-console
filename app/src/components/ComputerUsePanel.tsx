@@ -19,6 +19,9 @@ interface DesktopState {
   paused: boolean;
   status: string;
   lastWindow?: Target;
+  /** macOS: the driver's grants, read while computer use is on */
+  permissions?: { accessibility: boolean; screenRecording: boolean };
+  driverError?: string;
 }
 
 export function ComputerUsePanel({
@@ -46,22 +49,29 @@ export function ComputerUsePanel({
       if (previous?.isConnected) previous.focus();
     };
   }, [open]);
+  // The first macOS read starts the driver and can take a while: don't stack polls behind it
+  const reading = useRef(false);
   const refresh = useCallback(async () => {
-    if (!connected) return;
+    if (!connected || reading.current) return;
+    reading.current = true;
     try {
       setState(await rpc(hostId, 'computerUse.status', { sessionId: info.id }));
     } catch {
       setState(undefined);
+    } finally {
+      reading.current = false;
     }
   }, [hostId, info.id, connected]);
   useEffect(() => {
     void refresh();
   }, [refresh, info.computerUse, info.status, revision]);
+  const waitingGrant = state?.status === 'permissionsRequired';
   useEffect(() => {
     if (!state?.enabled || !connected) return;
-    const timer = window.setInterval(() => void refresh(), 5000);
+    // Faster while the user is granting in System Settings
+    const timer = window.setInterval(() => void refresh(), waitingGrant && open ? 2000 : 5000);
     return () => window.clearInterval(timer);
-  }, [state?.enabled, connected, refresh]);
+  }, [state?.enabled, connected, refresh, waitingGrant, open]);
   const change = async (action: string) => {
     setBusy(true);
     setError('');
@@ -75,7 +85,22 @@ export function ComputerUsePanel({
       setBusy(false);
     }
   };
-  const statusLabel = state?.status === 'desktopUnavailable' ? t('desktopUnavailable') : state?.paused ? t('paused') : t('ready');
+  const openSettings = async (kind: 'accessibility' | 'screenRecording') => {
+    setError('');
+    try {
+      setState(await rpc(hostId, 'session.computerUse', { sessionId: info.id, action: `settings:${kind}` }));
+    } catch (e) {
+      setError(trErr(e instanceof Error ? e.message : String(e)));
+    }
+  };
+  const statusLabel =
+    state?.status === 'desktopUnavailable'
+      ? t('desktopUnavailable')
+      : state?.status === 'permissionsRequired'
+        ? t('permissionsRequired')
+        : state?.paused
+          ? t('paused')
+          : t('ready');
   return (
     <>
       <div className="computer-use-bar">
@@ -126,9 +151,33 @@ export function ComputerUsePanel({
               </button>
             </div>
             <p className="muted">{t('description')}</p>
-            {state?.supported ? (
+            {state?.status === 'driverMissing' ? (
+              <p role="status">{t('driverMissing')}</p>
+            ) : state?.supported ? (
               <>
                 <p className="muted small">{t('scope')}</p>
+                {state.enabled && state.permissions && waitingGrant && (
+                  <div className="computer-use-grants">
+                    <p className="small">{t('permissionsHint')}</p>
+                    {(['accessibility', 'screenRecording'] as const).map((kind) => (
+                      <div className="computer-use-grant" key={kind}>
+                        <span>{t(kind)}</span>
+                        <span className={state.permissions![kind] ? 'ok' : 'muted'}>{state.permissions![kind] ? t('granted') : t('notGranted')}</span>
+                        {!state.permissions![kind] && (
+                          <button className="btn small" onClick={() => void openSettings(kind)}>
+                            {t('openSettings')}
+                          </button>
+                        )}
+                      </div>
+                    ))}
+                    <p className="muted small">{t('permissionsRetry')}</p>
+                  </div>
+                )}
+                {state.enabled && state.driverError && (
+                  <p className="error-text" role="alert">
+                    {t('driverError', { message: trErr(state.driverError) })}
+                  </p>
+                )}
                 {error && (
                   <p className="error-text" role="alert">
                     {error}

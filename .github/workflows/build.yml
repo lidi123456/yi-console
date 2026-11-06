@@ -151,6 +151,10 @@ jobs:
           # The local sidecar reuses the build for the same platform
           cp daemons/yi-agentd-${{ matrix.daemon }}${{ matrix.ext }} app/src-tauri/binaries/yi-agentd-${{ matrix.target }}${{ matrix.ext }}
           chmod +x app/src-tauri/binaries/* app/src-tauri/resources/yi-agentd/* || true
+      # CuaDriver.app for computer use: only the macOS installer carries it, next to yi-agentd (see docs/internals/computer-use.md)
+      - name: prepare macOS Computer Use driver
+        if: runner.os == 'macOS'
+        run: python3 scripts/prepare-computer-use.py --macos app/src-tauri/resources/yi-agentd/computer-use-macos.tgz
       - run: npm ci
         working-directory: app
       # Updater bundles (NSIS setup / .app.tar.gz / AppImage plus .sig) need the updater signing key; releases must have it,

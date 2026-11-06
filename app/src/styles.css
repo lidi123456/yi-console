@@ -8780,3 +8780,8 @@ button.wp-commit-title .chev {
 @media (max-width: 760px) {
   .composer-tools:has(.computer-use-bar) .model-btn { max-width: 100px; min-width: 0; }
 }
+.computer-use-grants { display: flex; flex-direction: column; gap: 8px; margin: 12px 0; padding: 12px; border: 1px solid var(--border); border-radius: 8px; }
+.computer-use-grants p { margin: 0; }
+.computer-use-grant { display: flex; align-items: center; gap: 12px; min-height: 28px; }
+.computer-use-grant > span:first-child { flex: 1; }
+.computer-use-grant .ok { color: var(--ok); }

@@ -1,13 +1,13 @@
 {
   "title": "操作电脑",
-  "description": "允许当前 AI 会话操作会话所在主机上已登录的 Windows 桌面：打开应用、切换窗口、点击和输入。操作记录和截图会显示在聊天里。",
+  "description": "允许当前 AI 会话操作会话所在主机上已登录的桌面：打开应用、切换窗口、点击和输入。操作记录和截图会显示在聊天里。",
   "scope": "AI 可以操作这台电脑上的所有应用，请只在信任当前任务时开启。多个会话可以同时开启，但它们的操作可能互相干扰；停止回复会暂停操作，下一条消息自动恢复。",
   "enable": "开启操作电脑",
   "cancel": "取消",
   "close": "关闭",
   "ready": "已就绪",
   "paused": "已暂停",
-  "windowsOnly": "首版仅支持 Windows x64 的已登录桌面",
+  "windowsOnly": "仅支持 Windows x64 和 macOS 13 以上的已登录桌面",
   "unavailable": "无法读取状态，请检查主机连接和 daemon 版本。",
   "waitForTurn": "请先停止当前回复，再开启操作电脑。",
   "running": "正在执行",
@@ -25,5 +25,15 @@
   "notePaused": "已暂停操作电脑",
   "noteResumed": "已恢复操作电脑",
   "noteStopped": "已关闭操作电脑",
-  "disable": "关闭操作电脑"
+  "disable": "关闭操作电脑",
+  "permissionsRequired": "需要授权",
+  "permissionsHint": "macOS 需要在系统设置里允许「Cua Driver」使用下面两项权限。Cua Driver 是 Yi Console 自带的桌面驱动，授权会一直保留，升级 Yi Console 后不用重新授权。",
+  "permissionsRetry": "授权后这里会自动更新。屏幕录制授权后仍显示未授权的话，关闭再开启操作电脑。",
+  "accessibility": "辅助功能",
+  "screenRecording": "屏幕录制",
+  "granted": "已允许",
+  "notGranted": "未允许",
+  "openSettings": "打开系统设置",
+  "driverMissing": "这台 Mac 上没有桌面驱动。操作电脑需要在这台 Mac 上安装 Yi Console 桌面版；通过 SSH 部署的守护进程不带驱动。",
+  "driverError": "桌面驱动没有响应：{{message}}"
 }
