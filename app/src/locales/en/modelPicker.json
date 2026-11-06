@@ -13,5 +13,11 @@
   "fastMode": "Fast",
   "enabled": "On",
   "disabled": "Off",
-  "fastHint": "Faster replies; may cost more."
+  "fastHint": "Faster replies; may cost more.",
+  "contextWindow": "Context Window",
+  "model": "Model",
+  "modelSettings": "Model Settings",
+  "backToModelSettings": "Back to model settings",
+  "noMatchingModels": "No matching models",
+  "loadingModelParameters": "Syncing model parameters…"
 }

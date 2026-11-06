@@ -32,6 +32,7 @@ export interface SessionInfo {
   /** Percentage of the context window used */
   contextPercent?: number | null;
   modelConfigOptions?: ModelConfigOption[];
+  modelConfigPending?: boolean;
   /** default / acceptEdits / plan / bypass */
   permissionMode?: string | null;
   /** Thinking level; empty means the tool's default */

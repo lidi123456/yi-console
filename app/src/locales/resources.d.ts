@@ -873,8 +873,10 @@ export default interface Resources {
     "zoomOut": "缩小"
   },
   "modelPicker": {
+    "backToModelSettings": "返回模型设置",
     "chooseModel": "选择模型",
     "close": "关闭",
+    "contextWindow": "上下文窗口",
     "default": "默认",
     "defaultModel": "默认模型",
     "disabled": "关闭",
@@ -882,6 +884,10 @@ export default interface Resources {
     "fastHint": "开启后响应更快，费用可能更高。",
     "fastMode": "Fast",
     "loading": "加载中…",
+    "loadingModelParameters": "正在同步模型参数…",
+    "model": "模型",
+    "modelSettings": "模型设置",
+    "noMatchingModels": "没有匹配的模型",
     "noModelsReportedYetTry": "工具还没报告可选模型，发一条消息后再试",
     "reasoningEffort": "思考等级",
     "searchModels": "搜索模型",

@@ -293,10 +293,10 @@ fn next_config(st: &mut State) -> Option<Value> {
 
 fn apply_config_options(st: &mut State, r: &Value, em: &Emitter) {
     let Some(options) = r["configOptions"].as_array() else { return; };
-    if let Some(id) = options.iter().find(|o| o["id"] == "model").and_then(|o| o["currentValue"].as_str()) { st.config_model = Some(id.into()); em.model(id); }
+    if let Some(id) = options.iter().find(|o| o["id"] == "model").and_then(|o| o["currentValue"].as_str()) { st.config_model = Some(id.into()); }
     st.config_options = options.iter().filter(|o| matches!(o["category"].as_str(), Some("model_config" | "thought_level")))
         .filter_map(|o| serde_json::from_value::<ModelConfigOption>(o.clone()).ok()).collect();
-    em.model_config_options(st.config_options.clone());
+    em.model_configuration(st.config_model.as_deref(), st.config_options.clone(), false);
 }
 
 fn prompt(st: &mut State, em: &Emitter, p: &Prompt) -> Value {
@@ -473,14 +473,16 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Result<V
                 }
                 Pending::SetModel => {
                     st.switching = None;
+                    if spec.tool == ToolKind::Cursor { em.model_configuration(None, vec![], true); }
                     em.event(EventBody::Error {
                         message: format!("切换模型失败: {msg}"),
                     });
                     Ok(out)
                 }
                 Pending::SetConfig => {
-                    if let Some(model) = &st.config_model { em.model(model); }
-                    em.model_config_options(st.config_options.clone());
+                    if !st.config_queue.iter().any(|(id, _)| id == "model") {
+                        em.model_configuration(st.config_model.as_deref(), st.config_options.clone(), true);
+                    }
                     em.event(EventBody::Error { message: format!("切换模型参数失败: {msg}") });
                     Ok(out)
                 }
@@ -526,6 +528,7 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Result<V
                 let models = parse_models(r);
                 st.parameterized = spec.tool == ToolKind::Cursor && r["configOptions"].is_array();
                 if st.parameterized { apply_config_options(st, r, em); }
+                else if spec.tool == ToolKind::Cursor { em.model_configuration(None, vec![], true); }
                 let current = r["models"]["currentModelId"].as_str().map(str::to_string);
                 // If the model recorded on the session (picked at creation or switched later) differs from the tool's current one, switch to it
                 let queued_config = std::mem::take(&mut st.config_queue);
@@ -540,7 +543,7 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Result<V
                         if st.parameterized { st.config_queue.insert(0, ("model".into(), w)); }
                         else { out.push(set_model(st, &w)); }
                     },
-                    (_, Some(c)) => em.model(c),
+                    (_, Some(c)) if !st.parameterized => em.model(c),
                     _ => {}
                 }
                 if st.parameterized {
@@ -616,6 +619,7 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Result<V
                 if let Some(m) = st.switching.take() {
                     em.model(&m);
                 }
+                if spec.tool == ToolKind::Cursor { em.model_configuration(None, vec![], true); }
             }
             Pending::SetConfig => apply_config_options(st, r, em),
             Pending::Other => {}

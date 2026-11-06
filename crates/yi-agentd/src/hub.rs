@@ -307,6 +307,7 @@ impl Hub {
         let mut interrupted = vec![];
         let mut map = self.sessions.lock().unwrap();
         for mut info in list {
+            info.model_config_pending = false;
             let queue = queues
                 .remove(&info.id)
                 .filter(|_| info.tool.has_process() && info.mode == SessionMode::Structured)
@@ -469,7 +470,8 @@ impl Hub {
                 .clone()
                 .filter(|m| permission_modes(tool, mode).contains(&m.as_str())),
             effort: p.effort.clone().filter(|e| !e.is_empty()),
-            model_config_options: vec![],
+            model_config_options: if tool == ToolKind::Cursor { p.model.as_deref().and_then(|m| self.store.model_config(m.split('[').next().unwrap_or(m)).ok().flatten()).unwrap_or_default() } else { vec![] },
+            model_config_pending: tool == ToolKind::Cursor && mode == SessionMode::Structured,
             pinned: false,
             queued: vec![],
             queue_paused: None,
@@ -856,6 +858,10 @@ impl Hub {
                 bail!("终端模式不支持切换模型");
             }
             i.model = Some(model.to_string()).filter(|m| !m.is_empty());
+            if i.tool == ToolKind::Cursor {
+                i.model_config_options = self.store.model_config(model.split('[').next().unwrap_or(model))?.unwrap_or_default();
+                i.model_config_pending = self.running_tx(&rt).is_some();
+            }
             i.clone()
         };
         self.store.save_session(&info)?;
@@ -978,6 +984,7 @@ impl Hub {
             if i.mode != SessionMode::Structured || i.tool != ToolKind::Cursor {
                 bail!("这个会话不支持调整模型参数");
             }
+            if i.model_config_pending { bail!("正在切换模型，请等待参数同步完成"); }
             let option = i.model_config_options.iter_mut().find(|o| o.id == config_id)
                 .ok_or_else(|| anyhow!("当前模型不支持这个参数"))?;
             if !option.options.iter().any(|o| o.value == value) {
@@ -2253,7 +2260,12 @@ impl Hub {
             );
         }
         // The process is gone, and so are its background tasks
-        self.set_info(sid, gen, |i| !std::mem::take(&mut i.background_tasks).is_empty());
+        self.set_info(sid, gen, |i| {
+            let changed = i.model_config_pending || !i.background_tasks.is_empty();
+            i.model_config_pending = false;
+            i.background_tasks.clear();
+            changed
+        });
         let failed = message.is_some();
         if let Some(m) = &message {
             self.emit(sid, gen, EventBody::Error { message: m.clone() });
@@ -2514,10 +2526,20 @@ impl Emitter {
         *rt.models.lock().unwrap() = models;
     }
 
-    pub fn model_config_options(&self, options: Vec<ModelConfigOption>) {
+    /// Publish model and parameters together. Late replies can populate the cache but cannot undo a newer selection.
+    pub fn model_configuration(&self, model: Option<&str>, options: Vec<ModelConfigOption>, rejected: bool) {
+        if self.hub.alive(&self.sid, self.gen).is_none() { return; }
+        if let Some(model) = model {
+            let _ = self.hub.store.save_model_config(model, &options);
+        }
         self.hub.set_info(&self.sid, self.gen, |i| {
-            if i.model_config_options == options { return false; }
+            let target = i.model.as_deref().filter(|m| !m.is_empty()).map(|m| m.split('[').next().unwrap_or(m));
+            if i.model_config_pending && target.is_some() && !rejected && model != target { return false; }
+            let next = model.map(str::to_string).or_else(|| i.model.clone());
+            if i.model == next && i.model_config_options == options && !i.model_config_pending { return false; }
+            i.model = next;
             i.model_config_options = options;
+            i.model_config_pending = false;
             true
         });
     }
@@ -2741,6 +2763,42 @@ mod tests {
     }
 
     #[test]
+    fn model_config_cache_is_host_wide_and_late_replies_do_not_revert_selection() {
+        let (hub, em, _rx) = test_emitter();
+        hub.get("s").unwrap().info.lock().unwrap().tool = ToolKind::Cursor;
+        let options = vec![ModelConfigOption {
+            id: "fast".into(), name: "Fast".into(), category: "model_config".into(), description: String::new(),
+            current_value: "false".into(), options: vec![],
+        }];
+        em.model_configuration(Some("known"), options.clone(), false);
+        hub.set_model("s", "cold").unwrap();
+        assert!(hub.info("s").unwrap().model_config_pending);
+        assert!(hub.info("s").unwrap().model_config_options.is_empty());
+        em.model_configuration(Some("known"), options.clone(), false);
+        assert_eq!(hub.info("s").unwrap().model.as_deref(), Some("cold"));
+        assert!(hub.info("s").unwrap().model_config_pending);
+        em.model_configuration(Some("cold"), vec![], false);
+        assert!(!hub.info("s").unwrap().model_config_pending);
+        // Empty capabilities are a hit too; they must not trigger another discovery.
+        assert_eq!(hub.store.model_config("cold").unwrap(), Some(vec![]));
+        let _other_rx = live(&hub, "other", SessionMode::Structured, SessionStatus::Idle, 0);
+        hub.get("other").unwrap().info.lock().unwrap().tool = ToolKind::Cursor;
+        hub.set_model("other", "known").unwrap();
+        let other = hub.info("other").unwrap();
+        let mut cached = options.clone();
+        cached[0].current_value.clear();
+        assert_eq!(other.model_config_options, cached);
+        assert!(other.model_config_pending);
+        assert!(hub.set_model_config("other", "fast", "true").is_err());
+        // A rejected switch atomically rolls back both model and parameters and stops loading.
+        em.model_configuration(Some("known"), options.clone(), true);
+        assert_eq!(hub.info("s").unwrap().model.as_deref(), Some("known"));
+        assert!(!hub.info("s").unwrap().model_config_pending);
+        let isolated = Store::open_memory().unwrap();
+        assert!(isolated.model_config("known").unwrap().is_none());
+    }
+
+    #[test]
     fn session_id_path_guard() {
         assert!(safe_sid(&uuid::Uuid::new_v4().to_string()));
         for bad in ["", "..", "../../victim", "/home/me", "a/b", r"C:\x", "abc def"] {
@@ -2769,6 +2827,7 @@ mod tests {
             permission_mode: None,
             effort: None,
             model_config_options: vec![],
+            model_config_pending: false,
             pinned: false,
             queued: vec![],
             queue_paused: None,

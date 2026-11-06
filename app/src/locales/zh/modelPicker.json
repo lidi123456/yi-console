@@ -13,5 +13,11 @@
   "fastMode": "Fast",
   "enabled": "开启",
   "disabled": "关闭",
-  "fastHint": "开启后响应更快，费用可能更高。"
+  "fastHint": "开启后响应更快，费用可能更高。",
+  "contextWindow": "上下文窗口",
+  "model": "模型",
+  "modelSettings": "模型设置",
+  "backToModelSettings": "返回模型设置",
+  "noMatchingModels": "没有匹配的模型",
+  "loadingModelParameters": "正在同步模型参数…"
 }

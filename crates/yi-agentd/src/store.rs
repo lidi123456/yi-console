@@ -1,7 +1,7 @@
 //! SQLite persistence: session metadata, event log, usage records, queued messages.
 
 use anyhow::Result;
-use yi_proto::{Event, EventBody, SessionInfo, Usage};
+use yi_proto::{Event, EventBody, ModelConfigOption, SessionInfo, Usage};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 use std::sync::Mutex;
@@ -48,6 +48,10 @@ impl Store {
                  credits REAL NOT NULL
              );
              CREATE INDEX IF NOT EXISTS usage_ts ON usage_log(ts);
+             CREATE TABLE IF NOT EXISTS model_configs (
+                 model TEXT PRIMARY KEY,
+                 options TEXT NOT NULL
+             );
              CREATE TABLE IF NOT EXISTS queues (
                  session_id TEXT PRIMARY KEY,
                  items TEXT NOT NULL
@@ -56,6 +60,24 @@ impl Store {
         Ok(Store {
             conn: Mutex::new(conn),
         })
+    }
+
+    /// Host-wide Cursor parameter snapshots. An empty list is a cached unsupported model, not a miss.
+    pub fn model_config(&self, model: &str) -> Result<Option<Vec<ModelConfigOption>>> {
+        let raw: Option<String> = self.conn.lock().unwrap().query_row(
+            "SELECT options FROM model_configs WHERE model = ?1", [model], |r| r.get(0),
+        ).optional()?;
+        Ok(raw.and_then(|s| serde_json::from_str(&s).ok()))
+    }
+
+    pub fn save_model_config(&self, model: &str, options: &[ModelConfigOption]) -> Result<()> {
+        // Capabilities are host-wide; selected values belong to a session and must never leak through the cache.
+        let options = options.iter().cloned().map(|mut o| { o.current_value.clear(); o }).collect::<Vec<_>>();
+        self.conn.lock().unwrap().execute(
+            "INSERT OR REPLACE INTO model_configs(model, options) VALUES (?1, ?2)",
+            params![model, serde_json::to_string(&options)?],
+        )?;
+        Ok(())
     }
 
     /// Find user messages and assistant replies containing q (case-insensitive), newest first
@@ -285,6 +307,21 @@ mod tests {
     use super::*;
     use yi_proto::*;
 
+    #[test]
+    fn model_config_cache_survives_reopen_and_distinguishes_empty_from_missing() {
+        let path = std::env::temp_dir().join(format!("yi-model-cache-{}.db", uuid::Uuid::new_v4()));
+        {
+            let store = Store::open(&path).unwrap();
+            store.save_model_config("no-parameters", &[]).unwrap();
+        }
+        {
+            let store = Store::open(&path).unwrap();
+            assert_eq!(store.model_config("no-parameters").unwrap(), Some(vec![]));
+            assert_eq!(store.model_config("unknown").unwrap(), None);
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
     fn info(id: &str) -> SessionInfo {
         SessionInfo {
             id: id.into(),
@@ -305,6 +342,7 @@ mod tests {
             permission_mode: None,
             effort: None,
             model_config_options: vec![],
+            model_config_pending: false,
             pinned: false,
             parent_id: None,
             synced_users: None,

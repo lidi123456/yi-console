@@ -191,6 +191,9 @@ pub struct SessionInfo {
     /// Session-local ACP model parameters, including their supported values
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub model_config_options: Vec<ModelConfigOption>,
+    /// The selected model is waiting for an authoritative ACP parameter snapshot.
+    #[serde(default)]
+    pub model_config_pending: bool,
     /// Pinned in the sidebar
     #[serde(default)]
     pub pinned: bool,
