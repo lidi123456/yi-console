@@ -26,6 +26,8 @@ function modelLabel(current: string | null | undefined, models: ModelOption[]) {
 }
 
 const EFFORT_LABEL_ZH: Record<string, string> = {
+  none: '无',
+  'extra-high': '很高',
   minimal: '最少',
   low: '低',
   medium: '中',
@@ -36,6 +38,8 @@ const EFFORT_LABEL_ZH: Record<string, string> = {
 };
 
 const EFFORT_LABEL_EN: Record<string, string> = {
+  none: 'None',
+  'extra-high': 'Extra High',
   minimal: 'Minimal',
   low: 'Low',
   medium: 'Medium',
@@ -86,7 +90,7 @@ export function ModelPicker({ hostId, info }: { hostId: string; info: SessionInf
     setModels(null);
     load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [hostId, info.id]);
+  }, [hostId, info.id, info.model]);
   // /model typed in the input box
   useEffect(() => {
     const f = () => {
@@ -113,6 +117,18 @@ export function ModelPicker({ hostId, info }: { hostId: string; info: SessionInf
       errorToast(e);
     }
   };
+  const pickConfig = async (configId: string, value: string) => {
+    try {
+      await rpc(hostId, 'session.setModelConfig', { sessionId: info.id, configId, value });
+    } catch (e) {
+      errorToast(e);
+    }
+  };
+  const cursorOptions = info.tool === 'cursor'
+    ? (info.modelConfigOptions ?? []).filter((o) => o.id === 'fast' || o.id === 'reasoning')
+    : [];
+  const fast = cursorOptions.find((o) => o.id === 'fast')?.currentValue === 'true';
+  const cursorEffort = cursorOptions.find((o) => o.id === 'reasoning')?.currentValue;
   const cur = info.model;
   const activeId = cur ? findModel(cur, models ?? [])?.id : undefined;
   const curModel = currentModel(cur, models ?? []);
@@ -157,6 +173,23 @@ export function ModelPicker({ hostId, info }: { hostId: string; info: SessionInf
               );
             })}
           </div>
+          {cursorOptions.map((o) => (
+            <div className="effort-row" key={o.id}>
+              <div className="muted small">{o.id === 'fast' ? t('fastMode') : t('reasoningEffort')}</div>
+              <div className="seg effort-seg">
+                {o.options.map((v) => (
+                  <button
+                    key={v.value}
+                    className={o.currentValue === v.value ? 'active' : ''}
+                    onClick={() => pickConfig(o.id, v.value)}
+                  >
+                    {o.id === 'fast' ? (v.value === 'true' ? t('enabled') : t('disabled')) : effortLabel(v.value)}
+                  </button>
+                ))}
+              </div>
+              {o.id === 'fast' && <div className="muted small" title={o.description}>{t('fastHint')}</div>}
+            </div>
+          ))}
           {efforts.length > 0 && (
             <div className="effort-row">
               <div className="muted small">{t('reasoningEffort')}</div>
@@ -193,7 +226,8 @@ export function ModelPicker({ hostId, info }: { hostId: string; info: SessionInf
         }}
       >
         <span className="truncate">{modelLabel(cur, models ?? [])}</span>
-        {effort && <span className="model-effort">{effortLabel(effort)}</span>}
+        {(cursorEffort || effort) && <span className="model-effort">{effortLabel(cursorEffort || effort)}</span>}
+        {fast && <span className="model-effort">{t('fastMode')}</span>}
         <Icon name="down" size={12} />
       </button>
       {open &&

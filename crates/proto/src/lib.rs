@@ -188,6 +188,9 @@ pub struct SessionInfo {
     /// Thinking level; the tool's default if unset
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
+    /// Session-local ACP model parameters, including their supported values
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub model_config_options: Vec<ModelConfigOption>,
     /// Pinned in the sidebar
     #[serde(default)]
     pub pinned: bool,
@@ -280,6 +283,24 @@ pub struct SlashCommand {
     /// Argument hint
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub hint: String,
+}
+
+/// A select parameter reported by an ACP tool. Model and permission-mode selectors are handled separately.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelConfigOption {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    pub current_value: String,
+    pub options: Vec<ModelConfigValue>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ModelConfigValue {
+    pub value: String,
+    pub name: String,
 }
 
 /// A model the tool offers
@@ -722,6 +743,7 @@ pub mod methods {
     pub const SESSION_MODELS: &str = "session.models";
     /// Switch model {sessionId, model}, effective next turn
     pub const SESSION_SET_MODEL: &str = "session.setModel";
+    pub const SESSION_SET_MODEL_CONFIG: &str = "session.setModelConfig";
     pub const SESSION_SET_EFFORT: &str = "session.setEffort";
     /// {sessionId, mode}: switch permission mode, effective immediately while the process runs
     pub const SESSION_SET_PERMISSION_MODE: &str = "session.setPermissionMode";

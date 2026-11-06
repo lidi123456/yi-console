@@ -417,6 +417,10 @@ pub async fn dispatch(
             hub.stop_task(s(&p, "sessionId")?, s(&p, "taskId")?)?;
             Value::Null
         }
+        SESSION_SET_MODEL_CONFIG => {
+            hub.set_model_config(s(&p, "sessionId")?, s(&p, "configId")?, s(&p, "value")?)?;
+            Value::Null
+        }
         SESSION_SET_EFFORT => {
             hub.set_effort(s(&p, "sessionId")?, p["effort"].as_str().unwrap_or(""))?;
             Value::Null

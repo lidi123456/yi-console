@@ -84,6 +84,10 @@ export function onLangChange(f: () => void): () => void {
 }
 
 const ERR_PATTERNS: [RegExp, string | ((...m: string[]) => string)][] = [
+  [/这个会话不支持调整模型参数/, 'This session does not support model parameters'],
+  [/当前模型不支持这个参数/, 'The current model does not support this parameter'],
+  [/模型参数值无效/, 'Invalid model parameter value'],
+  [/^切换模型参数失败[:：]\s*(.+)$/, (_, m) => `Could not change model parameter: ${m}`],
   [/^未知方法[:：]\s*(.+)$/, (_, m) => `Unknown method: ${m}`],
   [/未知方法/, 'Unknown method'],
   [/文件在这期间被修改过，请刷新后再试/, 'File was modified on disk, please reload and try again'],

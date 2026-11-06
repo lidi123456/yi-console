@@ -60,6 +60,8 @@ pub enum AdapterCmd {
     Send(Prompt),
     /// Switch model, effective next turn
     SetModel(String),
+    /// Set a supported ACP model parameter without restarting the process
+    SetModelConfig { id: String, value: String },
     /// Thinking level; an empty string restores the tool's default
     SetEffort(String),
     /// Switch permission mode (default / acceptEdits / plan / bypass)
@@ -87,6 +89,7 @@ pub struct StartSpec {
     pub replay_skip: usize,
     pub model: Option<String>,
     pub effort: Option<String>,
+    pub model_config_options: Vec<yi_proto::ModelConfigOption>,
     /// default / acceptEdits / bypass / plan
     pub permission_mode: String,
     pub command: Option<String>,

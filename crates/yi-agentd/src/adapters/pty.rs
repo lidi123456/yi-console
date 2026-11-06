@@ -291,7 +291,7 @@ pub fn start(spec: StartSpec, em: Emitter, mut rx: mpsc::UnboundedReceiver<Adapt
                         let _ = killer.kill();
                         break;
                     }
-                    Some(AdapterCmd::Permission { .. } | AdapterCmd::SetModel(_) | AdapterCmd::SetEffort(_) | AdapterCmd::SetPermissionMode(_) | AdapterCmd::StopTask(_)) => {}
+                    Some(AdapterCmd::Permission { .. } | AdapterCmd::SetModel(_) | AdapterCmd::SetEffort(_) | AdapterCmd::SetModelConfig { .. } | AdapterCmd::SetPermissionMode(_) | AdapterCmd::StopTask(_)) => {}
                 }
             }
         }

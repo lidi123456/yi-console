@@ -31,6 +31,7 @@ export interface SessionInfo {
   command?: string | null;
   /** Percentage of the context window used */
   contextPercent?: number | null;
+  modelConfigOptions?: ModelConfigOption[];
   /** default / acceptEdits / plan / bypass */
   permissionMode?: string | null;
   /** Thinking level; empty means the tool's default */
@@ -106,6 +107,14 @@ export interface GitFile {
   /** git status code (M, A, D…); untracked new files are new */
   status: string;
   diff: string;
+}
+
+export interface ModelConfigOption {
+  id: string;
+  name: string;
+  description: string;
+  currentValue: string;
+  options: { value: string; name: string }[];
 }
 
 export interface ModelOption {

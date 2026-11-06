@@ -304,6 +304,7 @@ mod tests {
             context_percent: None,
             permission_mode: None,
             effort: None,
+            model_config_options: vec![],
             pinned: false,
             parent_id: None,
             synced_users: None,

@@ -18,6 +18,7 @@ enum Pending {
     Load,
     Prompt,
     SetModel,
+    SetConfig,
     Other,
 }
 
@@ -50,6 +51,11 @@ struct State {
     want_model: Option<String>,
     /// Model being switched to; recorded on the session once it succeeds
     switching: Option<String>,
+    /// Cursor's parameterized picker is negotiated per process. Config changes run in order before prompts.
+    parameterized: bool,
+    config_options: Vec<ModelConfigOption>,
+    config_model: Option<String>,
+    config_queue: Vec<(String, String)>,
     seg: Option<(Seg, String, String)>,
     seg_n: u64,
     tools: HashMap<String, ToolState>,
@@ -145,7 +151,7 @@ pub async fn run(spec: StartSpec, em: Emitter, mut rx: mpsc::UnboundedReceiver<A
         Pending::Init,
         "initialize",
         json!({"protocolVersion":1,
-               "clientCapabilities":{"fs":{"readTextFile":false,"writeTextFile":false},"terminal":false},
+               "clientCapabilities":client_capabilities(spec.tool),
                "clientInfo":{"name":"yi-console","version":DAEMON_VERSION}}),
     );
     let _ = p.send(&init).await;
@@ -161,7 +167,8 @@ pub async fn run(spec: StartSpec, em: Emitter, mut rx: mpsc::UnboundedReceiver<A
                     Ok(outs) => for out in outs { let _ = p.send(&out).await; },
                     Err(msg) => { fatal = Some(msg); killed = true; break; }
                 }
-                if st.session_id.is_some() && !st.prompting && !st.loading && st.compacting.is_none() && !st.queue.is_empty() {
+                if let Some(m) = next_config(&mut st) { let _ = p.send(&m).await; }
+                if st.session_id.is_some() && !config_pending(&st) && !st.prompting && !st.loading && st.compacting.is_none() && !st.queue.is_empty() {
                     let next = st.queue.remove(0);
                     let m = prompt(&mut st, &em, &next);
                     let _ = p.send(&m).await;
@@ -170,7 +177,7 @@ pub async fn run(spec: StartSpec, em: Emitter, mut rx: mpsc::UnboundedReceiver<A
             cmd = rx.recv() => match cmd {
                 Some(AdapterCmd::Send(next)) => {
                     em.status(SessionStatus::Running, None);
-                    if st.session_id.is_some() && !st.prompting && !st.loading && st.compacting.is_none() {
+                    if st.session_id.is_some() && !config_pending(&st) && !st.prompting && !st.loading && st.compacting.is_none() {
                         let m = prompt(&mut st, &em, &next);
                         let _ = p.send(&m).await;
                     } else {
@@ -179,11 +186,20 @@ pub async fn run(spec: StartSpec, em: Emitter, mut rx: mpsc::UnboundedReceiver<A
                 }
                 Some(AdapterCmd::SetModel(model)) => {
                     if st.session_id.is_some() {
-                        let m = set_model(&mut st, &model);
-                        let _ = p.send(&m).await;
+                        if st.parameterized {
+                            st.config_queue.push(("model".into(), model));
+                            if let Some(m) = next_config(&mut st) { let _ = p.send(&m).await; }
+                        } else {
+                            let m = set_model(&mut st, &model);
+                            let _ = p.send(&m).await;
+                        }
                     } else {
                         st.want_model = Some(model);
                     }
+                }
+                Some(AdapterCmd::SetModelConfig { id, value }) => {
+                    st.config_queue.push((id, value));
+                    if let Some(m) = next_config(&mut st) { let _ = p.send(&m).await; }
                 }
                 Some(AdapterCmd::SetPermissionMode(mode)) => {
                     let was_plan = st.perm == "plan";
@@ -237,6 +253,39 @@ pub async fn run(spec: StartSpec, em: Emitter, mut rx: mpsc::UnboundedReceiver<A
     flush(&mut st, &em);
     let msg = p.finish(killed).await;
     em.exited(fatal.or(msg));
+}
+
+/// Cursor only exposes individual model parameters when this extension is declared.
+pub fn client_capabilities(tool: ToolKind) -> Value {
+    let mut caps = json!({"fs":{"readTextFile":false,"writeTextFile":false},"terminal":false});
+    if tool == ToolKind::Cursor { caps["_meta"] = json!({"parameterizedModelPicker":true}); }
+    caps
+}
+
+fn config_pending(st: &State) -> bool {
+    !st.config_queue.is_empty() || st.pending.values().any(|p| matches!(p, Pending::SetModel | Pending::SetConfig))
+}
+
+fn next_config(st: &mut State) -> Option<Value> {
+    if st.loading || st.session_id.is_none() || !st.parameterized || st.pending.values().any(|p| matches!(p, Pending::SetModel | Pending::SetConfig)) {
+        return None;
+    }
+    while !st.config_queue.is_empty() {
+        let (id, value) = st.config_queue.remove(0);
+        // Saved parameters may no longer exist after a model switch or tool upgrade.
+        if id != "model" && !st.config_options.iter().any(|o| o.id == id && o.options.iter().any(|v| v.value == value)) { continue; }
+        return Some(st.req(Pending::SetConfig, "session/set_config_option",
+            json!({"sessionId":st.session_id,"configId":id,"value":value})));
+    }
+    None
+}
+
+fn apply_config_options(st: &mut State, r: &Value, em: &Emitter) {
+    let Some(options) = r["configOptions"].as_array() else { return; };
+    if let Some(id) = options.iter().find(|o| o["id"] == "model").and_then(|o| o["currentValue"].as_str()) { st.config_model = Some(id.into()); em.model(id); }
+    st.config_options = options.iter().filter(|o| matches!(o["category"].as_str(), Some("model_config" | "thought_level")))
+        .filter_map(|o| serde_json::from_value::<ModelConfigOption>(o.clone()).ok()).collect();
+    em.model_config_options(st.config_options.clone());
 }
 
 fn prompt(st: &mut State, em: &Emitter, p: &Prompt) -> Value {
@@ -413,6 +462,12 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Result<V
                     });
                     Ok(out)
                 }
+                Pending::SetConfig => {
+                    if let Some(model) = &st.config_model { em.model(model); }
+                    em.model_config_options(st.config_options.clone());
+                    em.event(EventBody::Error { message: format!("切换模型参数失败: {msg}") });
+                    Ok(out)
+                }
                 Pending::Other => Ok(out),
             };
         }
@@ -450,18 +505,38 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Result<V
                     }
                 }
                 let models = parse_models(r);
+                st.parameterized = spec.tool == ToolKind::Cursor && r["configOptions"].is_array();
+                if st.parameterized { apply_config_options(st, r, em); }
                 let current = r["models"]["currentModelId"].as_str().map(str::to_string);
                 // If the model recorded on the session (picked at creation or switched later) differs from the tool's current one, switch to it
+                let queued_config = std::mem::take(&mut st.config_queue);
                 let want = st
                     .want_model
                     .take()
                     .or(spec.model.clone())
+                    .map(|m| if st.parameterized { m.split('[').next().unwrap_or(&m).to_string() } else { m })
                     .filter(|m| !m.is_empty() && models.iter().any(|o| &o.id == m));
                 match (want, &current) {
-                    (Some(w), c) if c.as_deref() != Some(w.as_str()) => out.push(set_model(st, &w)),
+                    (Some(w), c) if c.as_deref() != Some(w.as_str()) => {
+                        if st.parameterized { st.config_queue.insert(0, ("model".into(), w)); }
+                        else { out.push(set_model(st, &w)); }
+                    },
                     (_, Some(c)) => em.model(c),
                     _ => {}
                 }
+                if st.parameterized {
+                    if let Some(params) = spec.model.as_deref().and_then(|m| m.split_once('[')).map(|(_, p)| p.trim_end_matches(']')) {
+                        for param in params.split(',') {
+                            if let Some((id, value)) = param.split_once('=') {
+                                let id = if id.trim() == "reasoning_effort" { "reasoning" } else { id.trim() };
+                                st.config_queue.push((id.into(), value.trim().into()));
+                            }
+                        }
+                    }
+                    // Restore after the model switch, before any queued user prompt.
+                    for o in &spec.model_config_options { st.config_queue.push((o.id.clone(), o.current_value.clone())); }
+                }
+                st.config_queue.extend(queued_config);
                 em.models(models);
                 let modes = r["modes"]["availableModes"].as_array().cloned().unwrap_or_default();
                 st.plan_mode = modes
@@ -523,6 +598,7 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Result<V
                     em.model(&m);
                 }
             }
+            Pending::SetConfig => apply_config_options(st, r, em),
             Pending::Other => {}
         }
         return Ok(out);
@@ -805,6 +881,7 @@ fn login_hint(spec: &StartSpec, msg: &str) -> String {
 
 fn update(st: &mut State, em: &Emitter, u: &Value) {
     match u["sessionUpdate"].as_str().unwrap_or("") {
+        "config_option_update" if st.parameterized => apply_config_options(st, u, em),
         "available_commands_update" => {
             let list = u["availableCommands"]
                 .as_array()
@@ -1097,16 +1174,20 @@ fn qoder_context(sid: &str) -> Option<f64> {
 }
 
 /// Cursor's ACP doesn't report token usage, so the context ratio can only be read from its local session store:
-/// `~/.cursor/chats/<md5(cwd)>/<sessionId>/store.db`, whose meta table holds hex-encoded JSON;
+/// `~/.cursor/acp-sessions/<sessionId>/store.db` (terminal fallback: `chats/<md5(cwd)>/<sessionId>/store.db`), whose meta table holds hex-encoded JSON;
 /// its latestRootBlobId points to the root record in the blobs table (protobuf, unencrypted),
 /// and field 5 of the root record is token_details { 1: used_tokens, 2: max_tokens }
 fn cursor_context(sid: &str) -> Option<f64> {
-    let chats = crate::paths::home().join(".cursor").join("chats");
-    let db = std::fs::read_dir(chats)
-        .ok()?
-        .flatten()
-        .map(|d| d.path().join(sid).join("store.db"))
-        .find(|p| p.is_file())?;
+    cursor_context_in(&crate::paths::home().join(".cursor"), sid)
+}
+
+fn cursor_context_in(root: &std::path::Path, sid: &str) -> Option<f64> {
+    // ACP writes a separate copy. A terminal-mode copy can be absent or stale after switching back to chat.
+    let acp = root.join("acp-sessions").join(sid).join("store.db");
+    let db = if acp.is_file() { acp } else {
+        std::fs::read_dir(root.join("chats")).ok()?.flatten()
+            .map(|d| d.path().join(sid).join("store.db")).find(|p| p.is_file())?
+    };
     let conn = rusqlite::Connection::open_with_flags(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).ok()?;
     let meta: String = conn
         .query_row("SELECT value FROM meta WHERE key = '0'", [], |r| r.get(0))
@@ -1202,5 +1283,72 @@ mod cursor_tests {
         assert_eq!(pb_varint(d, 1), Some(31908));
         assert_eq!(pb_varint(d, 2), Some(256000));
         assert_eq!(unhex("7b7d"), Some(b"{}".to_vec()));
+    }
+}
+
+#[cfg(test)]
+mod model_config_tests {
+    use super::*;
+
+    fn config() -> Value {
+        json!({"configOptions":[
+            {"id":"mode","category":"mode","currentValue":"agent"},
+            {"id":"model","category":"model","currentValue":"gpt-test"},
+            {"id":"fast","name":"Fast","category":"model_config","type":"select","currentValue":"false",
+             "options":[{"value":"false","name":"Off"},{"value":"true","name":"Fast"}]},
+            {"id":"reasoning","name":"Reasoning","category":"thought_level","type":"select","currentValue":"medium",
+             "options":[{"value":"medium","name":"Medium"},{"value":"high","name":"High"}]}
+        ]})
+    }
+
+    #[test]
+    fn parameters_are_authoritative_and_requests_are_ordered() {
+        let (hub, em, _rx) = crate::hub::test_emitter();
+        let mut st = State { session_id: Some("ext".into()), parameterized: true, ..Default::default() };
+        apply_config_options(&mut st, &config(), &em);
+        assert_eq!(st.config_options.len(), 2);
+        assert_eq!(hub.session_models("s").unwrap()["current"], "gpt-test");
+        st.config_queue = vec![("fast".into(), "true".into()), ("reasoning".into(), "high".into())];
+        let first = next_config(&mut st).unwrap();
+        assert_eq!(first["method"], "session/set_config_option");
+        assert_eq!(first["params"]["configId"], "fast");
+        assert!(config_pending(&st));
+        assert!(next_config(&mut st).is_none(), "do not overlap parameter requests");
+        st.pending.remove(&first["id"].as_u64().unwrap());
+        let mut ack = config();
+        ack["configOptions"][2]["currentValue"] = json!("true");
+        apply_config_options(&mut st, &ack, &em);
+        assert_eq!(next_config(&mut st).unwrap()["params"]["configId"], "reasoning");
+        let saved = hub.store.load_sessions().unwrap();
+        assert_eq!(saved[0].model_config_options[0].current_value, "true");
+    }
+
+    #[test]
+    fn unsupported_saved_parameters_do_not_block_prompts() {
+        let mut st = State { session_id: Some("ext".into()), parameterized: true, ..Default::default() };
+        st.config_queue = vec![("fast".into(), "true".into()), ("reasoning".into(), "ultra".into())];
+        assert!(next_config(&mut st).is_none());
+        assert!(!config_pending(&st));
+        assert_eq!(client_capabilities(ToolKind::Cursor)["_meta"]["parameterizedModelPicker"], true);
+        assert!(client_capabilities(ToolKind::Kiro).get("_meta").is_none());
+    }
+
+    #[test]
+    fn context_prefers_acp_store_over_stale_terminal_copy() {
+        let root = std::env::temp_dir().join(format!("yi-cursor-context-{}", uuid::Uuid::new_v4()));
+        let write_store = |path: &std::path::Path, used: u8| {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let conn = rusqlite::Connection::open(path).unwrap();
+            conn.execute_batch("CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT); CREATE TABLE blobs(id TEXT PRIMARY KEY, data BLOB);").unwrap();
+            let meta = br#"{"latestRootBlobId":"root"}"#;
+            let hex: String = meta.iter().map(|b| format!("{b:02x}")).collect();
+            conn.execute("INSERT INTO meta VALUES ('0', ?1)", [hex]).unwrap();
+            conn.execute("INSERT INTO blobs VALUES ('root', ?1)", [vec![0x2a, 4, 8, used, 16, 100]]).unwrap();
+        };
+        write_store(&root.join("chats/work/session/store.db"), 10);
+        assert_eq!(cursor_context_in(&root, "session"), Some(10.0));
+        write_store(&root.join("acp-sessions/session/store.db"), 70);
+        assert_eq!(cursor_context_in(&root, "session"), Some(70.0));
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

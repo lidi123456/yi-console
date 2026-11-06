@@ -407,6 +407,7 @@ impl Hub {
                 .clone()
                 .filter(|m| permission_modes(tool, mode).contains(&m.as_str())),
             effort: p.effort.clone().filter(|e| !e.is_empty()),
+            model_config_options: vec![],
             pinned: false,
             queued: vec![],
             queue_paused: None,
@@ -531,6 +532,7 @@ impl Hub {
             replay_skip: 0,
             model: info.model.clone(),
             effort: info.effort.clone(),
+            model_config_options: info.model_config_options.clone(),
             permission_mode: info.permission_mode.clone().unwrap_or_else(|| "default".into()),
             command: info.command.clone(),
             program,
@@ -881,6 +883,30 @@ impl Hub {
         self.broadcast_updated(&info);
         if let Some(tx) = self.running_tx(&rt) {
             let _ = tx.send(AdapterCmd::SetEffort(effort.to_string()));
+        }
+        Ok(())
+    }
+
+    /// Set an ACP parameter using only the choices reported for this session's current model.
+    pub fn set_model_config(&self, id: &str, config_id: &str, value: &str) -> Result<()> {
+        let rt = self.get(id)?;
+        let info = {
+            let mut i = rt.info.lock().unwrap();
+            if i.mode != SessionMode::Structured || i.tool != ToolKind::Cursor {
+                bail!("这个会话不支持调整模型参数");
+            }
+            let option = i.model_config_options.iter_mut().find(|o| o.id == config_id)
+                .ok_or_else(|| anyhow!("当前模型不支持这个参数"))?;
+            if !option.options.iter().any(|o| o.value == value) {
+                bail!("模型参数值无效");
+            }
+            option.current_value = value.to_string();
+            i.clone()
+        };
+        self.store.save_session(&info)?;
+        self.broadcast_updated(&info);
+        if let Some(tx) = self.running_tx(&rt) {
+            let _ = tx.send(AdapterCmd::SetModelConfig { id: config_id.into(), value: value.into() });
         }
         Ok(())
     }
@@ -2388,6 +2414,14 @@ impl Emitter {
         *rt.models.lock().unwrap() = models;
     }
 
+    pub fn model_config_options(&self, options: Vec<ModelConfigOption>) {
+        self.hub.set_info(&self.sid, self.gen, |i| {
+            if i.model_config_options == options { return false; }
+            i.model_config_options = options;
+            true
+        });
+    }
+
     /// Context usage percentage
     pub fn context(&self, percent: f64) {
         let p = (percent.clamp(0.0, 100.0) * 10.0).round() / 10.0;
@@ -2628,6 +2662,7 @@ mod tests {
             context_percent: None,
             permission_mode: None,
             effort: None,
+            model_config_options: vec![],
             pinned: false,
             queued: vec![],
             queue_paused: None,

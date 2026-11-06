@@ -9,5 +9,9 @@
   "toolDefault": "Tool default ({{v}})",
   "toolDefault2": "Tool default",
   "default": "Default",
-  "switchModel": "Switch Model"
+  "switchModel": "Switch Model",
+  "fastMode": "Fast",
+  "enabled": "On",
+  "disabled": "Off",
+  "fastHint": "Fast mode increases speed and may cost more. Pricing depends on the current model."
 }

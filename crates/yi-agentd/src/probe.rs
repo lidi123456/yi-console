@@ -215,7 +215,7 @@ async fn acp(tool: ToolKind, settings: &DaemonSettings, want_quota: bool) -> Res
     let mut out = Probe::default();
     let cwd = probe_dir().display().to_string();
     let init = json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,
-        "clientCapabilities":{"fs":{"readTextFile":false,"writeTextFile":false},"terminal":false},
+        "clientCapabilities":adapters::acp::client_capabilities(tool),
         "clientInfo":{"name":"yi-console","version":DAEMON_VERSION}}});
     let kiro_usage = want_quota && tool == ToolKind::Kiro;
     let mut sid = String::new();

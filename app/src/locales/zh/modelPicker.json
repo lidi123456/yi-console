@@ -9,5 +9,9 @@
   "toolDefault": "工具默认（{{v}}）",
   "toolDefault2": "工具默认",
   "default": "默认",
-  "switchModel": "切换模型"
+  "switchModel": "切换模型",
+  "fastMode": "Fast",
+  "enabled": "开启",
+  "disabled": "关闭",
+  "fastHint": "Fast 模式速度更快，费用可能增加；具体以当前模型计费为准。"
 }
