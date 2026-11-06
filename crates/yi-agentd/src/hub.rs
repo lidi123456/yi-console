@@ -90,6 +90,10 @@ pub fn attach_append(sid: &str, path: &str, data: &str) -> Result<serde_json::Va
 }
 
 fn models_path() -> PathBuf {
+    // Tests must never read or overwrite the real model lists
+    #[cfg(test)]
+    return std::env::temp_dir().join(format!("yi-agentd-test-models-{}.json", std::process::id()));
+    #[cfg(not(test))]
     crate::paths::base_dir().join("models.json")
 }
 
@@ -1129,8 +1133,7 @@ impl Hub {
         if m.get(tool.as_str()).map(|v| v.as_slice()) == Some(models) {
             return;
         }
-        // Cursor lists only the current model when its own model request fails; that isn't the account's list
-        if tool == ToolKind::Cursor && models.len() == 1 && m.get(tool.as_str()).is_some_and(|v| v.len() > 1) {
+        if m.get(tool.as_str()).is_some_and(|saved| short_cursor_list(tool, models, saved)) {
             return;
         }
         m.insert(tool.as_str().to_string(), models.to_vec());
@@ -2536,6 +2539,12 @@ fn mcp_fingerprint(servers: &[yi_proto::McpServerConfig], desktop: bool) -> Stri
     format!("{}{}", crate::mcp::fingerprint(servers), if desktop { "+desktop" } else { "" })
 }
 
+/// Cursor fills its model list from a server request of its own; when that fails or is cut short it lists a few
+/// models (the current one, Auto, a recent one). Far fewer than the saved list means that, not that the account lost them
+fn short_cursor_list(tool: ToolKind, models: &[ModelOption], saved: &[ModelOption]) -> bool {
+    tool == ToolKind::Cursor && models.len() * 2 < saved.len()
+}
+
 /// `grok-4.7[context=256k]` (the old single-string form) -> `grok-4.7`
 fn base_model(model: &str) -> &str {
     model.split('[').next().unwrap_or(model)
@@ -2650,7 +2659,8 @@ impl Emitter {
         };
         let tool = rt.info.lock().unwrap().tool;
         self.hub.remember_models(tool, &models);
-        *rt.models.lock().unwrap() = models;
+        let saved = self.hub.cached_models(tool);
+        *rt.models.lock().unwrap() = if short_cursor_list(tool, &models, &saved) { saved } else { models };
     }
 
     /// Cursor answered a `session/set_config_option`: its model and that model's full parameter list. This is the

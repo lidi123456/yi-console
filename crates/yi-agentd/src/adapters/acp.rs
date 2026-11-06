@@ -1562,9 +1562,14 @@ mod model_config_tests {
                 "options":[{"value":"auto-smart","name":"Auto"},{"value":"grok-4.7","name":"Grok 4.7"},{"value":"gemini-4-argon","name":"Gemini 4 Argon"}]}]});
         assert_eq!(parse_models(&r).iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["auto-smart", "grok-4.7", "gemini-4-argon"]);
         let (hub, _em, _rx) = crate::hub::test_emitter();
-        hub.remember_models(ToolKind::Cursor, &parse_models(&r));
-        hub.remember_models(ToolKind::Cursor, &listed_models(&r));
-        assert_eq!(hub.cached_models(ToolKind::Cursor).len(), 3);
+        // A short answer (Cursor's own model request failed) neither replaces the saved list nor limits the session
+        let many: Vec<_> = (0..32).map(|i| ModelOption { id: format!("m{i}"), name: format!("M{i}"), description: String::new(),
+            resolved: String::new(), efforts: vec![], default_effort: String::new() }).collect();
+        hub.remember_models(ToolKind::Cursor, &many);
+        crate::hub::test_set_tool(&hub, "s", ToolKind::Cursor);
+        _em.models(parse_models(&r));
+        assert_eq!(hub.cached_models(ToolKind::Cursor).len(), 32);
+        assert_eq!(hub.session_models("s").unwrap()["models"].as_array().unwrap().len(), 32);
     }
 
     #[test]
