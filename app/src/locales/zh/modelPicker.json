@@ -19,5 +19,5 @@
   "modelSettings": "模型设置",
   "backToModelSettings": "返回模型设置",
   "noMatchingModels": "没有匹配的模型",
-  "loadingModelParameters": "正在同步模型参数…"
+  "loadingModelParameters": "正在读取这个模型的参数…"
 }

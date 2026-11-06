@@ -308,6 +308,12 @@ impl Hub {
         let mut map = self.sessions.lock().unwrap();
         for mut info in list {
             info.model_config_pending = false;
+            // Sessions from before the parameter cache (or not started since) take the cached parameters
+            if info.tool == ToolKind::Cursor && info.model_config_options.is_empty() {
+                if let Some(options) = info.model.as_deref().and_then(|m| self.cached_config(m)) {
+                    info.model_config_options = options;
+                }
+            }
             let queue = queues
                 .remove(&info.id)
                 .filter(|_| info.tool.has_process() && info.mode == SessionMode::Structured)
@@ -470,8 +476,10 @@ impl Hub {
                 .clone()
                 .filter(|m| permission_modes(tool, mode).contains(&m.as_str())),
             effort: p.effort.clone().filter(|e| !e.is_empty()),
-            model_config_options: if tool == ToolKind::Cursor { p.model.as_deref().and_then(|m| self.store.model_config(m.split('[').next().unwrap_or(m)).ok().flatten()).unwrap_or_default() } else { vec![] },
-            model_config_pending: tool == ToolKind::Cursor && mode == SessionMode::Structured,
+            model_config_options: if tool == ToolKind::Cursor { p.model.as_deref().and_then(|m| self.cached_config(m)).unwrap_or_default() } else { vec![] },
+            // Only a model whose parameters aren't known yet waits; the process reads them when it switches to it
+            model_config_pending: tool == ToolKind::Cursor && mode == SessionMode::Structured
+                && p.model.as_deref().is_some_and(|m| self.cached_config(m).is_none()),
             pinned: false,
             queued: vec![],
             queue_paused: None,
@@ -850,26 +858,93 @@ impl Hub {
     }
 
     /// Switch model: recorded on the session (survives restarts), and the tool is told if the process is running
-    pub fn set_model(&self, id: &str, model: &str) -> Result<()> {
+    /// For Cursor the choice takes effect at once: parameters come from the cache (values reset to the model's
+    /// defaults), and the process switches before the next prompt. Nothing waits for Cursor to confirm
+    pub fn set_model(self: &Arc<Self>, id: &str, model: &str) -> Result<()> {
         let rt = self.get(id)?;
-        let info = {
+        let running = self.running_tx(&rt);
+        let (info, discover) = {
             let mut i = rt.info.lock().unwrap();
             if i.mode == SessionMode::Terminal {
                 bail!("终端模式不支持切换模型");
             }
             i.model = Some(model.to_string()).filter(|m| !m.is_empty());
-            if i.tool == ToolKind::Cursor {
-                i.model_config_options = self.store.model_config(model.split('[').next().unwrap_or(model))?.unwrap_or_default();
-                i.model_config_pending = self.running_tx(&rt).is_some();
+            let mut discover = false;
+            if i.tool == ToolKind::Cursor && i.mode == SessionMode::Structured {
+                let cached = (!model.is_empty()).then(|| self.store.model_config(base_model(model)).ok().flatten()).flatten();
+                i.model_config_pending = !model.is_empty() && cached.is_none();
+                i.model_config_options = cached.unwrap_or_default();
+                // A running process reads the parameters when it switches; otherwise a short probe does
+                discover = i.model_config_pending && running.is_none();
             }
-            i.clone()
+            (i.clone(), discover)
         };
         self.store.save_session(&info)?;
         self.broadcast_updated(&info);
-        if let Some(tx) = self.running_tx(&rt) {
+        if let Some(tx) = running {
             let _ = tx.send(AdapterCmd::SetModel(model.to_string()));
         }
+        if discover {
+            self.discover_model_config(base_model(model), &info.cwd);
+        }
         Ok(())
+    }
+
+    /// Cached Cursor parameters for a model; parameters written into an old model string become the values
+    fn cached_config(&self, model: &str) -> Option<Vec<ModelConfigOption>> {
+        let mut options = self.store.model_config(base_model(model)).ok().flatten()?;
+        if let Some(params) = model.split_once('[').map(|(_, p)| p.trim_end_matches(']')) {
+            for (id, value) in params.split(',').filter_map(|p| p.split_once('=')).map(|(k, v)| (k.trim(), v.trim())) {
+                let alias = matches!(id, "reasoning" | "reasoning_effort" | "effort");
+                if let Some(o) = options.iter_mut().find(|o| o.id == id || alias && o.category == "thought_level") {
+                    if o.options.iter().any(|c| c.value == value) { o.current_value = value.into(); }
+                }
+            }
+        }
+        Some(options)
+    }
+
+    /// Ask a short-lived Cursor process for a model's parameters, for a session whose process isn't running
+    fn discover_model_config(self: &Arc<Self>, model: &str, cwd: &str) {
+        static RUNNING: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+        if !RUNNING.lock().unwrap().get_or_insert_with(HashSet::new).insert(model.to_string()) {
+            return;
+        }
+        let (hub, model, cwd) = (self.clone(), model.to_string(), PathBuf::from(cwd));
+        tokio::spawn(async move {
+            let settings = hub.settings.read().unwrap().clone();
+            let found = crate::probe::cursor_model_config(&settings, &model, &cwd).await;
+            RUNNING.lock().unwrap().get_or_insert_with(HashSet::new).remove(&model);
+            match found {
+                Ok(options) => {
+                    let _ = hub.store.save_model_config(&model, &options);
+                    hub.model_config_known(&model, None);
+                }
+                Err(e) => {
+                    crate::warn!("reading Cursor parameters of {model} failed: {e}");
+                    hub.model_config_known(&model, Some(()));
+                }
+            }
+        });
+    }
+
+    /// The cache now has a model's parameters (or reading them failed): sessions waiting for them stop waiting
+    fn model_config_known(&self, model: &str, failed: Option<()>) {
+        let sessions: Vec<_> = self.sessions.lock().unwrap().values().cloned().collect();
+        for rt in sessions {
+            let info = {
+                let mut i = rt.info.lock().unwrap();
+                if i.tool != ToolKind::Cursor || i.model.as_deref().map(base_model) != Some(model) { continue; }
+                if !i.model_config_pending && !i.model_config_options.is_empty() { continue; }
+                let options = if failed.is_none() { i.model.as_deref().and_then(|m| self.cached_config(m)).unwrap_or_default() } else { vec![] };
+                if !i.model_config_pending && options.is_empty() { continue; }
+                i.model_config_options = options;
+                i.model_config_pending = false;
+                i.clone()
+            };
+            let _ = self.store.save_session(&info);
+            self.broadcast_updated(&info);
+        }
     }
 
     /// Switch thinking level: recorded on the session, and the tool is told if running (immediate for Claude, next turn for Codex)
@@ -984,7 +1059,6 @@ impl Hub {
             if i.mode != SessionMode::Structured || i.tool != ToolKind::Cursor {
                 bail!("这个会话不支持调整模型参数");
             }
-            if i.model_config_pending { bail!("正在切换模型，请等待参数同步完成"); }
             let option = i.model_config_options.iter_mut().find(|o| o.id == config_id)
                 .ok_or_else(|| anyhow!("当前模型不支持这个参数"))?;
             if !option.options.iter().any(|o| o.value == value) {
@@ -1002,9 +1076,18 @@ impl Hub {
     }
 
     /// Models available to a session: those the tool reported on this start, otherwise the tool's last list
-    pub fn session_models(&self, id: &str) -> Result<Value> {
+    pub fn session_models(self: &Arc<Self>, id: &str) -> Result<Value> {
         let rt = self.get(id)?;
         let info = rt.info.lock().unwrap().clone();
+        // Opening the picker on a session that isn't running and whose model's parameters aren't cached
+        if info.tool == ToolKind::Cursor && info.mode == SessionMode::Structured && info.model_config_options.is_empty()
+            && !info.model_config_pending && self.running_tx(&rt).is_none() {
+            if let Some(model) = info.model.as_deref().filter(|m| !m.is_empty()).filter(|m| self.cached_config(m).is_none()) {
+                let model = base_model(model).to_string();
+                self.set_info_any(&rt, |i| { i.model_config_pending = true; true });
+                self.discover_model_config(&model, &info.cwd);
+            }
+        }
         let mut models = rt.models.lock().unwrap().clone();
         if models.is_empty() {
             models = self.cached_models(info.tool);
@@ -2200,6 +2283,19 @@ impl Hub {
         }
     }
 
+    /// set_info for the hub's own changes, which don't belong to one process
+    fn set_info_any(&self, rt: &SessionRt, f: impl FnOnce(&mut SessionInfo) -> bool) {
+        let info = {
+            let mut i = rt.info.lock().unwrap();
+            if !f(&mut i) {
+                return;
+            }
+            i.clone()
+        };
+        let _ = self.store.save_session(&info);
+        self.broadcast_updated(&info);
+    }
+
     fn set_info(&self, sid: &str, gen: u64, f: impl FnOnce(&mut SessionInfo) -> bool) {
         let Some(rt) = self.alive(sid, gen) else {
             return;
@@ -2419,6 +2515,16 @@ fn mcp_fingerprint(servers: &[yi_proto::McpServerConfig], desktop: bool) -> Stri
     format!("{}{}", crate::mcp::fingerprint(servers), if desktop { "+desktop" } else { "" })
 }
 
+/// `grok-4.7[context=256k]` (the old single-string form) -> `grok-4.7`
+fn base_model(model: &str) -> &str {
+    model.split('[').next().unwrap_or(model)
+}
+
+#[cfg(test)]
+pub(crate) fn test_set_tool(hub: &Hub, id: &str, tool: ToolKind) {
+    hub.get(id).unwrap().info.lock().unwrap().tool = tool;
+}
+
 #[cfg(test)]
 pub(crate) fn test_emitter() -> (Arc<Hub>, Emitter, mpsc::UnboundedReceiver<AdapterCmd>) {
     let hub = Hub::new(Store::open_memory().unwrap(), DaemonSettings::default());
@@ -2526,20 +2632,41 @@ impl Emitter {
         *rt.models.lock().unwrap() = models;
     }
 
-    /// Publish model and parameters together. Late replies can populate the cache but cannot undo a newer selection.
-    pub fn model_configuration(&self, model: Option<&str>, options: Vec<ModelConfigOption>, rejected: bool) {
+    /// Cursor answered a `session/set_config_option`: its model and that model's full parameter list. This is the
+    /// only source of the cache. The user's choices win over the reported values (they are queued to be sent);
+    /// an answer for another model (a late one, after the user picked again) only fills the cache
+    pub fn model_config_confirmed(&self, model: &str, options: Vec<ModelConfigOption>) {
         if self.hub.alive(&self.sid, self.gen).is_none() { return; }
-        if let Some(model) = model {
-            let _ = self.hub.store.save_model_config(model, &options);
-        }
+        let _ = self.hub.store.save_model_config(model, &options);
         self.hub.set_info(&self.sid, self.gen, |i| {
-            let target = i.model.as_deref().filter(|m| !m.is_empty()).map(|m| m.split('[').next().unwrap_or(m));
-            if i.model_config_pending && target.is_some() && !rejected && model != target { return false; }
-            let next = model.map(str::to_string).or_else(|| i.model.clone());
-            if i.model == next && i.model_config_options == options && !i.model_config_pending { return false; }
-            i.model = next;
-            i.model_config_options = options;
+            if i.model.as_deref().filter(|m| !m.is_empty()).map(base_model).is_some_and(|t| t != model) { return false; }
+            let merged: Vec<_> = options.into_iter().map(|mut o| {
+                if let Some(mine) = i.model_config_options.iter().find(|m| m.id == o.id).map(|m| &m.current_value)
+                    .filter(|v| !v.is_empty() && o.options.iter().any(|c| &c.value == *v)) {
+                    o.current_value = mine.clone();
+                }
+                o
+            }).collect();
+            if i.model.is_some() && i.model_config_options == merged && !i.model_config_pending { return false; }
+            if i.model.as_deref().map_or(true, str::is_empty) { i.model = Some(model.into()); }
+            i.model_config_options = merged;
             i.model_config_pending = false;
+            true
+        });
+        self.hub.model_config_known(model, None);
+    }
+
+    /// No parameters are coming (switch failed, or this Cursor has no parameterized picker)
+    pub fn model_config_settled(&self) {
+        self.hub.set_info(&self.sid, self.gen, |i| std::mem::take(&mut i.model_config_pending));
+    }
+
+    /// Cursor refused a parameter value: show the value it actually runs with
+    pub fn model_config_value(&self, id: &str, value: &str) {
+        self.hub.set_info(&self.sid, self.gen, |i| {
+            let Some(o) = i.model_config_options.iter_mut().find(|o| o.id == id) else { return false };
+            if o.current_value == value { return false; }
+            o.current_value = value.into();
             true
         });
     }
@@ -2763,39 +2890,53 @@ mod tests {
     }
 
     #[test]
-    fn model_config_cache_is_host_wide_and_late_replies_do_not_revert_selection() {
+    fn model_choices_never_wait_for_cursor_and_only_switch_answers_fill_the_cache() {
         let (hub, em, _rx) = test_emitter();
         hub.get("s").unwrap().info.lock().unwrap().tool = ToolKind::Cursor;
-        let options = vec![ModelConfigOption {
-            id: "fast".into(), name: "Fast".into(), category: "model_config".into(), description: String::new(),
-            current_value: "false".into(), options: vec![],
-        }];
-        em.model_configuration(Some("known"), options.clone(), false);
+        let opt = |id: &str, values: &[&str], current: &str| ModelConfigOption {
+            id: id.into(), name: id.into(), category: "model_config".into(), description: String::new(),
+            current_value: current.into(),
+            options: values.iter().map(|v| yi_proto::ModelConfigValue { value: (*v).into(), name: (*v).into() }).collect(),
+        };
+        let grok = vec![opt("fast", &["false", "true"], "false"), opt("context", &["256k", "500k"], "256k")];
+        em.model_config_confirmed("grok-4.7", grok.clone());
+        // A cached model: parameters at once, with the model's defaults, and adjustable while Cursor is busy
+        hub.set_model("s", "grok-4.7").unwrap();
+        let i = hub.info("s").unwrap();
+        assert!(!i.model_config_pending);
+        assert_eq!(i.model_config_options.iter().map(|o| o.current_value.as_str()).collect::<Vec<_>>(), ["", ""]);
+        hub.set_model_config("s", "fast", "true").unwrap();
+        // Cursor's answer reports the old value; the user's choice is queued and stays
+        em.model_config_confirmed("grok-4.7", grok.clone());
+        let i = hub.info("s").unwrap();
+        assert_eq!(i.model_config_options[0].current_value, "true");
+        assert_eq!(i.model_config_options[1].current_value, "256k");
+        // A model without Fast offers no Fast; a cold model waits only for its own parameters
+        hub.set_model("s", "gemini-4-argon").unwrap();
+        let i = hub.info("s").unwrap();
+        assert!(i.model_config_pending && i.model_config_options.is_empty());
+        assert!(hub.set_model_config("s", "fast", "true").is_err());
+        // A late answer for the previous model fills the cache but doesn't touch the session
+        em.model_config_confirmed("grok-4.7", grok.clone());
+        assert_eq!(hub.info("s").unwrap().model.as_deref(), Some("gemini-4-argon"));
+        assert!(hub.info("s").unwrap().model_config_pending);
+        em.model_config_confirmed("gemini-4-argon", vec![opt("reasoning_effort", &["low", "high"], "low")]);
+        let i = hub.info("s").unwrap();
+        assert!(!i.model_config_pending);
+        assert_eq!(i.model_config_options[0].id, "reasoning_effort");
+        // The cache never keeps a session's values; an empty list is a known model without parameters
+        assert_eq!(hub.store.model_config("grok-4.7").unwrap().unwrap()[0].current_value, "");
+        em.model_config_confirmed("composer-2.5", vec![]);
+        assert_eq!(hub.store.model_config("composer-2.5").unwrap(), Some(vec![]));
+        // Old model strings carry their values into the cached parameters
+        let legacy = hub.cached_config("grok-4.7[context=500k,fast=true]").unwrap();
+        assert_eq!(legacy.iter().map(|o| o.current_value.as_str()).collect::<Vec<_>>(), ["true", "500k"]);
+        // A failed switch stops the waiting and keeps the choice
         hub.set_model("s", "cold").unwrap();
-        assert!(hub.info("s").unwrap().model_config_pending);
-        assert!(hub.info("s").unwrap().model_config_options.is_empty());
-        em.model_configuration(Some("known"), options.clone(), false);
-        assert_eq!(hub.info("s").unwrap().model.as_deref(), Some("cold"));
-        assert!(hub.info("s").unwrap().model_config_pending);
-        em.model_configuration(Some("cold"), vec![], false);
-        assert!(!hub.info("s").unwrap().model_config_pending);
-        // Empty capabilities are a hit too; they must not trigger another discovery.
-        assert_eq!(hub.store.model_config("cold").unwrap(), Some(vec![]));
-        let _other_rx = live(&hub, "other", SessionMode::Structured, SessionStatus::Idle, 0);
-        hub.get("other").unwrap().info.lock().unwrap().tool = ToolKind::Cursor;
-        hub.set_model("other", "known").unwrap();
-        let other = hub.info("other").unwrap();
-        let mut cached = options.clone();
-        cached[0].current_value.clear();
-        assert_eq!(other.model_config_options, cached);
-        assert!(other.model_config_pending);
-        assert!(hub.set_model_config("other", "fast", "true").is_err());
-        // A rejected switch atomically rolls back both model and parameters and stops loading.
-        em.model_configuration(Some("known"), options.clone(), true);
-        assert_eq!(hub.info("s").unwrap().model.as_deref(), Some("known"));
-        assert!(!hub.info("s").unwrap().model_config_pending);
-        let isolated = Store::open_memory().unwrap();
-        assert!(isolated.model_config("known").unwrap().is_none());
+        em.model_config_settled();
+        let i = hub.info("s").unwrap();
+        assert_eq!(i.model.as_deref(), Some("cold"));
+        assert!(!i.model_config_pending);
     }
 
     #[test]

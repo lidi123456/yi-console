@@ -50,8 +50,10 @@ class FixtureSocket {
     if (method === 'session.setModel') {
       if (query.has('delayed')) {
         const target = params.model;
-        info = { ...info, model: target, modelConfigPending: true, modelConfigOptions: cached.get(target) ?? [] }; refresh();
-        setTimeout(() => {
+        // The daemon answers from its cache at once; only an unknown model waits for its parameters
+        const known = cached.get(target);
+        info = { ...info, model: target, modelConfigPending: !known, modelConfigOptions: known ?? [] }; refresh();
+        if (!known) setTimeout(() => {
           const options = target === 'model-b' ? [] : paramsForModel();
           cached.set(target, options);
           if (info.model === target) { info = { ...info, modelConfigPending: false, modelConfigOptions: options }; refresh(); }

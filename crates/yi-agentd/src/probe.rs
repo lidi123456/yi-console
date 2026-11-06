@@ -35,16 +35,28 @@ async fn converse(
     settings: &DaemonSettings,
     args: &[&str],
     first: Vec<Value>,
+    on: impl FnMut(&Value) -> Step,
+) -> Result<()> {
+    converse_in(tool, settings, args, &probe_dir(), TIMEOUT, first, on).await
+}
+
+async fn converse_in(
+    tool: ToolKind,
+    settings: &DaemonSettings,
+    args: &[&str],
+    cwd: &std::path::Path,
+    timeout: Duration,
+    first: Vec<Value>,
     mut on: impl FnMut(&Value) -> Step,
 ) -> Result<()> {
     let program = crate::tools::resolve(tool, settings)
         .ok_or_else(|| anyhow!("这台机器上没有找到 {}", tool.as_str()))?;
     let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
-    let mut p = JsonProc::spawn(&program, &args, &probe_dir())?;
+    let mut p = JsonProc::spawn(&program, &args, cwd)?;
     for m in first {
         p.send(&m).await?;
     }
-    let r = tokio::time::timeout(TIMEOUT, async {
+    let r = tokio::time::timeout(timeout, async {
         while let Ok(Some(line)) = p.stdout.next_line().await {
             let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
             match on(&v) {
@@ -252,6 +264,48 @@ async fn acp(tool: ToolKind, settings: &DaemonSettings, want_quota: bool) -> Res
     })
     .await?;
     Ok(out)
+}
+
+/// Cursor lists a model's parameters only after a session switches to it. Switch an empty session to `model`,
+/// read them, and switch back, since Cursor remembers the last model for its next session. `cwd` is the
+/// session's directory: Cursor refuses to set up a session in some directories ("Failed to initialize session services")
+pub async fn cursor_model_config(settings: &DaemonSettings, model: &str, cwd: &std::path::Path) -> Result<Vec<ModelConfigOption>> {
+    let init = json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,
+        "clientCapabilities":adapters::acp::client_capabilities(ToolKind::Cursor),
+        "clientInfo":{"name":"yi-console","version":DAEMON_VERSION}}});
+    let set = |id: u64, sid: &str, value: &str| json!({"jsonrpc":"2.0","id":id,"method":"session/set_config_option",
+        "params":{"sessionId":sid,"configId":"model","value":value}});
+    let (mut sid, mut original) = (String::new(), None::<String>);
+    let mut found: Result<Vec<ModelConfigOption>> = Err(anyhow!("cursor 没有返回模型参数"));
+    let cwd_s = cwd.display().to_string();
+    converse_in(ToolKind::Cursor, settings, &["acp"], cwd, Duration::from_secs(90), vec![init], |v| {
+        let Some(id) = v["id"].as_u64().filter(|_| v.get("method").is_none()) else { return Step::Wait };
+        let r = &v["result"];
+        let error = v["error"]["data"]["message"].as_str().or(v["error"]["message"].as_str()).map(str::to_string);
+        match id {
+            1 => Step::Send(vec![json!({"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":cwd_s,"mcpServers":[]}})]),
+            2 => {
+                if let Some(e) = error { found = Err(anyhow!("{e}")); return Step::Done; }
+                sid = r["sessionId"].as_str().unwrap_or("").to_string();
+                original = adapters::acp::config_params(r).and_then(|(m, _)| m);
+                Step::Send(vec![set(3, &sid, model)])
+            }
+            // A failed switch is often Cursor's own model list request failing; try once more
+            3 if error.is_some() => Step::Send(vec![set(4, &sid, model)]),
+            3 | 4 => {
+                if let Some(e) = error { found = Err(anyhow!("{e}")); return Step::Done; }
+                found = adapters::acp::config_params(r).map(|(_, p)| p).ok_or_else(|| anyhow!("cursor 没有返回模型参数"));
+                match original.as_deref().filter(|o| *o != model) {
+                    Some(o) => Step::Send(vec![set(5, &sid, o)]),
+                    None => Step::Done,
+                }
+            }
+            5 => Step::Done,
+            _ => Step::Wait,
+        }
+    })
+    .await?;
+    found
 }
 
 fn kiro_quota(r: &Value) -> Value {

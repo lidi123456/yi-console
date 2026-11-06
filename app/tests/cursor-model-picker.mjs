@@ -157,20 +157,23 @@ try {
     await delayed.locator('.model-list').getByRole('button', { name, exact: true }).click();
     await delayed.locator('.model-btn').click();
   };
+  const loading = 'Reading this model’s parameters…';
   await select('Auto');
-  await delayed.getByText('Syncing model parameters…', { exact: true }).waitFor();
+  await delayed.getByText(loading, { exact: true }).waitFor();
   assert.equal(await row(delayed, 'Reasoning Effort').count(), 0, 'cold models do not show previous parameters');
+  assert.equal(await row(delayed, 'Model').isDisabled(), false, 'another model can be chosen while parameters load');
+  assert.equal(await delayed.locator('.model-btn .spinner').count(), 0, 'the trigger never shows a loading spinner');
   await capture(delayed, 'model-cache-cold-loading');
-  await delayed.getByRole('dialog').filter({ has: delayed.getByText('Syncing model parameters…') }).waitFor({ state: 'hidden' });
+  await delayed.getByText(loading, { exact: true }).waitFor({ state: 'hidden' });
+  // Auto has no parameters, so the menu is the model list itself
   await delayed.getByRole('textbox', { name: 'Search models' }).waitFor();
   await delayed.locator('.model-list').getByRole('button', { name: 'Grok 4.7', exact: true }).click();
   await delayed.locator('.model-btn').click();
-  await delayed.getByText('Syncing model parameters…', { exact: true }).waitFor();
+  // Grok's parameters were cached when the fixture opened on it: usable at once
   await row(delayed, 'Reasoning Effort').waitFor();
-  assert.equal(await row(delayed, 'Reasoning Effort').isDisabled(), true, 'cached controls render immediately but wait for model acknowledgement');
-  await capture(delayed, 'model-cache-warm-loading');
-  await delayed.waitForFunction(() => document.querySelector('[role=dialog]')?.getAttribute('aria-busy') === 'false');
-  assert.equal(await row(delayed, 'Reasoning Effort').isDisabled(), false);
+  assert.equal(await delayed.getByText(loading, { exact: true }).count(), 0);
+  assert.equal(await row(delayed, 'Reasoning Effort').isDisabled(), false, 'cached controls are usable at once');
+  await capture(delayed, 'model-cache-warm');
   await delayed.close();
   assert.deepEqual(errors, []);
 } finally {

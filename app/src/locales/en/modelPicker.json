@@ -19,5 +19,5 @@
   "modelSettings": "Model Settings",
   "backToModelSettings": "Back to model settings",
   "noMatchingModels": "No matching models",
-  "loadingModelParameters": "Syncing model parameters…"
+  "loadingModelParameters": "Reading this model’s parameters…"
 }

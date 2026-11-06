@@ -16,7 +16,9 @@ export const OPEN_MODEL = 'ah:open-model';
 /** Look up by id, then by the actual model (Claude aliases); "Default" and "Opus" may point at the same model, prefer the more specific one */
 function findModel(current: string, models: ModelOption[]) {
   const same = models.filter((o) => o.resolved === current);
-  return models.find((o) => o.id === current) ?? same.find((o) => o.id !== 'default') ?? same[0];
+  // Old Cursor sessions saved the parameters in the model string: `grok-4.7[context=256k]`
+  const base = current.split('[')[0];
+  return models.find((o) => o.id === current) ?? same.find((o) => o.id !== 'default') ?? same[0] ?? models.find((o) => o.id === base);
 }
 
 /** Model name: use the display name if it's in the list */
@@ -127,7 +129,8 @@ export function ModelPicker({ hostId, info }: { hostId: string; info: SessionInf
   const submenuRef = useRef<HTMLDivElement>(null);
   const anchorRef = useRef<HTMLButtonElement | null>(null);
   const sheet = open && mobile;
-  const configPending = info.tool === 'cursor' && (!!info.modelConfigPending || changing === 'model');
+  // Only a model whose parameters aren't known yet; choosing never waits for Cursor
+  const configPending = info.tool === 'cursor' && !!info.modelConfigPending;
   const close = useCallback((focus = true) => {
     setOpen(false);
     setSection(null);
@@ -234,19 +237,19 @@ export function ModelPicker({ hostId, info }: { hostId: string; info: SessionInf
   const hasControls = configPending || !!fastOption || !!contextOption || hasEffort;
   const list = (models ?? []).filter((m) => !q.trim() || `${m.name} ${m.id}`.toLowerCase().includes(q.trim().toLowerCase()));
   const sectionLabel = section === 'effort' ? t('reasoningEffort') : section === 'context' ? t('contextWindow') : t('chooseModel');
-  const contextLabel = contextOption?.options.find((o) => o.value === contextOption.currentValue)?.name ?? contextOption?.currentValue;
+  const contextLabel = contextOption?.options.find((o) => o.value === contextOption.currentValue)?.name || contextOption?.currentValue || t('default');
   // A model/capability update can remove the parameter whose submenu is currently open.
   useEffect(() => {
     if (section === 'effort' && !hasEffort || section === 'context' && !contextOption) setSection(null);
   }, [section, hasEffort, contextOption]);
   const showSection = (next: PickerSection, anchor: HTMLButtonElement) => {
-    if (changing !== null || configPending && next !== 'models') return;
+    if (changing !== null) return;
     anchorRef.current = anchor;
     setSection(next);
   };
   const settingsRow = (key: PickerSection, label: string, value: string) => (
     <button className={`model-setting-row${section === key ? ' active' : ''}`} data-section={key}
-      disabled={configPending && key !== 'models'} aria-label={label} aria-haspopup="menu" aria-expanded={section === key}
+      aria-label={label} aria-haspopup="menu" aria-expanded={section === key}
       onClick={(event) => showSection(key, event.currentTarget)}
       onPointerEnter={(event) => { if (!sheet && event.pointerType === 'mouse') showSection(key, event.currentTarget); }}
       onPointerMove={(event) => { if (!sheet && event.pointerType === 'mouse' && section !== key) showSection(key, event.currentTarget); }}
@@ -284,7 +287,7 @@ export function ModelPicker({ hostId, info }: { hostId: string; info: SessionInf
     <div className="model-option-list">
       {choices.map((option) => (
         <button key={option.value} role="menuitemradio" aria-checked={option.value === choiceValue}
-          className={option.value === choiceValue ? 'active' : ''} disabled={changing !== null || configPending}
+          className={option.value === choiceValue ? 'active' : ''} disabled={changing !== null}
           onClick={() => {
             if (section === 'context' && contextOption) void pickConfig(contextOption.id, option.value);
             else if (reasoningOption) void pickConfig(reasoningOption.id, option.value);
@@ -300,14 +303,14 @@ export function ModelPicker({ hostId, info }: { hostId: string; info: SessionInf
       {configPending && <div className="model-config-loading muted small" role="status"><span className="spinner" aria-hidden="true" />{t('loadingModelParameters')}</div>}
       {fastOption && (
         <button className="model-setting-row" role="switch" aria-label={t('fastMode')} aria-checked={fast}
-          title={t('fastHint')} disabled={changing !== null || configPending}
+          title={t('fastHint')} disabled={changing !== null}
           onPointerEnter={() => { if (!sheet) setSection(null); }}
           onClick={() => void pickConfig(fastOption.id, fast ? 'false' : 'true')}>
-          <span>{t('fastMode')}</span>{configPending ? <span className="model-setting-value">{t('loading')}</span> : <span className={`switch${fast ? ' on' : ''}`} aria-hidden="true"><i /></span>}
+          <span>{t('fastMode')}</span><span className={`switch${fast ? ' on' : ''}`} aria-hidden="true"><i /></span>
         </button>
       )}
-      {contextOption && settingsRow('context', t('contextWindow'), configPending ? t('loading') : contextLabel ?? '')}
-      {hasEffort && settingsRow('effort', t('reasoningEffort'), configPending ? t('loading') : effort ? effortLabel(effort) : t('default'))}
+      {contextOption && settingsRow('context', t('contextWindow'), contextLabel)}
+      {hasEffort && settingsRow('effort', t('reasoningEffort'), effort ? effortLabel(effort) : t('default'))}
       <div className="model-settings-divider" />
       {settingsRow('models', t('model'), modelLabel(cur, models ?? []))}
     </div>
@@ -347,9 +350,9 @@ export function ModelPicker({ hostId, info }: { hostId: string; info: SessionInf
       <button ref={buttonRef} className="model-btn" title={t('switchModel')} aria-haspopup="dialog" aria-expanded={open}
         onClick={() => { if (open) close(); else { load(); setOpen(true); } }}>
         <span className="truncate">{modelLabel(cur, models ?? [])}</span>
-        {!configPending && effort && <span className="model-effort">{effortLabel(effort)}</span>}
-        {!configPending && fast && <span className="model-effort">{t('fastMode')}</span>}
-        {configPending ? <span className="spinner" role="status" aria-label={t('loadingModelParameters')} /> : <Icon name="down" size={12} />}
+        {effort && <span className="model-effort">{effortLabel(effort)}</span>}
+        {fast && <span className="model-effort">{t('fastMode')}</span>}
+        <Icon name="down" size={12} />
       </button>
       {open && (sheet ? createPortal(
         <div className="model-sheet-bg" onClick={() => close()}><div onClick={(event) => event.stopPropagation()}>{menuBody}</div></div>,

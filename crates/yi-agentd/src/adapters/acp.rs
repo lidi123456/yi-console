@@ -58,6 +58,16 @@ struct State {
     config_options: Vec<ModelConfigOption>,
     config_model: Option<String>,
     config_queue: Vec<(String, String)>,
+    /// The `session/set_config_option` waiting for its answer
+    config_inflight: Option<(String, String)>,
+    /// Parameters the user chose for the current model; sent again after a failed model switch
+    wanted: Vec<(String, String)>,
+    /// A failed model switch was already retried once
+    model_retried: bool,
+    /// The model switch failed twice; tried again before the next prompt
+    model_failed: Option<String>,
+    /// The model was switched before the session existed, so the parameters saved at launch belong to the old one
+    spec_params_stale: bool,
     seg: Option<(Seg, String, String)>,
     seg_n: u64,
     tools: HashMap<String, ToolState>,
@@ -188,6 +198,9 @@ pub async fn run(spec: StartSpec, em: Emitter, mut rx: mpsc::UnboundedReceiver<A
             cmd = rx.recv() => match cmd {
                 Some(AdapterCmd::Send(next)) => {
                     em.status(SessionStatus::Running, None);
+                    if retry_failed_model(&mut st) {
+                        if let Some(m) = next_config(&mut st) { let _ = p.send(&m).await; }
+                    }
                     if st.session_id.is_some() && !config_pending(&st) && !st.prompting && !st.loading && st.compacting.is_none() {
                         let m = prompt(&mut st, &em, &next);
                         let _ = p.send(&m).await;
@@ -196,9 +209,14 @@ pub async fn run(spec: StartSpec, em: Emitter, mut rx: mpsc::UnboundedReceiver<A
                     }
                 }
                 Some(AdapterCmd::SetModel(model)) => {
+                    // Parameters chosen for the previous model don't carry over
+                    st.wanted.clear();
+                    st.config_queue.clear();
+                    st.model_failed = None;
+                    st.model_retried = false;
                     if st.session_id.is_some() {
                         if st.parameterized {
-                            st.config_queue.push(("model".into(), model));
+                            st.config_queue.push(("model".into(), base_model(&model).into()));
                             if let Some(m) = next_config(&mut st) { let _ = p.send(&m).await; }
                         } else {
                             let m = set_model(&mut st, &model);
@@ -206,9 +224,12 @@ pub async fn run(spec: StartSpec, em: Emitter, mut rx: mpsc::UnboundedReceiver<A
                         }
                     } else {
                         st.want_model = Some(model);
+                        st.spec_params_stale = true;
                     }
                 }
                 Some(AdapterCmd::SetModelConfig { id, value }) => {
+                    st.wanted.retain(|(k, _)| *k != id);
+                    st.wanted.push((id.clone(), value.clone()));
                     st.config_queue.push((id, value));
                     if let Some(m) = next_config(&mut st) { let _ = p.send(&m).await; }
                 }
@@ -277,26 +298,61 @@ fn config_pending(st: &State) -> bool {
     !st.config_queue.is_empty() || st.pending.values().any(|p| matches!(p, Pending::SetModel | Pending::SetConfig))
 }
 
+/// `grok-4.7[context=256k]` (the old single-string form) -> `grok-4.7`
+fn base_model(model: &str) -> &str {
+    model.split('[').next().unwrap_or(model)
+}
+
+/// Before a prompt: a model switch that failed is sent again with the chosen parameters
+fn retry_failed_model(st: &mut State) -> bool {
+    let Some(model) = st.model_failed.take() else { return false };
+    st.model_retried = false;
+    st.config_queue.insert(0, ("model".into(), model));
+    let wanted = st.wanted.clone();
+    st.config_queue.extend(wanted);
+    true
+}
+
 fn next_config(st: &mut State) -> Option<Value> {
     if st.loading || st.session_id.is_none() || !st.parameterized || st.pending.values().any(|p| matches!(p, Pending::SetModel | Pending::SetConfig)) {
         return None;
     }
     while !st.config_queue.is_empty() {
-        let (id, value) = st.config_queue.remove(0);
+        let (mut id, value) = st.config_queue.remove(0);
+        // The old model string used `reasoning_effort` for every model; Cursor now names it per model
+        if id != "model" && !st.config_options.iter().any(|o| o.id == id) && matches!(id.as_str(), "reasoning" | "reasoning_effort" | "effort") {
+            if let Some(o) = st.config_options.iter().find(|o| o.category == "thought_level") { id = o.id.clone(); }
+        }
         // Saved parameters may no longer exist after a model switch or tool upgrade.
         if id != "model" && !st.config_options.iter().any(|o| o.id == id && o.options.iter().any(|v| v.value == value)) { continue; }
+        st.config_inflight = Some((id.clone(), value.clone()));
         return Some(st.req(Pending::SetConfig, "session/set_config_option",
             json!({"sessionId":st.session_id,"configId":id,"value":value})));
     }
     None
 }
 
-fn apply_config_options(st: &mut State, r: &Value, em: &Emitter) {
-    let Some(options) = r["configOptions"].as_array() else { return; };
-    if let Some(id) = options.iter().find(|o| o["id"] == "model").and_then(|o| o["currentValue"].as_str()) { st.config_model = Some(id.into()); }
-    st.config_options = options.iter().filter(|o| matches!(o["category"].as_str(), Some("model_config" | "thought_level")))
+/// The current model and its adjustable parameters in a `configOptions` list
+pub(crate) fn config_params(r: &Value) -> Option<(Option<String>, Vec<ModelConfigOption>)> {
+    let options = r["configOptions"].as_array()?;
+    let model = options.iter().find(|o| o["id"] == "model").and_then(|o| o["currentValue"].as_str()).map(str::to_string);
+    let params = options.iter().filter(|o| matches!(o["category"].as_str(), Some("model_config" | "thought_level")))
         .filter_map(|o| serde_json::from_value::<ModelConfigOption>(o.clone()).ok()).collect();
-    em.model_configuration(st.config_model.as_deref(), st.config_options.clone(), false);
+    Some((model, params))
+}
+
+/// Track the tool's state. Only the answer to `session/set_config_option` is published: Cursor's `session/new`
+/// lists `mode` and `model` but not the model's parameters, which would read as "this model has none"
+fn apply_config_options(st: &mut State, r: &Value) {
+    let Some((model, params)) = config_params(r) else { return; };
+    if model.is_some() { st.config_model = model; }
+    st.config_options = params;
+}
+
+fn publish_config(st: &State, em: &Emitter) {
+    if let Some(model) = &st.config_model {
+        em.model_config_confirmed(model, st.config_options.clone());
+    }
 }
 
 fn prompt(st: &mut State, em: &Emitter, p: &Prompt) -> Value {
@@ -473,17 +529,34 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Result<V
                 }
                 Pending::SetModel => {
                     st.switching = None;
-                    if spec.tool == ToolKind::Cursor { em.model_configuration(None, vec![], true); }
+                    if spec.tool == ToolKind::Cursor { em.model_config_settled(); }
                     em.event(EventBody::Error {
                         message: format!("切换模型失败: {msg}"),
                     });
                     Ok(out)
                 }
                 Pending::SetConfig => {
-                    if !st.config_queue.iter().any(|(id, _)| id == "model") {
-                        em.model_configuration(st.config_model.as_deref(), st.config_options.clone(), true);
+                    let (id, value) = st.config_inflight.take().unwrap_or_default();
+                    if id == "model" {
+                        // Cursor asks its server for the model list on every switch and reports a failed request as
+                        // "Invalid model value", so one retry usually goes through
+                        if !st.model_retried {
+                            st.model_retried = true;
+                            st.config_queue.insert(0, (id, value));
+                            return Ok(out);
+                        }
+                        st.model_retried = false;
+                        // The queued parameters were for that model; they go again with the next attempt
+                        st.config_queue.retain(|(k, _)| k == "model");
+                        st.model_failed = Some(value);
+                        em.model_config_settled();
+                        em.event(EventBody::Error { message: format!("切换模型失败，发下一条消息时会再试: {msg}") });
+                    } else {
+                        st.wanted.retain(|(k, _)| *k != id);
+                        let actual = st.config_options.iter().find(|o| o.id == id).map(|o| o.current_value.clone()).unwrap_or_default();
+                        em.model_config_value(&id, &actual);
+                        em.event(EventBody::Error { message: format!("切换模型参数失败: {msg}") });
                     }
-                    em.event(EventBody::Error { message: format!("切换模型参数失败: {msg}") });
                     Ok(out)
                 }
                 Pending::Other => Ok(out),
@@ -527,8 +600,8 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Result<V
                 }
                 let models = parse_models(r);
                 st.parameterized = spec.tool == ToolKind::Cursor && r["configOptions"].is_array();
-                if st.parameterized { apply_config_options(st, r, em); }
-                else if spec.tool == ToolKind::Cursor { em.model_configuration(None, vec![], true); }
+                if st.parameterized { apply_config_options(st, r); }
+                else if spec.tool == ToolKind::Cursor { em.model_config_settled(); }
                 let current = r["models"]["currentModelId"].as_str().map(str::to_string);
                 // If the model recorded on the session (picked at creation or switched later) differs from the tool's current one, switch to it
                 let queued_config = std::mem::take(&mut st.config_queue);
@@ -536,27 +609,52 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Result<V
                     .want_model
                     .take()
                     .or(spec.model.clone())
-                    .map(|m| if st.parameterized { m.split('[').next().unwrap_or(&m).to_string() } else { m })
-                    .filter(|m| !m.is_empty() && models.iter().any(|o| &o.id == m));
-                match (want, &current) {
-                    (Some(w), c) if c.as_deref() != Some(w.as_str()) => {
-                        if st.parameterized { st.config_queue.insert(0, ("model".into(), w)); }
-                        else { out.push(set_model(st, &w)); }
-                    },
-                    (_, Some(c)) if !st.parameterized => em.model(c),
-                    _ => {}
-                }
+                    .map(|m| if st.parameterized { base_model(&m).to_string() } else { m })
+                    .filter(|m| !m.is_empty());
+                let listed = |m: &str| models.is_empty() || models.iter().any(|o| o.id == m);
                 if st.parameterized {
-                    if let Some(params) = spec.model.as_deref().and_then(|m| m.split_once('[')).map(|(_, p)| p.trim_end_matches(']')) {
-                        for param in params.split(',') {
-                            if let Some((id, value)) = param.split_once('=') {
-                                let id = if id.trim() == "reasoning_effort" { "reasoning" } else { id.trim() };
-                                st.config_queue.push((id.into(), value.trim().into()));
+                    let use_spec = !st.spec_params_stale && want.as_deref().is_some_and(|w| listed(w));
+                    // Always switch, even to the model Cursor is already on: only that answer lists the model's parameters
+                    let target = match (&want, &current) {
+                        (Some(w), _) if listed(w) => Some(w.clone()),
+                        (Some(w), Some(c)) => {
+                            em.event(EventBody::Error { message: format!("Cursor 没有模型 {w}，改用 {c}") });
+                            em.model(c);
+                            Some(c.clone())
+                        }
+                        (None, Some(c)) => {
+                            em.model(c);
+                            Some(c.clone())
+                        }
+                        _ => None,
+                    };
+                    match target {
+                        Some(t) => st.config_queue.insert(0, ("model".into(), t)),
+                        None => em.model_config_settled(),
+                    }
+                    if use_spec {
+                        // Old sessions saved the parameters in the model string; `reasoning_effort` was later split into per-model ids
+                        if let Some(params) = spec.model.as_deref().and_then(|m| m.split_once('[')).map(|(_, p)| p.trim_end_matches(']')) {
+                            for param in params.split(',') {
+                                if let Some((id, value)) = param.split_once('=') {
+                                    st.wanted.push((id.trim().into(), value.trim().into()));
+                                }
                             }
                         }
+                        // Restore after the model switch, before any queued user prompt.
+                        for o in spec.model_config_options.iter().filter(|o| !o.current_value.is_empty()) {
+                            st.wanted.retain(|(k, _)| *k != o.id);
+                            st.wanted.push((o.id.clone(), o.current_value.clone()));
+                        }
+                        let wanted = st.wanted.clone();
+                        st.config_queue.extend(wanted);
                     }
-                    // Restore after the model switch, before any queued user prompt.
-                    for o in &spec.model_config_options { st.config_queue.push((o.id.clone(), o.current_value.clone())); }
+                } else {
+                    match (want.filter(|w| listed(w)), &current) {
+                        (Some(w), c) if c.as_deref() != Some(w.as_str()) => out.push(set_model(st, &w)),
+                        (_, Some(c)) => em.model(c),
+                        _ => {}
+                    }
                 }
                 st.config_queue.extend(queued_config);
                 em.models(models);
@@ -619,9 +717,13 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Result<V
                 if let Some(m) = st.switching.take() {
                     em.model(&m);
                 }
-                if spec.tool == ToolKind::Cursor { em.model_configuration(None, vec![], true); }
+                if spec.tool == ToolKind::Cursor { em.model_config_settled(); }
             }
-            Pending::SetConfig => apply_config_options(st, r, em),
+            Pending::SetConfig => {
+                if st.config_inflight.take().is_some_and(|(id, _)| id == "model") { st.model_retried = false; }
+                apply_config_options(st, r);
+                publish_config(st, em);
+            }
             Pending::Other => {}
         }
         return Ok(out);
@@ -904,7 +1006,7 @@ fn login_hint(spec: &StartSpec, msg: &str) -> String {
 
 fn update(st: &mut State, em: &Emitter, u: &Value) {
     match u["sessionUpdate"].as_str().unwrap_or("") {
-        "config_option_update" if st.parameterized => apply_config_options(st, u, em),
+        "config_option_update" if st.parameterized => apply_config_options(st, u),
         "available_commands_update" => {
             let list = u["availableCommands"]
                 .as_array()
@@ -1344,9 +1446,13 @@ mod model_config_tests {
     fn parameters_are_authoritative_and_requests_are_ordered() {
         let (hub, em, _rx) = crate::hub::test_emitter();
         let mut st = State { session_id: Some("ext".into()), parameterized: true, ..Default::default() };
-        apply_config_options(&mut st, &config(), &em);
+        apply_config_options(&mut st, &config());
+        publish_config(&st, &em);
         assert_eq!(st.config_options.len(), 2);
         assert_eq!(hub.session_models("s").unwrap()["current"], "gpt-test");
+        // The user's choice is recorded on the session before it is sent
+        crate::hub::test_set_tool(&hub, "s", ToolKind::Cursor);
+        hub.set_model_config("s", "fast", "true").unwrap();
         st.config_queue = vec![("fast".into(), "true".into()), ("reasoning".into(), "high".into())];
         let first = next_config(&mut st).unwrap();
         assert_eq!(first["method"], "session/set_config_option");
@@ -1356,7 +1462,9 @@ mod model_config_tests {
         st.pending.remove(&first["id"].as_u64().unwrap());
         let mut ack = config();
         ack["configOptions"][2]["currentValue"] = json!("true");
-        apply_config_options(&mut st, &ack, &em);
+        st.config_inflight = None;
+        apply_config_options(&mut st, &ack);
+        publish_config(&st, &em);
         assert_eq!(next_config(&mut st).unwrap()["params"]["configId"], "reasoning");
         let saved = hub.store.load_sessions().unwrap();
         assert_eq!(saved[0].model_config_options[0].current_value, "true");
@@ -1364,11 +1472,10 @@ mod model_config_tests {
 
     #[test]
     fn grok_reasoning_category_and_original_id_are_preserved() {
-        let (_hub, em, _rx) = crate::hub::test_emitter();
         let mut st = State { session_id: Some("ext".into()), parameterized: true, ..Default::default() };
         let mut reported = config();
         reported["configOptions"][3]["id"] = json!("reasoning_effort");
-        apply_config_options(&mut st, &reported, &em);
+        apply_config_options(&mut st, &reported);
         let effort = st.config_options.iter().find(|o| o.id == "reasoning_effort").unwrap();
         assert_eq!(effort.category, "thought_level");
         let wire = serde_json::to_value(effort).unwrap();
@@ -1378,6 +1485,65 @@ mod model_config_tests {
         let mut legacy = wire;
         legacy.as_object_mut().unwrap().remove("category");
         assert!(serde_json::from_value::<ModelConfigOption>(legacy).unwrap().category.is_empty());
+    }
+
+    fn cursor_spec(model: &str) -> StartSpec {
+        StartSpec {
+            tool: ToolKind::Cursor, mode: SessionMode::Structured, cwd: "/tmp".into(), resume: None, replay: false,
+            replay_skip: 0, model: Some(model.into()), effort: None, model_config_options: vec![],
+            permission_mode: "default".into(), command: None, program: "cursor-agent".into(), extra_args: vec![],
+            mcp_servers: vec![], mcp_fingerprint: String::new(), cols: 80, rows: 24, tmux: None, session_id: None,
+        }
+    }
+
+    #[test]
+    fn cursor_start_switches_explicitly_and_retries_a_failed_switch() {
+        let (hub, em, _rx) = crate::hub::test_emitter();
+        crate::hub::test_set_tool(&hub, "s", ToolKind::Cursor);
+        let spec = cursor_spec("grok-4.7[context=500k]");
+        let mut st = State::default();
+        st.pending.insert(1, Pending::Session);
+        // session/new lists mode and model only, and Cursor is already on the wanted model
+        let created = json!({"id":1,"result":{"sessionId":"ext","models":{"currentModelId":"grok-4.7",
+            "availableModels":[{"modelId":"grok-4.7","name":"Grok 4.7"}]},
+            "configOptions":[{"id":"model","category":"model","currentValue":"grok-4.7"}]}});
+        handle(&mut st, &spec, &created, &em).unwrap();
+        assert!(hub.store.model_config("grok-4.7").unwrap().is_none(), "session/new is not a parameter list");
+        assert_eq!(st.config_queue, [("model".to_string(), "grok-4.7".to_string()), ("context".into(), "500k".into())]);
+        let switch = next_config(&mut st).unwrap();
+        // First failure: retried at once, no error shown
+        let fail = |id: &Value| json!({"id":id,"error":{"code":-32602,"message":"Invalid params","data":{"message":"Invalid model value: grok-4.7"}}});
+        handle(&mut st, &spec, &fail(&switch["id"]), &em).unwrap();
+        let again = next_config(&mut st).unwrap();
+        assert_eq!(again["params"]["value"], "grok-4.7");
+        // Second failure: the prompt may go; the switch and its parameters wait for the next message
+        handle(&mut st, &spec, &fail(&again["id"]), &em).unwrap();
+        assert!(!config_pending(&st));
+        assert_eq!(st.model_failed.as_deref(), Some("grok-4.7"));
+        assert!(retry_failed_model(&mut st));
+        assert_eq!(st.config_queue, [("model".to_string(), "grok-4.7".to_string()), ("context".into(), "500k".into())]);
+        let switch = next_config(&mut st).unwrap();
+        let ok = json!({"id":switch["id"],"result":{"configOptions":[{"id":"model","category":"model","currentValue":"grok-4.7"},
+            {"id":"context","name":"Context","category":"model_config","type":"select","currentValue":"256k",
+             "options":[{"value":"256k","name":"256K"},{"value":"500k","name":"500K"}]}]}});
+        handle(&mut st, &spec, &ok, &em).unwrap();
+        assert_eq!(hub.store.model_config("grok-4.7").unwrap().unwrap()[0].id, "context");
+        assert_eq!(next_config(&mut st).unwrap()["params"]["value"], "500k");
+    }
+
+    #[test]
+    fn switching_models_drops_the_previous_models_parameters_before_the_session_exists() {
+        let mut st = State { want_model: Some("gemini-4-argon".into()), spec_params_stale: true, ..Default::default() };
+        let (_hub, em, _rx) = crate::hub::test_emitter();
+        let mut spec = cursor_spec("grok-4.7");
+        spec.model_config_options = vec![ModelConfigOption { id: "fast".into(), name: "Fast".into(), category: "model_config".into(),
+            description: String::new(), current_value: "true".into(), options: vec![] }];
+        st.pending.insert(1, Pending::Session);
+        let created = json!({"id":1,"result":{"sessionId":"ext","models":{"currentModelId":"grok-4.7",
+            "availableModels":[{"modelId":"grok-4.7"},{"modelId":"gemini-4-argon"}]},
+            "configOptions":[{"id":"model","category":"model","currentValue":"grok-4.7"}]}});
+        handle(&mut st, &spec, &created, &em).unwrap();
+        assert_eq!(st.config_queue, [("model".to_string(), "gemini-4-argon".to_string())]);
     }
 
     #[test]
