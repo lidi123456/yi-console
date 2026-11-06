@@ -192,6 +192,7 @@ export function ModelPicker({ hostId, info }: { hostId: string; info: SessionInf
   }, [hostId, info.id]);
   const pick = async (id: string) => {
     close();
+    if (id === info.model) return;
     setChanging('model');
     try {
       await rpc(hostId, 'session.setModel', { sessionId: info.id, model: id });

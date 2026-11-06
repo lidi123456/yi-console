@@ -863,26 +863,43 @@ impl Hub {
     pub fn set_model(self: &Arc<Self>, id: &str, model: &str) -> Result<()> {
         let rt = self.get(id)?;
         let running = self.running_tx(&rt);
-        let (info, discover) = {
+        let (info, discover, carried) = {
             let mut i = rt.info.lock().unwrap();
             if i.mode == SessionMode::Terminal {
                 bail!("终端模式不支持切换模型");
             }
+            let cursor = i.tool == ToolKind::Cursor && i.mode == SessionMode::Structured;
+            // Picking the model the session is already on keeps its parameters
+            if cursor && i.model.as_deref() == Some(model) {
+                return Ok(());
+            }
             i.model = Some(model.to_string()).filter(|m| !m.is_empty());
             let mut discover = false;
-            if i.tool == ToolKind::Cursor && i.mode == SessionMode::Structured {
-                let cached = (!model.is_empty()).then(|| self.store.model_config(base_model(model)).ok().flatten()).flatten();
+            let mut carried = vec![];
+            if cursor {
+                let mut cached = (!model.is_empty()).then(|| self.store.model_config(base_model(model)).ok().flatten()).flatten();
+                // Values the new model also offers carry over (Fast from one Grok to another); the rest start at the default
+                for o in cached.iter_mut().flatten() {
+                    let old = i.model_config_options.iter().find(|p| p.id == o.id || p.category == "thought_level" && o.category == "thought_level");
+                    if let Some(v) = old.map(|p| &p.current_value).filter(|v| !v.is_empty() && o.options.iter().any(|c| &c.value == *v)) {
+                        o.current_value = v.clone();
+                        carried.push((o.id.clone(), v.clone()));
+                    }
+                }
                 i.model_config_pending = !model.is_empty() && cached.is_none();
                 i.model_config_options = cached.unwrap_or_default();
                 // A running process reads the parameters when it switches; otherwise a short probe does
                 discover = i.model_config_pending && running.is_none();
             }
-            (i.clone(), discover)
+            (i.clone(), discover, carried)
         };
         self.store.save_session(&info)?;
         self.broadcast_updated(&info);
         if let Some(tx) = running {
             let _ = tx.send(AdapterCmd::SetModel(model.to_string()));
+            for (id, value) in carried {
+                let _ = tx.send(AdapterCmd::SetModelConfig { id, value });
+            }
         }
         if discover {
             self.discover_model_config(base_model(model), &info.cwd);
@@ -2905,6 +2922,7 @@ mod tests {
         let grok = vec![opt("fast", &["false", "true"], "false"), opt("context", &["256k", "500k"], "256k")];
         em.model_config_confirmed("grok-4.7", grok.clone());
         // A cached model: parameters at once, with the model's defaults, and adjustable while Cursor is busy
+        hub.set_model("s", "composer-2.5").unwrap();
         hub.set_model("s", "grok-4.7").unwrap();
         let i = hub.info("s").unwrap();
         assert!(!i.model_config_pending);
@@ -2915,6 +2933,13 @@ mod tests {
         let i = hub.info("s").unwrap();
         assert_eq!(i.model_config_options[0].current_value, "true");
         assert_eq!(i.model_config_options[1].current_value, "256k");
+        // Picking the same model again keeps the choice; another model with Fast carries it over
+        hub.set_model("s", "grok-4.7").unwrap();
+        assert_eq!(hub.info("s").unwrap().model_config_options[0].current_value, "true");
+        em.model_config_confirmed("grok-4.6", grok.clone());
+        hub.set_model("s", "grok-4.6").unwrap();
+        let i = hub.info("s").unwrap();
+        assert_eq!((i.model_config_options[0].current_value.as_str(), i.model_config_options[1].current_value.as_str()), ("true", "256k"));
         // A model without Fast offers no Fast; a cold model waits only for its own parameters
         hub.set_model("s", "gemini-4-argon").unwrap();
         let i = hub.info("s").unwrap();
