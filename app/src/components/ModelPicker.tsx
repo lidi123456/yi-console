@@ -4,7 +4,7 @@ import { useBack } from '../back';
 import { getT, isEn } from '../i18n';
 import { errorToast } from '../store';
 import { rpc } from '../transport';
-import type { ModelOption, SessionInfo } from '../types';
+import type { ModelConfigOption, ModelOption, SessionInfo } from '../types';
 import { Icon } from './Icon';
 import { isMobile } from '../util';
 
@@ -57,6 +57,12 @@ export const EFFORT_LABEL: Record<string, string> = new Proxy(EFFORT_LABEL_ZH, {
 });
 
 const effortLabel = (e: string) => EFFORT_LABEL[e] ?? e;
+
+/** Cursor parameter ids vary by model; older daemons/saved sessions may omit the ACP category. */
+function isReasoningOption(option: ModelConfigOption) {
+  return option.category === 'thought_level'
+    || ['reasoning', 'reasoning_effort', 'effort', 'thinking', 'thought_level'].includes(option.id);
+}
 
 /** Thinking levels supported by the current model */
 function currentModel(current: string | null | undefined, models: ModelOption[]) {
@@ -125,10 +131,10 @@ export function ModelPicker({ hostId, info }: { hostId: string; info: SessionInf
     }
   };
   const cursorOptions = info.tool === 'cursor'
-    ? (info.modelConfigOptions ?? []).filter((o) => o.id === 'fast' || o.id === 'reasoning')
+    ? (info.modelConfigOptions ?? []).filter((o) => o.options.length > 1 && (o.id === 'fast' || isReasoningOption(o)))
     : [];
   const fast = cursorOptions.find((o) => o.id === 'fast')?.currentValue === 'true';
-  const cursorEffort = cursorOptions.find((o) => o.id === 'reasoning')?.currentValue;
+  const cursorEffort = cursorOptions.find(isReasoningOption)?.currentValue;
   const cur = info.model;
   const activeId = cur ? findModel(cur, models ?? [])?.id : undefined;
   const curModel = currentModel(cur, models ?? []);

@@ -113,6 +113,7 @@ export interface GitFile {
 export interface ModelConfigOption {
   id: string;
   name: string;
+  category?: string;
   description: string;
   currentValue: string;
   options: { value: string; name: string }[];

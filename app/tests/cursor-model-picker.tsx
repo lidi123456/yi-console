@@ -6,9 +6,12 @@ import { handleBack } from '../src/back';
 import type { SessionInfo } from '../src/types';
 import '../src/styles.css';
 
+const query = new URLSearchParams(location.search);
+const reasoningId = query.get('reasoningId') ?? 'reasoning';
+const category = query.get('category');
 const params = [
   { id: 'fast', name: 'Fast', description: '2.5x more expensive', currentValue: 'false', options: [{ value: 'false', name: 'Off' }, { value: 'true', name: 'Fast' }] },
-  { id: 'reasoning', name: 'Reasoning', description: '', currentValue: 'medium', options: [{ value: 'medium', name: 'Medium' }, { value: 'high', name: 'High' }] },
+  { id: reasoningId, ...(category ? { category } : {}), name: 'Reasoning', description: '', currentValue: 'medium', options: [{ value: 'medium', name: 'Medium' }, { value: 'high', name: 'High' }] },
 ];
 let info = { id: 'fixture', tool: 'cursor', mode: 'structured', model: 'model-a', modelConfigOptions: params } as SessionInfo;
 let refresh = () => {};

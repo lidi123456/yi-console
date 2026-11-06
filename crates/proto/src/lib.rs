@@ -294,6 +294,9 @@ pub struct SlashCommand {
 pub struct ModelConfigOption {
     pub id: String,
     pub name: String,
+    /// ACP category identifies reasoning controls independently of provider-specific parameter ids.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub category: String,
     #[serde(default)]
     pub description: String,
     pub current_value: String,

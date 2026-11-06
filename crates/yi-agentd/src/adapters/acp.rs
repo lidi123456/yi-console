@@ -1359,6 +1359,24 @@ mod model_config_tests {
     }
 
     #[test]
+    fn grok_reasoning_category_and_original_id_are_preserved() {
+        let (_hub, em, _rx) = crate::hub::test_emitter();
+        let mut st = State { session_id: Some("ext".into()), parameterized: true, ..Default::default() };
+        let mut reported = config();
+        reported["configOptions"][3]["id"] = json!("reasoning_effort");
+        apply_config_options(&mut st, &reported, &em);
+        let effort = st.config_options.iter().find(|o| o.id == "reasoning_effort").unwrap();
+        assert_eq!(effort.category, "thought_level");
+        let wire = serde_json::to_value(effort).unwrap();
+        assert_eq!(wire["category"], "thought_level");
+        st.config_queue.push(("reasoning_effort".into(), "high".into()));
+        assert_eq!(next_config(&mut st).unwrap()["params"]["configId"], "reasoning_effort");
+        let mut legacy = wire;
+        legacy.as_object_mut().unwrap().remove("category");
+        assert!(serde_json::from_value::<ModelConfigOption>(legacy).unwrap().category.is_empty());
+    }
+
+    #[test]
     fn unsupported_saved_parameters_do_not_block_prompts() {
         let mut st = State { session_id: Some("ext".into()), parameterized: true, ..Default::default() };
         st.config_queue = vec![("fast".into(), "true".into()), ("reasoning".into(), "ultra".into())];
