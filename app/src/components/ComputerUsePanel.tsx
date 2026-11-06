@@ -19,7 +19,6 @@ interface DesktopState {
   paused: boolean;
   status: string;
   lastWindow?: Target;
-  ownerSessionId?: string;
 }
 
 export function ComputerUsePanel({
@@ -130,7 +129,6 @@ export function ComputerUsePanel({
             {state?.supported ? (
               <>
                 <p className="muted small">{t('scope')}</p>
-                {state.status === 'busy' && <p role="status">{t('occupied')}</p>}
                 {error && (
                   <p className="error-text" role="alert">
                     {error}

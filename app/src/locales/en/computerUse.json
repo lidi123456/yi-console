@@ -1,8 +1,7 @@
 {
   "title": "Computer use",
   "description": "Allow this AI session to operate the signed-in Windows desktop on the session host: open apps, switch windows, click and type. Activity and screenshots appear in chat.",
-  "scope": "The AI can operate every app on this computer; turn this on only for tasks you trust. One session controls the desktop at a time; stopping a reply pauses it and your next message resumes.",
-  "occupied": "Another session is using this desktop. Turn computer use off in that session first.",
+  "scope": "The AI can operate every app on this computer; turn this on only for tasks you trust. Several sessions can have it on at once, but their actions may interfere; stopping a reply pauses it and your next message resumes.",
   "enable": "Enable computer use",
   "cancel": "Cancel",
   "close": "Close",

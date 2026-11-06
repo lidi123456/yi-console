@@ -65,7 +65,8 @@ After each action read its structuredContent: refused or suspected_noop means it
 Chromium and Electron windows (Feishu, Slack, VS Code, browsers) drop background input: use delivery_mode \"foreground\" there from the first input; it briefly takes the focus. \
 To submit typed text, press_key return is more reliable than clicking a send button. \
 Before an action that is hard to undo (sending to other people, deleting, paying, closing unsaved work), make sure the user asked for it. \
-A paused, stopped or busy error means the user took control: stop and tell them. \
+A paused or stopped error means the user took control: stop and tell them. \
+Other sessions may use this desktop too: if a window changed unexpectedly, read it again before acting. \
 Never start your own MCP client, read Yi Console ticket files, or drive the desktop through shell scripts or other desktop tools. \
 When a direct API, CLI, file or browser tool can do the task, use that instead."
     };
@@ -97,19 +98,22 @@ struct Grant {
 
 #[derive(Default)]
 struct Control {
+    /// Several sessions may hold the desktop at once, as in OpenBot: driver requests are serialized and each
+    /// session's element tokens are its own, but their actions can still interleave on the one screen.
     grants: HashMap<String, Grant>,
-    owner: Option<String>,
 }
 
 pub struct Desktop {
     control: Mutex<Control>,
     driver: AsyncMutex<Option<Peer>>,
-    cancel: watch::Sender<u64>,
+    /// Per-session counter: bumped when that session's grant is paused, stopped or replaced, which aborts its
+    /// queued and in-flight desktop actions without touching other sessions
+    cancel: watch::Sender<HashMap<String, u64>>,
 }
 
 impl Desktop {
     pub fn new() -> Self {
-        let (cancel, _) = watch::channel(0);
+        let (cancel, _) = watch::channel(HashMap::new());
         Self {
             control: Mutex::new(Control::default()),
             driver: AsyncMutex::new(None),
@@ -125,10 +129,9 @@ impl Desktop {
             "status": if !cfg!(all(windows, target_arch = "x86_64")) { "unsupported" }
                 else if !desktop_available() { "desktopUnavailable" }
                 else if grant.is_some_and(|g| g.paused) { "paused" }
-                else if control.owner.as_deref().is_some_and(|owner| Some(owner) != sid) { "busy" }
                 else if grant.is_some() { "ready" } else { "disabled" },
             "enabled": grant.is_some(), "paused": grant.is_some_and(|g| g.paused),
-            "ownerSessionId": control.owner, "lastWindow": grant.and_then(|g| g.last.as_ref()),
+            "lastWindow": grant.and_then(|g| g.last.as_ref()),
         })
     }
 
@@ -146,9 +149,6 @@ impl Desktop {
             bail!("桌面不可用，请在已登录且解锁的 Windows 用户会话中运行 Yi Console");
         }
         let mut control = self.control.lock().unwrap();
-        if control.owner.as_deref().is_some_and(|owner| owner != sid) {
-            bail!("桌面正在被其他会话使用，请先在该会话里关闭操作电脑");
-        }
         // Replacing a grant invalidates old proxies even when their CLI has not exited yet.
         let grant = Grant {
             ticket: uuid::Uuid::new_v4().to_string(),
@@ -171,8 +171,8 @@ impl Desktop {
         }
         std::fs::write(&path, serde_json::to_vec(&json!({"ticket": grant.ticket}))?)?;
         control.grants.insert(sid.into(), grant);
-        control.owner = Some(sid.into());
-        self.cancel.send_modify(|n| *n += 1);
+        drop(control);
+        self.bump(sid);
         Ok(())
     }
 
@@ -204,14 +204,11 @@ impl Desktop {
 
     pub fn change(&self, sid: &str, action: &str) -> Result<()> {
         let mut control = self.control.lock().unwrap();
-        let was_owner = control.owner.as_deref() == Some(sid);
+        let had = control.grants.contains_key(sid);
         match action {
             "disable" | "stop" => {
                 control.grants.remove(sid);
                 let _ = std::fs::remove_file(Self::ticket_path(sid));
-                if control.owner.as_deref() == Some(sid) {
-                    control.owner = None;
-                }
             }
             "pause" => {
                 let grant = control
@@ -221,31 +218,28 @@ impl Desktop {
                 grant.paused = true;
                 grant.tokens.clear();
                 grant.captures.clear();
-                if control.owner.as_deref() == Some(sid) {
-                    control.owner = None;
-                }
             }
             "resume" => {
-                if control.owner.as_deref().is_some_and(|owner| owner != sid) {
-                    bail!("桌面正在被其他会话使用");
-                }
                 control
                     .grants
                     .get_mut(sid)
                     .ok_or_else(|| anyhow!("当前会话未开启操作电脑"))?
                     .paused = false;
-                control.owner = Some(sid.into());
             }
             _ => bail!("未知的操作电脑控制命令"),
         }
-        if was_owner || action == "resume" {
-            self.cancel.send_modify(|n| *n += 1);
+        drop(control);
+        if had {
+            self.bump(sid);
         }
         Ok(())
     }
 
+    fn bump(&self, sid: &str) {
+        self.cancel.send_modify(|m| *m.entry(sid.to_string()).or_default() += 1);
+    }
+
     /// Stopping a reply pauses the grant; the user's next message is the go-ahead again (no resume button, as in OpenBot).
-    /// Stays paused if another session has taken the desktop meanwhile.
     pub fn resume_if_paused(&self, sid: &str) {
         let paused = self.control.lock().unwrap().grants.get(sid).is_some_and(|g| g.paused);
         if paused { let _ = self.change(sid, "resume"); }
@@ -257,9 +251,7 @@ impl Desktop {
             return false;
         };
         let control = self.control.lock().unwrap();
-        allowed(tool)
-            && control.owner.as_deref() == Some(sid)
-            && control.grants.get(sid).is_some_and(|g| !g.paused)
+        allowed(tool) && control.grants.get(sid).is_some_and(|g| !g.paused)
     }
 
     pub fn mcp_config(&self, sid: &str) -> Option<Value> {
@@ -277,8 +269,8 @@ impl Desktop {
         if grant.ticket != ticket {
             bail!("操作电脑连接已失效，请重连会话");
         }
-        if active && (grant.paused || control.owner.as_deref() != Some(sid)) {
-            bail!("操作电脑已暂停或桌面被占用，请由用户恢复");
+        if active && grant.paused {
+            bail!("操作电脑已暂停，用户发下一条消息后恢复");
         }
         Ok(grant.clone())
     }
@@ -295,6 +287,9 @@ impl Desktop {
         hub: Option<&crate::hub::Hub>,
     ) -> Result<Value> {
         let mut cancel = self.cancel.subscribe();
+        let caller = auth.map(|(sid, _)| sid.to_string());
+        let start = caller.as_ref().and_then(|sid| cancel.borrow().get(sid).copied());
+        let changed = |m: &HashMap<String, u64>| caller.as_ref().is_some_and(|sid| m.get(sid).copied() != start);
         let mut lock = self.driver.lock().await;
         if let Some((sid, ticket)) = auth {
             let grant = self.grant(sid, ticket, true)?;
@@ -318,7 +313,7 @@ impl Desktop {
         // Only desktop actions (auth) are cancelled by pause/stop. Tool discovery must not be: a client that sees
         // tools/list fail once (Qoder) keeps an empty tool list for the whole process.
         let action = auth.is_some();
-        if action && cancel.has_changed().unwrap_or(true) {
+        if action && changed(&cancel.borrow()) {
             bail!("桌面控制状态已变化，请重新读取窗口");
         }
         if lock.is_none() {
@@ -331,7 +326,7 @@ impl Desktop {
         let peer = lock.as_mut().unwrap();
         let result = tokio::select! {
             biased;
-            _ = cancel.changed(), if action => Err(anyhow!("桌面操作已中断，结果待核验，请重新读取窗口")),
+            _ = cancel.wait_for(|m| changed(m)), if action => Err(anyhow!("桌面操作已中断，结果待核验，请重新读取窗口")),
             response = tokio::time::timeout(Duration::from_secs(25), peer.request(method, params)) => response.unwrap_or_else(|_| Err(anyhow!("桌面操作超时，结果待核验，请读取窗口后再继续"))),
         };
         if result.is_err() {
@@ -342,10 +337,10 @@ impl Desktop {
         result
     }
 
-    /// Await native shutdown before a pause/stop response; never stop a new desktop owner.
+    /// Await native shutdown before a pause/stop response; keep the driver while any session still holds an active grant.
     pub async fn close_if_idle(&self) {
         let mut driver = self.driver.lock().await;
-        let idle = self.control.lock().unwrap().owner.is_none();
+        let idle = self.control.lock().unwrap().grants.values().all(|g| g.paused);
         if idle {
             if let Some(mut peer) = driver.take() {
                 let _ = peer.child.kill().await;
@@ -1125,7 +1120,6 @@ mod tests {
         let sid = uuid::Uuid::new_v4().to_string();
         {
             let mut control = desktop.control.lock().unwrap();
-            control.owner = Some(sid.clone());
             control.grants.insert(
                 sid.clone(),
                 grant(),
@@ -1145,35 +1139,28 @@ mod tests {
         drop(driver);
         let error = task.await.unwrap().unwrap_err().to_string();
         assert!(error.contains("已关闭"), "{error}");
-        assert!(desktop.control.lock().unwrap().owner.is_none());
     }
     #[test]
-    fn stopping_an_unrelated_session_does_not_cancel_the_desktop_owner() {
-        let desktop = Desktop::new();
-        let change = desktop.cancel.subscribe();
-        desktop.control.lock().unwrap().owner = Some("active".into());
-        desktop
-            .change(&uuid::Uuid::new_v4().to_string(), "stop")
-            .unwrap();
-        assert!(!change.has_changed().unwrap());
-        assert_eq!(
-            desktop.control.lock().unwrap().owner.as_deref(),
-            Some("active")
-        );
-    }
-    #[test]
-    fn next_message_resumes_a_paused_grant_unless_the_desktop_was_taken() {
+    fn sessions_share_the_desktop_and_cancel_only_their_own_actions() {
         let desktop = Desktop::new();
         let grant = || Grant { ticket: "t".into(), paused: false, tokens: HashMap::new(), captures: HashMap::new(), titles: HashMap::new(), last: None, proxy: None };
-        desktop.control.lock().unwrap().grants.insert("a".into(), grant());
-        desktop.control.lock().unwrap().owner = Some("a".into());
+        for sid in ["a", "b"] {
+            desktop.control.lock().unwrap().grants.insert(sid.into(), grant());
+        }
+        let click = "mcp__yi_computer_use__click";
+        assert!(desktop.authorizes("a", click) && desktop.authorizes("b", click));
+        let watch = desktop.cancel.subscribe();
         desktop.change("a", "pause").unwrap();
+        assert!(!desktop.authorizes("a", click) && desktop.authorizes("b", click));
+        assert_eq!(watch.borrow().get("b"), None, "pausing a must not cancel b");
         desktop.resume_if_paused("a");
-        assert!(desktop.authorizes("a", "mcp__yi_computer_use__click"));
-        desktop.change("a", "pause").unwrap();
-        desktop.control.lock().unwrap().owner = Some("b".into());
-        desktop.resume_if_paused("a");
-        assert!(!desktop.authorizes("a", "mcp__yi_computer_use__click"));
+        assert!(desktop.authorizes("a", click));
+        desktop.change("b", "stop").unwrap();
+        assert!(desktop.authorizes("a", click) && !desktop.authorizes("b", click));
+        assert_eq!(watch.borrow().get("a"), Some(&2));
+        // Stopping a session that never enabled cancels nothing
+        desktop.change("none", "stop").unwrap();
+        assert_eq!(watch.borrow().get("none"), None);
         desktop.resume_if_paused("none");
     }
     #[test]

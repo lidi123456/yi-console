@@ -20,7 +20,7 @@ The Windows daemon embeds a pinned MIT `cua-driver`. There is no runtime driver 
 4. Give a specific task, such as: “Open Notepad and type a line, don't save.” or “Send someone a message in Feishu.”
 5. Review activity and screenshots in chat. Click an image to enlarge or save it.
 
-Only one session controls a desktop at a time. Turn computer use off in that session before another session takes control. Access covers the whole desktop, as in OpenBot: enable it only for tasks you trust, and stop the AI's reply whenever you need to take over. The AI is told to make sure you asked for hard-to-undo actions such as sending messages, deleting or paying.
+Several sessions can have computer use on at once, as in OpenBot. Their desktop requests run one at a time, but their actions can still interfere, for example one session switching the foreground window while another is typing, so avoid having two AIs drive the desktop at the same time. Access covers the whole desktop, as in OpenBot: enable it only for tasks you trust, and stop the AI's reply whenever you need to take over. The AI is told to make sure you asked for hard-to-undo actions such as sending messages, deleting or paying.
 
 Kiro CLI currently cannot pass MCP images directly to its model. Yi Console supplies the captured image as a session artifact for Kiro’s built-in image reader. If file approval is requested, review and allow only that session screenshot.
 
@@ -28,7 +28,7 @@ Kiro CLI currently cannot pass MCP images directly to its model. Yi Console supp
 
 As in OpenBot, there is only an on/off switch, with no separate pause or capture buttons.
 
-- Stopping the AI's reply pauses desktop activity: queued requests are interrupted and control is released. Your next message resumes it, and the AI has to read the screen again.
+- Stopping the AI's reply pauses desktop activity: that session's queued requests are interrupted; other sessions are not affected. Your next message resumes it, and the AI has to read the screen again.
 - Clicking the computer icon and choosing Turn off computer use revokes the session's desktop authorization: a desktop request in progress is cancelled and later desktop calls are refused. The AI's reply is not interrupted; stop it yourself if you want. With your next message the tool restarts in the same session without the computer use tools. Ending a session, changing mode and `/clear` also revoke authorization.
 - Actions already performed are not rolled back. Interrupted or timed-out actions may need a new screenshot or human verification and are not replayed automatically.
 - Closing a client does not automatically end a background task. The daemon can continue while the Windows desktop remains available. Re-enable computer use after a daemon restart.
