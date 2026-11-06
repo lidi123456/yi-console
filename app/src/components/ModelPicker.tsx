@@ -235,7 +235,8 @@ export function ModelPicker({ hostId, info }: { hostId: string; info: SessionInf
   const efforts = curModel?.efforts ?? [];
   const effort = reasoningOption?.currentValue ?? info.effort ?? '';
   const hasEffort = !!reasoningOption || efforts.length > 0;
-  const hasControls = configPending || !!fastOption || !!contextOption || hasEffort;
+  // Cursor always uses the settings menu, also before a model or its parameters are known, so it never falls back to the bare list
+  const hasControls = info.tool === 'cursor' || configPending || !!fastOption || !!contextOption || hasEffort;
   const list = (models ?? []).filter((m) => !q.trim() || `${m.name} ${m.id}`.toLowerCase().includes(q.trim().toLowerCase()));
   const sectionLabel = section === 'effort' ? t('reasoningEffort') : section === 'context' ? t('contextWindow') : t('chooseModel');
   const contextLabel = contextOption?.options.find((o) => o.value === contextOption.currentValue)?.name || contextOption?.currentValue || t('default');
@@ -312,7 +313,7 @@ export function ModelPicker({ hostId, info }: { hostId: string; info: SessionInf
       )}
       {contextOption && settingsRow('context', t('contextWindow'), contextLabel)}
       {hasEffort && settingsRow('effort', t('reasoningEffort'), effort ? effortLabel(effort) : t('default'))}
-      <div className="model-settings-divider" />
+      {(configPending || !!fastOption || !!contextOption || hasEffort) && <div className="model-settings-divider" />}
       {settingsRow('models', t('model'), modelLabel(cur, models ?? []))}
     </div>
   );

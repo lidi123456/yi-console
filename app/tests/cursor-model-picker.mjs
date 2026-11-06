@@ -78,7 +78,7 @@ try {
   await row(page, 'Auto').click();
   await page.getByRole('dialog').waitFor({ state: 'hidden' });
   await page.locator('.model-btn').click();
-  await page.locator('.model-list').getByRole('button', { name: 'Auto', exact: true }).waitFor();
+  await row(page, 'Model').waitFor();
   assert.equal(await page.getByRole('switch').count(), 0, 'unsupported model hides parameter controls');
   await page.keyboard.press('Escape');
   await page.getByRole('dialog').waitFor({ state: 'hidden' });
@@ -165,10 +165,9 @@ try {
   assert.equal(await delayed.locator('.model-btn .spinner').count(), 0, 'the trigger never shows a loading spinner');
   await capture(delayed, 'model-cache-cold-loading');
   await delayed.getByText(loading, { exact: true }).waitFor({ state: 'hidden' });
-  // Auto has no parameters, so the menu is the model list itself
-  await delayed.getByRole('textbox', { name: 'Search models' }).waitFor();
-  await delayed.locator('.model-list').getByRole('button', { name: 'Grok 4.7', exact: true }).click();
-  await delayed.locator('.model-btn').click();
+  // Auto has no parameters: still the same settings menu, with only the model row
+  assert.equal(await delayed.locator('.model-setting-row').count(), 1, 'Cursor never falls back to the bare model list');
+  await select('Grok 4.7');
   // Grok's parameters were cached when the fixture opened on it: usable at once
   await row(delayed, 'Reasoning Effort').waitFor();
   assert.equal(await delayed.getByText(loading, { exact: true }).count(), 0);
