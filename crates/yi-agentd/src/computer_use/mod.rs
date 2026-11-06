@@ -315,7 +315,10 @@ impl Desktop {
         if !desktop_available() {
             bail!("桌面不可用，请在已登录且解锁的 Windows 用户会话中运行 Yi Console");
         }
-        if cancel.has_changed().unwrap_or(true) {
+        // Only desktop actions (auth) are cancelled by pause/stop. Tool discovery must not be: a client that sees
+        // tools/list fail once (Qoder) keeps an empty tool list for the whole process.
+        let action = auth.is_some();
+        if action && cancel.has_changed().unwrap_or(true) {
             bail!("桌面控制状态已变化，请重新读取窗口");
         }
         if lock.is_none() {
@@ -328,7 +331,7 @@ impl Desktop {
         let peer = lock.as_mut().unwrap();
         let result = tokio::select! {
             biased;
-            _ = cancel.changed() => Err(anyhow!("桌面操作已中断，结果待核验，请重新读取窗口")),
+            _ = cancel.changed(), if action => Err(anyhow!("桌面操作已中断，结果待核验，请重新读取窗口")),
             response = tokio::time::timeout(Duration::from_secs(25), peer.request(method, params)) => response.unwrap_or_else(|_| Err(anyhow!("桌面操作超时，结果待核验，请读取窗口后再继续"))),
         };
         if result.is_err() {
@@ -1262,7 +1265,8 @@ pub fn acp_notice() -> &'static str {
     concat!(
         "<system-reminder>Yi Console turned on computer use for this session. The yi_computer_use MCP tools ",
         "(list_windows, launch_app, get_window_state, click, type_text, press_key, hotkey and more) ",
-        "are in your tool list now; earlier messages saying they are missing or broken are outdated. Use them only when the task needs the desktop. ",
+        "are in your tool list now; earlier messages saying they are missing or broken are outdated. Use them only when the task needs the desktop. \
+If they really are not in your tool list, tell the user computer use did not load and stop: do not hand the task to a subagent or do it with scripts. ",
         guide!(),
         "</system-reminder>"
     )
