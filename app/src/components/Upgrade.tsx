@@ -59,8 +59,8 @@ export function UpgradeOverlay() {
         </div>
       )}
       {waiting.map(([id, u]) => (
-        <div key={id} className="upgrade-toast">
-          <span>
+        <div key={id} className="upgrade-toast upgrade-waiting" title={`${name(id)}${t('text')}${u.message}`}>
+          <span className="upgrade-waiting-text">
             {name(id)}{t('text')}{u.message}
           </span>
           <button className="link-btn small" onClick={() => now(id)}>

@@ -6,6 +6,11 @@ use anyhow::Result;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
 
+tokio::task_local! {
+    /// Process id of the local IPC client, when the OS reports it. The desktop gateway binds its ticket to it.
+    pub static PEER_PID: Option<u32>;
+}
+
 pub trait Duplex: AsyncRead + AsyncWrite + Unpin + Send + 'static {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Duplex for T {}
 
@@ -166,10 +171,11 @@ pub async fn serve(l: Listener, hub: Arc<Hub>) -> Result<()> {
     loop {
         let (stream, _) = l.listener.accept().await?;
         let hub = hub.clone();
-        tokio::spawn(async move {
+        let pid = stream.peer_cred().ok().and_then(|c| c.pid()).and_then(|p| u32::try_from(p).ok());
+        tokio::spawn(PEER_PID.scope(pid, async move {
             let (r, w) = tokio::io::split(stream);
             crate::server::serve_conn(hub, r, w, "local").await;
-        });
+        }));
     }
 }
 
@@ -218,6 +224,15 @@ pub async fn bind() -> Result<Listener> {
 }
 
 #[cfg(windows)]
+fn pipe_client_pid(pipe: &tokio::net::windows::named_pipe::NamedPipeServer) -> Option<u32> {
+    use std::os::windows::io::AsRawHandle;
+    let mut pid = 0u32;
+    // Safety: the handle belongs to a connected pipe instance that outlives this call
+    let ok = unsafe { windows_sys::Win32::System::Pipes::GetNamedPipeClientProcessId(pipe.as_raw_handle() as _, &mut pid) };
+    (ok != 0 && pid != 0).then_some(pid)
+}
+
+#[cfg(windows)]
 pub async fn serve(l: Listener, hub: Arc<Hub>) -> Result<()> {
     let Listener { name, sec, mut server } = l;
     loop {
@@ -225,9 +240,10 @@ pub async fn serve(l: Listener, hub: Arc<Hub>) -> Result<()> {
         let client = server;
         server = create_pipe(&name, &sec, false)?;
         let hub = hub.clone();
-        tokio::spawn(async move {
+        let pid = pipe_client_pid(&client);
+        tokio::spawn(PEER_PID.scope(pid, async move {
             let (r, w) = tokio::io::split(client);
             crate::server::serve_conn(hub, r, w, "local").await;
-        });
+        }));
     }
 }

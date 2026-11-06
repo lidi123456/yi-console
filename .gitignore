@@ -15,3 +15,6 @@ app/src-tauri/resources/yi-agentd/*
 .kiro/
 .qoder/
 .codebuddy/
+
+# Pinned native driver artifacts; prepared and verified before a Windows build
+/runtime/computer-use/windows-x64/

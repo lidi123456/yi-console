@@ -19,6 +19,7 @@ import { limitHead, limitOutcome, type LimitEvent } from '../limit';
 const t = getT('chatView');
 
 type Item =
+  | { k: 'desktop'; key: string; ev: HubEvent & { kind: 'computer_use' } }
   | { k: 'user'; key: string; text: string; ts: number; images: ImageRef[] }
   | { k: 'text'; key: string; ts: number; text: string }
   | { k: 'thinking'; key: string; ts: number; text: string }
@@ -31,6 +32,8 @@ type Item =
       input: unknown;
       diffs: FileDiff[];
       result?: { output: string; isError: boolean };
+      /** The gateway's record of this desktop tool call: status and screenshots */
+      desktop?: HubEvent & { kind: 'computer_use' };
     }
   | {
       k: 'perm';
@@ -63,10 +66,43 @@ type Item =
       text: string;
     };
 
+const DESKTOP_SERVER = 'yi_computer_use';
+
+/** The tool row is a call of the desktop MCP server (Claude/Qoder mcp__yi_computer_use__x, Codex yi_computer_use.x, ACP titles) */
+function isDesktopTool(it: Item & { k: 'tool' }, tool: string) {
+  const id = `${it.name} ${it.title}`;
+  return id.includes(DESKTOP_SERVER) ? id.includes(tool) : false;
+}
+
+function desktopControlText(action: string) {
+  const tx = getT('computerUse');
+  const map: Record<string, string> = { enable: tx('noteEnabled'), pause: tx('notePaused'), resume: tx('noteResumed'), stop: tx('noteStopped'), disable: tx('noteStopped') };
+  return map[action] ?? tx('control');
+}
+
+/** Host and session for screenshots inside tool rows */
+const DesktopCtx = createContext<{ hostId: string; sessionId: string } | null>(null);
+
+function DesktopShots({ ev }: { ev: HubEvent & { kind: 'computer_use' } }) {
+  const ctx = useContext(DesktopCtx);
+  if (!ev.images?.length || !ctx) return null;
+  return <div className="computer-use-images">{ev.images.map((img) => <MsgImage key={img.id} hostId={ctx.hostId} sessionId={ctx.sessionId} img={img} />)}</div>;
+}
+
+/** Status worth flagging on a desktop tool row; a plain return is not proof, so "unverified" is shown too */
+function desktopStatus(ev?: HubEvent & { kind: 'computer_use' }) {
+  if (!ev) return null;
+  const tx = getT('computerUse');
+  if (ev.status === 'unverified') return tx('unverified');
+  if (ev.status === 'interrupted') return tx('interrupted');
+  return null;
+}
+
 /** hideCompactCmd: when the tool reports compaction progress (Claude, Codex), don't show the user's "/compact" bubble */
 function buildItems(events: HubEvent[], hideCompactCmd = false): Item[] {
   const items: Item[] = [];
   const tools = new Map<string, Item & { k: 'tool' }>();
+  const desktopTools = new Map<string, Item & { k: 'tool' }>();
   const perms = new Map<string, Item & { k: 'perm' }>();
   let planIdx = -1;
   const planner = new PlanTracker();
@@ -85,6 +121,34 @@ function buildItems(events: HubEvent[], hideCompactCmd = false): Item[] {
       planIdx = items.length - 1;
     }
     switch (e.kind) {
+      case 'computer_use': {
+        // A desktop action is the AI tool's own MCP call seen from the gateway: fold it into that tool row
+        // (OpenBot shows them as ordinary tool steps). Unmatched ones are control changes or manual captures.
+        let tool = desktopTools.get(e.actionId);
+        if (!tool && e.status !== 'control') {
+          for (let i = items.length - 1; i >= 0; i--) {
+            const it = items[i];
+            if (it.k === 'user') break;
+            if (it.k === 'tool' && !it.desktop && isDesktopTool(it, e.tool)) {
+              tool = it;
+              break;
+            }
+          }
+        }
+        if (tool) {
+          tool.desktop = e;
+          desktopTools.set(e.actionId, tool);
+          break;
+        }
+        if (e.status === 'control') {
+          items.push({ k: 'note', key: `desktop-${e.actionId}`, tone: 'muted', text: desktopControlText(e.tool) });
+          break;
+        }
+        const old = items.findIndex((item) => item.k === 'desktop' && item.ev.actionId === e.actionId);
+        const next: Item = { k: 'desktop', key: `desktop-${e.actionId}`, ev: e };
+        if (old >= 0) items[old] = next; else if (e.images?.length || e.status !== 'running') items.push(next);
+        break;
+      }
       case 'user_message':
         if (!(hideCompactCmd && e.text.trim() === '/compact')) {
           items.push({ k: 'user', key, text: e.text, ts: e.ts, images: e.images ?? [] });
@@ -585,6 +649,7 @@ const ToolLine = memo(function ToolLine({ it, active, cwd }: { it: Item & { k: '
         </div>
         {open && (
           <div className="tl-detail">
+            {it.desktop && <DesktopShots ev={it.desktop} />}
             {kind === 'edit' && it.diffs.map((d, i) => <DiffView key={i} diff={d} />)}
             {cmd ? <pre className="mono">{cmd}</pre> : hasInput && <pre className="mono">{typeof it.input === 'string' ? it.input : JSON.stringify(it.input, null, 2)}</pre>}
             {it.result && kind !== 'edit' && (
@@ -993,6 +1058,10 @@ function toolView(it: Item & { k: 'tool' }, cwd?: string) {
   const arg = generic || shown === t('todo') ? '' : toolArg(it, shown, cwd);
   const parsed = parseOutput(it.result?.output ?? '');
   const err = !!it.result?.isError || (parsed.exitCode ?? 0) !== 0;
+  if (it.desktop) {
+    const desktopErr = err || it.desktop.status === 'failed';
+    return { shown, kind, arg: it.desktop.message, parsed, err: desktopErr, label: getT('computerUse')('action', { tool: it.desktop.tool }) };
+  }
   return { shown, kind, arg, parsed, err, label: generic ? it.title : toolUiLabel(shown) };
 }
 
@@ -1017,7 +1086,7 @@ function useNow(on: boolean) {
 const ModernTool = memo(function ModernTool({ it, active, cwd }: { it: Item & { k: 'tool' }; active: boolean; cwd?: string }) {
   useLang();
   const [open, setOpen] = useState(false);
-  const v = useMemo(() => toolView(it, cwd), [it, it.result, it.title, it.input, it.diffs, cwd]);
+  const v = useMemo(() => toolView(it, cwd), [it, it.result, it.title, it.input, it.diffs, it.desktop, cwd]);
   const running = !it.result && active;
   const desc = v.kind === 'read' || v.kind === 'edit' ? baseName(v.arg) : v.arg;
   const stat = useMemo(() => {
@@ -1047,7 +1116,9 @@ const ModernTool = memo(function ModernTool({ it, active, cwd }: { it: Item & { 
           </span>
         )}
         {v.err && <span className="mt-fail">{v.parsed.exitCode ? t('exit', { exitCode: v.parsed.exitCode }) : t('failed')}</span>}
+        {!v.err && desktopStatus(it.desktop) && <span className="mt-desc">· {desktopStatus(it.desktop)}</span>}
       </button>
+      {open && it.desktop && <DesktopShots ev={it.desktop} />}
       {open && (
         <div className="mt-detail">
           {v.kind === 'edit' && it.diffs.length > 0 ? (
@@ -1296,7 +1367,8 @@ export function ChatView({
   pendingOutside?: boolean;
 }) {
   const hideCompactCmd = info?.tool === 'claude' || info?.tool === 'codex';
-  const items = useMemo(() => buildItems(events, hideCompactCmd), [events, events.length, hideCompactCmd]);
+  const [, lang] = useLang();
+  const items = useMemo(() => buildItems(events, hideCompactCmd), [events, events.length, hideCompactCmd, lang]);
   const [limit, setLimit] = useState(PAGE);
   const ref = useRef<HTMLDivElement>(null);
   const stick = useRef(true);
@@ -1443,6 +1515,7 @@ export function ChatView({
   }, [items, info?.tool, busy, onSendText, dismissedAsk]);
 
   const host = useStore((st) => (hostId ? st.hosts.find((h) => h.config.id === hostId)?.config : undefined));
+  const desktopCtx = useMemo(() => (hostId && info?.id ? { hostId, sessionId: info.id } : null), [hostId, info?.id]);
   const imgCtx = useMemo<ImgCtx | null>(
     () => (hostId ? { hostId, hostName: host?.name ?? hostId, local: host?.kind === 'local', cwd: info?.cwd } : null),
     [hostId, host?.name, host?.kind, info?.cwd],
@@ -1456,6 +1529,7 @@ export function ChatView({
 
   return (
     <ImgContext.Provider value={imgCtx}>
+    <DesktopCtx.Provider value={desktopCtx}>
     <div
       className={`chat ${modern ? 'modern' : ''}`}
       ref={ref}
@@ -1546,6 +1620,8 @@ export function ChatView({
               return modern ? <ModernTurnFooter key={it.key} it={it} latest={it.key === lastTurnKey} /> : <TurnFooter key={it.key} it={it} />;
             case 'bgdone':
               return <BgTaskNote key={it.key} it={it} />;
+            case 'desktop':
+              return <DesktopAction key={it.key} ev={it.ev} hostId={hostId} sessionId={info?.id} />;
             case 'note':
               return (
                 <div key={it.key} className={`note note-${it.tone}`}>
@@ -1590,6 +1666,7 @@ export function ChatView({
         )}
       </div>
     </div>
+    </DesktopCtx.Provider>
     </ImgContext.Provider>
   );
 }
@@ -1610,4 +1687,16 @@ function BgTaskNote({ it }: { it: Extract<Item, { k: 'bgdone' }> }) {
       {it.what && <code className="bgdone-what">{it.what}</code>}
     </button>
   );
+}
+
+function DesktopAction({ ev, hostId, sessionId }: { ev: HubEvent & { kind: 'computer_use' }; hostId?: string; sessionId?: string }) {
+  const tx = getT('computerUse');
+  useLang();
+  const status = ev.status === 'running' ? tx('running') : ev.status === 'completed' ? tx('completed') : ev.status === 'failed' ? tx('failed') : ev.status === 'control' ? tx('control') : ev.status === 'unverified' ? tx('unverified') : tx('interrupted');
+  return <div className="computer-use-action">
+    <div className="computer-use-action-head"><Icon name="laptop" size={15} /><strong>{tx('action', { tool: ev.tool })}</strong><span className="muted small">{status}</span></div>
+    {ev.message && <div className="muted small truncate">{ev.message}</div>}
+    {!!ev.durationMs && <div className="muted small">{tx('elapsed', { seconds: (ev.durationMs / 1000).toFixed(1) })}</div>}
+    {!!ev.images?.length && hostId && sessionId && <div className="computer-use-images">{ev.images.map((img) => <MsgImage key={img.id} hostId={hostId} sessionId={sessionId} img={img} />)}</div>}
+  </div>;
 }

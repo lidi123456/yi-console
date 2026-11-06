@@ -20,6 +20,7 @@ See [README.md](README.md) for an overview and usage. This file has the project 
 | File panel: tree, git changes and diffs, editor, search/replace, HTML preview | [docs/internals/file-panel.md](docs/internals/file-panel.md) |
 | Terminal mode, tmux, bottom terminal panel | [docs/internals/terminal.md](docs/internals/terminal.md) |
 | Frontend UI: chat timeline, theme, fonts, scrollbars, sidebar, links, overlays, i18n | [docs/internals/frontend-ui.md](docs/internals/frontend-ui.md) |
+| Computer Use: bundled Windows driver, session MCP, control leases, screenshots | [docs/internals/computer-use.md](docs/internals/computer-use.md) |
 | Remote: SSH bridge, relay, forwarding, port forwarding | [docs/internals/remote.md](docs/internals/remote.md) |
 | Daemon lifecycle, versions, auto-upgrade | [docs/internals/daemon.md](docs/internals/daemon.md) |
 | App self-update, Android | [docs/internals/release.md](docs/internals/release.md) |

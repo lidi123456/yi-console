@@ -95,6 +95,9 @@ pub struct StartSpec {
     pub command: Option<String>,
     pub program: PathBuf,
     pub extra_args: Vec<String>,
+    /// Session-scoped stdio servers supplied through ACP, separate from CLI arguments.
+    pub mcp_servers: Vec<serde_json::Value>,
+    pub mcp_fingerprint: String,
     pub cols: u16,
     pub rows: u16,
     /// Run terminal mode inside this tmux session (so it survives daemon restarts)

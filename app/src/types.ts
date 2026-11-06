@@ -53,6 +53,7 @@ export interface SessionInfo {
   autoResume?: AutoResume;
   /** Usage limit hits in a row since the last normal turn end */
   limitHits?: number;
+  computerUse?: boolean;
 }
 
 export interface AutoResume {
@@ -191,7 +192,10 @@ export interface PlanEntry {
   status: string;
 }
 
+export type ComputerUseEvent = { kind: 'computer_use'; actionId: string; tool: string; status: string; message: string; durationMs: number; images: ImageRef[] };
+
 export type EventBody =
+  | ComputerUseEvent
   | { kind: 'user_message'; text: string; images?: ImageRef[] }
   | { kind: 'assistant_text'; id: string; text: string }
   | { kind: 'assistant_delta'; id: string; delta: string }
@@ -365,7 +369,20 @@ export interface StatusLineSettings {
   useClaude: boolean;
 }
 
+export interface McpServerConfig {
+  name: string;
+  enabled: boolean;
+  transport: 'stdio' | 'http';
+  command: string;
+  args: string[];
+  env: Record<string, string>;
+  url: string;
+  headers: Record<string, string>;
+  tools: ToolKind[];
+}
+
 export interface DaemonSettings {
+  mcpServers?: McpServerConfig[];
   tools: Record<string, { command: string; extraArgs: string[] }>;
   statusLine: StatusLineSettings;
   snippets: Snippet[];

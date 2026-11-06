@@ -43,10 +43,29 @@ pub fn build_args(spec: &StartSpec) -> Vec<String> {
     // Don't add it if the user already set it in extra args, otherwise it's unclear which of two identical flags wins
     if !spec.extra_args.iter().any(|x| x == "--append-system-prompt" || x.starts_with("--append-system-prompt=")) {
         a.push("--append-system-prompt".into());
-        a.push(super::IMAGE_HINT.into());
+        a.push(format!("{}{}", super::IMAGE_HINT, crate::computer_use::model_hint(&spec.extra_args)));
     }
     a.extend(spec.extra_args.iter().cloned());
+    if !crate::computer_use::model_hint(&spec.extra_args).is_empty() {
+        allow_desktop_tools(&mut a);
+    }
     a
+}
+
+/// Preauthorize the gateway at the CLI layer too: auto mode can run its classifier before can_use_tool.
+/// The gateway continues to enforce the live grant, selected window and plan-mode restrictions.
+fn allow_desktop_tools(args: &mut Vec<String>) {
+    const RULE: &str = "mcp__yi_computer_use__*";
+    if let Some(index) = args.iter().rposition(|arg| arg == "--allowedTools" || arg == "--allowed-tools" || arg.starts_with("--allowedTools=") || arg.starts_with("--allowed-tools=")) {
+        if args[index].contains('=') {
+            args[index].push(',');
+            args[index].push_str(RULE);
+        } else {
+            args.insert(index + 1, RULE.into());
+        }
+    } else {
+        args.extend(["--allowedTools".into(), RULE.into()]);
+    }
 }
 
 /// Our mode names -> Claude's; default passes no argument.
@@ -376,6 +395,11 @@ fn handle(st: &mut State, v: &Value, em: &Emitter) -> Vec<Value> {
             let rid = v["request_id"].as_str().unwrap_or("").to_string();
             let req = &v["request"];
             match req["subtype"].as_str().unwrap_or("") {
+                "can_use_tool" if em.desktop_tool_allowed(req["tool_name"].as_str().unwrap_or("")) => {
+                    // The gateway still validates the selected window, live grant and read-only policy.
+                    out.push(json!({"type":"control_response","response":{
+                        "subtype":"success","request_id":rid,"response":{"behavior":"allow","updatedInput":req["input"]}}}));
+                }
                 "can_use_tool" if req["tool_name"] == "AskUserQuestion" => {
                     let input = req["input"].clone();
                     let questions = ask_questions(&input);
@@ -783,6 +807,17 @@ fn tool_diffs(name: &str, input: &Value) -> Vec<FileDiff> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn desktop_allow_rule_keeps_existing_tool_permissions() {
+        for original in [vec!["--allowedTools", "Read", "Bash(git *)"], vec!["--allowed-tools=Read,Bash(git *)"], vec!["--allowedTools=Read", "--allowed-tools", "Bash(git *)"]] {
+            let mut args: Vec<String> = original.iter().map(|s| s.to_string()).collect();
+            allow_desktop_tools(&mut args);
+            assert!(args.join(" ").contains("mcp__yi_computer_use__*"));
+            assert!(args.join(" ").contains("Read"));
+            assert!(args.join(" ").contains("Bash(git *)"));
+            assert!(!args.join(" ").contains("bypassPermissions"));
+        }
+    }
 
     #[test]
     fn background_tasks() {

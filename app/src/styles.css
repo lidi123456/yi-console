@@ -5156,6 +5156,11 @@ body.resizing-y {
   box-shadow: var(--shadow);
 }
 
+/* Daemon upgrade waiting notice: one line, the message truncates before the button wraps */
+.upgrade-waiting { max-width: min(640px, calc(100vw - 32px)); white-space: nowrap; }
+.upgrade-waiting-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.upgrade-waiting .link-btn { flex: none; }
+
 /* App self-update (AppUpdate.tsx): corner notice reuses .upgrade-toast; above the daemon-upgrade notice if both show */
 .app-update {
   bottom: 60px;
@@ -8723,4 +8728,48 @@ button.wp-commit-title .chev {
   user-select: none;
   pointer-events: none;
   transform-origin: center;
+}
+
+/* Session-scoped desktop control and checkpoint images. */
+.computer-use-bar { display: inline-flex; align-items: center; gap: 4px; flex: none; }
+.computer-use-btn { display: inline-flex; align-items: center; justify-content: center; padding: 0; }
+/* On: green icon, tint, ring and a corner dot, so it reads as "the AI can use this computer" at a glance */
+.computer-use-btn { position: relative; }
+.computer-use-btn.active,
+.computer-use-btn.active:hover {
+  color: var(--ok);
+  background: color-mix(in srgb, var(--ok) 14%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--ok) 55%, transparent);
+}
+.computer-use-btn.active::after {
+  content: '';
+  position: absolute;
+  top: -2px;
+  right: -2px;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--ok);
+  box-shadow: 0 0 0 2px var(--panel);
+}
+.computer-use-target { max-width: 140px; font-size: var(--fs-ui); }
+@media (max-width: 760px) { .computer-use-target { display: none; } }
+/* Rendered inside the composer toolbar, which is nowrap: let the dialog text wrap again */
+.computer-use-setup { width: min(560px, calc(100vw - 32px)); padding: 20px; white-space: normal; text-align: left; }
+.computer-use-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.computer-use-action { margin: 8px 0; padding: 10px 12px; border: 1px solid var(--border); border-radius: 8px; font-size: var(--fs-chat, 14px); }
+.computer-use-action-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.computer-use-images { margin-top: 8px; display: flex; gap: 8px; flex-wrap: wrap; }
+.computer-use-images .msg-img { width: min(420px, 100%); height: auto; max-height: 320px; }
+.computer-use-images .msg-img img { display: block; width: 100%; height: auto; max-height: 320px; object-fit: contain; }
+
+
+/* Host-owned MCP definitions. */
+.mcp-server-row { gap: 8px; padding: 8px 0; border-top: 1px solid var(--border); flex-wrap: wrap; }
+.mcp-editor { width: min(620px, calc(100vw - 32px)); padding: 20px; max-height: 90vh; overflow: auto; }
+.mcp-editor textarea { width: 100%; box-sizing: border-box; resize: vertical; font-family: var(--mono); }
+.mcp-tool-scopes { display: flex; gap: 12px; flex-wrap: wrap; }
+
+@media (max-width: 760px) {
+  .composer-tools:has(.computer-use-bar) .model-btn { max-width: 100px; min-width: 0; }
 }

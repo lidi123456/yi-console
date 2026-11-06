@@ -1,0 +1,10 @@
+{
+  "repository": "https://github.com/trycua/cua",
+  "version": "0.34.0",
+  "tag": "cua-driver-rs-v0.34.0",
+  "asset": "cua-driver-rs-0.34.0-windows-x86_64-binary.zip",
+  "archiveSha256": "bcc520e50861c7092cf775846fec76ae386d7dcd6b5b408608b0ea4423a8b888",
+  "binarySha256": "77f5cac754b42b6a8bae126414fc8f7487432ace93466967965188e24e9e53fb",
+  "license": "MIT",
+  "licenseSha256": "c0779290c1d4783169aa3dbfb55feb505e563ef8a004bbf55298ceffcfbda8d9"
+}

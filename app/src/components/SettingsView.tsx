@@ -1,3 +1,4 @@
+import { McpSettingsCard } from './McpSettingsCard';
 import { useEffect, useState } from 'react';
 import { getT, isEn } from '../i18n';
 import { Icon } from './Icon';
@@ -40,7 +41,8 @@ export function SettingsView({ hostId }: { hostId: string }) {
         Object.entries(s.tools).filter(([, v]) => v.command.trim() || v.extraArgs.length),
       );
       const snippets = s.snippets.filter((x) => x.name.trim() && x.text.trim()).map((x) => ({ name: x.name.trim(), text: x.text }));
-      await rpc(hostId, 'settings.set', { ...s, tools, snippets });
+      const saved = await rpc<DaemonSettings>(hostId, 'settings.set', { ...s, tools, snippets });
+      setS({ ...s, ...saved });
       invalidateSnippets(hostId);
       await redetectTools(hostId);
       invalidateStatusLine(hostId);
@@ -110,6 +112,7 @@ export function SettingsView({ hostId }: { hostId: string }) {
           </label>
         </div>
       </div>
+      <McpSettingsCard servers={s.mcpServers ?? []} onChange={(mcpServers) => setS({ ...s, mcpServers })} />
       <SnippetsCard list={s.snippets} onChange={(snippets) => setS({ ...s, snippets })} />
       <StatusLineCard v={s.statusLine} onChange={(statusLine) => setS({ ...s, statusLine })} />
       <div className="card">
