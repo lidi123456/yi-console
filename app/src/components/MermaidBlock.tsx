@@ -265,7 +265,14 @@ function DiagramViewer({ url, diagram, close }: { url: string; diagram: Diagram;
           zoom(e.deltaY < 0 ? 1.1 : 1 / 1.1);
         }}
         onDoubleClick={fit}
+        onDragStart={(e) => e.preventDefault()}
         onPointerDown={(e) => {
+          // Without this a mouse drag can select the diagram and turn into a
+          // native drag of the selection, which cancels the pointer stream.
+          if (e.pointerType === 'mouse') {
+            if (e.button !== 0) return;
+            e.preventDefault();
+          }
           e.currentTarget.setPointerCapture(e.pointerId);
           pointers.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
           gesture.current = measure();

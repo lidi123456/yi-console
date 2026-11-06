@@ -8849,6 +8849,8 @@ button.wp-commit-title .chev {
   align-items: center;
   justify-content: center;
   touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
   cursor: grab;
 }
 .diagram-viewport:active {
