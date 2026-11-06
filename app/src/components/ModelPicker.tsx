@@ -193,7 +193,7 @@ export function ModelPicker({ hostId, info }: { hostId: string; info: SessionInf
                   </button>
                 ))}
               </div>
-              {o.id === 'fast' && <div className="muted small" title={o.description}>{t('fastHint')}</div>}
+              {o.id === 'fast' && <div className="muted small effort-hint" title={o.description}>{t('fastHint')}</div>}
             </div>
           ))}
           {efforts.length > 0 && (

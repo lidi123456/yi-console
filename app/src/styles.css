@@ -2350,6 +2350,13 @@ textarea {
   flex-wrap: wrap;
 }
 
+/* The picker sits in the composer toolbar, which doesn't wrap */
+.effort-hint {
+  white-space: normal;
+  overflow-wrap: anywhere;
+  line-height: 1.4;
+}
+
 .menu .seg.effort-seg button {
   flex: 1;
   justify-content: center;

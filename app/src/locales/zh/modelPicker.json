@@ -13,5 +13,5 @@
   "fastMode": "Fast",
   "enabled": "开启",
   "disabled": "关闭",
-  "fastHint": "Fast 模式速度更快，费用可能增加；具体以当前模型计费为准。"
+  "fastHint": "开启后响应更快，费用可能更高。"
 }

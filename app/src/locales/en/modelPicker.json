@@ -13,5 +13,5 @@
   "fastMode": "Fast",
   "enabled": "On",
   "disabled": "Off",
-  "fastHint": "Fast mode increases speed and may cost more. Pricing depends on the current model."
+  "fastHint": "Faster replies; may cost more."
 }

@@ -869,7 +869,7 @@ export default interface Resources {
     "defaultModel": "默认模型",
     "disabled": "关闭",
     "enabled": "开启",
-    "fastHint": "Fast 模式速度更快，费用可能增加；具体以当前模型计费为准。",
+    "fastHint": "开启后响应更快，费用可能更高。",
     "fastMode": "Fast",
     "loading": "加载中…",
     "noModelsReportedYetTry": "工具还没报告可选模型，发一条消息后再试",
