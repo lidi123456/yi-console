@@ -82,6 +82,7 @@ export function ComputerUsePanel({
       <div className="computer-use-bar">
         <button
           className={`tool-chip computer-use-btn ${state?.enabled ? 'active' : ''}`}
+          aria-pressed={!!state?.enabled}
           disabled={!connected}
           aria-label={t('title')}
           title={state?.enabled ? (state.lastWindow?.title ? t('activeTitle', { title: state.lastWindow.title, status: statusLabel }) : statusLabel) : t('title')}
