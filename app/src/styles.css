@@ -5156,6 +5156,11 @@ body.resizing-y {
   box-shadow: var(--shadow);
 }
 
+/* Daemon upgrade waiting notice: one line, the message truncates before the button wraps */
+.upgrade-waiting { max-width: min(640px, calc(100vw - 32px)); white-space: nowrap; }
+.upgrade-waiting-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.upgrade-waiting .link-btn { flex: none; }
+
 /* App self-update (AppUpdate.tsx): corner notice reuses .upgrade-toast; above the daemon-upgrade notice if both show */
 .app-update {
   bottom: 60px;
