@@ -3,8 +3,9 @@
 // - app/src-tauri/tauri.conf.json: the app version the updater compares, and Android's versionName / versionCode
 // - Cargo.toml [workspace.package]: yi-agentd / client version (DAEMON_VERSION = <version>+<commit>)
 // - app/src-tauri/Cargo.toml, app/package.json: kept in step
+// - Cargo.lock, app/package-lock.json: the workspace's own entries, so `--locked` builds and `npm ci` agree
 // Usage: node scripts/set-version.mjs v1.2.3   (a leading "v" is optional); prints the bare version.
-// CI runs this on tag builds with the tag name; nothing is committed, the tag is the source of truth.
+// CI runs this on tag builds with the tag name. To raise the version in the repository, run it locally and commit.
 
 import { readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -40,11 +41,14 @@ function edit(rel, fn) {
 const firstVersionLine = (s) => s.replace(/^version = "[^"]*"$/m, `version = "${version}"`);
 edit('Cargo.toml', firstVersionLine);
 edit('app/src-tauri/Cargo.toml', firstVersionLine);
-for (const rel of ['app/src-tauri/tauri.conf.json', 'app/package.json']) {
-  edit(rel, (s) => {
-    const j = JSON.parse(s);
-    j.version = version;
-    return JSON.stringify(j, null, 2) + '\n';
-  });
-}
+// Only the version lines change, so a committed bump leaves the files' formatting alone
+const topVersion = (s) => s.replace(/^(  "version": )"[^"]*"/m, `$1"${version}"`);
+edit('app/src-tauri/tauri.conf.json', topVersion);
+edit('app/package.json', topVersion);
+// The root package and its "" entry; dependencies keep their own versions
+edit('app/package-lock.json', (s) => topVersion(s).replace(/("": \{\n\s+"name": "[^"]*",\n\s+"version": )"[^"]*"/, `$1"${version}"`));
+// Workspace members (they use version.workspace); third-party crates keep their versions
+const members = /^members = \[(.*)\]$/m.exec(readFileSync(join(root, 'Cargo.toml'), 'utf8'))?.[1] ?? '';
+const crates = [...members.matchAll(/"([^"]+)"/g)].map(([, dir]) => /^name = "([^"]+)"$/m.exec(readFileSync(join(root, dir, 'Cargo.toml'), 'utf8'))?.[1]);
+edit('Cargo.lock', (s) => crates.reduce((acc, name) => acc.replace(new RegExp(`(^name = "${name}"\\nversion = )"[^"]*"`, 'm'), `$1"${version}"`), s));
 console.log(version);
