@@ -2,7 +2,7 @@ import { useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore } fr
 import { useBack } from '../back';
 import { readClipboard, writeClipboard } from '../clipboard';
 import { getT } from '../i18n';
-import { Icon } from './Icon';
+import { Icon, ToolBadge } from './Icon';
 
 const t = getT('overlay');
 
@@ -35,6 +35,8 @@ export interface MenuItem {
   disabled?: boolean;
   /** Current item (highlighted) */
   active?: boolean;
+  /** Show this tool's badge instead of `icon` */
+  tool?: string;
   run: () => void;
 }
 
@@ -201,7 +203,7 @@ function ContextMenu({ m }: { m: MenuReq }) {
                 it.run();
               }}
             >
-              <span className="ctx-icon">{it.icon && <Icon name={it.icon} size={14} />}</span>
+              <span className="ctx-icon">{it.tool ? <ToolBadge tool={it.tool} size={14} /> : it.icon && <Icon name={it.icon} size={14} />}</span>
               <span className="grow">{it.label}</span>
               {it.hint && <span className="ctx-hint">{it.hint}</span>}
             </button>

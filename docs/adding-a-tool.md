@@ -81,7 +81,7 @@ English: [Adding a new AI coding tool](adding-a-tool.en.md)
 
 ### 2.4 审批和提问
 
-- 审批模式统一为 `default / acceptEdits / auto / plan / bypass`，只开放工具真正支持的。**两处要同步**：`hub.rs` 的 `permission_modes(tool, mode)` 和 `NewSession.tsx` 的 `permModes`，两种模式分别写。
+- 审批模式统一为 `default / acceptEdits / auto / plan / bypass`，只开放工具真正支持的。**两处要同步**：`hub.rs` 的 `permission_modes(tool, mode)` 和 `app/src/perm.ts` 的 `permModes`，两种模式分别写。
 - 审批请求转成 `PermissionRequest`，选项保留工具给的 id。自动放行时，优先选「只允许这一次」，不要选会改变工具自身模式的选项（Qoder 的「本会话都允许」会把它自己切到 acceptEdits）。
 - 工具向用户提问时，走同一条路：`PermissionRequest` 带 `questions`，选项固定为 `answer` / `skip`。参考 Claude 的 AskUserQuestion 和 Cursor 的 `cursor/ask_question`。工具没有提问机制、只在正文里问的（Kiro），可以在前端识别后给出可点选的卡片（`ChatView.tsx`）。
 

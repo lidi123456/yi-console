@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { getT, useLang } from '../i18n';
-import { getState, goBack, goForward, navigate, orderedSessions, setState, toggleSidebar, useStore } from '../store';
+import { getState, goBack, goForward, navigate, orderedSessions, openNewSession, setState, toggleSidebar, useStore } from '../store';
 import { renameSession } from './SessionActions';
 import { TOOL_LABEL } from '../types';
 import { basename, fuzzyScore, timeAgo } from '../util';
@@ -46,7 +46,7 @@ function newSession() {
     s.hosts.find((h) => h.status.status === 'connected')?.config.id;
   if (!hostId) return;
   const cur = v.kind === 'session' ? s.sessions[v.hostId]?.find((x) => x.id === v.sessionId) : undefined;
-  setState({ newSession: { hostId, cwd: cur?.cwd }, palette: false });
+  openNewSession({ hostId, cwd: cur?.cwd });
 }
 
 function stepSession(d: 1 | -1) {

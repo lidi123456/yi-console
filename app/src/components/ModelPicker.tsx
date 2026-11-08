@@ -4,7 +4,7 @@ import { useBack } from '../back';
 import { getT, isEn } from '../i18n';
 import { errorToast } from '../store';
 import { rpc } from '../transport';
-import type { ModelConfigOption, ModelOption, SessionInfo } from '../types';
+import type { ModelConfigOption, ModelOption, SessionInfo, ToolKind } from '../types';
 import { Icon } from './Icon';
 import { isMobile } from '../util';
 
@@ -116,11 +116,81 @@ function ModelSubmenu({ anchor, menuRef, label, children }: {
   );
 }
 
+/** The session's model button: reads the list from the session, changes go to the running tool */
 export function ModelPicker({ hostId, info }: { hostId: string; info: SessionInfo }) {
+  const [models, setModels] = useState<ModelOption[] | null>(null);
+  const load = useCallback(
+    () =>
+      rpc<{ current: string | null; models: ModelOption[] }>(hostId, 'session.models', { sessionId: info.id })
+        .then((r) => setModels(r.models))
+        .catch(() => setModels([])),
+    [hostId, info.id],
+  );
+  useEffect(() => {
+    setModels(null);
+    load();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [hostId, info.id, info.model]);
+  return (
+    <ModelMenu
+      tool={info.tool}
+      model={info.model}
+      effort={info.effort ?? ''}
+      models={models}
+      onOpen={load}
+      openEvent
+      resetKey={`${hostId}/${info.id}/${info.model ?? ''}`}
+      configOptions={info.modelConfigOptions}
+      configPending={info.tool === 'cursor' && !!info.modelConfigPending}
+      onModel={(model) => rpc(hostId, 'session.setModel', { sessionId: info.id, model })}
+      onEffort={(effort) => rpc(hostId, 'session.setEffort', { sessionId: info.id, effort })}
+      onConfig={(configId, value) => rpc(hostId, 'session.setModelConfig', { sessionId: info.id, configId, value })}
+    />
+  );
+}
+
+/**
+ * Model and thinking level button with its menu (a sheet on phones). Driven by props so the session input box and
+ * the new session page share it; the on* callbacks may reject, which is shown as an error toast
+ */
+export function ModelMenu({
+  tool,
+  model: cur,
+  effort: effortValue,
+  models,
+  onOpen,
+  openEvent,
+  resetKey,
+  configOptions,
+  configPending = false,
+  onModel,
+  onEffort,
+  onConfig,
+  onCustom,
+}: {
+  tool: ToolKind;
+  model: string | null | undefined;
+  /** '' = the tool's default */
+  effort: string;
+  /** null while loading */
+  models: ModelOption[] | null;
+  /** Called when the menu opens (reload the list) */
+  onOpen?: () => void;
+  /** Also open on the OPEN_MODEL event (/model in the session input box) */
+  openEvent?: boolean;
+  /** Closes the submenus when this changes */
+  resetKey?: string;
+  configOptions?: ModelConfigOption[];
+  configPending?: boolean;
+  onModel: (id: string) => unknown;
+  onEffort: (effort: string) => unknown;
+  onConfig?: (configId: string, value: string) => unknown;
+  /** Adds an "Other (type a model)" entry to the model list */
+  onCustom?: () => void;
+}) {
   const [open, setOpen] = useState(false);
   const [mobile, setMobile] = useState(isMobile);
   const [section, setSection] = useState<PickerSection | null>(null);
-  const [models, setModels] = useState<ModelOption[] | null>(null);
   const [q, setQ] = useState('');
   const [changing, setChanging] = useState<string | null>(null);
   const wrapRef = useRef<HTMLDivElement>(null);
@@ -129,8 +199,6 @@ export function ModelPicker({ hostId, info }: { hostId: string; info: SessionInf
   const submenuRef = useRef<HTMLDivElement>(null);
   const anchorRef = useRef<HTMLButtonElement | null>(null);
   const sheet = open && mobile;
-  // Only a model whose parameters aren't known yet; choosing never waits for Cursor
-  const configPending = info.tool === 'cursor' && !!info.modelConfigPending;
   const close = useCallback((focus = true) => {
     setOpen(false);
     setSection(null);
@@ -170,73 +238,50 @@ export function ModelPicker({ hostId, info }: { hostId: string; info: SessionInf
     document.addEventListener('keydown', onEscape);
     return () => document.removeEventListener('keydown', onEscape);
   }, [open, section, back, close]);
-  const load = () =>
-    rpc<{ current: string | null; models: ModelOption[] }>(hostId, 'session.models', { sessionId: info.id })
-      .then((r) => setModels(r.models))
-      .catch(() => setModels([]));
   useEffect(() => {
-    setModels(null);
     setSection(null);
-    load();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [hostId, info.id, info.model]);
+  }, [resetKey]);
   useEffect(() => {
+    if (!openEvent) return;
     const show = () => {
-      load();
+      onOpen?.();
       setSection(null);
       setOpen(true);
     };
     window.addEventListener(OPEN_MODEL, show);
     return () => window.removeEventListener(OPEN_MODEL, show);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [hostId, info.id]);
-  const pick = async (id: string) => {
+  }, [openEvent, onOpen]);
+  const run = async (key: string, fn: () => unknown, after?: () => void) => {
+    setChanging(key);
+    try {
+      await fn();
+      after?.();
+    } catch (error) {
+      errorToast(error);
+    } finally {
+      setChanging(null);
+    }
+  };
+  const pick = (id: string) => {
     close();
-    if (id === info.model) return;
-    setChanging('model');
-    try {
-      await rpc(hostId, 'session.setModel', { sessionId: info.id, model: id });
-    } catch (error) {
-      errorToast(error);
-    } finally {
-      setChanging(null);
-    }
+    if (id === cur) return;
+    void run('model', () => onModel(id));
   };
-  const pickEffort = async (effort: string) => {
-    setChanging('effort');
-    try {
-      await rpc(hostId, 'session.setEffort', { sessionId: info.id, effort });
-      back();
-    } catch (error) {
-      errorToast(error);
-    } finally {
-      setChanging(null);
-    }
-  };
-  const pickConfig = async (configId: string, value: string) => {
-    setChanging(configId);
-    try {
-      await rpc(hostId, 'session.setModelConfig', { sessionId: info.id, configId, value });
-      if (configId !== 'fast') back();
-    } catch (error) {
-      errorToast(error);
-    } finally {
-      setChanging(null);
-    }
-  };
-  const cursorOptions = info.tool === 'cursor' ? (info.modelConfigOptions ?? []).filter((o) => o.options.length > 1) : [];
+  const pickEffort = (effort: string) => run('effort', () => onEffort(effort), back);
+  const pickConfig = (configId: string, value: string) =>
+    run(configId, () => onConfig?.(configId, value), configId !== 'fast' ? back : undefined);
+  const cursorOptions = tool === 'cursor' ? (configOptions ?? []).filter((o) => o.options.length > 1) : [];
   const fastOption = cursorOptions.find((o) => o.id === 'fast' && ['true', 'false'].every((v) => o.options.some((o) => o.value === v)));
   const reasoningOption = cursorOptions.find(isReasoningOption);
   const contextOption = cursorOptions.find((o) => o.id === 'context');
   const fast = fastOption?.currentValue === 'true';
-  const cur = info.model;
   const activeId = cur ? findModel(cur, models ?? [])?.id : undefined;
   const curModel = currentModel(cur, models ?? []);
   const efforts = curModel?.efforts ?? [];
-  const effort = reasoningOption?.currentValue ?? info.effort ?? '';
+  const effort = reasoningOption?.currentValue ?? effortValue;
   const hasEffort = !!reasoningOption || efforts.length > 0;
   // Cursor always uses the settings menu, also before a model or its parameters are known, so it never falls back to the bare list
-  const hasControls = info.tool === 'cursor' || configPending || !!fastOption || !!contextOption || hasEffort;
+  const hasControls = tool === 'cursor' || configPending || !!fastOption || !!contextOption || hasEffort;
   const list = (models ?? []).filter((m) => !q.trim() || `${m.name} ${m.id}`.toLowerCase().includes(q.trim().toLowerCase()));
   const sectionLabel = section === 'effort' ? t('reasoningEffort') : section === 'context' ? t('contextWindow') : t('chooseModel');
   const contextLabel = contextOption?.options.find((o) => o.value === contextOption.currentValue)?.name || contextOption?.currentValue || t('default');
@@ -279,6 +324,11 @@ export function ModelPicker({ hostId, info }: { hostId: string; info: SessionInf
             {m.description && <span className="muted small">{m.description}</span>}
           </button>
         ))}
+        {onCustom && (
+          <button onClick={() => { close(false); onCustom(); }}>
+            <span className="model-name">{t('otherModel')}</span>
+          </button>
+        )}
       </div>
     </>
   );
@@ -350,7 +400,7 @@ export function ModelPicker({ hostId, info }: { hostId: string; info: SessionInf
   return (
     <div className="menu-wrap" ref={wrapRef} onKeyDown={onKeyDown}>
       <button ref={buttonRef} className="model-btn" title={t('switchModel')} aria-haspopup="dialog" aria-expanded={open}
-        onClick={() => { if (open) close(); else { load(); setOpen(true); } }}>
+        onClick={() => { if (open) close(); else { onOpen?.(); setOpen(true); } }}>
         <span className="truncate">{modelLabel(cur, models ?? [])}</span>
         {effort && <span className="model-effort">{effortLabel(effort)}</span>}
         {fast && <span className="model-effort">{t('fastMode')}</span>}

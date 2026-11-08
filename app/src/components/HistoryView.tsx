@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { useBack } from '../back';
 import { getT, isEn } from '../i18n';
-import { errorToast, hostStatus, setState } from '../store';
+import { errorToast, hostStatus, openNewSession } from '../store';
 import { rpc } from '../transport';
 import { TOOL_LABEL, type HistoryEntry, type HubEvent, type ToolKind } from '../types';
 import { shortPath, timeAgo } from '../util';
@@ -97,7 +97,7 @@ export function HistoryView({ hostId, cwd }: { hostId: string; cwd?: string }) {
   }, [inDir]);
 
   const resume = (h: HistoryEntry) =>
-    setState({ newSession: { hostId, tool: h.tool, cwd: h.cwd || '~', resumeId: h.id, title: h.title } });
+    openNewSession({ hostId, tool: h.tool, cwd: h.cwd || '~', resumeId: h.id, title: h.title });
 
   return (
     <div className={`page split ${sel ? 'has-sel' : ''}`}>

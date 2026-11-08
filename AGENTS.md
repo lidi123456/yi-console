@@ -29,7 +29,7 @@ See [README.md](README.md) for an overview and usage. This file has the project 
 
 Protocol and backend
 - Event fields are camelCase (`EventBody` uses `rename_all_fields = "camelCase"`). `assistant_delta` / `thinking_delta` are transient (seq 0, not persisted); the final `assistant_message` / `thinking` is authoritative.
-- Permission modes per tool: `permission_modes` in `hub.rs` and `permModes` in `NewSession.tsx` are synced by hand. Unknown modes reported by a tool are shown by raw name, never dropped.
+- Permission modes per tool: `permission_modes` in `hub.rs` and `permModes` in `app/src/perm.ts` are synced by hand. Unknown modes reported by a tool are shown by raw name, never dropped.
 - Wherever a process would start, check `ToolKind::has_process()` (Files sessions have none).
 - Every git command runs with `GIT_OPTIONAL_LOCKS=0`; git paths are repo-relative, absolute paths and `..` are rejected.
 - yi-agentd never listens on TCP; remote access is only via the SSH bridge or the relay. Local-only methods (`fs.open`, `proxy.setHosts`) are gated by peer in `serve_conn`.

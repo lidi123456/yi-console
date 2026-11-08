@@ -4,7 +4,7 @@ import { HistoryView } from './components/HistoryView';
 import { Home } from './components/Home';
 import { HostsView } from './components/HostsView';
 import { Icon } from './components/Icon';
-import { NewSessionDialog } from './components/NewSession';
+import { NewSessionPage } from './components/NewSession';
 import { SessionView } from './components/SessionView';
 import { SettingsView } from './components/SettingsView';
 import { Sidebar } from './components/Sidebar';
@@ -67,6 +67,11 @@ function Main() {
       return <SettingsView key={view.hostId} hostId={view.hostId} />;
     case 'prefs':
       return <PrefsView />;
+    case 'new': {
+      // Opened again with other parameters (another directory, a hand-off): start over
+      const { kind: _k, ...p } = view;
+      return <NewSessionPage key={JSON.stringify(p)} params={p} />;
+    }
     case 'search':
       return <SearchView key={view.q ?? ''} initial={view.q} />;
     default:
@@ -104,7 +109,6 @@ export function App() {
         </div>
       </main>
       </div>
-      <NewSessionDialog />
       <Palette />
       <Toasts />
       <Lightbox />

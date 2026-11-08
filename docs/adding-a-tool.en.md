@@ -81,7 +81,7 @@ An adapter is a tokio task that owns the tool's child process: it receives `Adap
 
 ### 2.4 Approvals and questions
 
-- Permission modes are normalized to `default / acceptEdits / auto / plan / bypass`; only expose the ones the tool really supports. **Two places must stay in sync**: `permission_modes(tool, mode)` in `hub.rs` and `permModes` in `NewSession.tsx`, each written for both modes.
+- Permission modes are normalized to `default / acceptEdits / auto / plan / bypass`; only expose the ones the tool really supports. **Two places must stay in sync**: `permission_modes(tool, mode)` in `hub.rs` and `permModes` in `app/src/perm.ts`, each written for both modes.
 - Approval requests become `PermissionRequest`, keeping the option ids the tool provides. When auto-approving, prefer "allow once" and avoid options that change the tool's own mode (Qoder's "allow for this session" switches it to acceptEdits).
 - Questions from the tool to the user go the same way: `PermissionRequest` carries `questions`, with options fixed to `answer` / `skip`. See Claude's AskUserQuestion and Cursor's `cursor/ask_question`. Tools without a question mechanism that just ask in their reply text (Kiro) can be recognized in the frontend and given a clickable card (`ChatView.tsx`).
 

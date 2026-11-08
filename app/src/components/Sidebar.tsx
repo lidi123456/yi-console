@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { getT, isEn } from '../i18n';
 import { hubCall, rpc } from '../transport';
-import { errorToast, navigate, setState, toast, useStore, type HostEntry } from '../store';
+import { errorToast, navigate, openNewSession, setState, toast, useStore, type HostEntry } from '../store';
 import type { SessionInfo } from '../types';
 import { basename, clock, fuzzyScore, lsGet, lsSet } from '../util';
 import { openMenu, type MenuItem } from './Overlay';
@@ -185,7 +185,7 @@ function useSlowClock() {
 function dirMenu(hostId: string, cwd: string, connected: boolean): (MenuItem | '-')[] {
   return [
     { label: tx('searchHistoryInDirectory'), icon: 'history', disabled: !connected, run: () => navigate({ kind: 'history', hostId, cwd }) },
-    { label: tx('newSessionInDirectory'), icon: 'plus', disabled: !connected, run: () => setState({ newSession: { hostId, cwd } }) },
+    { label: tx('newSessionInDirectory'), icon: 'plus', disabled: !connected, run: () => openNewSession({ hostId, cwd }) },
     { label: tx('browseDirectory'), icon: 'folder', disabled: !connected, run: () => navigate({ kind: 'files', hostId, path: cwd }) },
     { label: tx('openTerminalInDirectory'), icon: 'terminal', disabled: !connected, run: () => openTerminal(hostId, cwd) },
     { label: tx('copyPath'), icon: 'copy', run: () => writeClipboard(cwd).then(() => toast(tx('pathCopied'))) },
@@ -205,7 +205,7 @@ function hostMenu(h: HostEntry, connect: () => void): (MenuItem | '-')[] {
     ];
   }
   return [
-    { label: tx('newSession2'), icon: 'plus', hint: `${MOD}+N`, run: () => setState({ newSession: { hostId: id } }) },
+    { label: tx('newSession2'), icon: 'plus', hint: `${MOD}+N`, run: () => openNewSession({ hostId: id }) },
     { label: tx('sessionHistory'), icon: 'history', run: () => navigate({ kind: 'history', hostId: id }) },
     { label: tx('browseFiles'), icon: 'folder', run: () => navigate({ kind: 'files', hostId: id }) },
     { label: tx('openTerminal'), icon: 'terminal', run: () => openTerminal(id) },
@@ -377,7 +377,7 @@ function HostBlock({ h, filter }: { h: HostEntry; filter: string }) {
           <Icon name={layout === 'time' ? 'folder' : 'clock'} size={14} />
         </button>
         {connected ? (
-          <button className="host-act" title={tx('newSession2')} onClick={() => setState({ newSession: { hostId: id } })}>
+          <button className="host-act" title={tx('newSession2')} onClick={() => openNewSession({ hostId: id })}>
             <Icon name="plus" size={15} />
           </button>
         ) : (
@@ -431,7 +431,7 @@ function HostBlock({ h, filter }: { h: HostEntry; filter: string }) {
                     <button
                       className={`project-add ${connected ? '' : 'hidden'}`}
                       title={tx('newSessionIn', { v: basename(cwd) })}
-                      onClick={() => setState({ newSession: { hostId: id, cwd } })}
+                      onClick={() => openNewSession({ hostId: id, cwd })}
                     >
                       <Icon name="plus" size={13} />
                     </button>
@@ -527,10 +527,10 @@ export function Sidebar() {
         />
         <div className="side-top">
           <button
-            className="nav-item"
+            className={`nav-item ${view.kind === 'new' ? 'active' : ''}`}
             disabled={!firstConnected}
             title={firstConnected ? '' : tx('connectToAHostFirst')}
-            onClick={() => firstConnected && setState({ newSession: { hostId: firstConnected } })}
+            onClick={() => firstConnected && openNewSession({ hostId: firstConnected })}
           >
             <Icon name="edit" size={15} /> {tx('newSession3')}
           </button>

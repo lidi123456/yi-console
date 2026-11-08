@@ -4,11 +4,54 @@ use super::{AdapterCmd, StartSpec};
 use crate::hub::Emitter;
 use yi_proto::{SessionStatus, ToolKind};
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+use std::collections::VecDeque;
 use std::io::{Read, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
+
+/// Messages (`AdapterCmd::Send`) that arrive while the program is still starting are held until its output has been
+/// quiet this long: a TUI typed into before it draws its input box drops or garbles the keys (the first message of a
+/// new terminal-mode session, or a message that restarts an exited one)
+const READY_QUIET: Duration = Duration::from_millis(1500);
+/// Send anyway after this long, for programs that keep redrawing (spinners, clocks)
+const READY_MAX: Duration = Duration::from_secs(20);
+/// Pause between a bracketed paste and the Enter that submits it, so TUIs that time pastes don't take Enter as part of it
+const PASTE_ENTER_DELAY: Duration = Duration::from_millis(150);
+
+/// Whether the program is ready to be typed into, given the time since launch and since its last output
+fn input_ready(since_start: Duration, since_output: Option<Duration>) -> bool {
+    since_start >= READY_MAX || since_output.is_some_and(|q| q >= READY_QUIET && since_start >= READY_QUIET)
+}
+
+/// The bytes typing a message: as a bracketed paste when the program turned it on (multi-line text stays one message),
+/// otherwise the raw text. Enter is sent separately
+fn message_bytes(text: &str, bracketed: bool) -> Vec<u8> {
+    if !bracketed {
+        return text.as_bytes().to_vec();
+    }
+    // A paste-end marker inside the text would end the paste early
+    let clean = text.replace("\x1b[201~", "");
+    let mut out = b"\x1b[200~".to_vec();
+    out.extend_from_slice(clean.as_bytes());
+    out.extend_from_slice(b"\x1b[201~");
+    out
+}
+
+/// Tracks the latest bracketed-paste mode switch in the output (`ESC[?2004h` / `ESC[?2004l`); a switch split across
+/// two reads is missed, which only costs the paste wrapping
+fn scan_bracketed(data: &[u8], cur: bool) -> bool {
+    const ON: &[u8] = b"\x1b[?2004h";
+    const OFF: &[u8] = b"\x1b[?2004l";
+    let last = |pat: &[u8]| data.windows(pat.len()).rposition(|w| w == pat);
+    match (last(ON), last(OFF)) {
+        (Some(a), Some(b)) => a > b,
+        (Some(_), None) => true,
+        (None, Some(_)) => false,
+        (None, None) => cur,
+    }
+}
 
 /// Launch arguments for each tool's interactive mode (including resume)
 pub fn interactive_args(spec: &StartSpec) -> Vec<String> {
@@ -208,7 +251,12 @@ pub fn start(spec: StartSpec, em: Emitter, mut rx: mpsc::UnboundedReceiver<Adapt
         });
     }
 
-    // Reading output: blocking thread
+    // Reading output: blocking thread. It also records when output last came (ms since launch, 0 = none yet) and
+    // whether the program has bracketed paste on, for sending messages
+    let started = Instant::now();
+    let last_out = Arc::new(AtomicU64::new(0));
+    let bracketed = Arc::new(AtomicBool::new(false));
+    let (last_out_r, bracketed_r) = (last_out.clone(), bracketed.clone());
     let em_r = em.clone();
     let (reply_tx, mut reply_rx) = mpsc::unbounded_channel::<Vec<u8>>();
     std::thread::spawn(move || {
@@ -221,6 +269,9 @@ pub fn start(spec: StartSpec, em: Emitter, mut rx: mpsc::UnboundedReceiver<Adapt
             match reader.read(&mut buf) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
+                    last_out_r.store((started.elapsed().as_millis() as u64).max(1), Ordering::Relaxed);
+                    let b = bracketed_r.load(Ordering::Relaxed);
+                    bracketed_r.store(scan_bracketed(&buf[..n], b), Ordering::Relaxed);
                     if startup_dsr {
                         if let Some(rest) = strip_first_dsr(&buf[..n]) {
                             startup_dsr = false;
@@ -255,9 +306,31 @@ pub fn start(spec: StartSpec, em: Emitter, mut rx: mpsc::UnboundedReceiver<Adapt
     });
 
     tokio::spawn(async move {
+        // Messages waiting for the program to be ready (see READY_QUIET); once ready it stays ready
+        let mut pending: VecDeque<String> = VecDeque::new();
+        let mut ready = false;
+        let mut tick = tokio::time::interval(Duration::from_millis(250));
         loop {
+            if !ready {
+                let out = last_out.load(Ordering::Relaxed);
+                let since = started.elapsed();
+                ready = input_ready(since, (out > 0).then(|| since.saturating_sub(Duration::from_millis(out))));
+            }
+            if ready {
+                while let Some(text) = pending.pop_front() {
+                    let paste = bracketed.load(Ordering::Relaxed);
+                    let _ = writer.write_all(&message_bytes(&text, paste));
+                    let _ = writer.flush();
+                    if paste {
+                        tokio::time::sleep(PASTE_ENTER_DELAY).await;
+                    }
+                    let _ = writer.write_all(b"\r");
+                    let _ = writer.flush();
+                }
+            }
             tokio::select! {
                 _ = &mut done_rx => break,
+                _ = tick.tick(), if !ready && !pending.is_empty() => {}
                 Some(r) = reply_rx.recv() => {
                     let _ = writer.write_all(&r);
                     let _ = writer.flush();
@@ -270,11 +343,8 @@ pub fn start(spec: StartSpec, em: Emitter, mut rx: mpsc::UnboundedReceiver<Adapt
                     Some(AdapterCmd::PtyResize { cols, rows }) => {
                         let _ = master.resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 });
                     }
-                    Some(AdapterCmd::Send(p)) => {
-                        let _ = writer.write_all(p.text.as_bytes());
-                        let _ = writer.write_all(b"\r");
-                        let _ = writer.flush();
-                    }
+                    // Typed at the top of the loop, once the program is ready
+                    Some(AdapterCmd::Send(p)) => pending.push_back(p.text),
                     Some(AdapterCmd::Interrupt) => {
                         let _ = writer.write_all(&[3]);
                         let _ = writer.flush();
@@ -309,7 +379,31 @@ fn strip_first_dsr(data: &[u8]) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
-    use super::strip_first_dsr;
+    use super::{input_ready, message_bytes, scan_bracketed, strip_first_dsr};
+    use std::time::Duration;
+
+    #[test]
+    fn ready_after_quiet_output_or_timeout() {
+        let s = Duration::from_secs;
+        let ms = Duration::from_millis;
+        assert!(!input_ready(ms(500), None));
+        assert!(!input_ready(s(5), None), "no output yet: keep waiting");
+        assert!(!input_ready(s(5), Some(ms(300))), "still drawing");
+        assert!(input_ready(s(5), Some(s(2))));
+        assert!(!input_ready(ms(1000), Some(ms(1000))), "too soon after launch");
+        assert!(input_ready(s(21), Some(ms(10))), "keeps redrawing: send anyway");
+    }
+
+    #[test]
+    fn bracketed_paste() {
+        assert_eq!(message_bytes("a\nb", false), b"a\nb");
+        assert_eq!(message_bytes("a\nb", true), b"\x1b[200~a\nb\x1b[201~");
+        assert_eq!(message_bytes("x\x1b[201~y", true), b"\x1b[200~xy\x1b[201~");
+        assert!(scan_bracketed(b"..\x1b[?2004h..", false));
+        assert!(!scan_bracketed(b"\x1b[?2004h\x1b[?2004l", true));
+        assert!(scan_bracketed(b"\x1b[?2004l\x1b[?2004h", false));
+        assert!(scan_bracketed(b"plain", true));
+    }
 
     #[test]
     fn strips_only_first_dsr() {

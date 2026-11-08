@@ -261,6 +261,9 @@ pub struct CreateParams {
     pub command: Option<String>,
     #[serde(default)]
     pub prompt: Option<String>,
+    /// Images sent with the first message (chat mode only)
+    #[serde(default)]
+    pub images: Vec<IncomingImage>,
     #[serde(default)]
     pub cols: Option<u16>,
     #[serde(default)]
@@ -536,8 +539,11 @@ impl Hub {
             let tool = frt.info.lock().unwrap().tool;
             self.emit(&info.id, 0, EventBody::Handoff { session_id: fid.clone(), tool, to: false });
         }
-        if let Some(prompt) = p.prompt.filter(|s| !s.trim().is_empty()) {
-            self.send(&info.id, &prompt, vec![], false)?;
+        let images = if mode == SessionMode::Structured { p.images } else { vec![] };
+        match p.prompt.filter(|s| !s.trim().is_empty()) {
+            Some(prompt) => self.send(&info.id, &prompt, images, false)?,
+            None if !images.is_empty() => self.send(&info.id, "", images, false)?,
+            None => {}
         }
         if let Some((fid, frt)) = from {
             self.hand_over(&fid, &frt, &info);
@@ -756,9 +762,8 @@ impl Hub {
             }
         };
         if info.mode == SessionMode::Terminal {
-            let mut data = text.as_bytes().to_vec();
-            data.push(b'\r');
-            tx.send(AdapterCmd::PtyInput(data))
+            // Typed into the terminal by the pty adapter, held until the program has finished starting
+            tx.send(AdapterCmd::Send(Prompt { text: text.to_string(), images: vec![] }))
                 .map_err(|_| anyhow!("会话已结束"))?;
             return Ok(());
         }

@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { useBack } from '../back';
 import { getT } from '../i18n';
-import { errorToast, navigate, setState, useStore } from '../store';
+import { errorToast, navigate, openNewSession, useStore } from '../store';
 import { rpc } from '../transport';
 import type { DirEntry } from '../types';
 import { fmtSize, timeAgo } from '../util';
@@ -61,7 +61,7 @@ export function FilesView({ hostId, path }: { hostId: string; path?: string }) {
           <button
             className="btn small"
             disabled={!list}
-            onClick={() => list && setState({ newSession: { hostId, cwd: list.path } })}
+            onClick={() => list && openNewSession({ hostId, cwd: list.path })}
           >
             <Icon name="plus" size={14} /> {t('newSessionHere')}
           </button>

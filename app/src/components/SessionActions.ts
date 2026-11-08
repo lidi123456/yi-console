@@ -1,5 +1,5 @@
 import { getT, isEn } from '../i18n';
-import { errorToast, getState, loadSession, navigate, setState, skey, toast } from '../store';
+import { errorToast, getState, loadSession, navigate, openNewSession, skey, toast } from '../store';
 import { rpc } from '../transport';
 import { TOOL_LABEL, type HubEvent, type SessionInfo } from '../types';
 import { downloadText, isMobile, lsSet, safeFileName, sessionMarkdown, toB64 } from '../util';
@@ -98,12 +98,10 @@ export async function handoffSession(hostId: string, info: SessionInfo, opts: { 
     const avoid = opts.limit
       ? [...new Set((getState().sessions[hostId] ?? []).filter((s) => s.autoResume).map((s) => s.tool))]
       : undefined;
-    setState({
-      newSession: {
-        hostId,
-        cwd: info.cwd,
-        handoff: { from: info.tool, prompt: handoffPrompt(info, path, exported), fromId: info.id, perm: info.permissionMode, avoid },
-      },
+    openNewSession({
+      hostId,
+      cwd: info.cwd,
+      handoff: { from: info.tool, prompt: handoffPrompt(info, path, exported), fromId: info.id, perm: info.permissionMode, avoid },
     });
   } catch (e) {
     errorToast(e);

@@ -1,7 +1,7 @@
 import { type ReactNode, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { useBack } from '../back';
 import { getT, isEn, useLang } from '../i18n';
-import { errorToast, hostSnippets, navigate, setState, toast, useStore } from '../store';
+import { errorToast, hostSnippets, navigate, openNewSession, toast, useStore } from '../store';
 import { clearSession, showChanges } from './SessionActions';
 import { isTauri, rpc } from '../transport';
 import type { SessionInfo, SlashCommand, Snippet } from '../types';
@@ -12,7 +12,8 @@ import { imageMenu } from './ImageMenu';
 import { Icon } from './Icon';
 import { openMenu } from './Overlay';
 import { copiedRef, DRAG_REF, INSERT_COMPOSER, toB64 } from './FilePanel';
-import { getPermModesList, permModes } from './NewSession';
+import { permLabel, permModes } from '../perm';
+import { nextPerm, PermPicker } from './PermPicker';
 import { ModelPicker, OPEN_MODEL } from './ModelPicker';
 import { QueueList } from './QueueList';
 
@@ -33,7 +34,7 @@ function cmdScore(label: string, desc: string, q: string) {
 const IMAGE_MAX = 5 * 1024 * 1024;
 export const IMAGE_TYPES = ['image/png', 'image/jpeg', 'image/gif', 'image/webp'];
 
-interface Attached {
+export interface Attached {
   mimeType: string;
   data: string;
   url: string;
@@ -41,12 +42,41 @@ interface Attached {
 }
 
 /** Size limit for pasted / dropped regular files (same as yi-agentd's fs.upload) */
-const FILE_MAX = 50 * 1024 * 1024;
+export const FILE_MAX = 50 * 1024 * 1024;
 /** Upload item counter (React key) */
 let uploadSeq = 0;
 /** Chunk size for chunked uploads: allows cancelling between chunks and showing progress */
 const CHUNK = 1024 * 1024;
 const CANCELLED = new Error('cancelled');
+
+/**
+ * Upload a file to the session's upload directory on the host in chunks and return its path there; null if
+ * `cancelled()` turned true between chunks. On cancel or error, whatever was already uploaded is deleted
+ */
+export async function uploadChunked(
+  hostId: string,
+  sessionId: string,
+  f: File,
+  onProgress: (sent: number) => void,
+  cancelled: () => boolean = () => false,
+): Promise<string | null> {
+  let path = '';
+  try {
+    for (let off = 0; off === 0 || off < f.size; off += CHUNK) {
+      if (cancelled()) throw CANCELLED;
+      const data = toB64(await f.slice(off, off + CHUNK).arrayBuffer());
+      if (!path) path = (await rpc<{ path: string }>(hostId, 'session.attachFile', { sessionId, name: f.name, data })).path;
+      else await rpc(hostId, 'session.attachAppend', { sessionId, path, data });
+      onProgress(Math.min(f.size, off + CHUNK));
+    }
+    if (cancelled()) throw CANCELLED;
+    return path;
+  } catch (e) {
+    if (path) rpc(hostId, 'fs.delete', { path }).catch(() => {});
+    if (e === CANCELLED) return null;
+    throw e;
+  }
+}
 
 interface Upload {
   id: number;
@@ -56,14 +86,14 @@ interface Upload {
 }
 
 /** @-reference: quote paths that contain spaces */
-const refOf = (path: string) => (/\s/.test(path) ? `@"${path}" ` : `@${path} `);
+export const refOf = (path: string) => (/\s/.test(path) ? `@"${path}" ` : `@${path} `);
 const baseName = (p: string) => p.split(/[\\/]/).pop() ?? p;
 
 /**
  * In the desktop app, pasted files are local files (copied in Explorer / Finder): read their paths from the system clipboard;
  * they only count if each one matches an entry in `files` by name; otherwise (clipboard changed, can't read) return null and upload as usual
  */
-async function localPaths(files: File[]): Promise<string[] | null> {
+export async function localPaths(files: File[]): Promise<string[] | null> {
   if (!isTauri || isMobile() || !files.length) return null;
   try {
     const { invoke } = await import('@tauri-apps/api/core');
@@ -75,7 +105,7 @@ async function localPaths(files: File[]): Promise<string[] | null> {
   }
 }
 
-function readImage(f: File): Promise<Attached> {
+export function readImage(f: File): Promise<Attached> {
   return new Promise((resolve, reject) => {
     if (!IMAGE_TYPES.includes(f.type))
       return reject(
@@ -109,69 +139,6 @@ interface PopItem {
   apply: () => void;
 }
 
-
-/** When the tool switches itself to a mode we don't know (e.g. Claude's dontAsk), show its raw name */
-export function permLabel(mode?: string | null) {
-  return getPermModesList().find((m) => m[0] === (mode || 'default'))?.[1] ?? mode!;
-}
-
-function PermPicker({
-  hostId,
-  info,
-  open,
-  setOpen,
-}: {
-  hostId: string;
-  info: SessionInfo;
-  open: boolean;
-  setOpen: (v: boolean) => void;
-}) {
-  const cur = info.permissionMode || 'default';
-  const wrapRef = useRef<HTMLDivElement>(null);
-  useBack(open, () => setOpen(false));
-  useEffect(() => {
-    if (!open) return;
-    const onDown = (e: PointerEvent) => {
-      if (!wrapRef.current?.contains(e.target as Node)) setOpen(false);
-    };
-    document.addEventListener('pointerdown', onDown);
-    return () => document.removeEventListener('pointerdown', onDown);
-  }, [open]);
-  return (
-    <div className="menu-wrap" ref={wrapRef}>
-      <button
-        className={`perm-btn perm-${cur}`}
-        title={t('permissionModeShiftTabTo')}
-        onClick={() => setOpen(!open)}
-      >
-        <Icon name="shield" size={14} />
-        <span className="perm-label">{permLabel(cur)}</span>
-        <Icon name="down" size={11} />
-      </button>
-      {open && (
-        <div className="menu menu-up perm-menu" onMouseLeave={() => setOpen(false)}>
-          {permModes(info.tool, info.mode).map(([id, label, desc]) => (
-            <button
-              key={id}
-              className={id === cur ? 'active' : ''}
-              onClick={() => {
-                setOpen(false);
-                setPermMode(hostId, info, id);
-              }}
-            >
-              <span className="model-name">
-                <span className={`perm-dot perm-${id}`} />
-                {label}
-                {id === cur && <Icon name="check" size={13} />}
-              </span>
-              <span className="muted small">{desc}</span>
-            </button>
-          ))}
-        </div>
-      )}
-    </div>
-  );
-}
 
 async function setPermMode(hostId: string, info: SessionInfo, mode: string) {
   if ((info.permissionMode || 'default') === mode) return;
@@ -392,7 +359,7 @@ export function Composer({
       { key: 'b-changes', label: 'changes', desc: t('viewFilesModifiedInThis'), group: 'Yi Console', icon: 'edit', apply: () => (clearSlash(), showChanges(hostId, info.id)) },
       { key: 'b-export', label: 'export', desc: t('exportAsMarkdown'), group: 'Yi Console', icon: 'copy', apply: () => (clearSlash(), onExport()) },
       { key: 'b-rename', label: 'rename', desc: t('renameSession'), group: 'Yi Console', icon: 'edit', apply: () => (clearSlash(), onRename()) },
-      { key: 'b-new', label: 'new', desc: t('newSessionInTheSame'), group: 'Yi Console', icon: 'plus', apply: () => (clearSlash(), setState({ newSession: { hostId, cwd: info.cwd, tool: info.tool } })) },
+      { key: 'b-new', label: 'new', desc: t('newSessionInTheSame'), group: 'Yi Console', icon: 'plus', apply: () => (clearSlash(), openNewSession({ hostId, cwd: info.cwd, tool: info.tool })) },
       { key: 'b-files', label: 'files', desc: t('browseWorkingDirectory'), group: 'Yi Console', icon: 'folder', apply: () => (clearSlash(), navigate({ kind: 'files', hostId, path: info.cwd })) },
       { key: 'b-search', label: 'search', desc: t('searchMessagesAcrossAllSessions'), group: 'Yi Console', icon: 'search', apply: () => (clearSlash(), navigate({ kind: 'search' })) },
     ];
@@ -474,23 +441,14 @@ export function Composer({
   };
   /** Upload one file in chunks and return its path on the host; returns null if cancelled. On cancel or error, delete whatever was already uploaded */
   const uploadFile = async (f: File, up: Upload): Promise<string | null> => {
-    const sid = info.id;
-    let path = '';
     try {
-      for (let off = 0; off === 0 || off < f.size; off += CHUNK) {
-        if (cancelledUploads.current.has(up.id)) throw CANCELLED;
-        const data = toB64(await f.slice(off, off + CHUNK).arrayBuffer());
-        if (!path) path = (await rpc<{ path: string }>(hostId, 'session.attachFile', { sessionId: sid, name: f.name, data })).path;
-        else await rpc(hostId, 'session.attachAppend', { sessionId: sid, path, data });
-        const sent = Math.min(f.size, off + CHUNK);
-        setUploads((l) => l.map((x) => (x.id === up.id ? { ...x, sent } : x)));
-      }
-      if (cancelledUploads.current.has(up.id)) throw CANCELLED;
-      return path;
-    } catch (e) {
-      if (path) rpc(hostId, 'fs.delete', { path }).catch(() => {});
-      if (e === CANCELLED) return null;
-      throw e;
+      return await uploadChunked(
+        hostId,
+        info.id,
+        f,
+        (sent) => setUploads((l) => l.map((x) => (x.id === up.id ? { ...x, sent } : x))),
+        () => cancelledUploads.current.has(up.id),
+      );
     } finally {
       cancelledUploads.current.delete(up.id);
     }
@@ -612,11 +570,7 @@ export function Composer({
     }
   };
 
-  const cyclePerm = () => {
-    const ids = permModes(info.tool, info.mode).map((m) => m[0]);
-    const i = ids.indexOf(info.permissionMode || 'default');
-    setPermMode(hostId, info, ids[(i + 1) % ids.length]);
-  };
+  const cyclePerm = () => setPermMode(hostId, info, nextPerm(info.tool, info.mode, info.permissionMode));
 
   const onKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.nativeEvent.isComposing) return;
@@ -844,7 +798,14 @@ export function Composer({
               e.target.value = '';
             }}
           />
-          <PermPicker hostId={hostId} info={info} open={permOpen} setOpen={setPermOpen} />
+          <PermPicker
+            tool={info.tool}
+            mode={info.mode}
+            value={info.permissionMode}
+            onChange={(m) => setPermMode(hostId, info, m)}
+            open={permOpen}
+            setOpen={setPermOpen}
+          />
           <button
             className="tool-chip"
             title={t('slashCommandsSnippets')}

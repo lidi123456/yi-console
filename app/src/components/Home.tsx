@@ -1,5 +1,5 @@
 import { getT } from '../i18n';
-import { navigate, setState, useStore } from '../store';
+import { navigate, openNewSession, useStore } from '../store';
 import type { SessionInfo } from '../types';
 import { fmtUsage, shortPath, STATUS_LABEL, timeAgo } from '../util';
 import { Icon, ToolBadge } from './Icon';
@@ -47,7 +47,7 @@ export function Home() {
       <div className="page-head">
         <h2>{t('overview')}</h2>
         {connected.length > 0 && (
-          <button className="btn primary" onClick={() => setState({ newSession: { hostId: connected[0].config.id } })}>
+          <button className="btn primary" onClick={() => openNewSession({ hostId: connected[0].config.id })}>
             <Icon name="plus" size={14} /> {t('newSession2')}
           </button>
         )}

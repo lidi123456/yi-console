@@ -22,7 +22,22 @@ export type View =
   | { kind: 'stats'; hostId: string }
   | { kind: 'ports'; hostId: string }
   | { kind: 'settings'; hostId: string }
-  | { kind: 'prefs' };
+  | { kind: 'prefs' }
+  /** New session page (`NewSession.tsx`) */
+  | ({ kind: 'new' } & NewSessionParams);
+
+/** What the new session page opens with */
+export interface NewSessionParams {
+  hostId: string;
+  cwd?: string;
+  tool?: string;
+  resumeId?: string;
+  title?: string;
+  /** Continue with another tool: the original session's tool (the new session can't pick it), the prefilled first
+   *  message, the original session (`session.create` handoffFrom), its permission mode (kept if the new tool has it,
+   *  else default, never raised) and tools to avoid as the default pick (sessions of theirs wait for a limit reset) */
+  handoff?: { from: ToolKind; prompt: string; fromId?: string; perm?: string | null; avoid?: ToolKind[] };
+}
 
 export interface HostEntry {
   config: HostConfig;
@@ -56,17 +71,6 @@ export interface State {
   toasts: Toast[];
   transport: 'open' | 'closed' | 'connecting';
   sidebarOpen: boolean;
-  newSession: {
-    hostId: string;
-    cwd?: string;
-    tool?: string;
-    resumeId?: string;
-    title?: string;
-    /** Continue with another tool: the original session's tool (the new session can't pick it), the prefilled first
-     *  message, the original session (`session.create` handoffFrom), its permission mode (kept if the new tool has it,
-     *  else default, never raised) and tools to avoid as the default pick (sessions of theirs wait for a limit reset) */
-    handoff?: { from: ToolKind; prompt: string; fromId?: string; perm?: string | null; avoid?: ToolKind[] };
-  } | null;
   /** This device's settings (proxy, notifications), stored in the client data directory */
   client: ClientSettings | null;
   detectedProxy: string | null;
@@ -90,7 +94,6 @@ let state: State = {
   toasts: [],
   transport: 'connecting',
   sidebarOpen: false,
-  newSession: null,
   client: null,
   detectedProxy: null,
   palette: false,
@@ -614,6 +617,18 @@ export function navigate(view: View) {
     future.length = 0;
     syncNav();
   }
+  show(view);
+}
+
+/** Open the new session page */
+export function openNewSession(p: NewSessionParams) {
+  navigate({ kind: 'new', ...p });
+}
+
+/** Show a view in place of the current one, without a back entry (the new session page hands over to its session) */
+export function replaceView(view: View) {
+  future.length = 0;
+  syncNav();
   show(view);
 }
 

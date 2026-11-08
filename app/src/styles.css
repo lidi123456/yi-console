@@ -972,24 +972,8 @@ textarea {
   color: var(--text-2);
 }
 
-.field-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-}
 
-.tool-redetect {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  font-size: 12px;
-}
 
-.tool-redetect .spinner {
-  width: 11px;
-  height: 11px;
-}
 
 .form label.check {
   flex-direction: row;
@@ -1038,47 +1022,9 @@ textarea {
   box-shadow: 0 1px 2px rgba(0, 0, 0, 0.12);
 }
 
-.tool-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
-  gap: 6px;
-}
 
-/* Tool buttons are all 44px tall: names don't wrap (ellipsized if too long), "not installed" goes on the line below without adding height */
-.tool-opt {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  height: 44px;
-  padding: 0 8px;
-  border: 1px solid var(--border-2);
-  border-radius: 8px;
-  color: var(--text);
-  text-align: left;
-  min-width: 0;
-}
 
-.tool-opt-label {
-  display: flex;
-  flex-direction: column;
-  min-width: 0;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  line-height: 1.35;
-}
 
-.tool-opt-tag {
-  white-space: nowrap;
-  font-size: 11px;
-  line-height: 1.3;
-  color: var(--text-2);
-}
-
-.tool-opt.active {
-  border-color: var(--accent);
-  background: var(--accent-soft);
-}
 
 .tool-chips {
   display: flex;
@@ -8204,69 +8150,135 @@ button.wp-commit-title .chev {
   }
 }
 
-/* ---------- Mobile: new session ----------
-   The full-screen dialog's .modal-bg is a scrollable flex container, and children with min-height: 100% only stretch to one screen,
-   so with longer content the background doesn't reach the bottom and the sidebar shows through. Make it a plain block so the dialog grows with its content.
-   The title row sticks to the top (clearing the status bar), Cancel / Create stick to the bottom (clearing the gesture bar), and the middle scrolls */
+/* ---------- Mobile: dialogs ----------
+   A full-screen dialog's .modal-bg is a scrollable flex container, and children with min-height: 100% only stretch to one screen,
+   so with longer content the background doesn't reach the bottom and the sidebar shows through. Make it a plain block so the dialog grows with its content */
 @media (max-width: 760px) {
   .modal-bg {
     display: block;
   }
-  .modal.ns-modal {
-    padding: 0 18px;
-    border: none;
+}
+
+/* ---------- New session page (NewSession.tsx) ----------
+   The input box is the page: a title, the host / directory / tool / UI chips, then the same composer card as in a session.
+   Centered vertically on desktop; on phones it sits at the bottom, next to the keyboard */
+.page.ns-page {
+  display: flex;
+  flex-direction: column;
+}
+
+.ns-center {
+  width: 100%;
+  max-width: 760px;
+  /* auto margins center it and still let it scroll from the top when taller than the page */
+  margin: auto;
+  padding-bottom: 8vh;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.ns-title {
+  margin: 0 0 10px;
+  font-size: 22px;
+  font-weight: 600;
+  text-align: center;
+}
+
+.ns-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.ns-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  height: 30px;
+  padding: 0 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel);
+  color: var(--text-2);
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.ns-chip:hover:not(:disabled) {
+  border-color: var(--border-2);
+  color: var(--text);
+}
+
+.ns-chip:disabled {
+  cursor: default;
+}
+
+.ns-chip .truncate {
+  max-width: 280px;
+}
+
+.ns-composer textarea {
+  min-height: 88px;
+}
+
+/* Open button: last in the chip row (Files) or at the end of the one-line command box (shell) */
+.ns-open {
+  height: 30px;
+  padding: 0 14px;
+}
+
+.ns-chips .ns-open {
+  margin-left: 4px;
+}
+
+.composer.ns-shell {
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 8px 8px 14px;
+}
+
+.ns-prompt {
+  color: var(--text-3);
+  font-size: var(--fs-input, 14px);
+  user-select: none;
+}
+
+.ns-shell input {
+  flex: 1;
+  min-width: 0;
+  border: none;
+  outline: none;
+  background: transparent;
+  padding: 4px 0;
+  font-size: var(--fs-input, 14px);
+  color: var(--text);
+  box-shadow: none;
+}
+
+.ns-note {
+  margin: 0;
+}
+
+@media (max-width: 760px) {
+  .page.ns-page {
+    padding: 12px 12px calc(12px + env(safe-area-inset-bottom));
   }
-  .ns-modal .modal-head {
-    position: sticky;
-    top: 0;
-    z-index: 3;
-    margin: 0 -18px 4px;
-    padding: calc(10px + env(safe-area-inset-top)) 10px 10px 18px;
-    background: var(--panel);
-    border-bottom: 1px solid var(--border);
+  .ns-center {
+    margin: auto 0 0;
+    padding-bottom: 0;
   }
-  .ns-modal .modal-head h3 {
-    font-size: 17px;
+  .ns-title {
+    font-size: 18px;
   }
-  .ns-modal .modal-head .icon-btn {
-    width: 40px;
-    height: 40px;
+  .ns-chip,
+  .ns-open {
+    height: 34px;
   }
-  .ns-modal .form {
-    gap: 16px;
-    padding-top: 10px;
-  }
-  .ns-modal .tool-grid {
-    grid-template-columns: 1fr 1fr;
-    gap: 8px;
-  }
-  .ns-modal .tool-opt {
-    height: 46px;
-    padding: 0 12px;
-    gap: 10px;
-    border-radius: 10px;
-  }
-  .ns-modal .seg button {
-    min-height: 36px;
-  }
-  .ns-modal textarea {
-    min-height: 72px;
-  }
-  .ns-actions {
-    position: sticky;
-    bottom: 0;
-    z-index: 3;
-    margin: 4px -18px 0;
-    padding: 10px 18px calc(10px + env(safe-area-inset-bottom));
-    background: var(--panel);
-    border-top: 1px solid var(--border);
-    gap: 10px;
-  }
-  .ns-actions .btn {
-    flex: 1;
-    height: 46px;
-    font-size: 15px;
-    border-radius: 10px;
+  .ns-chip .truncate {
+    max-width: 55vw;
   }
 }
 
