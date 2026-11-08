@@ -46,7 +46,8 @@ Frontend
 - Links: clicks are handled by `guardLink` in `main.tsx`; nothing may navigate inside the app window.
 - The main window has a CSP (`app.security.csp` in `tauri.conf.json`, reused by yi-web): no inline `<script>`, `on*=` handlers, `eval` / `new Function`, workers or wasm. Loading a new kind of source means extending the policy; details in [frontend-ui.md](docs/internals/frontend-ui.md).
 - Dark-theme CSS variables are written twice (the `prefers-color-scheme` block and `:root[data-theme='dark']`); in JS use `isAppDark()`.
-- Text in chat / editor areas uses the font-size variables (`--fs-chat`, `--fs-editor`, …), not fixed px. No bundled web fonts.
+- Text in chat / editor areas uses the font-size variables (`--fs-chat`, `--fs-editor`, …), not fixed px. The only bundled web font is Inter (`@fontsource-variable/inter`); CJK falls back to system fonts.
+- The window background is the `--shell-gradient` on `.app`; chrome over it (title bar, sidebar) stays transparent. Look overrides go in the "Buzz look" section at the end of `styles.css`.
 - Sidebar styles are changed only in the "Sidebar" section at the end of `styles.css`. Host-related entries go into the host row's menu, not new buttons.
 - Panel toggles (terminal, file panel) are per session; don't make them global.
 - UI text is bilingual via i18next: add every new key to both `app/src/locales/zh/` and `en/`, one key per whole sentence with placeholders (no concatenation), and include `useLang()`'s lang in `useMemo` deps for translated text. `npm run i18n:check` enforces keys and placeholders. Details in [frontend-ui.md](docs/internals/frontend-ui.md).

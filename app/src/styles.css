@@ -1,33 +1,38 @@
 :root {
   --bg: #ffffff;
-  --bg-2: #f6f7f9;
-  --bg-3: #eef0f3;
+  --bg-2: #f6f8fa;
+  --bg-3: #eff2f5;
   --panel: #ffffff;
-  --border: #eaecef;
-  --border-2: #d3d7de;
+  --border: #e5e8ec;
+  --border-2: #d1d9e0;
   --text: #1f2328;
-  --text-2: #5c6370;
-  --text-3: #8b929d;
+  --text-2: #59636e;
+  --text-3: #818b98;
   --accent: #1f2328;
   --accent-2: #000000;
-  --accent-soft: #eef0f2;
-  --focus: rgba(31, 35, 40, 0.08);
-  --link: #2f6fde;
-  --unread: #3b82f6;
-  /* Window background (sidebar, title bar): solid, slightly darker than the content area */
-  --shell-bg: #f1f2f4;
-  --side-hover: rgba(31, 35, 40, 0.05);
-  --side-active: rgba(31, 35, 40, 0.08);
-  --bubble: #f2f3f5;
-  --ok: #1f9d55;
-  --warn: #b7791f;
-  --warn-soft: #fdf6e7;
-  --err: #d1453b;
-  --err-soft: #fdeeed;
-  --add-bg: #e8f7ee;
-  --add-fg: #116b35;
-  --del-bg: #fdecec;
-  --del-fg: #a3261d;
+  --accent-soft: #eff2f5;
+  --focus: rgba(9, 105, 218, 0.12);
+  --link: #0969da;
+  --unread: #0969da;
+  /* Window background (sidebar, title bar): Buzz's vertical gradient, painted once on .app; sidebar and title bar are
+     transparent over it. --shell-bg is the gradient's midpoint, for rings and chips that sit on the gradient */
+  --shell-top: #e6e6b6;
+  --shell-bottom: #c4d0da;
+  --shell-bg: #d5dbc8;
+  --shell-gradient: linear-gradient(to bottom, var(--shell-top), var(--shell-bottom));
+  --shell-muted: rgba(0, 0, 0, 0.45);
+  --side-hover: rgba(0, 0, 0, 0.04);
+  --side-active: rgba(0, 0, 0, 0.07);
+  --bubble: #f6f8fa;
+  --ok: #1a7f37;
+  --warn: #9a6700;
+  --warn-soft: #fff8c5;
+  --err: #cf222e;
+  --err-soft: #ffebe9;
+  --add-bg: #dafbe1;
+  --add-fg: #116329;
+  --del-bg: #ffebe9;
+  --del-fg: #a40e26;
   /* Full-file diff: VS Code's diffEditor.* defaults (light) */
   --df-add-line: rgba(155, 185, 85, 0.2);
   --df-del-line: rgba(255, 0, 0, 0.2);
@@ -36,7 +41,7 @@
   --df-add-mark: #2ea043;
   --df-del-mark: #e5534b;
   --df-diag: rgba(34, 34, 34, 0.2);
-  --code-bg: #f6f7f9;
+  --code-bg: #f6f8fa;
   --c-claude: #d97757;
   --c-codex: #10a37f;
   --c-cursor: #7c7cff;
@@ -44,52 +49,55 @@
   --c-qoder: #2adb5c;
   --c-codebuddy: #6c4dff;
   --c-shell: #8a8f98;
-  --shadow: 0 8px 30px rgba(20, 24, 33, 0.12);
-  --panel-shadow: 0 0 0 1px rgba(31, 35, 40, 0.06), 0 2px 12px rgba(31, 35, 40, 0.05);
-  --radius: 12px;
+  --shadow: 0 12px 32px rgba(31, 35, 40, 0.14), 0 0 0 1px rgba(31, 35, 40, 0.06);
+  --panel-shadow: -1px -1px 0 0 rgba(31, 35, 40, 0.07), 0 0 4px 0 rgba(0, 0, 0, 0.07);
+  --radius: 10px;
   /* Scrollbar slider */
   --sb-thumb: rgba(0, 0, 0, 0.18);
   --sb-thumb-hover: rgba(0, 0, 0, 0.3);
   --sb-thumb-active: rgba(0, 0, 0, 0.4);
-  /* System UI font: on Chinese Windows use Microsoft YaHei UI for both Chinese and English, PingFang on macOS;
-     on English Windows, Segoe UI for English with CJK falling back to YaHei UI. Don't put Segoe UI first, mixing two fonts for CJK and Latin looks uneven */
-  --font: system-ui, -apple-system, BlinkMacSystemFont, 'Microsoft YaHei UI', 'PingFang SC', 'Hiragino Sans GB',
-    'Noto Sans CJK SC', 'Noto Sans SC', sans-serif;
+  /* UI font: bundled Inter (@fontsource-variable/inter, imported in main.tsx) for Latin text, as in Buzz; Inter has no CJK
+     glyphs, so Chinese falls through to Microsoft YaHei UI on Windows, PingFang on macOS, Noto on Linux / Android */
+  --font: 'Inter Variable', Inter, 'Microsoft YaHei UI', 'PingFang SC', 'Hiragino Sans GB', 'Noto Sans CJK SC', 'Noto Sans SC',
+    system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
   --mono: 'Cascadia Mono', 'JetBrains Mono', ui-monospace, 'SF Mono', Menlo, Consolas, 'Microsoft YaHei UI', monospace;
   /* Chat and editor fonts: overridden per device by fontPrefs.ts */
   --font-chat: var(--font);
   --font-editor: var(--mono);
-  /* Minimal-style replies use Segoe UI for Latin text; the chat font goes in front of it too */
-  --font-modern: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Microsoft YaHei UI', 'PingFang SC', 'Noto Sans CJK SC', sans-serif;
+  /* Compact-style replies use the same Inter-first stack; the chat font goes in front of it too */
+  --font-modern: var(--font);
   --font-reply: var(--font-modern);
   color-scheme: light;
 }
 
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme='light']) {
-    /* Neutral greys after VS Code's Dark Modern: chrome #181818, editor #1f1f1f, borders #2b2b2b / #3c3c3c, text #cccccc / #9d9d9d */
-    --bg: #1f1f1f;
-    --bg-2: #252525;
-    --bg-3: #2b2b2b;
-    --panel: #222222;
-    --border: #2b2b2b;
-    --border-2: #3c3c3c;
-    --text: #cccccc;
-    --text-2: #9d9d9d;
-    --text-3: #858585;
-    --accent: #d7d7d7;
+    /* Buzz Dark: olive-to-navy window gradient, warm neutral #1a1a1a content card, GitHub Dark text and state colors */
+    --bg: #1a1a1a;
+    --bg-2: #202020;
+    --bg-3: #2a2a2a;
+    --panel: #202020;
+    --border: #2d2d2d;
+    --border-2: #3d3d3d;
+    --text: #d6dbe0;
+    --text-2: #9198a1;
+    --text-3: #6e7681;
+    --accent: #e6edf3;
     --accent-2: #ffffff;
-    --accent-soft: #2b2b2b;
-    --focus: rgba(204, 204, 204, 0.1);
-    --link: #4daafc;
-    --unread: #4daafc;
-    --shell-bg: #181818;
-    --side-hover: rgba(255, 255, 255, 0.05);
-    --side-active: rgba(255, 255, 255, 0.1);
-    --bubble: #2b2b2b;
-    --panel-shadow: 0 0 0 1px #2b2b2b, 0 2px 12px rgba(0, 0, 0, 0.3);
+    --accent-soft: #2a2a2a;
+    --focus: rgba(71, 140, 230, 0.2);
+    --link: #4493f8;
+    --unread: #4493f8;
+    --shell-top: #4a4616;
+    --shell-bottom: #0a1423;
+    --shell-bg: #2a2d1d;
+    --shell-muted: rgba(255, 255, 255, 0.45);
+    --side-hover: rgba(255, 255, 255, 0.06);
+    --side-active: rgba(255, 255, 255, 0.14);
+    --bubble: #2a2a2a;
+    --panel-shadow: 0 0 0 1px rgba(255, 255, 255, 0.06), 0 2px 12px rgba(0, 0, 0, 0.35);
     --ok: #3fb950;
-    --warn: #cca700;
+    --warn: #d29922;
     --warn-soft: #2b2714;
     --err: #f85149;
     --err-soft: #351d1c;
@@ -105,8 +113,8 @@
     --df-add-mark: #3fb950;
     --df-del-mark: #f85149;
     --df-diag: rgba(204, 204, 204, 0.2);
-    --code-bg: #181818;
-    --shadow: 0 8px 30px rgba(0, 0, 0, 0.5);
+    --code-bg: #141414;
+    --shadow: 0 12px 32px rgba(0, 0, 0, 0.55), 0 0 0 1px rgba(255, 255, 255, 0.07);
     --sb-thumb: rgba(255, 255, 255, 0.16);
     --sb-thumb-hover: rgba(255, 255, 255, 0.28);
     --sb-thumb-active: rgba(255, 255, 255, 0.38);
@@ -116,29 +124,32 @@
 
 /* Dark chosen manually (also applies when the system is light) */
 :root[data-theme='dark'] {
-  /* Neutral greys after VS Code's Dark Modern: chrome #181818, editor #1f1f1f, borders #2b2b2b / #3c3c3c, text #cccccc / #9d9d9d */
-  --bg: #1f1f1f;
-  --bg-2: #252525;
-  --bg-3: #2b2b2b;
-  --panel: #222222;
-  --border: #2b2b2b;
-  --border-2: #3c3c3c;
-  --text: #cccccc;
-  --text-2: #9d9d9d;
-  --text-3: #858585;
-  --accent: #d7d7d7;
+  /* Buzz Dark: olive-to-navy window gradient, warm neutral #1a1a1a content card, GitHub Dark text and state colors */
+  --bg: #1a1a1a;
+  --bg-2: #202020;
+  --bg-3: #2a2a2a;
+  --panel: #202020;
+  --border: #2d2d2d;
+  --border-2: #3d3d3d;
+  --text: #d6dbe0;
+  --text-2: #9198a1;
+  --text-3: #6e7681;
+  --accent: #e6edf3;
   --accent-2: #ffffff;
-  --accent-soft: #2b2b2b;
-  --focus: rgba(204, 204, 204, 0.1);
-  --link: #4daafc;
-  --unread: #4daafc;
-  --shell-bg: #181818;
-  --side-hover: rgba(255, 255, 255, 0.05);
-  --side-active: rgba(255, 255, 255, 0.1);
-  --bubble: #2b2b2b;
-  --panel-shadow: 0 0 0 1px #2b2b2b, 0 2px 12px rgba(0, 0, 0, 0.3);
+  --accent-soft: #2a2a2a;
+  --focus: rgba(71, 140, 230, 0.2);
+  --link: #4493f8;
+  --unread: #4493f8;
+  --shell-top: #4a4616;
+  --shell-bottom: #0a1423;
+  --shell-bg: #2a2d1d;
+  --shell-muted: rgba(255, 255, 255, 0.45);
+  --side-hover: rgba(255, 255, 255, 0.06);
+  --side-active: rgba(255, 255, 255, 0.14);
+  --bubble: #2a2a2a;
+  --panel-shadow: 0 0 0 1px rgba(255, 255, 255, 0.06), 0 2px 12px rgba(0, 0, 0, 0.35);
   --ok: #3fb950;
-  --warn: #cca700;
+  --warn: #d29922;
   --warn-soft: #2b2714;
   --err: #f85149;
   --err-soft: #351d1c;
@@ -154,8 +165,8 @@
   --df-add-mark: #3fb950;
   --df-del-mark: #f85149;
   --df-diag: rgba(204, 204, 204, 0.2);
-  --code-bg: #181818;
-  --shadow: 0 8px 30px rgba(0, 0, 0, 0.5);
+  --code-bg: #141414;
+  --shadow: 0 12px 32px rgba(0, 0, 0, 0.55), 0 0 0 1px rgba(255, 255, 255, 0.07);
   --sb-thumb: rgba(255, 255, 255, 0.16);
   --sb-thumb-hover: rgba(255, 255, 255, 0.28);
   --sb-thumb-active: rgba(255, 255, 255, 0.38);
@@ -4105,30 +4116,30 @@ button.md-rimg-ph:hover {
   --fs-ui: 13px;
   --fs-aux: 12px;
   --fs-meta: 11.5px;
-  --text: #24292f;
-  --text-strong: #141414;
-  --inline-code-bg: #f3f3f3;
+  --text: #1f2328;
+  --text-strong: #1f2328;
+  --inline-code-bg: #eff2f5;
   --text-2: #59636e;
-  --text-3: #8c959f;
+  --text-3: #818b98;
 }
 
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme='light']) {
-    --text: #cccccc;
-    --text-strong: #e7e7e7;
-    --inline-code-bg: #313131;
-    --text-2: #9d9d9d;
-    --text-3: #858585;
+    --text: #d6dbe0;
+    --text-strong: #f0f3f6;
+    --inline-code-bg: #2a2a2a;
+    --text-2: #9198a1;
+    --text-3: #6e7681;
   }
 }
 
 /* Dark chosen manually (also applies when the system is light) */
 :root[data-theme='dark'] {
-  --text: #cccccc;
-  --text-strong: #e7e7e7;
-  --inline-code-bg: #313131;
-  --text-2: #9d9d9d;
-  --text-3: #858585;
+  --text: #d6dbe0;
+  --text-strong: #f0f3f6;
+  --inline-code-bg: #2a2a2a;
+  --text-2: #9198a1;
+  --text-3: #6e7681;
 }
 
 
@@ -5349,7 +5360,9 @@ body.resizing-y {
    Sidebar: placed last to override sidebar settings elsewhere. Make sidebar changes here.
    Two-level structure: host header (icon tile + name + connection status, slightly bolder) → directory subheading (small light-grey text) → sessions.
    Session row: tool icon in its own color, grey title (darker on hover / selection), time on the right; status only shown when running / awaiting approval / errored,
-   on hover the time is replaced by pin and "…". Width 244px, row height 32px, font --fs-side 13px, text about 14px from the left
+   on hover the time is replaced by pin and "…". Width 244px, row height 32px, font --fs-side 13px, text about 14px from the left.
+   The sidebar is transparent over the window gradient (--shell-gradient on .app, Buzz style): hover 4% / selected 7% tint,
+   directory headings, times and secondary actions use --shell-muted, hosts are separated by space rather than lines
    ====================================================================== */
 
 :root {
@@ -5427,6 +5440,11 @@ body.resizing .side-resizer::after {
   border-color: var(--border-2);
 }
 
+.side-search > svg,
+.side-search input::placeholder {
+  color: var(--shell-muted);
+}
+
 .side-search input {
   font-size: var(--fs-side);
 }
@@ -5438,7 +5456,7 @@ body.resizing .side-resizer::after {
 .kbd-hint {
   margin-left: auto;
   font: 10.5px/16px var(--mono);
-  color: var(--text-3);
+  color: var(--shell-muted);
 }
 
 /* The sidebar scrolls but shows no scrollbar (the system scrollbar is thick and covers content on the right) */
@@ -5458,7 +5476,7 @@ body.resizing .side-resizer::after {
 }
 
 .host-block + .host-block {
-  border-top: 1px solid var(--border);
+  margin-top: 6px;
 }
 
 .host-head {
@@ -5576,7 +5594,7 @@ body.resizing .side-resizer::after {
   height: 24px;
   padding: 6px 12px 0 14px;
   font-size: var(--fs-side-aux);
-  color: var(--text-3);
+  color: var(--shell-muted);
 }
 
 .project-toggle .chev {
@@ -5653,7 +5671,7 @@ body.resizing .side-resizer::after {
 
 .row-time {
   font-size: 11px;
-  color: var(--text-3);
+  color: var(--shell-muted);
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
 }
@@ -5718,9 +5736,13 @@ body.resizing .side-resizer::after {
   color: var(--text-3);
 }
 
+.add-host {
+  color: var(--shell-muted);
+}
+
 .add-host:hover {
   background: var(--side-hover);
-  color: var(--text-2);
+  color: var(--text);
 }
 
 .sidebar-foot .brand {
@@ -5762,6 +5784,7 @@ body.resizing .side-resizer::after {
 @media (max-width: 760px) {
   .sidebar {
     --side-row-h: 38px;
+    background: var(--shell-gradient);
   }
   .host-head {
     height: 36px;
@@ -8943,4 +8966,73 @@ button.wp-commit-title .chev {
     max-height: none;
     padding: calc(16px + env(safe-area-inset-top)) 18px calc(18px + env(safe-area-inset-bottom));
   }
+}
+
+/* ======================================================================
+   Buzz look (after block/buzz's desktop app): one vertical gradient painted on .app (--shell-gradient, olive-yellow to
+   grey-blue in light, olive to navy in dark), transparent title bar and sidebar over it, the main panel as an inset
+   rounded card with a faint edge. Placed last so it wins
+   over the scattered settings above; sidebar-only rules stay in the "Sidebar" section
+   ====================================================================== */
+
+.app {
+  background: var(--shell-gradient);
+  background-color: var(--shell-bg);
+}
+
+.titlebar,
+.sidebar-foot {
+  background: transparent;
+}
+
+.tb-nav button,
+.win-btns button {
+  color: var(--shell-muted);
+}
+
+.main {
+  border-radius: var(--radius);
+}
+
+/* ---- Input box: Buzz's bordered card with a thin shadow ---- */
+
+.composer {
+  border-radius: 12px;
+  border-color: var(--border-2);
+  box-shadow: 0 1px 3px rgba(31, 35, 40, 0.06);
+}
+
+.composer:focus-within {
+  border-color: var(--text-3);
+  box-shadow: 0 1px 3px rgba(31, 35, 40, 0.08);
+}
+
+/* ---- Dialogs, menus, toasts ---- */
+
+.modal-bg {
+  background: rgba(10, 12, 16, 0.4);
+}
+
+.modal,
+.modal.dlg {
+  border-radius: 12px;
+}
+
+.menu,
+.ctx-menu {
+  border-radius: 10px;
+}
+
+.toast {
+  border-radius: 10px;
+}
+
+/* ---- Pages and settings ---- */
+
+.card {
+  border-radius: var(--radius);
+}
+
+.prefs-toc button.active {
+  background: var(--side-active);
 }

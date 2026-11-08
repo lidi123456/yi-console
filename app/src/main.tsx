@@ -2,6 +2,8 @@ import { createRoot } from 'react-dom/client';
 import { App } from './App';
 import { errorToast, loadClientSettings, refreshHosts, restoreView, startEventLoop } from './store';
 import { initTransport } from './transport';
+// Inter (variable, latin subsets via unicode-range) is bundled; CJK falls back to the system fonts in --font
+import '@fontsource-variable/inter';
 import './styles.css';
 import './back';
 import './scrollbars';
