@@ -10,14 +10,17 @@ import { errorToast, navigate, openNewSession, toast, useStore, type HostEntry }
 import { rpc } from '../transport';
 import { TOOL_LABEL, type GitStatus, type SessionInfo, type ToolKind, type Usage } from '../types';
 import { basename, clock, fmtTokens, isMobile, lsGet, lsSet, shortPath, timeAgo } from '../util';
+import { type Attached, FILE_MAX, IMAGE_TYPES, localPaths, readImage, refOf, uploadChunked } from './Composer';
 import type { Item } from './Home';
 import { Icon, ToolBadge } from './Icon';
+import { openImage } from './Lightbox';
 import { DirPicker, PREFS_KEY, recentDirs, rememberDir, type ToolPrefs } from './NewSession';
 import { openMenu, type MenuItem } from './Overlay';
 import { showChanges } from './SessionActions';
 import { QUOTA_TOOLS, QuotaCard, TOOL_VAR } from './StatsView';
 
 const t = getT('home');
+const tc = getT('composer');
 
 /** Projects listed under the board */
 const PROJ_MAX = 6;
@@ -66,15 +69,36 @@ function dirList(hostId: string, sessions: Record<string, SessionInfo[]>) {
   return [...new Set([...recentDirs(hostId), ...fromSessions])].slice(0, DIR_MENU_MAX);
 }
 
+/** A file added to the message, as on the new session page: images go with it, other files are uploaded into the
+ *  session once it exists (files on this machine for a local session are referenced by path in the text instead) */
+interface Pending {
+  id: number;
+  file: File;
+  img?: Attached;
+}
+let pendingSeq = 0;
+type Progress = { name: string; sent: number; total: number } | null;
+
 /** Start a chat session with a first message; the board shows it, so the page stays where it is */
-async function startSession(d: Pick<Draft, 'text' | 'hostId' | 'cwd' | 'tool' | 'perm'>): Promise<boolean> {
+async function startSession(
+  d: Pick<Draft, 'text' | 'hostId' | 'cwd' | 'tool' | 'perm'>,
+  items: Pending[] = [],
+  setProgress: (p: Progress | ((p: Progress) => Progress)) => void = () => {},
+): Promise<boolean> {
   const prefs = lsGet<Record<string, ToolPrefs>>(PREFS_KEY, {})[d.tool] ?? {};
+  const images = items.filter((i) => i.img).map((i) => ({ mimeType: i.img!.mimeType, data: i.img!.data }));
+  const uploads = items.filter((i) => !i.img);
+  // With files to upload the message goes out with session.send once they are in the session's directory
+  const later = uploads.length > 0;
+  let info: SessionInfo | null = null;
+  let message = d.text;
   try {
-    const info = await rpc<SessionInfo>(d.hostId, 'session.create', {
+    info = await rpc<SessionInfo>(d.hostId, 'session.create', {
       tool: d.tool,
       cwd: d.cwd,
       mode: 'structured',
-      prompt: d.text,
+      prompt: later ? undefined : d.text,
+      images: later || !images.length ? undefined : images,
       permissionMode: permModes(d.tool, 'structured').some((m) => m[0] === d.perm) ? d.perm : 'default',
       // The model and thinking level last chosen for this tool on the new session page
       model: prefs.model || undefined,
@@ -82,13 +106,34 @@ async function startSession(d: Pick<Draft, 'text' | 'hostId' | 'cwd' | 'tool' | 
       cols: 120,
       rows: 32,
     });
+    const id = info.id;
     rememberDir(d.hostId, info.cwd);
     lsSet('last-tool', d.tool);
-    toast(t('sessionStarted'), 'info', { label: t('view'), run: () => navigate({ kind: 'session', hostId: d.hostId, sessionId: info.id }) });
+    if (later) {
+      const refs: string[] = [];
+      for (const it of uploads) {
+        setProgress({ name: it.file.name, sent: 0, total: it.file.size });
+        const path = await uploadChunked(d.hostId, id, it.file, (sent) => setProgress((p) => p && { ...p, sent }));
+        if (path) refs.push(refOf(path).trim());
+      }
+      setProgress(null);
+      message = [d.text, ...refs].filter(Boolean).join(' ');
+      await rpc(d.hostId, 'session.send', { sessionId: id, text: message, images, queue: true });
+    }
+    toast(t('sessionStarted'), 'info', { label: t('view'), run: () => navigate({ kind: 'session', hostId: d.hostId, sessionId: id }) });
     return true;
   } catch (e) {
     errorToast(e);
-    return false;
+    setProgress(null);
+    if (!info) return false;
+    // The session exists but the first message didn't go out: open it with the message in its input box
+    try {
+      sessionStorage.setItem(`draft-${d.hostId}::${info.id}`, message);
+    } catch {
+      /* storage unavailable */
+    }
+    navigate({ kind: 'session', hostId: d.hostId, sessionId: info.id });
+    return true;
   }
 }
 
@@ -113,11 +158,44 @@ export function QuickStart({ hosts, sessions }: { hosts: HostEntry[]; sessions: 
   const [text, setText] = useState('');
   const [busy, setBusy] = useState(false);
   const [picking, setPicking] = useState(false);
+  const [items, setItems] = useState<Pending[]>([]);
+  const [progress, setProgress] = useState<Progress>(null);
+  const [drag, setDrag] = useState(false);
   const ta = useRef<HTMLTextAreaElement>(null);
+  const fileInput = useRef<HTMLInputElement>(null);
+  const imageInput = useRef<HTMLInputElement>(null);
   const drafts = useDrafts();
   useBack(picking, () => setPicking(false));
 
   const ready = !!host && !!tool && !busy;
+  const canAttach = !!host && !!tool;
+  // Same rules as the new session page (NewSession.tsx addFiles)
+  const addFiles = async (fs: File[]) => {
+    const local = host?.config.kind === 'local' ? await localPaths(fs.filter((f) => !IMAGE_TYPES.includes(f.type))) : null;
+    const refs: string[] = [];
+    for (const f of fs) {
+      try {
+        if (IMAGE_TYPES.includes(f.type)) {
+          const img = await readImage(f);
+          setItems((l) => [...l, { id: ++pendingSeq, file: f, img }]);
+          continue;
+        }
+        // A local session can use the original file on this machine: put its path in the text, nothing to upload
+        const at = local?.find((p) => basename(p) === f.name);
+        if (at) {
+          refs.push(refOf(at));
+          continue;
+        }
+        if (f.size > FILE_MAX) throw new Error(tc('exceeds50mb', { name: f.name }));
+        if (!f.size && !f.type) throw new Error(tc('isAFolderOrEmpty', { name: f.name }));
+        setItems((l) => [...l, { id: ++pendingSeq, file: f }]);
+      } catch (e) {
+        errorToast(e);
+      }
+    }
+    if (refs.length) setText((cur) => cur + (cur && !/\s$/.test(cur) ? ' ' : '') + refs.join(''));
+  };
+  const removeItem = (id: number) => setItems((l) => l.filter((x) => x.id !== id));
   const pickHost = (id: string) => {
     setHostPick(id);
     lsSet('ov-qs-host', id);
@@ -126,7 +204,10 @@ export function QuickStart({ hosts, sessions }: { hosts: HostEntry[]; sessions: 
     const v = text.trim();
     if (!v || !ready || !tool) return;
     setBusy(true);
-    if (await startSession({ text: v, hostId, cwd, tool, perm })) setText('');
+    if (await startSession({ text: v, hostId, cwd, tool, perm }, items, setProgress)) {
+      setText('');
+      setItems([]);
+    }
     setBusy(false);
   };
   const save = () => {
@@ -137,7 +218,9 @@ export function QuickStart({ hosts, sessions }: { hosts: HostEntry[]; sessions: 
     }
     addDraft({ text: v, hostId, cwd, tool, perm });
     setText('');
-    toast(t('draftSaved'));
+    // Drafts live in localStorage: text only
+    toast(items.length ? t('draftSavedTextOnly') : t('draftSaved'));
+    setItems([]);
   };
   const edit = (d: Draft) => {
     // Whatever is in the box isn't thrown away: it becomes a draft in turn
@@ -163,13 +246,72 @@ export function QuickStart({ hosts, sessions }: { hosts: HostEntry[]; sessions: 
   return (
     <>
       {connected.length > 0 && (
-        <div className="ov-qs">
+        <div
+          className={`ov-qs${drag ? ' drag' : ''}`}
+          onDragOver={(e) => {
+            if (canAttach && e.dataTransfer.types.includes('Files')) {
+              e.preventDefault();
+              setDrag(true);
+            }
+          }}
+          onDragLeave={() => setDrag(false)}
+          onDrop={(e) => {
+            e.preventDefault();
+            setDrag(false);
+            if (canAttach) addFiles(Array.from(e.dataTransfer.files));
+          }}
+        >
+          {progress && (
+            <div className="upload-row" aria-live="polite">
+              <span className="upload-chip" title={progress.name}>
+                <span className="spinner mini" />
+                <span className="truncate">{tc('uploading', { name: progress.name })}</span>
+                {progress.total > 0 && <span className="upload-pct">{Math.floor((progress.sent / progress.total) * 100)}%</span>}
+              </span>
+            </div>
+          )}
+          {items.some((i) => !i.img) && (
+            <div className="upload-row">
+              {items
+                .filter((i) => !i.img)
+                .map((i) => (
+                  <span key={i.id} className="upload-chip" title={i.file.name}>
+                    <Icon name="file" size={12} />
+                    <span className="truncate">{i.file.name}</span>
+                    <button className="upload-x" title={tc('remove')} aria-label={tc('remove')} disabled={busy} onClick={() => removeItem(i.id)}>
+                      <Icon name="x" size={12} />
+                    </button>
+                  </span>
+                ))}
+            </div>
+          )}
+          {items.some((i) => i.img) && (
+            <div className="attach-row">
+              {items
+                .filter((i) => i.img)
+                .map((i) => (
+                  <div key={i.id} className="attach" title={tc('doubleClickToZoom', { name: i.img!.name })}>
+                    <img src={i.img!.url} alt="" onDoubleClick={() => openImage(i.img!.url)} />
+                    <button className="attach-x" title={tc('remove')} disabled={busy} onClick={() => removeItem(i.id)}>
+                      <Icon name="x" size={12} />
+                    </button>
+                  </div>
+                ))}
+            </div>
+          )}
           <textarea
             ref={ta}
             value={text}
             rows={2}
             placeholder={tool ? t('quickStartPlaceholder') : t('noAiToolOnThisHost')}
             onChange={(e) => setText(e.target.value)}
+            onPaste={(e) => {
+              const fs = Array.from(e.clipboardData.files);
+              if (fs.length && canAttach) {
+                e.preventDefault();
+                addFiles(fs);
+              }
+            }}
             onKeyDown={(e) => {
               if (e.nativeEvent.isComposing) return;
               if (e.key === 'Enter' && !e.shiftKey && !isMobile()) {
@@ -179,6 +321,44 @@ export function QuickStart({ hosts, sessions }: { hosts: HostEntry[]; sessions: 
             }}
           />
           <div className="ov-qs-row">
+            <button
+              type="button"
+              className="ov-pick ov-pick-add"
+              title={tc('attachImagesOrFilesOr')}
+              aria-label={tc('attachImagesOrFilesOr')}
+              disabled={!canAttach || busy}
+              onClick={(e) => {
+                if (!isMobile()) return fileInput.current?.click();
+                const r = e.currentTarget.getBoundingClientRect();
+                openMenu({ clientX: r.left, clientY: r.bottom + 4 }, [
+                  { label: tc('photoLibrary'), icon: 'image', run: () => imageInput.current?.click() },
+                  { label: tc('file'), icon: 'file', run: () => fileInput.current?.click() },
+                ]);
+              }}
+            >
+              <Icon name="plus" size={14} />
+            </button>
+            <input
+              ref={fileInput}
+              type="file"
+              multiple
+              hidden
+              onChange={(e) => {
+                if (e.target.files) addFiles(Array.from(e.target.files));
+                e.target.value = '';
+              }}
+            />
+            <input
+              ref={imageInput}
+              type="file"
+              accept="image/*"
+              multiple
+              hidden
+              onChange={(e) => {
+                if (e.target.files) addFiles(Array.from(e.target.files));
+                e.target.value = '';
+              }}
+            />
             <button
               className="ov-pick"
               disabled={!tools.length}

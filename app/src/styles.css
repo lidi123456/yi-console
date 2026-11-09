@@ -9078,6 +9078,22 @@ button.wp-commit-title .chev {
   box-shadow: 0 1px 3px rgba(31, 35, 40, 0.06);
 }
 
+.ov-qs.drag {
+  border-color: var(--unread);
+  background: color-mix(in srgb, var(--unread) 5%, var(--panel));
+}
+
+.ov-qs > .upload-row,
+.ov-qs > .attach-row {
+  margin-bottom: 8px;
+}
+
+.ov-pick-add {
+  width: 26px;
+  padding: 0;
+  justify-content: center;
+}
+
 .ov-qs:focus-within {
   border-color: var(--text-3);
 }
@@ -9086,6 +9102,9 @@ button.wp-commit-title .chev {
   width: 100%;
   border: 0;
   outline: 0;
+  padding: 2px 0;
+  /* The box around it shows focus; drop the global input focus ring */
+  box-shadow: none !important;
   resize: none;
   background: none;
   color: var(--text);
@@ -9600,8 +9619,9 @@ button.wp-commit-title .chev {
 }
 
 .ov-proj {
+  position: relative;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto auto;
+  grid-template-columns: minmax(0, 1fr) auto;
   gap: 3px 14px;
   align-items: center;
   padding: 9px 14px;
@@ -9664,18 +9684,30 @@ button.wp-commit-title .chev {
   gap: 3px;
 }
 
+/* Over the tool icons on hover: the buttons differ per row (no "changes" without git), so a column of their own
+   would push each row's icons to a different place */
 .ov-proj-acts {
-  grid-row: 1 / span 2;
-  grid-column: 3;
+  position: absolute;
+  right: 14px;
+  top: 50%;
+  transform: translateY(-50%);
   display: flex;
   gap: 6px;
+  padding-left: 12px;
+  background: var(--bg-2);
   opacity: 0;
+  pointer-events: none;
   cursor: default;
+}
+
+.ov-proj.sel .ov-proj-acts {
+  background: color-mix(in srgb, var(--unread) 8%, var(--bg-2));
 }
 
 .ov-proj:hover .ov-proj-acts,
 .ov-proj:focus-within .ov-proj-acts {
   opacity: 1;
+  pointer-events: auto;
 }
 
 .ov-feed {
@@ -9945,9 +9977,15 @@ button.wp-commit-title .chev {
     scroll-snap-align: start;
   }
 
-  /* No hover on touch: keep the project actions visible */
+  /* No hover on touch: the project actions take the icons' place */
   .ov-proj-acts {
+    position: static;
+    transform: none;
+    grid-row: 1 / span 2;
+    padding-left: 0;
+    background: none;
     opacity: 1;
+    pointer-events: auto;
   }
 
   .ov-proj {

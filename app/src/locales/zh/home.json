@@ -65,7 +65,7 @@
   "actRead": "读取",
   "actSearch": "搜索",
   "actAgent": "子任务",
-  "quickStartPlaceholder": "想让 AI 做什么？回车直接开一个新会话",
+  "quickStartPlaceholder": "想让 AI 做什么？回车开始，Shift+回车换行",
   "noAiToolOnThisHost": "这台主机上没有可用的 AI 工具",
   "noAiTool": "没有 AI 工具",
   "chooseDirectory": "选择目录…",
@@ -108,5 +108,6 @@
   "todayLabel": "今天",
   "justStarted": "刚开始",
   "tookUnderAMinute": "用时不到 1 分钟",
-  "rejected": "已拒绝：{{v}}"
+  "rejected": "已拒绝：{{v}}",
+  "draftSavedTextOnly": "已存为草稿（只存文字，图片和文件没有存）"
 }
