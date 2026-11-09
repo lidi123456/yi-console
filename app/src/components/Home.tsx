@@ -9,7 +9,8 @@ import type { SessionInfo } from '../types';
 import { basename, fmtTokens, shortPath, timeAgo } from '../util';
 import { Icon, ToolBadge } from './Icon';
 import { FeedPanel, ProjectPanel, QuickStart, QuotaDialog, WeekPanel } from './OverviewPanels';
-import { showChanges } from './SessionActions';
+import { openMenu } from './Overlay';
+import { sessionMenu, showChanges } from './SessionActions';
 
 const t = getT('home');
 
@@ -121,6 +122,7 @@ function Card({ x, edge, children, multi }: { x: Item; edge: string; children: R
       role="button"
       tabIndex={0}
       onClick={() => open(x)}
+      onContextMenu={(e) => openMenu(e, sessionMenu(x.hostId, s))}
       onKeyDown={(e) => e.key === 'Enter' && e.target === e.currentTarget && open(x)}
     >
       <div className="ov-card-top">
@@ -319,7 +321,7 @@ const MiniRow = memo(function MiniRow({ x }: { x: Item }) {
   const s = x.s;
   const live = s.tool !== 'files' && (s.status === 'running' || s.status === 'starting');
   return (
-    <button className="ov-mini" onClick={() => open(x)} title={`${s.title || t('newSession')}\n${s.cwd}`}>
+    <button className="ov-mini" onClick={() => open(x)} onContextMenu={(e) => openMenu(e, sessionMenu(x.hostId, s))} title={`${s.title || t('newSession')}\n${s.cwd}`}>
       <ToolBadge tool={s.tool} size={16} />
       <span className="ov-mini-t truncate">{s.title || `${t('newSession')} · ${basename(s.cwd)}`}</span>
       {live && <span className="sdot sdot-busy" />}

@@ -203,6 +203,27 @@ export async function openTerminal(hostId: string, cwd = '~') {
   }
 }
 
+/** A new empty session with the same host, directory, tool, UI, permission mode, model, thinking level and (terminal)
+ *  command; no history, title, attachments or computer-use grant */
+export async function duplicateSession(hostId: string, info: SessionInfo) {
+  try {
+    const n = await rpc<SessionInfo>(hostId, 'session.create', {
+      tool: info.tool,
+      cwd: info.cwd,
+      mode: info.mode,
+      permissionMode: info.permissionMode || undefined,
+      model: info.model || undefined,
+      effort: info.effort || undefined,
+      command: info.command || undefined,
+      cols: 120,
+      rows: 32,
+    });
+    navigate({ kind: 'session', hostId, sessionId: n.id });
+  } catch (e) {
+    errorToast(e);
+  }
+}
+
 /** Command to continue this session from the command line (the tool's own session ID) */
 function resumeCommand(info: SessionInfo): string | null {
   const id = info.externalId;
@@ -302,6 +323,7 @@ export function sessionMenu(
       icon: 'pin',
       run: () => call(hostId, sid, 'session.pin', { pinned: !info.pinned }),
     },
+    ...(info.parentId ? [] : [{ label: tx('newWithSameSettings'), icon: 'plus', run: () => duplicateSession(hostId, info) }]),
     ...(info.tool !== 'shell' && !info.parentId
       ? [
           info.mode === 'terminal'
