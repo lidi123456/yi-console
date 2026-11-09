@@ -228,6 +228,64 @@ pub struct SessionInfo {
     /// Optional desktop control; disabled again after daemon restart.
     #[serde(default)]
     pub computer_use: bool,
+    /// The oldest approval or question still waiting, so lists (the overview board) can show it without subscribing to
+    /// the session. Cleared together with `pending_permissions`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending: Option<PendingBrief>,
+    /// The current or last chat turn (chat mode only)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn: Option<TurnInfo>,
+}
+
+/// Summary of a waiting approval / question
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingBrief {
+    pub request_id: String,
+    pub tool_name: String,
+    pub title: String,
+    /// The concrete command or file path from the request input, truncated
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// command / file / other
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail_kind: Option<String>,
+    /// When the request came in (ms)
+    pub at: i64,
+    /// It asks questions (answered on the session page), not a plain approval
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub question: bool,
+    /// The approval's options, so it can be answered from a list; empty for questions
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub options: Vec<PermissionOption>,
+}
+
+/// One chat turn: from the user message to `turn_end`
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnInfo {
+    pub started_at: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_at: Option<i64>,
+    /// Distinct files the tool reported editing in this turn (from tool call diffs, no git involved)
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub files_changed: u32,
+    /// The latest tool call of a running turn; cleared when the turn ends. Broadcasts are throttled by the hub
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity: Option<TurnActivity>,
+    /// The last approval the user rejected in this turn (its command / path, else its title)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rejected: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnActivity {
+    /// Tool name as the adapter reports it (Bash, Edit, shell, apply_patch, an ACP kind …)
+    pub name: String,
+    /// One line, truncated
+    pub title: String,
+    pub at: i64,
 }
 
 fn is_zero(n: &u32) -> bool {
@@ -837,6 +895,9 @@ pub mod methods {
     pub const SEARCH_MESSAGES: &str = "search.messages";
     /// {cwd, diff?, paths?} -> {repo, branch, head, total?, files:[{path, status, diff}]}; diff=false skips diffs, paths returns only those files; at most 10000 files, total is set when more were left out
     pub const GIT_CHANGES: &str = "git.changes";
+    /// {cwd} -> {branch, ahead, behind, changed} or null when not a git repo. One `git status --porcelain -b` with a
+    /// 2 s timeout, no diffs (the overview's project list)
+    pub const GIT_STATUS: &str = "git.status";
     /// {cwd, paths}: discard changes to these files
     pub const GIT_DISCARD: &str = "git.discard";
     /// {cwd, paths, message}: commit these files

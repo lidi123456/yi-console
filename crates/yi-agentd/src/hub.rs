@@ -135,6 +135,12 @@ struct SessionRt {
     limit_probing: Mutex<bool>,
     /// Terminal-mode process runs (memory only), for matching the tool session each run created (`guess_terminal_session`)
     runs: Mutex<Vec<TermRun>>,
+    /// Waiting approvals in arrival order; the first one is `info.pending`
+    pending_briefs: Mutex<Vec<PendingBrief>>,
+    /// Files edited in the current turn (`info.turn.files_changed` is its size)
+    turn_files: Mutex<HashSet<String>>,
+    /// Throttle for activity-only broadcasts: when the last one went out, and whether a trailing one is scheduled
+    activity_push: Mutex<(i64, bool)>,
 }
 
 /// One terminal-mode process run
@@ -354,6 +360,13 @@ impl Hub {
                 info.pending_permissions = 0;
                 let _ = self.store.save_session(&info);
             }
+            // The process that asked or was busy is gone
+            info.pending = None;
+            let stopped = info.updated_at;
+            if let Some(t) = &mut info.turn {
+                t.activity = None;
+                t.ended_at.get_or_insert(stopped);
+            }
             let rt = new_rt(info);
             *rt.queue.lock().unwrap() = queue;
             let id = rt.info.lock().unwrap().id.clone();
@@ -497,6 +510,8 @@ impl Hub {
             auto_resume: None,
             limit_hits: 0,
             computer_use: false,
+            pending: None,
+            turn: None,
         };
         self.store.save_session(&info)?;
         let rt = Arc::new(new_rt(info.clone()));
@@ -761,6 +776,11 @@ impl Hub {
                 self.running_tx(rt).ok_or_else(|| anyhow!("启动失败"))?
             }
         };
+        if info.mode == SessionMode::Structured {
+            // A turn starts with a message delivered to the tool (history imported on a mode switch starts none);
+            // the UserMessage emitted next saves and broadcasts it
+            begin_turn(rt, &mut rt.info.lock().unwrap(), now_ms());
+        }
         if info.mode == SessionMode::Terminal {
             // Typed into the terminal by the pty adapter, held until the program has finished starting
             tx.send(AdapterCmd::Send(Prompt { text: text.to_string(), images: vec![] }))
@@ -1023,12 +1043,16 @@ impl Hub {
             i.background_tasks.clear();
             i.auto_resume = None;
             i.limit_hits = 0;
+            i.pending = None;
+            i.turn = None;
             i.clone()
         };
         let _ = self.store.save_queue(id, "[]");
         *rt.resume_token.lock().unwrap() += 1;
         *rt.limited.lock().unwrap() = false;
         rt.pending.lock().unwrap().clear();
+        rt.pending_briefs.lock().unwrap().clear();
+        rt.turn_files.lock().unwrap().clear();
         rt.queue.lock().unwrap().clear();
         rt.term.lock().unwrap().clear();
         rt.last_text.lock().unwrap().clear();
@@ -1264,7 +1288,10 @@ impl Hub {
         info.queue_paused = None;
         info.restart_interrupted = false;
         info.background_tasks.clear();
+        info.pending = None;
+        info.turn = None;
         rt.pending.lock().unwrap().clear();
+        rt.pending_briefs.lock().unwrap().clear();
         rt.queue.lock().unwrap().clear();
         let _ = self.store.save_queue(id, "[]");
         rt.term.lock().unwrap().clear();
@@ -1916,6 +1943,51 @@ impl Hub {
         );
     }
 
+    /// Broadcast a turn activity change, at most once per `ACTIVITY_PUSH_MS` per session. A change inside the window
+    /// schedules one trailing broadcast, so the latest activity (often a long command) still shows up
+    fn push_activity(&self, rt: &Arc<SessionRt>, ts: i64) {
+        let wait = {
+            let mut p = rt.activity_push.lock().unwrap();
+            if ts - p.0 >= ACTIVITY_PUSH_MS {
+                p.0 = ts;
+                None
+            } else if p.1 {
+                return;
+            } else {
+                p.1 = true;
+                Some(ACTIVITY_PUSH_MS - (ts - p.0))
+            }
+        };
+        let Some(wait) = wait else {
+            let info = rt.info.lock().unwrap().clone();
+            self.broadcast_updated(&info);
+            return;
+        };
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            rt.activity_push.lock().unwrap().1 = false;
+            return;
+        };
+        let (bus, rt) = (self.bus.clone(), rt.clone());
+        handle.spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(wait.max(0) as u64)).await;
+            {
+                let mut p = rt.activity_push.lock().unwrap();
+                p.1 = false;
+                p.0 = now_ms();
+            }
+            // The session was deleted meanwhile (the map held the other reference): don't bring it back on clients
+            if Arc::strong_count(&rt) == 1 {
+                return;
+            }
+            let info = rt.info.lock().unwrap().clone();
+            let _ = bus.send(Arc::new(Outbound {
+                session_id: None,
+                method: methods::EV_SESSION_UPDATED,
+                params: serde_json::to_value(&info).unwrap_or(Value::Null),
+            }));
+        });
+    }
+
     // ---- Automatic continue after a usage limit (chat mode; the adapter reports `RateLimit { phase: "hit" }` before TurnEnd) ----
 
     /// The tool's turn failed on the usage limit
@@ -2190,6 +2262,8 @@ impl Hub {
 
         let mut notify: Option<(String, String)> = None;
         let mut limit_notice: Option<Value> = None;
+        // Only the turn's activity changed: broadcast (throttled) without saving
+        let mut activity = false;
         let (ev, info, changed) = {
             let mut info = rt.info.lock().unwrap();
             let mut changed = false;
@@ -2199,10 +2273,24 @@ impl Hub {
                         info.status = *status;
                         changed = true;
                     }
+                    // The process is gone: so is the turn it was running (the next message starts a new one)
+                    if matches!(status, SessionStatus::Exited | SessionStatus::Error) {
+                        if let Some(t) = info.turn.as_mut().filter(|t| t.activity.is_some() || t.ended_at.is_none()) {
+                            t.activity = None;
+                            t.ended_at.get_or_insert(ts);
+                            changed = true;
+                        }
+                    }
                 }
                 EventBody::PermissionRequest {
-                    request_id, title, questions, ..
+                    request_id, tool_name, title, input, options, questions,
                 } => {
+                    {
+                        let mut b = rt.pending_briefs.lock().unwrap();
+                        b.retain(|x| x.request_id != *request_id);
+                        b.push(pending_brief(request_id, tool_name, title, input, options, !questions.is_empty(), ts));
+                        info.pending = b.first().cloned();
+                    }
                     let mut p = rt.pending.lock().unwrap();
                     p.insert(request_id.clone());
                     info.pending_permissions = p.len() as u32;
@@ -2214,7 +2302,19 @@ impl Hub {
                         (format!("{} 在等你回答", display_name(&info)), questions[0].question.clone())
                     });
                 }
-                EventBody::PermissionResolved { request_id, .. } => {
+                EventBody::PermissionResolved { request_id, option_id, .. } => {
+                    {
+                        let mut b = rt.pending_briefs.lock().unwrap();
+                        // A reject option chosen (cancellations on interrupt and skipped questions don't count)
+                        let rejected = b.iter().find(|x| x.request_id == *request_id).filter(|x| {
+                            x.options.iter().any(|o| o.id == *option_id && o.kind.starts_with("reject"))
+                        });
+                        if let (Some(x), Some(t)) = (rejected, info.turn.as_mut().filter(|t| t.ended_at.is_none())) {
+                            t.rejected = Some(x.detail.clone().unwrap_or_else(|| x.title.clone()));
+                        }
+                        b.retain(|x| x.request_id != *request_id);
+                        info.pending = b.first().cloned();
+                    }
                     let mut p = rt.pending.lock().unwrap();
                     p.remove(request_id);
                     info.pending_permissions = p.len() as u32;
@@ -2239,6 +2339,15 @@ impl Hub {
                     }
                     changed = true;
                 }
+                // Only inside a turn that `deliver` started: imported history goes through here too
+                EventBody::ToolCall { name, title, diffs, .. } if info.turn.as_ref().is_some_and(|t| t.ended_at.is_none()) => {
+                    let t = info.turn.as_mut().unwrap();
+                    let mut files = rt.turn_files.lock().unwrap();
+                    files.extend(diffs.iter().filter(|d| !d.path.is_empty()).map(|d| d.path.clone()));
+                    t.files_changed = files.len() as u32;
+                    t.activity = Some(TurnActivity { name: name.clone(), title: one_line(title, 160), at: ts });
+                    activity = true;
+                }
                 EventBody::AssistantText { text, .. } => {
                     if !text.trim().is_empty() {
                         *rt.last_text.lock().unwrap() = text.clone();
@@ -2247,6 +2356,10 @@ impl Hub {
                 EventBody::TurnEnd { stop_reason, .. } => {
                     if !matches!(info.status, SessionStatus::Exited | SessionStatus::Error) {
                         info.status = SessionStatus::Idle;
+                    }
+                    if let Some(t) = &mut info.turn {
+                        t.ended_at.get_or_insert(ts);
+                        t.activity = None;
                     }
                     changed = true;
                     let what = match stop_reason.as_deref() {
@@ -2298,7 +2411,10 @@ impl Hub {
             json!({ "sessionId": sid, "event": ev }),
         );
         if changed {
+            rt.activity_push.lock().unwrap().0 = ts;
             self.broadcast_updated(&info);
+        } else if activity {
+            self.push_activity(&rt, ts);
         }
         // In-app notifications: the client decides whether to show them based on its own preferences
         if let Some((title, body)) = notify {
@@ -2451,6 +2567,61 @@ fn around(text: &str, q: &str, ctx: usize) -> String {
     s
 }
 
+/// Activity-only `session.updated` broadcasts go out at most this often per session
+const ACTIVITY_PUSH_MS: i64 = 5000;
+
+/// Start a new turn unless one is open (a message sent in the middle of a turn joins it)
+fn begin_turn(rt: &SessionRt, info: &mut SessionInfo, ts: i64) {
+    if info.turn.as_ref().map_or(true, |t| t.ended_at.is_some()) {
+        rt.turn_files.lock().unwrap().clear();
+        info.turn = Some(TurnInfo { started_at: ts, ..Default::default() });
+    }
+}
+
+/// First non-empty line, trimmed and truncated
+fn one_line(text: &str, max: usize) -> String {
+    truncate(text.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or(""), max)
+}
+
+/// The concrete thing an approval is about, from the request input: a command, else a file path, else a URL / pattern
+fn pending_detail(input: &Value) -> Option<(String, &'static str)> {
+    let cmd = match &input["command"] {
+        Value::String(c) => Some(c.clone()),
+        Value::Array(a) => Some(a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(" ")),
+        _ => None,
+    };
+    if let Some(c) = cmd.map(|c| crate::adapters::codex::strip_shell_wrapper(c.trim())).filter(|c| !c.trim().is_empty()) {
+        return Some((truncate(c.trim(), 300), "command"));
+    }
+    let first = |keys: &[&str]| keys.iter().find_map(|k| input[*k].as_str().map(str::trim).filter(|v| !v.is_empty()).map(str::to_string));
+    if let Some(p) = first(&["file_path", "path", "notebook_path"]) {
+        return Some((truncate(&p, 300), "file"));
+    }
+    first(&["url", "pattern", "query"]).map(|v| (truncate(&v, 300), "other"))
+}
+
+fn pending_brief(
+    request_id: &str,
+    tool_name: &str,
+    title: &str,
+    input: &Value,
+    options: &[PermissionOption],
+    question: bool,
+    at: i64,
+) -> PendingBrief {
+    let detail = if question { None } else { pending_detail(input) };
+    PendingBrief {
+        request_id: request_id.to_string(),
+        tool_name: tool_name.to_string(),
+        title: one_line(title, 200),
+        detail_kind: detail.as_ref().map(|d| d.1.to_string()),
+        detail: detail.map(|d| d.0),
+        at,
+        question,
+        options: if question { vec![] } else { options.to_vec() },
+    }
+}
+
 /// Notification body: strip Markdown markup, flatten into one line, truncate to max characters
 fn snippet(text: &str, max: usize) -> String {
     let one: String = text
@@ -2497,6 +2668,9 @@ fn new_rt(info: SessionInfo) -> SessionRt {
         limited: Mutex::new(false),
         limit_probing: Mutex::new(false),
         runs: Mutex::new(vec![]),
+        pending_briefs: Mutex::new(vec![]),
+        turn_files: Mutex::new(HashSet::new()),
+        activity_push: Mutex::new((0, false)),
     }
 }
 
@@ -2916,6 +3090,121 @@ mod tests {
         EventBody::AssistantText { id: t.into(), text: t.into() }
     }
 
+    fn updates(rx: &mut broadcast::Receiver<Arc<Outbound>>) -> Vec<SessionInfo> {
+        let mut out = vec![];
+        while let Ok(m) = rx.try_recv() {
+            if m.method == methods::EV_SESSION_UPDATED {
+                out.push(serde_json::from_value(m.params.clone()).unwrap());
+            }
+        }
+        out
+    }
+
+    fn tool_call(id: &str, name: &str, title: &str, files: &[&str]) -> EventBody {
+        EventBody::ToolCall {
+            id: id.into(),
+            name: name.into(),
+            title: title.into(),
+            input: Value::Null,
+            diffs: files.iter().map(|f| FileDiff { path: (*f).into(), old_text: None, new_text: None, unified: None }).collect(),
+        }
+    }
+
+    fn say(hub: &Arc<Hub>, text: &str) {
+        let rt = hub.get("s").unwrap();
+        let info = hub.info("s").unwrap();
+        hub.deliver(&rt, &info, text, vec![], vec![]).unwrap();
+    }
+
+    #[test]
+    fn turn_info_tracks_start_files_and_end() {
+        let (hub, em, _rx) = test_emitter();
+        // Imported history (user messages and tool calls emitted without `deliver`) starts no turn
+        em.event(user("old"));
+        em.event(tool_call("0", "Edit", "x.rs", &["/w/x.rs"]));
+        assert!(hub.info("s").unwrap().turn.is_none());
+
+        let mut bus = hub.bus.subscribe();
+        say(&hub, "go");
+        let t = hub.info("s").unwrap().turn.unwrap();
+        assert!(t.ended_at.is_none() && t.files_changed == 0);
+        let started = t.started_at;
+
+        em.event(tool_call("1", "Edit", "a.rs\nmore", &["/w/a.rs"]));
+        em.event(tool_call("2", "Edit", "a.rs", &["/w/a.rs", "/w/b.rs"]));
+        em.event(tool_call("3", "Bash", "cargo test", &[]));
+        let t = hub.info("s").unwrap().turn.unwrap();
+        assert_eq!(t.files_changed, 2);
+        assert_eq!(t.activity.as_ref().map(|a| (a.name.as_str(), a.title.as_str())), Some(("Bash", "cargo test")));
+        // Only the user message goes out: it restarts the throttle window, and the tool calls right after it fall
+        // inside (no runtime here, so no trailing broadcast either)
+        assert_eq!(updates(&mut bus).len(), 1);
+
+        em.event(EventBody::TurnEnd { stop_reason: None, model: None });
+        let t = hub.info("s").unwrap().turn.unwrap();
+        assert!(t.ended_at.is_some() && t.activity.is_none());
+        assert_eq!((t.started_at, t.files_changed), (started, 2));
+        assert!(updates(&mut bus).last().and_then(|i| i.turn.as_ref()).is_some_and(|t| t.ended_at.is_some()));
+
+        // The next message starts a new turn with a fresh file count
+        say(&hub, "again");
+        em.event(tool_call("4", "Edit", "c.rs", &["/w/c.rs"]));
+        let t = hub.info("s").unwrap().turn.unwrap();
+        assert!(t.ended_at.is_none());
+        assert_eq!(t.files_changed, 1);
+
+        // A process exit ends the turn, so the next message doesn't continue it
+        em.event(EventBody::Status { status: SessionStatus::Exited, message: None });
+        assert!(hub.info("s").unwrap().turn.unwrap().ended_at.is_some());
+    }
+
+    #[test]
+    fn pending_brief_follows_the_oldest_request() {
+        let (hub, em, _rx) = test_emitter();
+        let req = |id: &str, input: Value, questions: Vec<Question>| EventBody::PermissionRequest {
+            request_id: id.into(),
+            tool_name: "Bash".into(),
+            title: "Bash: run tests".into(),
+            input,
+            options: vec![PermissionOption { id: "allow_once".into(), label: "允许".into(), kind: "allow_once".into() }],
+            questions,
+        };
+        em.event(req("r1", json!({ "command": ["bash", "-lc", "cargo test -p relay"] }), vec![]));
+        em.event(req("r2", json!({ "file_path": "/w/a.rs" }), vec![]));
+        let p = hub.info("s").unwrap().pending.unwrap();
+        assert_eq!((p.request_id.as_str(), p.detail.as_deref(), p.detail_kind.as_deref()), ("r1", Some("cargo test -p relay"), Some("command")));
+        assert_eq!(p.options.len(), 1);
+
+        em.event(EventBody::PermissionResolved { request_id: "r1".into(), option_id: "allow_once".into(), answers: vec![] });
+        let p = hub.info("s").unwrap().pending.unwrap();
+        assert_eq!((p.request_id.as_str(), p.detail.as_deref(), p.detail_kind.as_deref()), ("r2", Some("/w/a.rs"), Some("file")));
+
+        em.event(EventBody::PermissionResolved { request_id: "r2".into(), option_id: "allow_once".into(), answers: vec![] });
+        assert!(hub.info("s").unwrap().pending.is_none());
+
+        // Inside a turn, choosing a reject option is remembered on the turn; allowing isn't
+        say(&hub, "go");
+        let mut r4 = req("r4", json!({ "command": "rm -rf build" }), vec![]);
+        if let EventBody::PermissionRequest { options, .. } = &mut r4 {
+            options.push(PermissionOption { id: "reject_once".into(), label: "拒绝".into(), kind: "reject_once".into() });
+        }
+        em.event(r4);
+        em.event(EventBody::PermissionResolved { request_id: "r4".into(), option_id: "reject_once".into(), answers: vec![] });
+        assert_eq!(hub.info("s").unwrap().turn.unwrap().rejected.as_deref(), Some("rm -rf build"));
+        // The next turn starts clean
+        em.event(EventBody::TurnEnd { stop_reason: None, model: None });
+        say(&hub, "again");
+        assert!(hub.info("s").unwrap().turn.unwrap().rejected.is_none());
+
+        // Questions carry no detail or options: they are answered on the session page
+        let q = Question {
+            id: "q".into(), header: String::new(), question: "Which?".into(), options: vec![], multi_select: false, allow_other: true, secret: false,
+        };
+        em.event(req("r3", json!({ "command": "x" }), vec![q]));
+        let p = hub.info("s").unwrap().pending.unwrap();
+        assert!(p.question && p.detail.is_none() && p.options.is_empty());
+    }
+
     #[test]
     fn after_users_skips_synced_turns() {
         let evs = vec![user("1"), reply("a"), user("2"), reply("b"), user("3"), reply("c")];
@@ -3023,6 +3312,8 @@ mod tests {
             auto_resume: None,
             limit_hits: 0,
             computer_use: false,
+            pending: None,
+            turn: None,
         };
         let rt = new_rt(info);
         let (tx, rx) = mpsc::unbounded_channel();

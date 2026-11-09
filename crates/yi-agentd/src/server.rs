@@ -329,6 +329,7 @@ pub async fn dispatch(
             let only: Option<Vec<String>> = p["paths"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect());
             tokio::task::spawn_blocking(move || crate::gitops::changes_with(&cwd, with_diff, only.as_deref())).await??
         }
+        GIT_STATUS => crate::statusline::git_info(s(&p, "cwd")?).await.unwrap_or(Value::Null),
         GIT_DISCARD => {
             let cwd = s(&p, "cwd")?.to_string();
             let paths: Vec<String> = serde_json::from_value(p["paths"].clone())?;

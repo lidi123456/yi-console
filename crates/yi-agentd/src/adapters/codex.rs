@@ -924,7 +924,7 @@ pub fn item_events(item: &Value, with_user: bool) -> Vec<EventBody> {
 }
 
 /// `/bin/bash -lc 'touch x'` -> `touch x`
-fn strip_shell_wrapper(cmd: &str) -> String {
+pub(crate) fn strip_shell_wrapper(cmd: &str) -> String {
     for prefix in ["/bin/bash -lc ", "bash -lc ", "/bin/zsh -lc ", "/bin/sh -c "] {
         if let Some(rest) = cmd.strip_prefix(prefix) {
             let r = rest.trim();

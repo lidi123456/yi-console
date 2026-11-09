@@ -64,7 +64,7 @@ pub async fn query(hub: &Arc<Hub>, sid: &str, want_git: bool) -> Result<Value> {
 }
 
 /// One `git status --porcelain -b` gives the branch, ahead/behind and changed file count
-async fn git_info(cwd: &str) -> Option<Value> {
+pub async fn git_info(cwd: &str) -> Option<Value> {
     if cwd.is_empty() || !Path::new(cwd).is_dir() {
         return None;
     }

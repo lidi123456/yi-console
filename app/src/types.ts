@@ -55,6 +55,42 @@ export interface SessionInfo {
   /** Usage limit hits in a row since the last normal turn end */
   limitHits?: number;
   computerUse?: boolean;
+  /** The oldest approval / question still waiting (overview board) */
+  pending?: PendingBrief;
+  /** The current or last chat turn (chat mode only) */
+  turn?: TurnInfo;
+}
+
+export interface PendingBrief {
+  requestId: string;
+  toolName: string;
+  title: string;
+  /** The concrete command or file path, truncated */
+  detail?: string;
+  detailKind?: 'command' | 'file' | 'other' | string;
+  at: number;
+  /** Asks questions: answered on the session page */
+  question?: boolean;
+  options?: PermissionOption[];
+}
+
+export interface TurnInfo {
+  startedAt: number;
+  endedAt?: number;
+  /** Distinct files the tool reported editing in this turn */
+  filesChanged?: number;
+  /** Latest tool call of a running turn (broadcast at most every 5 s) */
+  activity?: { name: string; title: string; at: number };
+  /** The last approval the user rejected in this turn (command / path / title) */
+  rejected?: string;
+}
+
+/** git.status */
+export interface GitStatus {
+  branch: string;
+  ahead: number;
+  behind: number;
+  changed: number;
 }
 
 export interface AutoResume {

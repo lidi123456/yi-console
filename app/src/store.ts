@@ -6,6 +6,7 @@ import { useSyncExternalStore } from 'react';
 import { getLang, getT, onLangChange, trErr } from './i18n';
 import { fmtAt } from './limit';
 import { hubCall, onHubEvent, rpc, isTauri } from './transport';
+import { markSeen, recordChange } from './overview';
 import type { ClientSettings, HostConfig, HostStatus, HubEvent, NotifyPrefs, SessionInfo, Snippet, ToolInfo, ToolJob, ToolKind } from './types';
 
 const t = getT('store');
@@ -385,6 +386,8 @@ function reportLang(hostId: string) {
 export async function refreshSessions(hostId: string) {
   try {
     const list = await rpc<SessionInfo[]>(hostId, 'session.list');
+    const before = new Map((state.sessions[hostId] ?? []).map((x) => [x.id, x]));
+    for (const x of list) recordChange(hostId, before.get(x.id), x);
     setState((s) => ({ sessions: { ...s.sessions, [hostId]: list } }));
   } catch {
     /* host not connected */
@@ -392,6 +395,7 @@ export async function refreshSessions(hostId: string) {
 }
 
 function upsertSession(hostId: string, info: SessionInfo) {
+  recordChange(hostId, state.sessions[hostId]?.find((x) => x.id === info.id), info);
   setState((s) => {
     const list = [...(s.sessions[hostId] ?? [])];
     const i = list.findIndex((x) => x.id === info.id);
@@ -633,6 +637,8 @@ export function replaceView(view: View) {
 }
 
 function show(view: View) {
+  // A turn that ended while its session was open, or that the user opens now, has been seen (overview board)
+  markSeen([state.view, view].flatMap((v) => (v.kind === 'session' ? [{ hostId: v.hostId, sessionId: v.sessionId }] : [])));
   setState({ view, sidebarOpen: false, palette: false });
   try {
     const { seq: _seq, ...keep } = view as View & { seq?: number };

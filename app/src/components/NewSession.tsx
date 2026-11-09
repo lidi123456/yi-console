@@ -106,22 +106,22 @@ export function DirPicker({
 }
 
 /** Last choices per tool when creating a session: UI, permission mode, model, thinking level (stored in localStorage `new-session-prefs`) */
-type ToolPrefs = { mode?: 'structured' | 'terminal'; perm?: string; model?: string; effort?: string };
-const PREFS_KEY = 'new-session-prefs';
+export type ToolPrefs = { mode?: 'structured' | 'terminal'; perm?: string; model?: string; effort?: string };
+export const PREFS_KEY = 'new-session-prefs';
 const RECENT_KEY = 'recent-dirs';
 const RECENT_MAX = 8;
 /** At most this many directories in the directory menu (recent ones first, then those of existing sessions) */
 const DIR_MENU_MAX = 10;
 
 /** Directories used recently on a host, newest first (localStorage `recent-dirs`; falls back to the single `recent-cwd` older versions kept) */
-function recentDirs(hostId: string): string[] {
+export function recentDirs(hostId: string): string[] {
   const all = lsGet<Record<string, string[]>>(RECENT_KEY, {});
   if (all[hostId]) return all[hostId];
   const old = lsGet<Record<string, string>>('recent-cwd', {})[hostId];
   return old ? [old] : [];
 }
 
-function rememberDir(hostId: string, dir: string) {
+export function rememberDir(hostId: string, dir: string) {
   const all = lsGet<Record<string, string[]>>(RECENT_KEY, {});
   all[hostId] = [dir, ...recentDirs(hostId).filter((d) => d !== dir)].slice(0, RECENT_MAX);
   lsSet(RECENT_KEY, all);

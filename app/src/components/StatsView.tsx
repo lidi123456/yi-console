@@ -22,7 +22,7 @@ export const errText = (e: unknown) => {
   return m.includes('未知方法') ? tx('thisHostSDaemonIs') : m;
 };
 
-const TOOL_VAR: Record<string, string> = {
+export const TOOL_VAR: Record<string, string> = {
   claude: 'var(--c-claude)',
   codex: 'var(--c-codex)',
   cursor: 'var(--c-cursor)',
@@ -32,7 +32,7 @@ const TOOL_VAR: Record<string, string> = {
   shell: 'var(--c-shell)',
 };
 
-const QUOTA_TOOLS: ToolKind[] = ['claude', 'codex', 'cursor', 'kiro', 'qoder', 'codebuddy'];
+export const QUOTA_TOOLS: ToolKind[] = ['claude', 'codex', 'cursor', 'kiro', 'qoder', 'codebuddy'];
 
 const fmtReset = (v: number | string | null | undefined) => {
   if (v == null) return '';
@@ -83,7 +83,7 @@ export function QuotaBody({ q }: { q: Quota | string | undefined }) {
 }
 
 /** Account quotas of each tool. One request per tool, shown as each returns (the first time starts the tool briefly, a few seconds) */
-function QuotaCard({ hostId }: { hostId: string }) {
+export function QuotaCard({ hostId }: { hostId: string }) {
   const hello = useStore((s) => s.hosts.find((h) => h.config.id === hostId)?.status.hello);
   const tools = useMemo(
     () => QUOTA_TOOLS.filter((k) => hello?.tools.some((t) => t.kind === k && t.available)),
