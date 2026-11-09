@@ -640,20 +640,30 @@ fn codebuddy_call(base: &str, path: &str, token: &str, ent_id: Option<&str>) -> 
     let url = format!("{base}{path}");
     let mut req = ureq::post(&url)
         .header("Content-Type", "application/json")
+        .header("Accept", "application/json")
+        // copilot.tencent.com answers `User-Agent: ureq/…` with HTTP 403 / code 10085 (请求不合法) and no quota body.
+        .header("User-Agent", "codebuddy-code")
         .header("Authorization", &format!("Bearer {token}"));
     if let Some(eid) = ent_id.filter(|s| !s.is_empty()) {
         req = req.header("X-Enterprise-Id", eid);
     }
+    // Read the JSON error body. A 403 from this gateway is not always an expired login.
     let mut resp = req
         .config()
+        .http_status_as_error(false)
         .timeout_global(Some(Duration::from_secs(15)))
         .build()
-        .send(&b"{}"[..])
-        .map_err(|e| match e {
-            ureq::Error::StatusCode(401 | 403) => anyhow!("登录已过期，请运行一次 codebuddy 重新登录"),
-            e => anyhow!("{e}"),
-        })?;
-    Ok(serde_json::from_str(&resp.body_mut().read_to_string()?)?)
+        .send(&b"{}"[..])?;
+    let status = resp.status().as_u16();
+    let v: Value = serde_json::from_str(&resp.body_mut().read_to_string()?)
+        .map_err(|_| anyhow!("后台返回的不是额度数据"))?;
+    if status == 401 || (status == 403 && v["msg"].as_str().unwrap_or("").is_empty()) {
+        bail!("登录已过期，请运行一次 codebuddy 重新登录");
+    }
+    if !(200..300).contains(&status) || v["data"].is_null() {
+        bail!("{}", v["msg"].as_str().unwrap_or("后台没有返回额度数据"));
+    }
+    Ok(v)
 }
 
 fn codebuddy_usage(user: &Value) -> Result<Value> {
@@ -671,10 +681,7 @@ fn codebuddy_usage(user: &Value) -> Result<Value> {
     let ent = ent_id
         .and_then(|eid| codebuddy_call(base, "/billing/meter/get-enterprise-user-usage", token, Some(eid)).ok())
         .unwrap_or(Value::Null);
-    let summary = codebuddy_call(base, "/billing/meter/get-user-resource-summary", token, ent_id).unwrap_or(Value::Null);
-    if ent["data"].is_null() && summary["data"].is_null() {
-        bail!("后台没有返回额度数据");
-    }
+    let summary = codebuddy_call(base, "/billing/meter/get-user-resource-summary", token, ent_id)?;
     Ok(codebuddy_quota(user, &summary, &ent))
 }
 
