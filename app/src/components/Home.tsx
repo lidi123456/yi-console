@@ -363,21 +363,25 @@ function Column({
           {col === 'attn' ? t('emptyAttn') : col === 'run' ? t('emptyRun') : col === 'review' ? t('emptyReview') : t('emptyRest')}
         </div>
       )}
-      {list.map((x) =>
-        col === 'attn' ? (
-          <AttnCard key={x.hostId + x.s.id} x={x} multi={multi} />
-        ) : col === 'run' ? (
-          <RunCard key={x.hostId + x.s.id} x={x} multi={multi} now={now} />
-        ) : col === 'review' ? (
-          <ReviewCard key={x.hostId + x.s.id} x={x} multi={multi} />
-        ) : (
-          <MiniRow key={x.hostId + x.s.id} x={x} />
-        ),
-      )}
-      {rest && items.length > REST_SHOWN && (
-        <button className="ov-more" onClick={() => setAll(!all)}>
-          {all ? t('showLess') : t('showAll', { n: items.length })}
-        </button>
+      {list.length > 0 && (
+        <div className="ov-col-list">
+          {list.map((x) =>
+            col === 'attn' ? (
+              <AttnCard key={x.hostId + x.s.id} x={x} multi={multi} />
+            ) : col === 'run' ? (
+              <RunCard key={x.hostId + x.s.id} x={x} multi={multi} now={now} />
+            ) : col === 'review' ? (
+              <ReviewCard key={x.hostId + x.s.id} x={x} multi={multi} />
+            ) : (
+              <MiniRow key={x.hostId + x.s.id} x={x} />
+            ),
+          )}
+          {rest && items.length > REST_SHOWN && (
+            <button className="ov-more" onClick={() => setAll(!all)}>
+              {all ? t('showLess') : t('showAll', { n: items.length })}
+            </button>
+          )}
+        </div>
       )}
     </section>
   );

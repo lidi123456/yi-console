@@ -9275,6 +9275,23 @@ button.wp-commit-title .chev {
   min-width: 0;
 }
 
+/* Cards scroll inside the column past this height, so a busy column doesn't push the panels below off screen.
+   The padding keeps card shadows and focus rings from being clipped */
+.ov-col-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: max(320px, calc(100vh - 420px));
+  overflow-y: auto;
+  margin: -2px;
+  padding: 2px;
+}
+
+/* Flex items would shrink to fit the max height instead of overflowing */
+.ov-col-list > * {
+  flex-shrink: 0;
+}
+
 .ov-col-attn {
   background: color-mix(in srgb, var(--warn) 7%, var(--bg-2));
 }
@@ -9956,6 +9973,12 @@ button.wp-commit-title .chev {
 
   .ov-col-h {
     display: none;
+  }
+
+  /* Phone: one column per tab, the page itself scrolls */
+  .ov-col-list {
+    max-height: none;
+    overflow: visible;
   }
 
   .ov-col-review.ov-show .ov-col-h {
