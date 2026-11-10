@@ -418,12 +418,15 @@ export function Composer({
   // ---------- Sending ----------
   /** Insert text at the cursor (padding with spaces on both sides) */
   const insertAtCaret = (s: string) => {
+    // Called after an upload finishes, from a closure made before it started: `text` here may be stale (the user
+    // typed meanwhile), so take the current value from the textarea, falling back to the state
     const el = ta.current;
-    const a = el?.selectionStart ?? text.length;
-    const b = el?.selectionEnd ?? text.length;
-    const pre = text.slice(0, a);
+    const cur = el ? el.value : text;
+    const a = Math.min(el?.selectionStart ?? cur.length, cur.length);
+    const b = Math.min(el?.selectionEnd ?? cur.length, cur.length);
+    const pre = cur.slice(0, a);
     const ins = (pre && !/\s$/.test(pre) ? ' ' : '') + s;
-    setText(pre + ins + text.slice(b));
+    setText(pre + ins + cur.slice(b));
     const pos = a + ins.length;
     requestAnimationFrame(() => {
       el?.focus();

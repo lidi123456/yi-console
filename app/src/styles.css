@@ -9315,6 +9315,11 @@ button.wp-commit-title .chev {
   flex-shrink: 0;
 }
 
+/* The idle / ended column expanded: about ten rows, then it scrolls */
+.ov-col-list-all {
+  max-height: min(400px, max(320px, calc(100vh - 420px)));
+}
+
 .ov-col-attn {
   background: color-mix(in srgb, var(--warn) 7%, var(--bg-2));
 }
@@ -9999,7 +10004,8 @@ button.wp-commit-title .chev {
   }
 
   /* Phone: one column per tab, the page itself scrolls */
-  .ov-col-list {
+  .ov-col-list,
+  .ov-col-list-all {
     max-height: none;
     overflow: visible;
   }

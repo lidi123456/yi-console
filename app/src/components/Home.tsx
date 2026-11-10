@@ -366,7 +366,7 @@ function Column({
         </div>
       )}
       {list.length > 0 && (
-        <div className="ov-col-list">
+        <div className={`ov-col-list${rest && all ? ' ov-col-list-all' : ''}`}>
           {list.map((x) =>
             col === 'attn' ? (
               <AttnCard key={x.hostId + x.s.id} x={x} multi={multi} />
@@ -378,12 +378,13 @@ function Column({
               <MiniRow key={x.hostId + x.s.id} x={x} />
             ),
           )}
-          {rest && items.length > REST_SHOWN && (
-            <button className="ov-more" onClick={() => setAll(!all)}>
-              {all ? t('showLess') : t('showAll', { n: items.length })}
-            </button>
-          )}
         </div>
+      )}
+      {/* Outside the list so it stays in view while the expanded list scrolls */}
+      {rest && items.length > REST_SHOWN && (
+        <button className="ov-more" onClick={() => setAll(!all)}>
+          {all ? t('showLess') : t('showAll', { n: items.length })}
+        </button>
       )}
     </section>
   );
