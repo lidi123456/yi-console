@@ -123,17 +123,24 @@ function buildItems(events: HubEvent[], hideCompactCmd = false): Item[] {
     switch (e.kind) {
       case 'computer_use': {
         // A desktop action is the AI tool's own MCP call seen from the gateway: fold it into that tool row
-        // (OpenBot shows them as ordinary tool steps). Unmatched ones are control changes or manual captures.
+        // (OpenBot shows them as ordinary tool steps). Match by server and tool name first; otherwise take the
+        // latest call of this turn still waiting for its result, since the gateway action runs inside it
+        // (CodeBuddy calls MCP tools through a DeferExecuteTool wrapper whose name and input don't say which).
+        // Unmatched ones are control changes or manual captures.
         let tool = desktopTools.get(e.actionId);
         if (!tool && e.status !== 'control') {
+          let pending: (Item & { k: 'tool' }) | undefined;
           for (let i = items.length - 1; i >= 0; i--) {
             const it = items[i];
             if (it.k === 'user') break;
-            if (it.k === 'tool' && !it.desktop && isDesktopTool(it, e.tool)) {
+            if (it.k !== 'tool' || it.desktop) continue;
+            if (isDesktopTool(it, e.tool)) {
               tool = it;
               break;
             }
+            if (!it.result) pending ??= it;
           }
+          tool ??= pending;
         }
         if (tool) {
           tool.desktop = e;
