@@ -283,6 +283,14 @@ fn handle(st: &mut State, v: &Value, em: &Emitter) -> Vec<Value> {
                     if let Some(t) = task_notice(&st.tasks, v) {
                         em.event(EventBody::System { text: t });
                     }
+                    // Normally a background_tasks_changed follows, but don't count on it: an ended task leaves the list now
+                    if matches!(v["status"].as_str(), Some("completed" | "failed" | "stopped" | "killed")) {
+                        let n = st.tasks.len();
+                        st.tasks.retain(|t| Some(t.id.as_str()) != v["task_id"].as_str());
+                        if st.tasks.len() != n {
+                            em.background_tasks(st.tasks.clone());
+                        }
+                    }
                 }
                 "compact_boundary" => {
                     st.compacting = false;

@@ -385,8 +385,10 @@ impl Hub {
                 info.pending_permissions = 0;
                 let _ = self.store.save_session(&info);
             }
-            // The process that asked or was busy is gone
+            // The process that asked or was busy is gone, and its background tasks with it (they were saved with the
+            // info; a resumed tool only sends task_notification for them, not another background_tasks_changed)
             info.pending = None;
+            info.background_tasks.clear();
             let stopped = info.updated_at;
             if let Some(t) = &mut info.turn {
                 t.activity = None;
