@@ -14,7 +14,7 @@ import { type Attached, FILE_MAX, IMAGE_TYPES, localPaths, readImage, refOf, upl
 import type { Item } from './Home';
 import { Icon, ToolBadge } from './Icon';
 import { openImage } from './Lightbox';
-import { DirPicker, PREFS_KEY, recentDirs, rememberDir, type ToolPrefs } from './NewSession';
+import { DirPicker, PREFS_KEY, prefModel, recentDirs, rememberDir, type ToolPrefs } from './NewSession';
 import { openMenu, type MenuItem } from './Overlay';
 import { showChanges } from './SessionActions';
 import { QUOTA_TOOLS, QuotaCard, TOOL_VAR } from './StatsView';
@@ -101,8 +101,10 @@ async function startSession(
       images: later || !images.length ? undefined : images,
       permissionMode: permModes(d.tool, 'structured').some((m) => m[0] === d.perm) ? d.perm : 'default',
       // The model and thinking level last chosen for this tool on the new session page
-      model: prefs.model || undefined,
+      model: prefModel(prefs) || undefined,
       effort: prefs.model ? prefs.effort || undefined : undefined,
+      // Cursor parameters chosen there; the host drops the ones the model lacks
+      modelConfig: d.tool === 'cursor' && prefModel(prefs) ? prefs.config : undefined,
       cols: 120,
       rows: 32,
     });

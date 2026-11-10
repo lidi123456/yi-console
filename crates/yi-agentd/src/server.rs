@@ -455,6 +455,11 @@ pub async fn dispatch(
                 serde_json::to_value(cached)?
             }
         }
+        TOOLS_MODEL_CONFIG => {
+            let model = s(&p, "model")?;
+            if model.is_empty() { return Err(anyhow!("缺少模型")); }
+            serde_json::to_value(hub.model_config_for(model, p["cwd"].as_str().unwrap_or("")).await?)?
+        }
         TOOLS_LATEST => {
             let hub2 = hub.clone();
             let refresh = p["refresh"].as_bool().unwrap_or(false);

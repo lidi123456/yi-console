@@ -241,6 +241,8 @@ pub struct Hub {
     tool_models: Mutex<HashMap<String, Vec<ModelOption>>>,
     /// Each tool's most recently reported slash commands (memory only)
     tool_commands: Mutex<HashMap<String, Vec<SlashCommand>>>,
+    /// Cursor models whose cached "no parameters" was confirmed by Cursor since this daemon started (see `stored_config`)
+    config_checked: Mutex<HashSet<String>>,
 }
 
 #[derive(Debug, Clone, Default, serde::Deserialize)]
@@ -280,6 +282,9 @@ pub struct CreateParams {
     /// Continue with another tool: the session this one takes over from (see `hand_over`)
     #[serde(default)]
     pub handoff_from: Option<String>,
+    /// Cursor model parameters chosen on the new session page {id: value}; ids or values the model lacks are dropped
+    #[serde(default)]
+    pub model_config: HashMap<String, String>,
 }
 
 impl Hub {
@@ -299,6 +304,7 @@ impl Hub {
                     .unwrap_or_default(),
             ),
             tool_commands: Mutex::new(HashMap::new()),
+            config_checked: Mutex::new(HashSet::new()),
         });
         hub.restore();
         hub
@@ -321,10 +327,12 @@ impl Hub {
         let mut map = self.sessions.lock().unwrap();
         for mut info in list {
             info.model_config_pending = false;
-            // Sessions from before the parameter cache (or not started since) take the cached parameters
+            // Sessions from before the parameter cache (or not started since) take the cached parameters; an old
+            // `model[k=v,…]` string becomes the model once its values are in them
             if info.tool == ToolKind::Cursor && info.model_config_options.is_empty() {
                 if let Some(options) = info.model.as_deref().and_then(|m| self.cached_config(m)) {
                     info.model_config_options = options;
+                    info.model = info.model.as_deref().map(|m| base_model(m).to_string());
                 }
             }
             let queue = queues
@@ -475,6 +483,16 @@ impl Hub {
             bail!("目录不存在: {}", cwd.display());
         }
         let now = now_ms();
+        // Cursor: an old `model[k=v,…]` string is split into the model and its values, so the session (and what it
+        // shows) carries only the model; the values chosen on the new session page go on top
+        let cursor = tool == ToolKind::Cursor;
+        let mut config = if cursor { p.model.as_deref().and_then(|m| self.cached_config(m)) } else { None };
+        for o in config.iter_mut().flatten() {
+            if let Some(v) = p.model_config.get(&o.id).filter(|v| o.options.iter().any(|c| &c.value == *v)) {
+                o.current_value = v.clone();
+            }
+        }
+        let model = p.model.as_deref().map(|m| if cursor { base_model(m) } else { m }).filter(|m| !m.is_empty()).map(str::to_string);
         let info = SessionInfo {
             id: uuid::Uuid::new_v4().to_string(),
             tool,
@@ -488,7 +506,9 @@ impl Hub {
             last_seq: 0,
             pending_permissions: 0,
             usage: Usage::default(),
-            model: p.model.clone(),
+            model_config_pending: cursor && mode == SessionMode::Structured && model.is_some() && config.is_none(),
+            model_config_options: config.unwrap_or_default(),
+            model,
             command: p.command.clone(),
             context_percent: None,
             permission_mode: p
@@ -496,10 +516,6 @@ impl Hub {
                 .clone()
                 .filter(|m| permission_modes(tool, mode).contains(&m.as_str())),
             effort: p.effort.clone().filter(|e| !e.is_empty()),
-            model_config_options: if tool == ToolKind::Cursor { p.model.as_deref().and_then(|m| self.cached_config(m)).unwrap_or_default() } else { vec![] },
-            // Only a model whose parameters aren't known yet waits; the process reads them when it switches to it
-            model_config_pending: tool == ToolKind::Cursor && mode == SessionMode::Structured
-                && p.model.as_deref().is_some_and(|m| self.cached_config(m).is_none()),
             pinned: false,
             queued: vec![],
             queue_paused: None,
@@ -906,7 +922,7 @@ impl Hub {
             let mut discover = false;
             let mut carried = vec![];
             if cursor {
-                let mut cached = (!model.is_empty()).then(|| self.store.model_config(base_model(model)).ok().flatten()).flatten();
+                let mut cached = (!model.is_empty()).then(|| self.stored_config(base_model(model))).flatten();
                 // Values the new model also offers carry over (Fast from one Grok to another); the rest start at the default
                 for o in cached.iter_mut().flatten() {
                     let old = i.model_config_options.iter().find(|p| p.id == o.id || p.category == "thought_level" && o.category == "thought_level");
@@ -938,16 +954,46 @@ impl Hub {
 
     /// Cached Cursor parameters for a model; parameters written into an old model string become the values
     fn cached_config(&self, model: &str) -> Option<Vec<ModelConfigOption>> {
-        let mut options = self.store.model_config(base_model(model)).ok().flatten()?;
-        if let Some(params) = model.split_once('[').map(|(_, p)| p.trim_end_matches(']')) {
-            for (id, value) in params.split(',').filter_map(|p| p.split_once('=')).map(|(k, v)| (k.trim(), v.trim())) {
-                let alias = matches!(id, "reasoning" | "reasoning_effort" | "effort");
-                if let Some(o) = options.iter_mut().find(|o| o.id == id || alias && o.category == "thought_level") {
-                    if o.options.iter().any(|c| c.value == value) { o.current_value = value.into(); }
-                }
+        let mut options = self.stored_config(base_model(model))?;
+        for (id, value) in legacy_params(model) {
+            if let Some(o) = options.iter_mut().find(|o| o.id == id || is_effort_alias(&id) && o.category == "thought_level") {
+                if o.options.iter().any(|c| c.value == value) { o.current_value = value; }
             }
         }
         Some(options)
+    }
+
+    /// A model's cached parameters. "No parameters" counts only once Cursor said so again since this daemon started:
+    /// an answer cut short (Cursor fetches the model list from its server on every switch) once cached that for
+    /// grok-4.7, and nothing asked again
+    fn stored_config(&self, model: &str) -> Option<Vec<ModelConfigOption>> {
+        let options = self.store.model_config(model).ok().flatten()?;
+        if options.is_empty() && !self.config_checked.lock().unwrap().contains(model) { return None; }
+        Some(options)
+    }
+
+    /// Cache what Cursor reported for a model. An empty list never replaces known parameters: models don't lose
+    /// them, answers do get cut short
+    fn save_config(&self, model: &str, options: &[ModelConfigOption]) {
+        if options.is_empty() && self.store.model_config(model).ok().flatten().is_some_and(|o| !o.is_empty()) {
+            crate::warn!("Cursor reported no parameters for {model}; keeping the cached ones");
+            return;
+        }
+        let _ = self.store.save_model_config(model, options);
+        self.config_checked.lock().unwrap().insert(model.to_string());
+    }
+
+    /// Parameters of a Cursor model for the new session page: from the cache, else asked from a short-lived
+    /// Cursor process in `cwd` (several seconds)
+    pub async fn model_config_for(self: &Arc<Self>, model: &str, cwd: &str) -> Result<Vec<ModelConfigOption>> {
+        let model = base_model(model);
+        if let Some(options) = self.stored_config(model) { return Ok(options); }
+        let cwd = Some(crate::paths::expand(cwd)).filter(|p| p.is_dir()).unwrap_or_else(crate::paths::home);
+        let settings = self.settings.read().unwrap().clone();
+        let options = crate::probe::cursor_model_config(&settings, model, &cwd).await?;
+        self.save_config(model, &options);
+        self.model_config_known(model, None);
+        Ok(self.stored_config(model).unwrap_or(options))
     }
 
     /// Ask a short-lived Cursor process for a model's parameters, for a session whose process isn't running
@@ -963,7 +1009,7 @@ impl Hub {
             RUNNING.lock().unwrap().get_or_insert_with(HashSet::new).remove(&model);
             match found {
                 Ok(options) => {
-                    let _ = hub.store.save_model_config(&model, &options);
+                    hub.save_config(&model, &options);
                     hub.model_config_known(&model, None);
                 }
                 Err(e) => {
@@ -984,6 +1030,7 @@ impl Hub {
                 if !i.model_config_pending && !i.model_config_options.is_empty() { continue; }
                 let options = if failed.is_none() { i.model.as_deref().and_then(|m| self.cached_config(m)).unwrap_or_default() } else { vec![] };
                 if !i.model_config_pending && options.is_empty() { continue; }
+                if !options.is_empty() { i.model = Some(model.to_string()); }
                 i.model_config_options = options;
                 i.model_config_pending = false;
                 i.clone()
@@ -2729,6 +2776,18 @@ fn base_model(model: &str) -> &str {
     model.split('[').next().unwrap_or(model)
 }
 
+/// `grok-4.7[context=256k,fast=true]` -> [(context, 256k), (fast, true)]
+fn legacy_params(model: &str) -> Vec<(String, String)> {
+    let Some((_, params)) = model.split_once('[') else { return vec![] };
+    params.trim_end_matches(']').split(',').filter_map(|p| p.split_once('='))
+        .map(|(k, v)| (k.trim().to_string(), v.trim().to_string())).collect()
+}
+
+/// The old model string used `reasoning_effort` for every model; Cursor now names the reasoning control per model
+fn is_effort_alias(id: &str) -> bool {
+    matches!(id, "reasoning" | "reasoning_effort" | "effort")
+}
+
 #[cfg(test)]
 pub(crate) fn test_set_tool(hub: &Hub, id: &str, tool: ToolKind) {
     hub.get(id).unwrap().info.lock().unwrap().tool = tool;
@@ -2847,18 +2906,22 @@ impl Emitter {
     /// an answer for another model (a late one, after the user picked again) only fills the cache
     pub fn model_config_confirmed(&self, model: &str, options: Vec<ModelConfigOption>) {
         if self.hub.alive(&self.sid, self.gen).is_none() { return; }
-        let _ = self.hub.store.save_model_config(model, &options);
+        self.hub.save_config(model, &options);
         self.hub.set_info(&self.sid, self.gen, |i| {
             if i.model.as_deref().filter(|m| !m.is_empty()).map(base_model).is_some_and(|t| t != model) { return false; }
+            // An old `model[k=v,…]` string: its values count as the user's, and the session keeps just the model
+            let legacy = i.model.as_deref().map(legacy_params).unwrap_or_default();
             let merged: Vec<_> = options.into_iter().map(|mut o| {
-                if let Some(mine) = i.model_config_options.iter().find(|m| m.id == o.id).map(|m| &m.current_value)
-                    .filter(|v| !v.is_empty() && o.options.iter().any(|c| &c.value == *v)) {
-                    o.current_value = mine.clone();
+                let mine = i.model_config_options.iter().find(|m| m.id == o.id).map(|m| m.current_value.clone()).filter(|v| !v.is_empty())
+                    .or_else(|| legacy.iter().find(|(k, _)| *k == o.id || is_effort_alias(k) && o.category == "thought_level").map(|(_, v)| v.clone()));
+                if let Some(mine) = mine.filter(|v| o.options.iter().any(|c| &c.value == v)) {
+                    o.current_value = mine;
                 }
                 o
             }).collect();
-            if i.model.is_some() && i.model_config_options == merged && !i.model_config_pending { return false; }
-            if i.model.as_deref().map_or(true, str::is_empty) { i.model = Some(model.into()); }
+            let legacy_name = i.model.as_deref().is_some_and(|m| m.contains('['));
+            if i.model.is_some() && !legacy_name && i.model_config_options == merged && !i.model_config_pending { return false; }
+            if i.model.as_deref().map_or(true, str::is_empty) || legacy_name { i.model = Some(model.into()); }
             i.model_config_options = merged;
             i.model_config_pending = false;
             true
@@ -3261,6 +3324,9 @@ mod tests {
         assert_eq!(hub.store.model_config("grok-4.7").unwrap().unwrap()[0].current_value, "");
         em.model_config_confirmed("composer-2.5", vec![]);
         assert_eq!(hub.store.model_config("composer-2.5").unwrap(), Some(vec![]));
+        // An empty answer never replaces known parameters
+        em.model_config_confirmed("grok-4.7", vec![]);
+        assert_eq!(hub.store.model_config("grok-4.7").unwrap().unwrap().len(), 2);
         // Old model strings carry their values into the cached parameters
         let legacy = hub.cached_config("grok-4.7[context=500k,fast=true]").unwrap();
         assert_eq!(legacy.iter().map(|o| o.current_value.as_str()).collect::<Vec<_>>(), ["true", "500k"]);
@@ -3513,6 +3579,33 @@ mod tests {
             hub.cancel_resume("s", "user");
         }
         assert!(limit_phases(&hub, "s").last().unwrap() == "skipped:repeated");
+    }
+
+    #[test]
+    fn cursor_cache_rechecks_no_parameters_and_old_model_strings_split() {
+        let (hub, em, _rx) = test_emitter();
+        let opt = |id: &str, values: &[&str]| ModelConfigOption {
+            id: id.into(), name: id.into(), category: if id == "reasoning" { "thought_level" } else { "model_config" }.into(),
+            description: String::new(), current_value: String::new(),
+            options: values.iter().map(|v| yi_proto::ModelConfigValue { value: (*v).into(), name: (*v).into() }).collect(),
+        };
+        // "No parameters" left by an earlier daemon is asked again before it counts
+        hub.store.save_model_config("grok-4.7", &[]).unwrap();
+        assert!(hub.cached_config("grok-4.7").is_none());
+        hub.save_config("composer-2.5", &[]);
+        assert_eq!(hub.cached_config("composer-2.5"), Some(vec![]));
+        // A session on an old `model[k=v,…]` string keeps just the model once Cursor answers; the string's values are kept
+        {
+            let rt = hub.get("s").unwrap();
+            let mut i = rt.info.lock().unwrap();
+            i.tool = ToolKind::Cursor;
+            i.model = Some("grok-4.7[context=256k,reasoning_effort=high,fast=true]".into());
+        }
+        em.model_config_confirmed("grok-4.7", vec![opt("fast", &["false", "true"]), opt("reasoning", &["low", "high"]), opt("context", &["256k", "500k"])]);
+        let i = hub.info("s").unwrap();
+        assert_eq!(i.model.as_deref(), Some("grok-4.7"));
+        assert_eq!(i.model_config_options.iter().map(|o| o.current_value.as_str()).collect::<Vec<_>>(), ["true", "high", "256k"]);
+        assert_eq!(hub.cached_config("grok-4.7").unwrap().len(), 3);
     }
 
     #[tokio::test]

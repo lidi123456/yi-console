@@ -925,6 +925,9 @@ pub mod methods {
     pub const SESSION_LOG_FILE: &str = "session.logFile";
     /// Models a tool offers (for new sessions) {tool} -> [ModelOption]
     pub const TOOLS_MODELS: &str = "tools.models";
+    /// Cursor model parameters for the new session page {model, cwd?} -> [ModelConfigOption]: cached, else read from a
+    /// short-lived Cursor process (several seconds); an empty list is a model without parameters
+    pub const TOOLS_MODEL_CONFIG: &str = "tools.modelConfig";
     /// Tool account quota {tool, refresh?}
     pub const TOOLS_QUOTA: &str = "tools.quota";
     /// {refresh?} -> {tools: {<tool>: {latest?, error?, via?, canUpdate}}, jobs: {<tool>: ToolJob}, info: [ToolInfo]}: the newest published

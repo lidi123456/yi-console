@@ -4,7 +4,7 @@ import { getT, useLang } from '../i18n';
 import { permModes } from '../perm';
 import { errorToast, hostStatus, redetectTools, replaceView, useStore, type NewSessionParams } from '../store';
 import { rpc } from '../transport';
-import { TOOL_LABEL, type DirEntry, type ModelOption, type SessionInfo, type SessionMode, type ToolKind } from '../types';
+import { TOOL_LABEL, type DirEntry, type ModelConfigOption, type ModelOption, type SessionInfo, type SessionMode, type ToolKind } from '../types';
 import { isMobile, lsGet, lsSet, shortPath } from '../util';
 import { type Attached, FILE_MAX, IMAGE_TYPES, localPaths, readImage, refOf, uploadChunked } from './Composer';
 import { useDrives } from './FilesView';
@@ -106,7 +106,24 @@ export function DirPicker({
 }
 
 /** Last choices per tool when creating a session: UI, permission mode, model, thinking level (stored in localStorage `new-session-prefs`) */
-export type ToolPrefs = { mode?: 'structured' | 'terminal'; perm?: string; model?: string; effort?: string };
+/** `config`: Cursor model parameters chosen here {id: value} */
+export type ToolPrefs = { mode?: 'structured' | 'terminal'; perm?: string; model?: string; effort?: string; config?: Record<string, string> };
+
+/**
+ * The remembered model for a tool. Old Cursor versions put the parameters in the model name
+ * (`grok-4.7[context=256k,fast=true]`); those values are dropped, the parameters are chosen in the menu now
+ */
+export const prefModel = (p: ToolPrefs) => (p.model ?? '').split('[')[0];
+
+/** The chosen parameters the model offers, for `session.create` */
+export function pickConfig(options: ModelConfigOption[] | null | undefined, config: Record<string, string> | undefined) {
+  const out: Record<string, string> = {};
+  for (const o of options ?? []) {
+    const v = config?.[o.id];
+    if (v && o.options.some((c) => c.value === v)) out[o.id] = v;
+  }
+  return out;
+}
 export const PREFS_KEY = 'new-session-prefs';
 const RECENT_KEY = 'recent-dirs';
 const RECENT_MAX = 8;
@@ -177,6 +194,9 @@ export function NewSessionPage({ params }: { params: NewSessionParams }) {
   const [perm, setPerm] = useState('default');
   const [model, setModel] = useState('');
   const [effort, setEffort] = useState('');
+  // Cursor: the model's parameters (null while loading) and the values chosen for them
+  const [cfgOptions, setCfgOptions] = useState<ModelConfigOption[] | null>(null);
+  const [config, setConfig] = useState<Record<string, string>>({});
   const [text, setText] = useState(ns.handoff?.prompt ?? '');
   const [items, setItems] = useState<Pending[]>([]);
   const [picking, setPicking] = useState(false);
@@ -219,6 +239,28 @@ export function NewSessionPage({ params }: { params: NewSessionParams }) {
     };
   }, [hostId, tool, aiTool, connected]);
 
+  // Cursor model parameters: cached by the host, else read from Cursor once (a few seconds). The directory only helps
+  // Cursor start, so changing it doesn't ask again
+  const cwdRef = useRef(cwd);
+  cwdRef.current = cwd;
+  const cursorModel = tool === 'cursor' && connected && mode === 'structured' ? model : '';
+  useEffect(() => {
+    setCfgOptions(null);
+    if (!hostId || !cursorModel) return;
+    let alive = true;
+    rpc<ModelConfigOption[]>(hostId, 'tools.modelConfig', { model: cursorModel, cwd: cwdRef.current.trim() })
+      .then((o) => alive && setCfgOptions(o))
+      .catch(() => alive && setCfgOptions([]));
+    return () => {
+      alive = false;
+    };
+  }, [hostId, cursorModel]);
+  const shownConfig = useMemo(() => {
+    if (!cursorModel || !cfgOptions) return undefined;
+    const chosen = pickConfig(cfgOptions, config);
+    return cfgOptions.map((o) => (chosen[o.id] ? { ...o, currentValue: chosen[o.id] } : o));
+  }, [cursorModel, cfgOptions, config]);
+
   // When the tool changes (including on open), bring back that tool's last choices
   useEffect(() => {
     const p = lsGet<Record<string, ToolPrefs>>(PREFS_KEY, {})[tool] ?? {};
@@ -228,8 +270,9 @@ export function NewSessionPage({ params }: { params: NewSessionParams }) {
     // Continue with another tool keeps the original session's permission mode when this tool has it, else default
     const want = ns.handoff ? ns.handoff.perm || 'default' : p.perm;
     setPerm(want && permModes(tool, m).some((x) => x[0] === want) ? want : 'default');
-    setModel(p.model ?? '');
+    setModel(prefModel(p));
     setEffort(p.effort ?? '');
+    setConfig(p.config ?? {});
   }, [ns, tool]);
 
   // The default tool (last used, or claude) isn't installed on this host: pick the first installed one instead of leaving a greyed-out chip selected
@@ -344,6 +387,7 @@ export function NewSessionPage({ params }: { params: NewSessionParams }) {
         permissionMode: aiTool && permModes(tool, mode).some((m) => m[0] === perm) ? perm : 'default',
         model: aiTool ? model || undefined : undefined,
         effort: aiTool ? sendEffort || undefined : undefined,
+        modelConfig: cursorModel ? pickConfig(cfgOptions, config) : undefined,
         command: tool === 'shell' ? text.trim() || undefined : undefined,
         resumeId: ns.resumeId,
         handoffFrom: ns.handoff?.fromId,
@@ -357,7 +401,7 @@ export function NewSessionPage({ params }: { params: NewSessionParams }) {
         // Continue with another tool always uses chat mode; don't record that as the user's chosen UI
         if (!ns.handoff) lsSet('last-mode', mode);
         const all = lsGet<Record<string, ToolPrefs>>(PREFS_KEY, {});
-        all[tool] = { mode: ns.handoff ? all[tool]?.mode : mode, perm: ns.handoff ? all[tool]?.perm : perm, model, effort: sendEffort };
+        all[tool] = { mode: ns.handoff ? all[tool]?.mode : mode, perm: ns.handoff ? all[tool]?.perm : perm, model, effort: sendEffort, config };
         lsSet(PREFS_KEY, all);
       }
       if (later) {
@@ -694,6 +738,9 @@ export function NewSessionPage({ params }: { params: NewSessionParams }) {
                     if (effort && m?.efforts && !m.efforts.includes(effort)) setEffort('');
                   }}
                   onEffort={setEffort}
+                  configOptions={shownConfig}
+                  configPending={!!cursorModel && cfgOptions === null}
+                  onConfig={(id, value) => setConfig((c) => ({ ...c, [id]: value }))}
                   onCustom={async () => {
                     const v = (await askText({ title: tx('model'), value: model, placeholder: tx('leaveEmptyForToolDefault') }))?.trim();
                     if (v !== undefined) setModel(v);

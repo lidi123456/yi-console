@@ -214,6 +214,7 @@ export async function duplicateSession(hostId: string, info: SessionInfo) {
       permissionMode: info.permissionMode || undefined,
       model: info.model || undefined,
       effort: info.effort || undefined,
+      modelConfig: Object.fromEntries((info.modelConfigOptions ?? []).filter((o) => o.currentValue).map((o) => [o.id, o.currentValue])),
       command: info.command || undefined,
       cols: 120,
       rows: 32,
