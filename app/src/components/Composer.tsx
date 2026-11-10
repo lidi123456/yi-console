@@ -16,6 +16,7 @@ import { permLabel, permModes } from '../perm';
 import { nextPerm, PermPicker } from './PermPicker';
 import { ModelPicker, OPEN_MODEL } from './ModelPicker';
 import { QueueList } from './QueueList';
+import { noteOwnerMessage } from '../bots';
 
 const t = getT('composer');
 
@@ -534,6 +535,7 @@ export function Composer({
         // Turn still running: Claude and Codex read it at their next step; other tools queue it until the turn ends
         queue: true,
       });
+      noteOwnerMessage(info);
       // Only clear once sent. If we switched sessions mid-send, only clear the original session's draft and leave the current input box alone
       if (keyRef.current === from) {
         setText((cur) => (cur.trim() === t ? '' : cur));

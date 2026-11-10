@@ -110,6 +110,15 @@ export function SettingsView({ hostId }: { hostId: string }) {
             />
             {t('continueAfterUsageLimitsWhen')}
           </label>
+          <label>
+            {t('worktreeRoot')}
+            <input
+              value={s.worktreeRoot ?? ''}
+              placeholder="~/.yi-console/worktrees"
+              onChange={(e) => setS({ ...s, worktreeRoot: e.target.value.trim() || undefined })}
+            />
+          </label>
+          <p className="muted small">{t('worktreeRootHint')}</p>
         </div>
       </div>
       <McpSettingsCard servers={s.mcpServers ?? []} onChange={(mcpServers) => setS({ ...s, mcpServers })} />

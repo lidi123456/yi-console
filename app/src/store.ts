@@ -7,6 +7,7 @@ import { getLang, getT, onLangChange, trErr } from './i18n';
 import { fmtAt } from './limit';
 import { hubCall, onHubEvent, rpc, isTauri } from './transport';
 import { markSeen, recordChange } from './overview';
+import { dropRemoteHost, findBot, mapHost, refreshBots, refreshRemote, refreshRemoteHost, remoteKey, sourceOf } from './bots';
 import type { ClientSettings, HostConfig, HostStatus, HubEvent, NotifyPrefs, SessionInfo, Snippet, ToolInfo, ToolJob, ToolKind } from './types';
 
 const t = getT('store');
@@ -24,6 +25,12 @@ export type View =
   | { kind: 'ports'; hostId: string }
   | { kind: 'settings'; hostId: string }
   | { kind: 'prefs' }
+  /** A Bot's details. src: the Bots source (bots.ts), '' or absent for this app */
+  | { kind: 'bot'; botId: string; src?: string }
+  /** Bot plugins and their instances */
+  | { kind: 'plugins'; src?: string; review?: string }
+  /** Every event a Bot received */
+  | { kind: 'botEvents'; botId: string; src?: string }
   /** New session page (`NewSession.tsx`) */
   | ({ kind: 'new' } & NewSessionParams);
 
@@ -38,6 +45,8 @@ export interface NewSessionParams {
    *  message, the original session (`session.create` handoffFrom), its permission mode (kept if the new tool has it,
    *  else default, never raised) and tools to avoid as the default pick (sessions of theirs wait for a limit reset) */
   handoff?: { from: ToolKind; prompt: string; fromId?: string; perm?: string | null; avoid?: ToolKind[] };
+  /** Create a Bot of this Bots source ('' for this app) instead of a session: the first message is its role */
+  bot?: { src: string };
 }
 
 export interface HostEntry {
@@ -661,6 +670,7 @@ export function startEventLoop() {
         if (ev.status === 'open') {
           refreshHosts().catch(() => {});
           loadClientSettings();
+          refreshBots();
         }
         break;
       case 'host.status': {
@@ -672,7 +682,8 @@ export function startEventLoop() {
           refreshSessions(hostId);
           catchUpHost(hostId);
           reportLang(hostId);
-        }
+          refreshRemoteHost(hostId);
+        } else dropRemoteHost(hostId);
         break;
       }
       case 'hosts.changed':
@@ -699,6 +710,24 @@ export function startEventLoop() {
       case 'notification':
         onNotification(ev.hostId, ev.method, ev.params);
         break;
+      case 'bots.changed':
+        refreshBots();
+        break;
+      case 'bots.secretsNeeded':
+        secretsNeeded(ev, '');
+        break;
+      case 'bots.confirm':
+        confirmNeeded(ev, '');
+        break;
+      case 'bots.pluginProposal':
+        pluginProposal(ev, '');
+        break;
+      case 'bots.notify':
+      case 'bots.attention': {
+        botToast(ev, '');
+        if (ev.type === 'bots.attention') refreshBots();
+        break;
+      }
     }
   });
 }
@@ -713,8 +742,72 @@ export function setToolJob(hostId: string, tool: string, job: ToolJob, line?: st
   });
 }
 
+/** A Bot proposed a plugin a task built: open it for review when the Bot's session is on screen, otherwise offer it
+ * in a toast */
+function pluginProposal(ev: any, src: string) {
+  const go = () => navigate({ kind: 'plugins', review: ev.token, src: src || undefined });
+  const hostId = mapHost(src, ev.host, (id) => state.hosts.some((h) => h.config.id === id));
+  const v = state.view;
+  if (v.kind === 'session' && v.hostId === hostId && v.sessionId === ev.sessionId) go();
+  else toast(t('pluginProposed', { name: ev.id }), 'info', { label: t('view'), run: go });
+}
+
+/** Plugin configurations of a Bot wait for the owner's secrets: a card in the Bot's session takes them */
+function secretsNeeded(ev: any, src: string) {
+  const pending: { name: string }[] = ev.pending ?? [];
+  if (pending.length === 0) return;
+  const v = state.view;
+  const s = findBot(ev.botId, src)?.session;
+  const hostId = s ? mapHost(src, s.host, (id) => state.hosts.some((h) => h.config.id === id)) : null;
+  if (s && v.kind === 'session' && v.hostId === hostId && v.sessionId === s.sessionId) return;
+  toast(t('pluginSecretsNeeded', { names: pending.map((p) => p.name).join(', ') }), 'info', {
+    label: t('fillIn'),
+    run: () => (s && hostId ? navigate({ kind: 'session', hostId, sessionId: s.sessionId }) : navigate({ kind: 'bot', botId: ev.botId, src: src || undefined })),
+  });
+}
+
+/** A Bot asked for a configuration change that needs the owner's confirmation (a card in its session bar) */
+function confirmNeeded(ev: any, src: string) {
+  const v = state.view;
+  const s = findBot(ev.botId, src)?.session;
+  const hostId = s ? mapHost(src, s.host, (id) => state.hosts.some((h) => h.config.id === id)) : null;
+  if (s && v.kind === 'session' && v.hostId === hostId && v.sessionId === s.sessionId) return;
+  toast(t('botWantsConfirm', { name: ev.name }), 'info', {
+    label: t('view'),
+    run: () => (s && hostId ? navigate({ kind: 'session', hostId, sessionId: s.sessionId }) : navigate({ kind: 'bot', botId: ev.botId, src: src || undefined })),
+  });
+}
+
+/** A Bot notification or a call for attention, from this app's engine (src '') or a remote desktop's */
+function botToast(ev: any, src: string) {
+  const title: string = ev.type === 'bots.notify' ? ev.title : t('botNeedsYou');
+  const body: string = (ev.type === 'bots.notify' ? ev.body : ev.text) ?? '';
+  const prefs = state.client?.notify ?? DEFAULT_NOTIFY;
+  const away = document.hidden || !document.hasFocus();
+  if (prefs.enabled && (prefs.when === 'always' || away)) systemNotify(title, body);
+  const botId: string | undefined = ev.botId;
+  const go = botId ? { label: t('view'), run: () => navigate({ kind: 'bot', botId, src: src || undefined }) } : undefined;
+  toast(body ? `${title} · ${body}` : title, 'info', go);
+}
+
 function onNotification(hostId: string, method: string, p: any) {
   switch (method) {
+    // Desktop apps registered with this daemon: their Bots are listed and controlled from here
+    case 'clients.changed':
+      refreshRemoteHost(hostId);
+      break;
+    case 'client.event': {
+      const ev = p?.event;
+      const key = remoteKey(hostId, p?.clientId);
+      // This app's own events arrive directly; on the local daemon they are echoed back
+      if (!ev || sourceOf(p?.clientId) === '') break;
+      if (ev.type === 'bots.changed' || ev.type === 'bots.attention') refreshRemote(key);
+      if (ev.type === 'bots.notify' || ev.type === 'bots.attention') botToast(ev, key);
+      if (ev.type === 'bots.secretsNeeded') secretsNeeded(ev, key);
+      if (ev.type === 'bots.confirm') confirmNeeded(ev, key);
+      if (ev.type === 'bots.pluginProposal') pluginProposal(ev, key);
+      break;
+    }
     case 'tools.updating':
       setToolJob(hostId, p.tool, p.job, p.line);
       if (Array.isArray(p.tools)) setHostTools(hostId, p.tools);

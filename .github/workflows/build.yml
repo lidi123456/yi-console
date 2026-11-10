@@ -123,10 +123,12 @@ jobs:
           echo "VERSION=$v" >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
+          targets: ${{ matrix.target }},wasm32-wasip2
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: app/src-tauri
+          workspaces: |
+            app/src-tauri
+            plugins
           key: ${{ matrix.target }}
       - uses: actions/setup-node@v5
         with:
@@ -155,6 +157,12 @@ jobs:
       - name: prepare macOS Computer Use driver
         if: runner.os == 'macOS'
         run: python3 scripts/prepare-computer-use.py --macos app/src-tauri/resources/yi-agentd/computer-use-macos.tgz
+      # Feishu / GitHub plugins ship with the desktop app (loaded from resources/plugins)
+      - name: bundle plugins
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = Windows ]; then py=python; else py=python3; fi
+          "$py" scripts/bundle-plugins.py
       - run: npm ci
         working-directory: app
       # Updater bundles (NSIS setup / .app.tar.gz / AppImage plus .sig) need the updater signing key; releases must have it,

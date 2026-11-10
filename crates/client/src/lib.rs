@@ -2,6 +2,7 @@
 
 pub mod api;
 pub mod deploy;
+pub mod ext;
 pub mod forward;
 pub mod hosts;
 pub mod localbin;
@@ -12,3 +13,4 @@ pub mod ssh;
 pub mod sshconfig;
 
 pub use api::{ClientHub, Sink};
+pub use ext::{Extension, Identity};

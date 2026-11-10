@@ -45,6 +45,8 @@ const paths: Record<string, string> = {
   qr: 'M4 4h6v6H4zM14 4h6v6h-6zM4 14h6v6H4zM14 14h2v2h-2zM18 14h2v2h-2zM14 18h2v2h-2zM18 18h2v2h-2z',
   power: 'M12 3v9M6.3 6.3a8 8 0 1 0 11.4 0',
   bell: 'M6 16V11a6 6 0 1 1 12 0v5l2 2H4zM10 20a2 2 0 0 0 4 0',
+  bot: 'M5 8h14v11H5zM12 8V4M10 4h4M9 13h.01M15 13h.01M9.5 16.5h5M3 12v3M21 12v3',
+  plug: 'M9 3v5M15 3v5M6 8h12v3a6 6 0 0 1-12 0zM12 17v4',
   shield: 'M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6z',
   play: 'M7 5l12 7-12 7z',
   pause: 'M8 5v14M16 5v14',

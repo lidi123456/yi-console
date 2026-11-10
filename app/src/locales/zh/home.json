@@ -45,7 +45,7 @@
   "exitedWithError": "进程出错退出",
   "usageLimitReached": "额度用尽",
   "continuesIn": "自动继续倒计时",
-  "backgroundTasks": "{{n}} 个后台任务",
+  "backgroundTasks": "{{n}} 个后台命令",
   "queued": "排队 {{n}} 条",
   "context": "上下文",
   "runningFor": "已跑 {{n}} 分钟",
@@ -58,13 +58,13 @@
   "showLess": "收起",
   "onlyProject": "只看 {{name}} 的会话",
   "showEverything": "显示全部",
-  "actPlan": "任务",
+  "actPlan": "待办",
   "actWeb": "网页",
   "actCommand": "命令",
   "actEdit": "编辑",
   "actRead": "读取",
   "actSearch": "搜索",
-  "actAgent": "子任务",
+  "actAgent": "子 agent",
   "quickStartPlaceholder": "想让 AI 做什么？回车开始，Shift+回车换行",
   "noAiToolOnThisHost": "这台主机上没有可用的 AI 工具",
   "noAiTool": "没有 AI 工具",
@@ -109,5 +109,7 @@
   "justStarted": "刚开始",
   "tookUnderAMinute": "用时不到 1 分钟",
   "rejected": "已拒绝：{{v}}",
-  "draftSavedTextOnly": "已存为草稿（只存文字，图片和文件没有存）"
+  "draftSavedTextOnly": "已存为草稿（只存文字，图片和文件没有存）",
+  "viewSessions": "按会话",
+  "viewBots": "按 Bot"
 }

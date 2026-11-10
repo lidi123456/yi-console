@@ -493,7 +493,7 @@ fn read_claude(p: &Path) -> Result<Vec<EventBody>> {
         match v["type"].as_str() {
             Some("user") => {
                 if let Some(t) = claude_user_text(&v) {
-                    out.push(EventBody::UserMessage { text: t, images: vec![] });
+                    out.push(EventBody::UserMessage { text: t, images: vec![], origin: None });
                 } else {
                     for ev in claude::user_content_events(&v["message"]["content"]) {
                         if matches!(ev, EventBody::ToolResult { .. }) {
@@ -707,7 +707,7 @@ fn read_codex(p: &Path) -> Result<Vec<EventBody>> {
                 let item = &pl["item"];
                 if item["type"] == "UserMessage" {
                     if let Some(t) = codex_user_text(pl) {
-                        out.push(EventBody::UserMessage { text: t, images: vec![] });
+                        out.push(EventBody::UserMessage { text: t, images: vec![], origin: None });
                     }
                     continue;
                 }
@@ -715,7 +715,7 @@ fn read_codex(p: &Path) -> Result<Vec<EventBody>> {
             }
             "user_message" => {
                 if let Some(t) = codex_user_text(pl) {
-                    legacy.push(EventBody::UserMessage { text: t, images: vec![] });
+                    legacy.push(EventBody::UserMessage { text: t, images: vec![], origin: None });
                 }
             }
             "agent_message" => {

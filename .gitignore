@@ -2,11 +2,15 @@
 app/node_modules
 app/dist
 app/src-tauri/target
+plugins/target
+plugins/dist
 app/src-tauri/gen
 app/src-tauri/binaries/*
 app/src-tauri/resources/yi-agentd/*
 !app/src-tauri/binaries/README.md
 !app/src-tauri/resources/yi-agentd/README.md
+app/src-tauri/resources/plugins/*
+!app/src-tauri/resources/plugins/README.md
 
 # Per-machine config of AI coding tools (project rules live in AGENTS.md)
 .claude/

@@ -4,5 +4,10 @@
   "continuesAutomaticallyAt": "Continues automatically at {{v}}",
   "continuesAutomaticallyOnceTheLimit": "Continues automatically once the limit resets",
   "wonTContinueAutomatically": "Won't continue automatically",
-  "view": "View"
+  "view": "View",
+  "botNeedsYou": "A Bot needs you",
+  "pluginProposed": "The assistant proposed the plugin {{name}} for you to install",
+  "pluginSecretsNeeded": "Plugin configurations the Bot uses need secrets: {{names}}. Fill them in on the card in the Bot's session.",
+  "fillIn": "Fill in",
+  "botWantsConfirm": "Bot \"{{name}}\" has a settings change waiting for you"
 }

@@ -55,7 +55,8 @@
       "binaries/yi-agentd"
     ],
     "resources": {
-      "resources/yi-agentd/": "yi-agentd-dist/"
+      "resources/yi-agentd/": "yi-agentd-dist/",
+      "resources/plugins/": "plugins/"
     },
     "category": "DeveloperTool",
     "shortDescription": "Use and manage all your AI coding tools in one place"

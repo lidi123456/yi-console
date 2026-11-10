@@ -7,6 +7,7 @@ import zhApp from './zh/app.json';
 import zhAppUpdate from './zh/appUpdate.json';
 import zhBack from './zh/back.json';
 import zhBgTasks from './zh/bgTasks.json';
+import zhBots from './zh/bots.json';
 import zhBrowser from './zh/browser.json';
 import zhChatImages from './zh/chatImages.json';
 import zhChatView from './zh/chatView.json';
@@ -60,6 +61,7 @@ import enApp from './en/app.json';
 import enAppUpdate from './en/appUpdate.json';
 import enBack from './en/back.json';
 import enBgTasks from './en/bgTasks.json';
+import enBots from './en/bots.json';
 import enBrowser from './en/browser.json';
 import enChatImages from './en/chatImages.json';
 import enChatView from './en/chatView.json';
@@ -116,6 +118,7 @@ export const resources = {
     appUpdate: zhAppUpdate,
     back: zhBack,
     bgTasks: zhBgTasks,
+    bots: zhBots,
     browser: zhBrowser,
     chatImages: zhChatImages,
     chatView: zhChatView,
@@ -171,6 +174,7 @@ export const resources = {
     appUpdate: enAppUpdate,
     back: enBack,
     bgTasks: enBgTasks,
+    bots: enBots,
     browser: enBrowser,
     chatImages: enChatImages,
     chatView: enChatView,

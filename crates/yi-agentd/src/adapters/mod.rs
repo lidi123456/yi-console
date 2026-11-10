@@ -26,6 +26,24 @@ For flowcharts and other supported diagrams, use fenced code blocks with the lan
 Yi Console renders them inline. Start with the diagram type, use plain text labels, close the code fence, \
 and omit configuration directives, HTML, external resources, click actions and custom style statements.";
 
+/// Everything we add to the system prompt of Claude (`--append-system-prompt`) and Codex (`developerInstructions`)
+pub fn system_text(spec: &StartSpec) -> String {
+    let mut s = format!("{}{}", IMAGE_HINT, crate::computer_use::model_hint(&spec.extra_args));
+    if let Some(p) = &spec.system_prompt {
+        s.push_str("\n\n");
+        s.push_str(p);
+    }
+    s
+}
+
+/// ACP tools take no system prompt: the session's appended prompt goes with the first prompt of a new tool session
+pub fn acp_system_notice(spec: &StartSpec) -> Option<String> {
+    spec.system_prompt
+        .as_ref()
+        .filter(|_| spec.system_notice)
+        .map(|p| format!("<system-reminder>\n{p}\n</system-reminder>"))
+}
+
 /// The tool's turn failed because the account's usage limit is used up. The hub decides whether and when to continue automatically.
 /// Adapters for other tools only need to emit this before `TurnEnd` to get automatic continue (`resets_at` ms; None lets the hub ask the quota probe)
 pub fn limit_hit(resets_at: Option<i64>, limit: Option<String>) -> yi_proto::EventBody {
@@ -98,6 +116,12 @@ pub struct StartSpec {
     /// Session-scoped stdio servers supplied through ACP, separate from CLI arguments.
     pub mcp_servers: Vec<serde_json::Value>,
     pub mcp_fingerprint: String,
+    /// MCP servers whose tools are preapproved (client MCP servers: Claude gets `--allowedTools mcp__<name>__*`)
+    pub allow_mcp: Vec<String>,
+    /// The session's appended system prompt (chat mode of AI tools)
+    pub system_prompt: Option<String>,
+    /// ACP tools: send `system_prompt` with the first prompt of this launch
+    pub system_notice: bool,
     pub cols: u16,
     pub rows: u16,
     /// Run terminal mode inside this tmux session (so it survives daemon restarts)

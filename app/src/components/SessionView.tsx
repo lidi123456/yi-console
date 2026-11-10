@@ -20,6 +20,7 @@ import { TermTools, TerminalView } from './TerminalView';
 import { StatusLine } from './StatusLine';
 import { BgTasks } from './BgTasks';
 import { UsageDialog } from './UsageDialog';
+import { SessionBotBar } from './BotsSection';
 
 const t = getT('sessionView');
 
@@ -300,6 +301,7 @@ export function SessionView({ hostId, sessionId, seq }: { hostId: string; sessio
           <Icon name="more" size={18} />
         </button>
       </header>
+      {info.bot && <SessionBotBar info={info} />}
 
       {filesOnly ? (
         connected ? (

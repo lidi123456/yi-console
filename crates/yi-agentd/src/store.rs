@@ -351,6 +351,9 @@ mod tests {
             computer_use: false,
             pending: None,
             turn: None,
+            bot: None,
+            client_mcp: vec![],
+            append_system_prompt: None,
             queued: vec![],
             queue_paused: None,
             restart_interrupted: false,
@@ -364,7 +367,7 @@ mod tests {
         s.save_session(&info("a")).unwrap();
         s.save_session(&info("b")).unwrap();
         for (sid, seq) in [("a", 1), ("a", 2), ("b", 1)] {
-            let body = EventBody::UserMessage { text: "m".into(), images: vec![] };
+            let body = EventBody::UserMessage { text: "m".into(), images: vec![], origin: None };
             s.append_event(sid, &Event { seq, ts: seq, body }).unwrap();
         }
         s.delete_events("a").unwrap();
@@ -392,6 +395,7 @@ mod tests {
                     body: EventBody::UserMessage {
                         text: format!("m{i}"),
                         images: vec![],
+                        origin: None,
                     },
                 },
             )

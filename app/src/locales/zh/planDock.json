@@ -1,5 +1,5 @@
 {
-  "tasks": "任务 {{done}}/{{length}}",
+  "tasks": "待办 {{done}}/{{length}}",
   "now": "正在：",
   "next": "下一项："
 }

@@ -14,3 +14,8 @@ serde_json.workspace = true
 dirs.workspace = true
 tokio-tungstenite = "0.28"
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+yi-bots = { path = "../bots", optional = true }
+
+[features]
+# Testing only: `--bots` runs the Bot engine in yi-web so it can be driven from a browser. Bots belong to the desktop app
+bots = ["dep:yi-bots"]

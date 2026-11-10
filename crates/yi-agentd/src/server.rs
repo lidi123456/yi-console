@@ -21,6 +21,15 @@ pub(crate) fn tools(hub: &Hub, refresh: bool) -> Vec<ToolInfo> {
     g.clone().unwrap_or_default()
 }
 
+/// A local peer process started by this daemon (an AI tool or its children). Unknown pids count as such
+fn from_tool(peer_pid: Option<u32>) -> bool {
+    peer_pid.map_or(true, crate::clientmcp::spawned_by_daemon)
+}
+
+fn clients_changed(hub: &Hub) {
+    let _ = hub.bus.send(Arc::new(crate::hub::Outbound { session_id: None, method: methods::EV_CLIENTS_CHANGED, params: json!({}) }));
+}
+
 pub async fn serve_conn<R, W>(hub: Arc<Hub>, r: R, mut w: W, peer: &str)
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -58,6 +67,9 @@ where
     }
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<String>();
     let subs: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+    // Identifies this connection to the client MCP bridge (`client.hello`)
+    static NEXT_CONN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let conn_id = NEXT_CONN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
     let writer = tokio::spawn(async move {
         while let Some(mut line) = out_rx.recv().await {
@@ -141,6 +153,31 @@ where
                     (Ok(sid), Ok(ticket)) => hub.desktop.proxy_call(&hub, sid, ticket, p["packet"].clone(), peer_pid).await,
                     (Err(e), _) | (_, Err(e)) => Err(e),
                 }
+            } else if req.method == methods::CLIENT_MCP_PROXY && !local {
+                Err(anyhow!("MCP 代理只接受本机连接"))
+            } else if req.method == methods::CLIENT_MCP_PROXY {
+                hub.clients.proxy(&hub, &req.params, peer_pid).await
+            } else if local && (req.method == methods::CLIENT_CALL && from_tool(peer_pid) || req.method == methods::CLIENT_HELLO && peer_pid.is_some_and(crate::clientmcp::spawned_by_daemon)) {
+                // The AI tools (and anything they run) are children of this daemon: they must not pose as the
+                // desktop app or drive its Bot engine
+                Err(anyhow!("AI 工具启动的进程不能调用 {}", req.method))
+            } else if req.method == methods::CLIENT_HELLO {
+                let r = hub.clients.hello(conn_id, tx.clone(), local, &req.params);
+                if matches!(r, Ok(true)) {
+                    clients_changed(&hub);
+                }
+                r.map(|_| Value::Null)
+            } else if req.method == methods::CLIENT_MCP_RESULT || req.method == methods::CLIENT_RESULT {
+                hub.clients.result(conn_id, &req.params)
+            } else if req.method == methods::CLIENTS_LIST {
+                Ok(hub.clients.desktops())
+            } else if req.method == methods::CLIENT_CALL {
+                hub.clients.remote_call(&req.params).await
+            } else if req.method == methods::CLIENT_EVENT {
+                hub.clients.event(conn_id, &req.params).map(|params| {
+                    let _ = hub.bus.send(Arc::new(crate::hub::Outbound { session_id: None, method: methods::EV_CLIENT_EVENT, params }));
+                    Value::Null
+                })
             } else if req.method == methods::PROXY_SET_HOSTS && !local {
                 Err(anyhow!("只能由本机客户端同步主机"))
             } else if req.method == methods::FS_OPEN && !local {
@@ -174,6 +211,9 @@ where
         });
     }
     forward.abort();
+    if hub.clients.disconnected(conn_id) {
+        clients_changed(&hub);
+    }
     drop(out_tx);
     let _ = writer.await;
     crate::info!("client disconnected ({peer})");
@@ -275,8 +315,9 @@ pub async fn dispatch(
                 return Err(anyhow!("消息不能为空"));
             }
             let queue = p["queue"].as_bool().unwrap_or(false);
+            let origin = p["origin"].as_str().filter(|o| !o.is_empty()).map(|o| o.chars().take(32).collect::<String>());
             let hub2 = hub.clone();
-            tokio::task::spawn_blocking(move || hub2.send(&sid, &text, images, queue)).await??;
+            tokio::task::spawn_blocking(move || hub2.send(&sid, &text, images, queue, origin)).await??;
             Value::Null
         }
         SESSION_QUEUE => {
@@ -330,6 +371,35 @@ pub async fn dispatch(
             tokio::task::spawn_blocking(move || crate::gitops::changes_with(&cwd, with_diff, only.as_deref())).await??
         }
         GIT_STATUS => crate::statusline::git_info(s(&p, "cwd")?).await.unwrap_or(Value::Null),
+        GIT_WORKTREE_ADD => {
+            let cwd = s(&p, "cwd")?.to_string();
+            let name = s(&p, "name")?.to_string();
+            let branch = p["branch"].as_str().map(str::to_string);
+            let base = p["base"].as_str().map(str::to_string);
+            let root = crate::gitops::worktree_root(&hub.settings.read().unwrap());
+            tokio::task::spawn_blocking(move || crate::gitops::worktree_add(&root, &cwd, &name, branch.as_deref(), base.as_deref())).await??
+        }
+        GIT_WORKTREE_REMOVE => {
+            let path = s(&p, "path")?.to_string();
+            let force = p["force"].as_bool().unwrap_or(false);
+            let delete_branch = p["deleteBranch"].as_bool().unwrap_or(false);
+            let root = crate::gitops::worktree_root(&hub.settings.read().unwrap());
+            tokio::task::spawn_blocking(move || crate::gitops::worktree_remove(&root, &path, force, delete_branch)).await??;
+            Value::Null
+        }
+        SESSION_SET_CLIENT_MCP => {
+            let list: Vec<ClientMcp> = serde_json::from_value(p["clientMcp"].clone()).map_err(|e| anyhow!("clientMcp 无效: {e}"))?;
+            serde_json::to_value(hub.set_client_mcp(s(&p, "sessionId")?, list)?)?
+        }
+        SESSION_SET_SYSTEM_PROMPT => {
+            serde_json::to_value(hub.set_system_prompt(s(&p, "sessionId")?, p["prompt"].as_str().map(str::to_string))?)?
+        }
+        SESSION_SET_BOT => {
+            let bot: Option<BotLink> = serde_json::from_value(p["bot"].clone()).map_err(|e| anyhow!("bot 无效: {e}"))?;
+            serde_json::to_value(hub.set_bot(s(&p, "sessionId")?, bot)?)?
+        }
+        // Handled in serve_conn, which knows the connection
+        CLIENT_HELLO | CLIENT_MCP_RESULT | CLIENT_MCP_PROXY | CLIENTS_LIST | CLIENT_CALL | CLIENT_RESULT | CLIENT_EVENT => anyhow::bail!("只能在客户端连接上调用"),
         GIT_DISCARD => {
             let cwd = s(&p, "cwd")?.to_string();
             let paths: Vec<String> = serde_json::from_value(p["paths"].clone())?;

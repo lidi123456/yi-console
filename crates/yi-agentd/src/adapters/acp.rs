@@ -42,6 +42,8 @@ struct ToolState {
 struct State {
     /// The computer use notice still has to go out with the next prompt (once per launch)
     desktop_notice: bool,
+    /// The session's appended system prompt still has to go out with the next prompt (new tool session or changed)
+    system_notice: Option<String>,
     next_id: u64,
     pending: HashMap<u64, Pending>,
     session_id: Option<String>,
@@ -166,6 +168,7 @@ pub async fn run(spec: StartSpec, em: Emitter, mut rx: mpsc::UnboundedReceiver<A
     let mut st = State {
         perm: spec.permission_mode.clone(),
         desktop_notice: spec.mcp_servers.iter().any(|server| server["name"] == crate::mcp::DESKTOP_SERVER),
+        system_notice: super::acp_system_notice(&spec),
         ..Default::default()
     };
     let init = st.req(
@@ -373,6 +376,11 @@ fn prompt(st: &mut State, em: &Emitter, p: &Prompt) -> Value {
         }
     }
     // Slash commands must stay the first block for the tool to recognize them; the notice waits for a real prompt
+    if !p.text.trim_start().starts_with('/') {
+        if let Some(notice) = st.system_notice.take() {
+            blocks.push(json!({"type":"text","text":notice}));
+        }
+    }
     if st.desktop_notice && !p.text.trim_start().starts_with('/') {
         st.desktop_notice = false;
         blocks.push(json!({"type":"text","text":crate::computer_use::acp_notice()}));
@@ -423,7 +431,7 @@ fn flush(st: &mut State, em: &Emitter) {
     em.event(match seg {
         Seg::Agent => EventBody::AssistantText { id, text },
         Seg::Thought => EventBody::Thinking { id, text },
-        Seg::User => EventBody::UserMessage { text, images: vec![] },
+        Seg::User => EventBody::UserMessage { text, images: vec![], origin: None },
     });
 }
 
@@ -1516,7 +1524,7 @@ mod model_config_tests {
             tool: ToolKind::Cursor, mode: SessionMode::Structured, cwd: "/tmp".into(), resume: None, replay: false,
             replay_skip: 0, model: Some(model.into()), effort: None, model_config_options: vec![],
             permission_mode: "default".into(), command: None, program: "cursor-agent".into(), extra_args: vec![],
-            mcp_servers: vec![], mcp_fingerprint: String::new(), cols: 80, rows: 24, tmux: None, session_id: None,
+            mcp_servers: vec![], mcp_fingerprint: String::new(), allow_mcp: vec![], system_prompt: None, system_notice: false, cols: 80, rows: 24, tmux: None, session_id: None,
         }
     }
 

@@ -1,0 +1,28 @@
+[package]
+name = "yi-bots"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Yi Console Bots: always-on orchestrating sessions, their tasks and trigger plugins (desktop app only)"
+
+[dependencies]
+yi-proto = { path = "../proto" }
+yi-client = { path = "../client" }
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+base64.workspace = true
+rusqlite = { version = "0.37", features = ["bundled"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+# WASM plugins: wasmtime + Component Model, WASI 0.2 with nothing granted
+wasmtime = { version = "50", default-features = false, features = ["cranelift", "runtime", "std", "component-model", "anyhow", "parallel-compilation"] }
+wasmtime-wasi = { version = "50", default-features = false, features = ["p2"] }
+ureq = "3"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+
+[dev-dependencies]
+tempfile = "3"

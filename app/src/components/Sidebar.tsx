@@ -9,6 +9,8 @@ import { writeClipboard } from '../clipboard';
 import { deleteDirSessions, openTerminal, renameSession, sessionMenu } from './SessionActions';
 import { Icon, ToolBadge } from './Icon';
 import { MOD } from './Palette';
+import { BotsSections } from './BotsSection';
+import { isListedBotSession, useBots } from '../bots';
 
 const tx = getT('sidebar');
 
@@ -265,10 +267,15 @@ function OldList({
   );
 }
 
+/** Sessions listed under a host: not sub-agents, not the Bots this app runs */
+const listed = (s: SessionInfo) => !s.parentId && !isListedBotSession(s);
+
 function HostBlock({ h, filter }: { h: HostEntry; filter: string }) {
   const id = h.config.id;
   const sessions = useStore((s) => s.sessions[id]);
   const view = useStore((s) => s.view);
+  // Re-render when this app's client id is known: its Bot sessions move to the Bots section
+  const botClient = useBots((b) => b.clientId);
   const [collapsed, setCollapsed] = useState<boolean>(() => lsGet(`collapse-${id}`, false));
   // Directories whose "Earlier" list is expanded ('' = the flat list in time layout); not remembered
   const [showOld, setShowOld] = useState<string[]>([]);
@@ -290,7 +297,7 @@ function HostBlock({ h, filter }: { h: HostEntry; filter: string }) {
 
   const q = filter.trim();
   const { pinned, groups, flat, matched } = useMemo(() => {
-    const all = (sessions ?? []).filter((s) => !s.parentId && (!q || fuzzyScore(`${s.title} ${s.cwd}`, q) >= 0));
+    const all = (sessions ?? []).filter((s) => listed(s) && (!q || fuzzyScore(`${s.title} ${s.cwd}`, q) >= 0));
     const pinned = all.filter((s) => s.pinned);
     const rest = all.filter((s) => !s.pinned);
     // Only ended sessions idle past the threshold; never while searching
@@ -305,11 +312,11 @@ function HostBlock({ h, filter }: { h: HostEntry; filter: string }) {
     }
     const groups = [...m.entries()].map(([cwd, list]) => ({ cwd, list, ...split(list) }));
     return { pinned, groups, flat: split(rest), matched: all.length };
-  }, [sessions, q, staleDays, now]);
+  }, [sessions, q, staleDays, now, botClient]);
 
   const allFolded = groups.length > 0 && groups.every((g) => folded.includes(g.cwd));
-  const total = (sessions ?? []).filter((s) => !s.parentId).length;
-  const hostCls = (sessions ?? []).filter((s) => !s.parentId).map(sessionStatusClass);
+  const total = (sessions ?? []).filter(listed).length;
+  const hostCls = (sessions ?? []).filter(listed).map(sessionStatusClass);
   const hostSum = hostCls.includes('attn') ? 'attn' : hostCls.includes('busy') ? 'busy' : null;
 
   const toggle = () => {
@@ -476,7 +483,7 @@ function HostBlock({ h, filter }: { h: HostEntry; filter: string }) {
               );
             })
           )}
-          {connected && sessions && !sessions.some((s) => !s.parentId) && (
+          {connected && sessions && !sessions.some(listed) && (
             <div className="muted small pad-x">{tx('noSessionsYetClickTo')}</div>
           )}
         </div>
@@ -571,6 +578,7 @@ export function Sidebar() {
           </button>
         )}
         <div className="hosts-scroll">
+          {!filter && <BotsSections />}
           {hosts.map((h) => (
             <HostBlock key={h.config.id} h={h} filter={filter} />
           ))}

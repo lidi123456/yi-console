@@ -4,6 +4,8 @@ import { getT, useLang } from '../i18n';
 import { permModes } from '../perm';
 import { errorToast, hostStatus, redetectTools, replaceView, useStore, type NewSessionParams } from '../store';
 import { rpc } from '../transport';
+import { botCall, unmapHost } from '../bots';
+import { localHost } from './BotsSection';
 import { TOOL_LABEL, type DirEntry, type ModelConfigOption, type ModelOption, type SessionInfo, type SessionMode, type ToolKind } from '../types';
 import { isMobile, lsGet, lsSet, shortPath } from '../util';
 import { type Attached, FILE_MAX, IMAGE_TYPES, localPaths, readImage, refOf, uploadChunked } from './Composer';
@@ -15,6 +17,7 @@ import { askText, openMenu, type MenuItem } from './Overlay';
 import { nextPerm, PermPicker } from './PermPicker';
 
 const tx = getT('newSession');
+const tb = getT('bots');
 const tc = getT('composer');
 
 export function DirPicker({
@@ -216,15 +219,17 @@ export function NewSessionPage({ params }: { params: NewSessionParams }) {
   const connected = st.status === 'connected';
   const tools = st.hello?.tools ?? [];
   const home = st.hello?.home;
-  const connectedHosts = hosts.filter((h) => h.status.status === 'connected');
+  // A new Bot: the first message is its role; it runs in chat mode on a host its desktop app reaches
+  const bot = ns.bot;
+  const connectedHosts = hosts.filter((h) => h.status.status === 'connected' && (!bot || unmapHost(bot.src, h.config.id) !== null));
   // Terminal and Files sessions don't talk to an AI tool: no UI choice, permission mode, model or first message
   const aiTool = tool !== 'shell' && tool !== 'files';
-  const effectiveMode: SessionMode = tool === 'shell' ? 'terminal' : tool === 'files' ? 'structured' : mode;
+  const effectiveMode: SessionMode = tool === 'shell' ? 'terminal' : tool === 'files' ? 'structured' : bot ? 'structured' : mode;
   // Continue with another tool: the selection must be an installed tool other than the original (if only the original is installed, it stays on a greyed-out chip)
   const handoffBlocked = !!ns.handoff && (tool === ns.handoff.from || !aiTool || !tools.some((t) => t.kind === tool && t.available));
   // Continuing a history session keeps it as it was: no first message
   const hasInput = tool !== 'files' && !ns.resumeId;
-  const canAttach = hasInput && aiTool;
+  const canAttach = hasInput && aiTool && !bot;
 
   // The tool's available models: returned directly if yi-agentd has them cached, otherwise it starts the tool once to ask (a few seconds)
   useEffect(() => {
@@ -265,7 +270,7 @@ export function NewSessionPage({ params }: { params: NewSessionParams }) {
   useEffect(() => {
     const p = lsGet<Record<string, ToolPrefs>>(PREFS_KEY, {})[tool] ?? {};
     // Continue with another tool only uses chat mode: the first message has to be sent through chat mode
-    const m = ns.handoff ? 'structured' : (p.mode ?? lsGet<'structured' | 'terminal'>('last-mode', 'structured'));
+    const m = ns.handoff || ns.bot ? 'structured' : (p.mode ?? lsGet<'structured' | 'terminal'>('last-mode', 'structured'));
     setMode(m);
     // Continue with another tool keeps the original session's permission mode when this tool has it, else default
     const want = ns.handoff ? ns.handoff.perm || 'default' : p.perm;
@@ -278,7 +283,7 @@ export function NewSessionPage({ params }: { params: NewSessionParams }) {
   // The default tool (last used, or claude) isn't installed on this host: pick the first installed one instead of leaving a greyed-out chip selected
   useEffect(() => {
     if (ns.resumeId || !tools.length) return;
-    const usable = (k: ToolKind) => !ns.handoff || (k !== ns.handoff.from && k !== 'shell' && k !== 'files');
+    const usable = (k: ToolKind) => (!ns.handoff && !ns.bot) || (k !== ns.handoff?.from && k !== 'shell' && k !== 'files');
     if (usable(tool) && tools.some((t) => t.kind === tool && t.available)) return;
     const first = tools.find((t) => t.available && usable(t.kind));
     if (first) setTool(first.kind);
@@ -365,7 +370,33 @@ export function NewSessionPage({ params }: { params: NewSessionParams }) {
     }
   };
 
+  // A Bot is created by its desktop app: the role becomes its first message, everything else starts at the defaults
+  const createBot = async (src: string) => {
+    const role = text.trim();
+    const target = unmapHost(src, hostId);
+    if (busy || !role || !cwd.trim() || !connected || !aiTool || !target) return;
+    setBusy(true);
+    try {
+      const r = await botCall<{ botId: string; host: string; sessionId: string }>(
+        'bots.create',
+        { host: target, cwd: cwd.trim(), tool, role, model: model || undefined, effort: sendEffort || undefined, permissionMode: perm },
+        src,
+      );
+      rememberDir(hostId, cwd.trim());
+      const all = lsGet<Record<string, ToolPrefs>>(PREFS_KEY, {});
+      all[tool] = { ...all[tool], perm, model, effort: sendEffort };
+      lsSet(PREFS_KEY, all);
+      const at = localHost(src, r.host);
+      replaceView(at ? { kind: 'session', hostId: at, sessionId: r.sessionId } : { kind: 'bot', botId: r.botId, src: src || undefined });
+    } catch (e) {
+      errorToast(e);
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const create = async () => {
+    if (bot) return createBot(bot.src);
     if (busy || !cwd.trim() || handoffBlocked || !connected) return;
     setBusy(true);
     const chat = aiTool && effectiveMode === 'structured';
@@ -447,12 +478,17 @@ export function NewSessionPage({ params }: { params: NewSessionParams }) {
   };
 
   const toolDisabled = (k: ToolKind, available: boolean) =>
-    !available || (!!ns.resumeId && k !== ns.tool) || (!!ns.handoff && (k === ns.handoff.from || k === 'shell' || k === 'files'));
+    !available ||
+    (!!ns.resumeId && k !== ns.tool) ||
+    (!!ns.handoff && (k === ns.handoff.from || k === 'shell' || k === 'files')) ||
+    (!!bot && (k === 'shell' || k === 'files'));
   const hostLocked = !!ns.resumeId || !!ns.handoff || connectedHosts.length < 2;
   const toolLocked = !!ns.resumeId;
   const curTool = tools.find((t) => t.kind === tool);
 
-  const title = ns.resumeId
+  const title = bot
+    ? tb('newBotTitle')
+    : ns.resumeId
     ? tx('resumeSession')
     : ns.handoff
       ? tx('continueInAnotherTool')
@@ -463,14 +499,20 @@ export function NewSessionPage({ params }: { params: NewSessionParams }) {
           : tx('whatShouldItDo');
   const placeholder = !connected
     ? tx('hostNotConnected')
-    : tool === 'shell'
+    : bot
+      ? tb('newBotPlaceholder')
+      : tool === 'shell'
       ? tx('commandLeaveEmptyForDefault')
       : effectiveMode === 'terminal'
         ? tx('firstMessageTerminal')
         : ns.handoff
           ? tx('initialPrompt')
           : tx('describeTask');
-  const goLabel = busy
+  const goLabel = bot
+    ? busy
+      ? tx('creating')
+      : tb('createBot')
+    : busy
     ? aiTool || tool === 'shell'
       ? tx('starting')
       : tx('creating')
@@ -479,7 +521,7 @@ export function NewSessionPage({ params }: { params: NewSessionParams }) {
       : tool === 'files' || tool === 'shell'
         ? tx('open')
         : tx('create');
-  const canGo = !busy && !!cwd.trim() && !handoffBlocked && connected;
+  const canGo = !busy && !!cwd.trim() && !handoffBlocked && connected && (!bot || (aiTool && !!text.trim()));
 
   return (
     <div className="page ns-page">
@@ -555,7 +597,7 @@ export function NewSessionPage({ params }: { params: NewSessionParams }) {
             {detecting && <span className="spinner mini" />}
             {!toolLocked && <Icon name="down" size={11} />}
           </button>
-          {aiTool && !ns.handoff && (
+          {aiTool && !ns.handoff && !bot && (
             <button
               type="button"
               className="ns-chip"
@@ -674,7 +716,7 @@ export function NewSessionPage({ params }: { params: NewSessionParams }) {
                       addFiles(fs);
                     }
                   }}
-                  style={{ height: Math.min(ns.handoff ? 320 : 240, 22 + text.split('\n').length * 20) }}
+                  style={{ height: Math.min(ns.handoff || bot ? 320 : 240, Math.max(bot ? 82 : 0, 22 + text.split('\n').length * 20)) }}
                 />
               </div>
             )}
@@ -721,7 +763,7 @@ export function NewSessionPage({ params }: { params: NewSessionParams }) {
                 </>
               )}
               {aiTool && (
-                <PermPicker tool={tool} mode={mode} value={perm} onChange={setPerm} open={permOpen} setOpen={setPermOpen} />
+                <PermPicker tool={tool} mode={effectiveMode === 'terminal' ? 'terminal' : 'structured'} value={perm} onChange={setPerm} open={permOpen} setOpen={setPermOpen} />
               )}
               <span className="composer-spacer" />
               {aiTool && (
@@ -761,6 +803,7 @@ export function NewSessionPage({ params }: { params: NewSessionParams }) {
           </div>
         )}
         {handoffBlocked && tools.length > 0 && <p className="muted small ns-note">{tx('noOtherToolIsInstalled')}</p>}
+        {bot && <p className="muted small ns-note ns-bot-note">{tb('newBotNote')}</p>}
       </div>
       {picking && (
         <div className="modal-bg" onClick={() => setPicking(false)}>

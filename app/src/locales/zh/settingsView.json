@@ -37,5 +37,7 @@
   "delete": "删除",
   "snippetText": "片段内容",
   "addSnippet": "添加片段",
-  "startWithExamples": "用几个示例开始"
+  "startWithExamples": "用几个示例开始",
+  "worktreeRoot": "worktree 根目录",
+  "worktreeRootHint": "Bot 派出的任务默认各用一个 git worktree，放在这个目录下（按仓库分子目录）。留空使用 ~/.yi-console/worktrees；修改后只影响新任务。"
 }

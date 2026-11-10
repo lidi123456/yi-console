@@ -434,7 +434,7 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Vec<Valu
                     params["model"] = json!(m);
                 }
                 // Overrides developer_instructions in config.toml
-                params["developerInstructions"] = json!(format!("{}{}", super::IMAGE_HINT, crate::computer_use::model_hint(&spec.extra_args)));
+                params["developerInstructions"] = json!(super::system_text(spec));
                 // Only sent for auto; older Codex versions don't have this field
                 if spec.permission_mode == "auto" {
                     params["approvalsReviewer"] = json!("auto_review");
@@ -796,7 +796,7 @@ pub fn item_events(item: &Value, with_user: bool) -> Vec<EventBody> {
                 .filter_map(|c| c["text"].as_str())
                 .collect::<Vec<_>>()
                 .join("\n");
-            vec![EventBody::UserMessage { text, images: vec![] }]
+            vec![EventBody::UserMessage { text, images: vec![], origin: None }]
         }
         "agentMessage" => {
             let text = s("text");

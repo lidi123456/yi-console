@@ -6422,6 +6422,29 @@ body.resizing .side-resizer::after {
   margin-top: 14px !important;
 }
 
+/* ---- Sidebar: Bots section (BotsSection.tsx), above the hosts ---- */
+.bots-block .bot-block + .bot-block {
+  margin-top: 2px;
+}
+.bot-row .bot-chev {
+  flex: none;
+  display: inline-flex;
+  margin: 0 -2px 0 -6px;
+  color: var(--shell-muted);
+}
+.bot-row .pill {
+  flex: none;
+}
+.bot-tasks {
+  padding-left: 14px;
+}
+.bot-tasks .old-toggle {
+  padding-left: 10px;
+}
+.bot-task-row.s-off .session-title {
+  color: var(--shell-muted);
+}
+
 /* ======================================================================
    Workspace file panel (modeled on the VS Code / Cursor explorer):
    on desktop it's --panel-w (preview area, or a placeholder when no file is open, plus the tree);
@@ -10023,6 +10046,720 @@ button.wp-commit-title .chev {
     grid-column: 2;
   }
 }
+
+/* ---------- Bots: session bar, details page, plugins page (BotsSection.tsx, BotView.tsx, PluginsView.tsx) ---------- */
+.bot-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 34px;
+  padding: 4px 14px;
+  border-bottom: 1px solid var(--border);
+  font-size: 13px;
+  color: var(--text-2);
+}
+.bot-bar > * {
+  flex: none;
+}
+.bot-bar > .truncate {
+  flex: 0 1 auto;
+  min-width: 0;
+}
+.bot-bar-fill {
+  flex: 1 !important;
+}
+.bot-page h2 {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.bot-page textarea {
+  font-size: var(--fs-editor, 13px);
+}
+/* The page head stays in view with its actions */
+.bot-page .page-head {
+  position: sticky;
+  top: -24px;
+  z-index: 4;
+  margin: -24px 0 12px;
+  padding: 18px 0 12px;
+  background: var(--bg);
+  box-shadow: 0 1px 0 var(--border);
+}
+.bot-page .card {
+  padding: 18px 20px 20px;
+  gap: 12px;
+}
+.bot-page .card-title {
+  font-size: 14px;
+}
+/* A card's hint reads as the subtitle of its title */
+.bot-page .card-title + p.muted {
+  margin-top: -8px;
+}
+.bot-page .card.bot-danger {
+  flex-direction: row;
+  align-items: center;
+  gap: 16px;
+}
+.bot-danger .card-title + p.muted {
+  margin-top: 4px;
+}
+.bot-danger .btn {
+  color: var(--err);
+  flex: none;
+}
+.bot-danger .btn:hover {
+  background: var(--err-soft);
+}
+/* The details: label column and values */
+.bot-kv {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 10px 20px;
+  margin: 0;
+  font-size: 13px;
+}
+.bot-kv dt {
+  color: var(--text-2);
+}
+.bot-kv dd {
+  margin: 0;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.bot-pick {
+  margin: 0 6px 4px 0;
+}
+.bot-pick.off {
+  opacity: 0.55;
+  text-decoration: line-through;
+}
+.bot-talk-hint {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: -4px 0 12px;
+}
+.bot-section + .bot-section {
+  margin-top: 4px;
+}
+.bot-section-label {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-2);
+  margin-bottom: 4px;
+}
+.bot-section-text {
+  white-space: pre-wrap;
+  font-size: var(--fs-chat, 13px);
+  line-height: 1.55;
+}
+@media (max-width: 720px) {
+  .bot-kv {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 2px;
+  }
+  .bot-kv dd {
+    margin-bottom: 8px;
+  }
+}
+/* Drafts waiting for approval: under the Bot's session bar (aligned with the chat column), and inline on the
+   details page. One card per draft, styled like the composer */
+.bot-approvals {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: 100%;
+  max-width: 800px;
+  margin: 12px auto 0;
+  padding: 0 24px;
+  max-height: 50vh;
+  overflow-y: auto;
+}
+.bot-approvals.inline {
+  max-width: none;
+  margin: 0 0 14px;
+  padding: 0;
+  max-height: none;
+  overflow: visible;
+}
+.bot-approval {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px 14px 10px;
+  border: 1px solid color-mix(in srgb, var(--accent) 28%, var(--border));
+  border-radius: 14px;
+  background: var(--panel);
+  box-shadow: 0 4px 18px rgba(31, 35, 40, 0.08);
+  font-size: 13px;
+}
+.bot-approval-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.bot-approval-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+}
+.bot-approval-title {
+  flex: none;
+  font-weight: 600;
+  color: var(--text);
+}
+.bot-approval-src {
+  min-width: 0;
+  color: var(--text-2);
+}
+.bot-approval-src::before {
+  content: '·';
+  margin-right: 8px;
+}
+.bot-approval-time {
+  flex: none;
+  font-size: 12px;
+  color: var(--text-2);
+}
+.bot-approval-quote {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 2px 0 2px 10px;
+  border-left: 3px solid var(--border);
+  color: var(--text-2);
+  font-size: 12.5px;
+}
+.bot-approval-who {
+  font-weight: 500;
+}
+.bot-approval-quote-text {
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.bot-approval-text {
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: var(--font-chat);
+  font-size: var(--fs-chat);
+  line-height: 1.6;
+  color: var(--text);
+}
+.bot-approval-edit {
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid var(--accent);
+  border-radius: 10px;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-chat);
+  font-size: var(--fs-chat);
+  line-height: 1.6;
+  resize: vertical;
+  outline: none;
+}
+.bot-approval-tool {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 12px;
+  color: var(--text-2);
+}
+.bot-approval-input {
+  margin: 0;
+  padding: 8px 10px;
+  max-height: 180px;
+  overflow: auto;
+  border-radius: 8px;
+  background: var(--code-bg);
+  font-family: var(--mono);
+  font-size: 12px;
+  white-space: pre-wrap;
+}
+.bot-approval-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.bot-approval .btn.ghost {
+  border-color: transparent;
+  background: none;
+  color: var(--text-2);
+  padding-left: 6px;
+}
+.bot-approval .btn.ghost:hover:not(:disabled) {
+  color: var(--text);
+  background: var(--side-hover);
+}
+.bot-approvals-more {
+  align-self: center;
+}
+/* Secret entry card (same frame as the approval cards) */
+.bot-secret-fields {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.bot-secret-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.bot-secret-label {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-2);
+}
+.bot-secret-field input {
+  width: 100%;
+}
+.bot-secret-note {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+/* Messages the Bot engine sends to a Bot or task session: system notes in the chat, not the person's bubble */
+.msg-engine {
+  display: flex;
+  justify-content: center;
+  margin: 6px 0;
+}
+.engine-note {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px 12px;
+  border-radius: 10px;
+  border: 1px dashed var(--border);
+  font-size: 12.5px;
+  color: var(--text-2);
+}
+.engine-note-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+}
+.engine-note-row > svg {
+  flex: none;
+  align-self: center;
+  opacity: 0.8;
+}
+.engine-note-title {
+  flex: none;
+  color: var(--text);
+  font-weight: 500;
+}
+.engine-note-row.ok > svg {
+  color: var(--ok, #2e9d5b);
+}
+.engine-note-row.warn > svg {
+  color: var(--warn, #c98a1a);
+}
+.engine-note-detail {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.engine-note-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 2px;
+}
+.engine-note-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 1px 8px 1px 6px;
+  border-radius: 999px;
+  background: var(--bubble);
+  color: var(--text-2);
+  font-size: 11.5px;
+  font-weight: 500;
+}
+.engine-note-raw {
+  flex: none;
+}
+.engine-note-pre {
+  margin: 4px 0 0;
+  max-height: 320px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: 12px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: var(--bg-2, rgba(127, 127, 127, 0.08));
+}
+
+/* Routines on the details page */
+.bot-routine {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px 0;
+  border-top: 1px solid var(--border);
+}
+.bot-routine:first-of-type {
+  border-top: none;
+}
+.bot-routine.off .bot-routine-name {
+  color: var(--text-2);
+}
+.bot-routine-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.bot-routine-name {
+  font-weight: 500;
+}
+.bot-routine-prompt {
+  white-space: pre-wrap;
+  color: var(--text);
+}
+.bot-runs {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 4px;
+  padding-left: 10px;
+  border-left: 2px solid var(--border);
+}
+.bot-run {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+.bot-run-failed {
+  color: var(--err);
+}
+.bot-run-nothing,
+.bot-run-skipped {
+  color: var(--text-2);
+}
+.ns-bot-note {
+  text-align: center;
+}
+.bot-error {
+  color: var(--err);
+  background: var(--err-soft);
+  white-space: pre-wrap;
+}
+.bot-revs {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.bot-rev {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 13px;
+  color: var(--text);
+}
+.bot-rev > .muted {
+  flex: 1;
+}
+.bot-attn {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  font-size: 13px;
+}
+.bot-attn > span {
+  flex: 1;
+  min-width: 0;
+}
+.bot-preview {
+  max-height: 360px;
+  overflow: auto;
+  margin: 0;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: var(--bg-2);
+  color: var(--text);
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.bot-events {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.bot-event {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  font-size: 13px;
+}
+.bot-event > .muted {
+  flex: none;
+  width: 92px;
+}
+.bot-event-text {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.bot-event .pill {
+  flex: none;
+}
+.bot-event.full .bot-event-text {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.bot-event-note {
+  display: block;
+  margin-top: 2px;
+}
+.bot-event .icon-btn {
+  flex: none;
+  align-self: center;
+}
+.bot-rev {
+  flex-wrap: wrap;
+}
+.bot-rev-diff {
+  flex-basis: 100%;
+}
+.bot-diff {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.bot-diff-body {
+  margin: 2px 0 0;
+  padding: 6px 0;
+  border-radius: 6px;
+  background: var(--bg-2);
+  font-family: var(--font-editor);
+  font-size: var(--fs-editor);
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 360px;
+  overflow: auto;
+}
+.bot-diff-body > span {
+  display: block;
+  padding: 0 10px;
+}
+.bot-diff-ctx {
+  color: var(--text-2);
+}
+.bot-budget {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 13px;
+}
+.bot-budget-bar {
+  flex: 1;
+  max-width: 240px;
+  height: 6px;
+  border-radius: 3px;
+  background: var(--bg-2);
+  overflow: hidden;
+}
+.bot-budget-bar > span {
+  display: block;
+  height: 100%;
+  background: var(--accent);
+}
+.bot-budget-bar.high > span {
+  background: var(--warn);
+}
+.bot-budget-bar.full > span {
+  background: var(--del-fg);
+}
+.bot-chart {
+  display: flex;
+  align-items: flex-end;
+  gap: 4px;
+  height: 64px;
+  margin-top: 12px;
+}
+.bot-chart-day {
+  flex: 1;
+  height: 100%;
+  display: flex;
+  align-items: flex-end;
+  gap: 1px;
+}
+.bot-chart-day .bar {
+  flex: 1;
+  min-height: 1px;
+  border-radius: 2px 2px 0 0;
+}
+.bot-chart .bar.events,
+.bot-chart-legend .dot.events {
+  background: color-mix(in srgb, var(--accent) 45%, transparent);
+}
+.bot-chart .bar.tasks,
+.bot-chart-legend .dot.tasks {
+  background: var(--accent);
+}
+.bot-chart-legend {
+  display: flex;
+  gap: 14px;
+  margin-top: 6px;
+}
+.bot-chart-legend .dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 2px;
+  margin-right: 4px;
+}
+.bot-board {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+  gap: 12px;
+  align-items: start;
+}
+.bot-card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 0;
+}
+.bot-card.attn {
+  box-shadow: inset 3px 0 0 var(--warn);
+}
+.bot-card.s-off {
+  opacity: 0.6;
+}
+.bot-card-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.bot-card-name {
+  font-weight: 600;
+  font-size: 14px;
+  color: var(--text);
+  background: none;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.bot-card-name:hover {
+  text-decoration: underline;
+}
+.bot-card-err {
+  color: var(--del-fg);
+}
+.bot-card-attn {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  background: var(--warn-soft);
+}
+.bot-card-task {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 5px 6px;
+  border: none;
+  border-radius: 6px;
+  background: none;
+  color: var(--text);
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+}
+.bot-card-task:hover {
+  background: var(--bg-2);
+}
+.bot-card-task-text {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+.bot-card-foot {
+  display: flex;
+  gap: 12px;
+}
+.bot-card-foot:empty {
+  display: none;
+}
+.bot-stat-pills {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 10px;
+}
+.plugin-add {
+  margin-left: auto;
+}
+.plugin-inst {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  min-width: 0;
+}
+.plugin-add.row {
+  gap: 6px;
+  align-items: center;
+}
+.plugin-inst-actions {
+  margin-left: auto;
+  flex: none;
+  display: flex;
+  gap: 10px;
+}
+.plugin-sub {
+  margin: 6px 0 10px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.plugin-off > :not(.card-title) {
+  opacity: 0.6;
+}
+.plugin-review {
+  border-color: var(--accent);
+}
+.plugin-danger {
+  color: var(--danger, #c0392b);
+}
+.pill-warn {
+  background: color-mix(in srgb, #e6a23c 18%, transparent);
+  color: #b7791f;
+}
+
 
 /* ======================================================================
    Buzz look (after block/buzz's desktop app): one vertical gradient painted on .app (--shell-gradient, olive-yellow to

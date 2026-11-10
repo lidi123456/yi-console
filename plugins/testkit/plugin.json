@@ -1,0 +1,23 @@
+{
+  "id": "testkit",
+  "version": "0.1.0",
+  "api": "0.1",
+  "runtime": "wasm",
+  "main": "plugin.wasm",
+  "name": { "zh": "测试插件", "en": "Test kit" },
+  "description": {
+    "zh": "端到端测试用：从本机的模拟服务拉事件、回复，并检查沙箱限制",
+    "en": "For end-to-end tests: pulls events from a local mock server, replies to it and checks the sandbox"
+  },
+  "capabilities": ["trigger", "reply", "context", "notify", "tools"],
+  "permissions": { "net": ["127.0.0.1"], "exec": [] },
+  "config": {
+    "type": "object",
+    "required": ["server"],
+    "properties": {
+      "server": { "type": "string", "title": "模拟服务地址", "x-en": { "title": "Mock server" } },
+      "token": { "type": "string", "title": "令牌", "x-secret": true, "x-en": { "title": "Token" } },
+      "pollMs": { "type": "integer", "title": "轮询间隔（毫秒）", "default": 1000, "x-en": { "title": "Poll interval (ms)" } }
+    }
+  }
+}

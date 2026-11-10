@@ -11,6 +11,10 @@ import { Sidebar } from './components/Sidebar';
 import { StatsView } from './components/StatsView';
 import { PortsView } from './components/PortsView';
 import { PrefsView } from './components/PrefsView';
+import { BotView } from './components/BotView';
+import { PluginsView } from './components/PluginsView';
+import { BotEventsView } from './components/BotActivity';
+import { BotSource } from './bots';
 import { Palette, useShortcuts } from './components/Palette';
 import { SearchView } from './components/SearchView';
 import { setState, useStore } from './store';
@@ -67,6 +71,25 @@ function Main() {
       return <SettingsView key={view.hostId} hostId={view.hostId} />;
     case 'prefs':
       return <PrefsView />;
+    case 'bot':
+      return (
+        <BotSource.Provider value={view.src ?? ''}>
+          {/* An older saved view may be the removed new-Bot form */}
+          {view.botId ? <BotView key={`${view.src ?? ''}/${view.botId}`} botId={view.botId} /> : <div className="page muted" />}
+        </BotSource.Provider>
+      );
+    case 'botEvents':
+      return (
+        <BotSource.Provider value={view.src ?? ''}>
+          <BotEventsView key={`${view.src ?? ''}/${view.botId}`} botId={view.botId} />
+        </BotSource.Provider>
+      );
+    case 'plugins':
+      return (
+        <BotSource.Provider value={view.src ?? ''}>
+          <PluginsView key={`${view.src ?? ''}/${view.review ?? ''}`} review={view.review} />
+        </BotSource.Provider>
+      );
     case 'new': {
       // Opened again with other parameters (another directory, a hand-off): start over
       const { kind: _k, ...p } = view;

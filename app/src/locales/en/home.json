@@ -45,7 +45,7 @@
   "exitedWithError": "Exited with an error",
   "usageLimitReached": "Usage limit reached",
   "continuesIn": "Continues automatically in",
-  "backgroundTasks": "{{n}} background tasks",
+  "backgroundTasks": "{{n}} background commands",
   "queued": "{{n}} queued",
   "context": "Context",
   "runningFor": "Running for {{n}} min",
@@ -59,7 +59,7 @@
   "showLess": "Show less",
   "onlyProject": "Only sessions in {{name}}",
   "showEverything": "Show all",
-  "actPlan": "Tasks",
+  "actPlan": "To-dos",
   "actWeb": "Web",
   "actCommand": "Command",
   "actEdit": "Edit",
@@ -112,5 +112,7 @@
   "justStarted": "Just started",
   "tookUnderAMinute": "took under a minute",
   "rejected": "Rejected: {{v}}",
-  "draftSavedTextOnly": "Saved as a draft (text only; images and files were not kept)"
+  "draftSavedTextOnly": "Saved as a draft (text only; images and files were not kept)",
+  "viewSessions": "Sessions",
+  "viewBots": "Bots"
 }

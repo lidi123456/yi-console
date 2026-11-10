@@ -1,5 +1,5 @@
 {
-  "tasks": "Tasks {{done}}/{{length}}",
+  "tasks": "To-dos {{done}}/{{length}}",
   "now": "Now: ",
   "next": "Next: "
 }

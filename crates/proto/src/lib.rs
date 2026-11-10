@@ -235,6 +235,48 @@ pub struct SessionInfo {
     /// The current or last chat turn (chat mode only)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn: Option<TurnInfo>,
+    /// Set by a desktop client on a Bot's own session and on the tasks it spawned; absent for ordinary sessions.
+    /// The daemon only stores and returns it, so every client can group these sessions under their Bot
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bot: Option<BotLink>,
+    /// MCP servers served by a client through the client MCP bridge (see `ClientMcp`)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub client_mcp: Vec<ClientMcp>,
+    /// Extra system prompt; delivered per tool like the computer-use hint (Claude `--append-system-prompt`,
+    /// Codex `developerInstructions`, ACP tools a `<system-reminder>` before the first prompt of a new tool session)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub append_system_prompt: Option<String>,
+}
+
+/// Which Bot a session belongs to. Bot state itself lives in the desktop client that runs the Bot
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct BotLink {
+    pub bot_id: String,
+    pub bot_name: String,
+    /// bot (the Bot's own session) / task (spawned by it); older sessions may say assistant (the removed config assistant)
+    pub role: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    /// The desktop client running the Bot (`client.hello`)
+    pub client_id: String,
+}
+
+/// An MCP server whose tools are implemented by a connected client. The AI tool starts `yi-agentd client-mcp`, which
+/// relays `tools/call` through the daemon to the client (`clientMcp.call` / `clientMcp.result`). The tool list is
+/// given up front, so the server starts and lists its tools even while the client is offline
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientMcp {
+    /// MCP server name as the model sees it ([A-Za-z0-9_-], must not clash with the host's MCP servers)
+    pub name: String,
+    pub client_id: String,
+    /// MCP tool definitions ({name, description, inputSchema})
+    #[serde(default)]
+    pub tools: Vec<Value>,
+    /// Text returned for a tool call while the client is offline, per tool name; tools not listed fail with an error
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub offline: std::collections::BTreeMap<String, String>,
 }
 
 /// Summary of a waiting approval / question
@@ -474,6 +516,10 @@ pub enum EventBody {
         text: String,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         images: Vec<ImageRef>,
+        /// Who sent it when not the person: `bot-engine` for what the desktop app's Bot engine sends to a Bot or
+        /// task session (events, reports, notices), shown as a system note instead of the person's bubble
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin: Option<String>,
     },
     AssistantText {
         id: String,
@@ -721,6 +767,9 @@ pub struct DaemonSettings {
     /// UI language last reported by a client (zh / en), used for the automatic continue message
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ui_lang: Option<String>,
+    /// Where `git.worktreeAdd` puts new worktrees (`~` allowed); `~/.yi-console/worktrees` if unset
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_root: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -940,6 +989,35 @@ pub mod methods {
     /// The client's UI language {lang: zh | en}, remembered for messages the daemon sends by itself
     pub const SETTINGS_UI_LANG: &str = "settings.uiLang";
 
+    /// {clientId, kind, name}: a client says who it is, so the daemon can call it back (client MCP bridge).
+    /// kind: desktop / mobile / web. The latest connection of a clientId wins
+    pub const CLIENT_HELLO: &str = "client.hello";
+    /// {callId, result?, error?}: a client answers a `clientMcp.call`
+    pub const CLIENT_MCP_RESULT: &str = "clientMcp.result";
+    /// Private, locally authenticated traffic from `yi-agentd client-mcp`; remote peers cannot invoke it
+    pub const CLIENT_MCP_PROXY: &str = "clientMcp.proxy";
+    /// {sessionId, clientMcp: [ClientMcp]}: replace the client MCP servers; applies after the current turn
+    pub const SESSION_SET_CLIENT_MCP: &str = "session.setClientMcp";
+    /// {sessionId, prompt: string | null}: replace the appended system prompt; applies after the current turn
+    pub const SESSION_SET_SYSTEM_PROMPT: &str = "session.setSystemPrompt";
+    /// {sessionId, bot: BotLink | null}
+    pub const SESSION_SET_BOT: &str = "session.setBot";
+    /// {cwd, name, branch?, base?} -> {path, branch, repo}: add a worktree for the repo at cwd under the worktree root
+    /// (`<root>/<repo name>-<hash>/<name>`), on a new branch (default `yi/<name>`) from base (default HEAD)
+    pub const GIT_WORKTREE_ADD: &str = "git.worktreeAdd";
+    /// {path, force?, deleteBranch?}: remove a worktree made by git.worktreeAdd (must be under the worktree root)
+    pub const GIT_WORKTREE_REMOVE: &str = "git.worktreeRemove";
+    /// -> [{clientId, name}]: desktop apps registered on this machine (`client.hello` over local IPC), whose Bots a
+    /// phone or yi-web can control through `client.call`
+    pub const CLIENTS_LIST: &str = "clients.list";
+    /// {clientId, cmd, args} -> the command's result: run a `bots.*` / `tasks.*` / `plugins.*` command in that
+    /// desktop app (remote control). Not accepted from processes started by this daemon (the AI tools)
+    pub const CLIENT_CALL: &str = "client.call";
+    /// {callId, result?, error?}: a desktop app answers a `client.call` notification
+    pub const CLIENT_RESULT: &str = "client.result";
+    /// {event}: a registered desktop app pushes a state change (`bots.changed`, ...) to every connected client
+    pub const CLIENT_EVENT: &str = "client.event";
+
     // Notifications
     pub const EV_SESSION_EVENT: &str = "session.event";
     pub const EV_SESSION_UPDATED: &str = "session.updated";
@@ -948,6 +1026,15 @@ pub mod methods {
     pub const EV_NOTIFY: &str = "notify";
     /// {tool, job: ToolJob, line?, tools?}: an upgrade started, printed a line, or ended (then with the re-detected tools)
     pub const EV_TOOLS_UPDATING: &str = "tools.updating";
+    /// {callId, sessionId, server, tool, arguments}: sent only to the client named in the session's `ClientMcp`;
+    /// it answers with `clientMcp.result`
+    pub const EV_CLIENT_MCP_CALL: &str = "clientMcp.call";
+    /// {callId, cmd, args}: a remote-control command for this desktop app; answered with `client.result`
+    pub const EV_CLIENT_CALL: &str = "client.call";
+    /// {clientId, event}: a desktop app's state changed (from `client.event`)
+    pub const EV_CLIENT_EVENT: &str = "client.event";
+    /// {}: a desktop app registered or went away; refetch `clients.list`
+    pub const EV_CLIENTS_CHANGED: &str = "clients.changed";
 }
 
 #[cfg(test)]

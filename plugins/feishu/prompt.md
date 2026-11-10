@@ -1,0 +1,1 @@
+Feishu events: private chats and messages that @ the bot are `explicit`; other group messages are ambient. Threads look like `feishu:<chat>:<root message>` for groups and `feishu:<chat>` for private chats. `reply` answers in that conversation (as a reply to the message the event came from). Write plain text, short, in the language of the conversation.

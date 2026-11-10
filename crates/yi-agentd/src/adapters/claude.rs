@@ -43,28 +43,31 @@ pub fn build_args(spec: &StartSpec) -> Vec<String> {
     // Don't add it if the user already set it in extra args, otherwise it's unclear which of two identical flags wins
     if !spec.extra_args.iter().any(|x| x == "--append-system-prompt" || x.starts_with("--append-system-prompt=")) {
         a.push("--append-system-prompt".into());
-        a.push(format!("{}{}", super::IMAGE_HINT, crate::computer_use::model_hint(&spec.extra_args)));
+        a.push(super::system_text(spec));
     }
     a.extend(spec.extra_args.iter().cloned());
     if !crate::computer_use::model_hint(&spec.extra_args).is_empty() {
-        allow_desktop_tools(&mut a);
+        allow_tools(&mut a, "mcp__yi_computer_use__*");
+    }
+    // Client MCP tools (a Bot's own tools) are answered by the desktop app, which does its own checks
+    for name in &spec.allow_mcp {
+        allow_tools(&mut a, &format!("mcp__{name}__*"));
     }
     a
 }
 
 /// Preauthorize the gateway at the CLI layer too: auto mode can run its classifier before can_use_tool.
 /// The gateway continues to enforce the live grant, selected window and plan-mode restrictions.
-fn allow_desktop_tools(args: &mut Vec<String>) {
-    const RULE: &str = "mcp__yi_computer_use__*";
+fn allow_tools(args: &mut Vec<String>, rule: &str) {
     if let Some(index) = args.iter().rposition(|arg| arg == "--allowedTools" || arg == "--allowed-tools" || arg.starts_with("--allowedTools=") || arg.starts_with("--allowed-tools=")) {
         if args[index].contains('=') {
             args[index].push(',');
-            args[index].push_str(RULE);
+            args[index].push_str(rule);
         } else {
-            args.insert(index + 1, RULE.into());
+            args.insert(index + 1, rule.into());
         }
     } else {
-        args.extend(["--allowedTools".into(), RULE.into()]);
+        args.extend(["--allowedTools".into(), rule.into()]);
     }
 }
 
@@ -739,6 +742,7 @@ pub fn user_content_events(content: &Value) -> Vec<EventBody> {
         return vec![EventBody::UserMessage {
             text: s.to_string(),
             images: vec![],
+            origin: None,
         }];
     }
     let mut out = vec![];
@@ -752,6 +756,7 @@ pub fn user_content_events(content: &Value) -> Vec<EventBody> {
             "text" => out.push(EventBody::UserMessage {
                 text: b["text"].as_str().unwrap_or("").to_string(),
                 images: vec![],
+                origin: None,
             }),
             _ => {}
         }
@@ -811,7 +816,7 @@ mod tests {
     fn desktop_allow_rule_keeps_existing_tool_permissions() {
         for original in [vec!["--allowedTools", "Read", "Bash(git *)"], vec!["--allowed-tools=Read,Bash(git *)"], vec!["--allowedTools=Read", "--allowed-tools", "Bash(git *)"]] {
             let mut args: Vec<String> = original.iter().map(|s| s.to_string()).collect();
-            allow_desktop_tools(&mut args);
+            allow_tools(&mut args, "mcp__yi_computer_use__*");
             assert!(args.join(" ").contains("mcp__yi_computer_use__*"));
             assert!(args.join(" ").contains("Read"));
             assert!(args.join(" ").contains("Bash(git *)"));

@@ -4,7 +4,7 @@
   "remoteAgent": "Remote Agent",
   "loading": "Loading…",
   "noOutputYet": "(no output yet)",
-  "backgroundTaskS": "{{length}} background task(s)",
+  "backgroundTaskS": "{{length}} background command(s)",
   "hide": "Hide",
   "output": "Output",
   "stop": "Stop"

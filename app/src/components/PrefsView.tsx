@@ -20,6 +20,8 @@ import { Icon } from './Icon';
 import { setTheme, useTheme, type Theme } from '../theme';
 import { canZoom, CHAT_SIZES, EDITOR_SIZES, setFontPrefs, useFontPrefs, zoomFactor, ZOOM_MAX, ZOOM_MIN } from '../fontPrefs';
 import { getT, setLangPref, type LangPref, useLang } from '../i18n';
+import { useBots } from '../bots';
+import { navigate } from '../store';
 
 const tx = getT('prefsView');
 
@@ -41,7 +43,16 @@ const SECTIONS: Section[] = [
     ),
   },
   { id: 'terminal', title: () => tx('catTerminal'), body: () => <TermCard /> },
-  { id: 'sessions', title: () => tx('catSessions'), body: () => <HandoffCard /> },
+  {
+    id: 'sessions',
+    title: () => tx('catSessions'),
+    body: () => (
+      <>
+        <HandoffCard />
+        <BotsCard />
+      </>
+    ),
+  },
   { id: 'notifications', title: () => tx('notifications'), body: () => <NotifyCard /> },
   { id: 'network', title: () => tx('catNetwork'), body: () => <ProxyCard /> },
   { id: 'about', title: () => tx('about'), body: () => <AboutCard /> },
@@ -388,6 +399,29 @@ function PrefRow({ title, desc, children }: { title: string; desc?: string; chil
         {desc && <div className="muted small">{desc}</div>}
       </div>
       {children}
+    </div>
+  );
+}
+
+/** Bots (desktop app only): keep running in the tray, plugins */
+function BotsCard() {
+  const available = useBots((b) => b.list !== null);
+  const client = useStore((s) => s.client);
+  if (!available) return null;
+  const on = client?.closeToTray ?? true;
+  return (
+    <div className="card">
+      <div className="card-title">{tx('bots')}</div>
+      <div className="form">
+        <label className="check">
+          <input type="checkbox" checked={on} onChange={(e) => saveClientSettings({ closeToTray: e.target.checked }).catch(errorToast)} />
+          {tx('closeToTray')}
+        </label>
+        <p className="muted small">{tx('closeToTrayHint')}</p>
+        <button className="btn small" onClick={() => navigate({ kind: 'plugins' })}>
+          <Icon name="plug" size={13} /> {tx('managePlugins')}
+        </button>
+      </div>
     </div>
   );
 }

@@ -1,0 +1,22 @@
+# Yi Console plugins: the SDK, the first-party plugins and the packer. A workspace of its own: plugins build for
+# wasm32-wasip2 (`cargo build --release --target wasm32-wasip2`), the packer for the host. See docs/plugins.en.md.
+[workspace]
+resolver = "2"
+members = ["sdk", "github", "feishu", "testkit", "pack"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+yi-plugin = { path = "sdk" }
+wit-bindgen = { version = "0.63", default-features = false, features = ["macros", "realloc", "std", "bitflags"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
+codegen-units = 1

@@ -1,5 +1,6 @@
 import { ChatMarkdown } from './ChatMarkdown';
 import { createContext, memo, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { ENGINE_ORIGIN, EngineNote } from './EngineNote';
 import { type ImgCtx } from '../chatImages';
 import { getT, isEn, trErr, useLang } from '../i18n';
 import { rpc } from '../transport';
@@ -20,7 +21,7 @@ const t = getT('chatView');
 
 type Item =
   | { k: 'desktop'; key: string; ev: HubEvent & { kind: 'computer_use' } }
-  | { k: 'user'; key: string; text: string; ts: number; images: ImageRef[] }
+  | { k: 'user'; key: string; text: string; ts: number; images: ImageRef[]; origin?: string }
   | { k: 'text'; key: string; ts: number; text: string }
   | { k: 'thinking'; key: string; ts: number; text: string }
   | {
@@ -158,7 +159,7 @@ function buildItems(events: HubEvent[], hideCompactCmd = false): Item[] {
       }
       case 'user_message':
         if (!(hideCompactCmd && e.text.trim() === '/compact')) {
-          items.push({ k: 'user', key, text: e.text, ts: e.ts, images: e.images ?? [] });
+          items.push({ k: 'user', key, text: e.text, ts: e.ts, images: e.images ?? [], origin: e.origin });
         }
         turnStart ??= e.ts;
         break;
@@ -1582,6 +1583,12 @@ export function ChatView({
             case 'thinking':
               return runItem(it);
             case 'user':
+              if (it.origin === ENGINE_ORIGIN)
+                return (
+                  <div key={it.key} data-key={it.key} className="msg-engine">
+                    <EngineNote text={it.text} />
+                  </div>
+                );
               return (
                 <div key={it.key} data-key={it.key} className="msg-user">
                   {it.images.length > 0 && hostId && info && (

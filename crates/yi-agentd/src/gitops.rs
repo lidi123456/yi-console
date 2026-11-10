@@ -357,9 +357,104 @@ pub fn commit(cwd: &str, paths: &[String], message: &str) -> Result<Value> {
     Ok(json!({ "commit": head.trim() }))
 }
 
+/// Where new worktrees go (`DaemonSettings::worktree_root`, default `~/.yi-console/worktrees`)
+pub fn worktree_root(settings: &yi_proto::DaemonSettings) -> std::path::PathBuf {
+    match settings.worktree_root.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(p) => crate::paths::expand(p),
+        None => crate::paths::base_dir().join("worktrees"),
+    }
+}
+
+fn safe_name(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 64
+        && !s.starts_with(['-', '.'])
+        && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+}
+
+/// Add a worktree for the repo at `cwd`: `<root>/<repo name>-<hash>/<name>` on a new branch (default `yi/<name>`)
+/// from `base` (default HEAD). The hash keeps repos with the same name apart
+pub fn worktree_add(root: &Path, cwd: &str, name: &str, branch: Option<&str>, base: Option<&str>) -> Result<Value> {
+    if !safe_name(name) {
+        bail!("worktree 名称只能包含字母、数字、点、下划线和短横线: {name}");
+    }
+    let repo = repo_root(Path::new(cwd)).ok_or_else(|| anyhow!("不是 git 仓库: {cwd}"))?;
+    let branch = branch.map(str::to_string).unwrap_or_else(|| format!("yi/{name}"));
+    let base = base.unwrap_or("HEAD");
+    if branch.starts_with('-') || base.starts_with('-') || git_ok(&repo, &["check-ref-format", "--branch", &branch]).is_err() {
+        bail!("分支名无效: {branch}");
+    }
+    let repo_name = repo.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "repo".into());
+    let repo_name: String = repo_name.chars().map(|c| if c.is_alphanumeric() || "._-".contains(c) { c } else { '_' }).collect();
+    let hash = format!("{:x}", md5::compute(repo.to_string_lossy().as_bytes()));
+    let dir = root.join(format!("{repo_name}-{}", &hash[..8])).join(name);
+    if dir.exists() {
+        bail!("worktree 目录已存在: {}", dir.display());
+    }
+    std::fs::create_dir_all(dir.parent().unwrap())?;
+    let path = dir.to_string_lossy().to_string();
+    git_ok(&repo, &["worktree", "add", "-b", &branch, &path, base])?;
+    Ok(json!({ "path": path, "branch": branch, "repo": repo.to_string_lossy() }))
+}
+
+/// Remove a worktree made by `worktree_add`; only paths under the worktree root are accepted
+pub fn worktree_remove(root: &Path, path: &str, force: bool, delete_branch: bool) -> Result<()> {
+    let dir = Path::new(path).canonicalize().map_err(|_| anyhow!("worktree 不存在: {path}"))?;
+    let root = root.canonicalize().map_err(|_| anyhow!("worktree 根目录不存在"))?;
+    if !dir.starts_with(&root) || dir == root {
+        bail!("只能删除 worktree 根目录下的 worktree: {path}");
+    }
+    let common = git_ok(&dir, &["rev-parse", "--path-format=absolute", "--git-common-dir"])?;
+    let common = std::path::PathBuf::from(common.trim());
+    let branch = git_ok(&dir, &["symbolic-ref", "--quiet", "--short", "HEAD"]).ok().map(|s| s.trim().to_string());
+    // The path as given: git may not understand the verbatim (\\?\) form canonicalize returns on Windows
+    let target = path.to_string();
+    let mut args = vec!["worktree", "remove"];
+    if force {
+        args.push("--force");
+    }
+    args.push(&target);
+    // Run from the shared git dir: git refuses to remove the worktree it is running in
+    git_ok(&common, &args)?;
+    if let (true, Some(b)) = (delete_branch, branch.filter(|b| !b.is_empty())) {
+        git_ok(&common, &["branch", "-D", &b])?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn worktrees_live_under_the_root_and_only_there_can_be_removed() {
+        let d = tempfile::tempdir().unwrap();
+        let repo = d.path().join("my repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let run = |a: &[&str]| assert!(git(&repo, a).unwrap().status.success(), "{a:?}");
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "t@t"]);
+        run(&["config", "user.name", "t"]);
+        std::fs::write(repo.join("a.txt"), "1\n").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-qm", "init"]);
+        let root = d.path().join("wt");
+        let cwd = repo.to_string_lossy().to_string();
+        assert!(worktree_add(&root, &cwd, "../x", None, None).is_err());
+        assert!(worktree_add(&root, &cwd, "t1", Some("--bad"), None).is_err());
+        let r = worktree_add(&root, &cwd, "t1", None, None).unwrap();
+        let path = r["path"].as_str().unwrap().to_string();
+        assert_eq!(r["branch"], "yi/t1");
+        assert!(Path::new(&path).join("a.txt").exists());
+        assert!(Path::new(&path).starts_with(&root));
+        // The same name again is refused
+        assert!(worktree_add(&root, &cwd, "t1", Some("yi/other"), None).is_err());
+        // The repo itself is not under the root
+        assert!(worktree_remove(&root, &cwd, false, false).is_err());
+        worktree_remove(&root, &path, false, true).unwrap();
+        assert!(!Path::new(&path).exists());
+        assert!(git_ok(&repo, &["branch", "--list", "yi/t1"]).unwrap().trim().is_empty());
+    }
 
     #[test]
     fn changes_discard_commit() {

@@ -934,7 +934,7 @@ fn hide_gateway_args(tool: &mut Value) {
 }
 
 #[derive(Debug, PartialEq)]
-enum ProxyAccess {
+pub(crate) enum ProxyAccess {
     Allow,
     Bind,
     Deny,
@@ -942,7 +942,7 @@ enum ProxyAccess {
 
 /// bound: the proxy pid holding the ticket and its parent (the AI tool). A second proxy of the same tool is allowed
 /// (some CLIs open the server twice); any other process only once the bound proxy has exited.
-fn proxy_access(bound: Option<(u32, Option<u32>)>, pid: u32, parent: Option<u32>, alive: impl Fn(u32) -> bool) -> ProxyAccess {
+pub(crate) fn proxy_access(bound: Option<(u32, Option<u32>)>, pid: u32, parent: Option<u32>, alive: impl Fn(u32) -> bool) -> ProxyAccess {
     match bound {
         Some((b, _)) if b == pid => ProxyAccess::Allow,
         Some((_, Some(tool))) if parent == Some(tool) => ProxyAccess::Allow,
@@ -1038,7 +1038,7 @@ pub fn display_result(value: &Value) -> String {
     crate::util::truncate(&display_value(value).to_string(), 64 * 1024)
 }
 
-mod process {
+pub(crate) mod process {
     #[cfg(windows)]
     pub fn alive(pid: u32) -> bool {
         use windows_sys::Win32::Foundation::CloseHandle;

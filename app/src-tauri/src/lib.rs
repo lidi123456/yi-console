@@ -3,6 +3,8 @@
 
 mod clipfiles;
 #[cfg(desktop)]
+mod tray;
+#[cfg(desktop)]
 mod updater;
 
 /// No tauri-plugin-updater on mobile: Android updates itself in MainActivity.kt (YiConsoleAndroid.update*), these only keep the handler list the same
@@ -127,11 +129,40 @@ pub fn run() {
                 let _ = handle.emit("hub-event", v);
             });
             // ClientHub::new spawns background tasks for auto-connecting hosts, so it must be called inside the tokio runtime
+            let dir = data_dir.clone();
             let hub = tauri::async_runtime::block_on(async move {
-                ClientHub::new(data_dir, yi_agentd_dir, LOCAL_SUPPORTED, sink)
+                ClientHub::new(dir, yi_agentd_dir, LOCAL_SUPPORTED, sink)
             });
+            #[cfg(desktop)]
+            {
+                // Bots run only in the desktop app; phones and yi-web will reach them through the desktop
+                let h = hub.clone();
+                // Feishu / GitHub ship with the app (scripts/bundle-plugins.py fills resources/plugins)
+                let bundled = app.path().resource_dir().ok().map(|d| d.join("plugins"));
+                let bots = tauri::async_runtime::block_on(async move {
+                    yi_bots::start(&h, &data_dir, &yi_client::api::device_name(), bundled.as_deref())
+                });
+                match bots {
+                    Ok(b) => {
+                        app.manage(tray::BotsState(Some(b)));
+                    }
+                    Err(e) => {
+                        eprintln!("Bots 启动失败: {e:#}");
+                        app.manage(tray::BotsState(None));
+                    }
+                }
+                tray::setup(app)?;
+            }
+            #[cfg(mobile)]
+            let _ = data_dir;
             app.manage(Hub(hub));
             Ok(())
+        })
+        .on_window_event(|window, event| {
+            #[cfg(desktop)]
+            tray::on_window_event(window, event);
+            #[cfg(mobile)]
+            let _ = (window, event);
         })
         .invoke_handler(tauri::generate_handler![
             hub_call,

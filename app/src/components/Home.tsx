@@ -6,11 +6,13 @@ import { errorToast, navigate, openNewSession, useStore } from '../store';
 import { rpc } from '../transport';
 import type { HostEntry } from '../store';
 import type { SessionInfo } from '../types';
-import { basename, fmtTokens, shortPath, timeAgo } from '../util';
+import { basename, fmtTokens, lsGet, lsSet, shortPath, timeAgo } from '../util';
 import { Icon, ToolBadge } from './Icon';
 import { FeedPanel, ProjectPanel, QuickStart, QuotaDialog, WeekPanel } from './OverviewPanels';
 import { openMenu } from './Overlay';
 import { sessionMenu, showChanges } from './SessionActions';
+import { BotBoard } from './BotBoard';
+import { useBots } from '../bots';
 
 const t = getT('home');
 
@@ -421,6 +423,14 @@ export function Home() {
   const [filter, setFilter] = useState<string | null>(null);
   const [quota, setQuota] = useState(false);
   const [tab, setTab] = useState<Col | null>(null);
+  // The board by session or by Bot; the Bot view is offered once there is a Bot (here or on a remote desktop)
+  const hasBots = useBots((s) => (s.list?.length ?? 0) > 0 || s.remotes.some((r) => (r.list?.length ?? 0) > 0));
+  const [byBot, setByBot] = useState(() => lsGet('yi-console-ov-bots', false));
+  const botView = hasBots && byBot;
+  const pickView = (v: boolean) => {
+    setByBot(v);
+    lsSet('yi-console-ov-bots', v);
+  };
 
   const all = useMemo(() => {
     const out: Item[] = [];
@@ -477,6 +487,16 @@ export function Home() {
           </span>
         )}
         <span className="grow" />
+        {hasBots && (
+          <div className="seg">
+            <button className={botView ? '' : 'active'} onClick={() => pickView(false)}>
+              {t('viewSessions')}
+            </button>
+            <button className={botView ? 'active' : ''} onClick={() => pickView(true)}>
+              {t('viewBots')}
+            </button>
+          </div>
+        )}
         {connected.length > 0 && (
           <button className="btn" onClick={() => setQuota(true)} title={limited ? t('aToolHitItsLimit') : undefined}>
             {limited && <span className="ov-warn-dot" />}
@@ -502,6 +522,9 @@ export function Home() {
       )}
       {hosts.length > 0 && <QuickStart hosts={hosts} sessions={sessions} />}
 
+      {botView && <BotBoard />}
+      {!botView && (
+      <>
       <div className="ov-tabs">
         {COLS.map((c) => (
           <button key={c} className={`${c === shownTab ? 'on' : ''}${c === 'attn' && cols.attn.length ? ' attn' : ''}`} onClick={() => setTab(c)}>
@@ -523,6 +546,8 @@ export function Home() {
           <Column key={c} col={c} items={cols[c]} multi={multi} now={now} shown={c === shownTab} />
         ))}
       </div>
+      </>
+      )}
 
       {all.length > 0 && (
         <div className="ov-lower">

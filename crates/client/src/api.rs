@@ -41,6 +41,9 @@ struct HostConn {
     child: Mutex<Option<tokio::process::Child>>,
 }
 
+/// The local host's id (the daemon on this machine)
+const LOCAL_ID: &str = "local";
+
 pub struct ClientHub {
     yi_agentd_dir: Option<PathBuf>,
     data_dir: PathBuf,
@@ -59,6 +62,8 @@ pub struct ClientHub {
     forwards: Mutex<HashMap<String, Arc<Forward>>>,
     /// File server for previewing HTML in browser tabs (see preview.rs)
     previews: crate::preview::Previews,
+    /// Local services of the desktop app (Bots), see ext.rs
+    ext: std::sync::OnceLock<Arc<dyn crate::ext::Extension>>,
 }
 
 /// Errors not worth retrying (they need the user to act)
@@ -118,6 +123,7 @@ impl ClientHub {
             auto_tried: Mutex::new(HashSet::new()),
             forwards: Mutex::new(HashMap::new()),
             previews: Default::default(),
+            ext: std::sync::OnceLock::new(),
         });
         let auto: Vec<String> = hub
             .store
@@ -138,6 +144,75 @@ impl ClientHub {
         (self.sink)(v);
     }
 
+    /// Push an event to the frontend (extensions use it for `bots.changed` and the like). The local daemon passes it
+    /// on to phones and yi-web controlling this app (`client.event`)
+    pub fn emit_event(&self, v: Value) {
+        let rpc = self.conns.lock().unwrap().get(LOCAL_ID).and_then(|c| c.rpc.lock().unwrap().clone());
+        if let (Some(rpc), true, Ok(rt)) = (rpc, self.ext.get().is_some(), tokio::runtime::Handle::try_current()) {
+            let ev = v.clone();
+            rt.spawn(async move {
+                let _ = rpc.call("client.event", json!({"event": ev})).await;
+            });
+        }
+        self.emit(v);
+    }
+
+    /// Plug in the desktop app's local services. Hosts already connected learn this client's identity at once
+    pub fn set_extension(self: &Arc<Self>, ext: Arc<dyn crate::ext::Extension>) {
+        if self.ext.set(ext).is_err() {
+            return;
+        }
+        let rpcs: Vec<(String, Arc<RpcConn>)> = self
+            .conns
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|(id, c)| c.rpc.lock().unwrap().clone().map(|r| (id.clone(), r)))
+            .collect();
+        for (_, rpc) in rpcs {
+            let me = self.clone();
+            tokio::spawn(async move { me.client_hello(&rpc).await });
+        }
+    }
+
+    pub fn extension(&self) -> Option<Arc<dyn crate::ext::Extension>> {
+        self.ext.get().cloned()
+    }
+
+    /// Tell a host who we are, so it can relay client MCP calls here. Older daemons don't know the method
+    async fn client_hello(&self, rpc: &RpcConn) {
+        if let Some(ext) = self.ext.get() {
+            let me = ext.identity();
+            let _ = rpc
+                .call("client.hello", json!({"clientId": me.client_id, "kind": me.kind, "name": me.name}))
+                .await;
+        }
+    }
+
+    /// Whether a host is connected right now
+    pub fn connected(&self, id: &str) -> bool {
+        self.conns
+            .lock()
+            .unwrap()
+            .get(id)
+            .and_then(|c| c.rpc.lock().unwrap().clone())
+            .is_some_and(|r| !r.is_closed())
+    }
+
+    pub fn close_to_tray(&self) -> bool {
+        self.settings.lock().unwrap().close_to_tray.unwrap_or(true)
+    }
+
+    /// Host id -> display name
+    pub fn host_names(&self) -> HashMap<String, String> {
+        self.store.lock().unwrap().hosts.iter().map(|h| (h.id.clone(), h.name.clone())).collect()
+    }
+
+    /// Call a method on a host (same as the frontend's `rpc` command)
+    pub async fn host_rpc(&self, id: &str, method: &str, params: Value) -> Result<Value> {
+        self.rpc(id, method, params).await
+    }
+
     fn conn(&self, id: &str) -> Arc<HostConn> {
         self.conns
             .lock()
@@ -152,6 +227,9 @@ impl ClientHub {
         v["type"] = json!("host.status");
         v["hostId"] = json!(id);
         *self.conn(id).status.lock().unwrap() = v.clone();
+        if let Some(ext) = self.ext.get() {
+            ext.host_status(id, &v);
+        }
         self.emit(v);
     }
 
@@ -489,7 +567,10 @@ impl ClientHub {
                 let params = args["params"].clone();
                 self.rpc(&id, method, params).await?
             }
-            _ => bail!("未知命令: {cmd}"),
+            _ => match self.ext.get().filter(|e| e.handles(cmd)).cloned() {
+                Some(ext) => ext.call(cmd, args).await?,
+                None => bail!("未知命令: {cmd}"),
+            },
         })
     }
 
@@ -614,6 +695,7 @@ impl ClientHub {
         );
         let hello = rpc.call("hello", json!({"client": "yi-console"})).await?;
         *c.rpc.lock().unwrap() = Some(rpc.clone());
+        self.client_hello(&rpc).await;
         // The same version string can still be two different builds (builds from copied sources are all +dev, and uncommitted changes keep the commit hash), so compare the build time too
         let mismatch = hello["daemonVersion"].as_str() != Some(DAEMON_VERSION)
             || hello["buildTime"].as_u64().unwrap_or(0) != yi_proto::build_time();
@@ -897,6 +979,54 @@ impl ClientHub {
                 }
             }
         }
+        if n.method == "client.call" {
+            // Remote control from a phone or yi-web, relayed by the local daemon only
+            let me = self.clone();
+            let c = c.clone();
+            let local = id == LOCAL_ID;
+            tokio::spawn(async move {
+                let call_id = n.params["callId"].clone();
+                let cmd = n.params["cmd"].as_str().unwrap_or("").to_string();
+                let r = match me.ext.get().cloned().filter(|e| local && e.handles(&cmd)) {
+                    Some(ext) => ext.call(&cmd, n.params["args"].clone()).await,
+                    None => Err(anyhow!("桌面端不能执行这个命令：{cmd}")),
+                };
+                let reply = match r {
+                    Ok(v) => json!({"callId": call_id, "result": v}),
+                    Err(e) => json!({"callId": call_id, "error": format!("{e:#}")}),
+                };
+                let rpc = c.rpc.lock().unwrap().clone();
+                if let Some(rpc) = rpc {
+                    let _ = rpc.call("client.result", reply).await;
+                }
+            });
+            return;
+        }
+        if n.method == "clientMcp.call" {
+            // A tool call for this client's own MCP servers (the Bot tools): answered here, never shown to the frontend
+            let me = self.clone();
+            let c = c.clone();
+            let id = id.to_string();
+            tokio::spawn(async move {
+                let call_id = n.params["callId"].clone();
+                let r = match me.ext.get().cloned() {
+                    Some(ext) => ext.client_mcp(&id, n.params).await,
+                    None => Err(anyhow!("这个客户端没有提供 MCP 工具")),
+                };
+                let reply = match r {
+                    Ok(v) => json!({"callId": call_id, "result": v}),
+                    Err(e) => json!({"callId": call_id, "error": format!("{e:#}")}),
+                };
+                let rpc = c.rpc.lock().unwrap().clone();
+                if let Some(rpc) = rpc {
+                    let _ = rpc.call("clientMcp.result", reply).await;
+                }
+            });
+            return;
+        }
+        if let Some(ext) = self.ext.get() {
+            ext.observe(id, &n.method, &n.params);
+        }
         if n.method == "resync" {
             let me = self.clone();
             let c = c.clone();
@@ -1165,7 +1295,7 @@ fn redact(h: &HostConfig) -> HostConfig {
 }
 
 /// This machine's name reported to the computer when pairing, shown in its "Paired devices"
-fn device_name() -> String {
+pub fn device_name() -> String {
     if cfg!(target_os = "android") {
         return "Android 手机".into();
     }

@@ -8,6 +8,8 @@ See [README.md](README.md) for an overview and usage. This file has the project 
 - `crates/yi-agentd/src/hub.rs`: the session state machine. Every event goes through `emit()` to be numbered, persisted and broadcast; adapters must not write to the database directly.
 - `crates/yi-agentd/src/adapters/`: one file per tool, all implementing `AdapterCmd` input and `Emitter` output. The ACP tools (Cursor / Kiro / Qoder / CodeBuddy) share `acp.rs`. Adding a tool: [docs/adding-a-tool.en.md](docs/adding-a-tool.en.md).
 - `crates/client/src/api.rs`: `ClientHub::call` is the complete set of commands the frontend can call. Tauri (`app/src-tauri/src/lib.rs`) and yi-web are thin wrappers around it.
+- `crates/bots`: the Bot engine and plugins, desktop app only; plugs into `ClientHub` through the `Extension` trait (`crates/client/src/ext.rs`).
+- `plugins/`: WASM plugin SDK (`yi-plugin`), first-party plugins and the packer; a separate cargo workspace built for `wasm32-wasip2`. The interface is `plugins/wit/yi-plugin.wit`, implemented by `crates/bots/src/plugins/wasm.rs`; change both together. `github` / `feishu` ship inside the desktop app: run `scripts/bundle-plugins.py` before `tauri build`. Author guide: [docs/plugins.en.md](docs/plugins.en.md).
 - `crates/link`, `crates/relay`: relay protocol and server.
 - `app/src/store.ts`: frontend state and the event loop; components live in `app/src/components/`.
 
@@ -18,6 +20,7 @@ See [README.md](README.md) for an overview and usage. This file has the project 
 | Sessions: turns, queueing, chat/terminal switch, `/clear` `/compact`, usage limits, questions, task lists, hand-off, attachments | [docs/internals/sessions.md](docs/internals/sessions.md) |
 | Tool detection, probing, permission modes, usage stats, per-tool quirks | [docs/internals/tools.md](docs/internals/tools.md) |
 | File panel: tree, git changes and diffs, editor, search/replace, HTML preview | [docs/internals/file-panel.md](docs/internals/file-panel.md) |
+| Bots: engine, tasks, plugins, client MCP bridge, system prompts, worktrees, tray | [docs/internals/bots.md](docs/internals/bots.md) |
 | Terminal mode, tmux, bottom terminal panel | [docs/internals/terminal.md](docs/internals/terminal.md) |
 | Frontend UI: chat timeline, theme, fonts, scrollbars, sidebar, links, overlays, i18n | [docs/internals/frontend-ui.md](docs/internals/frontend-ui.md) |
 | Computer Use: bundled Windows driver, macOS CuaDriver.app, session MCP, control leases, screenshots | [docs/internals/computer-use.md](docs/internals/computer-use.md) |

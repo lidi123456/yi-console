@@ -59,6 +59,21 @@ export interface SessionInfo {
   pending?: PendingBrief;
   /** The current or last chat turn (chat mode only) */
   turn?: TurnInfo;
+  /** Set on a Bot's own session and on its tasks (see `bots.ts`) */
+  bot?: BotLink;
+  /** MCP servers served by a desktop client (the Bot tools) */
+  clientMcp?: { name: string; clientId: string }[];
+  appendSystemPrompt?: string;
+}
+
+export interface BotLink {
+  botId: string;
+  botName: string;
+  /** bot / task / assistant */
+  role: string;
+  taskId?: string;
+  /** The desktop app running the Bot */
+  clientId: string;
 }
 
 export interface PendingBrief {
@@ -234,7 +249,8 @@ export type ComputerUseEvent = { kind: 'computer_use'; actionId: string; tool: s
 
 export type EventBody =
   | ComputerUseEvent
-  | { kind: 'user_message'; text: string; images?: ImageRef[] }
+  /** `origin`: who sent it when not the person (`bot-engine`: the desktop app's Bot engine) */
+  | { kind: 'user_message'; text: string; images?: ImageRef[]; origin?: string }
   | { kind: 'assistant_text'; id: string; text: string }
   | { kind: 'assistant_delta'; id: string; delta: string }
   | { kind: 'thinking'; id: string; text: string }
@@ -434,6 +450,8 @@ export interface DaemonSettings {
   autoResume?: boolean;
   /** UI language last reported by a client (zh / en) */
   uiLang?: string;
+  /** Where `git.worktreeAdd` puts worktrees (Bot tasks); `~/.yi-console/worktrees` if unset */
+  worktreeRoot?: string;
 }
 
 export const TOOL_LABEL: Record<ToolKind, string> = new Proxy(
@@ -468,4 +486,6 @@ export interface NotifyPrefs {
 export interface ClientSettings {
   proxy: { mode: string; url: string };
   notify: NotifyPrefs;
+  /** Desktop: closing the window keeps the app in the tray while a Bot is enabled (on if unset) */
+  closeToTray?: boolean;
 }

@@ -17,6 +17,7 @@ mod history;
 mod hub;
 mod install;
 mod log;
+mod clientmcp;
 mod computer_use;
 mod mcp;
 mod paths;
@@ -51,6 +52,7 @@ fn main() {
     let cmd = args.first().map(String::as_str).unwrap_or("help");
     let res = match cmd {
         "computer-use-mcp" => computer_use::proxy_main(&args[1..]),
+        "client-mcp" => clientmcp::proxy_main(&args[1..]),
         "serve" => serve(args.iter().any(|a| a == "-f" || a == "--foreground")),
         "bridge" => bridge(args.iter().any(|a| a == "--local")),
         "install" => install::install().map(|m| println!("{m}")),
@@ -159,15 +161,15 @@ fn relay_cmd(args: &[String]) -> Result<()> {
 
 /// Call a method on the local daemon from the command line (starting it first if not running)
 fn daemon_call(method: &str, params: serde_json::Value) -> Result<serde_json::Value> {
-    daemon_request(method, params, true)
+    daemon_request(method, params, true, 30)
 }
 
 /// Like daemon_call, but fails instead of starting a daemon when none is running
 fn daemon_call_running(method: &str, params: serde_json::Value) -> Result<serde_json::Value> {
-    daemon_request(method, params, false)
+    daemon_request(method, params, false, 30)
 }
 
-fn daemon_request(method: &str, params: serde_json::Value, start: bool) -> Result<serde_json::Value> {
+fn daemon_request(method: &str, params: serde_json::Value, start: bool, timeout_secs: u64) -> Result<serde_json::Value> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
     rt.block_on(async {
@@ -178,7 +180,8 @@ fn daemon_request(method: &str, params: serde_json::Value, start: bool) -> Resul
                     conn = Some(c);
                     break;
                 }
-                Err(_) if !start => anyhow::bail!("连不上守护进程，请重新开启操作电脑"),
+                Err(_) if !start && method == yi_proto::methods::COMPUTER_USE_MCP => anyhow::bail!("连不上守护进程，请重新开启操作电脑"),
+                Err(_) if !start => anyhow::bail!("连不上守护进程"),
                 Err(_) if i == 0 => {
                     paths::ensure_base()?;
                     spawn_detached()?;
@@ -192,7 +195,7 @@ fn daemon_request(method: &str, params: serde_json::Value, start: bool) -> Resul
         w.write_all(format!("{req}\n").as_bytes()).await?;
         w.flush().await?;
         let mut lines = BufReader::new(r).lines();
-        while let Some(line) = tokio::time::timeout(Duration::from_secs(30), lines.next_line()).await?? {
+        while let Some(line) = tokio::time::timeout(Duration::from_secs(timeout_secs), lines.next_line()).await?? {
             let v: serde_json::Value = serde_json::from_str(&line).unwrap_or_default();
             if v["id"] != 1 {
                 continue;

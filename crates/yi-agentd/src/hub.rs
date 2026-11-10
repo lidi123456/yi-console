@@ -125,6 +125,8 @@ struct SessionRt {
     /// Permission mode when the current process started
     launched_mode: Mutex<String>,
     mcp_fingerprint: Mutex<String>,
+    /// The appended system prompt changed: ACP tools get it again with the next launch's first prompt
+    prompt_dirty: Mutex<bool>,
     /// Permission mode changed but needs a process restart to apply (Claude switching to allow-all); restart once this turn ends
     restart_pending: Mutex<bool>,
     /// Bumped whenever the pending automatic continue changes; a timer only fires while its token is still current
@@ -166,6 +168,9 @@ struct Queued {
     /// The user clicked "Send now"
     #[serde(skip)]
     now: bool,
+    /// `UserMessage.origin` once it is sent
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    origin: Option<String>,
 }
 
 impl Queued {
@@ -237,6 +242,8 @@ pub struct Hub {
     pub settings: RwLock<DaemonSettings>,
     pub shutdown: tokio::sync::Notify,
     pub desktop: crate::computer_use::Desktop,
+    /// Clients that said who they are (`client.hello`), and the client MCP bridge
+    pub clients: crate::clientmcp::Clients,
     /// Each tool's most recently reported model list (persisted, used for new sessions)
     tool_models: Mutex<HashMap<String, Vec<ModelOption>>>,
     /// Each tool's most recently reported slash commands (memory only)
@@ -285,6 +292,15 @@ pub struct CreateParams {
     /// Cursor model parameters chosen on the new session page {id: value}; ids or values the model lacks are dropped
     #[serde(default)]
     pub model_config: HashMap<String, String>,
+    /// Extra system prompt (see `SessionInfo::append_system_prompt`)
+    #[serde(default)]
+    pub append_system_prompt: Option<String>,
+    /// MCP servers served by a client (chat mode of the six AI tools only)
+    #[serde(default)]
+    pub client_mcp: Vec<ClientMcp>,
+    /// The Bot this session belongs to
+    #[serde(default)]
+    pub bot: Option<BotLink>,
 }
 
 impl Hub {
@@ -297,6 +313,7 @@ impl Hub {
             settings: RwLock::new(settings),
             shutdown: tokio::sync::Notify::new(),
             desktop: crate::computer_use::Desktop::new(),
+            clients: Default::default(),
             tool_models: Mutex::new(
                 std::fs::read(models_path())
                     .ok()
@@ -465,6 +482,57 @@ impl Hub {
         }
     }
 
+    /// Change what a session was launched with (client MCP servers, appended system prompt, Bot link). A running turn
+    /// keeps its process and restarts when it ends; an idle process restarts before the next message (`send`)
+    fn update_launch(&self, id: &str, change: impl FnOnce(&mut SessionInfo) -> Result<bool>) -> Result<SessionInfo> {
+        let rt = self.get(id)?;
+        let (info, relaunch) = {
+            let mut info = rt.info.lock().unwrap();
+            let relaunch = change(&mut info)?;
+            (info.clone(), relaunch)
+        };
+        if relaunch && matches!(info.status, SessionStatus::Running | SessionStatus::WaitingPermission) {
+            *rt.restart_pending.lock().unwrap() = true;
+        }
+        self.store.save_session(&info)?;
+        self.broadcast_updated(&info);
+        Ok(info)
+    }
+
+    pub fn set_client_mcp(&self, id: &str, list: Vec<ClientMcp>) -> Result<SessionInfo> {
+        crate::clientmcp::validate(&list, &self.settings.read().unwrap())?;
+        self.update_launch(id, |info| {
+            if !list.is_empty() && (info.mode != SessionMode::Structured || !crate::mcp::supported(info.tool)) {
+                bail!("客户端 MCP 只能用于 AI 工具的聊天模式");
+            }
+            let changed = info.client_mcp != list;
+            info.client_mcp = list;
+            Ok(changed)
+        })
+    }
+
+    pub fn set_system_prompt(&self, id: &str, prompt: Option<String>) -> Result<SessionInfo> {
+        let prompt = prompt.filter(|s| !s.trim().is_empty());
+        let rt = self.get(id)?;
+        let mut changed = false;
+        let info = self.update_launch(id, |info| {
+            changed = info.append_system_prompt != prompt;
+            info.append_system_prompt = prompt;
+            Ok(changed)
+        })?;
+        if changed {
+            *rt.prompt_dirty.lock().unwrap() = true;
+        }
+        Ok(info)
+    }
+
+    pub fn set_bot(&self, id: &str, bot: Option<BotLink>) -> Result<SessionInfo> {
+        self.update_launch(id, |info| {
+            info.bot = bot;
+            Ok(false)
+        })
+    }
+
     pub fn info(&self, id: &str) -> Result<SessionInfo> {
         Ok(self.get(id)?.info.lock().unwrap().clone())
     }
@@ -481,6 +549,12 @@ impl Hub {
         let cwd = crate::paths::expand(&p.cwd);
         if !cwd.is_dir() {
             bail!("目录不存在: {}", cwd.display());
+        }
+        if !p.client_mcp.is_empty() {
+            if mode != SessionMode::Structured || !crate::mcp::supported(tool) {
+                bail!("客户端 MCP 只能用于 AI 工具的聊天模式");
+            }
+            crate::clientmcp::validate(&p.client_mcp, &self.settings.read().unwrap())?;
         }
         let now = now_ms();
         // Cursor: an old `model[k=v,…]` string is split into the model and its values, so the session (and what it
@@ -528,6 +602,9 @@ impl Hub {
             computer_use: false,
             pending: None,
             turn: None,
+            bot: p.bot.clone(),
+            client_mcp: p.client_mcp.clone(),
+            append_system_prompt: p.append_system_prompt.clone().filter(|s| !s.trim().is_empty()),
         };
         self.store.save_session(&info)?;
         let rt = Arc::new(new_rt(info.clone()));
@@ -572,8 +649,8 @@ impl Hub {
         }
         let images = if mode == SessionMode::Structured { p.images } else { vec![] };
         match p.prompt.filter(|s| !s.trim().is_empty()) {
-            Some(prompt) => self.send(&info.id, &prompt, images, false)?,
-            None if !images.is_empty() => self.send(&info.id, "", images, false)?,
+            Some(prompt) => self.send(&info.id, &prompt, images, false, None)?,
+            None if !images.is_empty() => self.send(&info.id, "", images, false, None)?,
             None => {}
         }
         if let Some((fid, frt)) = from {
@@ -641,8 +718,23 @@ impl Hub {
         if info.mode == SessionMode::Structured && info.computer_use {
             if let Some(config) = self.desktop.mcp_config(&info.id) { servers.push(crate::mcp::desktop(config)?); desktop = true; }
         }
-        let mcp_fingerprint = mcp_fingerprint(&servers[..servers.len() - desktop as usize], desktop);
+        let mcp_fingerprint = if info.mode == SessionMode::Structured {
+            launch_fingerprint(&settings, info, desktop)
+        } else {
+            mcp_fingerprint(&[], false)
+        };
+        let structured_ai = info.mode == SessionMode::Structured && crate::mcp::supported(info.tool);
+        let mut allow_mcp = vec![];
+        if structured_ai {
+            for m in &info.client_mcp {
+                servers.push(self.clients.server_config(&info.id, &m.name)?);
+                allow_mcp.push(m.name.clone());
+            }
+        }
         let mcp_servers = crate::mcp::inject(info.tool, &servers, &mut extra_args);
+        let system_prompt = info.append_system_prompt.clone().filter(|_| structured_ai);
+        // A new tool session has not seen the prompt yet; `launch` also sets this after the prompt changed
+        let system_notice = system_prompt.is_some() && resume.is_none();
         Ok(StartSpec {
             tool: info.tool,
             mode: info.mode,
@@ -660,6 +752,9 @@ impl Hub {
             extra_args,
             mcp_servers,
             mcp_fingerprint,
+            allow_mcp,
+            system_notice,
+            system_prompt,
             cols,
             rows,
             // tmux keeps AI terminal sessions and standalone shells alive across daemon restarts. Bottom-panel shells
@@ -671,7 +766,7 @@ impl Hub {
         })
     }
 
-    fn launch(self: &Arc<Self>, rt: &Arc<SessionRt>, spec: StartSpec) -> Result<()> {
+    fn launch(self: &Arc<Self>, rt: &Arc<SessionRt>, mut spec: StartSpec) -> Result<()> {
         if !spec.tool.has_process() {
             bail!("文件会话没有进程");
         }
@@ -679,8 +774,12 @@ impl Hub {
         if spec.mode == SessionMode::Structured && spec.tool != ToolKind::Shell {
             self.make_room(&sid);
         }
-        // The new tool process starts its own desktop proxy
+        // The new tool process starts its own desktop and client MCP proxies
         self.desktop.release_proxy(&sid);
+        self.clients.release_proxies(&sid);
+        if std::mem::take(&mut *rt.prompt_dirty.lock().unwrap()) {
+            spec.system_notice = spec.system_prompt.is_some();
+        }
         let gen = {
             let mut g = rt.generation.lock().unwrap();
             *g += 1;
@@ -725,7 +824,7 @@ impl Hub {
     /// Send a user message; resumes automatically if the process has exited.
     /// With `queue` true and the turn still running: Claude and Codex get it directly and read it after their next tool call
     /// (anything that misses that is handled by the tool after the turn ends); other tools queue it and send in order after the turn
-    pub fn send(self: &Arc<Self>, id: &str, text: &str, images: Vec<IncomingImage>, queue: bool) -> Result<()> {
+    pub fn send(self: &Arc<Self>, id: &str, text: &str, images: Vec<IncomingImage>, queue: bool, origin: Option<String>) -> Result<()> {
         let rt = self.get(id)?;
         // The user carried on by hand: the automatic continue is no longer needed
         self.cancel_resume(id, "manual");
@@ -741,7 +840,7 @@ impl Hub {
         if !busy && info.mode == SessionMode::Structured && self.running_tx(&rt).is_some() {
             // Turning computer use off reloads the tool here without its MCP entry, as OpenBot reloads the session
             let desktop = info.computer_use && self.desktop.mcp_config(id).is_some();
-            let expected = mcp_fingerprint(&crate::mcp::selected(&self.settings.read().unwrap(), info.tool), desktop);
+            let expected = launch_fingerprint(&self.settings.read().unwrap(), &info, desktop);
             if *rt.mcp_fingerprint.lock().unwrap() != expected { self.relaunch(&rt)?; }
         }
         // If the process must restart at turn end (permission mode change), messages the tool hasn't read would be lost with it, so queue in that case too
@@ -755,13 +854,14 @@ impl Hub {
                 text: text.to_string(),
                 images: refs,
                 now: false,
+                origin,
             });
             self.sync_queue(&rt);
             return Ok(());
         }
         // Validate and save images first, so a failure doesn't start the process
         let (refs, prompt_images) = self.save_images(id, images)?;
-        self.deliver(&rt, &info, text, refs, prompt_images)
+        self.deliver(&rt, &info, text, refs, prompt_images, origin)
     }
 
     /// Send a message taken off the queue (its images are already saved)
@@ -770,7 +870,7 @@ impl Hub {
         self.cancel_resume(id, "manual");
         let info = rt.info.lock().unwrap().clone();
         let prompt_images = self.load_images(id, &item.images)?;
-        self.deliver(&rt, &info, &item.text, item.images, prompt_images)
+        self.deliver(&rt, &info, &item.text, item.images, prompt_images, item.origin)
     }
 
     /// Hand a message to the tool, starting its process if it has exited
@@ -781,6 +881,7 @@ impl Hub {
         text: &str,
         refs: Vec<ImageRef>,
         prompt_images: Vec<PromptImage>,
+        origin: Option<String>,
     ) -> Result<()> {
         let id = info.id.as_str();
         self.clear_interrupted(rt);
@@ -809,6 +910,7 @@ impl Hub {
             EventBody::UserMessage {
                 text: text.to_string(),
                 images: refs,
+                origin,
             },
         );
         tx.send(AdapterCmd::Send(Prompt {
@@ -1047,7 +1149,7 @@ impl Hub {
         if info.mode == SessionMode::Terminal || info.tool == ToolKind::Shell {
             bail!("终端模式请直接在终端里输入 /compact");
         }
-        self.send(id, "/compact", vec![], true)
+        self.send(id, "/compact", vec![], true, None)
     }
 
     /// /clear: end the tool process, delete the chat history, reset usage and forget the tool session id; the next message starts a new tool session.
@@ -1814,6 +1916,7 @@ impl Hub {
         // When the process isn't running (e.g. the daemon just restarted and hasn't reattached), the tmux session must be cleaned up too
         crate::tmux::kill(&crate::tmux::session_name(id));
         self.sessions.lock().unwrap().remove(id);
+        self.clients.forget(id);
         self.store.delete_session(id)?;
         if safe_sid(id) {
             let _ = std::fs::remove_dir_all(uploads_dir(id));
@@ -2185,7 +2288,7 @@ impl Hub {
             return Ok(());
         }
         self.emit(sid, 0, limit_event("resumed", Some(pending.resets_at), pending.limit, None, Some(reason)));
-        self.send(sid, &self.continue_text(&info), vec![], false)
+        self.send(sid, &self.continue_text(&info), vec![], false, None)
     }
 
     /// Drop the pending automatic continue; returns whether there was one
@@ -2257,7 +2360,7 @@ impl Hub {
             bail!("这个会话没有被重启打断的回合");
         }
         match action {
-            "continue" => self.send(id, &self.restart_continue_text(&info), vec![], false),
+            "continue" => self.send(id, &self.restart_continue_text(&info), vec![], false, None),
             "dismiss" => {
                 self.clear_interrupted(&rt);
                 Ok(())
@@ -2710,6 +2813,7 @@ fn new_rt(info: SessionInfo) -> SessionRt {
         interrupted: Mutex::new(false),
         launched_mode: Mutex::new(String::new()),
         mcp_fingerprint: Mutex::new(mcp_fingerprint(&[], false)),
+        prompt_dirty: Mutex::new(false),
         restart_pending: Mutex::new(false),
         resume_token: Mutex::new(0),
         limited: Mutex::new(false),
@@ -2763,6 +2867,17 @@ fn exhausted_reset(q: &Value, now: i64) -> Option<i64> {
 /// (its ticket changes on every enable, so only its presence counts)
 fn mcp_fingerprint(servers: &[yi_proto::McpServerConfig], desktop: bool) -> String {
     format!("{}{}", crate::mcp::fingerprint(servers), if desktop { "+desktop" } else { "" })
+}
+
+/// What a chat-mode process was started with: host MCP servers, computer use, client MCP servers and the appended
+/// system prompt. When it no longer matches, the next message of an idle session restarts the process
+fn launch_fingerprint(settings: &DaemonSettings, info: &SessionInfo, desktop: bool) -> String {
+    let base = mcp_fingerprint(&crate::mcp::selected(settings, info.tool), desktop);
+    if info.client_mcp.is_empty() && info.append_system_prompt.is_none() {
+        return base;
+    }
+    let extra = serde_json::to_vec(&(&info.client_mcp, &info.append_system_prompt)).unwrap_or_default();
+    format!("{base}+{:x}", md5::compute(extra))
 }
 
 /// Cursor fills its model list from a server request of its own; when that fails or is cut short it lists a few
@@ -3147,7 +3262,7 @@ mod tests {
     }
 
     fn user(t: &str) -> EventBody {
-        EventBody::UserMessage { text: t.into(), images: vec![] }
+        EventBody::UserMessage { text: t.into(), images: vec![], origin: None }
     }
     fn reply(t: &str) -> EventBody {
         EventBody::AssistantText { id: t.into(), text: t.into() }
@@ -3176,7 +3291,7 @@ mod tests {
     fn say(hub: &Arc<Hub>, text: &str) {
         let rt = hub.get("s").unwrap();
         let info = hub.info("s").unwrap();
-        hub.deliver(&rt, &info, text, vec![], vec![]).unwrap();
+        hub.deliver(&rt, &info, text, vec![], vec![], None).unwrap();
     }
 
     #[test]
@@ -3380,6 +3495,9 @@ mod tests {
             computer_use: false,
             pending: None,
             turn: None,
+            bot: None,
+            client_mcp: vec![],
+            append_system_prompt: None,
         };
         let rt = new_rt(info);
         let (tx, rx) = mpsc::unbounded_channel();
@@ -3422,8 +3540,8 @@ mod tests {
             let hub = Hub::new(crate::store::Store::open(&db).unwrap(), DaemonSettings::default());
             let _rx = live(&hub, "s", SessionMode::Structured, SessionStatus::Running, 0);
             hub.store.save_session(&hub.info("s").unwrap()).unwrap();
-            hub.send("s", "one", vec![], true).unwrap();
-            hub.send("s", "two", vec![], true).unwrap();
+            hub.send("s", "one", vec![], true, None).unwrap();
+            hub.send("s", "two", vec![], true, None).unwrap();
             assert_eq!(queue_texts(&hub, "s"), ["one", "two"]);
             assert_eq!(hub.info("s").unwrap().queue_paused, None);
         }
@@ -3466,7 +3584,7 @@ mod tests {
         let mut rx = live(&hub, "s", SessionMode::Structured, SessionStatus::Running, 0);
         let em = Emitter { hub: hub.clone(), sid: "s".into(), gen: 0 };
         for t in ["a", "b", "c"] {
-            hub.send("s", t, vec![], true).unwrap();
+            hub.send("s", t, vec![], true, None).unwrap();
         }
         let ids: Vec<String> = hub.info("s").unwrap().queued.into_iter().map(|q| q.id).collect();
         hub.queue_action("s", &json!({"action": "edit", "id": ids[1], "text": "B"})).unwrap();
@@ -3506,7 +3624,7 @@ mod tests {
         let _ra = live(&hub, "a", SessionMode::Structured, SessionStatus::Running, 0);
         let _rb = live(&hub, "b", SessionMode::Structured, SessionStatus::Running, 0);
         let em = Emitter { hub: hub.clone(), sid: "a".into(), gen: 0 };
-        hub.send("a", "next step", vec![], true).unwrap();
+        hub.send("a", "next step", vec![], true, None).unwrap();
         em.event(crate::adapters::limit_hit(Some(now_ms() + 3_600_000), None));
         em.event(EventBody::TurnEnd { stop_reason: Some("error".into()), model: None });
         assert!(hub.info("a").unwrap().auto_resume.is_some());
@@ -3539,7 +3657,7 @@ mod tests {
         let hub = Hub::new(crate::store::Store::open_memory().unwrap(), DaemonSettings::default());
         let mut rx = live(&hub, "s", SessionMode::Structured, SessionStatus::Running, 0);
         let em = Emitter { hub: hub.clone(), sid: "s".into(), gen: 0 };
-        hub.get("s").unwrap().queue.lock().unwrap().push_back(Queued { id: "q".into(), text: "later".into(), images: vec![], now: false });
+        hub.get("s").unwrap().queue.lock().unwrap().push_back(Queued { id: "q".into(), text: "later".into(), images: vec![], now: false, origin: None });
 
         // The turn fails on the limit: scheduled, the queue is held
         let resets = now_ms() + 3_600_000;
@@ -3552,7 +3670,7 @@ mod tests {
         assert_eq!(limit_phases(&hub, "s"), ["hit", "scheduled"]);
 
         // The user sends a message by hand: cancelled
-        hub.send("s", "hi", vec![], false).unwrap();
+        hub.send("s", "hi", vec![], false, None).unwrap();
         assert!(hub.info("s").unwrap().auto_resume.is_none());
         assert!(matches!(rx.try_recv(), Ok(AdapterCmd::Send(p)) if p.text == "hi"));
         assert_eq!(limit_phases(&hub, "s"), ["hit", "scheduled", "cancelled:manual"]);
@@ -3629,7 +3747,7 @@ mod tests {
         // Several in the same directory
         assert_ne!(hub.create(p).unwrap().id, info.id);
         // Process actions are refused or no-ops
-        assert!(hub.send(&info.id, "x", vec![], false).is_err());
+        assert!(hub.send(&info.id, "x", vec![], false, None).is_err());
         assert!(hub.set_mode(&info.id, SessionMode::Terminal).await.is_err());
         assert!(hub.clear(&info.id).await.is_err());
         hub.resume(&info.id, 80, 24).unwrap();
@@ -3702,6 +3820,7 @@ mod tests {
             text: "x".into(),
             images: vec![],
             now: false,
+            origin: None,
         });
         hub.release_idle();
         assert!(killed(&mut idle) && killed(&mut asking) && killed(&mut err));

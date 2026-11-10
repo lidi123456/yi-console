@@ -1,6 +1,7 @@
 //! yi-web: use Yi Console from a browser.
 //!
 //!   yi-web [--listen 127.0.0.1:3001] [--dist app/dist] [--data <data dir>] [--yi-agentd-dir <dir>] [--token <token>]
+//!          [--bots [--bundled-plugins <dir>]]  (feature `bots`, testing only: run the Bot engine here, see docs/internals/bots.md)
 //!
 //! Static files are served directly; `/ws?token=` is the channel between the frontend and ClientHub:
 //!   frontend -> {"id":1,"cmd":"hosts.list","args":{}}
@@ -24,6 +25,10 @@ struct Args {
     data: PathBuf,
     yi_agentd_dir: Option<PathBuf>,
     token: String,
+    /// Run the Bot engine here (feature `bots`, testing only)
+    bots: bool,
+    /// WASM plugins to treat as shipped with the app (e.g. plugins/dist)
+    bundled_plugins: Option<PathBuf>,
 }
 
 fn args() -> Result<Args> {
@@ -33,6 +38,8 @@ fn args() -> Result<Args> {
         data: dirs::home_dir().unwrap_or_default().join(".yi-console-web"),
         yi_agentd_dir: None,
         token: yi_link::random_id(),
+        bots: false,
+        bundled_plugins: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(k) = it.next() {
@@ -43,6 +50,8 @@ fn args() -> Result<Args> {
             "--data" => a.data = PathBuf::from(v()?),
             "--yi-agentd-dir" => a.yi_agentd_dir = Some(PathBuf::from(v()?)),
             "--token" => a.token = v()?,
+            "--bots" if cfg!(feature = "bots") => a.bots = true,
+            "--bundled-plugins" if cfg!(feature = "bots") => a.bundled_plugins = Some(PathBuf::from(v()?)),
             _ => return Err(anyhow!("未知参数 {k}")),
         }
     }
@@ -62,6 +71,15 @@ async fn main() -> Result<()> {
             let _ = tx2.send(v);
         }),
     );
+    #[cfg(feature = "bots")]
+    let _bots = if a.bots {
+        std::fs::create_dir_all(&a.data)?;
+        Some(yi_bots::start(&hub, &a.data, "yi-web", a.bundled_plugins.as_deref())?)
+    } else {
+        None
+    };
+    #[cfg(not(feature = "bots"))]
+    let _ = a.bots;
     let listener = TcpListener::bind(&a.listen).await?;
     println!("Yi Console Web: http://{}/?token={}", a.listen, a.token);
     let dist = Arc::new(a.dist);
