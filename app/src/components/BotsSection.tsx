@@ -121,6 +121,13 @@ export function localHost(src: string, host: string) {
   return mapHost(src, host, (id) => getState().hosts.some((h) => h.config.id === id));
 }
 
+/** After a Bot is deleted: go home if the page shows it, its session or one of its tasks' sessions */
+export function leaveBotPages(b: BotEntry) {
+  const v = getState().view;
+  const sessions = new Set([b.session?.sessionId, ...b.tasks.map((x) => x.sessionId)].filter(Boolean));
+  if (('botId' in v && v.botId === b.config.id) || ('sessionId' in v && sessions.has(v.sessionId))) navigate({ kind: 'home' });
+}
+
 export function botMenu(b: BotEntry, src = ''): (MenuItem | '-')[] {
   const id = b.config.id;
   return [
@@ -148,7 +155,12 @@ export function botMenu(b: BotEntry, src = ''): (MenuItem | '-')[] {
       run: async () => {
         if (!(await askConfirm({ title: t('deleteBotTitle', { name: b.config.name }), message: t('deleteBotMessage'), danger: true })))
           return;
-        run(botCall('bots.delete', { id, sessions: false }, src));
+        try {
+          await botCall('bots.delete', { id, sessions: false }, src);
+          leaveBotPages(b);
+        } catch (e) {
+          errorToast(e);
+        }
       },
     },
   ];
