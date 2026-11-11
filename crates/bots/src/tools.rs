@@ -32,6 +32,7 @@ pub fn bot_tools() -> Vec<Value> {
                 "title": {"type": "string", "description": "Short title shown in the sidebar"},
                 "request": {"type": "string", "description": "Only when the owner asked in this session directly: their request, quoted as they wrote it"},
                 "note": {"type": "string", "description": "At most 30 words of routing information; never an implementation plan"},
+                "ack": {"type": "string", "description": "With event_ids: one sentence for the requester, sent to the event's conversation as the task is created; names the object and the expected result"},
                 "workspace": {"type": "integer", "description": "Workspace index (default 0)"},
                 "tool": {"type": "string", "description": "Task tool, one of those listed under Environment; omit for the default"},
                 "model": {"type": "string"},
@@ -269,6 +270,7 @@ pub fn draft() -> Value {
                 "properties": {"bot": strings("MCP server names for the Bot session"), "task": strings("MCP server names for tasks")},
             },
             "accept": {"type": "string", "enum": ["off", "observe", "auto"], "description": "off: events are only recorded; observe (default for new Bots): the Bot decides but only records what it would do; auto: carried out"},
+            "ambient": {"type": "string", "enum": ["record", "deliver"], "description": "Plugin events neither addressed to the Bot nor from an allowed sender (group chatter): record (default) keeps them out of your conversation, you can still read them with read_thread; deliver brings them to you like other events"},
             "allow": {
                 "type": "array",
                 "description": "Senders whose explicit requests run in auto mode, per instance",

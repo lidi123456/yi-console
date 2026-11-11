@@ -31,6 +31,9 @@ pub struct BotConfig {
     pub mcp: McpChoice,
     #[serde(default)]
     pub accept: Accept,
+    /// Plugin events neither addressed to the Bot nor from an allow-listed sender
+    #[serde(default)]
+    pub ambient: Ambient,
     /// Who may make explicit requests, per plugin instance
     #[serde(default)]
     pub allow: Vec<Allow>,
@@ -169,6 +172,18 @@ pub enum Accept {
     #[default]
     Observe,
     Auto,
+}
+
+/// What happens to plugin events nobody addressed to the Bot, from senders not on the allow list (chatter in a
+/// group the plugin listens to in full). Follow-ups in a task's conversation go to the task either way.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Ambient {
+    /// Recorded without waking the Bot; it can still read them with read_thread
+    #[default]
+    Record,
+    /// Delivered to the Bot like any other event
+    Deliver,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -382,6 +397,7 @@ mod tests {
         assert_eq!(c.name, "Issue helper");
         assert!(!c.enabled);
         assert_eq!(c.accept, Accept::Observe);
+        assert_eq!(c.ambient, Ambient::Record);
         assert_eq!(c.task.permission_mode, "bypass");
         assert!(c.task.worktree);
         assert_eq!(c.notify, ["app"]);

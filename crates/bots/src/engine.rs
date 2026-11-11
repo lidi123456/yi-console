@@ -4,7 +4,7 @@
 //! Everything here runs in the desktop app. Hosts only see ordinary sessions with a `BotLink`, an appended system
 //! prompt and a client MCP server (`yi_bot` / `yi_task`) whose calls come back here through `clientMcp.call`.
 
-use crate::config::{Accept, BotConfig, Routine, AI_TOOLS};
+use crate::config::{Accept, Ambient, BotConfig, Routine, AI_TOOLS};
 use crate::plugins::cron::Cron;
 use crate::plugins::builtin::{self, Builtin, APP_INSTANCE};
 use crate::plugins::wasm::Wasm;
@@ -886,6 +886,9 @@ impl Engine {
                 Some("accept off")
             } else if ev.sender.bot {
                 Some("bot sender")
+            } else if c.ambient == Ambient::Record && !system_source && !ev.addressed && !c.allowed(instance_id, &ev.sender.id) {
+                // Chatter nobody addressed to the Bot doesn't wake it; it stays readable through read_thread
+                Some("ambient: not addressed, sender not allowed")
             } else {
                 None
             };
@@ -1271,7 +1274,7 @@ impl Engine {
                 };
                 // The configured model and effort belong to the default tool
                 let default_tool = tool == c.task.tool;
-                let t = TaskRow {
+                let mut t = TaskRow {
                     id: short_id("task"),
                     bot_id: c.id.clone(),
                     host: ws.host.clone(),
@@ -1294,11 +1297,24 @@ impl Engine {
                     created_at: now_ms(),
                     ..Default::default()
                 };
-                self.store.save_task(&t)?;
-                for mut e in events {
-                    e.disposition = "spawned".into();
-                    e.task_id = Some(t.id.clone());
-                    let _ = self.store.update_event(&e);
+                // The requester's acknowledgement is queued with the task, so a crash can't lose it
+                let ack_text = s("ack");
+                let ack = events.first().filter(|_| !ack_text.trim().is_empty()).and_then(|e| self.ack_row(&t, e, ack_text.trim()));
+                if let Some(o) = &ack {
+                    t.spec["ack"] = json!(o.text);
+                }
+                let spawned: Vec<EventRow> = events
+                    .into_iter()
+                    .map(|mut e| {
+                        e.disposition = "spawned".into();
+                        e.task_id = Some(t.id.clone());
+                        e
+                    })
+                    .collect();
+                self.store.spawn(&t, &spawned, ack.as_ref())?;
+                self.changed();
+                if let Some(o) = ack {
+                    self.attempt(o).await;
                 }
                 let state = self.try_start(&t.id).await?;
                 Ok(json!({"taskId": t.id, "state": state}))
@@ -1705,6 +1721,25 @@ impl Engine {
         o
     }
 
+    /// A task's acknowledgement as a reply in `e`'s conversation; None when its plugin can't reply
+    fn ack_row(&self, t: &TaskRow, e: &EventRow, text: &str) -> Option<OutboxRow> {
+        let can_reply = self.instance_plugin(&e.instance_id).and_then(|p| self.manifest(&p)).is_some_and(|m| m.has("reply"));
+        let now = now_ms();
+        can_reply.then(|| OutboxRow {
+            key: format!("ack:{}", t.id),
+            instance_id: e.instance_id.clone(),
+            kind: "reply".into(),
+            bot_id: Some(t.bot_id.clone()),
+            thread: e.thread.clone(),
+            reply_to: Some(e.key.clone()),
+            text: truncate(text, 500),
+            state: "pending".into(),
+            created_at: now,
+            next_at: now,
+            ..Default::default()
+        })
+    }
+
     /// A ready task that gets more to do goes back to work. Its timeout counts from now, not from its first start.
     fn reopen(&self, t: &mut TaskRow) -> Result<()> {
         if t.state != "ready" || t.session_id.is_none() {
@@ -1772,6 +1807,9 @@ impl Engine {
                 Ok(json!("Reported to the Bot."))
             }
             "ack" => {
+                if let Some(sent) = t.spec["ack"].as_str().filter(|a| !a.is_empty()) {
+                    return Ok(json!(format!("Already acknowledged when the task was created (\"{sent}\"); nothing sent.")));
+                }
                 let text = s("text");
                 t.spec["ack"] = json!(text);
                 self.store.save_task(&t)?;
@@ -1779,21 +1817,8 @@ impl Engine {
                 // The acknowledgement goes back to the source conversation, when there is one that takes replies
                 let event_id = a["event_id"].as_str().map(str::to_string).or(t.event_ids.first().cloned());
                 if let (Accept::Auto, Some(eid)) = (bot.config.accept, event_id) {
-                    if let Ok(e) = self.store.event(&eid) {
-                        let caps = self.instance_plugin(&e.instance_id).and_then(|p| self.manifest(&p)).map(|m| m.has("reply")).unwrap_or(false);
-                        if caps {
-                            self.send_out(OutboxRow {
-                                key: format!("ack:{}", t.id),
-                                instance_id: e.instance_id.clone(),
-                                kind: "reply".into(),
-                                bot_id: Some(t.bot_id.clone()),
-                                thread: e.thread.clone(),
-                                reply_to: Some(e.key.clone()),
-                                text: text.clone(),
-                                ..Default::default()
-                            })
-                            .await;
-                        }
+                    if let Some(o) = self.store.event(&eid).ok().and_then(|e| self.ack_row(&t, &e, &text)) {
+                        self.send_out(o).await;
                     }
                 }
                 Ok(json!("ok"))
@@ -2746,6 +2771,9 @@ fn brief(t: &TaskRow, events: &[EventRow], label: &dyn Fn(&str) -> String) -> St
     let mut s = format!("# Task: {}\n\nTask id: {}\n", t.title, t.id);
     if let Some(n) = t.spec["note"].as_str().filter(|n| !n.is_empty()) {
         s.push_str(&format!("Routing note from the Bot: {n}\n"));
+    }
+    if let Some(a) = t.spec["ack"].as_str().filter(|a| !a.is_empty()) {
+        s.push_str(&format!("The requester was already told: \"{a}\". Do not ack again.\n"));
     }
     if let Some(r) = t.spec["request"].as_str().filter(|r| !r.is_empty()) {
         s.push_str(&format!("\n## Request from the owner\n\n{r}\n"));

@@ -36,6 +36,8 @@ export interface BotConfig {
   notify: string[];
   mcp: { bot: string[]; task: string[] };
   accept: Accept;
+  /** Events neither addressed to the Bot nor from an allowed sender; missing = record */
+  ambient?: 'record' | 'deliver';
   allow: { instance: string; ids: string[] }[];
   budget: { tasksPerDay: number; tokensPerDay?: number };
   routines?: Routine[];

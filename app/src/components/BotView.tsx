@@ -326,6 +326,10 @@ export function BotView({ botId }: { botId: string }) {
           <Row label={t('acceptLabel')}>
             {acceptLabel} <span className="muted small">{acceptHint}</span>
           </Row>
+          <Row label={t('ambientLabel')}>
+            {c.ambient === 'deliver' ? t('ambientDeliver') : t('ambientRecord')}{' '}
+            <span className="muted small">{c.ambient === 'deliver' ? t('ambientDeliverHint') : t('ambientRecordHint')}</span>
+          </Row>
           <Row label={t('approvalLabel')}>
             {approvalLabel} <span className="muted small">{t('approvalAutoOnly')}</span>
           </Row>

@@ -456,11 +456,7 @@ impl Store {
     }
 
     pub fn update_event(&self, e: &EventRow) -> Result<()> {
-        self.db.lock().unwrap().execute(
-            "UPDATE trigger_events SET disposition = ?2, task_id = ?3, data = ?4 WHERE id = ?1",
-            params![e.id, e.disposition, e.task_id, serde_json::to_string(e)?],
-        )?;
-        Ok(())
+        put_event(&self.db.lock().unwrap(), e)
     }
 
     pub fn event(&self, id: &str) -> Result<EventRow> {
@@ -494,11 +490,22 @@ impl Store {
     // ---------- tasks ----------
 
     pub fn save_task(&self, t: &TaskRow) -> Result<()> {
-        self.db.lock().unwrap().execute(
-            "INSERT INTO tasks (id, bot_id, state, created_at, data) VALUES (?1, ?2, ?3, ?4, ?5)
-             ON CONFLICT(id) DO UPDATE SET state = excluded.state, data = excluded.data",
-            params![t.id, t.bot_id, t.state, t.created_at, serde_json::to_string(t)?],
-        )?;
+        put_task(&self.db.lock().unwrap(), t)
+    }
+
+    /// A new task, the events it takes and its acknowledgement in one transaction: a crash can't leave a task whose
+    /// events still look unhandled, or one the requester is never told about
+    pub fn spawn(&self, t: &TaskRow, events: &[EventRow], ack: Option<&OutboxRow>) -> Result<()> {
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction()?;
+        put_task(&tx, t)?;
+        for e in events {
+            put_event(&tx, e)?;
+        }
+        if let Some(o) = ack {
+            put_outbox(&tx, o)?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -585,11 +592,7 @@ impl Store {
 
     /// false: the key is already there (the earlier attempt stands)
     pub fn outbox_add(&self, o: &OutboxRow) -> Result<bool> {
-        let n = self.db.lock().unwrap().execute(
-            "INSERT OR IGNORE INTO outbox (key, instance_id, state, next_at, created_at, data) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![o.key, o.instance_id, o.state, o.next_at, o.created_at, serde_json::to_string(o)?],
-        )?;
-        Ok(n > 0)
+        put_outbox(&self.db.lock().unwrap(), o)
     }
 
     pub fn outbox_save(&self, o: &OutboxRow) -> Result<()> {
@@ -753,6 +756,32 @@ impl Store {
     }
 }
 
+fn put_task(db: &Connection, t: &TaskRow) -> Result<()> {
+    db.execute(
+        "INSERT INTO tasks (id, bot_id, state, created_at, data) VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(id) DO UPDATE SET state = excluded.state, data = excluded.data",
+        params![t.id, t.bot_id, t.state, t.created_at, serde_json::to_string(t)?],
+    )?;
+    Ok(())
+}
+
+fn put_event(db: &Connection, e: &EventRow) -> Result<()> {
+    db.execute(
+        "UPDATE trigger_events SET disposition = ?2, task_id = ?3, data = ?4 WHERE id = ?1",
+        params![e.id, e.disposition, e.task_id, serde_json::to_string(e)?],
+    )?;
+    Ok(())
+}
+
+/// false: the key is already there (the earlier attempt stands)
+fn put_outbox(db: &Connection, o: &OutboxRow) -> Result<bool> {
+    let n = db.execute(
+        "INSERT OR IGNORE INTO outbox (key, instance_id, state, next_at, created_at, data) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![o.key, o.instance_id, o.state, o.next_at, o.created_at, serde_json::to_string(o)?],
+    )?;
+    Ok(n > 0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -812,5 +841,29 @@ mod tests {
         assert!(s.bots().unwrap().is_empty());
         assert!(s.tasks(None, 10).unwrap().is_empty());
 
+    }
+
+    #[test]
+    fn spawn_writes_task_events_and_ack_together() {
+        let d = tempfile::tempdir().unwrap();
+        let s = Store::open(&d.path().join("bots.db")).unwrap();
+        s.save_bot(&bot("b1"), 1).unwrap();
+        let e = EventRow { id: "e1".into(), instance_id: "i".into(), bot_id: "b1".into(), key: "k".into(), at: 5, disposition: "queued".into(), ..Default::default() };
+        s.add_event(&e).unwrap();
+        let t = TaskRow { id: "t1".into(), bot_id: "b1".into(), state: "queued".into(), created_at: 10, ..Default::default() };
+        let spawned = EventRow { disposition: "spawned".into(), task_id: Some("t1".into()), ..e.clone() };
+        let ack = OutboxRow { key: "ack:t1".into(), instance_id: "i".into(), kind: "reply".into(), text: "on it".into(), state: "pending".into(), next_at: 10, created_at: 10, ..Default::default() };
+        s.spawn(&t, &[spawned], Some(&ack)).unwrap();
+        assert_eq!(s.task("t1").unwrap().state, "queued");
+        let e = s.event("e1").unwrap();
+        assert_eq!((e.disposition.as_str(), e.task_id.as_deref()), ("spawned", Some("t1")));
+        assert_eq!(s.outbox_due(10).unwrap().len(), 1);
+
+        // A failing write rolls the whole spawn back
+        s.db.lock().unwrap().execute_batch("CREATE TRIGGER no_ack BEFORE INSERT ON outbox BEGIN SELECT RAISE(ABORT, 'no'); END").unwrap();
+        let t2 = TaskRow { id: "t2".into(), ..t };
+        let ack2 = OutboxRow { key: "ack:t2".into(), ..ack };
+        assert!(s.spawn(&t2, &[], Some(&ack2)).is_err());
+        assert!(s.task("t2").is_err());
     }
 }
