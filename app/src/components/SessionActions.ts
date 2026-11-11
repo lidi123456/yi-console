@@ -26,6 +26,24 @@ export function showChanges(hostId: string, sessionId: string) {
   setTimeout(() => window.dispatchEvent(new CustomEvent(OPEN_CHANGES, { detail: { hostId, sessionId } })), 0);
 }
 
+/** When the session page receives this, it opens the file panel and the panel opens the file left in pendingFiles */
+export const OPEN_FILE = 'yi-console:open-file';
+/** Same reason as pendingChanges: a closed panel mounts after the event and takes the request then */
+const pendingFiles = new Map<string, { path: string; line?: number }>();
+export function takeOpenFile(hostId: string, sessionId: string) {
+  const k = skey(hostId, sessionId);
+  const r = pendingFiles.get(k);
+  pendingFiles.delete(k);
+  return r;
+}
+
+/** Open a file (a link in a reply) in the session's file panel, optionally at a line */
+export function openFileInPanel(hostId: string, sessionId: string, path: string, line?: number) {
+  lsSet(`file-panel-${skey(hostId, sessionId)}`, true);
+  pendingFiles.set(skey(hostId, sessionId), { path, line });
+  setTimeout(() => window.dispatchEvent(new CustomEvent(OPEN_FILE, { detail: { hostId, sessionId } })), 0);
+}
+
 // Session actions: shared by the menu at the top right of the session page and the sidebar context menu
 
 /** For export: fetch all events of the session (opening only fetched the most recent part) */

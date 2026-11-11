@@ -8,7 +8,7 @@ import { rpc } from '../transport';
 import { TOOL_LABEL, type QuestionAnswer } from '../types';
 import { fmtUsage, lsGet, lsSet, shortPath, STATUS_LABEL } from '../util';
 import { openMenu } from './Overlay';
-import { exportSession, OPEN_CHANGES, renameSession, sessionMenu, showChanges, switchMode } from './SessionActions';
+import { exportSession, OPEN_CHANGES, OPEN_FILE, renameSession, sessionMenu, showChanges, switchMode } from './SessionActions';
 import { FilePanel } from './FilePanel';
 import { TermPanel } from './TermPanel';
 import { ChatView, PermissionCard, setChatStyle, useChatStyle } from './ChatView';
@@ -46,7 +46,7 @@ export function SessionView({ hostId, sessionId, seq }: { hostId: string; sessio
     setFileOpen(false);
     setFull(false);
   };
-  // "View changes": open the file panel (which switches itself to "Changes")
+  // "View changes" / a file link in a reply: open the file panel (which switches itself to "Changes" or opens the file)
   useEffect(() => {
     const on = (e: Event) => {
       const d = (e as CustomEvent<{ hostId: string; sessionId: string }>).detail;
@@ -56,7 +56,11 @@ export function SessionView({ hostId, sessionId, seq }: { hostId: string; sessio
       setFull(false);
     };
     window.addEventListener(OPEN_CHANGES, on);
-    return () => window.removeEventListener(OPEN_CHANGES, on);
+    window.addEventListener(OPEN_FILE, on);
+    return () => {
+      window.removeEventListener(OPEN_CHANGES, on);
+      window.removeEventListener(OPEN_FILE, on);
+    };
   }, [hostId, sessionId, filesKey]);
   // Bottom terminal panel: toggle remembered per session, so opening it in one session doesn't pop up a terminal in others
   const termKey = `term-panel-${key}`;

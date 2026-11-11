@@ -14,7 +14,7 @@ import { MergeDiff, oneSided, type MergeDiffHandle } from './MergeDiff';
 import { CsvView, ImageView, MdPreview, PdfView } from './FilePreview';
 import { GrepPanel } from './GrepPanel';
 import { QuickOpen, type QuickMode } from './QuickOpen';
-import { OPEN_CHANGES, takeOpenChanges } from './SessionActions';
+import { OPEN_CHANGES, OPEN_FILE, takeOpenChanges, takeOpenFile } from './SessionActions';
 import { BrowserPane, isWebTab, WEB_PREFIX, webTabFile, webTabTitle } from './Browser';
 import { CommitDetails, GitHistory, isCommitTab, parseCommitTab } from './GitHistory';
 
@@ -243,7 +243,7 @@ function fileKind(name: string): [Glyph, string] {
 }
 
 export function FileIcon({ name, size = 14 }: { name: string; size?: number }) {
-  const [g, color] = fileKind(name);
+  const [d, color] = fileGlyph(name);
   return (
     <svg
       className="wp-ficon"
@@ -257,9 +257,15 @@ export function FileIcon({ name, size = 14 }: { name: string; size?: number }) {
       strokeLinejoin="round"
       aria-hidden="true"
     >
-      <path d={GLYPH[g]} />
+      <path d={d} />
     </svg>
   );
+}
+
+/** Icon shape (16×16 path) and color for a file name; also used for file links in chat (chatFiles.ts) */
+export function fileGlyph(name: string): [string, string] {
+  const [g, color] = fileKind(name);
+  return [GLYPH[g], color];
 }
 
 // ---------- One row of the file tree ----------
@@ -877,6 +883,23 @@ export function FilePanel({
     setShowDiff(!!f.deleted || (diff && hasChange(path)));
     if (window.matchMedia('(max-width: 760px)').matches) setTreeOpen(false);
   };
+  // A file link in a reply (SessionActions.openFileInPanel): taken on mount too, since a closed panel mounts after the event.
+  // Through a ref, so the listener always calls the openFile of the latest render
+  const openFileRef = useRef(openFile);
+  openFileRef.current = openFile;
+  useEffect(() => {
+    const take = () => {
+      const r = takeOpenFile(hostId, sessionId);
+      if (r) openFileRef.current(r.path, false, r.line ? { line: r.line } : undefined);
+    };
+    take();
+    const on = (e: Event) => {
+      const d = (e as CustomEvent<{ hostId: string; sessionId: string }>).detail;
+      if (d.hostId === hostId && d.sessionId === sessionId) take();
+    };
+    window.addEventListener(OPEN_FILE, on);
+    return () => window.removeEventListener(OPEN_FILE, on);
+  }, [hostId, sessionId]);
 
   // ---------- When the tab bar overflows: scroll the current tab into view and add a dropdown on the right listing all tabs (like VS Code) ----------
   const tabsRef = useRef<HTMLDivElement>(null);
@@ -1043,8 +1066,11 @@ export function FilePanel({
     restoring.current = true;
     readFile(cur, true).then((f) => {
       restoring.current = false;
-      // If the user already opened a file while restoring, don't overwrite it
-      if (fileRef.current) return;
+      // If the user (or a file link) already opened a file while restoring, keep it but still bring back the saved tabs
+      if (fileRef.current) {
+        if (f) setTabs((t) => [...keep.filter((x) => !t.includes(x)), ...t].slice(-30));
+        return;
+      }
       if (!f) return setTabs(keep.filter((t) => t !== cur));
       setTabs(keep);
       setFile(f);

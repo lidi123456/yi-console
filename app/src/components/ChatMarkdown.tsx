@@ -1,6 +1,7 @@
 import { memo, useMemo, useRef, useLayoutEffect } from 'react';
 import { createPortal } from 'react-dom';
 import { hydrateImages, type ImgCtx } from '../chatImages';
+import { hydrateFileLinks, openFileLink } from '../chatFiles';
 import { renderDiagramMarkdown } from '../util';
 import { MermaidBlock } from './MermaidBlock';
 
@@ -30,10 +31,16 @@ export const ChatMarkdown = memo(function ChatMarkdown({
     root.replaceChildren(template.content);
     previous.current = targets;
     hydrateImages(root, ctx);
+    hydrateFileLinks(root, ctx);
   }, [model, targets, ctx]);
   return (
     <>
-      <div ref={ref} className="md" />
+      <div
+        ref={ref}
+        className="md"
+        onClick={(e) => openFileLink(e, ctx)}
+        onKeyDown={(e) => (e.key === 'Enter' || e.key === ' ') && openFileLink(e, ctx)}
+      />
       {model.diagrams.map((diagram, index) =>
         createPortal(<MermaidBlock {...diagram} streaming={streaming} />, targets[index], String(index)),
       )}

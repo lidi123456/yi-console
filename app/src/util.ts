@@ -1,5 +1,5 @@
 import DOMPurify from 'dompurify';
-import { Marked, marked, type Tokens } from 'marked';
+import { Marked, marked, type MarkedExtension, type Tokens } from 'marked';
 import { getT, isEn } from './i18n';
 import type { HubEvent, SessionInfo, SessionStatus, Usage } from './types';
 
@@ -15,6 +15,12 @@ export function classifyImageSrc(href: string): { kind: 'web' | 'file' | 'data' 
   const h = href.trim();
   if (/^https?:\/\//i.test(h)) return { kind: 'web', src: h };
   if (/^data:image\//i.test(h)) return { kind: 'data', src: h };
+  const p = hostPath(h);
+  return p ? { kind: 'file', src: p } : { kind: 'other', src: h };
+}
+
+/** A URL from a reply as a path on the host (absolute, relative to cwd, ~, file://); null for other schemes or nothing left */
+function hostPath(h: string): string | null {
   // Decode before checking the scheme: marked encodes backslashes as %5C (C:%5CUsers%5Ca.png)
   let p = h;
   if (/%[0-9a-fA-F]{2}/.test(p)) {
@@ -25,20 +31,55 @@ export function classifyImageSrc(href: string): { kind: 'web' | 'file' | 'data' 
     }
   }
   if (/^file:/i.test(p)) {
-    // file:///C:/a.png -> C:/a.png, file:///home/a.png -> /home/a.png
+    // file:///C:/a.png -> C:/a.png (leading slash dropped below), file:///home/a.png -> /home/a.png
     p = p.replace(/^file:(\/\/[^/]*)?/i, '');
-    if (/^\/[a-zA-Z]:[\\/]/.test(p)) p = p.slice(1);
   } else if (/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(p) && !/^[a-zA-Z]:[\\/]/.test(p)) {
-    return { kind: 'other', src: h };
+    return null;
   }
-  return p ? { kind: 'file', src: p } : { kind: 'other', src: h };
+  // Codex on Windows writes /D:/repo/a.rs (URL style); the host wants D:/repo/a.rs
+  if (/^\/[a-zA-Z]:[\\/]/.test(p)) p = p.slice(1);
+  return p || null;
+}
+
+/** Links in replies that point at a file on the host rather than a web page. Agents (Codex especially) cite files as
+ *  [name](/abs/path/file.rs:12) or [name](src/file.rs#L12-L20); returns the path and the line, if any */
+export function parseFileHref(href: string): { path: string; line?: number } | null {
+  const h = href.trim();
+  if (!h || h.startsWith('#') || h.startsWith('//')) return null;
+  let p = hostPath(h);
+  if (!p) return null;
+  let line: number | undefined;
+  // GitHub style #L12, #L12C3, #L12-L20; any other fragment (a heading) is dropped
+  const hash = p.lastIndexOf('#');
+  if (hash > 0) {
+    const m = /^#L(\d+)/i.exec(p.slice(hash));
+    if (m) line = Number(m[1]);
+    p = p.slice(0, hash);
+  }
+  // path:12 or path:12:3 (not the C: of a Windows drive, which is followed by a separator)
+  const c = /:(\d+)(?::\d+)?$/.exec(p);
+  if (c) {
+    line ??= Number(c[1]);
+    p = p.slice(0, c.index);
+  }
+  if (!p) return null;
+  return { path: p, line: line && line > 0 ? line : undefined };
 }
 
 /** For chat replies only: images aren't loaded by the browser right away but rendered as placeholder spans; ChatView decides per host and source whether to show them directly or on click */
-const chatOptions = {
+const chatOptions: MarkedExtension = {
   gfm: true,
   breaks: true,
   renderer: {
+    // File links become a chip (no href, so nothing navigates); chatFiles.ts adds the icon and opens it in the file panel
+    link({ href, title, tokens }: Tokens.Link) {
+      const f = parseFileHref(href ?? '');
+      if (!f) return false;
+      const label = this.parser.parseInline(tokens) || escAttr(basename(f.path) || f.path);
+      const where = f.line ? `${f.path}:${f.line}` : f.path;
+      const line = f.line ? ` data-line="${f.line}"` : '';
+      return `<a class="md-file" role="link" tabindex="0" data-path="${escAttr(f.path)}"${line} title="${escAttr(title || where)}"><span class="md-file-icon"></span>${label}</a>`;
+    },
     image({ href, text, title }: Tokens.Image) {
       const c = classifyImageSrc(href ?? '');
       if (c.kind === 'data') return false;

@@ -17,6 +17,8 @@ export interface ImgCtx {
   local: boolean;
   /** Session working directory; relative paths resolve against it */
   cwd?: string;
+  /** Session the reply belongs to: file links open in its file panel (chatFiles.ts) */
+  sessionId?: string;
 }
 
 /** Host files: hostId + path -> data URL */
@@ -26,7 +28,7 @@ const webAllowed = new Set<string>();
 
 const isAbs = (p: string) => /^([a-zA-Z]:)?[\\/]/.test(p) || p.startsWith('~');
 
-function filePath(src: string, cwd?: string) {
+export function filePath(src: string, cwd?: string) {
   return isAbs(src) || !cwd ? src : resolvePath(cwd, src);
 }
 

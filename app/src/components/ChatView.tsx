@@ -1525,8 +1525,8 @@ export function ChatView({
   const host = useStore((st) => (hostId ? st.hosts.find((h) => h.config.id === hostId)?.config : undefined));
   const desktopCtx = useMemo(() => (hostId && info?.id ? { hostId, sessionId: info.id } : null), [hostId, info?.id]);
   const imgCtx = useMemo<ImgCtx | null>(
-    () => (hostId ? { hostId, hostName: host?.name ?? hostId, local: host?.kind === 'local', cwd: info?.cwd } : null),
-    [hostId, host?.name, host?.kind, info?.cwd],
+    () => (hostId ? { hostId, hostName: host?.name ?? hostId, local: host?.kind === 'local', cwd: info?.cwd, sessionId: info?.id } : null),
+    [hostId, host?.name, host?.kind, info?.cwd, info?.id],
   );
   const runItem = (x: RunItem) =>
     x.k === 'tool' ? (

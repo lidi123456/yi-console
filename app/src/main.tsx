@@ -28,7 +28,8 @@ function guardLink(e: MouseEvent) {
   const href = a.getAttribute('href') ?? '';
   if (href.startsWith('#')) return;
   e.preventDefault();
-  if (/^(https?|mailto):/i.test(a.href)) openUrl(a.href);
+  // Test the href as written: a.href is resolved against the page, so /path/file.md would become http://tauri.localhost/path/file.md
+  if (/^(https?|mailto):/i.test(href.trim())) openUrl(a.href);
 }
 document.addEventListener('click', guardLink);
 document.addEventListener('auxclick', guardLink);
@@ -37,7 +38,7 @@ document.addEventListener('auxclick', guardLink);
 function linkMenu(e: MouseEvent) {
   if (e.defaultPrevented) return;
   const a = (e.target as Element | null)?.closest?.('a[href]') as HTMLAnchorElement | null;
-  if (!a || a.hasAttribute('download') || !/^https?:/i.test(a.href)) return;
+  if (!a || a.hasAttribute('download') || !/^https?:/i.test((a.getAttribute('href') ?? '').trim())) return;
   const url = a.href;
   const sel = window.getSelection()?.toString() ?? '';
   openMenu(e, [
