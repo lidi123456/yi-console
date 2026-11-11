@@ -158,5 +158,17 @@
   "showUnchangedRegions": "Show unchanged regions",
   "collapseUnchangedRegions": "Collapse unchanged regions",
   "saveAs": "Save As",
-  "pathRelativeToOrAbsolute": "Path relative to {{v}}, or an absolute path"
+  "pathRelativeToOrAbsolute": "Path relative to {{v}}, or an absolute path",
+  "cut": "Cut",
+  "paste": "Paste",
+  "selectAll": "Select All",
+  "find": "Find",
+  "addSelectionToChat": "Add selection to chat",
+  "copyPathWithLine": "Copy path with line number",
+  "foldAll": "Fold all",
+  "unfoldAll": "Unfold all",
+  "addDiffHunkToChat": "Add this diff hunk to chat",
+  "copyDiffHunk": "Copy this diff hunk",
+  "diffCopied": "Diff hunk copied",
+  "folderIsOutsideTheWorkspace": "This folder is outside the workspace: {{v}}"
 }

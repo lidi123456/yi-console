@@ -6,9 +6,10 @@ import { isTauri, rpc } from '../transport';
 import type { DirEntry, FileDiff } from '../types';
 import { fmtSize, lsGet, lsSet } from '../util';
 import { writeClipboard } from '../clipboard';
+import { addContextRefToChat } from '../contextRefs';
 import { Icon } from './Icon';
 import { askConfirm, askText, openMenu, type MenuItem } from './Overlay';
-import { CodeEditor } from './CodeEditor';
+import { CodeEditor, type EditorMenuCtx, type GotoTarget } from './CodeEditor';
 import { PaneDiff } from './DiffView';
 import { MergeDiff, oneSided, type MergeDiffHandle } from './MergeDiff';
 import { CsvView, ImageView, MdPreview, PdfView } from './FilePreview';
@@ -554,12 +555,12 @@ export function FilePanel({
   const [git, setGit] = useState<GitInfo | null>(() => gitCache.get(gitKey(hostId, cwd))?.git ?? null);
   const [view, setView] = useState<'all' | 'changes' | 'search'>(() => lsGet('wp-view', 'all'));
   const [showDiff, setShowDiff] = useState(false);
-  const [diffLayout, setDiffLayout] = useState<'split' | 'unified'>(() => lsGet('wp-diff-layout', 'split'));
-  // Collapse unchanged regions in the full-file diff. VS Code's own default is off; ours is on, since the hunk-only diff we had before showed just the changes
-  const [diffCollapse, setDiffCollapse] = useState(() => lsGet('wp-diff-collapse', true));
+  // Default to Cursor-style single-file inline diff with the full file expanded
+  const [diffLayout, setDiffLayout] = useState<'split' | 'unified'>(() => lsGet('wp-diff-mode', 'unified'));
+  const [diffCollapse, setDiffCollapse] = useState(() => lsGet('wp-diff-fold', false));
   const mergeRef = useRef<MergeDiffHandle>(null);
-  // Make the editor jump to a line (search results, outline, : line number)
-  const [goto, setGoto] = useState<{ line: number; col?: number; len?: number; n: number } | null>(null);
+  // Make the editor jump to a line (search results, outline, : line number, context pills)
+  const [goto, setGoto] = useState<GotoTarget | null>(null);
   const [quick, setQuick] = useState<QuickMode | null>(null);
   // Another file opened side by side on the right (read-only); compare diffs the current file against another
   const [second, setSecond] = useState<OpenFile | null>(null);
@@ -833,8 +834,8 @@ export function FilePanel({
   };
   // The file no longer has changes (e.g. just committed): if we're still on "Changes", switch back to the file
   useEffect(() => {
-    if (showDiff && file && !file.deleted && gitReady && !hasChange(file.path)) setShowDiff(false);
-  }, [git, showDiff, file?.path]); // eslint-disable-line react-hooks/exhaustive-deps
+    if (showDiff && file && !file.deleted && !dirty && gitReady && !hasChange(file.path)) setShowDiff(false);
+  }, [git, showDiff, file?.path, dirty]); // eslint-disable-line react-hooks/exhaustive-deps
 
   /** Whether to open the preview when opening a file: CSV defaults to the table; Markdown reuses the last choice of source / split / preview, and isn't preview-only when jumping to a line */
   const previewFor = (path: string, at?: unknown) => {
@@ -852,13 +853,14 @@ export function FilePanel({
   };
 
   /** diff: files opened from the changes list show the diff by default; line: jump to this line after opening */
-  const openFile = async (path0: string, diff = false, at?: { line: number; col?: number; len?: number }) => {
+  const openFile = async (path0: string, diff = false, at?: { line: number; endLine?: number; col?: number; len?: number }) => {
     const path = unverbatim(path0);
     const jump = () => at && setGoto({ ...at, n: Date.now() });
     if (file?.path === path) {
-      if (diff && hasChange(path)) setShowDiff(true);
+      const canDiff = !!file.commit || !!file.deleted || hasChange(path);
+      if (diff && canDiff) setShowDiff(true);
       if (at) {
-        setShowDiff(false);
+        if (!diff || !canDiff) setShowDiff(false);
         if (preview) previewFor(path, at);
         setCompare(null);
         jump();
@@ -883,14 +885,64 @@ export function FilePanel({
     setShowDiff(!!f.deleted || (diff && hasChange(path)));
     if (window.matchMedia('(max-width: 760px)').matches) setTreeOpen(false);
   };
-  // A file link in a reply (SessionActions.openFileInPanel): taken on mount too, since a closed panel mounts after the event.
+  // A file link or context pill in chat (SessionActions.openFileInPanel): taken on mount too, since a closed panel mounts after the event.
   // Through a ref, so the listener always calls the openFile of the latest render
   const openFileRef = useRef(openFile);
   openFileRef.current = openFile;
+  /** Like VS Code's "Reveal in Explorer" for a folder: expand it and its parents in the tree, focus and scroll to its row.
+   *  False when path isn't a folder (fs.list fails), so the caller opens it as a file */
+  const revealDir = async (path: string): Promise<boolean> => {
+    let r: { path: string; entries: DirEntry[] };
+    try {
+      r = await rpc<{ path: string; entries: DirEntry[] }>(hostId, 'fs.list', { path, showHidden: hidden });
+    } catch {
+      return false;
+    }
+    const dir = unverbatim(r.path);
+    // A panel that just mounted may not have its root yet
+    let top = root ?? rootCache.get(rootKey(hostId, cwd, hidden))?.path;
+    if (!top) {
+      try {
+        top = (await rpc<{ path: string }>(hostId, 'fs.list', { path: cwd, showHidden: hidden })).path;
+      } catch {
+        return true;
+      }
+    }
+    top = unverbatim(top);
+    const nr = norm(top);
+    const nd = norm(dir);
+    if (nd !== nr && !nd.startsWith(nr + '/')) {
+      toast(tx('folderIsOutsideTheWorkspace', { v: dir }));
+      return true;
+    }
+    // The folder and its parents below the root, spelled the way fs.list spells tree paths (the root's separator)
+    const chain: string[] = [];
+    let cur = top;
+    for (const part of dir.slice(top.length).split(/[\\/]/).filter(Boolean)) chain.push((cur = join(cur, part)));
+    setKids((k) => ({ ...k, [chain[chain.length - 1] ?? top]: r.entries }));
+    for (const d of chain.slice(0, -1)) if (!kids[d]) load(d, true);
+    setExpanded((x) => new Set([...x, ...chain]));
+    setFilter('');
+    pickView('all');
+    setTreeOpen(true);
+    const target = chain[chain.length - 1];
+    if (target) {
+      setFocusKey(target);
+      lastRow.current = { path: target, isDir: true };
+      // Rows render after the parents load; the virtualized list scrolls by focus itself, short lists by element
+      setTimeout(() => treeBox.current?.querySelector(`[data-key="${CSS.escape(target)}"]`)?.scrollIntoView({ block: 'center' }), 300);
+    }
+    return true;
+  };
+  const revealRef = useRef(revealDir);
+  revealRef.current = revealDir;
   useEffect(() => {
-    const take = () => {
+    const take = async () => {
       const r = takeOpenFile(hostId, sessionId);
-      if (r) openFileRef.current(r.path, false, r.line ? { line: r.line } : undefined);
+      if (!r) return;
+      // A folder link: show it in the tree instead of trying to read it as a file
+      if (!r.line && !r.diff && (await revealRef.current(r.path))) return;
+      openFileRef.current(r.path, !!r.diff, r.line ? { line: r.line, endLine: r.endLine } : undefined);
     };
     take();
     const on = (e: Event) => {
@@ -1464,6 +1516,75 @@ export function FilePanel({
     ]);
   };
 
+  const toggleWrap = () => {
+    lsSet('wp-wrap', !wrap);
+    setWrap(!wrap);
+  };
+  const pushContextRef = (
+    targetPath: string,
+    snip: { kind: 'diff' | 'code'; fromLine: number; toLine: number; added?: number; deleted?: number; content: string },
+    commitHash?: string,
+  ) => {
+    if (standalone) return;
+    const unt = isUntitled(targetPath);
+    const displayPath = commitHash ? targetPath : unt ? nameOf(targetPath) : rel(targetPath);
+    addContextRefToChat(sessionId, {
+      kind: snip.kind,
+      path: displayPath,
+      commit: commitHash,
+      untitled: unt || undefined,
+      fromLine: snip.fromLine,
+      toLine: snip.toLine,
+      added: snip.added,
+      deleted: snip.deleted,
+      content: snip.content,
+    });
+    toast(tx('addedToInput'));
+    if (window.matchMedia('(max-width: 760px)').matches) onClose();
+  };
+  /** Right-click menu inside the editor (VS Code's editor context menu, plus Cursor's "add selection to chat") */
+  const editorMenu = (path: string, commitHash?: string) => (c: EditorMenuCtx): (MenuItem | '-')[] => {
+    const mod = navigator.platform.includes('Mac') ? '⌘' : 'Ctrl+';
+    const onDisk = !isUntitled(path) && !commitHash;
+    const displayPath = commitHash ? path : isUntitled(path) ? nameOf(path) : rel(path);
+    const lines = c.fromLine === c.toLine ? `${c.fromLine}` : `${c.fromLine}-${c.toLine}`;
+    return [
+      { label: tx('cut'), icon: 'cut', hint: `${mod}X`, disabled: !c.selection || c.readOnly, run: c.cut },
+      { label: tx('copy'), icon: 'copy', hint: `${mod}C`, disabled: !c.selection, run: c.copy },
+      { label: tx('paste'), icon: 'paste', hint: `${mod}V`, disabled: c.readOnly, run: c.paste },
+      { label: tx('selectAll'), hint: `${mod}A`, run: c.selectAll },
+      '-',
+      { label: tx('find'), icon: 'search', hint: `${mod}F`, run: c.find },
+      { label: tx('goToLine'), hint: `${mod}G`, run: () => setQuick(':') },
+      '-',
+      ...(!standalone && (c.selection || onDisk)
+        ? [
+            c.selection
+              ? {
+                  label: tx('addSelectionToChat'),
+                  icon: 'chat',
+                  hint: `${mod}L`,
+                  run: () =>
+                    c.addSelection
+                      ? c.addSelection()
+                      : pushContextRef(
+                          path,
+                          { kind: 'code', fromLine: c.fromLine, toLine: c.toLine, content: c.selectedLines || c.selection },
+                          commitHash,
+                        ),
+                }
+              : { label: tx('addToChat'), icon: 'chat', run: () => addToChat(path, false) },
+          ]
+        : []),
+      // Old side of a diff: its line numbers don't point into the file on disk
+      ...(!isUntitled(path) && !c.oldSide ? [{ label: tx('copyPathWithLine'), icon: 'copy', run: () => copy(`${displayPath}:${lines}`) }] : []),
+      '-',
+      { label: wrap ? tx('disableWordWrap') : tx('enableWordWrap'), icon: 'wrap', hint: 'Alt+Z', run: toggleWrap },
+      { label: tx('foldAll'), icon: 'fold-all', hint: `${mod}Alt+[`, run: c.foldAll },
+      { label: tx('unfoldAll'), icon: 'unfold-all', hint: `${mod}Alt+]`, run: c.unfoldAll },
+    ];
+  };
+
   const fileMenu = (e: React.MouseEvent<HTMLElement>) => {
     const r = e.currentTarget.getBoundingClientRect();
     const items: (MenuItem | '-')[] = file?.untitled
@@ -1474,7 +1595,7 @@ export function FilePanel({
           { label: tx('saveAs'), icon: 'save', run: () => save() },
           { label: tx('copyFileContents'), icon: 'copy', run: () => copy(file.draft, tx('fileContentsCopied')) },
           '-',
-          { label: wrap ? tx('disableWordWrap') : tx('enableWordWrap'), icon: 'wrap', run: () => (lsSet('wp-wrap', !wrap), setWrap(!wrap)) },
+          { label: wrap ? tx('disableWordWrap') : tx('enableWordWrap'), icon: 'wrap', hint: 'Alt+Z', run: toggleWrap },
         ]
       : file
       ? [
@@ -1493,7 +1614,7 @@ export function FilePanel({
                 { label: tx('copyPasteInInputTo'), run: () => copyRef(file.path, false) },
               ]),
           '-',
-          { label: wrap ? tx('disableWordWrap') : tx('enableWordWrap'), icon: 'wrap', run: () => (lsSet('wp-wrap', !wrap), setWrap(!wrap)) },
+          { label: wrap ? tx('disableWordWrap') : tx('enableWordWrap'), icon: 'wrap', hint: 'Alt+Z', run: toggleWrap },
           dirty
             ? { label: tx('discardAndReload'), icon: 'refresh', danger: true, run: async () => (await confirmDiscard()) && reload() }
             : { label: tx('reload'), icon: 'refresh', run: reload },
@@ -1624,7 +1745,7 @@ export function FilePanel({
   const layout: 'split' | 'unified' = diffLayout === 'split' && wide() ? 'split' : 'unified';
   const flipLayout = () => {
     const v = diffLayout === 'split' ? 'unified' : 'split';
-    lsSet('wp-diff-layout', v);
+    lsSet('wp-diff-mode', v);
     setDiffLayout(v);
   };
   const viewing = compare ? 'compare' : showDiff ? 'diff' : 'file';
@@ -1667,14 +1788,43 @@ export function FilePanel({
     return file.commit ? { a: texts[0]!, b: texts[1]! } : { a: texts[0]!, b: file.deleted ? '' : file.draft };
   })();
   const flipCollapse = () => {
-    lsSet('wp-diff-collapse', !diffCollapse);
+    lsSet('wp-diff-fold', !diffCollapse);
     setDiffCollapse(!diffCollapse);
   };
-  const mergeView = (f: { a: string; b: string }, name: string) => (
-    <div className="wp-diff wp-diff-full">
-      <MergeDiff ref={mergeRef} a={f.a} b={f.b} filename={name} layout={layout} collapse={diffCollapse} wrap={wrap} />
-    </div>
-  );
+  const mergeView = (f: { a: string; b: string }, name: string, opts?: { editable?: boolean; refPath?: string; commitHash?: string }) => {
+    const refPath = opts?.refPath ?? (file?.commit ? file.commit.rel : file?.path ?? name);
+    const commitHash = opts?.commitHash ?? file?.commit?.hash;
+    const editable = !!opts?.editable;
+    return (
+      <div className="wp-diff wp-diff-full">
+        <MergeDiff
+          ref={mergeRef}
+          docKey={file ? `${file.path}#${compare?.path ?? ''}` : name}
+          a={f.a}
+          b={f.b}
+          filename={name}
+          layout={layout}
+          collapse={diffCollapse}
+          wrap={wrap}
+          readOnly={!editable}
+          goto={goto}
+          onChange={
+            editable
+              ? (draft) => {
+                  if (file?.untitled) untitled.set(file.path, draft);
+                  setFile((cur) => cur && { ...cur, draft });
+                }
+              : undefined
+          }
+          onSave={editable ? () => save() : undefined}
+          onToggleWrap={toggleWrap}
+          menu={editorMenu(refPath, commitHash)}
+          onAddContext={standalone ? undefined : (snip) => pushContextRef(refPath, snip, commitHash)}
+          onCopyHunk={(content) => void copy(content, tx('diffCopied'))}
+        />
+      </div>
+    );
+  };
   /** Toolbar buttons for the full-file diff: previous / next change and collapsing unchanged regions (none for an added /
    *  deleted file, which MergeDiff shows as the single file) */
   const singleFile = !!full && oneSided(full.a, full.b);
@@ -1954,20 +2104,36 @@ export function FilePanel({
         setFile((cur) => cur && { ...cur, draft });
       }}
       onSave={() => save()}
+      menu={editorMenu(file.path)}
+      onToggleWrap={toggleWrap}
+      onAddSelection={
+        standalone
+          ? undefined
+          : (sel) => pushContextRef(file.path, { kind: 'code', fromLine: sel.fromLine, toLine: sel.toLine, content: sel.content })
+      }
       scrollLine={md && mdSplit ? editorAt : null}
       onTopLine={md && mdSplit ? (line, frac) => syncFrom.current === 'editor' && setPreviewAt({ line, frac, n: Date.now() }) : undefined}
     />
   );
 
+  const paneDiffActions = (refPath: string, commitHash?: string) => ({
+    onAddHunk: standalone ? undefined : (h: { fromLine: number; toLine: number; added?: number; deleted?: number; content: string }) => pushContextRef(refPath, { kind: 'diff', ...h }, commitHash),
+    onCopyHunk: (content: string) => void copy(content, tx('diffCopied')),
+  });
+
   // Content of the editor column: file / changes / compare
   const mainView = !file ? null : file.commit ? (
     full ? (
-      mergeView(full, baseName(file.commit.rel))
+      mergeView(full, baseName(file.commit.rel), { refPath: file.commit.rel, commitHash: file.commit.hash })
     ) : full === undefined ? (
       loadingChanges
     ) : file.commit.diff ? (
       <div className="wp-diff">
-        <PaneDiff diff={{ path: file.commit.rel, unified: file.commit.diff.slice(Math.max(0, file.commit.diff.indexOf('@@'))) }} layout={layout} />
+        <PaneDiff
+          diff={{ path: file.commit.rel, unified: file.commit.diff.slice(Math.max(0, file.commit.diff.indexOf('@@'))) }}
+          layout={layout}
+          {...paneDiffActions(file.commit.rel, file.commit.hash)}
+        />
       </div>
     ) : (
       <div className="wp-empty">
@@ -1980,19 +2146,22 @@ export function FilePanel({
   ) : html && preview && viewing === 'file' ? (
     <BrowserPane hostId={hostId} root={root ?? cwd} tab={`${WEB_PREFIX}file:${file.path}`} reload={file.modified} onNavigate={(t) => openFile(t)} />
   ) : viewing === 'compare' && full ? (
-    mergeView(full, baseName(file.path))
+    mergeView(full, baseName(file.path), { editable: !file.truncated && !file.notUtf8 && !file.binary, refPath: file.path })
   ) : viewing === 'compare' ? (
     <div className="wp-diff">
-      <PaneDiff diff={{ path: rel(file.path), oldText: file.draft, newText: compare!.text }} layout={layout} />
+      <PaneDiff diff={{ path: rel(file.path), oldText: file.draft, newText: compare!.text }} layout={layout} {...paneDiffActions(file.path)} />
     </div>
   ) : viewing === 'diff' ? (
     full ? (
-      mergeView(full, baseName(file.path))
+      mergeView(full, baseName(file.path), {
+        editable: !file.deleted && !file.truncated && !file.notUtf8 && !file.binary,
+        refPath: file.path,
+      })
     ) : full === undefined ? (
       loadingChanges
     ) : fileDiff ? (
       <div className="wp-diff">
-        <PaneDiff diff={{ ...fileDiff, path: rel(file.path) }} layout={layout} />
+        <PaneDiff diff={{ ...fileDiff, path: rel(file.path) }} layout={layout} {...paneDiffActions(file.path)} />
       </div>
     ) : diffPending ? (
       <div className="wp-empty">
@@ -2004,7 +2173,7 @@ export function FilePanel({
       <div className="wp-diff">
         <div className="wp-limit">{tx('notAGitRepoBelow', { length: fileSessionDiffs.length })}</div>
         {fileSessionDiffs.map((d, i) => (
-          <PaneDiff key={i} diff={{ ...d, path: rel(file.path) }} layout={layout} />
+          <PaneDiff key={i} diff={{ ...d, path: rel(file.path) }} layout={layout} {...paneDiffActions(file.path)} />
         ))}
       </div>
     ) : (
@@ -2094,6 +2263,13 @@ export function FilePanel({
           wrap={wrap}
           onChange={() => {}}
           onSave={() => {}}
+          menu={editorMenu(second.path)}
+          onToggleWrap={toggleWrap}
+          onAddSelection={
+            standalone
+              ? undefined
+              : (sel) => pushContextRef(second.path, { kind: 'code', fromLine: sel.fromLine, toLine: sel.toLine, content: sel.content })
+          }
         />
       )}
     </div>

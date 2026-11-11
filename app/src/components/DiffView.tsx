@@ -3,8 +3,10 @@ import { memo, useMemo } from 'react';
 import { getT, useLang } from '../i18n';
 import type { FileDiff } from '../types';
 import { basename } from '../util';
+import { Icon } from './Icon';
 
 const t = getT('diffView');
+const tx = getT('filePanel');
 
 interface Line {
   t: 'add' | 'del' | 'ctx' | 'hunk';
@@ -123,51 +125,135 @@ function paneLines(d: FileDiff): PLine[] {
 
 type Cell = { t: PLine['t'] | 'empty'; text: string; num?: number };
 
-/** Side by side: context goes on both sides; consecutive deletions and additions are paired row by row */
-function splitRows(lines: PLine[]): [Cell, Cell][] {
-  const rows: [Cell, Cell][] = [];
-  let i = 0;
-  const empty: Cell = { t: 'empty', text: '' };
-  while (i < lines.length) {
-    const l = lines[i];
-    if (l.t === 'hunk') {
-      rows.push([{ t: 'hunk', text: l.text }, { t: 'hunk', text: '' }]);
-      i++;
-    } else if (l.t === 'ctx') {
-      rows.push([
-        { t: 'ctx', text: l.text, num: l.o },
-        { t: 'ctx', text: l.text, num: l.n },
-      ]);
-      i++;
-    } else {
-      const dels: PLine[] = [];
-      const adds: PLine[] = [];
-      while (i < lines.length && lines[i].t === 'del') dels.push(lines[i++]);
-      while (i < lines.length && lines[i].t === 'add') adds.push(lines[i++]);
-      for (let k = 0; k < Math.max(dels.length, adds.length); k++) {
-        const d = dels[k];
-        const a = adds[k];
-        rows.push([d ? { t: 'del', text: d.text, num: d.o } : empty, a ? { t: 'add', text: a.text, num: a.n } : empty]);
-      }
-    }
-  }
-  return rows;
-}
-
 const PANE_MAX = 5000;
 
-export const PaneDiff = memo(function PaneDiff({ diff, layout }: { diff: FileDiff; layout: 'unified' | 'split' }) {
+interface PaneHunkInfo {
+  fromLine: number;
+  toLine: number;
+  added?: number;
+  deleted?: number;
+  content: string;
+}
+
+function buildPaneHunks(lines: PLine[]): Map<number, PaneHunkInfo> {
+  const map = new Map<number, PaneHunkInfo>();
+  let i = 0;
+  while (i < lines.length) {
+    if (lines[i].t !== 'hunk') {
+      i++;
+      continue;
+    }
+    const headIdx = i;
+    const header = lines[i++].text;
+    const body: string[] = [header];
+    let added = 0;
+    let deleted = 0;
+    let firstAdd = 0;
+    let lastAdd = 0;
+    let firstAny = 0;
+    while (i < lines.length && lines[i].t !== 'hunk') {
+      const l = lines[i++];
+      if (l.n && !firstAny) firstAny = l.n;
+      if (l.t === 'add') {
+        added++;
+        if (l.n) {
+          if (!firstAdd) firstAdd = l.n;
+          lastAdd = l.n;
+        }
+        body.push(`+${l.text}`);
+      } else if (l.t === 'del') {
+        deleted++;
+        body.push(`-${l.text}`);
+      } else {
+        body.push(` ${l.text}`);
+      }
+    }
+    if (added || deleted) {
+      const fromLine = firstAdd || firstAny || 1;
+      const toLine = lastAdd || fromLine;
+      map.set(headIdx, {
+        fromLine,
+        toLine,
+        added: added || undefined,
+        deleted: deleted || undefined,
+        content: body.join('\n'),
+      });
+    }
+  }
+  return map;
+}
+
+export const PaneDiff = memo(function PaneDiff({
+  diff,
+  layout,
+  onAddHunk,
+  onCopyHunk,
+}: {
+  diff: FileDiff;
+  layout: 'unified' | 'split';
+  onAddHunk?: (hunk: PaneHunkInfo) => void;
+  onCopyHunk?: (content: string) => void;
+}) {
+  useLang();
   const lines = useMemo(() => paneLines(diff), [diff]);
-  const rows = useMemo(() => (layout === 'split' ? splitRows(lines) : []), [lines, layout]);
+  const hunks = useMemo(() => buildPaneHunks(lines), [lines]);
+  const rows = useMemo(() => {
+    if (layout !== 'split') return [];
+    // Keep track of original line index for hunk headers
+    const out: { pair: [Cell, Cell]; hunk?: PaneHunkInfo }[] = [];
+    let i = 0;
+    const empty: Cell = { t: 'empty', text: '' };
+    while (i < lines.length) {
+      const l = lines[i];
+      if (l.t === 'hunk') {
+        out.push({ pair: [{ t: 'hunk', text: l.text }, { t: 'hunk', text: '' }], hunk: hunks.get(i) });
+        i++;
+      } else if (l.t === 'ctx') {
+        out.push({ pair: [{ t: 'ctx', text: l.text, num: l.o }, { t: 'ctx', text: l.text, num: l.n }] });
+        i++;
+      } else {
+        const dels: PLine[] = [];
+        const adds: PLine[] = [];
+        while (i < lines.length && lines[i].t === 'del') dels.push(lines[i++]);
+        while (i < lines.length && lines[i].t === 'add') adds.push(lines[i++]);
+        for (let k = 0; k < Math.max(dels.length, adds.length); k++) {
+          const d = dels[k];
+          const a = adds[k];
+          out.push({ pair: [d ? { t: 'del', text: d.text, num: d.o } : empty, a ? { t: 'add', text: a.text, num: a.n } : empty] });
+        }
+      }
+    }
+    return out;
+  }, [lines, hunks, layout]);
   const more = (layout === 'split' ? rows.length : lines.length) - PANE_MAX;
   if (!lines.some((l) => l.t !== 'hunk')) return <div className="pd-empty muted small">{t('bothSidesAreTheSame')}</div>;
+
+  const hunkActs = (h?: PaneHunkInfo) =>
+    h && (onAddHunk || onCopyHunk) ? (
+      <span className="pd-hunk-acts">
+        {onAddHunk && (
+          <button type="button" className="wp-hunk-btn primary" title={tx('addDiffHunkToChat')} onClick={() => onAddHunk(h)}>
+            <Icon name="chat" size={12} />
+            <span>{tx('addToChat')}</span>
+          </button>
+        )}
+        {onCopyHunk && (
+          <button type="button" className="wp-hunk-btn" title={tx('copyDiffHunk')} onClick={() => onCopyHunk(h.content)}>
+            <Icon name="copy" size={12} />
+            <span>{tx('copy')}</span>
+          </button>
+        )}
+      </span>
+    ) : null;
+
   return (
     <div className={`pd mono pd-${layout}`}>
       {layout === 'unified'
         ? lines.slice(0, PANE_MAX).map((l, i) =>
             l.t === 'hunk' ? (
               <div key={i} className="pd-row pd-hunk">
-                {l.text}
+                <span className="pd-hunk-text">{l.text}</span>
+                {hunkActs(hunks.get(i))}
               </div>
             ) : (
               <div key={i} className={`pd-row pd-${l.t}`}>
@@ -178,10 +264,11 @@ export const PaneDiff = memo(function PaneDiff({ diff, layout }: { diff: FileDif
               </div>
             ),
           )
-        : rows.slice(0, PANE_MAX).map(([a, b], i) =>
+        : rows.slice(0, PANE_MAX).map(({ pair: [a, b], hunk }, i) =>
             a.t === 'hunk' ? (
               <div key={i} className="pd-row pd-hunk">
-                {a.text}
+                <span className="pd-hunk-text">{a.text}</span>
+                {hunkActs(hunk)}
               </div>
             ) : (
               <div key={i} className="pd-row pd-pair">

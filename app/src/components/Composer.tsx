@@ -5,7 +5,18 @@ import { errorToast, hostSnippets, navigate, openNewSession, toast, useStore } f
 import { clearSession, showChanges } from './SessionActions';
 import { isTauri, rpc } from '../transport';
 import type { SessionInfo, SlashCommand, Snippet } from '../types';
-import { fuzzyScore, isMobile } from '../util';
+import { fuzzyScore, isMobile, toB64 as toB64Str } from '../util';
+import {
+  ADD_CONTEXT_REF,
+  formatLineRange,
+  nextContextRefId,
+  parseContextMessage,
+  sameContextRef,
+  serializeContextMessage,
+  type ContextRef,
+  type ContextRefInput,
+} from '../contextRefs';
+import { ContextRefBar } from './ContextRefBar';
 
 import { openImage } from './Lightbox';
 import { imageMenu } from './ImageMenu';
@@ -194,6 +205,7 @@ export function Composer({
   /** Send was pressed during upload: send automatically once uploads finish */
   const [waitSend, setWaitSend] = useState(false);
   const [imgs, setImgs] = useState<Attached[]>([]);
+  const [refs, setRefs] = useState<ContextRef[]>([]);
   const [drag, setDrag] = useState(false);
   const [permOpen, setPermOpen] = useState(false);
   const [caret, setCaret] = useState(0);
@@ -243,15 +255,30 @@ export function Composer({
     }
   };
 
-  // Drafts are saved per session
+  // Drafts and referenced snippets are saved per session
   const draftKey = `draft-${key}`;
+  const refsKey = `draft-refs-${key}`;
+  const setRefsOf = (k: string, list: ContextRef[]) => {
+    try {
+      if (list.length) sessionStorage.setItem(`draft-refs-${k}`, JSON.stringify(list));
+      else sessionStorage.removeItem(`draft-refs-${k}`);
+    } catch {
+      /* ignore */
+    }
+  };
   useEffect(() => {
     try {
       setText(sessionStorage.getItem(draftKey) ?? '');
     } catch {
       setText('');
     }
-  }, [draftKey]);
+    try {
+      const raw = sessionStorage.getItem(refsKey);
+      setRefs(raw ? (JSON.parse(raw) as ContextRef[]) : []);
+    } catch {
+      setRefs([]);
+    }
+  }, [draftKey, refsKey]);
   // Right after switching sessions, text still belongs to the previous session and mustn't be saved under the new one; save from the render that loaded the new draft
   const savedFor = useRef(draftKey);
   useEffect(() => {
@@ -262,6 +289,15 @@ export function Composer({
     setDraftOf(key, text);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [text, draftKey]);
+  const savedRefsFor = useRef(refsKey);
+  useEffect(() => {
+    if (savedRefsFor.current !== refsKey) {
+      savedRefsFor.current = refsKey;
+      return;
+    }
+    setRefsOf(key, refs);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [refs, refsKey]);
 
   // "Add to chat" from the workspace files: append @path to the end of the draft
   useEffect(() => {
@@ -279,6 +315,18 @@ export function Composer({
     };
     window.addEventListener(INSERT_COMPOSER, onInsert);
     return () => window.removeEventListener(INSERT_COMPOSER, onInsert);
+  }, [info.id]);
+
+  // Code / diff snippet referenced from the file panel: add as a compact pill above the input box
+  useEffect(() => {
+    const onAddRef = (e: Event) => {
+      const d = (e as CustomEvent<{ sessionId: string; ref: ContextRefInput }>).detail;
+      if (d.sessionId !== info.id) return;
+      setRefs((cur) => (cur.some((x) => sameContextRef(x, d.ref)) ? cur : [...cur, { ...d.ref, id: nextContextRefId() }]));
+      requestAnimationFrame(() => ta.current?.focus());
+    };
+    window.addEventListener(ADD_CONTEXT_REF, onAddRef);
+    return () => window.removeEventListener(ADD_CONTEXT_REF, onAddRef);
   }, [info.id]);
 
   // ---------- / and @ popup menus ----------
@@ -514,6 +562,15 @@ export function Composer({
     });
   };
 
+  const restoreMessageToComposer = (rawText: string) => {
+    const parsed = parseContextMessage(rawText);
+    if (parsed.refs.length) {
+      setRefs((cur) => [...cur, ...parsed.refs.filter((r) => !cur.some((x) => sameContextRef(x, r)))]);
+    }
+    if (parsed.text) setText((cur) => (cur.trim() ? `${cur}\n${parsed.text}` : parsed.text));
+    ta.current?.focus();
+  };
+
   const send = async () => {
     // Files still uploading: spin for now; once done (and the references are in the input box) the effect below calls send again
     if (pendingUploads.current.size) {
@@ -521,9 +578,10 @@ export function Composer({
       return;
     }
     const t = text.trim();
-    if ((!t && imgs.length === 0) || sending) return;
+    const curRefs = refs;
+    if ((!t && imgs.length === 0 && curRefs.length === 0) || sending) return;
     // Typing /clear and pressing Enter (without picking from the menu) also uses Yi Console's clear, not sent to the tool
-    if (t === '/clear' && imgs.length === 0 && info.mode !== 'terminal') {
+    if (t === '/clear' && imgs.length === 0 && curRefs.length === 0 && info.mode !== 'terminal') {
       setText('');
       clearSession(hostId, info);
       return;
@@ -531,9 +589,25 @@ export function Composer({
     const from = key;
     setSendingKey(from);
     try {
+      let payload = t;
+      if (curRefs.length > 0) {
+        if (info.mode === 'terminal') {
+          // Terminal PTY has no chat UI to collapse <yi-context>: save snippets as files and pass @path references
+          const atRefs: string[] = [];
+          for (const r of curRefs) {
+            const ext = r.kind === 'diff' ? 'diff' : 'txt';
+            const name = `${baseName(r.path)}.L${formatLineRange(r.fromLine, r.toLine)}.${ext}`;
+            const up = await rpc<{ path: string }>(hostId, 'session.attachFile', { sessionId: info.id, name, data: toB64Str(r.content) });
+            atRefs.push(refOf(up.path));
+          }
+          payload = `${t ? t + ' ' : ''}${atRefs.join('')}`.trim();
+        } else {
+          payload = serializeContextMessage(t, curRefs);
+        }
+      }
       await rpc(hostId, 'session.send', {
         sessionId: info.id,
-        text: t,
+        text: payload,
         images: imgs.map((i) => ({ mimeType: i.mimeType, data: i.data })),
         // Turn still running: Claude and Codex read it at their next step; other tools queue it until the turn ends
         queue: true,
@@ -543,8 +617,10 @@ export function Composer({
       if (keyRef.current === from) {
         setText((cur) => (cur.trim() === t ? '' : cur));
         setImgs([]);
+        setRefs([]);
       }
       if (draftOf(from).trim() === t) setDraftOf(from, '');
+      setRefsOf(from, []);
     } catch (e) {
       errorToast(e);
     } finally {
@@ -568,8 +644,7 @@ export function Composer({
   const recallQueued = async (id: string) => {
     try {
       const r = await rpc<{ text: string }>(hostId, 'session.queue', { sessionId: info.id, id, action: 'remove' });
-      setText((t) => (t.trim() ? `${t}\n${r.text}` : r.text));
-      ta.current?.focus();
+      restoreMessageToComposer(r.text);
     } catch (e) {
       errorToast(e);
     }
@@ -636,18 +711,14 @@ export function Composer({
     setMobH(Math.min(Math.max(28, need), max));
   }, [text]);
   const syncCaret = () => setCaret(ta.current?.selectionStart ?? 0);
-  const hasText = !!text.trim() || imgs.length > 0;
+  const hasText = !!text.trim() || imgs.length > 0 || refs.length > 0;
 
   return (
     <>
       <QueueList
         hostId={hostId}
         info={info}
-        onRecall={(r) => {
-          // Recalled messages go back into the input box so they can be edited and resent
-          setText((t) => (t.trim() ? `${t}\n${r}` : r));
-          ta.current?.focus();
-        }}
+        onRecall={restoreMessageToComposer}
       />
       <div
         className={`composer ${drag ? 'drag' : ''}`}
@@ -719,6 +790,13 @@ export function Composer({
             ))}
           </div>
         )}
+        <ContextRefBar
+          refs={refs}
+          hostId={hostId}
+          sessionId={info.id}
+          cwd={info.cwd}
+          onRemove={(id) => setRefs((l) => l.filter((x) => x.id !== id))}
+        />
         <div className="composer-row">
           <textarea
             ref={ta}

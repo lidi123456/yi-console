@@ -1,6 +1,8 @@
 import { ChatMarkdown } from './ChatMarkdown';
 import { createContext, memo, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { ENGINE_ORIGIN, EngineNote } from './EngineNote';
+import { ContextRefBar } from './ContextRefBar';
+import { parseContextMessage } from '../contextRefs';
 import { type ImgCtx } from '../chatImages';
 import { getT, isEn, trErr, useLang } from '../i18n';
 import { rpc } from '../transport';
@@ -1582,13 +1584,15 @@ export function ChatView({
             case 'tool':
             case 'thinking':
               return runItem(it);
-            case 'user':
+            case 'user': {
               if (it.origin === ENGINE_ORIGIN)
                 return (
                   <div key={it.key} data-key={it.key} className="msg-engine">
                     <EngineNote text={it.text} />
                   </div>
                 );
+              const parsed = parseContextMessage(it.text);
+              const shownText = parsed.text;
               return (
                 <div key={it.key} data-key={it.key} className="msg-user">
                   {it.images.length > 0 && hostId && info && (
@@ -1598,15 +1602,18 @@ export function ChatView({
                       ))}
                     </div>
                   )}
-                  {it.text.trim() && <div className="bubble">{it.text}</div>}
+                  {parsed.refs.length > 0 && (
+                    <ContextRefBar refs={parsed.refs} hostId={hostId} sessionId={info?.id} cwd={info?.cwd} className="msg-refs" />
+                  )}
+                  {shownText.trim() && <div className="bubble">{shownText}</div>}
                   {modern ? (
                     <div className="msg-user-actions">
                       <span className="msg-time">{fullTime(it.ts)}</span>
-                      {it.text.trim() && (
+                      {shownText.trim() && (
                         <button
                           className="m-act-btn"
                           title={t('copyMessage')}
-                          onClick={async () => toast((await writeClipboard(it.text)) ? t('copied') : t('copyFailed'))}
+                          onClick={async () => toast((await writeClipboard(shownText)) ? t('copied') : t('copyFailed'))}
                         >
                           <Icon name="copy" size={13} />
                         </button>
@@ -1617,6 +1624,7 @@ export function ChatView({
                   )}
                 </div>
               );
+            }
             case 'text':
               return (
                 <div key={it.key} data-key={it.key} className="tl tl-text msg-assistant">

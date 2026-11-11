@@ -77,5 +77,6 @@
   "tookOverFrom": "从 {{tool}} 的会话接手",
   "openNewSession": "打开新会话",
   "openOriginalSession": "打开原会话",
-  "turnCutOffByRestart": "后台服务重启，这一轮回复被打断"
+  "turnCutOffByRestart": "后台服务重启，这一轮回复被打断",
+  "pathClickToOpen": "{{v}}（点击在右侧打开）"
 }

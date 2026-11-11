@@ -1,5 +1,6 @@
 import DOMPurify from 'dompurify';
 import { Marked, marked, type MarkedExtension, type Tokens } from 'marked';
+import { formatLineRange, parseContextMessage } from './contextRefs';
 import { getT, isEn } from './i18n';
 import type { HubEvent, SessionInfo, SessionStatus, Usage } from './types';
 
@@ -33,7 +34,8 @@ function hostPath(h: string): string | null {
   if (/^file:/i.test(p)) {
     // file:///C:/a.png -> C:/a.png (leading slash dropped below), file:///home/a.png -> /home/a.png
     p = p.replace(/^file:(\/\/[^/]*)?/i, '');
-  } else if (/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(p) && !/^[a-zA-Z]:[\\/]/.test(p)) {
+  } else if (/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(p) && !/^[a-zA-Z]:[\\/]/.test(p) && !/^[^\\/:]*\.[^\\/:]+:\d+(:\d+)?(#.*)?$/.test(p)) {
+    // A scheme (javascript:, mailto:); a bare file name with a line (sandbox.rs:4) only looks like one
     return null;
   }
   // Codex on Windows writes /D:/repo/a.rs (URL style); the host wants D:/repo/a.rs
@@ -66,6 +68,25 @@ export function parseFileHref(href: string): { path: string; line?: number } | n
   return { path: p, line: line && line > 0 ? line : undefined };
 }
 
+/** Inline code in a reply that may be a path on the host (`src/main.py:331`, `AGENTS.md`, `src/callbacks/*`), as agents
+ *  like Qoder and Claude Code cite files without links. Only the shape is checked here: no spaces or code punctuation,
+ *  and a separator or a file extension. chatFiles.ts then checks the file exists before making it clickable */
+export function pathCandidate(text: string): { path: string; line?: number } | null {
+  let t = text.trim();
+  if (t.length < 3 || t.length > 300 || /[\s()<>{}[\]"'`=,;|$!^]/.test(t)) return null;
+  if (/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(t) || t.startsWith('//') || t.startsWith('#')) return null;
+  // src/callbacks/* or ** : the folder
+  t = t.replace(/[\\/]\*\*?$/, '/');
+  if (/[*?]/.test(t)) return null;
+  const f = parseFileHref(t);
+  if (!f) return null;
+  // A separator inside the path (a slash only at the end, as in `docs/`, is too vague), or a file extension
+  const hasSep = /[\\/]/.test(f.path.replace(/[\\/]$/, ''));
+  const hasExt = /\.[a-zA-Z][a-zA-Z0-9]{0,7}$/.test(f.path);
+  if (!hasSep && !hasExt) return null;
+  return f;
+}
+
 /** For chat replies only: images aren't loaded by the browser right away but rendered as placeholder spans; ChatView decides per host and source whether to show them directly or on click */
 const chatOptions: MarkedExtension = {
   gfm: true,
@@ -79,6 +100,13 @@ const chatOptions: MarkedExtension = {
       const where = f.line ? `${f.path}:${f.line}` : f.path;
       const line = f.line ? ` data-line="${f.line}"` : '';
       return `<a class="md-file" role="link" tabindex="0" data-path="${escAttr(f.path)}"${line} title="${escAttr(title || where)}"><span class="md-file-icon"></span>${label}</a>`;
+    },
+    // Path-like inline code keeps the code look; chatFiles.ts turns it into a link once the file is known to exist
+    codespan({ text }: Tokens.Codespan) {
+      const f = pathCandidate(text);
+      if (!f) return false;
+      const line = f.line ? ` data-line="${f.line}"` : '';
+      return `<code class="md-pathcand" data-path="${escAttr(f.path)}"${line}>${escAttr(text)}</code>`;
     },
     image({ href, text, title }: Tokens.Image) {
       const c = classifyImageSrc(href ?? '');
@@ -287,7 +315,16 @@ export function sessionMarkdown(info: SessionInfo, events: HubEvent[], toolLabel
   const tools = new Set<string>();
   for (const e of events) {
     if (e.kind === 'user_message') {
-      out.push('---', '', `### 🧑 ${tx('user')} · ${fullTime(e.ts)}`, '', e.text, '');
+      const parsed = parseContextMessage(e.text);
+      out.push('---', '', `### 🧑 ${tx('user')} · ${fullTime(e.ts)}`, '');
+      if (parsed.refs.length) {
+        const chips = parsed.refs.map((r) => {
+          const stat = r.kind === 'diff' && (r.added || r.deleted) ? ` (${[r.added ? `+${r.added}` : '', r.deleted ? `−${r.deleted}` : ''].filter(Boolean).join(' ')})` : '';
+          return `\`${r.path}:${formatLineRange(r.fromLine, r.toLine)}\`${stat}`;
+        });
+        out.push(`> 📎 ${chips.join(' · ')}`, '');
+      }
+      if (parsed.text) out.push(parsed.text, '');
       if (e.images?.length) out.push(isEn() ? `*(${e.images.length} image(s) attached)*` : `*（附 ${e.images.length} 张图片）*`, '');
       lastRole = 'user';
     } else if (e.kind === 'assistant_text') {

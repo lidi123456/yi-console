@@ -77,5 +77,6 @@
   "tookOverFrom": "Took over from a {{tool}} session",
   "openNewSession": "Open new session",
   "openOriginalSession": "Open original session",
-  "turnCutOffByRestart": "The background service restarted; this turn was cut off"
+  "turnCutOffByRestart": "The background service restarted; this turn was cut off",
+  "pathClickToOpen": "{{v}} (click to open)"
 }

@@ -72,5 +72,15 @@
   "askTheToolToFinish": "Ask the tool to check where things are and finish the interrupted task",
   "askTheToolToFinishThenQueue": "Ask the tool to finish the interrupted task first; the queued messages follow in order",
   "continueTurn": "Continue",
-  "dismiss": "Dismiss"
+  "dismiss": "Dismiss",
+  "openInFilePanel": "Open in file panel",
+  "copyReferencedSnippet": "Copy referenced snippet",
+  "copyPathWithLine": "Copy path with line number",
+  "snippetCopied": "Snippet copied",
+  "pathCopied": "Path copied",
+  "copyFailed": "Copy failed",
+  "contextRefCount_one": "{{count}} ref",
+  "contextRefCount_other": "{{count}} refs",
+  "clickToOpenContextRefHint": "Click to open, right-click to copy",
+  "moreLines": "{{n}} more lines"
 }

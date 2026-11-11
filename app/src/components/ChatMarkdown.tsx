@@ -1,7 +1,7 @@
 import { memo, useMemo, useRef, useLayoutEffect } from 'react';
 import { createPortal } from 'react-dom';
 import { hydrateImages, type ImgCtx } from '../chatImages';
-import { hydrateFileLinks, openFileLink } from '../chatFiles';
+import { hydrateFileLinks, hydratePaths, openFileLink } from '../chatFiles';
 import { renderDiagramMarkdown } from '../util';
 import { MermaidBlock } from './MermaidBlock';
 
@@ -32,6 +32,7 @@ export const ChatMarkdown = memo(function ChatMarkdown({
     previous.current = targets;
     hydrateImages(root, ctx);
     hydrateFileLinks(root, ctx);
+    hydratePaths(root, ctx);
   }, [model, targets, ctx]);
   return (
     <>

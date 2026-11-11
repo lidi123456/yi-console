@@ -158,5 +158,17 @@
   "showUnchangedRegions": "显示未更改的区域",
   "collapseUnchangedRegions": "折叠未更改的区域",
   "saveAs": "另存为",
-  "pathRelativeToOrAbsolute": "相对于 {{v}} 的路径，也可以填绝对路径"
+  "pathRelativeToOrAbsolute": "相对于 {{v}} 的路径，也可以填绝对路径",
+  "cut": "剪切",
+  "paste": "粘贴",
+  "selectAll": "全选",
+  "find": "查找",
+  "addSelectionToChat": "将选中内容添加到对话",
+  "copyPathWithLine": "复制路径和行号",
+  "foldAll": "全部折叠",
+  "unfoldAll": "全部展开",
+  "addDiffHunkToChat": "将这一处改动添加到对话",
+  "copyDiffHunk": "复制这一处 diff",
+  "diffCopied": "已复制 diff 片段",
+  "folderIsOutsideTheWorkspace": "这个文件夹不在当前工作目录里：{{v}}"
 }

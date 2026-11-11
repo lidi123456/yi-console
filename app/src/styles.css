@@ -37,11 +37,11 @@
   --add-fg: #116329;
   --del-bg: #ffebe9;
   --del-fg: #a40e26;
-  /* Full-file diff: VS Code's diffEditor.* defaults (light) */
-  --df-add-line: rgba(155, 185, 85, 0.2);
-  --df-del-line: rgba(255, 0, 0, 0.2);
-  --df-add-text: rgba(156, 204, 44, 0.25);
-  --df-del-text: rgba(255, 0, 0, 0.2);
+  /* Full-file diff: crisp green/red line and token highlights (light) */
+  --df-add-line: rgba(46, 160, 67, 0.14);
+  --df-del-line: rgba(248, 81, 73, 0.13);
+  --df-add-text: rgba(46, 160, 67, 0.3);
+  --df-del-text: rgba(248, 81, 73, 0.28);
   --df-add-mark: #2ea043;
   --df-del-mark: #e5534b;
   --df-diag: rgba(34, 34, 34, 0.2);
@@ -113,11 +113,11 @@
     --add-fg: #7ee2a0;
     --del-bg: #3b1f1e;
     --del-fg: #f48771;
-    /* Full-file diff: VS Code's diffEditor.* defaults (dark) */
-    --df-add-line: rgba(155, 185, 85, 0.2);
-    --df-del-line: rgba(255, 0, 0, 0.2);
-    --df-add-text: rgba(156, 204, 44, 0.2);
-    --df-del-text: rgba(255, 0, 0, 0.2);
+    /* Full-file diff: crisp green/red line and token highlights (dark) */
+    --df-add-line: rgba(46, 160, 67, 0.18);
+    --df-del-line: rgba(248, 81, 73, 0.18);
+    --df-add-text: rgba(63, 185, 80, 0.34);
+    --df-del-text: rgba(248, 81, 73, 0.34);
     --df-add-mark: #3fb950;
     --df-del-mark: #f85149;
     --df-diag: rgba(204, 204, 204, 0.2);
@@ -169,11 +169,11 @@
   --add-fg: #7ee2a0;
   --del-bg: #3b1f1e;
   --del-fg: #f48771;
-  /* Full-file diff: VS Code's diffEditor.* defaults (dark) */
-  --df-add-line: rgba(155, 185, 85, 0.2);
-  --df-del-line: rgba(255, 0, 0, 0.2);
-  --df-add-text: rgba(156, 204, 44, 0.2);
-  --df-del-text: rgba(255, 0, 0, 0.2);
+  /* Full-file diff: crisp green/red line and token highlights (dark) */
+  --df-add-line: rgba(46, 160, 67, 0.18);
+  --df-del-line: rgba(248, 81, 73, 0.18);
+  --df-add-text: rgba(63, 185, 80, 0.34);
+  --df-del-text: rgba(248, 81, 73, 0.34);
   --df-add-mark: #3fb950;
   --df-del-mark: #f85149;
   --df-diag: rgba(204, 204, 204, 0.2);
@@ -2234,6 +2234,171 @@ textarea {
   margin-bottom: 6px;
 }
 
+/* Referenced code / diff context pills in the composer and above user chat bubbles */
+.cref-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.composer > .cref-row {
+  margin-bottom: 6px;
+}
+.msg-refs {
+  justify-content: flex-end;
+  margin-bottom: 6px;
+}
+.cref-chip {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: min(100%, 320px);
+  height: 22px;
+  padding: 0 6px;
+  border-radius: 5px;
+  background: var(--bg-3);
+  border: 1px solid transparent;
+  font-size: 12px;
+  line-height: 1;
+  color: var(--text);
+  user-select: none;
+}
+.cref-chip.clickable {
+  cursor: pointer;
+}
+.cref-chip.clickable:hover {
+  border-color: var(--border-2);
+}
+.cref-chip:focus-visible {
+  outline: 2px solid var(--link);
+  outline-offset: 1px;
+}
+.cref-name {
+  min-width: 0;
+}
+/* Line range after the name, muted, like Cursor's "file.rs (10-11)" */
+.cref-lines,
+.cref-hash {
+  flex: none;
+  color: var(--text-3);
+  font-size: 11px;
+}
+.cref-lines::before {
+  content: '(';
+}
+.cref-lines::after {
+  content: ')';
+}
+.cref-stat {
+  display: inline-flex;
+  flex: none;
+  gap: 3px;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+.cref-stat .add {
+  color: var(--add-fg);
+}
+.cref-stat .del {
+  color: var(--del-fg);
+}
+/* The remove button only takes room on hover / focus; always shown where there's no hover (touch) */
+.cref-x {
+  display: none;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  width: 14px;
+  height: 14px;
+  margin-right: -2px;
+  border-radius: 3px;
+  color: var(--text-3);
+}
+.cref-chip:hover .cref-x,
+.cref-chip:focus-within .cref-x {
+  display: inline-flex;
+}
+@media (hover: none) {
+  .cref-x {
+    display: inline-flex;
+  }
+}
+.cref-x:hover {
+  background: var(--bg-2);
+  color: var(--text);
+}
+/* Hover preview of the referenced code */
+.cref-pop {
+  position: absolute;
+  left: 0;
+  bottom: calc(100% + 6px);
+  z-index: 30;
+  width: max-content;
+  min-width: 260px;
+  max-width: min(520px, 80vw);
+  padding: 8px 0 6px;
+  border-radius: 8px;
+  background: var(--bg);
+  box-shadow: var(--shadow);
+  color: var(--text);
+  visibility: hidden;
+  opacity: 0;
+  transition: opacity 0.12s;
+  pointer-events: none;
+  cursor: default;
+}
+.cref-chip:hover .cref-pop {
+  visibility: visible;
+  opacity: 1;
+  transition-delay: 0.35s;
+}
+@media (hover: none) {
+  .cref-pop {
+    display: none;
+  }
+}
+.msg-refs .cref-pop {
+  left: auto;
+  right: 0;
+}
+.cref-pop-loc {
+  padding: 0 10px 6px;
+  font-size: 11px;
+  color: var(--text-2);
+  border-bottom: 1px solid var(--border);
+}
+.cref-pop-code {
+  margin: 0;
+  padding: 6px 0;
+  max-height: 240px;
+  overflow: hidden;
+  font-family: var(--font-editor);
+  font-size: 11.5px;
+  line-height: 1.5;
+  white-space: pre;
+}
+.cref-pop-code > div {
+  padding: 0 10px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.cref-pop-code .add {
+  background: var(--df-add-line);
+}
+.cref-pop-code .del {
+  background: var(--df-del-line);
+}
+.cref-pop-code .more {
+  color: var(--text-3);
+  font-family: var(--font);
+}
+.cref-pop-hint {
+  padding: 6px 10px 0;
+  border-top: 1px solid var(--border);
+  font-size: 11px;
+  color: var(--text-3);
+}
+
 .msg-img {
   display: block;
   width: 160px;
@@ -3891,6 +4056,24 @@ button.msg-img {
   cursor: zoom-in;
 }
 
+/* Path-like inline code that exists on the host (chatFiles.ts hydratePaths): keeps the code look, a link on hover */
+.md code.md-path {
+  cursor: pointer;
+  text-decoration: underline dotted transparent;
+  text-underline-offset: 3px;
+  transition: text-decoration-color 0.12s;
+}
+.md code.md-path:hover,
+.chat.modern .msg-assistant .md :not(pre) > code.md-path:hover {
+  color: var(--link);
+  text-decoration-color: currentColor;
+  text-decoration-style: solid;
+}
+.md code.md-path:focus-visible {
+  outline: 2px solid var(--link);
+  outline-offset: 1px;
+}
+
 /* File links in replies (chatFiles.ts): a chip that opens the file in the session's file panel */
 .md a.md-file {
   display: inline-flex;
@@ -4775,6 +4958,14 @@ button.wp-crumb:hover {
   flex: 1;
   min-width: 0;
   min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.wp-code-wrap {
+  flex: 1;
+  min-height: 0;
+  position: relative;
   display: flex;
   flex-direction: column;
 }
@@ -7212,6 +7403,108 @@ body.resizing .wp-merge-sash {
 }
 .wp-merge-split .cm-mergeViewEditor + .cm-mergeViewEditor {
   border-left: 1px solid var(--border);
+}
+.wp-merge .cm-merge-b .cm-changedLineGutter::after {
+  content: '+';
+  display: block;
+  font-weight: 600;
+}
+.wp-merge .cm-merge-a .cm-changedLineGutter::after,
+.wp-merge .cm-deletedLineGutter::after {
+  content: '−';
+  display: block;
+  font-weight: 600;
+}
+.wp-merge-all-del .cm-line {
+  background-color: var(--df-del-line);
+}
+.wp-merge-all-del .cm-all-del-gutter .cm-gutterElement {
+  border-left: 3px solid var(--df-del-mark);
+  color: var(--del-fg);
+  font-size: 11px;
+  font-weight: 600;
+  text-align: center;
+}
+
+/* Floating action bars on diff hunks and editor text selections */
+.wp-hunk-bar {
+  position: absolute;
+  right: 14px;
+  z-index: 6;
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px;
+  border-radius: 7px;
+  background: var(--panel);
+  border: 1px solid var(--border-2);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.14);
+}
+.wp-hunk-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 22px;
+  padding: 0 7px;
+  border-radius: 5px;
+  font-family: var(--font);
+  font-size: 11.5px;
+  color: var(--text-2);
+  white-space: nowrap;
+}
+.wp-hunk-btn.primary {
+  color: var(--text);
+  font-weight: 500;
+}
+.wp-hunk-btn:hover {
+  background: var(--bg-3);
+  color: var(--text);
+}
+.cm-sel-act {
+  position: absolute;
+  z-index: 7;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 26px;
+  padding: 0 8px;
+  border-radius: 7px;
+  background: var(--panel);
+  border: 1px solid var(--border-2);
+  box-shadow: 0 3px 10px rgba(0, 0, 0, 0.16);
+  font-family: var(--font);
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text);
+  white-space: nowrap;
+}
+.cm-sel-act:hover {
+  background: var(--bg-3);
+}
+.cm-sel-act kbd {
+  padding: 1px 4px;
+  border-radius: 4px;
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  font-family: var(--font);
+  font-size: 10.5px;
+  font-weight: 400;
+  color: var(--text-3);
+}
+.pd-hunk {
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.pd-hunk-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.pd-hunk-acts {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  flex: none;
 }
 .pd {
   font-family: var(--font-editor);
