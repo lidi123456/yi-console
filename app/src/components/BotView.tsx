@@ -374,13 +374,16 @@ export function BotView({ botId }: { botId: string }) {
               {[
                 permLabel(c.task.permissionMode),
                 c.task.worktree ? t('worktreeOn') : t('noWorktree'),
+                c.task.computerUse ? t('computerUseOnDemand') : null,
                 t('limitsLine', {
                   n: c.task.maxConcurrent,
                   timeout: c.task.timeoutMinutes ? t('minutes', { n: c.task.timeoutMinutes }) : t('never'),
                   perDay: c.budget.tasksPerDay || t('unlimited'),
                 }),
                 (c.task.keepDays ?? 7) > 0 ? t('keepDays', { n: c.task.keepDays ?? 7 }) : t('keepForever'),
-              ].join(' · ')}
+              ]
+                .filter(Boolean)
+                .join(' · ')}
             </div>
           </Row>
         </dl>

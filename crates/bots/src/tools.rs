@@ -37,6 +37,7 @@ pub fn bot_tools() -> Vec<Value> {
                 "tool": {"type": "string", "description": "Task tool, one of those listed under Environment; omit for the default"},
                 "model": {"type": "string"},
                 "worktree": {"type": "boolean", "description": "false to work directly in the workspace directory"},
+                "computer_use": {"type": "boolean", "description": "true to let this task operate the host's desktop GUI (only when task.computerUse is enabled under Environment and the request genuinely needs GUI apps)"},
             }),
             &["title"],
         ),
@@ -120,7 +121,7 @@ pub fn bot_tools() -> Vec<Value> {
             "Change your configuration when the owner asks for it in this session. `changes` is a JSON merge patch over \
              get_config: objects merge, anything else (arrays included) replaces, so pass arrays in full. Instruction \
              changes are saved as a prompt revision the owner can restore and apply from your next turn. Changing accept \
-             to auto, the allow list or a permission mode waits for the owner to confirm in the app.",
+             to auto, the allow list, a permission mode or enabling computer use waits for the owner to confirm in the app.",
             json!({
                 "changes": {"type": "object", "description": "Fields to change, shaped like get_config"},
                 "instances": new_instances(),
@@ -257,6 +258,7 @@ pub fn draft() -> Value {
                     "effort": s("Reasoning effort for the default tool"),
                     "permissionMode": {"type": "string", "description": "Default bypass (tasks run unattended)"},
                     "worktree": {"type": "boolean", "description": "One git worktree per task (default true)"},
+                    "computerUse": {"type": "boolean", "description": "Allow tasks to operate the host's desktop GUI on demand (`spawn_task.computer_use`); waits for the owner's confirmation when turned on (default false)"},
                     "maxConcurrent": {"type": "integer", "description": "Tasks running at once (default 3)"},
                     "timeoutMinutes": {"type": "integer", "description": "Per task; 0 means none (default 120)"},
                     "keepDays": {"type": "integer", "description": "Days an ended task keeps its session before it is cleaned up; 0 means forever (default 7)"},
@@ -479,7 +481,7 @@ mod tests {
             "name": "x",
             "workspaces": [{"host": "local", "cwd": "/repo"}],
             "bot": {"host": "local", "tool": "claude", "model": "m", "effort": "high", "permissionMode": "default"},
-            "task": {"tools": ["codex"], "model": "m", "effort": "high"},
+            "task": {"tools": ["codex"], "model": "m", "effort": "high", "computerUse": true},
             "allow": [{"instance": "i", "ids": ["a"]}],
             "mcp": {"bot": ["a"], "task": ["b"]},
             "routines": [{"name": "r", "schedule": "0 9 * * *", "prompt": "p"}],

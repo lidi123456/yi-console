@@ -307,5 +307,9 @@
   "noteBotMessage": "Message from the Bot",
   "noteSentBy": "Sent by the Bot",
   "noteShowRaw": "Original",
-  "noteHideRaw": "Hide original"
+  "noteHideRaw": "Hide original",
+  "changeComputerUse": "allowing tasks to use the desktop",
+  "computerUseOnDemand": "computer use on demand",
+  "continueTask": "Continue",
+  "noteTaskContinued": "You resumed the task"
 }

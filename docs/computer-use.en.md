@@ -30,6 +30,8 @@ The first time you enable computer use, Cua Driver shows its own permission guid
 
 Several sessions can have computer use on at once, as in OpenBot. Their desktop requests run one at a time, but their actions can still interfere, for example one session switching the foreground window while another is typing, so avoid having two AIs drive the desktop at the same time. Access covers the whole desktop, as in OpenBot: enable it only for tasks you trust, and stop the AI's reply whenever you need to take over. The AI is told to make sure you asked for hard-to-undo actions such as sending messages, deleting or paying.
 
+With Bots, you can ask a Bot in its session to allow computer use for its tasks (`task.computerUse`; enabling it waits for your confirmation in the session bar). The Bot's own session stays a router and only passes `computer_use: true` to tasks that actually need GUI apps, running at most one desktop task per host at a time. When the target host's desktop is locked or a task stops at a login, QR code or CAPTCHA, the task waits in "Needs you" until you handle it and click "Continue" in the task bar.
+
 Kiro CLI currently cannot pass MCP images directly to its model. Yi Console supplies the captured image as a session artifact for Kiro’s built-in image reader. If file approval is requested, review and allow only that session screenshot.
 
 ## Stopping and turning off

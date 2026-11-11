@@ -27,6 +27,7 @@ export interface BotConfig {
     effort?: string | null;
     permissionMode: string;
     worktree: boolean;
+    computerUse?: boolean;
     maxConcurrent: number;
     timeoutMinutes: number;
     /** Days an ended task keeps its session; 0: forever */

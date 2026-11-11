@@ -261,6 +261,25 @@ impl Engine {
         })
     }
 
+    #[cfg(test)]
+    fn for_tests(store: Store) -> Arc<Engine> {
+        Arc::new_cyclic(|me| Engine {
+            me: me.clone(),
+            hub: Weak::new(),
+            store,
+            identity: Identity { client_id: "test".into(), kind: "desktop".into(), name: "test".into() },
+            rt: tokio::runtime::Handle::current(),
+            runtimes: vec![],
+            wasm: None,
+            staged: Mutex::new(HashMap::new()),
+            instances: Mutex::new(HashMap::new()),
+            health: Mutex::new(HashMap::new()),
+            bots: Mutex::new(HashMap::new()),
+            catching_up: Mutex::new(HashSet::new()),
+            task_busy: Mutex::new(HashMap::new()),
+        })
+    }
+
     fn arc(&self) -> Arc<Engine> {
         self.me.upgrade().expect("engine alive")
     }
@@ -784,6 +803,7 @@ impl Engine {
                     me.catch_up(&t.id).await;
                 }
             }
+            me.start_queued_for_host("", &host).await;
         });
     }
 
@@ -1272,6 +1292,10 @@ impl Engine {
                     Some(t) => bail!("Tool \"{t}\" is not allowed for tasks; use one of: {}.", allowed.join(", ")),
                     None => c.task.tool.clone(),
                 };
+                let computer_use = a["computer_use"].as_bool().unwrap_or(false);
+                if computer_use && !c.task.computer_use {
+                    bail!("Computer use is not enabled for this Bot's tasks; ask the owner if they want `task.computerUse` turned on.");
+                }
                 // The configured model and effort belong to the default tool
                 let default_tool = tool == c.task.tool;
                 let mut t = TaskRow {
@@ -1291,6 +1315,7 @@ impl Engine {
                         "model": a["model"].as_str().filter(|m| !m.is_empty()).map(str::to_string).or(if default_tool { c.task.model.clone() } else { None }),
                         "effort": if default_tool { c.task.effort.clone() } else { None },
                         "worktree": a["worktree"].as_bool().unwrap_or(c.task.worktree),
+                        "computerUse": computer_use,
                         "note": truncate(&s("note"), 400),
                         "request": s("request"),
                     }),
@@ -1325,6 +1350,10 @@ impl Engine {
                 if t.bot_id != c.id {
                     bail!("任务不存在");
                 }
+                let pending_brief = t.spec["pendingBrief"].as_bool().unwrap_or(false);
+                if !t.manual && !pending_brief && (t.active() || t.state == "ready") && t.session_id.is_some() {
+                    self.check_task_desktop_ready(&t).await?;
+                }
                 e.disposition = "attached".into();
                 e.task_id = Some(t.id.clone());
                 self.store.update_event(&e)?;
@@ -1336,9 +1365,17 @@ impl Engine {
                 if t.manual {
                     return Ok(json!("Recorded. The owner has taken over this task, so nothing was sent to it."));
                 }
-                self.reopen(&mut t)?;
-                if let (true, Some(sid)) = (t.active(), &t.session_id) {
-                    self.rpc(&t.host, "session.send", json!({"sessionId": sid, "text": follow_up(&e), "queue": true, "origin": ENGINE_ORIGIN})).await?;
+                if pending_brief {
+                    // Included in the initial brief once the desktop is unlocked; try waking it now if already unlocked
+                    if self.send_to_task(&mut t, String::new()).await.is_err() {
+                        return Ok(json!("Recorded on the task; it will receive the event once the host's desktop is unlocked."));
+                    }
+                    return Ok(json!("ok"));
+                }
+                if t.active() || t.state == "ready" {
+                    if t.session_id.is_some() {
+                        self.send_to_task(&mut t, follow_up(&e)).await?;
+                    }
                 }
                 Ok(json!("ok"))
             }
@@ -1357,10 +1394,10 @@ impl Engine {
                 if t.manual {
                     bail!("The owner has taken over this task; send nothing until they hand it back.");
                 }
-                self.reopen(&mut t)?;
-                let sid = t.session_id.clone().filter(|_| t.active()).ok_or_else(|| anyhow!("The task has ended."))?;
-                self.rpc(&t.host, "session.send", json!({"sessionId": sid, "text": format!("<bot-message>\n{}\n</bot-message>", s("text")), "queue": true, "origin": ENGINE_ORIGIN}))
-                    .await?;
+                if !(t.active() || t.state == "ready") || t.session_id.is_none() {
+                    bail!("The task has ended.");
+                }
+                self.send_to_task(&mut t, format!("<bot-message>\n{}\n</bot-message>", s("text"))).await?;
                 Ok(json!("ok"))
             }
             "task_status" => Ok(task_view(&self.bot_task(&c.id, &s("task_id"))?)),
@@ -1399,7 +1436,8 @@ impl Engine {
                 t.last_report = Some(json!({"state": result, "summary": s("summary"), "by": "bot", "at": now_ms()}));
                 self.store.save_task(&t)?;
                 self.store.resolve_attention(None, Some(&t.id), now_ms())?;
-                self.start_queued(&c.id).await;
+                self.release_task_desktop(&t).await;
+                self.start_queued_for_host(&c.id, &t.host).await;
                 self.changed();
                 Ok(json!(format!("Closed as {result}.")))
             }
@@ -1740,17 +1778,87 @@ impl Engine {
         })
     }
 
-    /// A ready task that gets more to do goes back to work. Its timeout counts from now, not from its first start.
+    /// A ready or blocked (`needsYou`) task that gets more to do goes back to work; its timeout counts from now.
     fn reopen(&self, t: &mut TaskRow) -> Result<()> {
-        if t.state != "ready" || t.session_id.is_none() {
+        if !matches!(t.state.as_str(), "ready" | "needsYou") || t.session_id.is_none() {
             return Ok(());
         }
         t.state = "working".into();
         t.started_at = Some(now_ms());
+        if t.last_report.as_ref().is_some_and(|r| r["state"] == "blocked") {
+            t.last_report = None;
+        }
         self.store.save_task(t)?;
         self.store.resolve_attention(None, Some(&t.id), now_ms())?;
         self.changed();
         Ok(())
+    }
+
+    /// Another computer-use task currently holding `host`'s desktop (`working` or `needsYou`).
+    fn desktop_holder(&self, host: &str, except_task: Option<&str>) -> Result<Option<TaskRow>> {
+        Ok(self
+            .store
+            .active_tasks()?
+            .into_iter()
+            .find(|x| except_task != Some(x.id.as_str()) && x.host == host && x.state != "queued" && task_uses_computer(x)))
+    }
+
+    /// Make sure `host`'s desktop is unlocked, available and free before sending a turn to a computer-use task.
+    async fn check_task_desktop_ready(&self, t: &TaskRow) -> Result<()> {
+        if !task_uses_computer(t) {
+            return Ok(());
+        }
+        if let Some(other) = self.desktop_holder(&t.host, Some(&t.id))? {
+            bail!("主机上另一个桌面任务「{}」正在运行，请稍后再试", other.title);
+        }
+        let sid = t.session_id.as_deref().ok_or_else(|| anyhow!("任务会话不存在"))?;
+        let cu = self.rpc(&t.host, "computerUse.status", json!({"sessionId": sid})).await?;
+        if cu["supported"] == false {
+            bail!("操作电脑仅支持 Windows x64 和 macOS");
+        }
+        if cu["status"] == "driverMissing" {
+            bail!("远端电脑缺少桌面驱动");
+        }
+        if cu["status"] == "desktopUnavailable" {
+            bail!("桌面不可用，请先在远端电脑上登录并解锁桌面");
+        }
+        if cu["enabled"] != true {
+            let enabled = self.rpc(&t.host, "session.computerUse", json!({"sessionId": sid, "action": "enable"})).await?;
+            if enabled["status"] == "permissionsRequired" {
+                bail!("请先在远端 Mac 的系统设置中为 Cua Driver 开启辅助功能和屏幕录制权限");
+            }
+        } else if cu["status"] == "permissionsRequired" {
+            bail!("请先在远端 Mac 的系统设置中为 Cua Driver 开启辅助功能和屏幕录制权限");
+        }
+        Ok(())
+    }
+
+    /// Send a message to a working, blocked or ready task, enabling desktop access (and sending a held initial brief) first when needed.
+    async fn send_to_task(&self, t: &mut TaskRow, text: String) -> Result<()> {
+        let sid = t.session_id.clone().filter(|_| t.active() || t.state == "ready").ok_or_else(|| anyhow!("任务已结束"))?;
+        self.check_task_desktop_ready(t).await?;
+        let pending_brief = t.spec["pendingBrief"].as_bool().unwrap_or(false);
+        self.reopen(t)?;
+        if pending_brief {
+            t.spec["pendingBrief"] = json!(false);
+            self.store.save_task(t)?;
+            let events: Vec<EventRow> = t.event_ids.iter().filter_map(|id| self.store.event(id).ok()).collect();
+            let initial = brief(t, &events, &|id| self.instance_label(id));
+            self.rpc(&t.host, "session.send", json!({"sessionId": sid, "text": initial, "queue": true})).await?;
+        }
+        if !text.is_empty() {
+            self.rpc(&t.host, "session.send", json!({"sessionId": sid, "text": text, "queue": true, "origin": ENGINE_ORIGIN}))
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn release_task_desktop(&self, t: &TaskRow) {
+        if task_uses_computer(t) && matches!(t.state.as_str(), "done" | "failed" | "stopped") {
+            if let Some(sid) = &t.session_id {
+                let _ = self.rpc(&t.host, "session.computerUse", json!({"sessionId": sid, "action": "stop"})).await;
+            }
+        }
     }
 
     fn bot_task(&self, bot_id: &str, id: &str) -> Result<TaskRow> {
@@ -1802,7 +1910,8 @@ impl Engine {
                 card.push_str("\n</report>");
                 self.push(&t.bot_id, card, state != "progress");
                 if !t.active() {
-                    self.start_queued(&t.bot_id).await;
+                    self.release_task_desktop(&t).await;
+                    self.start_queued_for_host(&t.bot_id, &t.host).await;
                 }
                 Ok(json!("Reported to the Bot."))
             }
@@ -1874,7 +1983,7 @@ impl Engine {
 
     // ---------- task lifecycle ----------
 
-    /// Start a queued task if there is room; returns its state
+    /// Start a queued task if there is room (and the host's desktop is free when it uses computer use); returns its state
     async fn try_start(&self, task_id: &str) -> Result<String> {
         let t = self.store.task(task_id)?;
         if t.state != "queued" {
@@ -1890,8 +1999,11 @@ impl Engine {
         if running >= c.task.max_concurrent {
             return Ok("queued".into());
         }
+        if task_uses_computer(&t) && self.desktop_holder(&t.host, Some(&t.id))?.is_some() {
+            return Ok("queued".into());
+        }
         match self.start_task(&c, t.clone()).await {
-            Ok(()) => Ok("working".into()),
+            Ok(state) => Ok(state),
             Err(e) => {
                 let mut t = self.store.task(task_id)?;
                 t.state = "failed".into();
@@ -1903,7 +2015,7 @@ impl Engine {
         }
     }
 
-    async fn start_task(&self, c: &BotConfig, mut t: TaskRow) -> Result<()> {
+    async fn start_task(&self, c: &BotConfig, mut t: TaskRow) -> Result<String> {
         let mut cwd = t.workspace.clone();
         if t.spec["worktree"].as_bool().unwrap_or(true) {
             let name = t.id.replace('_', "-");
@@ -1916,8 +2028,57 @@ impl Engine {
                 Err(e) => return Err(e),
             }
         }
+        let want_cu = task_uses_computer(&t);
+        if want_cu {
+            let cu = self.rpc(&t.host, "computerUse.status", json!({})).await?;
+            if cu["supported"] == false {
+                bail!("Host {} does not support computer use (Windows x64 and macOS only)", t.host);
+            }
+            if cu["status"] == "driverMissing" {
+                bail!("Desktop driver is missing on host {}", t.host);
+            }
+            if cu["status"] == "desktopUnavailable" {
+                return self.park_desktop_unavailable(c, t, cwd).await;
+            }
+        }
         let events: Vec<EventRow> = t.event_ids.iter().filter_map(|id| self.store.event(id).ok()).collect();
         let brief = brief(&t, &events, &|id| self.instance_label(id));
+        let create = self
+            .rpc(
+                &t.host,
+                "session.create",
+                json!({
+                    "tool": t.spec["tool"],
+                    "cwd": cwd,
+                    "title": t.title,
+                    "model": t.spec["model"],
+                    "effort": t.spec["effort"],
+                    "permissionMode": c.task.permission_mode,
+                    "appendSystemPrompt": prompt::task_prompt(c),
+                    "clientMcp": [tools::client_mcp(TASK_SERVER, &self.identity.client_id)],
+                    "bot": self.link(c, "task", Some(&t.id)),
+                    "computerUse": want_cu,
+                    "prompt": brief,
+                }),
+            )
+            .await;
+        let info = match create {
+            Ok(info) => info,
+            Err(e) if want_cu && format!("{e:#}").contains("桌面不可用") => return self.park_desktop_unavailable(c, t, cwd).await,
+            Err(e) => return Err(e),
+        };
+        t.session_id = info["id"].as_str().map(str::to_string);
+        t.cwd = cwd;
+        t.state = "working".into();
+        t.started_at = Some(now_ms());
+        self.store.save_task(&t)?;
+        self.changed();
+        Ok("working".into())
+    }
+
+    /// The host's desktop is locked or not signed in: create an idle task session without sending the prompt yet and
+    /// wait in `needsYou` until the owner unlocks it and continues.
+    async fn park_desktop_unavailable(&self, c: &BotConfig, mut t: TaskRow, cwd: String) -> Result<String> {
         let info = self
             .rpc(
                 &t.host,
@@ -1932,27 +2093,40 @@ impl Engine {
                     "appendSystemPrompt": prompt::task_prompt(c),
                     "clientMcp": [tools::client_mcp(TASK_SERVER, &self.identity.client_id)],
                     "bot": self.link(c, "task", Some(&t.id)),
-                    "prompt": brief,
                 }),
             )
             .await?;
         t.session_id = info["id"].as_str().map(str::to_string);
         t.cwd = cwd;
-        t.state = "working".into();
+        t.state = "needsYou".into();
         t.started_at = Some(now_ms());
+        t.spec["pendingBrief"] = json!(true);
+        let summary = "The desktop on the host is locked or unavailable.";
+        let question = "Unlock or sign in to the desktop on the host, then continue this task.";
+        t.last_report = Some(json!({"state": "blocked", "summary": summary, "question": question, "at": now_ms()}));
         self.store.save_task(&t)?;
+        self.attention(&t.bot_id, Some(&t.id), &format!("{}: 远端电脑当前锁屏或桌面不可用，请解锁后点继续", t.title), "normal");
+        self.push(
+            &t.bot_id,
+            format!("<report task=\"{}\" title=\"{}\" state=\"blocked\">\n{summary}\nQuestion: {question}\n</report>", t.id, attr(&t.title)),
+            true,
+        );
         self.changed();
-        Ok(())
+        Ok("needsYou".into())
     }
 
     async fn start_queued(&self, bot_id: &str) {
         for t in self.store.active_tasks().unwrap_or_default() {
             if t.bot_id == bot_id && t.state == "queued" {
-                if let Ok(state) = self.try_start(&t.id).await {
-                    if state == "queued" {
-                        break;
-                    }
-                }
+                let _ = self.try_start(&t.id).await;
+            }
+        }
+    }
+
+    async fn start_queued_for_host(&self, bot_id: &str, host: &str) {
+        for t in self.store.active_tasks().unwrap_or_default() {
+            if t.state == "queued" && (t.bot_id == bot_id || (t.host == host && self.store.bot(&t.bot_id).is_ok_and(|b| b.config.enabled))) {
+                let _ = self.try_start(&t.id).await;
             }
         }
     }
@@ -1970,7 +2144,8 @@ impl Engine {
         t.ended_at = Some(now_ms());
         self.store.save_task(&t)?;
         self.store.resolve_attention(None, Some(id), now_ms())?;
-        self.start_queued(&t.bot_id).await;
+        self.release_task_desktop(&t).await;
+        self.start_queued_for_host(&t.bot_id, &t.host).await;
         self.changed();
         Ok(())
     }
@@ -1988,6 +2163,7 @@ impl Engine {
                 t.ended_at = Some(now);
                 t.last_report = Some(json!({"state": "failed", "summary": "Timed out", "at": now}));
                 let _ = self.store.save_task(&t);
+                self.release_task_desktop(&t).await;
                 self.attention(&t.bot_id, Some(&t.id), &format!("{}: timed out", t.title), "normal");
                 self.push(&t.bot_id, format!("<report task=\"{}\" title=\"{}\" state=\"failed\">Timed out after {} minutes.</report>", t.id, attr(&t.title), b.config.task.timeout_minutes), true);
             }
@@ -2359,7 +2535,28 @@ impl Engine {
                 t.ended_at.get_or_insert(now_ms());
                 self.store.save_task(&t)?;
                 self.store.resolve_attention(None, Some(&t.id), now_ms())?;
-                self.start_queued(&t.bot_id).await;
+                self.release_task_desktop(&t).await;
+                self.start_queued_for_host(&t.bot_id, &t.host).await;
+                Value::Null
+            }
+            "tasks.continue" => {
+                let mut t = self.store.task(&s("id")?)?;
+                if t.state != "needsYou" {
+                    bail!("只有等待你处理的任务才能继续");
+                }
+                let pending_brief = t.spec["pendingBrief"].as_bool().unwrap_or(false);
+                t.manual = false;
+                let msg = if pending_brief {
+                    String::new()
+                } else {
+                    "<owner event=\"task-continued\">The owner handled what this task was waiting for and asked you to continue. If you are using desktop tools, read the current window state again before acting.</owner>".to_string()
+                };
+                self.send_to_task(&mut t, msg).await?;
+                self.push(
+                    &t.bot_id,
+                    format!("<owner event=\"task-continued\" summary=\"{}\">The owner handled what task \"{}\" ({}) was waiting for and resumed it.</owner>", attr(&t.title), t.title, t.id),
+                    false,
+                );
                 Value::Null
             }
             "tasks.manual" | "tasks.handBack" => {
@@ -2796,10 +2993,19 @@ fn brief(t: &TaskRow, events: &[EventRow], label: &dyn Fn(&str) -> String) -> St
     s
 }
 
+fn task_uses_computer(t: &TaskRow) -> bool {
+    t.spec["computerUse"].as_bool().unwrap_or(false)
+}
+
+fn host_supports_computer_use(os: Option<&str>, arch: Option<&str>) -> Option<bool> {
+    let (os, arch) = (os?, arch?);
+    Some((os == "windows" && arch == "x86_64") || (os == "macos" && matches!(arch, "x86_64" | "aarch64")))
+}
+
 fn task_view(t: &TaskRow) -> Value {
     json!({
         "taskId": t.id, "title": t.title, "state": t.state, "host": t.host, "sessionId": t.session_id,
-        "cwd": t.cwd, "lastReport": t.last_report, "manual": t.manual, "createdAt": t.created_at,
+        "cwd": t.cwd, "computerUse": task_uses_computer(t), "lastReport": t.last_report, "manual": t.manual, "createdAt": t.created_at,
     })
 }
 
@@ -2929,6 +3135,19 @@ impl Engine {
         }
         if c.workspaces.is_empty() {
             warnings.push("No workspace: this Bot cannot start tasks".into());
+        } else if c.task.computer_use {
+            let support_of = |hid: &str| {
+                hosts.iter().find(|h| h["config"]["id"].as_str() == Some(hid)).and_then(|h| {
+                    host_supports_computer_use(h["status"]["hello"]["os"].as_str(), h["status"]["hello"]["arch"].as_str())
+                })
+            };
+            let known: Vec<(&str, bool)> = c.workspaces.iter().filter_map(|w| support_of(&w.host).map(|ok| (w.host.as_str(), ok))).collect();
+            if !known.is_empty() && known.iter().all(|(_, ok)| !*ok) {
+                errors.push("None of the configured workspaces are on a host that supports computer use (Windows x86_64 or macOS only).".into());
+            } else if known.iter().any(|(_, ok)| !*ok) {
+                let unsupported: Vec<&str> = known.iter().filter(|(_, ok)| !*ok).map(|(h, _)| *h).collect();
+                warnings.push(format!("Workspace host(s) {} do not support computer use; only spawn computer_use tasks in workspaces on Windows x64 or macOS.", unsupported.join(", ")));
+            }
         }
         if c.accept == Accept::Auto {
             warnings.push("accept is auto: tasks start without review; new Bots usually start in observe".into());
@@ -2980,13 +3199,19 @@ impl Engine {
                 .host_entries()
                 .await?
                 .iter()
-                .map(|h| json!({
-                    "id": h["config"]["id"],
-                    "name": h["config"]["name"],
-                    "connected": h["status"]["status"] == "connected",
-                    "home": h["status"]["hello"]["home"],
-                    "os": h["status"]["hello"]["os"],
-                }))
+                .map(|h| {
+                    let os = h["status"]["hello"]["os"].as_str();
+                    let arch = h["status"]["hello"]["arch"].as_str();
+                    json!({
+                        "id": h["config"]["id"],
+                        "name": h["config"]["name"],
+                        "connected": h["status"]["status"] == "connected",
+                        "home": h["status"]["hello"]["home"],
+                        "os": h["status"]["hello"]["os"],
+                        "arch": h["status"]["hello"]["arch"],
+                        "computerUse": host_supports_computer_use(os, arch),
+                    })
+                })
                 .collect::<Vec<_>>())),
             "list_tools" => {
                 let id = s("host")?;
@@ -3176,6 +3401,9 @@ fn sensitive_changes(old: &BotConfig, new: &BotConfig) -> Vec<String> {
     }
     if (old.approval.reply && !new.approval.reply) || (old.approval.write && !new.approval.write) {
         items.push("approval".to_string());
+    }
+    if !old.task.computer_use && new.task.computer_use {
+        items.push("computerUse".to_string());
     }
     items
 }
@@ -3386,6 +3614,58 @@ mod tests {
         old.approval.write = false;
         new.approval.write = true;
         assert!(sensitive_changes(&old, &new).is_empty());
+    }
+
+    #[test]
+    fn enabling_computer_use_needs_confirmation_and_host_support_matches_platforms() {
+        let old: BotConfig = serde_json::from_value(json!({
+            "name": "x", "bot": {"host": "local", "tool": "claude"}
+        }))
+        .unwrap();
+        let mut new = old.clone();
+        new.task.computer_use = true;
+        assert_eq!(sensitive_changes(&old, &new), ["computerUse"]);
+        // Turning it off is never held up
+        assert!(sensitive_changes(&new, &old).is_empty());
+        assert_eq!(host_supports_computer_use(Some("windows"), Some("x86_64")), Some(true));
+        assert_eq!(host_supports_computer_use(Some("windows"), Some("aarch64")), Some(false));
+        assert_eq!(host_supports_computer_use(Some("macos"), Some("aarch64")), Some(true));
+        assert_eq!(host_supports_computer_use(Some("macos"), Some("x86_64")), Some(true));
+        assert_eq!(host_supports_computer_use(Some("linux"), Some("x86_64")), Some(false));
+        assert_eq!(host_supports_computer_use(None, None), None);
+    }
+
+    #[tokio::test]
+    async fn host_desktop_mutex_blocks_concurrent_computer_use_tasks_only() {
+        let dir = std::env::temp_dir().join(format!("yi-bots-cu-{}", short_id("t")));
+        let _ = std::fs::create_dir_all(&dir);
+        let store = Store::open(&dir.join("bots.db")).unwrap();
+        let engine = Engine::for_tests(store);
+        let mk = |id: &str, host: &str, state: &str, cu: bool| TaskRow {
+            id: id.into(),
+            bot_id: "b1".into(),
+            host: host.into(),
+            session_id: Some(format!("s-{id}")),
+            state: state.into(),
+            title: id.into(),
+            spec: json!({"computerUse": cu}),
+            created_at: 1,
+            ..Default::default()
+        };
+        engine.store.save_task(&mk("t1", "win", "needsYou", true)).unwrap();
+        engine.store.save_task(&mk("t2", "win", "working", false)).unwrap();
+        // t1 holds `win`'s desktop even while waiting for a person in needsYou
+        assert_eq!(engine.desktop_holder("win", Some("t3")).unwrap().unwrap().id, "t1");
+        assert!(engine.desktop_holder("win", Some("t1")).unwrap().is_none());
+        assert!(engine.desktop_holder("mac", Some("t3")).unwrap().is_none());
+        // reopen clears blocked state on needsYou tasks too
+        let mut t1 = engine.store.task("t1").unwrap();
+        t1.last_report = Some(json!({"state": "blocked", "question": "unlock"}));
+        engine.store.save_task(&t1).unwrap();
+        engine.reopen(&mut t1).unwrap();
+        assert_eq!(t1.state, "working");
+        assert!(t1.last_report.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

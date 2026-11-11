@@ -307,5 +307,9 @@
   "noteBotMessage": "Bot 发来的消息",
   "noteSentBy": "Bot 自动发送",
   "noteShowRaw": "原文",
-  "noteHideRaw": "收起原文"
+  "noteHideRaw": "收起原文",
+  "changeComputerUse": "允许任务操作电脑",
+  "computerUseOnDemand": "可按需操作电脑",
+  "continueTask": "已处理，继续",
+  "noteTaskContinued": "你让任务继续执行"
 }

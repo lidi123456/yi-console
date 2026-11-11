@@ -172,6 +172,9 @@ export function taskMenu(task: TaskRow, src = ''): (MenuItem | '-')[] {
   return [
     ...(active
       ? [
+          ...(task.state === 'needsYou' && !task.manual && task.lastReport?.state === 'blocked'
+            ? [{ label: t('continueTask'), icon: 'play', run: () => run(botCall('tasks.continue', { id }, src)) }]
+            : []),
           task.manual
             ? { label: t('handBack'), icon: 'bot', run: () => run(botCall('tasks.handBack', { id }, src)) }
             : { label: t('takeOver'), icon: 'edit', run: () => run(botCall('tasks.manual', { id }, src)) },
@@ -385,7 +388,15 @@ function PendingCard({ bot, src }: { bot: BotEntry; src: string }) {
     }
   };
   const items = p.items.map((i) =>
-    i === 'accept' ? t('changeAccept') : i === 'allow' ? t('changeAllow') : i === 'approval' ? t('changeApproval') : t('changePermission'),
+    i === 'accept'
+      ? t('changeAccept')
+      : i === 'allow'
+        ? t('changeAllow')
+        : i === 'approval'
+          ? t('changeApproval')
+          : i === 'computerUse'
+            ? t('changeComputerUse')
+            : t('changePermission'),
   );
   return (
     <div className="bot-approvals">
@@ -640,6 +651,7 @@ export function SessionBotBar({ info }: { info: SessionInfo }) {
   if (link.role === 'task') {
     const task = bot.tasks.find((x) => x.id === link.taskId);
     const active = task ? ACTIVE_TASK.includes(task.state) : false;
+    const waitingExternal = !!task && task.state === 'needsYou' && !task.manual && !info.pending;
     return (
       <div className="bot-bar">
         <Icon name="bot" size={14} />
@@ -647,7 +659,17 @@ export function SessionBotBar({ info }: { info: SessionInfo }) {
           {bot.config.name}
         </button>
         {task && <span className={`pill bot-task-${task.state}`}>{taskStateLabel(task.state)}</span>}
+        {task?.spec.computerUse === true && (
+          <span className="muted small" title={t('computerUseOnDemand')}>
+            <Icon name="laptop" size={13} />
+          </span>
+        )}
         {task?.manual && <span className="muted small">{t('manualHint')}</span>}
+        {waitingExternal && task?.lastReport?.question && (
+          <span className="muted small truncate" title={task.lastReport.question}>
+            {task.lastReport.question}
+          </span>
+        )}
         {task && task.eventIds.length > 0 && (
           <button className="btn small" onClick={(e) => sourceMenu(e.currentTarget, task, src)}>
             {t('sources', { n: task.eventIds.length })}
@@ -659,6 +681,11 @@ export function SessionBotBar({ info }: { info: SessionInfo }) {
           </span>
         )}
         <span className="bot-bar-fill" />
+        {waitingExternal && (
+          <button className="btn small primary" onClick={() => run(botCall('tasks.continue', { id: task.id }, src))}>
+            <Icon name="play" size={12} /> {t('continueTask')}
+          </button>
+        )}
         {task && active && task.manual && (
           <button className="btn small" onClick={() => run(botCall('tasks.handBack', { id: task.id }, src))}>
             {t('handBack')}

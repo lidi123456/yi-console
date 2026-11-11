@@ -301,6 +301,9 @@ pub struct CreateParams {
     /// The Bot this session belongs to
     #[serde(default)]
     pub bot: Option<BotLink>,
+    /// Start with Computer Use enabled right away (AI chat mode on supported hosts only)
+    #[serde(default)]
+    pub computer_use: bool,
 }
 
 impl Hub {
@@ -558,6 +561,13 @@ impl Hub {
             }
             crate::clientmcp::validate(&p.client_mcp, &self.settings.read().unwrap())?;
         }
+        if p.computer_use && (mode != SessionMode::Structured || !crate::mcp::supported(tool)) {
+            bail!("操作电脑仅支持 AI 工具的聊天模式");
+        }
+        let id = uuid::Uuid::new_v4().to_string();
+        if p.computer_use {
+            self.desktop.configure(&id)?;
+        }
         let now = now_ms();
         // Cursor: an old `model[k=v,…]` string is split into the model and its values, so the session (and what it
         // shows) carries only the model; the values chosen on the new session page go on top
@@ -570,7 +580,7 @@ impl Hub {
         }
         let model = p.model.as_deref().map(|m| if cursor { base_model(m) } else { m }).filter(|m| !m.is_empty()).map(str::to_string);
         let info = SessionInfo {
-            id: uuid::Uuid::new_v4().to_string(),
+            id,
             tool,
             mode,
             cwd: cwd.display().to_string(),
@@ -601,7 +611,7 @@ impl Hub {
             synced_users: None,
             auto_resume: None,
             limit_hits: 0,
-            computer_use: false,
+            computer_use: p.computer_use,
             pending: None,
             turn: None,
             bot: p.bot.clone(),
@@ -639,8 +649,24 @@ impl Hub {
         let started = self
             .spec_for(&info, replay, p.cols.unwrap_or(120), p.rows.unwrap_or(32))
             .and_then(|spec| self.launch(&rt, spec));
+        if started.is_err() && p.computer_use {
+            self.revoke_desktop(&info.id);
+        }
         self.broadcast_updated(&self.info(&info.id)?);
         started?;
+        if p.computer_use {
+            self.desktop_event(
+                &info.id,
+                EventBody::ComputerUse {
+                    action_id: uuid::Uuid::new_v4().to_string(),
+                    tool: "enable".into(),
+                    status: "control".into(),
+                    message: String::new(),
+                    duration_ms: 0,
+                    images: vec![],
+                },
+            );
+        }
         let from = p
             .handoff_from
             .filter(|f| *f != info.id)
@@ -3854,6 +3880,25 @@ mod tests {
         let hub = Hub::new(crate::store::Store::open_memory().unwrap(), Default::default());
         assert!(hub.delete("../../victim").is_err());
         assert!(hub.delete("").is_err());
+    }
+
+    #[test]
+    fn create_rejects_computer_use_for_non_chat_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        let hub = Hub::new(crate::store::Store::open_memory().unwrap(), Default::default());
+        let cwd = dir.path().display().to_string();
+        for (tool, mode) in [("shell", None), ("files", None), ("claude", Some(SessionMode::Terminal))] {
+            let err = hub
+                .create(CreateParams {
+                    tool: tool.into(),
+                    cwd: cwd.clone(),
+                    mode,
+                    computer_use: true,
+                    ..Default::default()
+                })
+                .unwrap_err();
+            assert!(err.to_string().contains("操作电脑仅支持 AI 工具的聊天模式"), "{err}");
+        }
     }
 }
 

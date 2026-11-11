@@ -107,6 +107,9 @@ pub struct TaskDefaults {
     /// One git worktree per task (when the workspace is a git repo)
     #[serde(default = "yes")]
     pub worktree: bool,
+    /// Allow tasks to operate the host's desktop GUI when `spawn_task` passes `computer_use: true`
+    #[serde(default)]
+    pub computer_use: bool,
     #[serde(default = "default_max")]
     pub max_concurrent: u32,
     /// 0: no limit
@@ -145,6 +148,7 @@ impl Default for TaskDefaults {
             effort: None,
             permission_mode: default_task_mode(),
             worktree: true,
+            computer_use: false,
             max_concurrent: default_max(),
             timeout_minutes: default_timeout(),
             keep_days: default_keep_days(),
@@ -400,6 +404,7 @@ mod tests {
         assert_eq!(c.ambient, Ambient::Record);
         assert_eq!(c.task.permission_mode, "bypass");
         assert!(c.task.worktree);
+        assert!(!c.task.computer_use);
         assert_eq!(c.notify, ["app"]);
         assert_eq!(c.compact_at, 70);
     }

@@ -138,6 +138,13 @@ const ERR_PATTERNS: [RegExp, string | ((...m: string[]) => string)][] = [
   [/桌面操作已中断，结果待核验，请重新读取窗口/, 'Desktop action interrupted. Read the window to verify its result'],
   [/桌面操作超时，结果待核验，请读取窗口后再继续/, 'Desktop action timed out. Read the window to verify its result before continuing'],
   [/桌面驱动连接已断开，请重新读取窗口/, 'Desktop driver disconnected. Read the window again'],
+  [/主机上另一个桌面任务「(.+)」正在运行，请稍后再试/, (_, title) => `Another desktop task "${title}" is running on that host; try again once it finishes`],
+  [/远端电脑缺少桌面驱动/, 'The remote host does not have the desktop driver'],
+  [/桌面不可用，请先在远端电脑上登录并解锁桌面/, 'Desktop unavailable. Sign in and unlock the desktop on the remote host first'],
+  [/请先在远端 Mac 的系统设置中为 Cua Driver 开启辅助功能和屏幕录制权限/, 'Grant Accessibility and Screen Recording to Cua Driver in System Settings on the remote Mac first'],
+  [/只有等待你处理的任务才能继续/, 'Only a task waiting on you can be continued'],
+  [/任务会话不存在/, 'Task session not found'],
+  [/任务已结束/, 'The task has ended'],
 
   [/^未知方法[:：]\s*(.+)$/, (_, m) => `Unknown method: ${m}`],
   [/未知方法/, 'Unknown method'],

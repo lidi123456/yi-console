@@ -81,6 +81,8 @@ function describe(b: Block): { icon: string; title: string; detail?: string; ton
           return { icon: 'key', title: t('noteSecretFilled', { name: a.name ?? '' }), tone: 'ok' };
         case 'secret-dismissed':
           return { icon: 'key', title: t('noteSecretDismissed') };
+        case 'task-continued':
+          return { icon: 'play', title: t('noteTaskContinued'), detail: a.summary, tone: 'ok' };
         default:
           return { icon: 'bot', title: t('noteOwner') };
       }
