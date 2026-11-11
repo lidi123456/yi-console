@@ -23,6 +23,10 @@
   --shell-muted: rgba(0, 0, 0, 0.45);
   --side-hover: rgba(0, 0, 0, 0.04);
   --side-active: rgba(0, 0, 0, 0.07);
+  --side-search-bg: rgba(0, 0, 0, 0.045);
+  --side-search-border: rgba(0, 0, 0, 0.05);
+  --side-search-focus-bg: rgba(255, 255, 255, 0.42);
+  --side-search-focus-border: rgba(0, 0, 0, 0.14);
   --bubble: #f6f8fa;
   --ok: #1a7f37;
   --warn: #9a6700;
@@ -94,6 +98,10 @@
     --shell-muted: rgba(255, 255, 255, 0.45);
     --side-hover: rgba(255, 255, 255, 0.06);
     --side-active: rgba(255, 255, 255, 0.14);
+    --side-search-bg: rgba(255, 255, 255, 0.06);
+    --side-search-border: rgba(255, 255, 255, 0.06);
+    --side-search-focus-bg: rgba(255, 255, 255, 0.12);
+    --side-search-focus-border: rgba(255, 255, 255, 0.2);
     --bubble: #2a2a2a;
     --panel-shadow: 0 0 0 1px rgba(255, 255, 255, 0.06), 0 2px 12px rgba(0, 0, 0, 0.35);
     --ok: #3fb950;
@@ -146,6 +154,10 @@
   --shell-muted: rgba(255, 255, 255, 0.45);
   --side-hover: rgba(255, 255, 255, 0.06);
   --side-active: rgba(255, 255, 255, 0.14);
+  --side-search-bg: rgba(255, 255, 255, 0.06);
+  --side-search-border: rgba(255, 255, 255, 0.06);
+  --side-search-focus-bg: rgba(255, 255, 255, 0.12);
+  --side-search-focus-border: rgba(255, 255, 255, 0.2);
   --bubble: #2a2a2a;
   --panel-shadow: 0 0 0 1px rgba(255, 255, 255, 0.06), 0 2px 12px rgba(0, 0, 0, 0.35);
   --ok: #3fb950;
@@ -5378,16 +5390,17 @@ body.resizing .side-resizer::after {
 
 .side-search {
   height: var(--side-row-h);
-  margin: 2px 6px 4px;
-  padding: 0 4px 0 8px;
+  margin: 5px 6px 6px;
+  padding: 0 8px;
   border-radius: 7px;
-  background: var(--side-hover);
-  border: 1px solid transparent;
+  background: var(--side-search-bg);
+  border: 1px solid var(--side-search-border);
 }
 
 .side-search:focus-within {
-  background: var(--panel);
-  border-color: var(--border-2);
+  background: var(--side-search-focus-bg);
+  border-color: var(--side-search-focus-border);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
 }
 
 .side-search > svg,
@@ -5397,6 +5410,22 @@ body.resizing .side-resizer::after {
 
 .side-search input {
   font-size: var(--fs-side);
+}
+
+.side-search .icon-btn {
+  width: 22px;
+  height: 22px;
+  margin-right: -3px;
+}
+
+.kbd-btn {
+  border: none;
+  padding: 0 2px;
+  color: var(--shell-muted);
+}
+
+.kbd-btn:hover {
+  color: var(--text);
 }
 
 .search-msgs {
