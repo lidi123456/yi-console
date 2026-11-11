@@ -4,7 +4,7 @@ members = ["crates/proto", "crates/link", "crates/yi-agentd", "crates/relay", "c
 exclude = ["app/src-tauri", "plugins"]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 license = "MIT"
 
