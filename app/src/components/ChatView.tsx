@@ -1219,8 +1219,7 @@ function ActGroup({
   return (
     <div className="act-group">
       <button className="ag-head" onClick={() => setToggled(!open)} aria-expanded={open}>
-        <span className={`ag-box ${tools.length ? 'has-count' : ''} ${open ? 'open' : ''}`}>
-          {tools.length > 0 && <span className="ag-count">{tools.length}</span>}
+        <span className={`ag-box ${open ? 'open' : ''}`}>
           <span className="ag-chev">
             <Icon name="chevron" size={12} />
           </span>

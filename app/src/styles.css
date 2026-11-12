@@ -6244,38 +6244,20 @@ body.resizing .side-resizer::after {
   border-radius: 6px;
   background: var(--bg);
   box-shadow: 0 1px 2px rgba(20, 24, 33, 0.06);
-  font-size: 10px;
   color: var(--text-3);
 }
-.ag-count,
 .ag-chev {
   position: absolute;
   inset: 0;
   display: grid;
   place-items: center;
   line-height: 1;
-  transition: opacity 0.15s;
-}
-.ag-count {
-  font-family: var(--mono);
-  font-variant-numeric: tabular-nums;
 }
 .ag-chev svg {
   transition: transform 0.15s;
 }
 .ag-box.open .ag-chev svg {
   transform: rotate(90deg);
-}
-.ag-box.has-count .ag-chev {
-  opacity: 0;
-}
-.ag-head:hover .ag-box.has-count .ag-count,
-.ag-head:focus-visible .ag-box.has-count .ag-count {
-  opacity: 0;
-}
-.ag-head:hover .ag-box.has-count .ag-chev,
-.ag-head:focus-visible .ag-box.has-count .ag-chev {
-  opacity: 1;
 }
 .ag-sum {
   min-width: 0;
