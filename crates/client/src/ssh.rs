@@ -3,7 +3,7 @@
 use crate::hosts::SshTarget;
 use anyhow::{anyhow, bail, Result};
 use russh::client::{self, Handle};
-use russh::keys::{self, HashAlg, PrivateKeyWithHashAlg, PublicKey};
+use russh::keys::{self, HashAlg, PrivateKeyWithHashAlg};
 use russh::ChannelMsg;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -39,7 +39,9 @@ struct H {
 impl client::Handler for H {
     type Error = russh::Error;
 
-    async fn check_server_key(&mut self, key: &PublicKey) -> Result<bool, Self::Error> {
+    async fn check_server_key(&mut self, key: &keys::PublicKeyOrCertificate) -> Result<bool, Self::Error> {
+        // No certificate algorithms are advertised, so this is always a plain key; known_hosts matching works on the key either way
+        let key = &key.public_key();
         let fp = key.fingerprint(HashAlg::Sha256).to_string();
         // 1) The user's own ~/.ssh/known_hosts (on desktop)
         match keys::check_known_hosts(&self.host, self.port, key) {
@@ -92,6 +94,17 @@ fn config() -> Arc<client::Config> {
         inactivity_timeout: None,
         // Streaming replies are a series of small packets; with Nagle on they'd be held back waiting for the peer's ACK
         nodelay: true,
+        // Session backlogs are JSON that compresses ~5-10x, which matters on slow links (multi-MB subscribes used to time out).
+        // russh's default order puts "none" first, so compression is never negotiated unless we ask for it.
+        // zlib@openssh.com first: OpenSSH's default `Compression yes` only offers the delayed variant
+        preferred: russh::Preferred {
+            compression: std::borrow::Cow::Borrowed(&[
+                russh::compression::ZLIB_LEGACY,
+                russh::compression::ZLIB,
+                russh::compression::NONE,
+            ]),
+            ..Default::default()
+        },
         ..Default::default()
     })
 }
@@ -202,7 +215,8 @@ async fn auth_agent(h: &mut Handle<H>, user: &str) -> Result<bool> {
     };
     let ids = agent.request_identities().await.unwrap_or_default();
     let hash = h.best_supported_rsa_hash().await?.flatten();
-    for key in ids {
+    for id in ids {
+        let key = id.public_key().into_owned();
         if let Ok(r) = h
             .authenticate_publickey_with(user, key, hash, &mut agent)
             .await
@@ -225,7 +239,8 @@ async fn auth_agent(h: &mut Handle<H>, user: &str) -> Result<bool> {
     };
     let ids = agent.request_identities().await.unwrap_or_default();
     let hash = h.best_supported_rsa_hash().await?.flatten();
-    for key in ids {
+    for id in ids {
+        let key = id.public_key().into_owned();
         if let Ok(r) = h
             .authenticate_publickey_with(user, key, hash, &mut agent)
             .await
@@ -440,9 +455,11 @@ PZJFJNZSyPwAeBgCJlULAAAACbLiytRAtefE1AECAwQ=\n\
 
     #[test]
     fn key_with_gbk_comment() {
-        assert!(keys::decode_secret_key(GBK_COMMENT_KEY, None).is_err());
+        // russh >= 0.65 parses this by itself; strip_openssh_comment remains as a fallback for parsers that don't
         let k = decode_key(GBK_COMMENT_KEY, None).unwrap();
         assert_eq!(k.algorithm().to_string(), "ssh-ed25519");
+        let fixed = strip_openssh_comment(GBK_COMMENT_KEY).unwrap();
+        assert_eq!(keys::decode_secret_key(&fixed, None).unwrap().algorithm().to_string(), "ssh-ed25519");
     }
 
     /// Run manually: AH_SSH_TEST=host:port:user:key-path:remote-port-to-forward cargo test -p yi-client direct_tcpip -- --ignored

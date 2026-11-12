@@ -75,7 +75,7 @@ impl RpcConn {
 
     pub async fn call(&self, method: &str, params: Value) -> Result<Value> {
         let timeout = match method {
-            "history.list" | "session.create" | "hello" | "tools.detect" => 120,
+            "history.list" | "history.read" | "session.history" | "session.create" | "hello" | "tools.detect" => 120,
             _ => 60,
         };
         self.call_timeout(method, params, Duration::from_secs(timeout)).await

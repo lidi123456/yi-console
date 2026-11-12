@@ -39,7 +39,29 @@ struct HostConn {
     kick: Notify,
     ssh: Mutex<Option<Arc<SshSession>>>,
     child: Mutex<Option<tokio::process::Child>>,
+    bulk: tokio::sync::Mutex<Bulk>,
 }
+
+/// SSH hosts: a second `yi-agentd bridge` channel on the same SSH connection for large responses.
+/// Each SSH channel has its own flow-control window, so a multi-MB backlog on this one doesn't hold up
+/// requests and live events on the main channel. Opened on first use; reset whenever the transport is reopened
+#[derive(Default)]
+struct Bulk {
+    /// Command that starts the bridge on the host; only set for SSH transports
+    cmd: Option<String>,
+    rpc: Option<Arc<RpcConn>>,
+}
+
+/// Read-only methods whose replies can be large; they go over `Bulk` when there is one
+const BULK_METHODS: &[&str] = &[
+    "session.history",
+    "history.read",
+    "history.list",
+    "fs.read",
+    "fs.grep",
+    "git.show",
+    "git.blob",
+];
 
 /// The local host's id (the daemon on this machine)
 const LOCAL_ID: &str = "local";
@@ -584,7 +606,18 @@ impl ClientHub {
             .filter(|r| !r.is_closed())
             .ok_or_else(|| anyhow!("主机未连接"))?;
         let sid = params["sessionId"].as_str().map(str::to_string);
-        let r = rpc.call(method, params).await?;
+        let r = match method {
+            "session.subscribe" => self.subscribe(&c, &rpc, params).await?,
+            m if BULK_METHODS.contains(&m) => match self.bulk_rpc(&c).await {
+                Some(b) => match b.call(method, params.clone()).await {
+                    // The bulk channel dropped on its own: the main channel still works
+                    Err(_) if b.is_closed() => rpc.call(method, params).await?,
+                    r => r?,
+                },
+                None => rpc.call(method, params).await?,
+            },
+            _ => rpc.call(method, params).await?,
+        };
         match (method, sid) {
             ("session.subscribe", Some(sid)) => {
                 let max = r["events"]
@@ -611,11 +644,55 @@ impl ClientHub {
         Ok(r)
     }
 
+    /// The SSH bulk channel, opened on first use. None for other transports or when it can't be opened (callers fall back to the main channel)
+    async fn bulk_rpc(&self, c: &HostConn) -> Option<Arc<RpcConn>> {
+        let mut b = c.bulk.lock().await;
+        if let Some(r) = b.rpc.as_ref().filter(|r| !r.is_closed()) {
+            return Some(r.clone());
+        }
+        b.rpc = None;
+        let cmd = b.cmd.clone()?;
+        let s = c.ssh.lock().unwrap().clone().filter(|s| !s.is_closed())?;
+        let stream = tokio::time::timeout(Duration::from_secs(15), s.exec_stream(&cmd)).await.ok()?.ok()?;
+        let (r, w) = tokio::io::split(stream);
+        // Notifications are already delivered on the main channel, and nothing subscribes here
+        let rpc = RpcConn::start(r, w, Arc::new(|_| {}));
+        b.rpc = Some(rpc.clone());
+        Some(rpc)
+    }
+
+    /// session.subscribe. With a bulk channel, the subscription is made on the main channel with only the newest event
+    /// (registers it and fixes the cursor), and the backlog window up to that event is fetched over the bulk channel
+    /// with session.history. Later events arrive as notifications on the main channel, so nothing falls in between
+    async fn subscribe(&self, c: &HostConn, rpc: &RpcConn, mut params: Value) -> Result<Value> {
+        let Some(bulk) = self.bulk_rpc(c).await else {
+            return rpc.call("session.subscribe", params).await;
+        };
+        let since = params["sinceSeq"].as_i64().unwrap_or(0);
+        let tail = params["tail"].as_u64().unwrap_or(200);
+        params["tail"] = json!(1);
+        let mut r = rpc.call("session.subscribe", params.clone()).await?;
+        // A window (rather than the events after sinceSeq) comes back for sinceSeq 0, or when the daemon reports a reset; older daemons have no `reset`
+        let window = since == 0 || r["reset"].as_bool() == Some(true);
+        let last = r["events"].as_array().and_then(|a| a.last()).and_then(|e| e["seq"].as_i64());
+        if let (true, true, Some(last)) = (window, r["hasMore"].as_bool() == Some(true), last) {
+            let hp = json!({"sessionId": params["sessionId"], "beforeSeq": last + 1, "limit": tail});
+            let mut h = match bulk.call("session.history", hp.clone()).await {
+                Err(_) if bulk.is_closed() => rpc.call("session.history", hp).await?,
+                h => h?,
+            };
+            r["events"] = h["events"].take();
+            r["hasMore"] = h["hasMore"].take();
+        }
+        Ok(r)
+    }
+
     async fn disconnect(&self, id: &str) {
         let c = self.conn(id);
         c.stop.store(true, Ordering::SeqCst);
         c.kick.notify_waiters();
         c.rpc.lock().unwrap().take();
+        *c.bulk.lock().await = Bulk::default();
         c.ssh.lock().unwrap().take();
         let child = c.child.lock().unwrap().take();
         if let Some(mut ch) = child {
@@ -651,6 +728,7 @@ impl ClientHub {
                             _ = c.kick.notified() => {}
                         }
                         c.rpc.lock().unwrap().take();
+                        *c.bulk.lock().await = Bulk::default();
                         c.ssh.lock().unwrap().take();
                         if c.stop.load(Ordering::SeqCst) {
                             break;
@@ -946,8 +1024,8 @@ impl ClientHub {
             .map(|(k, v)| (k.clone(), *v))
             .collect();
         for (sid, since) in subs {
-            match rpc
-                .call("session.subscribe", json!({"sessionId": sid, "sinceSeq": since}))
+            match self
+                .subscribe(c, rpc, json!({"sessionId": sid, "sinceSeq": since}))
                 .await
             {
                 Ok(mut r) => {
@@ -1148,6 +1226,7 @@ impl ClientHub {
     }
 
     async fn open_transport(&self, h: &HostConfig, c: &HostConn) -> Result<(BoxR, BoxW)> {
+        *c.bulk.lock().await = Bulk::default();
         match h.kind {
             HostKind::Local => {
                 if !self.local_supported {
@@ -1232,6 +1311,7 @@ impl ClientHub {
                 }
                 let stream = s.exec_stream(&p.command("bridge")).await?;
                 *c.ssh.lock().unwrap() = Some(s);
+                c.bulk.lock().await.cmd = Some(p.command("bridge"));
                 let (r, w) = tokio::io::split(stream);
                 Ok((Box::new(r), Box::new(w)))
             }

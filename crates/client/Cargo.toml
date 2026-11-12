@@ -17,7 +17,7 @@ base64.workspace = true
 dirs.workspace = true
 gethostname = "1"
 # ring cross-compiles more easily than aws-lc-rs (no cmake needed for Android)
-russh = { version = "0.55", default-features = false, features = ["ring", "flate2", "rsa"] }
+russh = { version = "0.65.1", default-features = false, features = ["ring", "flate2", "rsa"] }
 russh-sftp = "2"
 
 [dev-dependencies]
