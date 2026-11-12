@@ -38,12 +38,12 @@
   --del-bg: #ffebe9;
   --del-fg: #a40e26;
   /* Full-file diff: crisp green/red line and token highlights (light) */
-  --df-add-line: rgba(46, 160, 67, 0.14);
-  --df-del-line: rgba(248, 81, 73, 0.13);
-  --df-add-text: rgba(46, 160, 67, 0.3);
-  --df-del-text: rgba(248, 81, 73, 0.28);
-  --df-add-mark: #2ea043;
-  --df-del-mark: #e5534b;
+  --df-add-line: rgba(34, 197, 94, 0.08);
+  --df-del-line: rgba(239, 68, 68, 0.08);
+  --df-add-text: rgba(34, 197, 94, 0.22);
+  --df-del-text: rgba(239, 68, 68, 0.18);
+  --df-add-mark: #3fb950;
+  --df-del-mark: #f0706a;
   --df-diag: rgba(34, 34, 34, 0.2);
   --code-bg: #f6f8fa;
   --c-claude: #d97757;
@@ -114,10 +114,10 @@
     --del-bg: #3b1f1e;
     --del-fg: #f48771;
     /* Full-file diff: crisp green/red line and token highlights (dark) */
-    --df-add-line: rgba(46, 160, 67, 0.18);
-    --df-del-line: rgba(248, 81, 73, 0.18);
-    --df-add-text: rgba(63, 185, 80, 0.34);
-    --df-del-text: rgba(248, 81, 73, 0.34);
+    --df-add-line: rgba(46, 160, 67, 0.12);
+    --df-del-line: rgba(248, 81, 73, 0.11);
+    --df-add-text: rgba(63, 185, 80, 0.28);
+    --df-del-text: rgba(248, 81, 73, 0.26);
     --df-add-mark: #3fb950;
     --df-del-mark: #f85149;
     --df-diag: rgba(204, 204, 204, 0.2);
@@ -170,10 +170,10 @@
   --del-bg: #3b1f1e;
   --del-fg: #f48771;
   /* Full-file diff: crisp green/red line and token highlights (dark) */
-  --df-add-line: rgba(46, 160, 67, 0.18);
-  --df-del-line: rgba(248, 81, 73, 0.18);
-  --df-add-text: rgba(63, 185, 80, 0.34);
-  --df-del-text: rgba(248, 81, 73, 0.34);
+  --df-add-line: rgba(46, 160, 67, 0.12);
+  --df-del-line: rgba(248, 81, 73, 0.11);
+  --df-add-text: rgba(63, 185, 80, 0.28);
+  --df-del-text: rgba(248, 81, 73, 0.26);
   --df-add-mark: #3fb950;
   --df-del-mark: #f85149;
   --df-diag: rgba(204, 204, 204, 0.2);
@@ -1806,12 +1806,11 @@ textarea {
   line-height: 1.5;
 }
 
+/* Changed lines, as in Cursor: a faint tint and a thin bar on the left, no +/- signs; removed text is dimmed */
 .dl-sign {
-  width: 20px;
+  width: 10px;
   flex: none;
-  text-align: center;
   user-select: none;
-  color: var(--text-3);
 }
 
 .dl-text {
@@ -1819,13 +1818,20 @@ textarea {
 }
 
 .dl-add {
-  background: var(--add-bg);
-  color: var(--add-fg);
+  background: var(--df-add-line);
+}
+
+.dl-add .dl-sign {
+  box-shadow: inset 2px 0 0 var(--df-add-mark);
 }
 
 .dl-del {
-  background: var(--del-bg);
-  color: var(--del-fg);
+  background: var(--df-del-line);
+  color: var(--text-3);
+}
+
+.dl-del .dl-sign {
+  box-shadow: inset 2px 0 0 var(--df-del-mark);
 }
 
 .dl-hunk {
@@ -2384,9 +2390,12 @@ textarea {
 }
 .cref-pop-code .add {
   background: var(--df-add-line);
+  box-shadow: inset 2px 0 0 var(--df-add-mark);
 }
 .cref-pop-code .del {
   background: var(--df-del-line);
+  box-shadow: inset 2px 0 0 var(--df-del-mark);
+  color: var(--text-3);
 }
 .cref-pop-code .more {
   color: var(--text-3);
@@ -7404,26 +7413,11 @@ body.resizing .wp-merge-sash {
 .wp-merge-split .cm-mergeViewEditor + .cm-mergeViewEditor {
   border-left: 1px solid var(--border);
 }
-.wp-merge .cm-merge-b .cm-changedLineGutter::after {
-  content: '+';
-  display: block;
-  font-weight: 600;
-}
-.wp-merge .cm-merge-a .cm-changedLineGutter::after,
-.wp-merge .cm-deletedLineGutter::after {
-  content: '−';
-  display: block;
-  font-weight: 600;
-}
 .wp-merge-all-del .cm-line {
   background-color: var(--df-del-line);
 }
 .wp-merge-all-del .cm-all-del-gutter .cm-gutterElement {
-  border-left: 3px solid var(--df-del-mark);
-  color: var(--del-fg);
-  font-size: 11px;
-  font-weight: 600;
-  text-align: center;
+  border-left: 2px solid var(--df-del-mark);
 }
 
 /* Floating action bars on diff hunks and editor text selections */
@@ -7538,10 +7532,10 @@ body.resizing .wp-merge-sash {
   user-select: none;
   opacity: 0.8;
 }
+/* Same look as the chat diff: tint plus a thin bar, no signs */
 .pd-sign {
   flex: none;
-  width: 16px;
-  color: var(--text-3);
+  width: 8px;
   user-select: none;
 }
 .pd-text {
@@ -7549,19 +7543,22 @@ body.resizing .wp-merge-sash {
 }
 .pd-add,
 .pd-half.pd-add {
-  background: var(--add-bg);
+  background: var(--df-add-line);
 }
 .pd-del,
 .pd-half.pd-del {
-  background: var(--del-bg);
+  background: var(--df-del-line);
 }
-.pd-add .pd-text,
-.pd-add .pd-sign {
-  color: var(--add-fg);
+.pd-add .pd-sign,
+.pd-half.pd-add {
+  box-shadow: inset 2px 0 0 var(--df-add-mark);
 }
-.pd-del .pd-text,
-.pd-del .pd-sign {
-  color: var(--del-fg);
+.pd-del .pd-sign,
+.pd-half.pd-del {
+  box-shadow: inset 2px 0 0 var(--df-del-mark);
+}
+.pd-del .pd-text {
+  color: var(--text-3);
 }
 .pd-pair {
   display: grid;

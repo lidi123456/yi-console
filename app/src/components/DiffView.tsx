@@ -83,7 +83,7 @@ export const DiffView = memo(function DiffView({ diff }: { diff: FileDiff }) {
       <div className="diff-body mono">
         {lines.slice(0, 800).map((l, i) => (
           <div key={i} className={`dl dl-${l.t}`}>
-            <span className="dl-sign">{l.t === 'add' ? '+' : l.t === 'del' ? '-' : l.t === 'hunk' ? '' : ' '}</span>
+            <span className="dl-sign" />
             <span className="dl-text">{l.text || ' '}</span>
           </div>
         ))}
@@ -259,7 +259,7 @@ export const PaneDiff = memo(function PaneDiff({
               <div key={i} className={`pd-row pd-${l.t}`}>
                 <span className="pd-num">{l.o ?? ''}</span>
                 <span className="pd-num">{l.n ?? ''}</span>
-                <span className="pd-sign">{l.t === 'add' ? '+' : l.t === 'del' ? '-' : ''}</span>
+                <span className="pd-sign" />
                 <span className="pd-text">{l.text || ' '}</span>
               </div>
             ),
