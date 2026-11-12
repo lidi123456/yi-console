@@ -1789,6 +1789,7 @@ export default interface Resources {
     "sessionHistory": "历史会话",
     "sessionRunning": "有会话在运行",
     "sessionWaitingForApproval": "有会话等待审批",
+    "sessionsNeedYou": "{{n}} 个会话需要你处理",
     "showLess": "收起",
     "showMore": "显示更多 ({{length}})",
     "sortByTime": "改为按时间排列",

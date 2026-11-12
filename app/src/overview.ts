@@ -67,6 +67,17 @@ export function unseenTurn(hostId: string, s: SessionInfo): boolean {
 
 export const useSeenVersion = seenSig.use;
 
+/** An error older than this no longer asks for attention */
+const ERROR_FRESH_MS = 24 * 3600 * 1000;
+
+/** The session waits for the user: an approval or question, a turn cut off by a restart, or a recent error.
+ *  Drives the overview's first column and the count on the sidebar's Overview entry. */
+export function needsAttention(s: SessionInfo, now = Date.now()): boolean {
+  if (s.tool === 'files') return false;
+  if (s.pendingPermissions > 0 || s.status === 'waiting-permission' || s.restartInterrupted) return true;
+  return s.status === 'error' && now - s.updatedAt < ERROR_FRESH_MS;
+}
+
 // localStorage is shared between windows: pick up what another window marked
 if (typeof window !== 'undefined') {
   window.addEventListener('storage', (e) => {

@@ -11,6 +11,7 @@ import { Icon, ToolBadge } from './Icon';
 import { MOD } from './Palette';
 import { BotsSections } from './BotsSection';
 import { isListedBotSession, useBots } from '../bots';
+import { needsAttention } from '../overview';
 
 const tx = getT('sidebar');
 
@@ -496,6 +497,13 @@ export function Sidebar() {
   const hosts = useStore((s) => s.hosts);
   const view = useStore((s) => s.view);
   const open = useStore((s) => s.sidebarOpen);
+  // Same rule as the overview's "Needs you" column: top-level sessions on every host
+  const attn = useStore((s) => {
+    const now = Date.now();
+    let n = 0;
+    for (const h of s.hosts) for (const x of s.sessions[h.config.id] ?? []) if (!x.parentId && needsAttention(x, now)) n++;
+    return n;
+  });
   const transport = useStore((s) => s.transport);
   const firstConnected = hosts.find((h) => h.status.status === 'connected')?.config.id;
   const [filter, setFilter] = useState('');
@@ -541,8 +549,13 @@ export function Sidebar() {
           >
             <Icon name="edit" size={15} /> {tx('newSession3')}
           </button>
-          <button className={`nav-item ${view.kind === 'home' ? 'active' : ''}`} onClick={() => navigate({ kind: 'home' })}>
-            <Icon name="home" size={15} /> {tx('overview')}
+          <button
+            className={`nav-item ${view.kind === 'home' ? 'active' : ''}`}
+            title={attn > 0 ? tx('sessionsNeedYou', { n: attn }) : ''}
+            onClick={() => navigate({ kind: 'home' })}
+          >
+            <Icon name="home" size={15} /> <span className="nav-label">{tx('overview')}</span>
+            {attn > 0 && <span className="pill pill-attn nav-count">{attn}</span>}
           </button>
         </div>
         <div className="side-search">

@@ -62,5 +62,6 @@
   "addManageHosts": "Add / Manage Hosts",
   "offline": "Offline",
   "hosts": "Hosts",
-  "preferencesAppearanceLanguageNotificationsProxy": "Preferences (Appearance, Language, Notifications, Proxy)"
+  "preferencesAppearanceLanguageNotificationsProxy": "Preferences (Appearance, Language, Notifications, Proxy)",
+  "sessionsNeedYou": "Sessions waiting for you: {{n}}"
 }

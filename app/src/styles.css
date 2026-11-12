@@ -5621,6 +5621,21 @@ body.resizing .side-resizer::after {
   color: var(--text);
 }
 
+.nav-item .nav-label {
+  flex: 1;
+  min-width: 0;
+  text-align: left;
+}
+
+/* Count of sessions waiting for the user, on the Overview entry; same pill as a session row's approvals */
+.nav-item .nav-count {
+  line-height: 16px;
+  padding: 0 5px;
+  font-size: 10.5px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
 .nav-item.active,
 .session-row.active,
 .add-host.active {

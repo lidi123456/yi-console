@@ -1,6 +1,6 @@
 import { memo, useMemo, useState } from 'react';
 import { getT, useLang } from '../i18n';
-import { markSeen, projKey, relPath, unseenTurn, useNow, useSeenVersion } from '../overview';
+import { markSeen, needsAttention, projKey, relPath, unseenTurn, useNow, useSeenVersion } from '../overview';
 import { permLabel } from '../perm';
 import { errorToast, navigate, openNewSession, useStore } from '../store';
 import { rpc } from '../transport';
@@ -28,14 +28,11 @@ type Col = 'attn' | 'run' | 'review' | 'rest';
 const COLS: Col[] = ['attn', 'run', 'review', 'rest'];
 /** Compact rows shown in the last column before "Show all" */
 const REST_SHOWN = 6;
-/** An error older than this no longer asks for attention (it stays in the last column) */
-const ERROR_FRESH_MS = 24 * 3600 * 1000;
 
 function colOf(x: Item): Col {
   const s = x.s;
   if (s.tool === 'files') return 'rest';
-  if (s.pendingPermissions > 0 || s.status === 'waiting-permission' || s.restartInterrupted) return 'attn';
-  if (s.status === 'error' && Date.now() - s.updatedAt < ERROR_FRESH_MS) return 'attn';
+  if (needsAttention(s)) return 'attn';
   // Terminal sessions stay "running" as long as their process lives, so they don't get a column of their own
   if (s.mode !== 'structured') return 'rest';
   if (s.status === 'running' || s.status === 'starting' || s.autoResume) return 'run';
