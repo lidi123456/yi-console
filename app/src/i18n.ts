@@ -85,7 +85,7 @@ export function onLangChange(f: () => void): () => void {
 
 const ERR_PATTERNS: [RegExp, string | ((...m: string[]) => string)][] = [
   [/这个会话不支持调整模型参数/, 'This session does not support model parameters'],
-  [/^子 agent 在等待审批/, "A subagent is waiting for approval, but agy doesn't pass subagent approval requests on to Yi Console. Switch to Bypass All and try again, or handle it in terminal mode"],
+  [/^子 agent 在等待审批/, "A subagent is waiting for approval, but agy doesn't pass subagent approval requests on to Yi Console. Stop it in the background tasks, switch to Bypass All and try again, or handle it in terminal mode"],
   [/当前模型不支持这个参数/, 'The current model does not support this parameter'],
   [/模型参数值无效/, 'Invalid model parameter value'],
   [/^切换模型失败，发下一条消息时会再试[:：]\s*(.+)$/s, (_, m) => `Could not switch models; it will be tried again with the next message: ${m}`],

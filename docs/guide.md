@@ -45,7 +45,9 @@ yi-agentd 会读取登录 shell 的 PATH，并检查常见的安装目录。仍�
 | 用量统计的 token 来源 | 工具自己的日志（终端里直接用的也算） | 工具自己的日志（终端里直接用的也算） | Yi Console 会话 | Yi Console 会话 | 工具自己的日志（按 credits 计） | 工具自己的日志（token + credits） | Yi Console 会话 |
 | 导入历史会话 | ✓ | ✓ | ✓ | ✓ | ✓（可直接查看） | ✓（继续会话后查看） | ✓（继续会话后查看） |
 
-Antigravity 的子 agent 在后台运行：Yi Console 会一直显示这一轮在进行，子 agent 的工具调用带「子 agent」标记，它汇报后 Antigravity 的回复会自动出现。agy 不会把子 agent 的审批请求转出来，所以除「全部放行」外的模式里，子 agent 要执行需要审批的操作时会停住：等 30 秒没有动静，这一轮会结束并提示切到「全部放行」。切换到或切出「全部放行」会重启 agy 进程（会话接着用）。
+Codex 和 Antigravity 的子 agent 跟 Claude Code 的后台任务一样处理：主 agent 回复完，这一轮就结束，可以接着对话；还在跑的子 agent 显示在输入框上方的后台任务栏里，可以单独停止。子 agent 的工具调用带「子 agent」标记，它的最后回复显示在启动它的那一步里，做完时对话里会留一行提示。Antigravity 收到子 agent 的汇报后会自己接着回复；Codex 不会，需要你再发一条消息让它继续。
+
+Codex 的子 agent 的审批请求照常弹出。agy 不会把子 agent 的审批请求转出来，所以除「全部放行」外的模式里，子 agent 要执行需要审批的操作时会停住，30 秒没有动静会提示你在后台任务栏里停止它，切到「全部放行」后重试。切换到或切出「全部放行」会重启 agy 进程（会话接着用），重启会等后台任务都结束后再进行。
 
 模型列表和额度是 yi-agentd 临时起一次工具去问的（在 `~/.yi-console/probe/` 里运行，不会产生会话），模型列表会缓存到 `models.json`，额度缓存 60 秒。Cursor 的用量是用 cursor-agent 登录时保存的令牌（`~/.config/cursor/auth.json`，Windows 在 `%APPDATA%\Cursor`，macOS 在 `~/.cursor`）直接查 Cursor 后台，令牌过期时运行一次 cursor-agent 即可。
 

@@ -1630,6 +1630,24 @@ impl Hub {
         Ok(json!({ "text": text }))
     }
 
+    /// The last background task ended: a restart held back for it (permission mode change) runs now if the
+    /// session is idle; a running turn does it at its end (`after_turn`)
+    fn restart_when_settled(self: &Arc<Self>, sid: &str, gen: u64) {
+        let Some(rt) = self.alive(sid, gen) else {
+            return;
+        };
+        if rt.info.lock().unwrap().status != SessionStatus::Idle || !std::mem::take(&mut *rt.restart_pending.lock().unwrap()) {
+            return;
+        }
+        let (hub, sid) = (self.clone(), sid.to_string());
+        // Not from inside the adapter's own call
+        tokio::spawn(async move {
+            if let Err(e) = hub.relaunch(&rt) {
+                hub.emit(&sid, 0, EventBody::Error { message: format!("重启会话失败: {e}") });
+            }
+        });
+    }
+
     /// Turn ended: restart the process first if needed (permission mode change), then send the next queued message
     fn after_turn(self: &Arc<Self>, sid: &str, gen: u64, stop_reason: Option<&str>) {
         let Some(rt) = self.alive(sid, gen) else {
@@ -1641,7 +1659,9 @@ impl Hub {
         if !limited && !was_interrupted {
             self.set_info(sid, gen, |i| std::mem::take(&mut i.limit_hits) > 0);
         }
-        if std::mem::take(&mut *rt.restart_pending.lock().unwrap()) {
+        // A restart would also end the background tasks (Claude's shells, subagents); it waits until they finish
+        let tasks_left = !rt.info.lock().unwrap().background_tasks.is_empty();
+        if !tasks_left && std::mem::take(&mut *rt.restart_pending.lock().unwrap()) {
             if let Err(e) = self.relaunch(&rt) {
                 self.emit(sid, 0, EventBody::Error { message: format!("重启会话失败: {e}") });
             }
@@ -1720,7 +1740,8 @@ impl Hub {
             _ => false,
         };
         if restart {
-            let busy = matches!(info.status, SessionStatus::Running | SessionStatus::WaitingPermission);
+            let busy = matches!(info.status, SessionStatus::Running | SessionStatus::WaitingPermission)
+                || !info.background_tasks.is_empty();
             if busy {
                 *rt.restart_pending.lock().unwrap() = true;
             } else {
@@ -3126,6 +3147,7 @@ impl Emitter {
     }
 
     pub fn background_tasks(&self, tasks: Vec<BackgroundTask>) {
+        let ended = tasks.is_empty();
         self.hub.set_info(&self.sid, self.gen, |i| {
             if i.background_tasks == tasks {
                 return false;
@@ -3133,6 +3155,9 @@ impl Emitter {
             i.background_tasks = tasks;
             true
         });
+        if ended {
+            self.hub.restart_when_settled(&self.sid, self.gen);
+        }
     }
 
     pub fn title_if_empty(&self, title: &str) {

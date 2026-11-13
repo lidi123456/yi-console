@@ -234,12 +234,15 @@ function buildItems(events: HubEvent[], hideCompactCmd = false): Item[] {
         const bg = /^后台任务(完成|失败|已停止|\s*\S+?)：([\s\S]*)$/.exec(e.text.trim());
         if (bg) {
           const s = bg[1] === '完成' ? 'done' : bg[1] === '失败' ? 'failed' : bg[1] === '已停止' ? 'stopped' : 'other';
+          // Codex / Antigravity subagents: "后台任务完成：子 agent <name>"
+          const sub = /^子 agent /.test(bg[2]);
           const label =
-            s === 'done' ? t('backgroundTaskDone')
-            : s === 'failed' ? t('backgroundTaskFailed')
-            : s === 'stopped' ? t('backgroundTaskStopped')
+            s === 'done' ? t(sub ? 'subagentTaskDone' : 'backgroundTaskDone')
+            : s === 'failed' ? t(sub ? 'subagentTaskFailed' : 'backgroundTaskFailed')
+            : s === 'stopped' ? t(sub ? 'subagentTaskStopped' : 'backgroundTaskStopped')
             : t('backgroundTask', { v: bg[1].trim() });
-          items.push({ k: 'bgdone', key, status: s, label, what: bg[2].replace(/\s+/g, ' ').trim() });
+          const what = (sub ? bg[2].replace(/^子 agent /, '') : bg[2]).replace(/\s+/g, ' ').trim();
+          items.push({ k: 'bgdone', key, status: s, label, what });
         } else if (e.text.trim()) items.push({ k: 'note', key, text: e.text, tone: 'muted' });
         break;
       }
@@ -561,8 +564,9 @@ function shownToolName(it: Item & { k: 'tool' }) {
   return isGenericTool(it) ? it.title : toolName((it.name === 'other' || it.name === 'think') && it.title ? it.title : it.name, it.input);
 }
 
-/** Antigravity subagents' own tool calls, read from their transcripts (`acp.rs` gives them `agy-sub:` ids) */
-const isSubagentTool = (it: Item & { k: 'tool' }) => it.id.startsWith('agy-sub:');
+/** Subagents' own tool calls: Antigravity's, read from their transcripts (`acp.rs` gives them `agy-sub:` ids), and
+ *  Codex's, from their threads' notifications (`codex.rs`, `cx-sub:`) */
+const isSubagentTool = (it: Item & { k: 'tool' }) => it.id.startsWith('agy-sub:') || it.id.startsWith('cx-sub:');
 
 /** Key argument in parentheses: paths relative to the working directory; Cursor titles carry prefixes like "Read xxx", strip them to avoid repetition */
 const ARG_KEYS = ['command', 'pattern', 'query', 'file_path', 'notebook_path', 'path', 'url', 'description', 'skill', 'prompt', 'toolSummary', 'ImageName', 'Name'];

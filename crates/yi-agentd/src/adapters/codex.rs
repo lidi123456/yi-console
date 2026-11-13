@@ -56,7 +56,32 @@ struct State {
     rate_limits: Value,
     /// This turn's error was usageLimitExceeded
     usage_limited: bool,
+    /// Subagent threads (multi_agent `spawn_agent`), by thread id. app-server streams their notifications on this
+    /// connection with their own threadId. Running ones are the session's background tasks
+    subs: HashMap<String, SubThread>,
 }
+
+/// One subagent thread
+#[derive(Default)]
+struct SubThread {
+    /// Id of the ToolCall that started it; its ToolResult is the subagent's reply
+    spawn_call: Option<String>,
+    /// Running turn
+    turn: Option<String>,
+    /// Last message of the running turn
+    reply: String,
+    /// Previous cumulative tokens of this thread
+    last_total: Option<Value>,
+    /// Name from the spawn (last segment of its agent path), shown in the background task list
+    name: String,
+    /// When its running turn started (ms)
+    started_at: i64,
+    /// Stopped from the background task list
+    stopped: bool,
+}
+
+/// Id prefix for subagents' own tool calls (the timeline tags them "Subagent")
+const SUB_PREFIX: &str = "cx-sub:";
 
 impl State {
     fn req(&mut self, kind: Pending, method: &str, params: Value) -> Value {
@@ -162,6 +187,12 @@ pub async fn run(spec: StartSpec, em: Emitter, mut rx: mpsc::UnboundedReceiver<A
                 Some(AdapterCmd::Interrupt) => {
                     if let (Some(t), Some(turn)) = (st.thread_id.clone(), st.turn_id.clone()) {
                         let m = st.req(Pending::Other, "turn/interrupt", json!({"threadId":t,"turnId":turn}));
+                        let _ = p.send(&m).await;
+                    }
+                }
+                Some(AdapterCmd::StopTask(task)) => {
+                    // Background task ids are subagent thread ids
+                    if let Some(m) = stop_sub(&mut st, &task) {
                         let _ = p.send(&m).await;
                     }
                 }
@@ -461,8 +492,22 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Vec<Valu
                     em.model(m);
                 }
                 if st.replaying {
+                    // Subagent thread -> spawn call, to close the call when the history says the subagent finished
+                    let mut spawned: HashMap<String, String> = HashMap::new();
                     for turn in th["turns"].as_array().into_iter().flatten() {
                         for item in turn["items"].as_array().into_iter().flatten() {
+                            for (child, call) in spawned_threads(item, "") {
+                                spawned.insert(child, call);
+                            }
+                            if item["type"] == "subAgentActivity" && item["kind"] != "started" {
+                                if let Some(call) = item["agentThreadId"].as_str().and_then(|t| spawned.remove(t)) {
+                                    em.event(EventBody::ToolResult {
+                                        id: call,
+                                        output: String::new(),
+                                        is_error: item["kind"] == "interrupted",
+                                    });
+                                }
+                            }
                             for ev in item_events(item, true) {
                                 em.event(ev);
                             }
@@ -582,6 +627,10 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Vec<Valu
     }
 
     // 3) Notifications
+    if let Some(sub) = sub_thread(st, params) {
+        sub_notification(st, &sub, method, params, em);
+        return out;
+    }
     match method {
         "item/reasoning/summaryTextDelta" | "item/reasoning/textDelta" => {
             if let (Some(id), Some(d)) = (params["itemId"].as_str(), params["delta"].as_str()) {
@@ -609,6 +658,7 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Vec<Valu
                     duration_ms: None,
                 });
             }
+            register_spawns(st, &params["item"], "");
             for ev in item_events(&params["item"], false) {
                 if matches!(ev, EventBody::ToolCall { .. }) {
                     em.event(ev);
@@ -617,8 +667,12 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Vec<Valu
         }
         "item/completed" => {
             let item = &params["item"];
+            register_spawns(st, item, "");
             // Commands/patches already emitted a ToolCall at item/started; only the result is needed here, and a patch's diff is taken from completion
-            let started_already = matches!(item["type"].as_str(), Some("commandExecution") | Some("mcpToolCall"));
+            let started_already = matches!(
+                item["type"].as_str(),
+                Some("commandExecution") | Some("mcpToolCall") | Some("collabAgentToolCall") | Some("subAgentActivity")
+            );
             let manual = item["type"] == "contextCompaction" && std::mem::take(&mut st.manual_compact);
             for mut ev in item_events(item, false) {
                 if started_already && matches!(ev, EventBody::ToolCall { .. }) {
@@ -651,6 +705,7 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Vec<Valu
                     em.event(super::limit_hit(limit_reset(&st.rate_limits), None));
                 }
             }
+            // Subagents still running carry on as background tasks
             em.event(EventBody::TurnEnd {
                 stop_reason: turn["status"].as_str().map(str::to_string),
                 model: None,
@@ -684,25 +739,11 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Vec<Valu
             }
             let total = params["tokenUsage"]["total"].clone();
             let prev = st.last_total.replace(total.clone());
-            let g = |v: &Value, k: &str| v[k].as_u64().unwrap_or(0);
-            let d = |k: &str| {
-                g(&total, k).saturating_sub(prev.as_ref().map(|p| g(p, k)).unwrap_or(0))
-            };
             // The first report after resume is the historical total; don't count it as usage for this run
             if prev.is_none() && st.resumed {
                 return out;
             }
-            let cached = d("cachedInputTokens");
-            em.event(EventBody::Usage {
-                usage: Usage {
-                    input_tokens: d("inputTokens").saturating_sub(cached),
-                    output_tokens: d("outputTokens"),
-                    cache_read_tokens: cached,
-                    cache_write_tokens: d("cacheWriteInputTokens"),
-                    cost_usd: 0.0,
-                    credits: 0.0,
-                },
-            });
+            em.event(usage_delta(&total, prev.as_ref()));
         }
         "account/rateLimits/updated" => st.rate_limits = params["rateLimits"].clone(),
         "error" => {
@@ -725,6 +766,165 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Vec<Valu
         _ => {}
     }
     out
+}
+
+/// Usage event for the increase from `prev` to `total` (cumulative thread totals)
+fn usage_delta(total: &Value, prev: Option<&Value>) -> EventBody {
+    let g = |v: &Value, k: &str| v[k].as_u64().unwrap_or(0);
+    let d = |k: &str| g(total, k).saturating_sub(prev.map(|p| g(p, k)).unwrap_or(0));
+    let cached = d("cachedInputTokens");
+    EventBody::Usage {
+        usage: Usage {
+            input_tokens: d("inputTokens").saturating_sub(cached),
+            output_tokens: d("outputTokens"),
+            cache_read_tokens: cached,
+            cache_write_tokens: d("cacheWriteInputTokens"),
+            cost_usd: 0.0,
+            credits: 0.0,
+        },
+    }
+}
+
+/// The notification's thread when it is a subagent's rather than the main thread's
+fn sub_thread(st: &State, params: &Value) -> Option<String> {
+    let t = params["threadId"].as_str()?;
+    let main = st.thread_id.as_deref()?;
+    (t != main).then(|| t.to_string())
+}
+
+/// Subagent threads an item starts, with the id of the ToolCall that stands for each (prefixed when the spawning
+/// thread is itself a subagent). multi_agent reports a spawn as `subAgentActivity` (kind started, call id as item id);
+/// a `collabAgentToolCall` spawnAgent names them in receiverThreadIds
+fn spawned_threads(item: &Value, pre: &str) -> Vec<(String, String)> {
+    let id = format!("{pre}{}", item["id"].as_str().unwrap_or(""));
+    match item["type"].as_str() {
+        Some("subAgentActivity") if item["kind"] == "started" => {
+            item["agentThreadId"].as_str().map(|t| vec![(t.to_string(), id)]).unwrap_or_default()
+        }
+        Some("collabAgentToolCall") if item["tool"] == "spawnAgent" => item["receiverThreadIds"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|t| t.as_str().map(|t| (t.to_string(), id.clone())))
+            .collect(),
+        _ => vec![],
+    }
+}
+
+fn register_spawns(st: &mut State, item: &Value, pre: &str) {
+    for (child, call) in spawned_threads(item, pre) {
+        let s = st.subs.entry(child).or_default();
+        s.spawn_call.get_or_insert(call);
+        if s.name.is_empty() {
+            s.name = item["agentPath"].as_str().and_then(|p| p.rsplit('/').next()).unwrap_or("").to_string();
+        }
+    }
+}
+
+/// A subagent thread's notification. Its tool calls are shown (ids with SUB_PREFIX), its last message becomes the
+/// spawn call's result, its tokens count as usage; text deltas, reasoning, plans and its turn events stay out of the
+/// main timeline. A running subagent is a background task, like Claude's: the main turn ends on its own schedule
+fn sub_notification(st: &mut State, sub: &str, method: &str, params: &Value, em: &Emitter) {
+    match method {
+        "turn/started" => {
+            let s = st.subs.entry(sub.to_string()).or_default();
+            s.turn = params["turn"]["id"].as_str().map(str::to_string).or(Some(String::new()));
+            s.reply.clear();
+            s.stopped = false;
+            s.started_at = crate::util::now_ms();
+            publish_tasks(st, em);
+        }
+        "turn/completed" => {
+            let s = st.subs.entry(sub.to_string()).or_default();
+            s.turn = None;
+            let turn = &params["turn"];
+            let status = turn["status"].as_str().unwrap_or("completed");
+            let reply = std::mem::take(&mut s.reply);
+            let stopped = std::mem::take(&mut s.stopped);
+            let name = if s.name.is_empty() { sub.to_string() } else { s.name.clone() };
+            // Only the first turn answers the spawn call; later turns (follow-up input) show their tool calls only
+            if let Some(call) = s.spawn_call.take() {
+                let err = turn["error"]["message"].as_str().unwrap_or("");
+                em.event(EventBody::ToolResult {
+                    id: call,
+                    output: if reply.is_empty() { err.to_string() } else { reply },
+                    is_error: status != "completed",
+                });
+            }
+            // While the main turn waits for it, its result above says enough; otherwise leave a line, as for
+            // Claude's background tasks (format parsed by ChatView)
+            if st.turn_id.is_none() {
+                let what = match status {
+                    _ if stopped || status == "interrupted" => "已停止",
+                    "completed" => "完成",
+                    _ => "失败",
+                };
+                em.event(EventBody::System { text: format!("后台任务{what}：子 agent {name}") });
+            }
+            publish_tasks(st, em);
+        }
+        "item/started" | "item/completed" => {
+            let item = &params["item"];
+            register_spawns(st, item, SUB_PREFIX);
+            if item["type"] == "agentMessage" {
+                let text = item["text"].as_str().unwrap_or("").trim();
+                if method == "item/completed" && !text.is_empty() {
+                    st.subs.entry(sub.to_string()).or_default().reply = text.to_string();
+                }
+                return;
+            }
+            let started = method == "item/started";
+            let started_already = matches!(
+                item["type"].as_str(),
+                Some("commandExecution") | Some("mcpToolCall") | Some("collabAgentToolCall") | Some("subAgentActivity")
+            );
+            for ev in item_events(item, false) {
+                let ev = match ev {
+                    EventBody::ToolCall { id, name, title, input, diffs } if started || !started_already => {
+                        EventBody::ToolCall { id: format!("{SUB_PREFIX}{id}"), name, title, input, diffs }
+                    }
+                    EventBody::ToolResult { id, output, is_error } if !started => {
+                        EventBody::ToolResult { id: format!("{SUB_PREFIX}{id}"), output, is_error }
+                    }
+                    _ => continue,
+                };
+                em.event(ev);
+            }
+        }
+        "thread/tokenUsage/updated" => {
+            let total = params["tokenUsage"]["total"].clone();
+            let s = st.subs.entry(sub.to_string()).or_default();
+            let prev = s.last_total.replace(total.clone());
+            em.event(usage_delta(&total, prev.as_ref()));
+        }
+        _ => {}
+    }
+}
+
+/// Running subagents as the session's background tasks
+fn publish_tasks(st: &State, em: &Emitter) {
+    let mut tasks: Vec<BackgroundTask> = st
+        .subs
+        .iter()
+        .filter(|(_, s)| s.turn.is_some())
+        .map(|(id, s)| BackgroundTask {
+            id: id.clone(),
+            kind: "local_agent".into(),
+            description: if s.name.is_empty() { id.clone() } else { s.name.clone() },
+            started_at: s.started_at,
+            output_file: None,
+        })
+        .collect();
+    tasks.sort_by(|a, b| a.started_at.cmp(&b.started_at).then_with(|| a.id.cmp(&b.id)));
+    em.background_tasks(tasks);
+}
+
+/// turn/interrupt for a subagent's running turn (stopped from the background task list)
+fn stop_sub(st: &mut State, thread: &str) -> Option<Value> {
+    let s = st.subs.get_mut(thread)?;
+    let turn = s.turn.clone().filter(|t| !t.is_empty())?;
+    s.stopped = true;
+    Some(st.req(Pending::Other, "turn/interrupt", json!({"threadId":thread,"turnId":turn})))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -903,6 +1103,70 @@ pub fn item_events(item: &Value, with_user: bool) -> Vec<EventBody> {
             }
             v
         }
+        "subAgentActivity" if item["kind"] == "started" => {
+            let path = s("agentPath");
+            let name = path.rsplit('/').next().unwrap_or("").to_string();
+            vec![EventBody::ToolCall {
+                id,
+                name: "spawn_agent".into(),
+                title: name.clone(),
+                input: json!({"description": name, "agentPath": path, "agentThreadId": s("agentThreadId"),
+                    "model": item["model"], "reasoningEffort": item["reasoningEffort"]}),
+                diffs: vec![],
+            }]
+        }
+        "collabAgentToolCall" => {
+            let tool = s("tool");
+            let name = match tool.as_str() {
+                "spawnAgent" => "spawn_agent".to_string(),
+                "wait" => "wait_agent".to_string(),
+                t => {
+                    // camelCase -> snake_case
+                    let mut n = String::new();
+                    for c in t.chars() {
+                        if c.is_ascii_uppercase() {
+                            n.push('_');
+                        }
+                        n.push(c.to_ascii_lowercase());
+                    }
+                    n
+                }
+            };
+            let prompt = s("prompt");
+            let mut v = vec![EventBody::ToolCall {
+                id: id.clone(),
+                name,
+                title: crate::util::truncate(&prompt, 200),
+                // `wait` usually carries nothing: leave the input out instead of showing empty fields
+                input: {
+                    let mut o = serde_json::Map::new();
+                    if !prompt.is_empty() {
+                        o.insert("prompt".into(), json!(prompt));
+                    }
+                    if item["receiverThreadIds"].as_array().is_some_and(|a| !a.is_empty()) {
+                        o.insert("receiverThreadIds".into(), item["receiverThreadIds"].clone());
+                    }
+                    if item["model"].is_string() {
+                        o.insert("model".into(), item["model"].clone());
+                    }
+                    if o.is_empty() { Value::Null } else { Value::Object(o) }
+                },
+                diffs: vec![],
+            }];
+            let status = s("status");
+            // A spawn is answered by the subagent's reply (sub_notification), unless it failed
+            if !status.is_empty() && status != "inProgress" && (tool != "spawnAgent" || status != "completed") {
+                let states = item["agentsStates"]
+                    .as_object()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|(_, a)| a["message"].as_str().filter(|m| !m.is_empty()))
+                    .collect::<Vec<_>>()
+                    .join("\n\n");
+                v.push(EventBody::ToolResult { id, output: states, is_error: status != "completed" });
+            }
+            v
+        }
         "webSearch" => vec![EventBody::ToolCall {
             id,
             name: "web_search".into(),
@@ -971,6 +1235,115 @@ mod tests {
         assert!(is_usage_limit(&json!({"message":"x","codexErrorInfo":"usageLimitExceeded"})));
         assert!(!is_usage_limit(&json!({"codexErrorInfo":{"httpConnectionFailed":{"httpStatusCode":429}}})));
         assert!(crate::adapters::is_usage_limit_text("You’ve hit your usage limit. Try again at 3:05 PM."));
+    }
+
+    fn spec() -> StartSpec {
+        StartSpec {
+            tool: ToolKind::Codex,
+            mode: SessionMode::Structured,
+            cwd: "/tmp".into(),
+            resume: None,
+            replay: false,
+            replay_skip: 0,
+            model: None,
+            effort: None,
+            model_config_options: vec![],
+            permission_mode: "default".into(),
+            command: None,
+            program: "codex".into(),
+            extra_args: vec![],
+            mcp_servers: vec![],
+            mcp_fingerprint: String::new(),
+            allow_mcp: vec![],
+            system_prompt: None,
+            system_notice: false,
+            cols: 80,
+            rows: 24,
+            tmux: None,
+            session_id: None,
+        }
+    }
+
+    fn note(method: &str, thread: &str, extra: Value) -> Value {
+        let mut params = json!({"threadId": thread});
+        for (k, v) in extra.as_object().unwrap() {
+            params[k] = v.clone();
+        }
+        json!({"method": method, "params": params})
+    }
+
+    /// Shapes from codex-cli 0.166 app-server (multi_agent): the parent starts a subagent and ends its turn without waiting
+    #[test]
+    fn subagent_after_main_turn() {
+        let (hub, em, _rx) = crate::hub::test_emitter();
+        let sp = spec();
+        let mut st = State { thread_id: Some("main".into()), ..Default::default() };
+        let tu = |n: u64| json!({"tokenUsage":{"total":{"inputTokens":n,"cachedInputTokens":0,"outputTokens":10},"last":{},"modelContextWindow":1000}});
+        let tasks = || hub.info("s").unwrap().background_tasks;
+        let seq = vec![
+            note("turn/started", "main", json!({"turn":{"id":"t1"}})),
+            note("item/started", "main", json!({"item":{"type":"subAgentActivity","id":"call_1","kind":"started","agentThreadId":"sub","agentPath":"/root/late_ok","model":"m"}})),
+            note("item/completed", "main", json!({"item":{"type":"subAgentActivity","id":"call_1","kind":"started","agentThreadId":"sub","agentPath":"/root/late_ok","model":"m"}})),
+            note("turn/started", "sub", json!({"turn":{"id":"st1","rootTurnId":"t1"}})),
+            note("item/completed", "main", json!({"item":{"type":"agentMessage","id":"m1","text":"已启动"}})),
+            note("turn/completed", "main", json!({"turn":{"id":"t1","status":"completed"}})),
+        ];
+        for v in &seq {
+            assert!(handle(&mut st, &sp, v, &em).is_empty());
+        }
+        // The main turn ends right away; the subagent's turn didn't touch turn_id and is a background task now
+        assert!(st.turn_id.is_none());
+        let evs = || hub.store.events_since("s", 0, 100).unwrap();
+        assert_eq!(evs().iter().filter(|e| matches!(e.body, EventBody::TurnEnd { .. })).count(), 1);
+        let t = tasks();
+        assert_eq!(t.len(), 1);
+        assert_eq!((t[0].id.as_str(), t[0].kind.as_str(), t[0].description.as_str()), ("sub", "local_agent", "late_ok"));
+        for v in [
+            note("item/started", "sub", json!({"item":{"type":"commandExecution","id":"exec-1","command":"/bin/bash -lc 'sleep 15; echo LATE-OK'","status":"inProgress"}})),
+            note("item/agentMessage/delta", "sub", json!({"itemId":"m2","delta":"x"})),
+            note("item/completed", "sub", json!({"item":{"type":"commandExecution","id":"exec-1","command":"/bin/bash -lc 'sleep 15; echo LATE-OK'","status":"completed","aggregatedOutput":"LATE-OK\n","exitCode":0}})),
+            note("thread/tokenUsage/updated", "sub", tu(100)),
+            note("item/completed", "sub", json!({"item":{"type":"agentMessage","id":"m2","text":"LATE-OK","phase":"final_answer"}})),
+            note("thread/tokenUsage/updated", "sub", tu(250)),
+            note("turn/completed", "sub", json!({"turn":{"id":"st1","status":"completed"}})),
+            note("item/completed", "main", json!({"item":{"type":"subAgentActivity","id":"subagent-completed-st1","kind":"completed","agentThreadId":"sub","agentPath":"/root/late_ok"}})),
+        ] {
+            handle(&mut st, &sp, &v, &em);
+        }
+        assert!(tasks().is_empty());
+
+        let evs = evs();
+        let bodies: Vec<&EventBody> = evs.iter().map(|e| &e.body).collect();
+        assert!(bodies.iter().any(|b| matches!(b, EventBody::ToolCall { id, name, title, .. } if id == "call_1" && name == "spawn_agent" && title == "late_ok")));
+        assert!(bodies.iter().any(|b| matches!(b, EventBody::ToolCall { id, .. } if id == "cx-sub:exec-1")));
+        assert!(bodies.iter().any(|b| matches!(b, EventBody::ToolResult { id, output, .. } if id == "cx-sub:exec-1" && output == "LATE-OK\n")));
+        assert!(bodies.iter().any(|b| matches!(b, EventBody::ToolResult { id, output, is_error: false } if id == "call_1" && output == "LATE-OK")));
+        assert!(bodies.iter().any(|b| matches!(b, EventBody::System { text } if text == "后台任务完成：子 agent late_ok")));
+        // The subagent's reply is the spawn result, not a main-thread message
+        assert_eq!(bodies.iter().filter(|b| matches!(b, EventBody::AssistantText { .. })).count(), 1);
+        let usage: u64 = bodies.iter().filter_map(|b| match b { EventBody::Usage { usage } => Some(usage.input_tokens), _ => None }).sum();
+        assert_eq!(usage, 250);
+        assert_eq!(bodies.iter().filter(|b| matches!(b, EventBody::TurnEnd { .. })).count(), 1);
+    }
+
+    #[test]
+    fn subagent_stop_task() {
+        let (hub, em, _rx) = crate::hub::test_emitter();
+        let sp = spec();
+        let mut st = State { thread_id: Some("main".into()), ..Default::default() };
+        handle(&mut st, &sp, &note("item/started", "main", json!({"item":{"type":"subAgentActivity","id":"call_2","kind":"started","agentThreadId":"sub","agentPath":"/root/sleeper"}})), &em);
+        handle(&mut st, &sp, &note("turn/started", "sub", json!({"turn":{"id":"st2"}})), &em);
+        assert!(stop_sub(&mut st, "nope").is_none());
+        let m = stop_sub(&mut st, "sub").unwrap();
+        assert_eq!(m["method"], "turn/interrupt");
+        assert_eq!(m["params"], json!({"threadId":"sub","turnId":"st2"}));
+        handle(&mut st, &sp, &note("turn/completed", "sub", json!({"turn":{"id":"st2","status":"interrupted"}})), &em);
+        let evs = hub.store.events_since("s", 0, 100).unwrap();
+        assert!(evs.iter().any(|e| matches!(&e.body, EventBody::System { text } if text == "后台任务已停止：子 agent sleeper")));
+        assert!(evs.iter().any(|e| matches!(&e.body, EventBody::ToolResult { id, is_error: true, .. } if id == "call_2")));
+        assert!(hub.info("s").unwrap().background_tasks.is_empty());
+        // Never a TurnEnd from a subagent
+        assert!(!evs.iter().any(|e| matches!(e.body, EventBody::TurnEnd { .. })));
     }
 
     #[test]

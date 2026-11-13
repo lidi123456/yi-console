@@ -127,6 +127,8 @@ struct State {
     agy_pending_calls: HashMap<String, AgyPendingCall>,
     agy_send_baselines: HashMap<String, usize>,
     agy_watch: Option<AgyWatch>,
+    /// Subagents still running when a new prompt went out: the prompt's own watch picks them up when it returns
+    agy_carry: AgyCarry,
 }
 
 impl State {
@@ -294,15 +296,21 @@ pub async fn run(spec: StartSpec, em: Emitter, mut rx: mpsc::UnboundedReceiver<A
                         st.queue.clear();
                         em.event(EventBody::TurnEnd { stop_reason: Some("cancelled".into()), model: None });
                     }
-                    // A detached watch has no open turn unless a late reply reopened it
-                    if let Some(open) = st.agy_watch.as_ref().map(|w| !w.detached || w.reopened) {
-                        for m in drop_agy_watch(&mut st, &em, true) {
-                            let _ = p.send(&m).await;
-                        }
-                        if open {
-                            st.prompting = false;
-                            st.end_subagents();
-                            em.event(EventBody::TurnEnd { stop_reason: Some("cancelled".into()), model: None });
+                    // The watch's turn is only open while the parent's wakeup runs. Interrupting that stops the parent;
+                    // subagents still running stay background tasks (stopped one by one from the list)
+                    if st.agy_watch.as_ref().is_some_and(|w| w.reopened) {
+                        carry_agy_watch(&mut st, &em);
+                        st.prompting = false;
+                        st.end_subagents();
+                        em.event(EventBody::TurnEnd { stop_reason: Some("cancelled".into()), model: None });
+                        if !st.agy_carry.subs.is_empty() {
+                            if let Some(sid) = st.session_id.clone() {
+                                let steps = count_agy_transcript_steps(&agy_brain_dir(), &sid);
+                                let mut w = AgyWatch::new(sid, agy_brain_dir(), steps, steps, None, HashMap::new(), HashMap::new(), st.perm != "bypass");
+                                w.adopt(std::mem::take(&mut st.agy_carry));
+                                w.detached = true;
+                                st.agy_watch = Some(w);
+                            }
                         }
                     }
                     if let Some(sid) = st.session_id.clone() {
@@ -336,12 +344,18 @@ pub async fn run(spec: StartSpec, em: Emitter, mut rx: mpsc::UnboundedReceiver<A
                         em.event(EventBody::PermissionResolved { request_id, option_id, answers: vec![] });
                     }
                 }
+                Some(AdapterCmd::StopTask(task)) if st.is_antigravity => {
+                    // Background task ids are subagent conversation ids
+                    if let Some(m) = stop_agy_subagent(&mut st, &em, &task) {
+                        let _ = p.send(&m).await;
+                    }
+                }
                 Some(AdapterCmd::Kill) | None => { killed = true; break; }
                 Some(_) => {}
             }
         }
     }
-    let _ = drop_agy_watch(&mut st, &em, false);
+    drop_agy_watch(&mut st, &em);
     flush(&mut st, &em);
     let msg = p.finish(killed).await;
     em.exited(fatal.or(msg));
@@ -443,8 +457,9 @@ fn prompt(st: &mut State, em: &Emitter, p: &Prompt) -> Value {
     st.turn_credits = 0.0;
     st.agy_pending_calls.clear();
     st.agy_send_baselines.clear();
-    // A detached watch (still waiting for a late subagent reply) ends with the next prompt: agy hands that reply to the new turn itself
-    let _ = drop_agy_watch(st, em, false);
+    // The watch can't run during a prompt (the parent's own steps would look like a wakeup): its running subagents
+    // wait in agy_carry for this prompt's watch. A report arriving meanwhile is handed to this turn by agy itself
+    carry_agy_watch(st, em);
     st.agy_pre_turn_steps = match st.session_id.as_deref() {
         Some(sid) if st.is_antigravity => count_agy_transcript_steps(&agy_brain_dir(), sid),
         _ => 0,
@@ -856,13 +871,14 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Result<V
                 }
                 let stop_reason = r["stopReason"].as_str().map(str::to_string);
                 let should_watch = st.is_antigravity
-                    && meta_err.is_none()
-                    && limit_left.is_none()
-                    && stop_reason.as_deref() != Some("cancelled")
-                    && (!st.agy_pending_calls.is_empty()
-                        || st.session_id.as_deref().is_some_and(|sid| {
-                            has_pending_agy_subagent_turn(&agy_brain_dir(), sid, st.agy_pre_turn_steps)
-                        }));
+                    && (!st.agy_carry.subs.is_empty()
+                        || (meta_err.is_none()
+                            && limit_left.is_none()
+                            && stop_reason.as_deref() != Some("cancelled")
+                            && (!st.agy_pending_calls.is_empty()
+                                || st.session_id.as_deref().is_some_and(|sid| {
+                                    has_pending_agy_subagent_turn(&agy_brain_dir(), sid, st.agy_pre_turn_steps)
+                                }))));
                 if should_watch {
                     if let Some(sid) = st.session_id.clone() {
                         let wake_from = count_agy_transcript_steps(&agy_brain_dir(), &sid);
@@ -876,16 +892,26 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Result<V
                             std::mem::take(&mut st.agy_send_baselines),
                             st.perm != "bypass",
                         );
+                        watch.adopt(std::mem::take(&mut st.agy_carry));
+                        // The turn ends now; the subagents go on as background tasks
+                        watch.detached = true;
                         // One pass right away, so subagents that already finished are picked up without waiting for a tick
-                        match step_agy_watch(&mut watch, spec, em, &mut st.next_id, &mut st.pending) {
+                        let step = step_agy_watch(&mut watch, spec, em, &mut st.next_id, &mut st.pending);
+                        st.prompting = false;
+                        st.end_subagents();
+                        // A wakeup already seen in this pass reopened the turn: that one ends it
+                        let reopened = watch.reopened;
+                        if !reopened {
+                            em.event(EventBody::TurnEnd { stop_reason: watch.stop_reason.clone(), model: None });
+                        }
+                        match step {
                             AgyStep::Done(req) => {
                                 out.extend(req);
-                                st.prompting = false;
-                                st.end_subagents();
-                                em.event(EventBody::TurnEnd { stop_reason: watch.stop_reason, model: None });
+                                if reopened {
+                                    em.event(EventBody::TurnEnd { stop_reason: watch.stop_reason, model: None });
+                                }
                             }
-                            // Detaching needs the tick to have seen the subagent at rest first; keep the turn for now
-                            AgyStep::Wait | AgyStep::Detach => st.agy_watch = Some(watch),
+                            AgyStep::Wait => st.agy_watch = Some(watch),
                         }
                         return Ok(out);
                     }
@@ -1431,7 +1457,7 @@ fn update(st: &mut State, em: &Emitter, u: &Value) {
                                 .or_insert_with(|| count_agy_transcript_steps(&agy_brain_dir(), recip));
                         }
                     }
-                    st.agy_pending_calls.insert(id.clone(), AgyPendingCall { name: agy_tool.to_string(), target_subagent: target });
+                    st.agy_pending_calls.insert(id.clone(), AgyPendingCall { name: agy_tool.to_string(), target_subagent: target, desc: agy_task_desc(&t.input) });
                 }
             }
             let status = u["status"].as_str().unwrap_or("");
@@ -1812,12 +1838,43 @@ struct AgySubagentTracker {
     last_text: Option<String>,
     done: bool,
     transcript: AgyTranscript,
+    /// Background task description (from the call that started it)
+    desc: String,
+    /// When the watch first saw it (ms), for the background task list
+    started_at: i64,
+    /// Stopped from the background task list
+    stopped: bool,
+    /// Its "finished" line was posted
+    announced: bool,
+    /// Its "waiting for an approval" error was posted
+    stall_reported: bool,
 }
 
 #[derive(Debug, Clone)]
 struct AgyPendingCall {
     name: String,
     target_subagent: Option<String>,
+    /// Shown in the background task list for the subagent it starts
+    desc: String,
+}
+
+/// Background task description for a subagent call: its role, else the start of its prompt / message
+fn agy_task_desc(input: &Value) -> String {
+    let first = input["Subagents"].as_array().and_then(|a| a.first()).unwrap_or(input);
+    let pick = |v: &Value| {
+        ["Role", "TypeName", "name", "Prompt", "Message", "brief", "prompt", "message"]
+            .iter()
+            .find_map(|k| v[*k].as_str().map(str::trim).filter(|s| !s.is_empty()))
+            .map(|s| crate::util::truncate(&s.replace(char::is_whitespace, " "), 80))
+    };
+    pick(first).or_else(|| pick(input)).unwrap_or_default()
+}
+
+/// Running subagents handed from one watch to the next across a prompt
+#[derive(Debug, Default)]
+struct AgyCarry {
+    subs: Vec<(String, AgySubagentTracker)>,
+    calls: HashMap<String, AgyPendingCall>,
 }
 
 /// What a pass of the watch decided
@@ -1827,14 +1884,13 @@ enum AgyStep {
     Wait,
     /// Finished; the request (if any) goes to agy
     Done(Option<Value>),
-    /// Stop holding the turn open (a subagent waits for an approval we never see, or it runs too long), but keep
-    /// watching in the background so a late reply still shows up
-    Detach,
 }
 
 /// Antigravity subagents (`invoke_subagent`, `send_message` to one, `swarm`) run in the background: agy ends the
 /// prompt turn right after launching them, and when they report back it wakes the parent by itself, outside any
-/// ACP prompt, so none of that is streamed. This follows their transcripts on disk instead
+/// ACP prompt, so none of that is streamed. This follows their transcripts on disk instead. Like Claude's
+/// background tasks, the turn ends with the prompt; running subagents are listed as the session's background
+/// tasks, and the parent's wakeup reopens the session (Running, then TurnEnd)
 #[derive(Debug)]
 struct AgyWatch {
     parent_sid: String,
@@ -1857,9 +1913,11 @@ struct AgyWatch {
     all_subagents_done_at: Option<tokio::time::Instant>,
     /// Allow-all launches agy with --dangerously-skip-permissions, so subagents never wait for approval there
     stall_check: bool,
-    /// The turn already ended (TurnEnd sent); anything new reopens it with a Running status first
+    /// The turn already ended (TurnEnd sent); the parent's wakeup reopens it with a Running status first
     detached: bool,
     reopened: bool,
+    /// This pass produced the parent's own events (its wakeup), which reopen a detached turn
+    wake: bool,
     out: AgyOut,
 }
 
@@ -1894,6 +1952,7 @@ impl AgyWatch {
             stall_check,
             detached: false,
             reopened: false,
+            wake: false,
             out: vec![],
         };
         for (sid, baseline) in send_baselines {
@@ -1915,20 +1974,81 @@ impl AgyWatch {
                 .unwrap_or(0)
         });
         self.subagent_order.push(sub_id.clone());
-        self.subagents.insert(sub_id, AgySubagentTracker { start_step, next_step: start_step, ..Default::default() });
+        self.subagents.insert(
+            sub_id,
+            AgySubagentTracker { start_step, next_step: start_step, started_at: crate::util::now_ms(), ..Default::default() },
+        );
         self.all_subagents_done_at = None;
+    }
+
+    /// Take over subagents still running from the previous watch
+    fn adopt(&mut self, carry: AgyCarry) {
+        for (id, t) in carry.subs {
+            if !self.subagents.contains_key(&id) {
+                self.subagent_order.push(id.clone());
+                self.subagents.insert(id, t);
+                self.all_subagents_done_at = None;
+            }
+        }
+        self.pending_calls.extend(carry.calls);
+    }
+
+    /// Running subagents as background tasks
+    fn tasks(&mut self) -> Vec<BackgroundTask> {
+        let mut v = vec![];
+        for id in &self.subagent_order {
+            let Some(t) = self.subagents.get_mut(id) else { continue };
+            if t.desc.is_empty() {
+                if let Some(c) = self.pending_calls.values().find(|c| c.target_subagent.as_deref() == Some(id.as_str())) {
+                    t.desc = c.desc.clone();
+                }
+            }
+            if !t.done {
+                v.push(BackgroundTask {
+                    id: id.clone(),
+                    kind: "local_agent".into(),
+                    description: if t.desc.is_empty() { id.chars().take(8).collect() } else { t.desc.clone() },
+                    started_at: t.started_at,
+                    output_file: None,
+                });
+            }
+        }
+        v
+    }
+
+    /// Mark a subagent stopped from the background task list; the caller sends session/cancel for it
+    fn stop(&mut self, id: &str) -> bool {
+        let _ = self.tasks();
+        let Some(t) = self.subagents.get_mut(id).filter(|t| !t.done) else {
+            return false;
+        };
+        t.done = true;
+        t.stopped = true;
+        t.announced = true;
+        let name = if t.desc.is_empty() { id.chars().take(8).collect() } else { t.desc.clone() };
+        t.lane.close_all(&mut self.out);
+        // Its call won't get a report; close it now (a restart waiting for the task list to empty comes next)
+        let calls: Vec<String> =
+            self.pending_calls.iter().filter(|(_, c)| c.target_subagent.as_deref() == Some(id)).map(|(k, _)| k.clone()).collect();
+        for k in calls {
+            self.pending_calls.remove(&k);
+            self.out.push(EventBody::ToolResult { id: k, output: String::new(), is_error: true });
+        }
+        self.out.push(EventBody::System { text: format!("后台任务已停止：子 agent {name}") });
+        true
     }
 
     fn running_subagents(&self) -> Vec<String> {
         self.subagent_order.iter().filter(|id| self.subagents.get(*id).is_some_and(|t| !t.done)).cloned().collect()
     }
 
-    /// Send what this pass produced. A detached turn is reopened (status Running) before its first new event
+    /// Send what this pass produced. A detached turn is reopened (status Running) before the parent's wakeup;
+    /// the subagents' own events go out while the session is idle, like a background task's
     fn flush_out(&mut self, em: &Emitter) {
         if self.out.is_empty() {
             return;
         }
-        if self.detached && !self.reopened {
+        if self.detached && !self.reopened && self.wake {
             self.reopened = true;
             em.status(SessionStatus::Running, None);
         }
@@ -1939,6 +2059,9 @@ impl AgyWatch {
 }
 
 fn subagent_summary_text(t: &AgySubagentTracker) -> String {
+    if t.stopped {
+        return String::new();
+    }
     t.reply.clone().or_else(|| t.last_text.clone()).unwrap_or_default()
 }
 
@@ -1986,33 +2109,92 @@ fn finish_agy_watch(watch: &mut AgyWatch, em: &Emitter) {
     watch.flush_out(em);
 }
 
-/// Stop following the subagents: on interrupt, a new prompt, or when the adapter exits. `cancel` also stops the
-/// subagents still running (session/cancel on their conversation ids does that; session/close doesn't)
-fn drop_agy_watch(st: &mut State, em: &Emitter, cancel: bool) -> Vec<Value> {
-    let Some(mut watch) = st.agy_watch.take() else {
-        return vec![];
-    };
-    let running = watch.running_subagents();
-    finish_agy_watch(&mut watch, em);
-    if !cancel {
-        return vec![];
+/// Stop following the subagents (the adapter exits)
+fn drop_agy_watch(st: &mut State, em: &Emitter) {
+    if let Some(mut watch) = st.agy_watch.take() {
+        finish_agy_watch(&mut watch, em);
+        em.background_tasks(vec![]);
     }
-    running.into_iter().map(|sub| json!({"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":sub}})).collect()
+}
+
+/// End the watch but keep its running subagents (with their calls still waiting for a report) in `st.agy_carry`:
+/// a new prompt is going out (the parent's own steps would confuse the watch), or the wakeup turn was interrupted
+fn carry_agy_watch(st: &mut State, em: &Emitter) {
+    let Some(mut watch) = st.agy_watch.take() else {
+        return;
+    };
+    for id in watch.running_subagents() {
+        if let Some(t) = watch.subagents.remove(&id) {
+            st.agy_carry.subs.push((id, t));
+        }
+    }
+    watch.subagent_order.retain(|id| watch.subagents.contains_key(id));
+    let carried: Vec<String> = st.agy_carry.subs.iter().map(|(id, _)| id.clone()).collect();
+    let calls: Vec<String> = watch
+        .pending_calls
+        .iter()
+        .filter(|(_, c)| c.target_subagent.as_ref().is_some_and(|t| carried.contains(t)))
+        .map(|(k, _)| k.clone())
+        .collect();
+    for k in calls {
+        if let Some(c) = watch.pending_calls.remove(&k) {
+            st.agy_carry.calls.insert(k, c);
+        }
+    }
+    finish_agy_watch(&mut watch, em);
+}
+
+/// session/cancel for a subagent stopped from the background task list (session/close doesn't stop it)
+fn stop_agy_subagent(st: &mut State, em: &Emitter, id: &str) -> Option<Value> {
+    let in_watch = st.agy_watch.as_mut().is_some_and(|w| w.stop(id));
+    let stopped = match st.agy_watch.as_mut() {
+        Some(w) if in_watch => {
+            w.flush_out(em);
+            em.background_tasks(w.tasks());
+            true
+        }
+        _ => {
+            let pos = st.agy_carry.subs.iter().position(|(sid, t)| sid == id && !t.done)?;
+            let (_, mut t) = st.agy_carry.subs.remove(pos);
+            let mut out = vec![];
+            t.lane.close_all(&mut out);
+            for e in out {
+                em.event(e);
+            }
+            st.agy_carry.calls.retain(|k, c| {
+                let mine = c.target_subagent.as_deref() == Some(id);
+                if mine {
+                    em.event(EventBody::ToolResult { id: k.clone(), output: String::new(), is_error: true });
+                }
+                !mine
+            });
+            let name = if t.desc.is_empty() { id.chars().take(8).collect() } else { t.desc };
+            em.event(EventBody::System { text: format!("后台任务已停止：子 agent {name}") });
+            let left: Vec<BackgroundTask> = em_carry_tasks(&st.agy_carry);
+            em.background_tasks(left);
+            true
+        }
+    };
+    stopped.then(|| json!({"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":id}}))
+}
+
+fn em_carry_tasks(c: &AgyCarry) -> Vec<BackgroundTask> {
+    c.subs
+        .iter()
+        .map(|(id, t)| BackgroundTask {
+            id: id.clone(),
+            kind: "local_agent".into(),
+            description: if t.desc.is_empty() { id.chars().take(8).collect() } else { t.desc.clone() },
+            started_at: t.started_at,
+            output_file: None,
+        })
+        .collect()
 }
 
 fn poll_agy_watch(st: &mut State, spec: &StartSpec, em: &Emitter) -> Option<Value> {
     let mut watch = st.agy_watch.take()?;
     match step_agy_watch(&mut watch, spec, em, &mut st.next_id, &mut st.pending) {
         AgyStep::Wait => {
-            st.agy_watch = Some(watch);
-            None
-        }
-        AgyStep::Detach => {
-            st.prompting = false;
-            st.end_subagents();
-            em.event(EventBody::TurnEnd { stop_reason: watch.stop_reason.clone(), model: None });
-            watch.detached = true;
-            watch.started_at = tokio::time::Instant::now();
             st.agy_watch = Some(watch);
             None
         }
@@ -2044,15 +2226,14 @@ fn step_agy_watch(
     } else {
         watch.flush_out(em);
     }
+    em.background_tasks(if matches!(step, AgyStep::Done(_)) { vec![] } else { watch.tasks() });
     step
 }
 
 fn step_agy_watch_inner(watch: &mut AgyWatch, spec: &StartSpec, next_id: &mut u64, pending: &mut HashMap<u64, Pending>) -> AgyStep {
     use std::time::Duration;
-    /// How long a turn is held open for running subagents
-    const OVERALL_TIMEOUT: Duration = Duration::from_secs(600);
-    /// How long a detached watch keeps waiting for a late reply
-    const DETACHED_TIMEOUT: Duration = Duration::from_secs(1800);
+    /// Give up on subagents whose transcripts (and the parent's) haven't moved for this long
+    const IDLE_TIMEOUT: Duration = Duration::from_secs(1800);
     const DISCOVER_GRACE: Duration = Duration::from_secs(3);
     const WAKEUP_GRACE: Duration = Duration::from_secs(20);
     /// A subagent whose transcript ends in a tool call without a result, and that doesn't move for this long, is
@@ -2060,6 +2241,18 @@ fn step_agy_watch_inner(watch: &mut AgyWatch, spec: &StartSpec, next_id: &mut u6
     const STALL: Duration = Duration::from_secs(30);
 
     let parent_steps = watch.parent.refresh(&watch.brain_dir, &watch.parent_sid);
+    let idle_for = || {
+        watch
+            .subagents
+            .values()
+            .filter_map(|t| t.transcript.changed_at)
+            .chain(watch.parent.changed_at)
+            .chain(std::iter::once(watch.started_at))
+            .max()
+            .map(|t| t.elapsed())
+            .unwrap_or_default()
+    };
+    let timed_out = idle_for() >= IDLE_TIMEOUT;
 
     // 1. Discover newly spawned/messaged subagents from parent transcript steps since pre_turn_steps
     while watch.next_parent_discover_step < parent_steps.len() {
@@ -2100,7 +2293,6 @@ fn step_agy_watch_inner(watch: &mut AgyWatch, spec: &StartSpec, next_id: &mut u6
 
     // 2. Poll each subagent's own transcript for live tool calls, results, and final reply
     let parent_sid = watch.parent_sid.clone();
-    let mut stalled = false;
     for sub_id in watch.subagent_order.clone() {
         let Some(tracker) = watch.subagents.get_mut(&sub_id) else { continue };
         let sub_steps = tracker.transcript.refresh(&watch.brain_dir, &sub_id);
@@ -2147,15 +2339,19 @@ fn step_agy_watch_inner(watch: &mut AgyWatch, spec: &StartSpec, next_id: &mut u6
         if !tracker.done && !tracker.lane.busy() && ended {
             tracker.done = true;
         }
-        // Waiting on a tool call that never got a result, with the transcript at rest: an approval nobody can give
+        // Waiting on a tool call that never got a result, with the transcript at rest: an approval nobody can give.
+        // Said once; it stays in the background task list, where it can be stopped
         if watch.stall_check
-            && !watch.detached
             && !tracker.done
+            && !tracker.stall_reported
             && !tracker.lane.open.is_empty()
             && tracker.next_step == sub_steps.len()
             && tracker.transcript.changed_at.is_some_and(|t| t.elapsed() >= STALL)
         {
-            stalled = true;
+            tracker.stall_reported = true;
+            watch.out.push(EventBody::Error {
+                message: "子 agent 在等待审批，但 agy 不会把子 agent 的审批请求转给 Yi Console。在后台任务里停止它，切到「全部放行」后重试，或在终端模式里处理".into(),
+            });
         }
     }
 
@@ -2184,21 +2380,21 @@ fn step_agy_watch_inner(watch: &mut AgyWatch, spec: &StartSpec, next_id: &mut u6
         }
     }
 
+    // A line for each subagent that finished, like Claude's background task notices (format parsed by ChatView)
+    let _ = watch.tasks();
+    for id in watch.subagent_order.clone() {
+        if let Some(t) = watch.subagents.get_mut(&id).filter(|t| t.done && !t.announced) {
+            t.announced = true;
+            let name = if t.desc.is_empty() { id.chars().take(8).collect() } else { t.desc.clone() };
+            watch.out.push(EventBody::System { text: format!("后台任务完成：子 agent {name}") });
+        }
+    }
+
     flush_ready_pending_calls(watch, false);
 
     // 4. Wait until all tracked subagents are finished
     if !watch.subagents.values().all(|t| t.done) {
-        if stalled {
-            watch.out.push(EventBody::Error {
-                message: "子 agent 在等待审批，但 agy 不会把子 agent 的审批请求转给 Yi Console。切到「全部放行」后重试，或在终端模式里处理".into(),
-            });
-            return AgyStep::Detach;
-        }
-        let limit = if watch.detached { DETACHED_TIMEOUT } else { OVERALL_TIMEOUT };
-        if watch.started_at.elapsed() >= limit {
-            return if watch.detached { AgyStep::Done(None) } else { AgyStep::Detach };
-        }
-        return AgyStep::Wait;
+        return if timed_out { AgyStep::Done(None) } else { AgyStep::Wait };
     }
 
     let done_at = *watch.all_subagents_done_at.get_or_insert_with(tokio::time::Instant::now);
@@ -2224,7 +2420,7 @@ fn step_agy_watch_inner(watch: &mut AgyWatch, spec: &StartSpec, next_id: &mut u6
                         watch.out.push(EventBody::ToolCall { id: tc_id.clone(), name: tc_name.to_string(), title: tc_name.to_string(), input: tc_args.clone(), diffs: vec![] });
                         if is_agy_subagent_tool(tc_name, &tc_args) {
                             let target = agy_recipient(&tc_args).map(str::to_string);
-                            watch.pending_calls.insert(tc_id, AgyPendingCall { name: tc_name.to_string(), target_subagent: target.clone() });
+                            watch.pending_calls.insert(tc_id, AgyPendingCall { name: tc_name.to_string(), target_subagent: target.clone(), desc: agy_task_desc(&tc_args) });
                             if let Some(recip) = target {
                                 watch.add_subagent(recip, None);
                             }
@@ -2252,6 +2448,7 @@ fn step_agy_watch_inner(watch: &mut AgyWatch, spec: &StartSpec, next_id: &mut u6
             }
             watch.next_parent_emit_step += 1;
             watch.wakeup_stable_ticks = 0;
+            watch.wake = true;
         }
 
         // Did the wakeup turn launch another chained subagent? If so, wait for it
@@ -2280,7 +2477,7 @@ fn step_agy_watch_inner(watch: &mut AgyWatch, spec: &StartSpec, next_id: &mut u6
         }
     }
 
-    if done_at.elapsed() >= WAKEUP_GRACE || watch.started_at.elapsed() >= if watch.detached { DETACHED_TIMEOUT } else { OVERALL_TIMEOUT } {
+    if done_at.elapsed() >= WAKEUP_GRACE || timed_out {
         let emitted_wakeup_text = watch.wakeup_msg_idx.is_some_and(|wi| {
             parent_steps[wi + 1..watch.next_parent_emit_step.min(parent_steps.len())]
                 .iter()
@@ -2289,6 +2486,7 @@ fn step_agy_watch_inner(watch: &mut AgyWatch, spec: &StartSpec, next_id: &mut u6
         if !emitted_wakeup_text {
             let fallback: String = watch.subagent_order.iter().filter_map(|sid| watch.subagents.get(sid)).map(subagent_summary_text).filter(|s| !s.is_empty()).collect::<Vec<_>>().join("\n\n");
             if !fallback.is_empty() {
+                watch.wake = true;
                 watch.out.push(EventBody::AssistantText { id: format!("agy-sub-fallback-{}", watch.parent_sid), text: fallback });
             }
         }
@@ -2902,9 +3100,15 @@ mod model_config_tests {
         let mut next_id = 10;
         let mut pending = HashMap::new();
 
+        watch.detached = true;
         // First tick: discovers subagent and emits subagent's live generate_image ToolCall
         assert!(matches!(step_agy_watch(&mut watch, &spec, &em, &mut next_id, &mut pending), AgyStep::Wait));
         assert_eq!(watch.subagent_order, vec![sub_id]);
+        // Listed as a background task named after the call's role; its own tool calls don't reopen the turn
+        let tasks = hub.info("s").unwrap().background_tasks;
+        assert_eq!(tasks.len(), 1);
+        assert_eq!((tasks[0].id.as_str(), tasks[0].description.as_str()), (sub_id, "Image Generator"));
+        assert!(!watch.reopened);
 
         // 3. Subagent completes generate_image and sends result back to parent
         write_steps(
@@ -2937,12 +3141,20 @@ mod model_config_tests {
         };
         assert_eq!(sync["method"], "session/resume");
         assert_eq!(sync["params"]["sessionId"], parent_id);
+        // The parent's wakeup reopened the session; the task list is empty again
+        assert!(watch.reopened);
+        assert!(hub.info("s").unwrap().background_tasks.is_empty());
 
         let evs = hub.store.events_since("s", 0, 100).unwrap();
         assert!(evs.iter().any(|e| matches!(&e.body, EventBody::ToolCall { name, .. } if name == "generate_image")));
         assert!(evs.iter().any(|e| matches!(&e.body, EventBody::ToolResult { id, output, .. } if id.starts_with("agy-sub:") && output.contains("/tmp/cat.png"))));
         assert!(evs.iter().any(|e| matches!(&e.body, EventBody::ToolResult { id, output, .. } if id == "tc-sub-1" && output == "Image saved at /tmp/cat.png")));
         assert!(evs.iter().any(|e| matches!(&e.body, EventBody::AssistantText { text, .. } if text == "Here is your image: ![cat](/tmp/cat.png)")));
+        assert!(evs.iter().any(|e| matches!(&e.body, EventBody::System { text } if text == "后台任务完成：子 agent Image Generator")));
+        // The finished line comes before the wakeup reply
+        let done = evs.iter().position(|e| matches!(&e.body, EventBody::System { .. })).unwrap();
+        let reply = evs.iter().position(|e| matches!(&e.body, EventBody::AssistantText { text, .. } if text.starts_with("Here is"))).unwrap();
+        assert!(done < reply);
 
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -3016,7 +3228,7 @@ mod model_config_tests {
             json!({"type":"PLANNER_RESPONSE","status":"DONE","content":"Running in the background, waiting."}),
         ];
         write_agy_steps(&root, "s1", &sub);
-        let calls = HashMap::from([("tc".to_string(), AgyPendingCall { name: "invoke_subagent".into(), target_subagent: None })]);
+        let calls = HashMap::from([("tc".to_string(), AgyPendingCall { name: "invoke_subagent".into(), target_subagent: None, desc: String::new() })]);
         let mut watch = AgyWatch::new("p1".into(), root.clone(), 0, 4, Some("end_turn".into()), calls, HashMap::new(), true);
         let spec = agy_test_spec();
         let (mut next_id, mut pending) = (1, HashMap::new());
@@ -3036,7 +3248,7 @@ mod model_config_tests {
     }
 
     #[test]
-    fn antigravity_subagent_waiting_for_approval_detaches() {
+    fn antigravity_subagent_waiting_for_approval() {
         use super::*;
         let root = std::env::temp_dir().join(format!("yi-agy-stall-{}", uuid::Uuid::new_v4()));
         let (hub, em, _rx) = crate::hub::test_emitter();
@@ -3047,17 +3259,33 @@ mod model_config_tests {
         ]);
         let spec = agy_test_spec();
         let (mut next_id, mut pending) = (1, HashMap::new());
+        let errors = || hub.store.events_since("s", 0, 100).unwrap().iter().filter(|e| matches!(&e.body, EventBody::Error { message } if message.starts_with("子 agent 在等待审批"))).count();
         for stall_check in [false, true] {
             let mut watch = AgyWatch::new("p1".into(), root.clone(), 0, 1, None, HashMap::new(), HashMap::from([("s1".to_string(), 0)]), stall_check);
+            watch.detached = true;
             assert!(matches!(step_agy_watch(&mut watch, &spec, &em, &mut next_id, &mut pending), AgyStep::Wait));
-            // The subagent's transcript hasn't moved for longer than the stall limit
+            // A running subagent is a background task
+            let tasks = hub.info("s").unwrap().background_tasks;
+            assert_eq!(tasks.len(), 1);
+            assert_eq!((tasks[0].id.as_str(), tasks[0].kind.as_str()), ("s1", "local_agent"));
+            // The subagent's transcript hasn't moved for longer than the stall limit: said once, and the watch goes on
+            // (allow-all runs agy with --dangerously-skip-permissions, where waiting means a slow tool)
             watch.subagents.get_mut("s1").unwrap().transcript.changed_at = Some(tokio::time::Instant::now() - std::time::Duration::from_secs(31));
-            let step = step_agy_watch(&mut watch, &spec, &em, &mut next_id, &mut pending);
-            // Allow-all runs agy with --dangerously-skip-permissions, where waiting means a slow tool
-            assert_eq!(matches!(step, AgyStep::Detach), stall_check, "stall_check={stall_check}");
+            assert!(matches!(step_agy_watch(&mut watch, &spec, &em, &mut next_id, &mut pending), AgyStep::Wait));
+            assert!(matches!(step_agy_watch(&mut watch, &spec, &em, &mut next_id, &mut pending), AgyStep::Wait));
+            assert_eq!(errors(), stall_check as usize);
+            // Never reopened by the subagent's own events
+            assert!(!watch.reopened);
+            if stall_check {
+                // Stopped from the background task list
+                assert!(watch.stop("s1"));
+                assert!(!watch.stop("s1"));
+                watch.flush_out(&em);
+                assert!(watch.tasks().is_empty());
+                let evs = hub.store.events_since("s", 0, 100).unwrap();
+                assert!(evs.iter().any(|e| matches!(&e.body, EventBody::System { text } if text == "后台任务已停止：子 agent s1")));
+            }
         }
-        let evs = hub.store.events_since("s", 0, 100).unwrap();
-        assert_eq!(evs.iter().filter(|e| matches!(&e.body, EventBody::Error { message } if message.starts_with("子 agent 在等待审批"))).count(), 1);
         assert_eq!(count_agy_transcript_steps(&root, "s1"), 2);
         assert_eq!(count_agy_transcript_steps(&root, "../s1"), 0);
         std::fs::remove_dir_all(root).unwrap();
