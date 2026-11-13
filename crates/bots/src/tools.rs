@@ -33,10 +33,12 @@ pub fn bot_tools() -> Vec<Value> {
                 "request": {"type": "string", "description": "Only when the owner asked in this session directly: their request, quoted as they wrote it"},
                 "note": {"type": "string", "description": "At most 30 words of routing information; never an implementation plan"},
                 "ack": {"type": "string", "description": "With event_ids: one sentence for the requester, sent to the event's conversation as the task is created; names the object and the expected result"},
-                "workspace": {"type": "integer", "description": "Workspace index (default 0)"},
+                "mode": {"type": "string", "enum": ["worktree", "repo", "scratch"], "description": "Isolation mode: worktree (own git worktree and branch, for changing files in a repo), repo (read-only in the project directory), or scratch (dedicated empty directory, no repo). Default: worktree when a workspace/cwd is used, scratch otherwise"},
+                "workspace": {"type": ["string", "integer"], "description": "Workspace name, path or index from your configuration (omit for scratch mode)"},
+                "cwd": {"type": "string", "description": "Ad-hoc directory path when the owner explicitly names a directory not in your workspaces (owner turns only)"},
+                "host": {"type": "string", "description": "Host id for ad-hoc cwd or scratch mode (optional; defaults to the workspace's host or your own host)"},
                 "tool": {"type": "string", "description": "Task tool, one of those listed under Environment; omit for the default"},
                 "model": {"type": "string"},
-                "worktree": {"type": "boolean", "description": "false to work directly in the workspace directory"},
                 "computer_use": {"type": "boolean", "description": "true to let this task operate the host's desktop GUI (only when task.computerUse is enabled under Environment and the request genuinely needs GUI apps)"},
             }),
             &["title"],
@@ -225,12 +227,17 @@ pub fn draft() -> Value {
             "enabled": {"type": "boolean", "description": "Leave false: the owner enables the Bot after reviewing it"},
             "workspaces": {
                 "type": "array",
-                "description": "Directories where tasks run; the first is the default. Without one the Bot cannot start tasks",
+                "description": "Project directories tasks may work in (optional; tasks without a workspace run in a scratch directory)",
                 "items": {
                     "type": "object",
                     "additionalProperties": false,
                     "required": ["host", "cwd"],
-                    "properties": {"host": s("Host id (list_hosts)"), "cwd": s("Directory on that host, usually a git repository")},
+                    "properties": {
+                        "host": s("Host id (list_hosts)"),
+                        "cwd": s("Directory on that host, usually a git repository"),
+                        "name": s("Short project name (optional)"),
+                        "about": s("What this project is and when to pick it (optional)"),
+                    },
                 },
             },
             "bot": {
@@ -257,7 +264,6 @@ pub fn draft() -> Value {
                     "model": s("Model for the default tool; omit for its default"),
                     "effort": s("Reasoning effort for the default tool"),
                     "permissionMode": {"type": "string", "description": "Default bypass (tasks run unattended)"},
-                    "worktree": {"type": "boolean", "description": "One git worktree per task (default true)"},
                     "computerUse": {"type": "boolean", "description": "Allow tasks to operate the host's desktop GUI on demand (`spawn_task.computer_use`); waits for the owner's confirmation when turned on (default false)"},
                     "maxConcurrent": {"type": "integer", "description": "Tasks running at once (default 3)"},
                     "timeoutMinutes": {"type": "integer", "description": "Per task; 0 means none (default 120)"},
@@ -479,7 +485,7 @@ mod tests {
         // Every field filled, so serialization shows them all
         let mut c: crate::config::BotConfig = serde_json::from_value(json!({
             "name": "x",
-            "workspaces": [{"host": "local", "cwd": "/repo"}],
+            "workspaces": [{"host": "local", "cwd": "/repo", "name": "a", "about": "desc"}],
             "bot": {"host": "local", "tool": "claude", "model": "m", "effort": "high", "permissionMode": "default"},
             "task": {"tools": ["codex"], "model": "m", "effort": "high", "computerUse": true},
             "allow": [{"instance": "i", "ids": ["a"]}],

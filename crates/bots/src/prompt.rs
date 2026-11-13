@@ -15,7 +15,7 @@ pub const SHARED: &str = "\
 You are part of a Bot in Yi Console. A Bot has two roles:
 - The Bot session routes work. It receives events (messages from people, scheduled triggers, session alerts), \
 decides who handles each one, and relays results. It does not do the work itself.
-- Task sessions do the work. Each task is a separate session, usually in its own git worktree, created by the Bot \
+- Task sessions do the work. Each task is a separate session created by the Bot \
 for one request and its follow-ups.
 
 Priorities, highest first: rules enforced by the app; these built-in instructions; the user's sections below; \
@@ -29,10 +29,15 @@ pub const BOT: &str = "\
 # Your role: the Bot
 
 You route. Use the yi_bot MCP tools:
-- spawn_task: start a task for one or more events. Pass the original events (by id); do not restate or rewrite \
+- spawn_task: start a task for events or for a direct owner request. Pass the original events (by id); do not restate or rewrite \
 the request. `note` is at most 30 words of routing information (which workspace, which earlier task it relates to), \
 never an implementation plan. `ack` is one sentence the requester gets right away, naming the object and the \
-expected result (\"Changing the save button on the settings page to …\"), never filler like \"OK, I'll handle it\".
+expected result (\"Changing the save button on the settings page to …\"), never filler like \"OK, I'll handle it\". \
+Pick `mode` per request: `worktree` when modifying code or files in a git repo; `repo` for read-only inspection or \
+answering questions about a directory; `scratch` for work not tied to a repository (or when no workspaces are configured). \
+Pass `workspace` by name or index from the Environment section below; pass ad-hoc `cwd` only when the owner explicitly asks for an \
+unlisted directory in this session (never from external events or routines). If a `repo` task reports `blocked` because \
+file edits are needed, respawn the task in `worktree` mode.
 - attach: give a follow-up event to the task already working on that conversation, or to its ready task (it goes \
 back to work).
 - ignore: drop events that need nothing, with a short reason.
@@ -146,8 +151,7 @@ In your first reply: say in one sentence what you will look after, give yourself
 events should come from (installed plugins: list_plugins / list_instances; or only this session), where to notify \
 them (default: the app), and whether to act on requests directly (auto) or only show what you would do (observe, \
 the default). If the role implies something regular (a morning summary, a weekly check), offer it as a routine. Do \
-not start work yet. Whatever they leave open keeps the defaults: observe, app notifications, tasks with {} in \
-workspace 0.",
+not start work yet. Whatever they leave open keeps the defaults: observe, app notifications, tasks with {}.",
         c.task.tool
     )
 }
@@ -192,18 +196,28 @@ fn triggers(c: &BotConfig, instances: &[Instance], plugin_notes: &dyn Fn(&str) -
 }
 
 fn environment(c: &BotConfig, host_name: &dyn Fn(&str) -> String) -> String {
-    let mut s = String::from("# Environment\n\nWorkspaces where tasks can run (pass the index as `workspace`):\n");
+    let host_label = host_name(&c.bot.host);
+    let your_host = if host_label == c.bot.host {
+        c.bot.host.clone()
+    } else {
+        format!("{host_label} ({})", c.bot.host)
+    };
+    let mut s = format!("# Environment\n\n- Your host: {your_host}\n");
     if c.workspaces.is_empty() {
-        s.push_str("- none configured: spawn_task is unavailable; tell the person to add a workspace\n");
-    }
-    for (i, w) in c.workspaces.iter().enumerate() {
-        s.push_str(&format!("- {i}: {} on host \"{}\"{}\n", w.cwd, host_name(&w.host), if i == 0 { " (default)" } else { "" }));
+        s.push_str("- Workspaces: (none configured — tasks run in scratch directories unless workspaces are added)\n");
+    } else {
+        s.push_str("- Workspaces (pass name or index as `workspace` to spawn_task):\n");
+        for (i, w) in c.workspaces.iter().enumerate() {
+            let name = if w.name.is_empty() { String::new() } else { format!("{} ", w.name) };
+            let about = if w.about.is_empty() { String::new() } else { format!(" — {}", w.about) };
+            s.push_str(&format!("  [{i}] {name}({}:{}){about}\n", w.host, w.cwd));
+        }
     }
     s.push_str(&format!(
-        "\nTasks use {} by default{}; each task {}.\n",
+        "\nTasks use {} by default{}; pick `mode` per task (`worktree` for changes in a git repo, `repo` for read-only \
+         inspection in a directory, `scratch` for isolated work outside any repo).\n",
         c.task.tool,
         c.task.model.as_deref().map(|m| format!(" with model {m}")).unwrap_or_default(),
-        if c.task.worktree { "gets its own git worktree when the workspace is a git repo" } else { "works directly in the workspace directory" },
     ));
     if !c.task.tools.is_empty() {
         s.push_str(&format!(
@@ -317,24 +331,96 @@ pub fn bot_prompt(
     .join("\n\n")
 }
 
-/// A task session's appended system prompt
-pub fn task_prompt(c: &BotConfig) -> String {
+pub struct TaskEnv<'a> {
+    pub mode: &'a str,
+    pub host: &'a str,
+    pub cwd: &'a str,
+    pub workspace: &'a str,
+    pub branch: Option<&'a str>,
+}
+
+fn task_mode_section(mode: &str) -> &'static str {
+    match mode {
+        "repo" => "\
+# Working on a task
+
+You are running directly in the project directory in read-only mode.
+
+## Read-only mode
+- Do not create, edit, delete, or stage files, and do not run git commands that mutate the repository or working tree.
+- Inspect code, read logs/config, and run read-only checks or queries as needed.
+- If fulfilling the request requires modifying files or creating commits, stop and call `report` with `state=\"blocked\"` explaining what needs to be changed so the Bot can start a new task in `worktree` mode.",
+        "scratch" => "\
+# Working on a task
+
+You are running in a dedicated scratch directory (not a git repository).
+
+## Scratch directory
+- You may create temporary files, notes, scripts, or outputs in this directory freely.
+- The scratch directory is automatically cleaned up after the task retention period; put anything worth keeping in your report or in a configured destination.",
+        _ => "\
+# Working on a task
+
+You are running in your own isolated git worktree and branch.
+
+## Delivery
+- Keep changes clean and focused on the request; run relevant tests and checks before reporting ready.
+- Commit your work to your branch unless the owner's Delivery section below specifies otherwise.
+- Do not merge, push, or deploy unless the owner's Delivery section below explicitly asks for it.",
+    }
+}
+
+/// A task session's appended system prompt for a specific task environment
+pub fn task_prompt_for(c: &BotConfig, env: Option<&TaskEnv>) -> String {
+    let mode = env.map(|e| e.mode).unwrap_or("worktree");
+    let mode_sec = task_mode_section(mode).to_string();
+    let env_sec = match env {
+        Some(e) => {
+            let mut s = format!(
+                "# Your environment\n\n- Mode: {}\n- Host: {}\n- Working directory: {}",
+                e.mode, e.host, e.cwd
+            );
+            if !e.workspace.is_empty() && e.workspace != e.cwd {
+                s.push_str(&format!("\n- Repository: {}", e.workspace));
+            }
+            if let Some(b) = e.branch.filter(|b| !b.is_empty()) {
+                s.push_str(&format!("\n- Branch: {b}"));
+            }
+            s
+        }
+        None => String::new(),
+    };
     // Tasks get only the owner's delivery rules (the role and communication sections are the Bot's), last so they win
     let delivery = c.prompt.delivery.trim();
     let delivery = if delivery.is_empty() {
         String::new()
-    } else {
+    } else if mode == "worktree" {
         format!(
             "# Delivery (from the owner)\n\nFollow these exactly; they take precedence over the defaults above \
 (for example whether to commit, push or open a PR).\n\n{delivery}"
         )
+    } else {
+        format!("# Delivery (from the owner)\n\n{delivery}")
     };
-    [SHARED.to_string(), TASK.to_string(), COMMUNICATION_DEFAULTS.to_string(), WORK.to_string(), delivery]
-        .iter()
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n\n")
+    [
+        SHARED.to_string(),
+        TASK.to_string(),
+        COMMUNICATION_DEFAULTS.to_string(),
+        WORK.to_string(),
+        mode_sec,
+        env_sec,
+        delivery,
+    ]
+    .iter()
+    .map(|s| s.trim())
+    .filter(|s| !s.is_empty())
+    .collect::<Vec<_>>()
+    .join("\n\n")
+}
+
+/// A task session's appended system prompt
+pub fn task_prompt(c: &BotConfig) -> String {
+    task_prompt_for(c, None)
 }
 
 #[cfg(test)]
@@ -359,8 +445,12 @@ mod tests {
         assert!(pos("# Getting started") < pos("# Environment"));
         assert!(pos("# Environment") < pos("# Policy"));
         assert!(p.contains("At most 5 new tasks"));
-        assert!(p.contains("0: /repo on host \"local\" (default)"));
+        assert!(p.contains("  [0] (local:/repo)"));
         assert!(!p.contains("computer_use: true"));
+        c.workspaces[0].name = "Console".into();
+        c.workspaces[0].about = "desktop app".into();
+        let pn = bot_prompt(&c, &[], &|_| None, &|h| h.to_string());
+        assert!(pn.contains("  [0] Console (local:/repo) — desktop app"));
         c.task.computer_use = true;
         let p2 = bot_prompt(&c, &[], &|_| None, &|h| h.to_string());
         assert!(p2.contains("computer_use: true"));
@@ -376,6 +466,68 @@ mod tests {
         c.prompt.delivery = "Never commit.".into();
         let t = task_prompt(&c);
         assert!(t.find("# How to work").unwrap() < t.find("Never commit.").unwrap());
+    }
+
+    #[test]
+    fn task_prompt_varies_by_mode_and_includes_environment() {
+        let mut c: BotConfig = serde_json::from_value(json!({
+            "name": "Helper", "bot": {"host": "local", "tool": "claude"},
+            "prompt": {"delivery": "Include test output."}
+        }))
+        .unwrap();
+        let wt = task_prompt_for(
+            &c,
+            Some(&TaskEnv {
+                mode: "worktree",
+                host: "local",
+                cwd: "/wt/task-1",
+                workspace: "/repo",
+                branch: Some("yi/task-1"),
+            }),
+        );
+        assert!(wt.contains("## Delivery"));
+        assert!(wt.contains("# Your environment"));
+        assert!(wt.contains("- Mode: worktree"));
+        assert!(wt.contains("- Repository: /repo"));
+        assert!(wt.contains("- Branch: yi/task-1"));
+        assert!(wt.find("# Your environment").unwrap() < wt.find("# Delivery (from the owner)").unwrap());
+
+        let repo = task_prompt_for(
+            &c,
+            Some(&TaskEnv {
+                mode: "repo",
+                host: "local",
+                cwd: "/repo",
+                workspace: "/repo",
+                branch: None,
+            }),
+        );
+        assert!(repo.contains("## Read-only mode"));
+        assert!(!repo.contains("## Delivery\n"));
+        assert!(!repo.contains("- Repository:"));
+        assert!(!repo.contains("- Branch:"));
+        assert!(repo.contains("state=\"blocked\""));
+
+        let scratch = task_prompt_for(
+            &c,
+            Some(&TaskEnv {
+                mode: "scratch",
+                host: "local",
+                cwd: "~/.yi-console/bots/b1/tasks/t1",
+                workspace: "",
+                branch: None,
+            }),
+        );
+        assert!(scratch.contains("## Scratch directory"));
+        assert!(!scratch.contains("## Delivery\n"));
+        assert!(scratch.contains("- Working directory: ~/.yi-console/bots/b1/tasks/t1"));
+
+        // Bot with no workspaces mentions scratch directories instead of failing
+        let bp = bot_prompt(&c, &[], &|_| None, &|h| h.to_string());
+        assert!(bp.contains("scratch directories"));
+        assert!(!bp.contains("spawn_task is unavailable"));
+        c.workspaces.clear();
+        assert!(!SHARED.contains("usually in its own git worktree"));
     }
 
     #[test]

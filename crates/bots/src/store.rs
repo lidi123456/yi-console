@@ -131,6 +131,15 @@ impl TaskRow {
     pub fn active(&self) -> bool {
         matches!(self.state.as_str(), "queued" | "working" | "needsYou")
     }
+
+    pub fn mode(&self) -> &str {
+        match self.spec["mode"].as_str() {
+            Some(m @ ("worktree" | "repo" | "scratch")) => m,
+            _ if self.worktree.is_some() => "worktree",
+            _ if !self.workspace.is_empty() => "repo",
+            _ => "scratch",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

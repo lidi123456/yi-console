@@ -17,7 +17,7 @@ export interface BotConfig {
   id: string;
   name: string;
   enabled: boolean;
-  workspaces: { host: string; cwd: string }[];
+  workspaces: { host: string; cwd: string; name?: string; about?: string }[];
   bot: { host: string; cwd: string; tool: ToolKind; model?: string | null; effort?: string | null; permissionMode?: string | null };
   task: {
     tool: ToolKind;
@@ -26,7 +26,6 @@ export interface BotConfig {
     model?: string | null;
     effort?: string | null;
     permissionMode: string;
-    worktree: boolean;
     computerUse?: boolean;
     maxConcurrent: number;
     timeoutMinutes: number;
@@ -111,7 +110,7 @@ export interface TaskRow {
   workspace: string;
   /** `dirty`: kept after the task ended because something in it is uncommitted */
   worktree?: { path: string; branch: string; repo: string; dirty?: boolean } | null;
-  spec: Record<string, unknown>;
+  spec: { mode?: 'worktree' | 'repo' | 'scratch'; [key: string]: unknown };
   /** `auto`: written by the engine from the last message of a turn that ended without a report (state `waiting`) */
   lastReport?: { state: string; summary: string; question?: string; links?: string[]; auto?: boolean; at: number } | null;
   hold: boolean;

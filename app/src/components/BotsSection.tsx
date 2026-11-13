@@ -221,8 +221,17 @@ export function taskMenu(task: TaskRow, src = ''): (MenuItem | '-')[] {
   ];
 }
 
+const taskMode = (task: TaskRow): 'worktree' | 'repo' | 'scratch' => {
+  const m = task.spec.mode;
+  if (m === 'worktree' || m === 'repo' || m === 'scratch') return m;
+  if (task.worktree) return 'worktree';
+  if (task.workspace) return 'repo';
+  return 'scratch';
+};
+
 function TaskLine({ task, active, showHost, src }: { task: TaskRow; active: boolean; showHost: boolean; src: string }) {
   const dot = taskDot(task.state);
+  const mode = taskMode(task);
   const hostName = useStore((s) => s.hosts.find((h) => h.config.id === localHost(src, task.host))?.config.name ?? task.host);
   const open = () => task.sessionId && openOn(src, task.host, task.sessionId);
   return (
@@ -231,7 +240,7 @@ function TaskLine({ task, active, showHost, src }: { task: TaskRow; active: bool
         className={`session-row bot-task-row ${active ? 'active' : ''} ${ACTIVE_TASK.includes(task.state) ? '' : 's-off'}`}
         onClick={open}
         onContextMenu={(e) => openMenu(e, taskMenu(task, src))}
-        title={`${task.title}\n${hostName} · ${task.cwd}\n${taskStateLabel(task.state)}${task.lastReport?.summary ? `\n${task.lastReport.summary}` : ''}`}
+        title={`${task.title}\n${hostName} · ${task.cwd}${mode !== 'worktree' ? ` (${t(mode === 'repo' ? 'modeRepo' : 'modeScratch')})` : ''}\n${taskStateLabel(task.state)}${task.lastReport?.summary ? `\n${task.lastReport.summary}` : ''}`}
       >
         <span className="row-badge">
           <ToolBadge tool={String(task.spec.tool ?? 'claude')} size={16} />
@@ -675,11 +684,15 @@ export function SessionBotBar({ info }: { info: SessionInfo }) {
             {t('sources', { n: task.eventIds.length })}
           </button>
         )}
-        {task?.worktree && (
+        {task?.worktree ? (
           <span className="muted small mono truncate" title={task.worktree.path}>
             {task.worktree.branch}
           </span>
-        )}
+        ) : task && taskMode(task) !== 'worktree' ? (
+          <span className="pill" title={task.cwd}>
+            {t(taskMode(task) === 'repo' ? 'modeRepo' : 'modeScratch')}
+          </span>
+        ) : null}
         <span className="bot-bar-fill" />
         {waitingExternal && (
           <button className="btn small primary" onClick={() => run(botCall('tasks.continue', { id: task.id }, src))}>

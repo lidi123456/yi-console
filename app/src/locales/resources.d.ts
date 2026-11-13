@@ -173,6 +173,8 @@ export default interface Resources {
     "manualHint": "你已接手，Bot 暂不过问",
     "markDone": "标记完成",
     "minutes": "{{n}} 分钟",
+    "modeRepo": "只读目录",
+    "modeScratch": "临时目录",
     "model": "模型",
     "more": "更多",
     "name": "名称",
@@ -190,7 +192,6 @@ export default interface Resources {
     "noPromptChange": "提示词没有变化",
     "noRuns": "还没运行过",
     "noTools": "这个插件没有提供工具",
-    "noWorktree": "直接在目录里做",
     "none": "无",
     "notSet": "未设置",
     "noteApprovedReply": "你批准了 Bot 起草的回复",
@@ -349,8 +350,7 @@ export default interface Resources {
     "waitingItems": "{{n}} 条待处理",
     "wasmUnavailable": "插件运行时没有启动，只能使用内置插件。",
     "weekdays": "周一,周二,周三,周四,周五,周六,周日",
-    "workspaces": "工作区",
-    "worktreeOn": "独立 worktree"
+    "workspaces": "工作区"
   },
   "browser": {
     "address": "地址",

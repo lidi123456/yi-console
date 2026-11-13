@@ -1927,7 +1927,11 @@ impl Hub {
     pub fn delete(&self, id: &str) -> Result<()> {
         self.revoke_desktop(id);
         // The id comes from the client and is later used in a path for remove_dir_all: only handle sessions that really exist
-        self.get(id)?;
+        let rt = self.get(id)?;
+        let (bot_link, session_cwd) = {
+            let i = rt.info.lock().unwrap();
+            (i.bot.clone(), i.cwd.clone())
+        };
         // First delete its terminals in the bottom terminal panel
         let kids: Vec<String> = self
             .sessions
@@ -1950,6 +1954,19 @@ impl Hub {
         self.store.delete_session(id)?;
         if safe_sid(id) {
             let _ = std::fs::remove_dir_all(uploads_dir(id));
+        }
+        if let Some(bot) = bot_link.filter(|b| b.role == "task") {
+            if let Some(tid) = bot.task_id.as_deref() {
+                let safe = |s: &str| !s.is_empty() && s.len() <= 64 && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+                if safe(&bot.bot_id) && safe(tid) {
+                    let p1 = crate::paths::expand(&format!("~/.yi-console/bots/{}/tasks/{tid}", bot.bot_id));
+                    let p2 = crate::paths::base_dir().join("bots").join(&bot.bot_id).join("tasks").join(tid);
+                    let cur = std::path::Path::new(&session_cwd);
+                    if cur == p1 || cur == p2 {
+                        let _ = std::fs::remove_dir_all(cur);
+                    }
+                }
+            }
         }
         self.publish(
             None,

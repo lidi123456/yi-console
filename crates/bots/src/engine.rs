@@ -1284,8 +1284,8 @@ impl Engine {
                         bail!("Daily task budget used up ({}). Tell the owner if this is urgent.", c.budget.tasks_per_day);
                     }
                 }
-                let ws_index = a["workspace"].as_u64().map(|i| i as usize);
-                let ws = c.workspace(ws_index).cloned().ok_or_else(|| anyhow!("No workspace is configured for this Bot."))?;
+                let restricted = self.engine_turn(&c.id) || !event_ids.is_empty();
+                let (mode, host, ws_path) = resolve_spawn_location(c, &a, restricted)?;
                 let allowed = c.task_tools();
                 let tool = match a["tool"].as_str().filter(|t| !t.is_empty()) {
                     Some(t) if allowed.contains(&t) => t.to_string(),
@@ -1298,23 +1298,29 @@ impl Engine {
                 }
                 // The configured model and effort belong to the default tool
                 let default_tool = tool == c.task.tool;
+                let task_id = short_id("task");
+                let initial_cwd = if mode == "scratch" {
+                    scratch_dir(&c.id, &task_id)
+                } else {
+                    ws_path.clone()
+                };
                 let mut t = TaskRow {
-                    id: short_id("task"),
+                    id: task_id,
                     bot_id: c.id.clone(),
-                    host: ws.host.clone(),
+                    host,
                     session_id: None,
                     state: "queued".into(),
                     title: truncate(&s("title"), 80),
                     event_ids: event_ids.clone(),
                     threads: events.iter().map(|e| e.thread.clone()).collect::<HashSet<_>>().into_iter().collect(),
-                    cwd: String::new(),
-                    workspace: ws.cwd.clone(),
+                    cwd: initial_cwd,
+                    workspace: ws_path,
                     worktree: None,
                     spec: json!({
+                        "mode": mode,
                         "tool": tool,
                         "model": a["model"].as_str().filter(|m| !m.is_empty()).map(str::to_string).or(if default_tool { c.task.model.clone() } else { None }),
                         "effort": if default_tool { c.task.effort.clone() } else { None },
-                        "worktree": a["worktree"].as_bool().unwrap_or(c.task.worktree),
                         "computerUse": computer_use,
                         "note": truncate(&s("note"), 400),
                         "request": s("request"),
@@ -2016,18 +2022,40 @@ impl Engine {
     }
 
     async fn start_task(&self, c: &BotConfig, mut t: TaskRow) -> Result<String> {
-        let mut cwd = t.workspace.clone();
-        if t.spec["worktree"].as_bool().unwrap_or(true) {
+        let mut mode = t.mode().to_string();
+        let mut cwd = if mode == "scratch" {
+            let dir = scratch_dir(&t.bot_id, &t.id);
+            match self.rpc(&t.host, "fs.mkdir", json!({"path": &dir})).await {
+                Ok(r) => r["path"].as_str().map(str::to_string).unwrap_or(dir),
+                Err(e) if format!("{e:#}").contains("已经存在") => dir,
+                Err(e) => return Err(e),
+            }
+        } else {
+            t.workspace.clone()
+        };
+        if mode == "worktree" {
             let name = t.id.replace('_', "-");
             match self.rpc(&t.host, "git.worktreeAdd", json!({"cwd": t.workspace, "name": name, "branch": format!("yi/{name}")})).await {
                 Ok(w) => {
                     cwd = w["path"].as_str().unwrap_or(&cwd).to_string();
                     t.worktree = Some(w);
                 }
-                Err(e) if format!("{e:#}").contains("不是 git 仓库") => {}
+                Err(e) if format!("{e:#}").contains("不是 git 仓库") => {
+                    mode = "repo".into();
+                    t.spec["mode"] = json!("repo");
+                }
                 Err(e) => return Err(e),
             }
         }
+        let branch = t.worktree.as_ref().and_then(|w| w["branch"].as_str()).map(str::to_string);
+        let env = prompt::TaskEnv {
+            mode: &mode,
+            host: &t.host,
+            cwd: &cwd,
+            workspace: &t.workspace,
+            branch: branch.as_deref(),
+        };
+        let task_prompt = prompt::task_prompt_for(c, Some(&env));
         let want_cu = task_uses_computer(&t);
         if want_cu {
             let cu = self.rpc(&t.host, "computerUse.status", json!({})).await?;
@@ -2041,6 +2069,7 @@ impl Engine {
                 return self.park_desktop_unavailable(c, t, cwd).await;
             }
         }
+        t.cwd = cwd.clone();
         let events: Vec<EventRow> = t.event_ids.iter().filter_map(|id| self.store.event(id).ok()).collect();
         let brief = brief(&t, &events, &|id| self.instance_label(id));
         let create = self
@@ -2054,7 +2083,7 @@ impl Engine {
                     "model": t.spec["model"],
                     "effort": t.spec["effort"],
                     "permissionMode": c.task.permission_mode,
-                    "appendSystemPrompt": prompt::task_prompt(c),
+                    "appendSystemPrompt": task_prompt,
                     "clientMcp": [tools::client_mcp(TASK_SERVER, &self.identity.client_id)],
                     "bot": self.link(c, "task", Some(&t.id)),
                     "computerUse": want_cu,
@@ -2068,7 +2097,7 @@ impl Engine {
             Err(e) => return Err(e),
         };
         t.session_id = info["id"].as_str().map(str::to_string);
-        t.cwd = cwd;
+        t.cwd = info["cwd"].as_str().map(str::to_string).unwrap_or(cwd);
         t.state = "working".into();
         t.started_at = Some(now_ms());
         self.store.save_task(&t)?;
@@ -2079,6 +2108,15 @@ impl Engine {
     /// The host's desktop is locked or not signed in: create an idle task session without sending the prompt yet and
     /// wait in `needsYou` until the owner unlocks it and continues.
     async fn park_desktop_unavailable(&self, c: &BotConfig, mut t: TaskRow, cwd: String) -> Result<String> {
+        let mode = t.mode().to_string();
+        let branch = t.worktree.as_ref().and_then(|w| w["branch"].as_str()).map(str::to_string);
+        let env = prompt::TaskEnv {
+            mode: &mode,
+            host: &t.host,
+            cwd: &cwd,
+            workspace: &t.workspace,
+            branch: branch.as_deref(),
+        };
         let info = self
             .rpc(
                 &t.host,
@@ -2090,14 +2128,14 @@ impl Engine {
                     "model": t.spec["model"],
                     "effort": t.spec["effort"],
                     "permissionMode": c.task.permission_mode,
-                    "appendSystemPrompt": prompt::task_prompt(c),
+                    "appendSystemPrompt": prompt::task_prompt_for(c, Some(&env)),
                     "clientMcp": [tools::client_mcp(TASK_SERVER, &self.identity.client_id)],
                     "bot": self.link(c, "task", Some(&t.id)),
                 }),
             )
             .await?;
         t.session_id = info["id"].as_str().map(str::to_string);
-        t.cwd = cwd;
+        t.cwd = info["cwd"].as_str().map(str::to_string).unwrap_or(cwd);
         t.state = "needsYou".into();
         t.started_at = Some(now_ms());
         t.spec["pendingBrief"] = json!(true);
@@ -2965,7 +3003,12 @@ fn follow_up(e: &EventRow) -> String {
 
 /// The first message of a task session
 fn brief(t: &TaskRow, events: &[EventRow], label: &dyn Fn(&str) -> String) -> String {
-    let mut s = format!("# Task: {}\n\nTask id: {}\n", t.title, t.id);
+    let mut s = format!("# Task: {}\n\nTask id: {}\nMode: {}\n", t.title, t.id, t.mode());
+    if !t.workspace.is_empty() {
+        s.push_str(&format!("Workspace: {}\n", t.workspace));
+    } else if !t.cwd.is_empty() {
+        s.push_str(&format!("Working directory: {}\n", t.cwd));
+    }
     if let Some(n) = t.spec["note"].as_str().filter(|n| !n.is_empty()) {
         s.push_str(&format!("Routing note from the Bot: {n}\n"));
     }
@@ -3004,9 +3047,130 @@ fn host_supports_computer_use(os: Option<&str>, arch: Option<&str>) -> Option<bo
 
 fn task_view(t: &TaskRow) -> Value {
     json!({
-        "taskId": t.id, "title": t.title, "state": t.state, "host": t.host, "sessionId": t.session_id,
+        "taskId": t.id, "title": t.title, "mode": t.mode(), "state": t.state, "host": t.host, "sessionId": t.session_id,
         "cwd": t.cwd, "computerUse": task_uses_computer(t), "lastReport": t.last_report, "manual": t.manual, "createdAt": t.created_at,
     })
+}
+
+fn scratch_dir(bot_id: &str, task_id: &str) -> String {
+    format!("~/.yi-console/bots/{bot_id}/tasks/{task_id}")
+}
+
+fn looks_like_path(s: &str) -> bool {
+    let s = s.trim();
+    s.starts_with('/') || s.starts_with('~') || s.get(1..2) == Some(":")
+}
+
+fn resolve_spawn_location(c: &BotConfig, a: &Value, restricted: bool) -> Result<(String, String, String)> {
+    let requested_mode = match a["mode"].as_str().map(str::trim).filter(|m| !m.is_empty()) {
+        Some(m @ ("worktree" | "repo" | "scratch")) => Some(m),
+        Some(other) => bail!("Unknown mode \"{other}\"; use worktree, repo, or scratch."),
+        None if a["worktree"].as_bool() == Some(false) => Some("repo"),
+        None => None,
+    };
+    let explicit_cwd = a["cwd"].as_str().map(str::trim).filter(|s| !s.is_empty());
+    let explicit_host = a["host"].as_str().map(str::trim).filter(|s| !s.is_empty());
+    let ws_arg = &a["workspace"];
+    let has_ws_arg = !(ws_arg.is_null() || ws_arg.as_str().is_some_and(|s| s.trim().is_empty()));
+
+    let matched_ws = if has_ws_arg { c.find_workspace(ws_arg) } else { None };
+    let (ad_hoc_cwd, unmatched_ws) = if has_ws_arg && matched_ws.is_none() {
+        if let Some(s) = ws_arg.as_str().map(str::trim).filter(|s| !s.is_empty()) {
+            if !restricted && explicit_cwd.is_none() && looks_like_path(s) {
+                (Some(s), None)
+            } else {
+                (explicit_cwd, Some(s.to_string()))
+            }
+        } else {
+            (explicit_cwd, Some(ws_arg.to_string()))
+        }
+    } else {
+        (explicit_cwd, None)
+    };
+
+    if let Some(bad) = unmatched_ws {
+        if c.workspaces.is_empty() {
+            bail!(
+                "No workspaces are configured (cannot resolve \"{bad}\"); use mode=\"scratch\"{}.",
+                if restricted { "" } else { " or pass `cwd`" }
+            );
+        }
+        let avail: Vec<String> = c
+            .workspaces
+            .iter()
+            .enumerate()
+            .map(|(i, w)| if w.name.is_empty() { format!("[{i}] {}", w.cwd) } else { format!("[{i}] {} ({})", w.name, w.cwd) })
+            .collect();
+        bail!("Unknown workspace \"{bad}\"; configured workspaces: {}.", avail.join(", "));
+    }
+
+    if let Some(raw_cwd) = ad_hoc_cwd {
+        if requested_mode == Some("scratch") {
+            bail!("scratch mode does not take a workspace or cwd.");
+        }
+        let target_host = explicit_host.unwrap_or(&c.bot.host);
+        let configured = c.workspaces.iter().any(|w| w.host == target_host && w.cwd == raw_cwd);
+        if !configured && restricted {
+            bail!(
+                "Tasks triggered by events or routines may only use configured workspaces or scratch mode; \
+                 ad-hoc directories (cwd) are only allowed when the owner asks directly in the Bot session."
+            );
+        }
+        return Ok((
+            requested_mode.unwrap_or("worktree").into(),
+            target_host.into(),
+            raw_cwd.into(),
+        ));
+    }
+
+    if let Some(w) = matched_ws {
+        if requested_mode == Some("scratch") {
+            bail!("scratch mode does not take a workspace.");
+        }
+        return Ok((
+            requested_mode.unwrap_or("worktree").into(),
+            w.host.clone(),
+            w.cwd.clone(),
+        ));
+    }
+
+    if requested_mode == Some("scratch") {
+        let host = match explicit_host {
+            Some(h) => {
+                if restricted && h != c.bot.host && !c.workspaces.iter().any(|w| w.host == h) {
+                    bail!("Tasks triggered by events or routines may only run on configured hosts.");
+                }
+                h.to_string()
+            }
+            None => c.bot.host.clone(),
+        };
+        return Ok(("scratch".into(), host, String::new()));
+    }
+    if c.workspaces.len() == 1 {
+        let w = &c.workspaces[0];
+        return Ok((
+            requested_mode.unwrap_or("worktree").into(),
+            w.host.clone(),
+            w.cwd.clone(),
+        ));
+    }
+    if let Some(m) = requested_mode {
+        if c.workspaces.is_empty() {
+            bail!("No workspaces are configured for {m} mode; use mode=\"scratch\" or specify a directory.");
+        } else {
+            bail!("Multiple workspaces are configured; specify `workspace` (name or index) for {m} mode.");
+        }
+    }
+    let host = match explicit_host {
+        Some(h) => {
+            if restricted && h != c.bot.host && !c.workspaces.iter().any(|w| w.host == h) {
+                bail!("Tasks triggered by events or routines may only run on configured hosts.");
+            }
+            h.to_string()
+        }
+        None => c.bot.host.clone(),
+    };
+    Ok(("scratch".into(), host, String::new()))
 }
 
 // ---------- configuration changes a Bot asks for ----------
@@ -3133,20 +3297,23 @@ impl Engine {
         for al in &c.allow {
             need(&al.instance, "trigger", "allow");
         }
-        if c.workspaces.is_empty() {
-            warnings.push("No workspace: this Bot cannot start tasks".into());
-        } else if c.task.computer_use {
+        if c.task.computer_use {
             let support_of = |hid: &str| {
                 hosts.iter().find(|h| h["config"]["id"].as_str() == Some(hid)).and_then(|h| {
                     host_supports_computer_use(h["status"]["hello"]["os"].as_str(), h["status"]["hello"]["arch"].as_str())
                 })
             };
-            let known: Vec<(&str, bool)> = c.workspaces.iter().filter_map(|w| support_of(&w.host).map(|ok| (w.host.as_str(), ok))).collect();
+            let target_hosts: Vec<&str> = if c.workspaces.is_empty() {
+                vec![c.bot.host.as_str()]
+            } else {
+                c.workspaces.iter().map(|w| w.host.as_str()).collect()
+            };
+            let known: Vec<(&str, bool)> = target_hosts.into_iter().filter_map(|h| support_of(h).map(|ok| (h, ok))).collect();
             if !known.is_empty() && known.iter().all(|(_, ok)| !*ok) {
-                errors.push("None of the configured workspaces are on a host that supports computer use (Windows x86_64 or macOS only).".into());
+                errors.push("None of the target hosts support computer use (Windows x86_64 or macOS only).".into());
             } else if known.iter().any(|(_, ok)| !*ok) {
                 let unsupported: Vec<&str> = known.iter().filter(|(_, ok)| !*ok).map(|(h, _)| *h).collect();
-                warnings.push(format!("Workspace host(s) {} do not support computer use; only spawn computer_use tasks in workspaces on Windows x64 or macOS.", unsupported.join(", ")));
+                warnings.push(format!("Host(s) {} do not support computer use; only spawn computer_use tasks on Windows x64 or macOS.", unsupported.join(", ")));
             }
         }
         if c.accept == Accept::Auto {
@@ -3675,5 +3842,62 @@ mod tests {
         assert_eq!(fmt_tokens(1_700), "2k");
         assert_eq!(fmt_tokens(2_500_000), "2.5M");
         assert_eq!(fmt_tokens(12), "12");
+    }
+
+    #[test]
+    fn spawn_location_resolves_modes_and_enforces_owner_boundary() {
+        let mut c: BotConfig = serde_json::from_value(json!({
+            "name": "x",
+            "bot": {"host": "local", "tool": "claude"},
+            "workspaces": [
+                {"host": "local", "cwd": "/repo/app", "name": "app"},
+                {"host": "mac", "cwd": "/repo/ios", "name": "ios"}
+            ]
+        }))
+        .unwrap();
+        c.normalize();
+
+        // Named workspace lookup works in both owner and restricted turns
+        assert_eq!(
+            resolve_spawn_location(&c, &json!({"workspace": "ios", "mode": "repo"}), true).unwrap(),
+            ("repo".into(), "mac".into(), "/repo/ios".into())
+        );
+        // No workspace with multiple workspaces defaults to scratch
+        assert_eq!(
+            resolve_spawn_location(&c, &json!({}), true).unwrap(),
+            ("scratch".into(), "local".into(), "".into())
+        );
+        // Explicit repo mode with multiple workspaces requires specifying workspace
+        assert!(resolve_spawn_location(&c, &json!({"mode": "repo"}), true).is_err());
+
+        // Ad-hoc cwd allowed in owner turn, rejected in restricted turn
+        assert_eq!(
+            resolve_spawn_location(&c, &json!({"cwd": "/tmp/other", "mode": "repo"}), false).unwrap(),
+            ("repo".into(), "local".into(), "/tmp/other".into())
+        );
+        assert!(resolve_spawn_location(&c, &json!({"cwd": "/tmp/other", "mode": "repo"}), true).is_err());
+        // Configured cwd explicitly passed is allowed even in restricted turn
+        assert_eq!(
+            resolve_spawn_location(&c, &json!({"cwd": "/repo/app"}), true).unwrap(),
+            ("worktree".into(), "local".into(), "/repo/app".into())
+        );
+
+        // Single workspace defaults to worktree, unless scratch is explicitly requested
+        c.workspaces.truncate(1);
+        assert_eq!(
+            resolve_spawn_location(&c, &json!({}), true).unwrap(),
+            ("worktree".into(), "local".into(), "/repo/app".into())
+        );
+        assert_eq!(
+            resolve_spawn_location(&c, &json!({"mode": "scratch"}), true).unwrap(),
+            ("scratch".into(), "local".into(), "".into())
+        );
+
+        // Zero workspaces defaults to scratch cleanly
+        c.workspaces.clear();
+        assert_eq!(
+            resolve_spawn_location(&c, &json!({}), true).unwrap(),
+            ("scratch".into(), "local".into(), "".into())
+        );
     }
 }

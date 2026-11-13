@@ -66,11 +66,15 @@ fn default_compact_at() -> u32 {
     70
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Workspace {
     pub host: String,
     pub cwd: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub about: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -104,9 +108,6 @@ pub struct TaskDefaults {
     pub effort: Option<String>,
     #[serde(default = "default_task_mode")]
     pub permission_mode: String,
-    /// One git worktree per task (when the workspace is a git repo)
-    #[serde(default = "yes")]
-    pub worktree: bool,
     /// Allow tasks to operate the host's desktop GUI when `spawn_task` passes `computer_use: true`
     #[serde(default)]
     pub computer_use: bool,
@@ -147,7 +148,6 @@ impl Default for TaskDefaults {
             model: None,
             effort: None,
             permission_mode: default_task_mode(),
-            worktree: true,
             computer_use: false,
             max_concurrent: default_max(),
             timeout_minutes: default_timeout(),
@@ -308,6 +308,8 @@ impl BotConfig {
         self.task.max_concurrent = self.task.max_concurrent.clamp(1, 20);
         for w in &mut self.workspaces {
             w.cwd = w.cwd.trim().to_string();
+            w.name = w.name.trim().to_string();
+            w.about = w.about.trim().to_string();
         }
         self.bot.cwd = self.bot.cwd.trim().to_string();
         // Keep given ids (the first one wins), then number the rest
@@ -373,9 +375,25 @@ impl BotConfig {
         Ok(())
     }
 
-    /// The workspace a task runs in: by index, else the first one
-    pub fn workspace(&self, index: Option<usize>) -> Option<&Workspace> {
-        index.and_then(|i| self.workspaces.get(i)).or(self.workspaces.first())
+    /// Find a workspace by index, name, exact path, or folder basename
+    pub fn find_workspace(&self, v: &serde_json::Value) -> Option<&Workspace> {
+        if let Some(i) = v.as_u64() {
+            return self.workspaces.get(i as usize);
+        }
+        let s = v.as_str()?.trim();
+        if s.is_empty() {
+            return None;
+        }
+        self.workspaces
+            .iter()
+            .find(|w| !w.name.is_empty() && w.name.eq_ignore_ascii_case(s))
+            .or_else(|| self.workspaces.iter().find(|w| w.cwd == s))
+            .or_else(|| {
+                self.workspaces.iter().find(|w| {
+                    w.cwd.trim_end_matches(['/', '\\']).rsplit(['/', '\\']).next() == Some(s)
+                })
+            })
+            .or_else(|| s.parse::<usize>().ok().and_then(|i| self.workspaces.get(i)))
     }
 
     /// Whether `sender` on `instance` is on the allow list
@@ -403,7 +421,6 @@ mod tests {
         assert_eq!(c.accept, Accept::Observe);
         assert_eq!(c.ambient, Ambient::Record);
         assert_eq!(c.task.permission_mode, "bypass");
-        assert!(c.task.worktree);
         assert!(!c.task.computer_use);
         assert_eq!(c.notify, ["app"]);
         assert_eq!(c.compact_at, 70);
@@ -471,5 +488,28 @@ mod tests {
         assert!(night.contains(at(14, 1, 30)));
         assert!(!night.contains(at(13, 1, 30)));
         assert!(ActiveHours { days: vec![], start: "9".into(), end: "18:00".into() }.check().is_err());
+    }
+
+    #[test]
+    fn find_workspace_matches_by_index_name_path_or_basename() {
+        let mut c: BotConfig = serde_json::from_value(json!({
+            "name": "x",
+            "bot": {"host": "local", "tool": "claude"},
+            "workspaces": [
+                {"host": "local", "cwd": "/git/yi-console", "name": " console ", "about": " desktop app "},
+                {"host": "mac", "cwd": "/Users/me/docs"}
+            ]
+        }))
+        .unwrap();
+        c.normalize();
+        assert_eq!(c.workspaces[0].name, "console");
+        assert_eq!(c.workspaces[0].about, "desktop app");
+        assert_eq!(c.find_workspace(&json!(1)).unwrap().cwd, "/Users/me/docs");
+        assert_eq!(c.find_workspace(&json!("Console")).unwrap().cwd, "/git/yi-console");
+        assert_eq!(c.find_workspace(&json!("/Users/me/docs")).unwrap().host, "mac");
+        assert_eq!(c.find_workspace(&json!("yi-console")).unwrap().name, "console");
+        assert_eq!(c.find_workspace(&json!("0")).unwrap().name, "console");
+        assert!(c.find_workspace(&json!("missing")).is_none());
+        assert!(c.find_workspace(&json!("")).is_none());
     }
 }

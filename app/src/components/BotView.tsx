@@ -359,8 +359,12 @@ export function BotView({ botId }: { botId: string }) {
               <span className="muted">{t('none')}</span>
             ) : (
               c.workspaces.map((w, i) => (
-                <div key={i} className="mono small">
-                  {hostName(w.host)}: {w.cwd}
+                <div key={i} className="small">
+                  {w.name && <strong>{w.name} · </strong>}
+                  <span className="mono">
+                    {hostName(w.host)}: {w.cwd}
+                  </span>
+                  {w.about && <span className="muted"> — {w.about}</span>}
                 </div>
               ))
             )}
@@ -373,7 +377,6 @@ export function BotView({ botId }: { botId: string }) {
             <div className="muted small">
               {[
                 permLabel(c.task.permissionMode),
-                c.task.worktree ? t('worktreeOn') : t('noWorktree'),
                 c.task.computerUse ? t('computerUseOnDemand') : null,
                 t('limitsLine', {
                   n: c.task.maxConcurrent,
