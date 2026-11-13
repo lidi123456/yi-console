@@ -59,6 +59,7 @@
   "thought2": "Thought",
   "thinking3": "Thinking",
   "working": "Working",
+  "subagentTag": "Subagent",
   "toolCallsFailed": "{{length}} tool calls, {{failed}} failed",
   "toolCalls": "{{length}} tool calls",
   "slowResponseTapStopTo": ". Slow response — tap Stop to interrupt and resend",

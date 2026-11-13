@@ -6322,6 +6322,16 @@ body.resizing .side-resizer::after {
   overflow: hidden;
   text-overflow: ellipsis;
 }
+/* "Subagent" in front of tool calls an Antigravity subagent made (they share the parent's timeline) */
+.mt-tag {
+  flex: none;
+  padding: 0 5px;
+  border-radius: 4px;
+  font-size: 0.85em;
+  line-height: 1.5;
+  color: var(--text-2);
+  background: var(--bg-3, rgba(127, 127, 127, 0.12));
+}
 /* When space runs out, shrink the description first and only then the tool name (otherwise short labels get squeezed to "..." or vanish) */
 .mt-desc {
   flex: 0 100000 auto;

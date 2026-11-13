@@ -59,6 +59,7 @@
   "thought2": "已思考",
   "thinking3": "正在思考",
   "working": "正在执行",
+  "subagentTag": "子 agent",
   "toolCallsFailed": "执行工具 {{length}} 次，其中 {{failed}} 次失败",
   "toolCalls": "执行工具 {{length}} 次",
   "slowResponseTapStopTo": "，模型响应较慢，可以点停止按钮中断后重发",

@@ -40,10 +40,12 @@ What each tool supports in chat mode:
 | Thinking level | ✓ (immediately) | ✓ (from the next turn) | — | — | — | — | ✓ (from the next turn) |
 | Image input (≤ 5 MB each, png/jpeg/gif/webp) | ✓ | ✓ | ✓ | if the tool declares support | ✓ | ✓ | ✓ |
 | Context usage | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | — |
-| Permission modes | all | all | Default / Accept Edits / Plan / Bypass All | same as Cursor | no Plan | same as Cursor | all (Auto is the tool's own auto mode) |
+| Permission modes | all | all | Default / Accept Edits / Plan / Bypass All | same as Cursor | no Plan | same as Cursor | all (Auto is the tool's own auto mode; only Bypass All lets subagents run commands without stalling, see below) |
 | Account quota (Usage Stats page) | 5-hour / weekly windows | 5-hour / weekly windows | included, Auto, API usage and on-demand (same as cursor-agent's `/usage`) | plan usage | plan credits, add-ons and dedicated packs | plan credits and bonus credits | 5-hour / weekly windows per model group, AI credits |
 | Token source for usage stats | the tool's own logs (direct terminal use counts too) | the tool's own logs (direct terminal use counts too) | Yi Console sessions | Yi Console sessions | the tool's own logs (counted in credits) | the tool's own logs (tokens + credits) | Yi Console sessions |
 | Import history sessions | ✓ | ✓ | ✓ | ✓ | ✓ (viewable right away) | ✓ (viewable after continuing) | ✓ (viewable after continuing) |
+
+Antigravity subagents run in the background: Yi Console keeps the turn running, the subagent's tool calls carry a "Subagent" tag, and Antigravity's reply appears by itself once the subagent reports back. agy doesn't pass subagent approval requests on, so in every mode except Bypass All a subagent stops when it reaches an action that needs approval: after 30 seconds without progress the turn ends with a hint to switch to Bypass All. Switching into or out of Bypass All restarts the agy process (the session carries on).
 
 Model lists and quotas come from yi-agentd briefly starting the tool and asking it (in `~/.yi-console/probe/`, so no session is created). Model lists are cached in `models.json`; quotas are cached for 60 seconds. Cursor usage is fetched from Cursor's backend with the token cursor-agent saved at login (`~/.config/cursor/auth.json`; `%APPDATA%\Cursor` on Windows, `~/.cursor` on macOS). If the token has expired, run cursor-agent once.
 

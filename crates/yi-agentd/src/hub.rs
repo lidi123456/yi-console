@@ -1711,9 +1711,15 @@ impl Hub {
         let Some(tx) = self.running_tx(&rt) else {
             return Ok(());
         };
-        // Claude can only switch to allow-all if it was started with the skip-permissions flag, so the process must restart
+        // Claude can only switch to allow-all if it was started with the skip-permissions flag, so the process must restart.
+        // Antigravity's allow-all is its --dangerously-skip-permissions flag too, which also has to go when leaving it
         let launched = rt.launched_mode.lock().unwrap().clone();
-        if info.tool == ToolKind::Claude && mode == "bypass" && launched != "bypass" {
+        let restart = match info.tool {
+            ToolKind::Claude => mode == "bypass" && launched != "bypass",
+            ToolKind::Antigravity => (mode == "bypass") != (launched == "bypass"),
+            _ => false,
+        };
+        if restart {
             let busy = matches!(info.status, SessionStatus::Running | SessionStatus::WaitingPermission);
             if busy {
                 *rt.restart_pending.lock().unwrap() = true;

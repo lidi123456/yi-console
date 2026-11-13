@@ -29,6 +29,8 @@ type Item =
   | {
       k: 'tool';
       key: string;
+      /** The tool call id */
+      id: string;
       ts: number;
       name: string;
       title: string;
@@ -182,6 +184,7 @@ function buildItems(events: HubEvent[], hideCompactCmd = false): Item[] {
           const it: Item & { k: 'tool' } = {
             k: 'tool',
             key,
+            id: e.id,
             ts: e.ts,
             name: e.name,
             title: e.title,
@@ -224,7 +227,7 @@ function buildItems(events: HubEvent[], hideCompactCmd = false): Item[] {
       }
       case 'error':
         // yi-agentd's own wording for a failed automatic continue is Chinese; tool errors are shown as they are
-        items.push({ k: 'note', key, text: e.message.startsWith('自动继续失败') ? trErr(e.message) : e.message, tone: 'err' });
+        items.push({ k: 'note', key, text: /^(自动继续失败|子 agent 在等待审批)/.test(e.message) ? trErr(e.message) : e.message, tone: 'err' });
         break;
       case 'system': {
         // yi-agentd records Claude's task_notification as "后台任务完成：<command>"; draw it as a single line
@@ -445,29 +448,34 @@ function LiveMarkdown({ text }: { text: string }) {
 }
 
 /** Tool display names: use Claude Code's names where possible so every tool shares one set */
-function toolName(name: string) {
+function toolName(name: string, input?: unknown) {
   const n = name.toLowerCase();
   if (n === 'powershell') return 'PowerShell';
   if (n === 'toolsearch' || n.startsWith('mcp__')) return name;
   if (['bash', 'shell', 'execute', 'terminal', 'command'].some((x) => n.includes(x))) return 'Bash';
   if (n === 'write' || n === 'fs_write' || n === 'create' || n === 'write_file' || n === 'write_to_file') return 'Write';
   if (['edit', 'patch', 'notebook', 'str_replace', 'replace_file_content', 'sed_file'].some((x) => n.includes(x))) return 'Update';
-  // Antigravity: read_url_content / search_web / grep_search / find_by_name
+  // Antigravity: read_url_content / search_web / grep_search / find_by_name / list_dir / subagent tools
   if (n === 'read_url_content') return 'Fetch';
   if (n === 'search_web') return 'Web Search';
   if (n === 'grep_search') return 'Grep';
   if (n === 'find_by_name') return 'Glob';
+  if (n === 'list_dir' || n === 'ls') return 'LS';
   if (['read', 'view'].some((x) => n.includes(x))) return 'Read';
   if (n === 'grep') return 'Grep';
   if (n === 'glob') return 'Glob';
   if (n.includes('websearch') || n.includes('web_search')) return 'Web Search';
   if (['fetch', 'web'].some((x) => n.includes(x))) return 'Fetch';
   if (['search', 'find', 'grep', 'glob'].some((x) => n.includes(x))) return 'Search';
-  if (n === 'task' || n === 'agent') return 'Task';
+  if (n === 'task' || n === 'agent' || n === 'invoke_subagent' || n === 'dispatch_agent' || n === 'subagent' || n === 'delegate' || n === 'spawn_agent') return 'Task';
+  if (n === 'swarm') return 'Task';
+  if (n === 'send_message' && input && typeof input === 'object' && ('Recipient' in input || 'recipient' in input)) return 'Task';
   if (n.includes('todo')) return t('todo');
   if (n === 'delete') return 'Delete';
   if (n === 'move') return 'Move';
   if (n === 'think') return 'Think';
+  const obj = input && typeof input === 'object' ? (input as Record<string, unknown>) : null;
+  if (obj && typeof obj.CommandLine === 'string') return 'Bash';
   return name;
 }
 
@@ -476,23 +484,114 @@ function toolKind(shown: string, it: Item & { k: 'tool' }): ToolKind {
   if (shown === 'Bash' || shown === 'PowerShell') return 'bash';
   if (shown === 'Read') return 'read';
   if (shown === 'Update' || shown === 'Write' || it.diffs.length > 0) return 'edit';
-  if (shown === 'Grep' || shown === 'Glob' || shown === 'Search') return 'search';
+  if (shown === 'Grep' || shown === 'Glob' || shown === 'Search' || shown === 'LS') return 'search';
   return 'other';
 }
 
+/** Extract concise summary & readable detail for subagent/task calls (Claude/Codex/Antigravity) */
+function formatTaskPrompt(input: unknown): { summary: string; detail: string } {
+  if (!input || typeof input !== 'object') return { summary: '', detail: '' };
+  const o = input as Record<string, unknown>;
+  // Antigravity batch invoke_subagent: { Subagents: [{ TypeName, Role, Prompt }], TaskMode }
+  if (Array.isArray(o.Subagents) && o.Subagents.length > 0) {
+    const items = o.Subagents.filter((x): x is Record<string, unknown> => !!x && typeof x === 'object');
+    const summary = items
+      .map((s) => {
+        const role = String(s.Role ?? s.TypeName ?? '').trim();
+        const prompt = String(s.Prompt ?? '').trim();
+        return role ? (prompt ? `[${role}] ${prompt}` : role) : prompt;
+      })
+      .filter(Boolean)
+      .join(' | ');
+    const detail = items
+      .map((s, i) => {
+        const role = String(s.Role ?? '').trim();
+        const type = String(s.TypeName ?? '').trim();
+        const head = role && type && role !== type ? `${role} (${type})` : role || type || `#${i + 1}`;
+        const prompt = String(s.Prompt ?? '').trim();
+        return `[${head}]\n${prompt}`.trim();
+      })
+      .join('\n\n');
+    return { summary, detail };
+  }
+  // Antigravity single invoke_subagent: { TypeName, Role, Prompt }
+  if (typeof o.Role === 'string' || typeof o.TypeName === 'string' || typeof o.Prompt === 'string') {
+    const role = String(o.Role ?? '').trim();
+    const type = String(o.TypeName ?? '').trim();
+    const shortRole = role || type;
+    const fullRole = role && type && role !== type ? `${role} (${type})` : shortRole;
+    const prompt = String(o.Prompt ?? o.prompt ?? o.description ?? '').trim();
+    const summary = shortRole ? (prompt ? `[${shortRole}] ${prompt}` : shortRole) : prompt;
+    const detail = fullRole ? (prompt ? `[${fullRole}]\n${prompt}` : `[${fullRole}]`) : prompt;
+    return { summary, detail };
+  }
+  // Antigravity send_message: { Recipient, Message }
+  if (typeof o.Recipient === 'string' || typeof o.recipient === 'string') {
+    const recipient = String(o.Recipient ?? o.recipient ?? '').trim();
+    const msg = String(o.Message ?? o.message ?? '').trim();
+    const shortId = recipient.slice(0, 8);
+    const summary = shortId ? `[→ ${shortId}] ${msg}`.trim() : msg;
+    const detail = recipient ? `[→ ${recipient}]\n${msg}`.trim() : msg;
+    return { summary, detail };
+  }
+  // Antigravity swarm: { action, name, brief, tasks }
+  if (typeof o.brief === 'string' || typeof o.action === 'string') {
+    const action = String(o.action ?? '').trim();
+    const name = String(o.name ?? '').trim();
+    const brief = String(o.brief ?? '').trim();
+    const head = ['swarm', action, name].filter(Boolean).join(' ');
+    const summary = brief ? `[${head}] ${brief}` : `[${head}]`;
+    const tasks = Array.isArray(o.tasks) ? o.tasks.map((t, i) => `${i + 1}. ${String(t)}`).join('\n') : '';
+    const detail = [summary, tasks].filter(Boolean).join('\n');
+    return { summary, detail };
+  }
+  const fallback = String(o.description ?? o.prompt ?? o.task ?? '').trim();
+  return { summary: fallback, detail: fallback };
+}
+
+/** Tools with no real name show their title as is. Only subagent titles (Antigravity's invoke_subagent / send_message /
+ *  swarm when a replay leaves the name out) are mapped, so other tools' titles stay as the tool wrote them */
+function isGenericTool(it: Item & { k: 'tool' }) {
+  if ((it.name !== 'other' && it.name !== 'think') || !it.title) return false;
+  return toolName(it.title, it.input) !== 'Task';
+}
+
+/** Name shown for a tool call; a generic one maps to Task when its title is a subagent tool */
+function shownToolName(it: Item & { k: 'tool' }) {
+  return isGenericTool(it) ? it.title : toolName((it.name === 'other' || it.name === 'think') && it.title ? it.title : it.name, it.input);
+}
+
+/** Antigravity subagents' own tool calls, read from their transcripts (`acp.rs` gives them `agy-sub:` ids) */
+const isSubagentTool = (it: Item & { k: 'tool' }) => it.id.startsWith('agy-sub:');
+
 /** Key argument in parentheses: paths relative to the working directory; Cursor titles carry prefixes like "Read xxx", strip them to avoid repetition */
-const ARG_KEYS = ['command', 'pattern', 'query', 'file_path', 'notebook_path', 'path', 'url', 'description', 'skill', 'prompt'];
+const ARG_KEYS = ['command', 'pattern', 'query', 'file_path', 'notebook_path', 'path', 'url', 'description', 'skill', 'prompt', 'toolSummary', 'ImageName', 'Name'];
 
 /** Key argument in parentheses: prefer common fields from the input (Cursor titles start out as just "Read File" / "Terminal"),
  *  then fall back to the title; if the title is a JSON blob, take the first short string */
 function toolArg(it: Item & { k: 'tool' }, shown: string, cwd?: string) {
+  if (shown === 'Task') {
+    const sub = formatTaskPrompt(it.input).summary;
+    if (sub) return sub.replace(/\s+/g, ' ');
+  }
   const input: Record<string, unknown> = it.input && typeof it.input === 'object' ? { ...(it.input as Record<string, unknown>) } : {};
   // File-editing tools check the path first: Kiro's write also puts the operation type (strReplace / create) in command
   const keys = shown === 'Update' || shown === 'Write' ? ['file_path', 'notebook_path', 'path', ...ARG_KEYS] : ARG_KEYS;
-  // Antigravity names its arguments in PascalCase (CommandLine, Path, SearchPath…)
-  const pascal: Record<string, string> = { command: 'CommandLine', path: 'Path', pattern: 'Pattern', query: 'Query', url: 'Url' };
-  for (const [k, v] of Object.entries(pascal)) if (input[k] === undefined && typeof input[v] === 'string') input[k] = input[v];
-  if (input.path === undefined && typeof input.SearchPath === 'string') input.path = input.SearchPath;
+  // Antigravity names its arguments in PascalCase (CommandLine, Path, TargetFile, DirectoryPath, SearchPath…)
+  const pascal: Record<string, string[]> = {
+    command: ['CommandLine', 'toolSummary'],
+    path: ['Path', 'TargetFile', 'AbsolutePath', 'FilePath', 'DirectoryPath', 'SearchPath', 'SearchDirectory'],
+    pattern: ['Pattern', 'Query'],
+    query: ['Query', 'Pattern'],
+    url: ['Url'],
+    prompt: ['Prompt', 'Message'],
+  };
+  for (const [k, aliases] of Object.entries(pascal)) {
+    if (input[k] === undefined) {
+      const hit = aliases.find((a) => typeof input[a] === 'string' && input[a]);
+      if (hit) input[k] = input[hit];
+    }
+  }
   const key = keys.find((k) => typeof input[k] === 'string' && input[k]);
   const opPath = Array.isArray(input.operations) ? (input.operations[0] as { path?: string } | undefined)?.path : undefined;
   let t = key ? String(input[key]) : opPath || it.title || it.diffs[0]?.path || '';
@@ -588,8 +687,8 @@ const ToolLine = memo(function ToolLine({ it, active, cwd }: { it: Item & { k: '
   useLang();
   const [open, setOpen] = useState(false);
   const [full, setFull] = useState(false);
-  const generic = (it.name === 'other' || it.name === 'think') && !!it.title;
-  let shown = generic ? it.title : toolName(it.name);
+  const generic = isGenericTool(it);
+  let shown = shownToolName(it);
   // Changing existing content is called Update, same as Claude Code
   if (shown === 'Write' && it.diffs.some((d) => d.oldText)) shown = 'Update';
   const kind = toolKind(shown, it);
@@ -653,12 +752,15 @@ const ToolLine = memo(function ToolLine({ it, active, cwd }: { it: Item & { k: '
     );
 
   const hasInput = kind !== 'edit' && it.input !== undefined && it.input !== null && JSON.stringify(it.input) !== '{}';
-  const cmd = kind === 'bash' && it.input && typeof it.input === 'object' ? (it.input as { command?: string }).command : undefined;
+  const inputObj = it.input && typeof it.input === 'object' ? (it.input as { command?: string; CommandLine?: string }) : undefined;
+  const cmd = kind === 'bash' ? inputObj?.command ?? inputObj?.CommandLine : undefined;
+  const taskDetail = shown === 'Task' ? formatTaskPrompt(it.input).detail : '';
   return (
     <div className={`tl tl-tool ${state}`}>
       <span className="tl-dot" />
       <div className="tl-main">
         <button className="tl-head" onClick={() => setOpen(!open)} title={it.title || it.name}>
+          {isSubagentTool(it) && <span className="mt-tag">{t('subagentTag')}</span>}
           <span className="tl-name">{shown}</span>
           {arg && <span className="tl-arg">({arg})</span>}
         </button>
@@ -670,7 +772,7 @@ const ToolLine = memo(function ToolLine({ it, active, cwd }: { it: Item & { k: '
           <div className="tl-detail">
             {it.desktop && <DesktopShots ev={it.desktop} />}
             {kind === 'edit' && it.diffs.map((d, i) => <DiffView key={i} diff={d} />)}
-            {cmd ? <pre className="mono">{cmd}</pre> : hasInput && <pre className="mono">{typeof it.input === 'string' ? it.input : JSON.stringify(it.input, null, 2)}</pre>}
+            {cmd ? <pre className="mono">{cmd}</pre> : taskDetail ? <pre className="mono">{taskDetail}</pre> : hasInput && <pre className="mono">{typeof it.input === 'string' ? it.input : JSON.stringify(it.input, null, 2)}</pre>}
             {it.result && kind !== 'edit' && (
               <>
                 <pre className="mono">{(full ? out : out.split('\n').slice(0, 200).join('\n')) || t('noOutput')}</pre>
@@ -1037,6 +1139,7 @@ function toolUiLabel(shown: string): string {
     Update: 'Edit file',
     Grep: 'Search text',
     Glob: 'Find files',
+    LS: 'List directory',
     Search: 'Search',
     'Web Search': 'Web search',
     Fetch: 'Open page',
@@ -1053,6 +1156,7 @@ function toolUiLabel(shown: string): string {
     Update: '编辑文件',
     Grep: '搜索内容',
     Glob: '查找文件',
+    LS: '列出目录',
     Search: '搜索',
     'Web Search': '搜索网页',
     Fetch: '打开网页',
@@ -1070,8 +1174,8 @@ const baseName = (p: string) => p.replace(/[\\/]+$/, '').split(/[\\/]/).pop() ||
 
 /** What to show for one tool call; parsing shared by both styles lives here */
 function toolView(it: Item & { k: 'tool' }, cwd?: string) {
-  const generic = (it.name === 'other' || it.name === 'think') && !!it.title;
-  let shown = generic ? it.title : toolName(it.name);
+  const generic = isGenericTool(it);
+  let shown = shownToolName(it);
   if (shown === 'Write' && it.diffs.some((d) => d.oldText)) shown = 'Update';
   const kind = toolKind(shown, it);
   const arg = generic || shown === t('todo') ? '' : toolArg(it, shown, cwd);
@@ -1114,18 +1218,24 @@ const ModernTool = memo(function ModernTool({ it, active, cwd }: { it: Item & { 
     return { add: all.filter((l) => l.t === 'add').length, del: all.filter((l) => l.t === 'del').length };
   }, [v.kind, it.diffs]);
   const out = v.parsed.text;
+  const inputObj = it.input && typeof it.input === 'object' ? (it.input as { command?: unknown; CommandLine?: unknown }) : undefined;
+  const bashCmd = v.kind === 'bash' ? inputObj?.command ?? inputObj?.CommandLine : undefined;
+  const taskDetail = v.shown === 'Task' ? formatTaskPrompt(it.input).detail : '';
   const input =
-    v.kind === 'bash' && it.input && typeof it.input === 'object' && typeof (it.input as { command?: unknown }).command === 'string'
-      ? String((it.input as { command: string }).command)
-      : it.input === undefined || it.input === null || JSON.stringify(it.input) === '{}'
-        ? ''
-        : typeof it.input === 'string'
-          ? it.input
-          : JSON.stringify(it.input, null, 2);
+    typeof bashCmd === 'string'
+      ? bashCmd
+      : taskDetail
+        ? taskDetail
+        : it.input === undefined || it.input === null || JSON.stringify(it.input) === '{}'
+          ? ''
+          : typeof it.input === 'string'
+            ? it.input
+            : JSON.stringify(it.input, null, 2);
   return (
     <div className={`mt-row ${v.err ? 'err' : ''}`}>
       <button className="mt-head" onClick={() => setOpen(!open)} title={v.arg || it.title || it.name} aria-expanded={open}>
         <span className="mt-icon">{running ? <span className="spinner mini" /> : <Icon name={v.err ? 'x' : KIND_ICON[v.kind]} size={13} />}</span>
+        {isSubagentTool(it) && <span className="mt-tag">{t('subagentTag')}</span>}
         <span className="mt-name">{v.label}</span>
         {desc && <span className="mt-desc">{desc}</span>}
         {stat && (stat.add > 0 || stat.del > 0) && (

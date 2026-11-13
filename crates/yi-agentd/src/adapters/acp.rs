@@ -121,6 +121,12 @@ struct State {
     compacting: Option<i64>,
     /// The last prompt we sent was /compact, so the next compaction is manual
     compact_manual: bool,
+    /// Antigravity (`agy acp`): tracks asynchronous subagents spawned in the current turn
+    is_antigravity: bool,
+    agy_pre_turn_steps: usize,
+    agy_pending_calls: HashMap<String, AgyPendingCall>,
+    agy_send_baselines: HashMap<String, usize>,
+    agy_watch: Option<AgyWatch>,
 }
 
 impl State {
@@ -161,6 +167,10 @@ pub fn build_args(spec: &StartSpec) -> Vec<String> {
             a.push(m.clone());
         }
     }
+    // Allow-all: agy never sends its subagents' approval requests over ACP, so only this flag lets them run commands
+    if spec.tool == ToolKind::Antigravity && spec.permission_mode == "bypass" {
+        a.push("--dangerously-skip-permissions".into());
+    }
     a.extend(spec.extra_args.iter().cloned());
     if spec.tool == ToolKind::Kiro && spec.permission_mode != "bypass" && spec.mcp_servers.iter().any(|server| server["name"] == "yi_computer_use") {
         // Trust only the user-selected gateway server; its live window grant still gates every native call.
@@ -182,6 +192,7 @@ pub async fn run(spec: StartSpec, em: Emitter, mut rx: mpsc::UnboundedReceiver<A
     let mut st = State {
         perm: spec.permission_mode.clone(),
         native_modes: spec.tool == ToolKind::Antigravity,
+        is_antigravity: spec.tool == ToolKind::Antigravity,
         effort: spec.effort.clone().filter(|e| !e.is_empty() && spec.tool == ToolKind::Antigravity),
         desktop_notice: spec.mcp_servers.iter().any(|server| server["name"] == crate::mcp::DESKTOP_SERVER),
         system_notice: super::acp_system_notice(&spec),
@@ -198,6 +209,8 @@ pub async fn run(spec: StartSpec, em: Emitter, mut rx: mpsc::UnboundedReceiver<A
 
     let mut killed = false;
     let mut fatal: Option<String> = None;
+    let mut agy_tick = tokio::time::interval(std::time::Duration::from_millis(250));
+    agy_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
             line = p.stdout.next_line() => {
@@ -210,6 +223,16 @@ pub async fn run(spec: StartSpec, em: Emitter, mut rx: mpsc::UnboundedReceiver<A
                 if let Some(m) = next_config(&mut st) { let _ = p.send(&m).await; }
                 if let Some(m) = next_effort(&mut st) { let _ = p.send(&m).await; }
                 if st.session_id.is_some() && !config_pending(&st) && !st.prompting && !st.loading && st.compacting.is_none() && !st.queue.is_empty() {
+                    let next = st.queue.remove(0);
+                    let m = prompt(&mut st, &em, &next);
+                    let _ = p.send(&m).await;
+                }
+            }
+            _ = agy_tick.tick(), if st.agy_watch.is_some() => {
+                if let Some(m) = poll_agy_watch(&mut st, &spec, &em) {
+                    let _ = p.send(&m).await;
+                }
+                if !st.prompting && st.session_id.is_some() && !config_pending(&st) && !st.loading && st.compacting.is_none() && !st.queue.is_empty() {
                     let next = st.queue.remove(0);
                     let m = prompt(&mut st, &em, &next);
                     let _ = p.send(&m).await;
@@ -271,6 +294,17 @@ pub async fn run(spec: StartSpec, em: Emitter, mut rx: mpsc::UnboundedReceiver<A
                         st.queue.clear();
                         em.event(EventBody::TurnEnd { stop_reason: Some("cancelled".into()), model: None });
                     }
+                    // A detached watch has no open turn unless a late reply reopened it
+                    if let Some(open) = st.agy_watch.as_ref().map(|w| !w.detached || w.reopened) {
+                        for m in drop_agy_watch(&mut st, &em, true) {
+                            let _ = p.send(&m).await;
+                        }
+                        if open {
+                            st.prompting = false;
+                            st.end_subagents();
+                            em.event(EventBody::TurnEnd { stop_reason: Some("cancelled".into()), model: None });
+                        }
+                    }
                     if let Some(sid) = st.session_id.clone() {
                         for (rid, rpc_id) in st.perms.drain().chain(st.asks.drain()) {
                             let _ = p.send(&json!({"jsonrpc":"2.0","id":rpc_id,
@@ -307,6 +341,7 @@ pub async fn run(spec: StartSpec, em: Emitter, mut rx: mpsc::UnboundedReceiver<A
             }
         }
     }
+    let _ = drop_agy_watch(&mut st, &em, false);
     flush(&mut st, &em);
     let msg = p.finish(killed).await;
     em.exited(fatal.or(msg));
@@ -406,6 +441,14 @@ fn prompt(st: &mut State, em: &Emitter, p: &Prompt) -> Value {
     st.last_reply.clear();
     st.compact_manual = p.text.trim().starts_with("/compact");
     st.turn_credits = 0.0;
+    st.agy_pending_calls.clear();
+    st.agy_send_baselines.clear();
+    // A detached watch (still waiting for a late subagent reply) ends with the next prompt: agy hands that reply to the new turn itself
+    let _ = drop_agy_watch(st, em, false);
+    st.agy_pre_turn_steps = match st.session_id.as_deref() {
+        Some(sid) if st.is_antigravity => count_agy_transcript_steps(&agy_brain_dir(), sid),
+        _ => 0,
+    };
     let sid = st.session_id.clone().unwrap_or_default();
     let mut blocks = vec![];
     if !p.images.is_empty() {
@@ -777,11 +820,10 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Result<V
                 }
             }
             Pending::Prompt => {
-                st.prompting = false;
-                st.end_subagents();
                 flush(st, em);
-                if let Some(msg) = meta_error(r) {
-                    em.event(EventBody::Error { message: login_hint(spec, &msg) });
+                let meta_err = meta_error(r);
+                if let Some(msg) = meta_err.as_ref() {
+                    em.event(EventBody::Error { message: login_hint(spec, msg) });
                 }
                 if st.turn_credits > 0.0 {
                     em.event(EventBody::Usage {
@@ -806,13 +848,59 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Result<V
                 if let Some(p) = ctx {
                     em.context(p);
                 }
-                if let Some(left) = (spec.tool == ToolKind::Antigravity).then(|| antigravity_limit(&st.last_reply)).flatten() {
+                let limit_left = (spec.tool == ToolKind::Antigravity).then(|| antigravity_limit(&st.last_reply)).flatten();
+                if let Some(left) = limit_left {
                     // Which window ran out isn't said; one resetting within 5 hours is the 5-hour one
                     let limit = if left <= 5 * 3_600_000 { "five_hour" } else { "seven_day" };
                     em.event(super::limit_hit(Some(crate::util::now_ms() + left), Some(limit.into())));
                 }
+                let stop_reason = r["stopReason"].as_str().map(str::to_string);
+                let should_watch = st.is_antigravity
+                    && meta_err.is_none()
+                    && limit_left.is_none()
+                    && stop_reason.as_deref() != Some("cancelled")
+                    && (!st.agy_pending_calls.is_empty()
+                        || st.session_id.as_deref().is_some_and(|sid| {
+                            has_pending_agy_subagent_turn(&agy_brain_dir(), sid, st.agy_pre_turn_steps)
+                        }));
+                if should_watch {
+                    if let Some(sid) = st.session_id.clone() {
+                        let wake_from = count_agy_transcript_steps(&agy_brain_dir(), &sid);
+                        let mut watch = AgyWatch::new(
+                            sid,
+                            agy_brain_dir(),
+                            st.agy_pre_turn_steps,
+                            wake_from,
+                            stop_reason,
+                            std::mem::take(&mut st.agy_pending_calls),
+                            std::mem::take(&mut st.agy_send_baselines),
+                            st.perm != "bypass",
+                        );
+                        // One pass right away, so subagents that already finished are picked up without waiting for a tick
+                        match step_agy_watch(&mut watch, spec, em, &mut st.next_id, &mut st.pending) {
+                            AgyStep::Done(req) => {
+                                out.extend(req);
+                                st.prompting = false;
+                                st.end_subagents();
+                                em.event(EventBody::TurnEnd { stop_reason: watch.stop_reason, model: None });
+                            }
+                            // Detaching needs the tick to have seen the subagent at rest first; keep the turn for now
+                            AgyStep::Wait | AgyStep::Detach => st.agy_watch = Some(watch),
+                        }
+                        return Ok(out);
+                    }
+                }
+                for (id, _) in st.agy_pending_calls.drain() {
+                    em.event(EventBody::ToolResult {
+                        id,
+                        output: String::new(),
+                        is_error: false,
+                    });
+                }
+                st.prompting = false;
+                st.end_subagents();
                 em.event(EventBody::TurnEnd {
-                    stop_reason: r["stopReason"].as_str().map(str::to_string),
+                    stop_reason,
                     model: None,
                 });
             }
@@ -1332,6 +1420,20 @@ fn update(st: &mut State, em: &Emitter, u: &Value) {
                     diffs: t.diffs.clone(),
                 });
             }
+            if st.is_antigravity && !st.loading {
+                let agy_tool = if t.name == "other" || t.name.is_empty() { t.title.as_str() } else { t.name.as_str() };
+                if is_agy_subagent_tool(agy_tool, &t.input) {
+                    let target = agy_recipient(&t.input).map(str::to_string);
+                    if agy_tool.eq_ignore_ascii_case("send_message") {
+                        if let Some(recip) = target.as_deref() {
+                            st.agy_send_baselines
+                                .entry(recip.to_string())
+                                .or_insert_with(|| count_agy_transcript_steps(&agy_brain_dir(), recip));
+                        }
+                    }
+                    st.agy_pending_calls.insert(id.clone(), AgyPendingCall { name: agy_tool.to_string(), target_subagent: target });
+                }
+            }
             let status = u["status"].as_str().unwrap_or("");
             if (status == "completed" || status == "failed") && !t.done {
                 t.done = true;
@@ -1345,11 +1447,21 @@ fn update(st: &mut State, em: &Emitter, u: &Value) {
                 if output.is_empty() && !command_text && !u["rawOutput"].is_null() {
                     output = raw_output_text(&crate::computer_use::display_value(&u["rawOutput"]));
                 }
-                em.event(EventBody::ToolResult {
-                    id: id.clone(),
-                    output: crate::util::truncate(&output, 64 * 1024),
-                    is_error: status == "failed",
-                });
+                // `agy acp` reports invoke_subagent / send_message completed immediately after spawning, with empty output.
+                // Hold the ToolResult until the background subagent actually finishes and produces its result.
+                let defer_agy = st.is_antigravity
+                    && !st.loading
+                    && status == "completed"
+                    && output.is_empty()
+                    && st.agy_pending_calls.contains_key(&id);
+                if !defer_agy {
+                    st.agy_pending_calls.remove(&id);
+                    em.event(EventBody::ToolResult {
+                        id: id.clone(),
+                        output: crate::util::truncate(&output, 64 * 1024),
+                        is_error: status == "failed",
+                    });
+                }
             }
             st.tools.insert(id, t);
         }
@@ -1412,6 +1524,11 @@ fn antigravity_command_text(t: &str) -> Option<String> {
     if !t.starts_with("Created At:") {
         return None;
     }
+    antigravity_command_body(t)
+}
+
+/// The "Command exited with code N.\n\nCommand output:\n…" part, also used for background command results
+fn antigravity_command_body(t: &str) -> Option<String> {
     let code = t.split_once("Command exited with code ")?.1.split(['.', '\n']).next()?.trim();
     let mut out = t.split_once("Command output:\n").map(|(_, o)| o.replace("\r\n", "\n").trim_end().to_string()).unwrap_or_default();
     if code != "0" {
@@ -1421,6 +1538,765 @@ fn antigravity_command_text(t: &str) -> Option<String> {
         out.push_str(&format!("exit code: {code}"));
     }
     Some(out)
+}
+
+fn agy_brain_dir() -> std::path::PathBuf {
+    crate::paths::home().join(".gemini").join("antigravity-cli").join("brain")
+}
+
+/// `brain/<id>/.system_generated/logs/transcript_full.jsonl` (or the compact one); None for ids that aren't a plain name
+fn agy_transcript_path(brain_dir: &std::path::Path, conv_id: &str) -> Option<std::path::PathBuf> {
+    if conv_id.is_empty() || conv_id.contains(['/', '\\']) || conv_id.contains("..") {
+        return None;
+    }
+    let logs_dir = brain_dir.join(conv_id).join(".system_generated").join("logs");
+    let full = logs_dir.join("transcript_full.jsonl");
+    if full.is_file() {
+        return Some(full);
+    }
+    let compact = logs_dir.join("transcript.jsonl");
+    compact.is_file().then_some(compact)
+}
+
+fn parse_agy_steps(raw: &str) -> Vec<Value> {
+    raw.lines().filter(|l| !l.trim().is_empty()).filter_map(|l| serde_json::from_str::<Value>(l).ok()).collect()
+}
+
+fn read_agy_transcript_steps(brain_dir: &std::path::Path, conv_id: &str) -> Vec<Value> {
+    agy_transcript_path(brain_dir, conv_id)
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|raw| parse_agy_steps(&raw))
+        .unwrap_or_default()
+}
+
+/// Number of steps (one per line) without parsing them: transcripts of long sessions run to megabytes
+fn count_agy_transcript_steps(brain_dir: &std::path::Path, conv_id: &str) -> usize {
+    agy_transcript_path(brain_dir, conv_id)
+        .and_then(|p| std::fs::read(p).ok())
+        .map(|raw| raw.split(|b| *b == b'\n').filter(|l| l.iter().any(|b| !b.is_ascii_whitespace())).count())
+        .unwrap_or(0)
+}
+
+/// One transcript, parsed again only when its size or mtime changes (the watch polls every 250 ms)
+#[derive(Debug, Default)]
+struct AgyTranscript {
+    stamp: Option<(u64, std::time::SystemTime)>,
+    steps: std::sync::Arc<Vec<Value>>,
+    /// When the file last changed, for spotting a subagent that stopped moving
+    changed_at: Option<tokio::time::Instant>,
+}
+
+impl AgyTranscript {
+    fn refresh(&mut self, brain_dir: &std::path::Path, conv_id: &str) -> std::sync::Arc<Vec<Value>> {
+        let now = tokio::time::Instant::now();
+        let Some(path) = agy_transcript_path(brain_dir, conv_id) else {
+            self.changed_at.get_or_insert(now);
+            return self.steps.clone();
+        };
+        let stamp = std::fs::metadata(&path)
+            .ok()
+            .map(|m| (m.len(), m.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH)));
+        if stamp.is_some() && stamp != self.stamp {
+            if let Ok(raw) = std::fs::read_to_string(&path) {
+                self.steps = std::sync::Arc::new(parse_agy_steps(&raw));
+                self.stamp = stamp;
+                self.changed_at = Some(now);
+            }
+        }
+        self.changed_at.get_or_insert(now);
+        self.steps.clone()
+    }
+}
+
+fn agy_recipient(v: &Value) -> Option<&str> {
+    v["Recipient"]
+        .as_str()
+        .or_else(|| v["recipient"].as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
+fn is_agy_subagent_tool(name: &str, input: &Value) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower == "invoke_subagent"
+        || (lower == "send_message" && agy_recipient(input).is_some())
+        || (lower == "swarm" && input["action"].as_str() == Some("add"))
+}
+
+fn is_agy_system(step: &Value) -> bool {
+    step["type"].as_str() == Some("SYSTEM_MESSAGE") || step["source"].as_str() == Some("SYSTEM")
+}
+
+/// A SYSTEM_MESSAGE that wakes the parent: a report from a subagent or a background task. agy's own notices
+/// (`sender=system`, e.g. after a settings change) arrive inside a prompt turn and wake nobody
+fn is_agy_wakeup(step: &Value) -> bool {
+    is_agy_system(step) && {
+        let content = step["content"].as_str().unwrap_or("");
+        content.contains("<SYSTEM_MESSAGE>") && !content.contains("sender=system ")
+    }
+}
+
+fn is_agy_final_reply(step: &Value) -> bool {
+    step["type"].as_str() == Some("PLANNER_RESPONSE")
+        && step["status"].as_str() == Some("DONE")
+        && step["tool_calls"].as_array().is_none_or(|a| a.is_empty())
+}
+
+/// A step that won't change any more. A background command stays a RUNNING GENERIC step for good (its output comes
+/// later as a SYSTEM_MESSAGE), so it counts as settled too
+fn agy_step_settled(step: &Value) -> bool {
+    match step["status"].as_str() {
+        Some("DONE" | "ERROR" | "INVALID") => true,
+        Some("RUNNING") => step["type"].as_str() == Some("GENERIC") && agy_background_task(step["content"].as_str().unwrap_or("")).is_some(),
+        _ => false,
+    }
+}
+
+/// "Tool is running as a background task with task id: <conv>/task-2"
+fn agy_background_task(content: &str) -> Option<&str> {
+    let rest = content.split_once("Tool is running as a background task with task id: ")?.1;
+    rest.split_whitespace().next().filter(|s| !s.is_empty())
+}
+
+/// A SYSTEM_MESSAGE `Task id "<id>" finished with result:\n<result>\n\nLog: …`: the task id and its result text
+fn agy_task_finished(content: &str) -> Option<(&str, String)> {
+    let rest = content.split_once("Task id \"")?.1;
+    let (task, rest) = rest.split_once('"')?;
+    let result = rest.split_once("finished with result:")?.1;
+    let result = result.split("\n\nLog: ").next().unwrap_or(result);
+    let result = result.split("</SYSTEM_MESSAGE>").next().unwrap_or(result).trim();
+    let text = antigravity_command_body(result).unwrap_or_else(|| result.replace("\r\n", "\n"));
+    Some((task, text))
+}
+
+/// Extract spawned subagent conversation IDs from `"Created the following subagent:\n{...}"` GENERIC step content
+fn extract_created_subagent_ids(content: &str) -> Vec<String> {
+    if !content.contains("Created the following subagent") {
+        return vec![];
+    }
+    let mut ids = vec![];
+    let mut rest = content;
+    while let Some(pos) = rest.find("\"conversationId\"") {
+        rest = &rest[pos + "\"conversationId\"".len()..];
+        let Some(colon) = rest.find(':') else { break };
+        rest = rest[colon + 1..].trim_start();
+        let Some(after_quote) = rest.strip_prefix('"') else { continue };
+        let Some(end_quote) = after_quote.find('"') else { break };
+        let id = after_quote[..end_quote].trim();
+        if !id.is_empty() && !ids.iter().any(|x| x == id) {
+            ids.push(id.to_string());
+        }
+        rest = &after_quote[end_quote + 1..];
+    }
+    ids
+}
+
+/// Clean Antigravity transcript GENERIC tool outputs and append any generated media file paths
+fn clean_agy_generic_output(raw: &str, media: Option<&Vec<Value>>) -> String {
+    let mut out = if let Some(cmd) = antigravity_command_text(raw) {
+        cmd
+    } else {
+        let normalized = raw.replace("\r\n", "\n");
+        let lines: Vec<&str> = normalized.lines().collect();
+        let mut start = 0;
+        while start < lines.len() && (lines[start].starts_with("Created At:") || lines[start].starts_with("Completed At:")) {
+            start += 1;
+        }
+        lines[start..].join("\n").trim().to_string()
+    };
+    for m in media.into_iter().flatten() {
+        if let Some(uri) = m["uri"].as_str().map(str::trim).filter(|s| !s.is_empty()) {
+            let clean_path = uri.strip_prefix("file://").unwrap_or(uri);
+            if !out.contains(clean_path) && !out.contains(uri) {
+                if !out.is_empty() {
+                    out.push('\n');
+                }
+                out.push_str(clean_path);
+            }
+        }
+    }
+    out
+}
+
+fn has_pending_agy_subagent_turn(brain_dir: &std::path::Path, parent_sid: &str, pre_turn_steps: usize) -> bool {
+    let steps = read_agy_transcript_steps(brain_dir, parent_sid);
+    if pre_turn_steps >= steps.len() {
+        return false;
+    }
+    let slice = &steps[pre_turn_steps..];
+    let launched = slice.iter().any(|s| {
+        s["tool_calls"].as_array().is_some_and(|tcs| {
+            tcs.iter().any(|tc| is_agy_subagent_tool(tc["name"].as_str().unwrap_or(""), &tc["args"]))
+        }) || !extract_created_subagent_ids(s["content"].as_str().unwrap_or("")).is_empty()
+    });
+    if !launched {
+        return false;
+    }
+    // Still pending unless a SYSTEM_MESSAGE already woke the parent and produced a finished empty-tool PLANNER_RESPONSE
+    match slice.iter().rposition(is_agy_wakeup) {
+        None => true,
+        Some(wi) => !slice[wi + 1..].iter().any(is_agy_final_reply),
+    }
+}
+
+/// Tool calls read from a transcript, waiting for the GENERIC steps that carry their results
+#[derive(Debug, Default)]
+struct AgyToolLane {
+    /// `(tool_call_id, tool_name)` in call order; GENERIC results come back in the same order
+    open: Vec<(String, String)>,
+    /// Upcoming GENERIC steps that belong to calls we don't show (`send_message` back to the parent…)
+    skip: usize,
+    /// Background commands: agy task id → our tool call id; the result arrives as a SYSTEM_MESSAGE
+    background: Vec<(String, String)>,
+}
+
+impl AgyToolLane {
+    fn busy(&self) -> bool {
+        !self.open.is_empty() || !self.background.is_empty()
+    }
+
+    /// A settled GENERIC step: the result of the oldest open call (or the start of its background task)
+    fn generic(&mut self, watch_out: &mut AgyOut, step: &Value) {
+        if self.skip > 0 {
+            self.skip -= 1;
+            return;
+        }
+        if self.open.is_empty() {
+            return;
+        }
+        let (tc_id, _) = self.open.remove(0);
+        let content = step["content"].as_str().unwrap_or("");
+        if step["status"].as_str() == Some("RUNNING") {
+            if let Some(task) = agy_background_task(content) {
+                self.background.push((task.to_string(), tc_id));
+                return;
+            }
+        }
+        let out = clean_agy_generic_output(content, step["media"].as_array());
+        watch_out.push(EventBody::ToolResult {
+            id: tc_id,
+            output: crate::util::truncate(&out, 64 * 1024),
+            is_error: matches!(step["status"].as_str(), Some("ERROR" | "INVALID")),
+        });
+    }
+
+    /// A SYSTEM_MESSAGE: fills a background command's result when it reports its task finished
+    fn system(&mut self, watch_out: &mut AgyOut, step: &Value) {
+        let Some((task, text)) = agy_task_finished(step["content"].as_str().unwrap_or("")) else {
+            return;
+        };
+        if let Some(i) = self.background.iter().position(|(t, _)| t == task) {
+            let (_, tc_id) = self.background.remove(i);
+            watch_out.push(EventBody::ToolResult { id: tc_id, output: crate::util::truncate(&text, 64 * 1024), is_error: text.contains("exit code: ") });
+        }
+    }
+
+    fn close_all(&mut self, watch_out: &mut AgyOut) {
+        for (tc_id, _) in self.open.drain(..).chain(self.background.drain(..).map(|(_, id)| (id, String::new()))) {
+            watch_out.push(EventBody::ToolResult { id: tc_id, output: String::new(), is_error: false });
+        }
+    }
+}
+
+/// Events produced by one pass of the watch; `AgyWatch::flush_out` sends them, reopening a detached turn first
+type AgyOut = Vec<EventBody>;
+
+#[derive(Debug, Default)]
+struct AgySubagentTracker {
+    start_step: usize,
+    next_step: usize,
+    lane: AgyToolLane,
+    /// Message sent back to the parent via `send_message`
+    reply: Option<String>,
+    /// Last plain-text PLANNER_RESPONSE fallback if no `send_message` was used
+    last_text: Option<String>,
+    done: bool,
+    transcript: AgyTranscript,
+}
+
+#[derive(Debug, Clone)]
+struct AgyPendingCall {
+    name: String,
+    target_subagent: Option<String>,
+}
+
+/// What a pass of the watch decided
+#[derive(Debug)]
+enum AgyStep {
+    /// Keep waiting
+    Wait,
+    /// Finished; the request (if any) goes to agy
+    Done(Option<Value>),
+    /// Stop holding the turn open (a subagent waits for an approval we never see, or it runs too long), but keep
+    /// watching in the background so a late reply still shows up
+    Detach,
+}
+
+/// Antigravity subagents (`invoke_subagent`, `send_message` to one, `swarm`) run in the background: agy ends the
+/// prompt turn right after launching them, and when they report back it wakes the parent by itself, outside any
+/// ACP prompt, so none of that is streamed. This follows their transcripts on disk instead
+#[derive(Debug)]
+struct AgyWatch {
+    parent_sid: String,
+    brain_dir: std::path::PathBuf,
+    pre_turn_steps: usize,
+    /// Steps in the parent's transcript when the prompt returned: everything before was streamed, so only a
+    /// SYSTEM_MESSAGE after them can be the wakeup
+    wake_from: usize,
+    next_parent_discover_step: usize,
+    stop_reason: Option<String>,
+    pending_calls: HashMap<String, AgyPendingCall>,
+    subagents: HashMap<String, AgySubagentTracker>,
+    subagent_order: Vec<String>,
+    wakeup_msg_idx: Option<usize>,
+    next_parent_emit_step: usize,
+    parent_lane: AgyToolLane,
+    parent: AgyTranscript,
+    wakeup_stable_ticks: usize,
+    started_at: tokio::time::Instant,
+    all_subagents_done_at: Option<tokio::time::Instant>,
+    /// Allow-all launches agy with --dangerously-skip-permissions, so subagents never wait for approval there
+    stall_check: bool,
+    /// The turn already ended (TurnEnd sent); anything new reopens it with a Running status first
+    detached: bool,
+    reopened: bool,
+    out: AgyOut,
+}
+
+impl AgyWatch {
+    fn new(
+        parent_sid: String,
+        brain_dir: std::path::PathBuf,
+        pre_turn_steps: usize,
+        wake_from: usize,
+        stop_reason: Option<String>,
+        pending_calls: HashMap<String, AgyPendingCall>,
+        send_baselines: HashMap<String, usize>,
+        stall_check: bool,
+    ) -> Self {
+        let mut watch = Self {
+            parent_sid,
+            brain_dir,
+            pre_turn_steps,
+            wake_from: wake_from.max(pre_turn_steps),
+            next_parent_discover_step: pre_turn_steps,
+            stop_reason,
+            pending_calls,
+            subagents: HashMap::new(),
+            subagent_order: vec![],
+            wakeup_msg_idx: None,
+            next_parent_emit_step: pre_turn_steps,
+            parent_lane: AgyToolLane::default(),
+            parent: AgyTranscript::default(),
+            wakeup_stable_ticks: 0,
+            started_at: tokio::time::Instant::now(),
+            all_subagents_done_at: None,
+            stall_check,
+            detached: false,
+            reopened: false,
+            out: vec![],
+        };
+        for (sid, baseline) in send_baselines {
+            watch.add_subagent(sid, Some(baseline));
+        }
+        watch
+    }
+
+    fn add_subagent(&mut self, sub_id: String, explicit_start: Option<usize>) {
+        if self.subagents.contains_key(&sub_id) {
+            return;
+        }
+        let start_step = explicit_start.unwrap_or_else(|| {
+            // Reused via send_message: start at the last message from this parent, else from the beginning
+            let steps = read_agy_transcript_steps(&self.brain_dir, &sub_id);
+            steps
+                .iter()
+                .rposition(|s| is_agy_system(s) && s["content"].as_str().unwrap_or("").contains(&self.parent_sid))
+                .unwrap_or(0)
+        });
+        self.subagent_order.push(sub_id.clone());
+        self.subagents.insert(sub_id, AgySubagentTracker { start_step, next_step: start_step, ..Default::default() });
+        self.all_subagents_done_at = None;
+    }
+
+    fn running_subagents(&self) -> Vec<String> {
+        self.subagent_order.iter().filter(|id| self.subagents.get(*id).is_some_and(|t| !t.done)).cloned().collect()
+    }
+
+    /// Send what this pass produced. A detached turn is reopened (status Running) before its first new event
+    fn flush_out(&mut self, em: &Emitter) {
+        if self.out.is_empty() {
+            return;
+        }
+        if self.detached && !self.reopened {
+            self.reopened = true;
+            em.status(SessionStatus::Running, None);
+        }
+        for body in self.out.drain(..) {
+            em.event(body);
+        }
+    }
+}
+
+fn subagent_summary_text(t: &AgySubagentTracker) -> String {
+    t.reply.clone().or_else(|| t.last_text.clone()).unwrap_or_default()
+}
+
+fn extract_system_message_content(msg: &str) -> Option<String> {
+    let (_, rest) = msg.split_once("content=")?;
+    let trimmed = rest.split("</SYSTEM_MESSAGE>").next().unwrap_or(rest).trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+fn flush_ready_pending_calls(watch: &mut AgyWatch, force_all: bool) {
+    let all_done = !watch.subagents.is_empty() && watch.subagents.values().all(|t| t.done);
+    let combined: String = watch
+        .subagent_order
+        .iter()
+        .filter_map(|sid| watch.subagents.get(sid))
+        .map(subagent_summary_text)
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let mut done = vec![];
+    for (call_id, call) in &watch.pending_calls {
+        if let Some(target) = call.target_subagent.as_deref() {
+            if force_all || watch.subagents.get(target).is_some_and(|t| t.done) {
+                let output = watch.subagents.get(target).map(subagent_summary_text).filter(|s| !s.is_empty()).unwrap_or_else(|| combined.clone());
+                done.push((call_id.clone(), output));
+            }
+        } else if all_done || force_all {
+            done.push((call_id.clone(), combined.clone()));
+        }
+    }
+    for (call_id, output) in done {
+        watch.pending_calls.remove(&call_id);
+        watch.out.push(EventBody::ToolResult { id: call_id, output: crate::util::truncate(&output, 64 * 1024), is_error: false });
+    }
+}
+
+fn finish_agy_watch(watch: &mut AgyWatch, em: &Emitter) {
+    flush_ready_pending_calls(watch, true);
+    for sid in watch.subagent_order.clone() {
+        if let Some(t) = watch.subagents.get_mut(&sid) {
+            t.lane.close_all(&mut watch.out);
+        }
+    }
+    watch.parent_lane.close_all(&mut watch.out);
+    watch.flush_out(em);
+}
+
+/// Stop following the subagents: on interrupt, a new prompt, or when the adapter exits. `cancel` also stops the
+/// subagents still running (session/cancel on their conversation ids does that; session/close doesn't)
+fn drop_agy_watch(st: &mut State, em: &Emitter, cancel: bool) -> Vec<Value> {
+    let Some(mut watch) = st.agy_watch.take() else {
+        return vec![];
+    };
+    let running = watch.running_subagents();
+    finish_agy_watch(&mut watch, em);
+    if !cancel {
+        return vec![];
+    }
+    running.into_iter().map(|sub| json!({"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":sub}})).collect()
+}
+
+fn poll_agy_watch(st: &mut State, spec: &StartSpec, em: &Emitter) -> Option<Value> {
+    let mut watch = st.agy_watch.take()?;
+    match step_agy_watch(&mut watch, spec, em, &mut st.next_id, &mut st.pending) {
+        AgyStep::Wait => {
+            st.agy_watch = Some(watch);
+            None
+        }
+        AgyStep::Detach => {
+            st.prompting = false;
+            st.end_subagents();
+            em.event(EventBody::TurnEnd { stop_reason: watch.stop_reason.clone(), model: None });
+            watch.detached = true;
+            watch.started_at = tokio::time::Instant::now();
+            st.agy_watch = Some(watch);
+            None
+        }
+        AgyStep::Done(req) => {
+            if !watch.detached {
+                st.prompting = false;
+                st.end_subagents();
+                em.event(EventBody::TurnEnd { stop_reason: watch.stop_reason, model: None });
+            } else if watch.reopened {
+                em.event(EventBody::TurnEnd { stop_reason: Some("end_turn".into()), model: None });
+            }
+            req
+        }
+    }
+}
+
+/// Advance the Antigravity subagent + parent-wakeup watch by one tick
+fn step_agy_watch(
+    watch: &mut AgyWatch,
+    spec: &StartSpec,
+    em: &Emitter,
+    next_id: &mut u64,
+    pending: &mut HashMap<u64, Pending>,
+) -> AgyStep {
+    let step = step_agy_watch_inner(watch, spec, next_id, pending);
+    if matches!(step, AgyStep::Done(_)) {
+        // Close whatever is still open (Task calls without a report, subagent tool calls without a result)
+        finish_agy_watch(watch, em);
+    } else {
+        watch.flush_out(em);
+    }
+    step
+}
+
+fn step_agy_watch_inner(watch: &mut AgyWatch, spec: &StartSpec, next_id: &mut u64, pending: &mut HashMap<u64, Pending>) -> AgyStep {
+    use std::time::Duration;
+    /// How long a turn is held open for running subagents
+    const OVERALL_TIMEOUT: Duration = Duration::from_secs(600);
+    /// How long a detached watch keeps waiting for a late reply
+    const DETACHED_TIMEOUT: Duration = Duration::from_secs(1800);
+    const DISCOVER_GRACE: Duration = Duration::from_secs(3);
+    const WAKEUP_GRACE: Duration = Duration::from_secs(20);
+    /// A subagent whose transcript ends in a tool call without a result, and that doesn't move for this long, is
+    /// waiting for an approval: agy never sends subagent approvals over ACP
+    const STALL: Duration = Duration::from_secs(30);
+
+    let parent_steps = watch.parent.refresh(&watch.brain_dir, &watch.parent_sid);
+
+    // 1. Discover newly spawned/messaged subagents from parent transcript steps since pre_turn_steps
+    while watch.next_parent_discover_step < parent_steps.len() {
+        let step = &parent_steps[watch.next_parent_discover_step];
+        if !agy_step_settled(step) {
+            break;
+        }
+        match step["type"].as_str().unwrap_or("") {
+            "PLANNER_RESPONSE" => {
+                for tc in step["tool_calls"].as_array().into_iter().flatten() {
+                    if tc["name"].as_str() == Some("send_message") {
+                        if let Some(recip) = agy_recipient(&tc["args"]) {
+                            watch.add_subagent(recip.to_string(), None);
+                        }
+                    }
+                }
+            }
+            "GENERIC" => {
+                for sub_id in extract_created_subagent_ids(step["content"].as_str().unwrap_or("")) {
+                    watch.add_subagent(sub_id.clone(), Some(0));
+                    // Bind an unbound invoke_subagent call to the first subagent it created
+                    if let Some(call) = watch.pending_calls.values_mut().find(|c| c.target_subagent.is_none() && c.name.eq_ignore_ascii_case("invoke_subagent")) {
+                        call.target_subagent = Some(sub_id.clone());
+                    }
+                }
+            }
+            _ => {}
+        }
+        watch.next_parent_discover_step += 1;
+    }
+
+    if watch.subagents.is_empty() {
+        if watch.started_at.elapsed() >= DISCOVER_GRACE {
+            return AgyStep::Done(None);
+        }
+        return AgyStep::Wait;
+    }
+
+    // 2. Poll each subagent's own transcript for live tool calls, results, and final reply
+    let parent_sid = watch.parent_sid.clone();
+    let mut stalled = false;
+    for sub_id in watch.subagent_order.clone() {
+        let Some(tracker) = watch.subagents.get_mut(&sub_id) else { continue };
+        let sub_steps = tracker.transcript.refresh(&watch.brain_dir, &sub_id);
+        while tracker.next_step < sub_steps.len() {
+            let step = &sub_steps[tracker.next_step];
+            if !agy_step_settled(step) {
+                break;
+            }
+            let step_idx = tracker.next_step;
+            match step["type"].as_str().unwrap_or("") {
+                "PLANNER_RESPONSE" => {
+                    if let Some(tcs) = step["tool_calls"].as_array().filter(|a| !a.is_empty()) {
+                        for (tc_idx, tc) in tcs.iter().enumerate() {
+                            let tc_name = tc["name"].as_str().unwrap_or("tool");
+                            let tc_args = tc["args"].clone();
+                            if tc_name == "send_message" && agy_recipient(&tc_args) == Some(parent_sid.as_str()) {
+                                if let Some(msg) = tc_args["Message"].as_str().or_else(|| tc_args["message"].as_str()) {
+                                    tracker.reply = Some(msg.to_string());
+                                }
+                                tracker.lane.skip += 1;
+                            } else {
+                                // Transcript tool calls carry no id; the prefix also tells the frontend they're the subagent's
+                                let tc_id = tc["id"].as_str().map(str::to_string).unwrap_or_else(|| format!("agy-sub:{sub_id}:{step_idx}:{tc_idx}"));
+                                watch.out.push(EventBody::ToolCall { id: tc_id.clone(), name: tc_name.to_string(), title: tc_name.to_string(), input: tc_args, diffs: vec![] });
+                                tracker.lane.open.push((tc_id, tc_name.to_string()));
+                            }
+                        }
+                    } else if let Some(text) = step["content"].as_str().map(str::trim).filter(|s| !s.is_empty()) {
+                        tracker.last_text = Some(text.to_string());
+                    }
+                }
+                "GENERIC" => {
+                    tracker.lane.generic(&mut watch.out, step);
+                    if tracker.lane.skip == 0 && tracker.reply.is_some() && !tracker.lane.busy() {
+                        tracker.done = true;
+                    }
+                }
+                "SYSTEM_MESSAGE" => tracker.lane.system(&mut watch.out, step),
+                _ => {}
+            }
+            tracker.next_step += 1;
+        }
+        let ended = tracker.next_step > tracker.start_step && sub_steps.get(tracker.next_step - 1).is_some_and(is_agy_final_reply);
+        if !tracker.done && !tracker.lane.busy() && ended {
+            tracker.done = true;
+        }
+        // Waiting on a tool call that never got a result, with the transcript at rest: an approval nobody can give
+        if watch.stall_check
+            && !watch.detached
+            && !tracker.done
+            && !tracker.lane.open.is_empty()
+            && tracker.next_step == sub_steps.len()
+            && tracker.transcript.changed_at.is_some_and(|t| t.elapsed() >= STALL)
+        {
+            stalled = true;
+        }
+    }
+
+    // 3. Check parent transcript for SYSTEM_MESSAGE notifications from finished subagent(s)
+    for (idx, step) in parent_steps.iter().enumerate().skip(watch.pre_turn_steps) {
+        if !is_agy_system(step) || step["status"].as_str() != Some("DONE") {
+            continue;
+        }
+        let content = step["content"].as_str().unwrap_or("");
+        for sub_id in &watch.subagent_order {
+            // `sender=<sub>` but not `sender=<sub>/task-N` (a background command of the subagent)
+            if content.contains(&format!("sender={sub_id} ")) || content.contains(&format!("sender={sub_id}\n")) {
+                if let Some(tracker) = watch.subagents.get_mut(sub_id) {
+                    tracker.done = true;
+                    if tracker.reply.is_none() {
+                        tracker.reply = extract_system_message_content(content);
+                    }
+                }
+            }
+        }
+        if idx >= watch.wake_from && is_agy_wakeup(step) && watch.wakeup_msg_idx.is_none_or(|prev| idx >= prev) {
+            if watch.wakeup_msg_idx.is_none() {
+                watch.next_parent_emit_step = idx + 1;
+            }
+            watch.wakeup_msg_idx = Some(idx);
+        }
+    }
+
+    flush_ready_pending_calls(watch, false);
+
+    // 4. Wait until all tracked subagents are finished
+    if !watch.subagents.values().all(|t| t.done) {
+        if stalled {
+            watch.out.push(EventBody::Error {
+                message: "子 agent 在等待审批，但 agy 不会把子 agent 的审批请求转给 Yi Console。切到「全部放行」后重试，或在终端模式里处理".into(),
+            });
+            return AgyStep::Detach;
+        }
+        let limit = if watch.detached { DETACHED_TIMEOUT } else { OVERALL_TIMEOUT };
+        if watch.started_at.elapsed() >= limit {
+            return if watch.detached { AgyStep::Done(None) } else { AgyStep::Detach };
+        }
+        return AgyStep::Wait;
+    }
+
+    let done_at = *watch.all_subagents_done_at.get_or_insert_with(tokio::time::Instant::now);
+
+    // 5. Stream & capture parent's reactive wakeup turn once SYSTEM_MESSAGE arrives
+    if let Some(wakeup_idx) = watch.wakeup_msg_idx {
+        while watch.next_parent_emit_step < parent_steps.len() {
+            let step_idx = watch.next_parent_emit_step;
+            let step = &parent_steps[step_idx];
+            if !agy_step_settled(step) {
+                watch.wakeup_stable_ticks = 0;
+                break;
+            }
+            match step["type"].as_str().unwrap_or("") {
+                "PLANNER_RESPONSE" => {
+                    if let Some(thinking) = step["thinking"].as_str().map(str::trim).filter(|s| !s.is_empty()) {
+                        watch.out.push(EventBody::Thinking { id: format!("agy-wake-{}-t-{}", watch.parent_sid, step_idx), text: thinking.to_string() });
+                    }
+                    for (tc_idx, tc) in step["tool_calls"].as_array().into_iter().flatten().enumerate() {
+                        let tc_name = tc["name"].as_str().unwrap_or("tool");
+                        let tc_args = tc["args"].clone();
+                        let tc_id = tc["id"].as_str().map(str::to_string).unwrap_or_else(|| format!("agy-wake:{}:{}:{}", watch.parent_sid, step_idx, tc_idx));
+                        watch.out.push(EventBody::ToolCall { id: tc_id.clone(), name: tc_name.to_string(), title: tc_name.to_string(), input: tc_args.clone(), diffs: vec![] });
+                        if is_agy_subagent_tool(tc_name, &tc_args) {
+                            let target = agy_recipient(&tc_args).map(str::to_string);
+                            watch.pending_calls.insert(tc_id, AgyPendingCall { name: tc_name.to_string(), target_subagent: target.clone() });
+                            if let Some(recip) = target {
+                                watch.add_subagent(recip, None);
+                            }
+                            // Its GENERIC step ("Message sent" / "Created the following subagent") isn't a shown result
+                            watch.parent_lane.skip += 1;
+                        } else {
+                            watch.parent_lane.open.push((tc_id, tc_name.to_string()));
+                        }
+                    }
+                    if let Some(text) = step["content"].as_str().filter(|s| !s.trim().is_empty()) {
+                        watch.out.push(EventBody::AssistantText { id: format!("agy-wake-{}-a-{}", watch.parent_sid, step_idx), text: text.to_string() });
+                    }
+                }
+                "GENERIC" => {
+                    for sub_id in extract_created_subagent_ids(step["content"].as_str().unwrap_or("")) {
+                        if let Some(call) = watch.pending_calls.values_mut().find(|c| c.target_subagent.is_none() && c.name.eq_ignore_ascii_case("invoke_subagent")) {
+                            call.target_subagent = Some(sub_id.clone());
+                        }
+                        watch.add_subagent(sub_id, Some(0));
+                    }
+                    watch.parent_lane.generic(&mut watch.out, step);
+                }
+                "SYSTEM_MESSAGE" => watch.parent_lane.system(&mut watch.out, step),
+                _ => {}
+            }
+            watch.next_parent_emit_step += 1;
+            watch.wakeup_stable_ticks = 0;
+        }
+
+        // Did the wakeup turn launch another chained subagent? If so, wait for it
+        if !watch.subagents.values().all(|t| t.done) {
+            return AgyStep::Wait;
+        }
+
+        let has_planner_after_wakeup = parent_steps[wakeup_idx + 1..].iter().any(|s| s["type"].as_str() == Some("PLANNER_RESPONSE"));
+        let last_is_final_planner = parent_steps.last().is_some_and(is_agy_final_reply);
+        if has_planner_after_wakeup && last_is_final_planner && !watch.parent_lane.busy() && watch.next_parent_emit_step == parent_steps.len() {
+            watch.wakeup_stable_ticks += 1;
+            if watch.wakeup_stable_ticks >= 2 {
+                flush_ready_pending_calls(watch, true);
+                // agy only marks steps it streamed as seen; resuming moves that mark past the wakeup turn, so the
+                // next prompt doesn't replay it (session/resume sends no history)
+                *next_id += 1;
+                pending.insert(*next_id, Pending::Other);
+                return AgyStep::Done(Some(json!({
+                    "jsonrpc": "2.0",
+                    "id": *next_id,
+                    "method": "session/resume",
+                    "params": {"sessionId": watch.parent_sid, "cwd": spec.cwd.display().to_string(), "mcpServers": spec.mcp_servers}
+                })));
+            }
+            return AgyStep::Wait;
+        }
+    }
+
+    if done_at.elapsed() >= WAKEUP_GRACE || watch.started_at.elapsed() >= if watch.detached { DETACHED_TIMEOUT } else { OVERALL_TIMEOUT } {
+        let emitted_wakeup_text = watch.wakeup_msg_idx.is_some_and(|wi| {
+            parent_steps[wi + 1..watch.next_parent_emit_step.min(parent_steps.len())]
+                .iter()
+                .any(|s| s["type"].as_str() == Some("PLANNER_RESPONSE") && !s["content"].as_str().unwrap_or("").trim().is_empty())
+        });
+        if !emitted_wakeup_text {
+            let fallback: String = watch.subagent_order.iter().filter_map(|sid| watch.subagents.get(sid)).map(subagent_summary_text).filter(|s| !s.is_empty()).collect::<Vec<_>>().join("\n\n");
+            if !fallback.is_empty() {
+                watch.out.push(EventBody::AssistantText { id: format!("agy-sub-fallback-{}", watch.parent_sid), text: fallback });
+            }
+        }
+        flush_ready_pending_calls(watch, true);
+        return AgyStep::Done(None);
+    }
+
+    AgyStep::Wait
 }
 
 /// ACP `usage` in a session/prompt result. Antigravity's totalTokens is inputTokens + cachedReadTokens + outputTokens
@@ -1932,5 +2808,258 @@ mod model_config_tests {
         assert_eq!(antigravity_limit(text), Some(((4 * 60 + 9) * 60 + 8) * 1000));
         assert_eq!(antigravity_limit("Quota reached. Resets in 2d3h."), Some((2 * 24 + 3) * 3_600_000));
         assert_eq!(antigravity_limit("all good"), None);
+    }
+
+    #[test]
+    fn antigravity_subagent_tracking_and_wakeup() {
+        use super::*;
+        let root = std::env::temp_dir().join(format!("yi-agy-sub-{}", uuid::Uuid::new_v4()));
+        let parent_id = "parent-conv";
+        let sub_id = "sub-conv-1";
+        let write_steps = |conv: &str, lines: &[Value]| {
+            let dir = root.join(conv).join(".system_generated").join("logs");
+            std::fs::create_dir_all(&dir).unwrap();
+            let body = lines
+                .iter()
+                .map(|v| serde_json::to_string(v).unwrap())
+                .collect::<Vec<_>>()
+                .join("\n");
+            std::fs::write(dir.join("transcript_full.jsonl"), format!("{body}\n")).unwrap();
+        };
+
+        // 1. Test parsing Created subagent id and cleaned output
+        let generic_spawn = "Created At: x\nCompleted At: y\nCreated the following subagent:\n{\n  \"conversationId\":  \"sub-conv-1\",\n  \"logAbsoluteUri\":  \"file:///tmp/x\"\n}\n";
+        assert_eq!(extract_created_subagent_ids(generic_spawn), vec!["sub-conv-1"]);
+        assert!(is_agy_subagent_tool("invoke_subagent", &json!({"Role":"Researcher"})));
+        assert!(is_agy_subagent_tool("send_message", &json!({"Recipient":"sub-conv-1","Message":"hi"})));
+        assert!(!is_agy_subagent_tool("send_message", &json!({"Message":"hi"})));
+
+        let media = vec![json!({"mime_type":"image/png","uri":"file:///tmp/out.png"})];
+        assert_eq!(
+            clean_agy_generic_output("Created At: a\nCompleted At: b\nDone!", Some(&media)),
+            "Done!\n/tmp/out.png"
+        );
+
+        // 2. Simulate parent spawning subagent and going IDLE before subagent finishes
+        let (hub, em, _rx) = crate::hub::test_emitter();
+        let mut st = State {
+            is_antigravity: true,
+            session_id: Some(parent_id.into()),
+            ..Default::default()
+        };
+        update(
+            &mut st,
+            &em,
+            &json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "tc-sub-1",
+                "kind": "other",
+                "title": "invoke_subagent",
+                "rawInput": {"TypeName":"image-generator","Role":"Image Generator","Prompt":"Draw a cat"}
+            }),
+        );
+        update(
+            &mut st,
+            &em,
+            &json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "tc-sub-1",
+                "status": "completed"
+            }),
+        );
+        // ToolResult must be deferred while subagent is pending
+        assert!(st.agy_pending_calls.contains_key("tc-sub-1"));
+        assert!(!hub.store.events_since("s", 0, 100).unwrap().iter().any(|e| matches!(e.body, EventBody::ToolResult { .. })));
+
+        write_steps(
+            parent_id,
+            &[
+                json!({"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","content":"Draw a cat"}),
+                json!({"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"invoke_subagent","args":{"TypeName":"image-generator","Role":"Image Generator","Prompt":"Draw a cat"}}]}),
+                json!({"step_index":2,"source":"MODEL","type":"GENERIC","status":"DONE","content":generic_spawn}),
+                json!({"step_index":3,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","content":"Working on it, please wait."}),
+            ],
+        );
+        write_steps(
+            sub_id,
+            &[
+                json!({"step_index":0,"source":"SYSTEM","type":"SYSTEM_MESSAGE","status":"DONE","content":"<SYSTEM_MESSAGE>sender=parent-conv</SYSTEM_MESSAGE>"}),
+                json!({"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"generate_image","args":{"ImageName":"cat.png","Prompt":"cat"}}]}),
+            ],
+        );
+
+        let mut watch = AgyWatch::new(
+            parent_id.into(),
+            root.clone(),
+            0,
+            4,
+            Some("end_turn".into()),
+            std::mem::take(&mut st.agy_pending_calls),
+            HashMap::new(),
+            true,
+        );
+        let spec = agy_test_spec();
+        let mut next_id = 10;
+        let mut pending = HashMap::new();
+
+        // First tick: discovers subagent and emits subagent's live generate_image ToolCall
+        assert!(matches!(step_agy_watch(&mut watch, &spec, &em, &mut next_id, &mut pending), AgyStep::Wait));
+        assert_eq!(watch.subagent_order, vec![sub_id]);
+
+        // 3. Subagent completes generate_image and sends result back to parent
+        write_steps(
+            sub_id,
+            &[
+                json!({"step_index":0,"source":"SYSTEM","type":"SYSTEM_MESSAGE","status":"DONE","content":"<SYSTEM_MESSAGE>sender=parent-conv</SYSTEM_MESSAGE>"}),
+                json!({"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"generate_image","args":{"ImageName":"cat.png","Prompt":"cat"}}]}),
+                json!({"step_index":2,"source":"MODEL","type":"GENERIC","status":"DONE","content":"Created At: x\nCompleted At: y\nSaved cat.png","media":[{"mime_type":"image/png","uri":"file:///tmp/cat.png"}]}),
+                json!({"step_index":3,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"send_message","args":{"Recipient":"parent-conv","Message":"Image saved at /tmp/cat.png"}}]}),
+                json!({"step_index":4,"source":"MODEL","type":"GENERIC","status":"DONE","content":"Message sent to \"parent-conv\"."}),
+                json!({"step_index":5,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","content":"Done."}),
+            ],
+        );
+        // Parent wakes up and writes final response
+        write_steps(
+            parent_id,
+            &[
+                json!({"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","content":"Draw a cat"}),
+                json!({"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"invoke_subagent","args":{"TypeName":"image-generator","Role":"Image Generator","Prompt":"Draw a cat"}}]}),
+                json!({"step_index":2,"source":"MODEL","type":"GENERIC","status":"DONE","content":generic_spawn}),
+                json!({"step_index":3,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","content":"Working on it, please wait."}),
+                json!({"step_index":4,"source":"SYSTEM","type":"SYSTEM_MESSAGE","status":"DONE","content":"<SYSTEM_MESSAGE>\n[Message] sender=sub-conv-1 content=Image saved at /tmp/cat.png\n</SYSTEM_MESSAGE>"}),
+                json!({"step_index":5,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","content":"Here is your image: ![cat](/tmp/cat.png)"}),
+            ],
+        );
+
+        assert!(matches!(step_agy_watch(&mut watch, &spec, &em, &mut next_id, &mut pending), AgyStep::Wait));
+        let AgyStep::Done(Some(sync)) = step_agy_watch(&mut watch, &spec, &em, &mut next_id, &mut pending) else {
+            panic!("should emit session/resume");
+        };
+        assert_eq!(sync["method"], "session/resume");
+        assert_eq!(sync["params"]["sessionId"], parent_id);
+
+        let evs = hub.store.events_since("s", 0, 100).unwrap();
+        assert!(evs.iter().any(|e| matches!(&e.body, EventBody::ToolCall { name, .. } if name == "generate_image")));
+        assert!(evs.iter().any(|e| matches!(&e.body, EventBody::ToolResult { id, output, .. } if id.starts_with("agy-sub:") && output.contains("/tmp/cat.png"))));
+        assert!(evs.iter().any(|e| matches!(&e.body, EventBody::ToolResult { id, output, .. } if id == "tc-sub-1" && output == "Image saved at /tmp/cat.png")));
+        assert!(evs.iter().any(|e| matches!(&e.body, EventBody::AssistantText { text, .. } if text == "Here is your image: ![cat](/tmp/cat.png)")));
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn agy_test_spec() -> StartSpec {
+        StartSpec {
+            tool: ToolKind::Antigravity,
+            mode: SessionMode::Structured,
+            cwd: "/tmp".into(),
+            resume: None,
+            replay: false,
+            replay_skip: 0,
+            model: None,
+            effort: None,
+            model_config_options: vec![],
+            permission_mode: "default".into(),
+            command: None,
+            program: "agy".into(),
+            extra_args: vec![],
+            mcp_servers: vec![],
+            mcp_fingerprint: String::new(),
+            allow_mcp: vec![],
+            system_prompt: None,
+            system_notice: false,
+            cols: 80,
+            rows: 24,
+            tmux: None,
+            session_id: None,
+        }
+    }
+
+    fn write_agy_steps(root: &std::path::Path, conv: &str, lines: &[Value]) {
+        let dir = root.join(conv).join(".system_generated").join("logs");
+        std::fs::create_dir_all(&dir).unwrap();
+        let body = lines.iter().map(|v| serde_json::to_string(v).unwrap()).collect::<Vec<_>>().join("\n");
+        std::fs::write(dir.join("transcript_full.jsonl"), format!("{body}\n")).unwrap();
+    }
+
+    #[test]
+    fn antigravity_bypass_skips_permissions() {
+        use super::*;
+        let mut spec = agy_test_spec();
+        assert!(!build_args(&spec).contains(&"--dangerously-skip-permissions".to_string()));
+        spec.permission_mode = "bypass".into();
+        assert_eq!(build_args(&spec), vec!["acp", "--dangerously-skip-permissions"]);
+    }
+
+    #[test]
+    fn antigravity_background_command_result() {
+        use super::*;
+        let msg = "The following is a <SYSTEM_MESSAGE> not actually sent by the user.\n\n<SYSTEM_MESSAGE>\n[Message] timestamp=x sender=s1/task-2 priority=MESSAGE_PRIORITY_HIGH content=Task id \"s1/task-2\" finished with result:\nCommand exited with code 0.\n\nCommand output:\nSUB-DONE-42\r\n\nLog: file:///tmp/task-2.log\n</SYSTEM_MESSAGE>";
+        assert_eq!(agy_task_finished(msg), Some(("s1/task-2", "SUB-DONE-42".to_string())));
+        assert!(!is_agy_wakeup(&json!({"type":"SYSTEM_MESSAGE","content":"<SYSTEM_MESSAGE>\n[Message] timestamp=x sender=system priority=MESSAGE_PRIORITY_HIGH content=settings changed\n</SYSTEM_MESSAGE>"})));
+        assert!(is_agy_wakeup(&json!({"type":"SYSTEM_MESSAGE","content":msg})));
+        assert_eq!(agy_background_task("Created At: x\nTool is running as a background task with task id: s1/task-2\nTask Description: sleep"), Some("s1/task-2"));
+
+        let root = std::env::temp_dir().join(format!("yi-agy-bg-{}", uuid::Uuid::new_v4()));
+        let (hub, em, _rx) = crate::hub::test_emitter();
+        let spawn = "Created the following subagent:\n{\"conversationId\": \"s1\"}";
+        let parent = vec![
+            json!({"type":"USER_INPUT","status":"DONE","content":"go"}),
+            json!({"type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"invoke_subagent","args":{"Prompt":"run it"}}]}),
+            json!({"type":"GENERIC","status":"DONE","content":spawn}),
+            json!({"type":"PLANNER_RESPONSE","status":"DONE","content":"Waiting."}),
+        ];
+        write_agy_steps(&root, "p1", &parent);
+        let mut sub = vec![
+            json!({"type":"SYSTEM_MESSAGE","status":"DONE","content":"<SYSTEM_MESSAGE>sender=p1 content=run it</SYSTEM_MESSAGE>"}),
+            json!({"type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"run_command","args":{"CommandLine":"sleep 20; echo SUB-DONE-42"}}]}),
+            json!({"type":"GENERIC","status":"RUNNING","content":"Created At: x\nTool is running as a background task with task id: s1/task-2\n"}),
+            json!({"type":"PLANNER_RESPONSE","status":"DONE","content":"Running in the background, waiting."}),
+        ];
+        write_agy_steps(&root, "s1", &sub);
+        let calls = HashMap::from([("tc".to_string(), AgyPendingCall { name: "invoke_subagent".into(), target_subagent: None })]);
+        let mut watch = AgyWatch::new("p1".into(), root.clone(), 0, 4, Some("end_turn".into()), calls, HashMap::new(), true);
+        let spec = agy_test_spec();
+        let (mut next_id, mut pending) = (1, HashMap::new());
+        // The background command keeps the subagent running, though its last reply has no tool calls
+        assert!(matches!(step_agy_watch(&mut watch, &spec, &em, &mut next_id, &mut pending), AgyStep::Wait));
+        assert!(!watch.subagents["s1"].done);
+        sub.push(json!({"type":"SYSTEM_MESSAGE","status":"DONE","content":msg}));
+        sub.push(json!({"type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"send_message","args":{"Recipient":"p1","Message":"SUB-DONE-42"}}]}));
+        sub.push(json!({"type":"GENERIC","status":"DONE","content":"Message sent to \"p1\"."}));
+        write_agy_steps(&root, "s1", &sub);
+        assert!(matches!(step_agy_watch(&mut watch, &spec, &em, &mut next_id, &mut pending), AgyStep::Wait));
+        assert!(watch.subagents["s1"].done);
+        let evs = hub.store.events_since("s", 0, 100).unwrap();
+        assert!(evs.iter().any(|e| matches!(&e.body, EventBody::ToolResult { id, output, .. } if id == "agy-sub:s1:1:0" && output == "SUB-DONE-42")));
+        assert!(evs.iter().any(|e| matches!(&e.body, EventBody::ToolResult { id, output, .. } if id == "tc" && output == "SUB-DONE-42")));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn antigravity_subagent_waiting_for_approval_detaches() {
+        use super::*;
+        let root = std::env::temp_dir().join(format!("yi-agy-stall-{}", uuid::Uuid::new_v4()));
+        let (hub, em, _rx) = crate::hub::test_emitter();
+        write_agy_steps(&root, "p1", &[json!({"type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"send_message","args":{"Recipient":"s1","Message":"run"}}]})]);
+        write_agy_steps(&root, "s1", &[
+            json!({"type":"SYSTEM_MESSAGE","status":"DONE","content":"<SYSTEM_MESSAGE>sender=p1 content=run</SYSTEM_MESSAGE>"}),
+            json!({"type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"run_command","args":{"CommandLine":"echo hi"}}]}),
+        ]);
+        let spec = agy_test_spec();
+        let (mut next_id, mut pending) = (1, HashMap::new());
+        for stall_check in [false, true] {
+            let mut watch = AgyWatch::new("p1".into(), root.clone(), 0, 1, None, HashMap::new(), HashMap::from([("s1".to_string(), 0)]), stall_check);
+            assert!(matches!(step_agy_watch(&mut watch, &spec, &em, &mut next_id, &mut pending), AgyStep::Wait));
+            // The subagent's transcript hasn't moved for longer than the stall limit
+            watch.subagents.get_mut("s1").unwrap().transcript.changed_at = Some(tokio::time::Instant::now() - std::time::Duration::from_secs(31));
+            let step = step_agy_watch(&mut watch, &spec, &em, &mut next_id, &mut pending);
+            // Allow-all runs agy with --dangerously-skip-permissions, where waiting means a slow tool
+            assert_eq!(matches!(step, AgyStep::Detach), stall_check, "stall_check={stall_check}");
+        }
+        let evs = hub.store.events_since("s", 0, 100).unwrap();
+        assert_eq!(evs.iter().filter(|e| matches!(&e.body, EventBody::Error { message } if message.starts_with("子 agent 在等待审批"))).count(), 1);
+        assert_eq!(count_agy_transcript_steps(&root, "s1"), 2);
+        assert_eq!(count_agy_transcript_steps(&root, "../s1"), 0);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
