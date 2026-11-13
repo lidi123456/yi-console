@@ -139,7 +139,7 @@ pub fn start(spec: StartSpec, em: Emitter, rx: mpsc::UnboundedReceiver<AdapterCm
         (SessionMode::Structured, ToolKind::Codex) => {
             tokio::spawn(codex::run(spec, em, rx));
         }
-        (SessionMode::Structured, ToolKind::Cursor | ToolKind::Kiro | ToolKind::Qoder | ToolKind::Codebuddy) => {
+        (SessionMode::Structured, ToolKind::Cursor | ToolKind::Kiro | ToolKind::Qoder | ToolKind::Codebuddy | ToolKind::Antigravity) => {
             tokio::spawn(acp::run(spec, em, rx));
         }
         // Files sessions have no process; Hub::launch never gets here

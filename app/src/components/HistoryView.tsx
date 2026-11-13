@@ -10,7 +10,7 @@ import { Icon, ToolBadge } from './Icon';
 
 const t = getT('historyView');
 
-const HISTORY_TOOLS: ToolKind[] = ['claude', 'codex', 'cursor', 'kiro', 'qoder', 'codebuddy'];
+const HISTORY_TOOLS: ToolKind[] = ['claude', 'codex', 'cursor', 'kiro', 'qoder', 'codebuddy', 'antigravity'];
 const PAGE = 100;
 
 /** For comparing directories: expand ~, normalize slashes, strip the trailing slash; Windows paths are case-insensitive */

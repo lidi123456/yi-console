@@ -6,7 +6,7 @@ import { Icon } from './Icon';
 import { askConfirm } from './Overlay';
 
 const t = getT('mcpSettings');
-const tools: ToolKind[] = ['claude', 'codex', 'cursor', 'kiro', 'qoder', 'codebuddy'];
+const tools: ToolKind[] = ['claude', 'codex', 'cursor', 'kiro', 'qoder', 'codebuddy', 'antigravity'];
 const blank = (): McpServerConfig => ({
   name: '',
   enabled: true,

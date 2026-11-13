@@ -273,6 +273,8 @@ function resumeCommand(info: SessionInfo): string | null {
       return `qodercli --resume ${id}`;
     case 'codebuddy':
       return `codebuddy --resume ${id}`;
+    case 'antigravity':
+      return `agy --conversation ${id}`;
     default:
       return null;
   }
@@ -374,10 +376,11 @@ export function sessionMenu(
       : []),
     ...(info.tool !== 'shell' && info.mode !== 'terminal' ? [{ label: tx('clearConversation'), icon: 'trash', run: () => clearSession(hostId, info) }] : []),
     // Chat mode: no tool session id means nothing has been said yet (or just /clear-ed), so there's nothing to hand off.
-    // Terminal mode: the daemon works out the tool session when asked (session.logFile); Cursor's terminal sessions have no readable log
+    // Terminal mode: the daemon works out the tool session when asked (session.logFile); Cursor's and Antigravity's
+    // sessions have no readable log, and the Markdown export needs our events, which a terminal session doesn't have
     ...(info.tool !== 'shell' &&
     !info.parentId &&
-    (info.mode === 'structured' ? !!info.externalId : info.mode === 'terminal' && info.tool !== 'cursor')
+    (info.mode === 'structured' ? !!info.externalId : info.mode === 'terminal' && info.tool !== 'cursor' && info.tool !== 'antigravity')
       ? [{ label: tx('continueInAnotherTool'), icon: 'forward', run: () => handoffSession(hostId, info) }]
       : []),
     '-',

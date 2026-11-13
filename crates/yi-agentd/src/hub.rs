@@ -197,6 +197,8 @@ pub fn permission_modes(tool: ToolKind, mode: SessionMode) -> &'static [&'static
         // Qoder has no plan mode
         (Qoder, _) => &["default", "acceptEdits", "bypass"],
         (Codebuddy, _) => &["default", "acceptEdits", "plan", "bypass"],
+        // Antigravity's own modes (default / accept-edits / auto / plan), allow-all answers every request
+        (Antigravity, _) => &["default", "acceptEdits", "auto", "plan", "bypass"],
         (Shell | Files, _) => &[],
     }
 }
@@ -1264,7 +1266,7 @@ impl Hub {
             if i.mode == SessionMode::Terminal {
                 bail!("终端模式不支持切换思考等级");
             }
-            if !matches!(i.tool, ToolKind::Claude | ToolKind::Codex) {
+            if !matches!(i.tool, ToolKind::Claude | ToolKind::Codex | ToolKind::Antigravity) {
                 bail!("{} 不支持调整思考等级", i.tool.as_str());
             }
             i.effort = Some(effort.to_string()).filter(|m| !m.is_empty());
@@ -1979,7 +1981,7 @@ impl Hub {
     pub async fn guess_terminal_session(&self, id: &str) {
         let Ok(rt) = self.get(id) else { return };
         let info = rt.info.lock().unwrap().clone();
-        if info.mode != SessionMode::Terminal || !matches!(info.tool, ToolKind::Codex | ToolKind::Cursor | ToolKind::Kiro) {
+        if info.mode != SessionMode::Terminal || !matches!(info.tool, ToolKind::Codex | ToolKind::Cursor | ToolKind::Kiro | ToolKind::Antigravity) {
             return;
         }
         let own_runs = rt.runs.lock().unwrap().clone();
@@ -2002,7 +2004,7 @@ impl Hub {
                 }));
             }
         }
-        let pick = if info.tool == ToolKind::Cursor || own_runs.is_empty() {
+        let pick = if matches!(info.tool, ToolKind::Cursor | ToolKind::Antigravity) || own_runs.is_empty() {
             if info.external_id.is_some() {
                 return;
             }
@@ -2821,6 +2823,7 @@ fn display_name(info: &SessionInfo) -> String {
         ToolKind::Kiro => "Kiro",
         ToolKind::Qoder => "Qoder",
         ToolKind::Codebuddy => "CodeBuddy",
+        ToolKind::Antigravity => "Antigravity",
         ToolKind::Shell => "终端",
         ToolKind::Files => "文件",
     }

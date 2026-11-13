@@ -450,8 +450,13 @@ function toolName(name: string) {
   if (n === 'powershell') return 'PowerShell';
   if (n === 'toolsearch' || n.startsWith('mcp__')) return name;
   if (['bash', 'shell', 'execute', 'terminal', 'command'].some((x) => n.includes(x))) return 'Bash';
-  if (n === 'write' || n === 'fs_write' || n === 'create') return 'Write';
-  if (['edit', 'patch', 'notebook', 'str_replace'].some((x) => n.includes(x))) return 'Update';
+  if (n === 'write' || n === 'fs_write' || n === 'create' || n === 'write_file' || n === 'write_to_file') return 'Write';
+  if (['edit', 'patch', 'notebook', 'str_replace', 'replace_file_content', 'sed_file'].some((x) => n.includes(x))) return 'Update';
+  // Antigravity: read_url_content / search_web / grep_search / find_by_name
+  if (n === 'read_url_content') return 'Fetch';
+  if (n === 'search_web') return 'Web Search';
+  if (n === 'grep_search') return 'Grep';
+  if (n === 'find_by_name') return 'Glob';
   if (['read', 'view'].some((x) => n.includes(x))) return 'Read';
   if (n === 'grep') return 'Grep';
   if (n === 'glob') return 'Glob';
@@ -481,9 +486,13 @@ const ARG_KEYS = ['command', 'pattern', 'query', 'file_path', 'notebook_path', '
 /** Key argument in parentheses: prefer common fields from the input (Cursor titles start out as just "Read File" / "Terminal"),
  *  then fall back to the title; if the title is a JSON blob, take the first short string */
 function toolArg(it: Item & { k: 'tool' }, shown: string, cwd?: string) {
-  const input = it.input && typeof it.input === 'object' ? (it.input as Record<string, unknown>) : {};
+  const input: Record<string, unknown> = it.input && typeof it.input === 'object' ? { ...(it.input as Record<string, unknown>) } : {};
   // File-editing tools check the path first: Kiro's write also puts the operation type (strReplace / create) in command
   const keys = shown === 'Update' || shown === 'Write' ? ['file_path', 'notebook_path', 'path', ...ARG_KEYS] : ARG_KEYS;
+  // Antigravity names its arguments in PascalCase (CommandLine, Path, SearchPath…)
+  const pascal: Record<string, string> = { command: 'CommandLine', path: 'Path', pattern: 'Pattern', query: 'Query', url: 'Url' };
+  for (const [k, v] of Object.entries(pascal)) if (input[k] === undefined && typeof input[v] === 'string') input[k] = input[v];
+  if (input.path === undefined && typeof input.SearchPath === 'string') input.path = input.SearchPath;
   const key = keys.find((k) => typeof input[k] === 'string' && input[k]);
   const opPath = Array.isArray(input.operations) ? (input.operations[0] as { path?: string } | undefined)?.path : undefined;
   let t = key ? String(input[key]) : opPath || it.title || it.diffs[0]?.path || '';

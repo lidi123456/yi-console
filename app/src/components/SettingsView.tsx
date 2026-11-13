@@ -128,7 +128,7 @@ export function SettingsView({ hostId }: { hostId: string }) {
         <div className="card-title">{t('toolPaths')}</div>
         <p className="muted small">{t('lookedUpOnPathAnd')}</p>
         <div className="form">
-          {(['claude', 'codex', 'cursor', 'kiro', 'qoder', 'codebuddy', 'shell'] as ToolKind[]).map((k) => {
+          {(['claude', 'codex', 'cursor', 'kiro', 'qoder', 'codebuddy', 'antigravity', 'shell'] as ToolKind[]).map((k) => {
             const detected = host?.status.hello?.tools.find((t) => t.kind === k);
             return (
               <label key={k}>

@@ -3,8 +3,8 @@
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 
-/// Tools a Bot or task may use: the six AI tools with MCP support, chat mode only
-pub const AI_TOOLS: [&str; 6] = ["claude", "codex", "cursor", "kiro", "qoder", "codebuddy"];
+/// Tools a Bot or task may use: the AI tools with MCP support, chat mode only
+pub const AI_TOOLS: [&str; 7] = ["claude", "codex", "cursor", "kiro", "qoder", "codebuddy", "antigravity"];
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]

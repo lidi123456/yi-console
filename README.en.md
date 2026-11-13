@@ -12,7 +12,7 @@ AI coding tools like Claude Code and Codex live in the terminal. Several session
 
 Yi Console brings them together:
 
-- **Many tools, one interface**: Claude Code, Codex, Cursor, Kiro, Qoder, CodeBuddy, plus a plain terminal.
+- **Many tools, one interface**: Claude Code, Codex, Cursor, Kiro, Qoder, CodeBuddy, Antigravity, plus a plain terminal.
 - **Sessions that don't die**: a background service on each machine hosts every session. Close the window, put the computer to sleep, or send the phone app to the background, and the tools keep working; come back and pick up where you left off.
 - **Two views, switch any time**: a chat view (messages, tool calls, file changes, approval buttons) or the tool's own terminal UI. Switch the same session back and forth without losing context.
 - **Remote machines**: connect to servers over SSH, with automatic deployment on first connect and nothing to install by hand. Reach computers on a home or office network from your phone or another computer through a relay, end-to-end encrypted.
@@ -45,6 +45,7 @@ Runs on Windows, macOS and Linux desktops, and on Android phones. The UI is avai
    | Kiro CLI | install `kiro-cli` and log in |
    | Qoder CLI | install `qodercli`, run `qodercli login` |
    | CodeBuddy Code | `npm i -g @tencent-ai/codebuddy-code`, run `codebuddy` and type `/login` |
+   | Antigravity CLI | Install `agy` and run it once to sign in (`agy acp --login` on a remote host) |
 
    You can also skip the AI tools and use it just as a terminal.
 
@@ -70,7 +71,7 @@ See [Remote access and relay](docs/remote.en.md) for step-by-step instructions.
 ```
   Desktop / mobile app                     Browser (yi-web, for development)
         │
-        ├── local ───────────────── yi-agentd ── Claude Code / Codex / Cursor / Kiro / Qoder / CodeBuddy / terminal
+        ├── local ───────────────── yi-agentd ── Claude Code / Codex / Cursor / Kiro / Qoder / CodeBuddy / Antigravity / terminal
         ├── SSH ─────────────────── yi-agentd ── …
         └── relay (end-to-end) ──── yi-agentd ── …
 ```
@@ -93,4 +94,4 @@ Issues and pull requests are welcome. See the [development guide](docs/developme
 
 [MIT License](LICENSE)
 
-Claude Code, Codex, Cursor, Kiro, Qoder and CodeBuddy are trademarks of their respective owners; Yi Console is not affiliated with these companies. Tool icons in the UI come from [@lobehub/icons](https://github.com/lobehub/lobe-icons) (MIT).
+Claude Code, Codex, Cursor, Kiro, Qoder, CodeBuddy and Antigravity are trademarks of their respective owners; Yi Console is not affiliated with these companies. Tool icons in the UI come from [@lobehub/icons](https://github.com/lobehub/lobe-icons) (MIT).

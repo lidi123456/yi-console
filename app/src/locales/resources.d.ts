@@ -1805,7 +1805,7 @@ export default interface Resources {
     "billedInCreditsNoTokens": "按积分计费（未上报 token）",
     "cache": "缓存",
     "calculatingTheFirstReadOf": "统计中…（第一次要读一遍工具日志，可能要几秒）",
-    "claudeCodeCodexQoderAnd": "Claude Code、Codex、Qoder、CodeBuddy 的用量读自这台主机上工具自己的日志，终端里直接用的也算在内；Kiro 只统计 Yi Console 里的会话。Qoder、Kiro 按积分（credits）计，CodeBuddy 同时记录 token 与积分，费用只有 Claude Code 在 Yi Console 会话里会上报。",
+    "claudeCodeCodexQoderAnd": "Claude Code、Codex、Qoder、CodeBuddy 的用量读自这台主机上工具自己的日志，终端里直接用的也算在内；Kiro、Antigravity 只统计 Yi Console 里的会话。Qoder、Kiro 按积分（credits）计，CodeBuddy 同时记录 token 与积分，费用只有 Claude Code 在 Yi Console 会话里会上报。",
     "cost": "费用",
     "credits": "积分",
     "d": "{{d}} 天",

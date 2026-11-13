@@ -19,7 +19,7 @@ export function older(a: string, b: string) {
   return false;
 }
 
-const UPGRADABLE = ['claude', 'codex', 'cursor', 'kiro', 'qoder', 'codebuddy'];
+const UPGRADABLE = ['claude', 'codex', 'cursor', 'kiro', 'qoder', 'codebuddy', 'antigravity'];
 
 /** Tools on one host in the host manager: version, newest version, and an upgrade with the tool's own update command */
 export function HostTools({ hostId, tools }: { hostId: string; tools: ToolInfo[] }) {
@@ -163,7 +163,7 @@ export function HostTools({ hostId, tools }: { hostId: string; tools: ToolInfo[]
                 <button
                   className={`btn small ${newer ? 'primary' : ''}`}
                   disabled={!info?.canUpdate || anyRunning}
-                  title={tx('runsCommand', { cmd: `${t.kind === 'cursor' ? 'cursor-agent' : t.kind === 'kiro' ? 'kiro-cli' : t.kind === 'qoder' ? 'qodercli' : t.kind} update` })}
+                  title={tx('runsCommand', { cmd: `${t.kind === 'cursor' ? 'cursor-agent' : t.kind === 'kiro' ? 'kiro-cli' : t.kind === 'qoder' ? 'qodercli' : t.kind === 'antigravity' ? 'agy' : t.kind} update` })}
                   onClick={() => update(t.kind)}
                 >
                   {tx('update')}

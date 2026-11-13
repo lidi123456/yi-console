@@ -13,6 +13,7 @@ fn binary_names(kind: ToolKind) -> &'static [&'static str] {
         ToolKind::Kiro => &["kiro-cli"],
         ToolKind::Qoder => &["qodercli"],
         ToolKind::Codebuddy => &["codebuddy", "cbc"],
+        ToolKind::Antigravity => &["agy"],
         ToolKind::Shell | ToolKind::Files => &[],
     }
 }
@@ -66,6 +67,8 @@ pub fn fix_path() {
             PathBuf::from(&local).join("cursor-agent"),
             // Qoder's install script puts it under ~/.qoder/bin/qodercli/, not on PATH
             home.join(".qoder").join("bin").join("qodercli"),
+            // Antigravity CLI's install.ps1
+            PathBuf::from(&local).join("agy").join("bin"),
         ]
     } else {
         vec![

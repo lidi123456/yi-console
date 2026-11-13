@@ -16,6 +16,7 @@ pub fn supported(tool: ToolKind) -> bool {
             | ToolKind::Kiro
             | ToolKind::Qoder
             | ToolKind::Codebuddy
+            | ToolKind::Antigravity
     )
 }
 
@@ -157,7 +158,7 @@ fn toml(value: &Value) -> String {
     }
 }
 
-/// CLI adapters receive process arguments; all four ACP adapters receive the same session definitions.
+/// CLI adapters receive process arguments; all ACP adapters receive the same session definitions.
 pub fn inject(tool: ToolKind, servers: &[McpServerConfig], args: &mut Vec<String>) -> Vec<Value> {
     if servers.is_empty() {
         return vec![];
@@ -174,7 +175,7 @@ pub fn inject(tool: ToolKind, servers: &[McpServerConfig], args: &mut Vec<String
             for server in servers { args.extend(["-c".into(), format!("mcp_servers.{}={}", server.name, toml(&cli_config(server, true)))]); }
             vec![]
         }
-        ToolKind::Cursor | ToolKind::Kiro | ToolKind::Qoder | ToolKind::Codebuddy => servers.iter().map(|server| match server.transport {
+        ToolKind::Cursor | ToolKind::Kiro | ToolKind::Qoder | ToolKind::Codebuddy | ToolKind::Antigravity => servers.iter().map(|server| match server.transport {
             McpTransport::Stdio => json!({"name":server.name,"command":server.command,"args":server.args,"env":server.env.iter().map(|(name,value)|json!({"name":name,"value":value})).collect::<Vec<_>>()}),
             McpTransport::Http => json!({"name":server.name,"type":"http","url":server.url,"headers":server.headers.iter().map(|(name,value)|json!({"name":name,"value":value})).collect::<Vec<_>>()}),
         }).collect(),
@@ -189,7 +190,7 @@ mod tests {
         serde_json::from_value(json!({"name":"probe","command":"C:\\Program Files\\probe.exe","args":["a b"],"env":{"TOKEN":"secret"}})).unwrap()
     }
     #[test]
-    fn six_providers_receive_the_same_server_and_existing_args_survive() {
+    fn all_providers_receive_the_same_server_and_existing_args_survive() {
         for tool in [
             ToolKind::Claude,
             ToolKind::Codex,
@@ -197,6 +198,7 @@ mod tests {
             ToolKind::Kiro,
             ToolKind::Qoder,
             ToolKind::Codebuddy,
+            ToolKind::Antigravity,
         ] {
             let mut args = vec!["--existing".into()];
             let servers = inject(tool, &[fixture()], &mut args);

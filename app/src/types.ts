@@ -1,7 +1,7 @@
 // Types mirroring crates/proto
 
 /** files: no process, the session page is just the workspace file panel */
-export type ToolKind = 'claude' | 'codex' | 'cursor' | 'kiro' | 'qoder' | 'codebuddy' | 'shell' | 'files';
+export type ToolKind = 'claude' | 'codex' | 'cursor' | 'kiro' | 'qoder' | 'codebuddy' | 'antigravity' | 'shell' | 'files';
 export type SessionMode = 'structured' | 'terminal';
 export type SessionStatus = 'starting' | 'idle' | 'running' | 'waiting-permission' | 'exited' | 'error';
 
@@ -462,6 +462,7 @@ export const TOOL_LABEL: Record<ToolKind, string> = new Proxy(
     kiro: 'Kiro',
     qoder: 'Qoder',
     codebuddy: 'CodeBuddy',
+    antigravity: 'Antigravity',
     shell: '终端',
     files: '文件',
   },

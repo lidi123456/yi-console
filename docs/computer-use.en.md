@@ -2,7 +2,7 @@
 
 [简体中文](computer-use.md)
 
-Let a Claude Code, Codex, Cursor, Kiro, Qoder or CodeBuddy chat session operate the signed-in Windows or macOS desktop on its host (open apps, switch windows, read, click and type), with activity and checkpoint screenshots in the conversation.
+Let a Claude Code, Codex, Cursor, Kiro, Qoder, CodeBuddy or Antigravity chat session operate the signed-in Windows or macOS desktop on its host (open apps, switch windows, read, click and type), with activity and checkpoint screenshots in the conversation.
 
 ## Support
 
@@ -22,7 +22,7 @@ The first time you enable computer use, Cua Driver shows its own permission guid
 
 ## Use
 
-1. Start Yi Console normally on the target computer and open a Claude Code, Codex, Cursor, Kiro, Qoder or CodeBuddy chat session.
+1. Start Yi Console normally on the target computer and open a Claude Code, Codex, Cursor, Kiro, Qoder, CodeBuddy or Antigravity chat session.
 2. Click the computer icon (Computer use) right of @ in the composer toolbar.
 3. With no reply in progress, enable computer use. The AI can then operate every app on this computer; it finds windows or launches apps itself, with no window to pick first. The tool connects to a session-scoped MCP entry and continues the existing tool session ID where possible.
 4. Give a specific task, such as: “Open Notepad and type a line, don't save.” or “Send someone a message in Feishu.”

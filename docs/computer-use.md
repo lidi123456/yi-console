@@ -2,7 +2,7 @@
 
 [English](computer-use.en.md)
 
-让 Claude Code、Codex、Cursor、Kiro、Qoder 或 CodeBuddy 的聊天会话操作目标主机上已登录的 Windows 或 macOS 桌面：打开应用、切换窗口、查看界面、点击、输入，并把操作记录和关键截图带回聊天。
+让 Claude Code、Codex、Cursor、Kiro、Qoder、CodeBuddy 或 Antigravity 的聊天会话操作目标主机上已登录的 Windows 或 macOS 桌面：打开应用、切换窗口、查看界面、点击、输入，并把操作记录和关键截图带回聊天。
 
 ## 支持范围
 

@@ -68,6 +68,8 @@ pub enum ToolKind {
     Qoder,
     /// Tencent's CodeBuddy Code (codebuddy), via ACP
     Codebuddy,
+    /// Google's Antigravity CLI (agy), via ACP
+    Antigravity,
     /// Any command, terminal mode only
     Shell,
     /// No process: the session page is just the workspace file panel (plus the bottom terminal panel)
@@ -75,13 +77,14 @@ pub enum ToolKind {
 }
 
 impl ToolKind {
-    pub const ALL: [ToolKind; 8] = [
+    pub const ALL: [ToolKind; 9] = [
         ToolKind::Claude,
         ToolKind::Codex,
         ToolKind::Cursor,
         ToolKind::Kiro,
         ToolKind::Qoder,
         ToolKind::Codebuddy,
+        ToolKind::Antigravity,
         ToolKind::Shell,
         ToolKind::Files,
     ];
@@ -94,6 +97,7 @@ impl ToolKind {
             ToolKind::Kiro => "kiro",
             ToolKind::Qoder => "qoder",
             ToolKind::Codebuddy => "codebuddy",
+            ToolKind::Antigravity => "antigravity",
             ToolKind::Shell => "shell",
             ToolKind::Files => "files",
         }

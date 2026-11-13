@@ -19,6 +19,8 @@ enum Pending {
     Prompt,
     SetModel,
     SetConfig,
+    /// Antigravity's `thought_level` option
+    SetEffort,
     Other,
 }
 
@@ -93,7 +95,19 @@ struct State {
     base_mode: Option<String>,
     /// Current permission mode; can change during the session
     perm: String,
+    /// The tool has an ACP mode for every permission mode (Antigravity), so each one is set with session/set_mode
+    native_modes: bool,
+    /// The tool's current ACP mode id, when `native_modes`
+    native_mode: Option<String>,
     turn_credits: f64,
+    /// Antigravity: the thinking level chosen in Yi Console, kept on the tool's `thought_level` option. agy resets the
+    /// option to its default on every model switch, so it is set again whenever the tool reports a different value
+    effort: Option<String>,
+    /// Levels the tool offers for the current model, and the one it is on
+    thought_levels: Vec<String>,
+    thought_current: Option<String>,
+    /// Text of the turn's last reply (Antigravity reports a used-up quota only as reply text)
+    last_reply: String,
     /// Cursor's cursor/ask_question requests: request id -> (JSON-RPC id)
     asks: HashMap<String, Value>,
     /// Auth methods returned by initialize. We don't call authenticate up front (cursor_login opens a browser,
@@ -167,6 +181,8 @@ pub async fn run(spec: StartSpec, em: Emitter, mut rx: mpsc::UnboundedReceiver<A
     };
     let mut st = State {
         perm: spec.permission_mode.clone(),
+        native_modes: spec.tool == ToolKind::Antigravity,
+        effort: spec.effort.clone().filter(|e| !e.is_empty() && spec.tool == ToolKind::Antigravity),
         desktop_notice: spec.mcp_servers.iter().any(|server| server["name"] == crate::mcp::DESKTOP_SERVER),
         system_notice: super::acp_system_notice(&spec),
         ..Default::default()
@@ -192,6 +208,7 @@ pub async fn run(spec: StartSpec, em: Emitter, mut rx: mpsc::UnboundedReceiver<A
                     Err(msg) => { fatal = Some(msg); killed = true; break; }
                 }
                 if let Some(m) = next_config(&mut st) { let _ = p.send(&m).await; }
+                if let Some(m) = next_effort(&mut st) { let _ = p.send(&m).await; }
                 if st.session_id.is_some() && !config_pending(&st) && !st.prompting && !st.loading && st.compacting.is_none() && !st.queue.is_empty() {
                     let next = st.queue.remove(0);
                     let m = prompt(&mut st, &em, &next);
@@ -235,6 +252,11 @@ pub async fn run(spec: StartSpec, em: Emitter, mut rx: mpsc::UnboundedReceiver<A
                     st.wanted.push((id.clone(), value.clone()));
                     st.config_queue.push((id, value));
                     if let Some(m) = next_config(&mut st) { let _ = p.send(&m).await; }
+                }
+                Some(AdapterCmd::SetEffort(effort)) if spec.tool == ToolKind::Antigravity => {
+                    // Back to "default" is agy's own default level
+                    st.effort = Some(if effort.is_empty() { "medium".into() } else { effort });
+                    if let Some(m) = next_effort(&mut st) { let _ = p.send(&m).await; }
                 }
                 Some(AdapterCmd::SetPermissionMode(mode)) => {
                     let was_plan = st.perm == "plan";
@@ -298,7 +320,28 @@ pub fn client_capabilities(tool: ToolKind) -> Value {
 }
 
 fn config_pending(st: &State) -> bool {
-    !st.config_queue.is_empty() || st.pending.values().any(|p| matches!(p, Pending::SetModel | Pending::SetConfig))
+    !st.config_queue.is_empty() || st.pending.values().any(|p| matches!(p, Pending::SetModel | Pending::SetConfig | Pending::SetEffort))
+}
+
+/// Antigravity: record the `thought_level` option from a configOptions list (absent: the model has no levels)
+fn read_thought_level(st: &mut State, v: &Value) {
+    let Some(options) = v["configOptions"].as_array() else { return };
+    let option = options.iter().find(|o| o["category"] == "thought_level");
+    st.thought_levels = option.and_then(|o| o["options"].as_array()).into_iter().flatten()
+        .filter_map(|o| o["value"].as_str().map(str::to_string)).collect();
+    st.thought_current = option.and_then(|o| o["currentValue"].as_str()).map(str::to_string);
+}
+
+/// Antigravity: set the chosen thinking level when the tool is on another one and the current model offers it
+fn next_effort(st: &mut State) -> Option<Value> {
+    let want = st.effort.clone()?;
+    if st.loading || st.session_id.is_none() || st.pending.values().any(|p| matches!(p, Pending::SetModel | Pending::SetEffort))
+        || st.thought_current.as_deref() == Some(want.as_str()) || !st.thought_levels.contains(&want) {
+        return None;
+    }
+    st.thought_current = Some(want.clone());
+    Some(st.req(Pending::SetEffort, "session/set_config_option",
+        json!({"sessionId":st.session_id,"configId":"thought_level","value":want})))
 }
 
 /// `grok-4.7[context=256k]` (the old single-string form) -> `grok-4.7`
@@ -360,6 +403,7 @@ fn publish_config(st: &State, em: &Emitter) {
 
 fn prompt(st: &mut State, em: &Emitter, p: &Prompt) -> Value {
     st.prompting = true;
+    st.last_reply.clear();
     st.compact_manual = p.text.trim().starts_with("/compact");
     st.turn_credits = 0.0;
     let sid = st.session_id.clone().unwrap_or_default();
@@ -398,6 +442,14 @@ fn prompt(st: &mut State, em: &Emitter, p: &Prompt) -> Value {
 /// Of the permission modes, only read-only planning needs the tool's cooperation (ACP session mode); the rest we handle at approval time
 fn apply_mode(st: &mut State, was_plan: bool) -> Option<Value> {
     let sid = st.session_id.clone()?;
+    if st.native_modes {
+        let target = antigravity_mode(&st.perm);
+        if st.native_mode.as_deref() == Some(target) {
+            return None;
+        }
+        st.native_mode = Some(target.to_string());
+        return Some(st.req(Pending::Other, "session/set_mode", json!({"sessionId":sid,"modeId":target})));
+    }
     let target = if st.perm == "plan" {
         st.plan_mode.clone()?
     } else if was_plan {
@@ -406,6 +458,16 @@ fn apply_mode(st: &mut State, was_plan: bool) -> Option<Value> {
         return None;
     };
     Some(st.req(Pending::Other, "session/set_mode", json!({"sessionId":sid,"modeId":target})))
+}
+
+/// Antigravity's ACP mode for a permission mode. Allow-all stays in default: every request it asks about is answered here
+fn antigravity_mode(perm: &str) -> &'static str {
+    match perm {
+        "acceptEdits" => "accept-edits",
+        "auto" => "auto",
+        "plan" => "plan",
+        _ => "default",
+    }
 }
 
 fn set_model(st: &mut State, model: &str) -> Value {
@@ -428,6 +490,9 @@ fn flush(st: &mut State, em: &Emitter) {
     if text.trim().is_empty() || st.muted() {
         return;
     }
+    if seg == Seg::Agent && !st.loading {
+        st.last_reply = text.clone();
+    }
     em.event(match seg {
         Seg::Agent => EventBody::AssistantText { id, text },
         Seg::Thought => EventBody::Thinking { id, text },
@@ -436,6 +501,10 @@ fn flush(st: &mut State, em: &Emitter) {
 }
 
 fn chunk(st: &mut State, em: &Emitter, seg: Seg, text: &str) {
+    // Antigravity echoes the prompt as user_message_chunk in a live turn too; the hub already recorded it
+    if seg == Seg::User && !st.loading {
+        return;
+    }
     if seg != Seg::User && !st.loading && !st.subagents.is_empty() {
         return;
     }
@@ -543,6 +612,12 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Result<V
                     });
                     Ok(out)
                 }
+                Pending::SetEffort => {
+                    // Don't try again on every option update
+                    st.effort = None;
+                    em.event(EventBody::Error { message: format!("设置思考等级失败: {msg}") });
+                    Ok(out)
+                }
                 Pending::SetConfig => {
                     let (id, value) = st.config_inflight.take().unwrap_or_default();
                     if id == "model" {
@@ -579,10 +654,12 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Result<V
                 st.image_ok = r["agentCapabilities"]["promptCapabilities"]["image"]
                     .as_bool()
                     .unwrap_or(false);
+                // Antigravity's first method is a browser sign-in on the host; leave it to `agy acp --login`
                 st.auth_method = r["authMethods"]
                     .as_array()
                     .and_then(|a| a.first())
                     .and_then(|m| m["id"].as_str())
+                    .filter(|_| spec.tool != ToolKind::Antigravity)
                     .map(str::to_string);
                 out.push(new_or_load(st, spec));
             }
@@ -606,11 +683,15 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Result<V
                         em.context(p);
                     }
                 }
-                let models = parse_models(r);
+                let agy = spec.tool == ToolKind::Antigravity;
+                let models = if agy { antigravity_models(r) } else { parse_models(r) };
+                if agy { read_thought_level(st, r); }
                 st.parameterized = spec.tool == ToolKind::Cursor && r["configOptions"].is_array();
                 if st.parameterized { apply_config_options(st, r); }
                 else if spec.tool == ToolKind::Cursor { em.model_config_settled(); }
-                let current = r["models"]["currentModelId"].as_str().map(str::to_string);
+                // Antigravity's currentModelId is a model+level variant; its `model` option holds the model itself
+                let current = if agy { config_params(r).and_then(|(m, _)| m) } else { None }
+                    .or_else(|| r["models"]["currentModelId"].as_str().map(str::to_string));
                 // If the model recorded on the session (picked at creation or switched later) differs from the tool's current one, switch to it
                 let queued_config = std::mem::take(&mut st.config_queue);
                 let want = st
@@ -683,7 +764,10 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Result<V
                             .find(|id| !id.contains("plan"))
                             .map(str::to_string)
                     });
-                if st.perm == "plan" {
+                if st.native_modes {
+                    st.native_mode = r["modes"]["currentModeId"].as_str().map(str::to_string);
+                }
+                if st.perm == "plan" || st.native_modes {
                     if let Some(m) = apply_mode(st, false) {
                         out.push(m);
                     }
@@ -708,6 +792,12 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Result<V
                     });
                     st.turn_credits = 0.0;
                 }
+                // Antigravity reports the turn's tokens in the prompt result (and keeps no usage log of its own)
+                if spec.tool == ToolKind::Antigravity {
+                    if let Some(usage) = prompt_usage(&r["usage"]) {
+                        em.event(EventBody::Usage { usage });
+                    }
+                }
                 let ctx = match spec.tool {
                     ToolKind::Cursor => st.session_id.as_deref().and_then(cursor_context),
                     ToolKind::Qoder => st.session_id.as_deref().and_then(qoder_context),
@@ -715,6 +805,11 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Result<V
                 };
                 if let Some(p) = ctx {
                     em.context(p);
+                }
+                if let Some(left) = (spec.tool == ToolKind::Antigravity).then(|| antigravity_limit(&st.last_reply)).flatten() {
+                    // Which window ran out isn't said; one resetting within 5 hours is the 5-hour one
+                    let limit = if left <= 5 * 3_600_000 { "five_hour" } else { "seven_day" };
+                    em.event(super::limit_hit(Some(crate::util::now_ms() + left), Some(limit.into())));
                 }
                 em.event(EventBody::TurnEnd {
                     stop_reason: r["stopReason"].as_str().map(str::to_string),
@@ -732,6 +827,7 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Result<V
                 apply_config_options(st, r);
                 publish_config(st, em);
             }
+            Pending::SetEffort => read_thought_level(st, r),
             Pending::Other => {}
         }
         return Ok(out);
@@ -764,7 +860,9 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Result<V
                 .collect();
             // Allow everything, or accept-edits mode and this is a file edit
             let is_edit = tc["kind"] == "edit" || known.name == "edit" || !known.diffs.is_empty();
-            if st.perm == "bypass" || (st.perm == "acceptEdits" && is_edit) {
+            // Antigravity asks the user questions through request_permission with an `interaction_` id; the options are answers
+            let question = tc_id.starts_with("interaction_");
+            if !question && (st.perm == "bypass" || (st.perm == "acceptEdits" && is_edit)) {
                 // Prefer "allow once": choosing "allow for this session" in Qoder also switches it into accept-edits mode
                 let once = options.iter().find(|o| o.kind == "allow_once");
                 if let Some(o) = once.or_else(|| options.iter().find(|o| o.kind.starts_with("allow"))) {
@@ -983,6 +1081,57 @@ pub fn parse_models(r: &Value) -> Vec<ModelOption> {
     if options.len() > listed.len() { options } else { listed }
 }
 
+/// Antigravity: the models are the values of its `model` option; `availableModels` lists every model+level pair
+/// (`claude-opus-5-5-high`), which gives each model's thinking levels. A model without levels is listed as itself
+pub fn antigravity_models(r: &Value) -> Vec<ModelOption> {
+    const LEVELS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
+    let variants = listed_models(r);
+    let mut models: Vec<ModelOption> = r["configOptions"].as_array().into_iter().flatten()
+        .filter(|o| o["id"] == "model")
+        .flat_map(|o| o["options"].as_array().into_iter().flatten())
+        .filter_map(|v| {
+            let id = v["value"].as_str()?.to_string();
+            let mut efforts: Vec<String> = LEVELS.iter()
+                .filter(|l| variants.iter().any(|m| m.id.strip_prefix(id.as_str()).and_then(|t| t.strip_prefix('-')) == Some(**l)))
+                .map(|l| l.to_string())
+                .collect();
+            if efforts.len() < 2 { efforts.clear(); }
+            Some(ModelOption {
+                name: v["name"].as_str().unwrap_or(&id).to_string(),
+                description: String::new(),
+                resolved: String::new(),
+                default_effort: if efforts.iter().any(|e| e == "medium") { "medium".into() } else { String::new() },
+                efforts,
+                id,
+            })
+        })
+        .collect();
+    if models.is_empty() { models = variants; }
+    models
+}
+
+/// Antigravity reports a used-up quota as the turn's only reply, "⚠ Individual quota reached. … Resets in 4h9m8s.",
+/// and ends the turn normally. Returns the time until the reset in ms
+fn antigravity_limit(text: &str) -> Option<i64> {
+    if !text.to_lowercase().contains("quota reached") {
+        return None;
+    }
+    let rest = &text[text.find("Resets in ")? + "Resets in ".len()..];
+    let (mut total, mut n, mut any) = (0i64, 0i64, false);
+    for c in rest.chars() {
+        match c {
+            '0'..='9' => n = n * 10 + c.to_digit(10).unwrap() as i64,
+            'd' | 'h' | 'm' | 's' => {
+                total += n * match c { 'd' => 86_400_000, 'h' => 3_600_000, 'm' => 60_000, _ => 1000 };
+                n = 0;
+                any = true;
+            }
+            _ => break,
+        }
+    }
+    any.then_some(total)
+}
+
 fn listed_models(r: &Value) -> Vec<ModelOption> {
     r["models"]["availableModels"]
         .as_array()
@@ -1028,6 +1177,7 @@ fn login_hint(spec: &StartSpec, msg: &str) -> String {
             ToolKind::Kiro => "kiro-cli login",
             ToolKind::Qoder => "qodercli login",
             ToolKind::Codebuddy => "codebuddy`，在里面输入 `/login",
+            ToolKind::Antigravity => "agy acp --login",
             _ => "登录命令",
         };
         format!("{msg}\n请先在这台机器上执行 `{cmd}` 完成登录")
@@ -1039,6 +1189,7 @@ fn login_hint(spec: &StartSpec, msg: &str) -> String {
 fn update(st: &mut State, em: &Emitter, u: &Value) {
     match u["sessionUpdate"].as_str().unwrap_or("") {
         "config_option_update" if st.parameterized => apply_config_options(st, u),
+        "config_option_update" => read_thought_level(st, u),
         "available_commands_update" => {
             let list = u["availableCommands"]
                 .as_array()
@@ -1053,6 +1204,24 @@ fn update(st: &mut State, em: &Emitter, u: &Value) {
                 })
                 .collect();
             em.commands(list);
+        }
+        "current_mode_update" if st.native_modes => {
+            // Antigravity switched modes itself (Shift+Tab equivalents, leaving plan)
+            if let Some(m) = u["currentModeId"].as_str() {
+                st.native_mode = Some(m.to_string());
+                let perm = match m {
+                    "accept-edits" => "acceptEdits",
+                    "auto" => "auto",
+                    "plan" => "plan",
+                    "default" if st.perm == "bypass" => "bypass",
+                    "default" => "default",
+                    other => other,
+                };
+                if perm != st.perm {
+                    st.perm = perm.to_string();
+                    em.permission_mode(&st.perm);
+                }
+            }
         }
         "current_mode_update" => {
             // The tool switched modes itself (e.g. leaving plan after planning)
@@ -1077,6 +1246,11 @@ fn update(st: &mut State, em: &Emitter, u: &Value) {
                 }
             }
         }
+        "session_info_update" => {
+            if let Some(t) = u["title"].as_str().map(str::trim).filter(|t| !t.is_empty()) {
+                em.title_if_empty(t);
+            }
+        }
         "agent_message_chunk" => chunk(st, em, Seg::Agent, &content_text(&u["content"])),
         "agent_thought_chunk" => chunk(st, em, Seg::Thought, &content_text(&u["content"])),
         "user_message_chunk" => chunk(st, em, Seg::User, &content_text(&u["content"])),
@@ -1096,7 +1270,9 @@ fn update(st: &mut State, em: &Emitter, u: &Value) {
                 t.title = title.to_string();
             }
             if t.name.is_empty() {
+                // Antigravity puts its tool name (run_command, write_file…) at the top level
                 t.name = meta_tool_name(u)
+                    .or(u["name"].as_str())
                     .or(u["kind"].as_str())
                     .unwrap_or("tool")
                     .to_string();
@@ -1114,6 +1290,8 @@ fn update(st: &mut State, em: &Emitter, u: &Value) {
                 st.subagents.insert(id.clone());
             }
             let mut texts = vec![];
+            // An Antigravity command result was recognized (its output may be empty)
+            let mut command_text = false;
             for c in u["content"].as_array().into_iter().flatten() {
                 match c["type"].as_str().unwrap_or("") {
                     "diff" => {
@@ -1131,7 +1309,16 @@ fn update(st: &mut State, em: &Emitter, u: &Value) {
                             t.diffs.push(d);
                         }
                     }
-                    "content" => texts.push(content_text(&c["content"])),
+                    "content" => {
+                        let text = content_text(&c["content"]);
+                        match antigravity_command_text(&text) {
+                            Some(out) => {
+                                command_text = true;
+                                texts.push(out);
+                            }
+                            None => texts.push(text),
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -1150,7 +1337,12 @@ fn update(st: &mut State, em: &Emitter, u: &Value) {
                 t.done = true;
                 st.subagents.remove(&id);
                 let mut output = texts.join("\n");
-                if output.is_empty() && !u["rawOutput"].is_null() {
+                if output.is_empty() && !command_text && u["rawOutput"]["output"].is_string() {
+                    let raw = u["rawOutput"]["output"].as_str().unwrap_or("");
+                    command_text = true;
+                    output = antigravity_command_text(raw).unwrap_or_else(|| raw.to_string());
+                }
+                if output.is_empty() && !command_text && !u["rawOutput"].is_null() {
                     output = raw_output_text(&crate::computer_use::display_value(&u["rawOutput"]));
                 }
                 em.event(EventBody::ToolResult {
@@ -1212,6 +1404,37 @@ fn raw_output_text(v: &Value) -> String {
     } else {
         parts.join("\n")
     }
+}
+
+/// Antigravity's run_command result: "Created At: …\nCompleted At: …\nCommand exited with code N.\n\nCommand output:\n…".
+/// Keep only the output, plus an "exit code: N" line when N isn't 0 (the frontend marks the call failed from it)
+fn antigravity_command_text(t: &str) -> Option<String> {
+    if !t.starts_with("Created At:") {
+        return None;
+    }
+    let code = t.split_once("Command exited with code ")?.1.split(['.', '\n']).next()?.trim();
+    let mut out = t.split_once("Command output:\n").map(|(_, o)| o.replace("\r\n", "\n").trim_end().to_string()).unwrap_or_default();
+    if code != "0" {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&format!("exit code: {code}"));
+    }
+    Some(out)
+}
+
+/// ACP `usage` in a session/prompt result. Antigravity's totalTokens is inputTokens + cachedReadTokens + outputTokens
+/// (inputTokens excludes cache hits; outputTokens includes thinking)
+fn prompt_usage(u: &Value) -> Option<Usage> {
+    let n = |k: &str| u[k].as_u64().unwrap_or(0);
+    let usage = Usage {
+        input_tokens: n("inputTokens"),
+        output_tokens: n("outputTokens"),
+        cache_read_tokens: n("cachedReadTokens"),
+        cache_write_tokens: n("cachedWriteTokens"),
+        ..Default::default()
+    };
+    (usage.input_tokens + usage.output_tokens + usage.cache_read_tokens > 0).then_some(usage)
 }
 
 /// CodeBuddy command results are a "Command / Stdout / Stderr / Exit Code / Signal" text block; keep only the output,
@@ -1622,5 +1845,92 @@ mod model_config_tests {
         write_store(&root.join("acp-sessions/session/store.db"), 70);
         assert_eq!(cursor_context_in(&root, "session"), Some(70.0));
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Samples cut from `agy acp` 1.5.7
+    #[test]
+    fn antigravity_tool_calls_modes_and_usage() {
+        use super::*;
+        let out = "Created At: 2026-11-13T05:25:00+08:00\nCompleted At: 2026-11-13T05:25:00+08:00\nCommand exited with code 0.\n\nCommand output:\n./hello.txt:1:hello world\r\n";
+        assert_eq!(antigravity_command_text(out).as_deref(), Some("./hello.txt:1:hello world"));
+        let failed = "Created At: x\nCompleted At: y\nCommand exited with code 2.\n\nCommand output:\nls: cannot access 'nope'\r\n";
+        assert_eq!(antigravity_command_text(failed).as_deref(), Some("ls: cannot access 'nope'\nexit code: 2"));
+        assert_eq!(antigravity_command_text("plain output"), None);
+        let silent = "Created At: x\nCompleted At: y\nCommand exited with code 0.\n\nNo output from the command.";
+        assert_eq!(antigravity_command_text(silent).as_deref(), Some(""));
+
+        let (hub, em, _rx) = crate::hub::test_emitter();
+        let mut st = State { native_modes: true, perm: "default".into(), session_id: Some("ext".into()), ..Default::default() };
+        update(&mut st, &em, &json!({"sessionUpdate":"tool_call","toolCallId":"c1","name":"run_command","kind":"execute",
+            "title":"ls -la","status":"in_progress","rawInput":{"CommandLine":"ls -la"}}));
+        update(&mut st, &em, &json!({"sessionUpdate":"tool_call_update","toolCallId":"c1","name":"run_command","kind":"execute",
+            "status":"completed","rawOutput":{"output":out,"exit_code":0},
+            "content":[{"type":"content","content":{"type":"text","text":out}}]}));
+        update(&mut st, &em, &json!({"sessionUpdate":"tool_call","toolCallId":"c2","name":"run_command","kind":"execute","title":"git status"}));
+        update(&mut st, &em, &json!({"sessionUpdate":"tool_call_update","toolCallId":"c2","status":"completed",
+            "rawOutput":{"output":silent,"exit_code":0},"content":[{"type":"content","content":{"type":"text","text":silent}}]}));
+        // The live echo of the prompt is dropped (the hub records the user message itself)
+        update(&mut st, &em, &json!({"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"hi"}}));
+        update(&mut st, &em, &json!({"sessionUpdate":"session_info_update","title":"Create And Check File"}));
+        let evs = hub.store.events_since("s", 0, 100).unwrap();
+        assert!(evs.iter().any(|e| matches!(&e.body, EventBody::ToolCall { name, .. } if name == "run_command")));
+        assert!(evs.iter().any(|e| matches!(&e.body, EventBody::ToolResult { output, is_error: false, .. } if output == "./hello.txt:1:hello world")));
+        assert!(evs.iter().any(|e| matches!(&e.body, EventBody::ToolResult { id, output, .. } if id == "c2" && output.is_empty())));
+        flush(&mut st, &em);
+        assert!(!hub.store.events_since("s", 0, 100).unwrap().iter().any(|e| matches!(e.body, EventBody::UserMessage { .. })));
+
+        // Every permission mode is the tool's own ACP mode; allow-all stays in default
+        st.native_mode = Some("default".into());
+        st.perm = "auto".into();
+        assert_eq!(apply_mode(&mut st, false).unwrap()["params"]["modeId"], "auto");
+        assert!(apply_mode(&mut st, false).is_none());
+        st.perm = "bypass".into();
+        assert_eq!(apply_mode(&mut st, false).unwrap()["params"]["modeId"], "default");
+        update(&mut st, &em, &json!({"sessionUpdate":"current_mode_update","currentModeId":"default"}));
+        assert_eq!(st.perm, "bypass");
+        update(&mut st, &em, &json!({"sessionUpdate":"current_mode_update","currentModeId":"accept-edits"}));
+        assert_eq!(st.perm, "acceptEdits");
+
+        let u = prompt_usage(&json!({"inputTokens":2132,"outputTokens":5,"cachedReadTokens":6081,"cachedWriteTokens":0,"thoughtTokens":0,"totalTokens":8218})).unwrap();
+        assert_eq!((u.input_tokens, u.output_tokens, u.cache_read_tokens), (2132, 5, 6081));
+        assert!(prompt_usage(&json!({})).is_none());
+    }
+
+    #[test]
+    fn antigravity_models_levels_and_limit() {
+        use super::*;
+        let r = json!({
+            "models":{"currentModelId":"gemini-4-argon-medium","availableModels":[
+                {"modelId":"gemini-4-argon-medium"},{"modelId":"gemini-4-argon-high"},{"modelId":"gemini-4-argon-low"},
+                {"modelId":"gemini-4-hydrogen-high"},{"modelId":"gemini-4-hydrogen-xhigh"},{"modelId":"gemini-4-hydrogen-low"},
+                {"modelId":"gemini-4-hydrogen-medium"},{"modelId":"gpt-oss-120b-medium"}]},
+            "configOptions":[
+                {"id":"model","category":"model","currentValue":"gemini-4-argon","options":[
+                    {"value":"gemini-4-argon","name":"Gemini 4 Argon"},{"value":"gemini-4-hydrogen","name":"Gemini 4 Hydrogen"},
+                    {"value":"gpt-oss-120b-medium","name":"GPT-OSS 120B (Medium)"}]},
+                {"id":"thought_level","category":"thought_level","currentValue":"medium","options":[
+                    {"value":"low"},{"value":"medium"},{"value":"high"}]}]});
+        let models = antigravity_models(&r);
+        let ids: Vec<_> = models.iter().map(|m| (m.id.as_str(), m.efforts.join(","))).collect();
+        assert_eq!(ids, [("gemini-4-argon", "low,medium,high".into()), ("gemini-4-hydrogen", "low,medium,high,xhigh".into()), ("gpt-oss-120b-medium", String::new())]);
+        assert_eq!(models[0].default_effort, "medium");
+
+        // The level is set once the tool reports another one, and again after a model switch resets it
+        let mut st = State { session_id: Some("s".into()), effort: Some("high".into()), ..Default::default() };
+        read_thought_level(&mut st, &r);
+        let m = next_effort(&mut st).unwrap();
+        assert_eq!((m["params"]["configId"].as_str(), m["params"]["value"].as_str()), (Some("thought_level"), Some("high")));
+        assert!(next_effort(&mut st).is_none());
+        st.pending.clear();
+        read_thought_level(&mut st, &r);
+        assert!(next_effort(&mut st).is_some());
+        st.pending.clear();
+        st.effort = Some("xhigh".into());
+        assert!(next_effort(&mut st).is_none(), "not offered by this model");
+
+        let text = "\n⚠ Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 4h9m8s.\n";
+        assert_eq!(antigravity_limit(text), Some(((4 * 60 + 9) * 60 + 8) * 1000));
+        assert_eq!(antigravity_limit("Quota reached. Resets in 2d3h."), Some((2 * 24 + 3) * 3_600_000));
+        assert_eq!(antigravity_limit("all good"), None);
     }
 }

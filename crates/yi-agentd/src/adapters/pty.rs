@@ -137,6 +137,24 @@ pub fn interactive_args(spec: &StartSpec) -> Vec<String> {
                 _ => {}
             }
         }
+        ToolKind::Antigravity => {
+            // No way to pin a conversation id on a new session; Hub::guess_terminal_session finds it afterwards
+            if let Some(r) = &spec.resume {
+                a.extend(["--conversation".into(), r.clone()]);
+            }
+            if let Some(m) = model {
+                a.extend(["--model".into(), m.clone()]);
+            }
+            if let Some(e) = spec.effort.as_ref().filter(|e| !e.is_empty()) {
+                a.extend(["--effort".into(), e.clone()]);
+            }
+            match spec.permission_mode.as_str() {
+                "bypass" => a.push("--dangerously-skip-permissions".into()),
+                "acceptEdits" => a.extend(["--mode".into(), "accept-edits".into()]),
+                m @ ("auto" | "plan") => a.extend(["--mode".into(), m.into()]),
+                _ => {}
+            }
+        }
         ToolKind::Shell => {
             if let Some(c) = spec.command.as_ref().filter(|c| !c.trim().is_empty()) {
                 if cfg!(windows) {

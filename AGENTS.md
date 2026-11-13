@@ -6,7 +6,7 @@ See [README.md](README.md) for an overview and usage. This file has the project 
 
 - `crates/proto`: the single source of truth for the protocol. To add a method, first add a constant in `methods`, then extend the dispatch in `crates/yi-agentd/src/server.rs`; the frontend types in `app/src/types.ts` are kept in sync by hand.
 - `crates/yi-agentd/src/hub.rs`: the session state machine. Every event goes through `emit()` to be numbered, persisted and broadcast; adapters must not write to the database directly.
-- `crates/yi-agentd/src/adapters/`: one file per tool, all implementing `AdapterCmd` input and `Emitter` output. The ACP tools (Cursor / Kiro / Qoder / CodeBuddy) share `acp.rs`. Adding a tool: [docs/adding-a-tool.en.md](docs/adding-a-tool.en.md).
+- `crates/yi-agentd/src/adapters/`: one file per tool, all implementing `AdapterCmd` input and `Emitter` output. The ACP tools (Cursor / Kiro / Qoder / CodeBuddy / Antigravity) share `acp.rs`. Adding a tool: [docs/adding-a-tool.en.md](docs/adding-a-tool.en.md).
 - `crates/client/src/api.rs`: `ClientHub::call` is the complete set of commands the frontend can call. Tauri (`app/src-tauri/src/lib.rs`) and yi-web are thin wrappers around it.
 - `crates/bots`: the Bot engine and plugins, desktop app only; plugs into `ClientHub` through the `Extension` trait (`crates/client/src/ext.rs`).
 - `plugins/`: WASM plugin SDK (`yi-plugin`), first-party plugins and the packer; a separate cargo workspace built for `wasm32-wasip2`. The interface is `plugins/wit/yi-plugin.wit`, implemented by `crates/bots/src/plugins/wasm.rs`; change both together. `github` / `feishu` ship inside the desktop app: run `scripts/bundle-plugins.py` before `tauri build`. Author guide: [docs/plugins.en.md](docs/plugins.en.md).

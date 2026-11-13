@@ -24,7 +24,7 @@ const LATEST_TTL_MS: i64 = 10 * 60_000;
 /// The tool's own update subcommand
 fn update_args(kind: ToolKind) -> Option<&'static [&'static str]> {
     Some(match kind {
-        ToolKind::Claude | ToolKind::Codex | ToolKind::Cursor | ToolKind::Qoder | ToolKind::Codebuddy => &["update"],
+        ToolKind::Claude | ToolKind::Codex | ToolKind::Cursor | ToolKind::Qoder | ToolKind::Codebuddy | ToolKind::Antigravity => &["update"],
         // Without it Kiro asks for confirmation on stdin
         ToolKind::Kiro => &["update", "--non-interactive"],
         ToolKind::Shell | ToolKind::Files => return None,

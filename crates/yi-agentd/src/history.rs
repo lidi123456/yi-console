@@ -3,6 +3,7 @@
 //! - Codex: ~/.codex/sessions/**/rollout-*.jsonl, readable offline
 //! - Cursor: ACP session/list (falls back to scanning ~/.cursor/chats on failure); content is replayed by session/load after resuming
 //! - Kiro: `kiro-cli chat --list-sessions --all-cwds -f json`, likewise replayed after resuming
+//! - Antigravity: ACP session/list (its conversations are SQLite files), replayed by session/load
 
 use crate::adapters::{claude, codex};
 use crate::util::{parse_iso, truncate};
@@ -68,9 +69,14 @@ pub async fn list(tool: Option<ToolKind>, settings: &DaemonSettings) -> Vec<Hist
             out.extend(list_kiro(&p).await.unwrap_or_default());
         }
     }
+    if want(ToolKind::Antigravity) {
+        if let Some(p) = crate::tools::resolve(ToolKind::Antigravity, settings) {
+            out.extend(list_acp(ToolKind::Antigravity, &p).await.unwrap_or_default());
+        }
+    }
     if want(ToolKind::Cursor) {
         if let Some(p) = crate::tools::resolve(ToolKind::Cursor, settings) {
-            match list_cursor_acp(&p).await {
+            match list_acp(ToolKind::Cursor, &p).await {
                 Ok(v) if !v.is_empty() => out.extend(v),
                 _ => out.extend(list_cursor_dirs()),
             }
@@ -773,8 +779,9 @@ async fn list_kiro(program: &Path) -> Result<Vec<HistoryEntry>> {
 
 // ---------------- Cursor ----------------
 
-/// Start a short-lived `cursor-agent acp` to call session/list
-async fn list_cursor_acp(program: &Path) -> Result<Vec<HistoryEntry>> {
+/// Start a short-lived `<tool> acp` to call session/list. Cursor needs `authenticate` first; Antigravity uses its
+/// cached sign-in (its first auth method is a browser sign-in)
+async fn list_acp(tool: ToolKind, program: &Path) -> Result<Vec<HistoryEntry>> {
     let home = crate::paths::home();
     let mut p = crate::adapters::JsonProc::spawn(program, &["acp".into()], &home)?;
     let fut = async {
@@ -790,7 +797,7 @@ async fn list_cursor_acp(program: &Path) -> Result<Vec<HistoryEntry>> {
                     if v["result"]["agentCapabilities"]["sessionCapabilities"]["list"].is_null() {
                         break;
                     }
-                    if let Some(m) = v["result"]["authMethods"][0]["id"].as_str() {
+                    if let Some(m) = v["result"]["authMethods"][0]["id"].as_str().filter(|_| tool == ToolKind::Cursor) {
                         p.send(&json!({"jsonrpc":"2.0","id":2,"method":"authenticate","params":{"methodId":m}}))
                             .await?;
                     } else {
@@ -809,7 +816,7 @@ async fn list_cursor_acp(program: &Path) -> Result<Vec<HistoryEntry>> {
                     let r = &v["result"];
                     for s in r["sessions"].as_array().into_iter().flatten() {
                         entries.push(HistoryEntry {
-                            tool: ToolKind::Cursor,
+                            tool,
                             id: s["sessionId"].as_str().unwrap_or("").to_string(),
                             cwd: s["cwd"].as_str().unwrap_or("").to_string(),
                             title: truncate(s["title"].as_str().unwrap_or("(无标题)"), 100),

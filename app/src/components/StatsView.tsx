@@ -29,10 +29,11 @@ export const TOOL_VAR: Record<string, string> = {
   kiro: 'var(--c-kiro)',
   qoder: 'var(--c-qoder)',
   codebuddy: 'var(--c-codebuddy)',
+  antigravity: 'var(--c-antigravity)',
   shell: 'var(--c-shell)',
 };
 
-export const QUOTA_TOOLS: ToolKind[] = ['claude', 'codex', 'cursor', 'kiro', 'qoder', 'codebuddy'];
+export const QUOTA_TOOLS: ToolKind[] = ['claude', 'codex', 'cursor', 'kiro', 'qoder', 'codebuddy', 'antigravity'];
 
 const fmtReset = (v: number | string | null | undefined) => {
   if (v == null) return '';

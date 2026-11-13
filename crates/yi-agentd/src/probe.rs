@@ -242,7 +242,7 @@ async fn acp(tool: ToolKind, settings: &DaemonSettings, want_quota: bool) -> Res
             1 => Step::Send(vec![json!({"jsonrpc":"2.0","id":2,"method":"session/new",
                 "params":{"cwd":cwd,"mcpServers":[]}})]),
             2 => {
-                out.models = adapters::acp::parse_models(r);
+                out.models = if tool == ToolKind::Antigravity { adapters::acp::antigravity_models(r) } else { adapters::acp::parse_models(r) };
                 sid = r["sessionId"].as_str().unwrap_or("").to_string();
                 if delete && !sid.is_empty() {
                     return Step::Send(vec![json!({"jsonrpc":"2.0","id":4,"method":"session/delete",
@@ -636,6 +636,55 @@ async fn codebuddy_account(settings: &DaemonSettings) -> Result<Value> {
     }
 }
 
+/// Antigravity: `agy -p /usage` and `/credits` answer without starting a turn, and `--output-format json`
+/// carries the data under `command.data` (the slash command never reaches the model)
+async fn antigravity_account(settings: &DaemonSettings) -> Result<Value> {
+    let ask = |cmd: &'static str| async move {
+        let mut data = Value::Null;
+        converse(ToolKind::Antigravity, settings, &["-p", cmd, "--output-format", "json"], vec![], |v| {
+            if v.get("status").is_none() {
+                return Step::Wait;
+            }
+            data = v.clone();
+            Step::Done
+        })
+        .await?;
+        if data["status"] != "SUCCESS" {
+            bail!("{}", data["error"].as_str().filter(|e| !e.is_empty()).unwrap_or("agy 没有返回额度"));
+        }
+        anyhow::Ok(data["command"]["data"].clone())
+    };
+    let (usage, credits) = tokio::join!(ask("/usage"), ask("/credits"));
+    Ok(antigravity_quota(&usage?, credits.as_ref().unwrap_or(&Value::Null)))
+}
+
+/// `/usage` data: groups of models sharing a 5-hour and a weekly bucket, each with remaining_fraction and reset_time
+fn antigravity_quota(usage: &Value, credits: &Value) -> Value {
+    let mut windows = vec![];
+    for g in usage["groups"].as_array().into_iter().flatten() {
+        // "Gemini Models" -> "Gemini", "Claude and GPT models" -> "Claude / GPT": the cards are narrow
+        let group = g["name"].as_str().unwrap_or("").trim_end_matches(" Models").trim_end_matches(" models").replace(" and ", " / ");
+        for b in g["buckets"].as_array().into_iter().flatten() {
+            let window = match b["window"].as_str() {
+                Some("5h") => "5 小时".to_string(),
+                Some("weekly") => "每周".to_string(),
+                _ => b["name"].as_str().unwrap_or("").to_string(),
+            };
+            let used = b["remaining_fraction"].as_f64().map(|r| ((1.0 - r) * 1000.0).round() / 10.0);
+            windows.push(json!({
+                "label": if group.is_empty() { window } else { format!("{group} {window}") },
+                "usedPercent": used,
+                "resetsAt": b["reset_time"],
+            }));
+        }
+    }
+    let note = match credits["remaining_credits"].as_f64() {
+        Some(c) if c > 0.0 => Some(format!("AI 积分剩余 {}", fmt_num(c))),
+        _ => None,
+    };
+    json!({ "account": {}, "windows": windows, "note": note })
+}
+
 fn codebuddy_call(base: &str, path: &str, token: &str, ent_id: Option<&str>) -> Result<Value> {
     let url = format!("{base}{path}");
     let mut req = ureq::post(&url)
@@ -763,6 +812,11 @@ async fn run(tool: ToolKind, settings: &DaemonSettings, want_quota: bool) -> Res
             quota: Some(cursor_account(settings).await?),
         }),
         ToolKind::Cursor => acp(tool, settings, false).await,
+        ToolKind::Antigravity if want_quota => Ok(Probe {
+            models: vec![],
+            quota: Some(antigravity_account(settings).await?),
+        }),
+        ToolKind::Antigravity => acp(tool, settings, false).await,
         ToolKind::Shell => bail!("终端没有模型和额度"),
         ToolKind::Files => bail!("文件会话没有模型和额度"),
     }
@@ -800,6 +854,26 @@ pub async fn quota(hub: &Arc<Hub>, tool: ToolKind, settings: &DaemonSettings, re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Cut from `agy -p /usage --output-format json` (1.5.7)
+    #[test]
+    fn antigravity_quota_shape() {
+        let usage = json!({"groups":[
+            {"name":"Gemini Models","buckets":[
+                {"id":"gemini-weekly","window":"weekly","remaining_fraction":0.9897445440292358,"reset_time":"2026-11-19T22:11:03Z"},
+                {"id":"gemini-5h","window":"5h","remaining_fraction":0.9891058206558228,"reset_time":"2026-11-13T03:11:03Z"}]},
+            {"name":"Claude and GPT models","buckets":[
+                {"id":"3p-5h","window":"5h","remaining_fraction":0,"reset_time":"2026-11-13T03:16:47Z"}]}]});
+        let q = antigravity_quota(&usage, &json!({"remaining_credits":0}));
+        assert_eq!(q["windows"][0]["label"], "Gemini 每周");
+        assert_eq!(q["windows"][0]["usedPercent"], 1.0);
+        assert_eq!(q["windows"][1]["label"], "Gemini 5 小时");
+        assert_eq!(q["windows"][2]["label"], "Claude / GPT 5 小时");
+        assert_eq!(q["windows"][2]["usedPercent"], 100.0);
+        assert_eq!(q["windows"][2]["resetsAt"], "2026-11-13T03:16:47Z");
+        assert!(q["note"].is_null());
+        assert_eq!(antigravity_quota(&usage, &json!({"remaining_credits":250}))["note"], "AI 积分剩余 250");
+    }
 
     #[test]
     fn cursor_quota_shape() {

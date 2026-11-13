@@ -12,7 +12,7 @@ Claude Code、Codex 这类 AI 编程工具都跑在命令行里：开多个会�
 
 Yi Console 把它们统一管起来：
 
-- **一个界面用多种工具**：Claude Code、Codex、Cursor、Kiro、Qoder、CodeBuddy，以及普通终端。
+- **一个界面用多种工具**：Claude Code、Codex、Cursor、Kiro、Qoder、CodeBuddy、Antigravity，以及普通终端。
 - **会话不会断**：每台机器上有一个后台服务托管所有会话。关掉窗口、电脑休眠、手机切到后台，工具都继续干活；回来后接着看。
 - **两种界面随时切换**：对话界面（消息、工具调用、文件改动、审批按钮），或者工具自己的终端界面。同一个会话来回切，上下文不丢。
 - **管远程机器**：通过 SSH 连服务器，首次连接自动部署，不用手动安装；家里或公司内网的电脑，可以经中继服务器从手机或另一台电脑连上，全程端到端加密。
@@ -45,6 +45,7 @@ Yi Console 把它们统一管起来：
    | Kiro CLI | 安装 `kiro-cli` 并登录 |
    | Qoder CLI | 安装 `qodercli`，执行 `qodercli login` |
    | CodeBuddy Code | `npm i -g @tencent-ai/codebuddy-code`，运行 `codebuddy` 后输入 `/login` |
+   | Antigravity CLI | 安装 `agy`，运行一次 `agy` 登录（远程主机上用 `agy acp --login`） |
 
    不装 AI 工具也可以，只把它当终端用。
 
@@ -70,7 +71,7 @@ Yi Console 把它们统一管起来：
 ```
   桌面 / 手机 App                         浏览器（yi-web，开发调试用）
         │
-        ├── 本机 ──────────────── yi-agentd ── Claude Code / Codex / Cursor / Kiro / Qoder / CodeBuddy / 终端
+        ├── 本机 ──────────────── yi-agentd ── Claude Code / Codex / Cursor / Kiro / Qoder / CodeBuddy / Antigravity / 终端
         ├── SSH ───────────────── yi-agentd ── …
         └── 中继（端到端加密）── yi-agentd ── …
 ```
@@ -93,4 +94,4 @@ Yi Console 把它们统一管起来：
 
 [MIT License](LICENSE)
 
-Claude Code、Codex、Cursor、Kiro、Qoder、CodeBuddy 是各自所有者的商标，Yi Console 与这些公司没有关联。界面中的工具图标取自 [@lobehub/icons](https://github.com/lobehub/lobe-icons)（MIT）。
+Claude Code、Codex、Cursor、Kiro、Qoder、CodeBuddy、Antigravity 是各自所有者的商标，Yi Console 与这些公司没有关联。界面中的工具图标取自 [@lobehub/icons](https://github.com/lobehub/lobe-icons)（MIT）。

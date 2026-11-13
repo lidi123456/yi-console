@@ -28,21 +28,22 @@ Install and log in to a tool on whichever machine you want to use it on:
 | Kiro | `kiro-cli` logged in |
 | Qoder | `qodercli` logged in (run `qodercli login`). The install script puts it in `~/.qoder/bin/qodercli/`; it's found even when that isn't on PATH |
 | CodeBuddy | `codebuddy` (npm package `@tencent-ai/codebuddy-code`) logged in: run `codebuddy` once and type `/login` |
+| Antigravity | `agy` signed in: run `agy` once; on an SSH host without a browser, run `agy acp --login` and paste the code. The Windows install script puts it in `%LOCALAPPDATA%\agy\bin`; it's found even when that isn't on PATH |
 
 yi-agentd reads the PATH of your login shell and checks the usual install directories. If a tool still isn't found, enter its full path in the host settings, or set the `YI_CONSOLE_PATH` environment variable to add search directories.
 
 What each tool supports in chat mode:
 
-| Feature | Claude Code | Codex | Cursor | Kiro | Qoder | CodeBuddy |
-|---|---|---|---|---|---|---|
-| Switch model mid-session | ✓ | ✓ (from the next turn) | ✓ | ✓ | ✓ | ✓ |
-| Thinking level | ✓ (immediately) | ✓ (from the next turn) | — | — | — | — |
-| Image input (≤ 5 MB each, png/jpeg/gif/webp) | ✓ | ✓ | ✓ | if the tool declares support | ✓ | ✓ |
-| Context usage | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| Permission modes | all | all | Default / Accept Edits / Plan / Bypass All | same as Cursor | no Plan | same as Cursor |
-| Account quota (Usage Stats page) | 5-hour / weekly windows | 5-hour / weekly windows | included, Auto, API usage and on-demand (same as cursor-agent's `/usage`) | plan usage | plan credits, add-ons and dedicated packs | plan credits and bonus credits |
-| Token source for usage stats | the tool's own logs (direct terminal use counts too) | the tool's own logs (direct terminal use counts too) | Yi Console sessions | Yi Console sessions | the tool's own logs (counted in credits) | the tool's own logs (tokens + credits) |
-| Import history sessions | ✓ | ✓ | ✓ | ✓ | ✓ (viewable right away) | ✓ (viewable after continuing) |
+| Feature | Claude Code | Codex | Cursor | Kiro | Qoder | CodeBuddy | Antigravity |
+|---|---|---|---|---|---|---|---|
+| Switch model mid-session | ✓ | ✓ (from the next turn) | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Thinking level | ✓ (immediately) | ✓ (from the next turn) | — | — | — | — | ✓ (from the next turn) |
+| Image input (≤ 5 MB each, png/jpeg/gif/webp) | ✓ | ✓ | ✓ | if the tool declares support | ✓ | ✓ | ✓ |
+| Context usage | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | — |
+| Permission modes | all | all | Default / Accept Edits / Plan / Bypass All | same as Cursor | no Plan | same as Cursor | all (Auto is the tool's own auto mode) |
+| Account quota (Usage Stats page) | 5-hour / weekly windows | 5-hour / weekly windows | included, Auto, API usage and on-demand (same as cursor-agent's `/usage`) | plan usage | plan credits, add-ons and dedicated packs | plan credits and bonus credits | 5-hour / weekly windows per model group, AI credits |
+| Token source for usage stats | the tool's own logs (direct terminal use counts too) | the tool's own logs (direct terminal use counts too) | Yi Console sessions | Yi Console sessions | the tool's own logs (counted in credits) | the tool's own logs (tokens + credits) | Yi Console sessions |
+| Import history sessions | ✓ | ✓ | ✓ | ✓ | ✓ (viewable right away) | ✓ (viewable after continuing) | ✓ (viewable after continuing) |
 
 Model lists and quotas come from yi-agentd briefly starting the tool and asking it (in `~/.yi-console/probe/`, so no session is created). Model lists are cached in `models.json`; quotas are cached for 60 seconds. Cursor usage is fetched from Cursor's backend with the token cursor-agent saved at login (`~/.config/cursor/auth.json`; `%APPDATA%\Cursor` on Windows, `~/.cursor` on macOS). If the token has expired, run cursor-agent once.
 
@@ -63,7 +64,7 @@ Model lists and quotas come from yi-agentd briefly starting the tool and asking 
   - built-in Yi Console actions: switch model, switch permission mode, view changes, export, rename, new session in the same directory, and so on;
   - the tool's own commands, such as Claude Code's `/compact` and custom commands, or the commands Cursor / Kiro report over ACP.
 - **`@` files**: type `@` plus part of a file name to fuzzy-search the session directory (in git repos this uses `git ls-files` and respects `.gitignore`); pick one to insert its relative path.
-- **Model and thinking level**: switch at the bottom right of the input box (takes effect from the next message), or type `/model`. The bottom of that menu has the thinking level (Claude Code and Codex; the levels offered are whatever the model reports). You can also pick both when creating a session.
+- **Model and thinking level**: switch at the bottom right of the input box (takes effect from the next message), or type `/model`. The bottom of that menu has the thinking level (Claude Code, Codex and Antigravity; the levels offered are whatever the model reports). You can also pick both when creating a session.
 - **Referencing files**: right-click "Copy" in the file panel (or click a file in the tree and press Ctrl+C), then paste into the input box to insert `@relative/path`, the same as dragging it in. Files copied in your OS (Ctrl+C in Explorer/Finder) can be pasted or dragged into the input box too: images are sent as images, and other files are uploaded to this session's upload directory on the host (`~/.yi-console/uploads/<session id>/files/`, up to 50 MB each, deleted with the session) and inserted as `@/absolute/path`. This works for SSH and relay hosts as well.
 - **Images**: paste or drag them into the input box; double-click a thumbnail to enlarge it. Click an image in the conversation to enlarge it; scroll to zoom, drag to pan, rotate if needed, and press Esc to close.
 - **Permission mode**: switch at any time at the bottom left of the input box between "Default", "Accept Edits", "Plan" and "Bypass All", or cycle with Shift+Tab. The setting is saved on the session and kept when you resume it. Switching Claude Code to "Bypass All" restarts the tool process; if it's mid-reply, the restart waits for the turn to end. Claude doesn't allow Bypass All when running as root.
@@ -94,7 +95,7 @@ Model lists and quotas come from yi-agentd briefly starting the tool and asking 
 
 ## Computer use (Windows)
 
-The Computer use control in the composer toolbar of all six AI chat tools lets the AI operate the signed-in Windows desktop of the target host, opening apps and switching windows itself. The driver is bundled with the Windows daemon. It supports screenshots, interface reads, clicks and typing; one session controls the desktop at a time, with pause and stop controls. Activity and screenshots appear in chat. See [Computer use](computer-use.en.md) for support and instructions.
+The Computer use control in the composer toolbar of every AI tool's chat UI lets the AI operate the signed-in Windows desktop of the target host, opening apps and switching windows itself. The driver is bundled with the Windows daemon. It supports screenshots, interface reads, clicks and typing; one session controls the desktop at a time, with pause and stop controls. Activity and screenshots appear in chat. See [Computer use](computer-use.en.md) for support and instructions.
 
 Host settings manage external [MCP servers](mcp.en.md) shared across providers, independently of Computer Use platform restrictions.
 
@@ -138,7 +139,7 @@ Below a session's input box is a status line. Configure it under "Host Settings 
 
 ## Continuing after a usage limit
 
-When Claude Code or Codex stops in the chat UI because the account's usage limit is used up, Yi Console records when the limit resets and, one minute after that, sends "continue" automatically (in Chinese or English, following the UI language) so the task carries on. While it waits, a countdown above the input box offers "Continue now" and "Cancel", and the sidebar row shows when it will continue. Sending a message yourself, `/clear`, or switching to the terminal UI cancels it. It doesn't wait for limits that reset more than a day out, or after hitting the limit again right after continuing several times in a row. You can turn it off under "Host Settings → Session processes". The background service on the host keeps the timer, so it works with the app closed.
+When Claude Code, Codex or Antigravity stops in the chat UI because the account's usage limit is used up, Yi Console records when the limit resets and, one minute after that, sends "continue" automatically (in Chinese or English, following the UI language) so the task carries on. While it waits, a countdown above the input box offers "Continue now" and "Cancel", and the sidebar row shows when it will continue. Sending a message yourself, `/clear`, or switching to the terminal UI cancels it. It doesn't wait for limits that reset more than a day out, or after hitting the limit again right after continuing several times in a row. You can turn it off under "Host Settings → Session processes". The background service on the host keeps the timer, so it works with the app closed.
 
 To not wait for the reset, click "Continue in another tool" on the countdown bar or on the limit line in the timeline. The "Continue in another tool" page opens with a tool that isn't waiting for its own limit, and the original session's permission mode (default if the new tool lacks it). The new session's first turn reads the original log and reports back; the original session no longer continues by itself, and its queued messages move to the new session, held until you've read the report. Each timeline gets a line linking to the other session.
 

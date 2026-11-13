@@ -30,6 +30,7 @@ export function permModes(tool: ToolKind, mode: SessionMode) {
     kiro: mode === 'structured' ? ['default', 'acceptEdits', 'plan', 'bypass'] : ['default', 'bypass'],
     qoder: ['default', 'acceptEdits', 'bypass'],
     codebuddy: ['default', 'acceptEdits', 'plan', 'bypass'],
+    antigravity: ['default', 'acceptEdits', 'auto', 'plan', 'bypass'],
     shell: [],
     files: [],
   };
