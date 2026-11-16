@@ -46,6 +46,8 @@ struct State {
     desktop_notice: bool,
     /// The session's appended system prompt still has to go out with the next prompt (new tool session or changed)
     system_notice: Option<String>,
+    /// Compact cross-account handoff summary injected if `session/load` fell back to a fresh ACP session
+    account_handoff: Option<String>,
     next_id: u64,
     pending: HashMap<u64, Pending>,
     session_id: Option<String>,
@@ -515,6 +517,9 @@ fn prompt(st: &mut State, em: &Emitter, p: &Prompt) -> Value {
         if let Some(notice) = st.system_notice.take() {
             blocks.push(json!({"type":"text","text":notice}));
         }
+        if let Some(handoff) = st.account_handoff.take() {
+            blocks.push(json!({"type":"text","text":handoff}));
+        }
     }
     if st.desktop_notice && !p.text.trim_start().starts_with('/') {
         st.desktop_notice = false;
@@ -701,10 +706,14 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Result<V
             }
             return match kind {
                 // If the process went away after the session was created but before anything was said, some tools (Cursor) never saved the session and load reports not found.
-                // The old session had no content anyway, so just start a new one; don't treat it as not logged in
-                Pending::Load if is_missing_session(&msg) => {
+                // Also if resuming across switched accounts fails for a non-auth reason (e.g. team/model mismatch), start a fresh session with the handoff digest.
+                Pending::Load if is_missing_session(&msg) || (spec.account_handoff.is_some() && !is_auth_error(&msg)) => {
                     st.loading = false;
                     st.resumed = false;
+                    if spec.account_handoff.is_some() {
+                        st.account_handoff = spec.account_handoff.clone();
+                        em.resume_fallback();
+                    }
                     out.push(new_session(st, spec));
                     Ok(out)
                 }
@@ -1397,9 +1406,13 @@ fn meta_tool_name(u: &Value) -> Option<&str> {
     })
 }
 
-fn login_hint(spec: &StartSpec, msg: &str) -> String {
+fn is_auth_error(msg: &str) -> bool {
     let lower = msg.to_lowercase();
-    if lower.contains("auth") || lower.contains("login") || msg.contains("401") {
+    lower.contains("auth") || lower.contains("login") || msg.contains("401") || msg.contains("403")
+}
+
+fn login_hint(spec: &StartSpec, msg: &str) -> String {
+    if is_auth_error(msg) {
         let cmd = match spec.tool {
             ToolKind::Cursor => "cursor-agent login",
             ToolKind::Kiro => "kiro-cli login",

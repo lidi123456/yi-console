@@ -35,6 +35,7 @@ struct ProbeEnv {
     env: BTreeMap<String, String>,
     env_unset: Vec<String>,
     auth_kind: Option<AccountAuthKind>,
+    auth_method: Option<String>,
     identity: AccountIdentity,
     account_id: Option<String>,
     account_label: Option<String>,
@@ -47,6 +48,7 @@ impl ProbeEnv {
             env: res.env.clone(),
             env_unset: res.env_unset.clone(),
             auth_kind: Some(res.auth_kind),
+            auth_method: res.auth_method.clone(),
             identity: res.identity.clone(),
             account_id: Some(res.id.clone()),
             account_label: Some(res.label.clone()),
@@ -75,18 +77,6 @@ async fn converse_env(
     on: impl FnMut(&Value) -> Step,
 ) -> Result<()> {
     converse_in_env(tool, settings, penv, args, &probe_dir(), TIMEOUT, first, on).await
-}
-
-async fn converse_in(
-    tool: ToolKind,
-    settings: &DaemonSettings,
-    args: &[&str],
-    cwd: &std::path::Path,
-    timeout: Duration,
-    first: Vec<Value>,
-    on: impl FnMut(&Value) -> Step,
-) -> Result<()> {
-    converse_in_env(tool, settings, &ProbeEnv::default(), args, cwd, timeout, first, on).await
 }
 
 async fn converse_in_env(
@@ -273,8 +263,8 @@ fn codex_quota(account: &Value, rl: &Value) -> Value {
     })
 }
 
-/// Cursor / Kiro: create an empty session to get the model list; Kiro then runs /usage
-async fn acp(tool: ToolKind, settings: &DaemonSettings, want_quota: bool) -> Result<Probe> {
+/// Cursor / Kiro / Qoder / CodeBuddy / Antigravity: create an empty session to get the model list; Kiro then runs /usage
+async fn acp(tool: ToolKind, settings: &DaemonSettings, penv: &ProbeEnv, want_quota: bool) -> Result<Probe> {
     let mut out = Probe::default();
     let cwd = probe_dir().display().to_string();
     let init = json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,
@@ -284,13 +274,22 @@ async fn acp(tool: ToolKind, settings: &DaemonSettings, want_quota: bool) -> Res
     let mut sid = String::new();
     // Every session Qoder creates shows up in its history, so delete it after asking
     let delete = tool == ToolKind::Qoder;
-    converse(tool, settings, &[adapters::acp::acp_arg(tool)], vec![init], |v| {
+    let explicit_auth = penv.auth_method.clone();
+    converse_env(tool, settings, penv, &[adapters::acp::acp_arg(tool)], vec![init], |v| {
         let Some(id) = v["id"].as_u64().filter(|_| v.get("method").is_none()) else {
             return Step::Wait;
         };
         let r = &v["result"];
         match id {
-            1 => Step::Send(vec![json!({"jsonrpc":"2.0","id":2,"method":"session/new",
+            1 => {
+                if let Some(m) = explicit_auth.as_deref() {
+                    Step::Send(vec![json!({"jsonrpc":"2.0","id":99,"method":"authenticate","params":{"methodId":m}})])
+                } else {
+                    Step::Send(vec![json!({"jsonrpc":"2.0","id":2,"method":"session/new",
+                        "params":{"cwd":cwd,"mcpServers":[]}})])
+                }
+            }
+            99 => Step::Send(vec![json!({"jsonrpc":"2.0","id":2,"method":"session/new",
                 "params":{"cwd":cwd,"mcpServers":[]}})]),
             2 => {
                 out.models = if tool == ToolKind::Antigravity { adapters::acp::antigravity_models(r) } else { adapters::acp::parse_models(r) };
@@ -320,7 +319,20 @@ async fn acp(tool: ToolKind, settings: &DaemonSettings, want_quota: bool) -> Res
 /// Cursor lists a model's parameters only after a session switches to it. Switch an empty session to `model`,
 /// read them, and switch back, since Cursor remembers the last model for its next session. `cwd` is the
 /// session's directory: Cursor refuses to set up a session in some directories ("Failed to initialize session services")
-pub async fn cursor_model_config(settings: &DaemonSettings, model: &str, cwd: &std::path::Path) -> Result<Vec<ModelConfigOption>> {
+pub async fn cursor_model_config(
+    hub: &Arc<Hub>,
+    settings: &DaemonSettings,
+    model: &str,
+    cwd: &std::path::Path,
+    account_id: Option<&str>,
+) -> Result<Vec<ModelConfigOption>> {
+    let resolved = hub.accounts.resolve(ToolKind::Cursor, account_id);
+    if let Some(res) = &resolved {
+        if res.auth_kind == AccountAuthKind::Oauth {
+            hub.accounts.ensure_cursor_oauth_host_clean(&res.id)?;
+        }
+    }
+    let penv = resolved.as_ref().map(ProbeEnv::from_resolved).unwrap_or_default();
     let init = json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,
         "clientCapabilities":adapters::acp::client_capabilities(ToolKind::Cursor),
         "clientInfo":{"name":"yi-console","version":DAEMON_VERSION}}});
@@ -329,7 +341,7 @@ pub async fn cursor_model_config(settings: &DaemonSettings, model: &str, cwd: &s
     let (mut sid, mut original) = (String::new(), None::<String>);
     let mut found: Result<Vec<ModelConfigOption>> = Err(anyhow!("cursor 没有返回模型参数"));
     let cwd_s = cwd.display().to_string();
-    converse_in(ToolKind::Cursor, settings, &["acp"], cwd, Duration::from_secs(90), vec![init], |v| {
+    converse_in_env(ToolKind::Cursor, settings, &penv, &["acp"], cwd, Duration::from_secs(90), vec![init], |v| {
         let Some(id) = v["id"].as_u64().filter(|_| v.get("method").is_none()) else { return Step::Wait };
         let r = &v["result"];
         let error = v["error"]["data"]["message"].as_str().or(v["error"]["message"].as_str()).map(str::to_string);
@@ -400,20 +412,97 @@ fn cursor_api_endpoint(penv: &ProbeEnv) -> String {
         .map(String::as_str)
         .filter(|s| !s.trim().is_empty())
         .map(str::to_string)
-        .or_else(|| std::env::var("CURSOR_API_ENDPOINT").ok().filter(|s| !s.trim().is_empty()))
-        .or_else(|| std::env::var("CURSOR_API_BASE_URL").ok().filter(|s| !s.trim().is_empty()))
+        .or_else(|| crate::tools::host_env_var("CURSOR_API_ENDPOINT"))
+        .or_else(|| crate::tools::host_env_var("CURSOR_API_BASE_URL"))
         .unwrap_or_else(|| "https://api2.cursor.sh".to_string())
         .trim_end_matches('/')
         .to_string()
 }
 
 fn cursor_auth_api_key(bytes: &[u8]) -> Option<String> {
-    let v: Value = serde_json::from_slice(bytes).ok()?;
-    v["apiKey"]
+    crate::accounts::cursor_auth_api_key(bytes)
+}
+
+/// Validate a `CURSOR_API_KEY` on save/capture:
+/// - Rejects HTTP 401/403 immediately with a clear invalid-key error.
+/// - Returns `Ok(Some((identity, raw_quota)))` when the Cursor API responds.
+/// - Returns `Ok(None)` on offline / transport errors so offline setup still works.
+pub fn verify_cursor_api_key(
+    api_key: &str,
+    base_url: Option<&str>,
+) -> Result<Option<(AccountIdentity, Value)>> {
+    let key = api_key.trim();
+    if key.is_empty() {
+        return Ok(None);
+    }
+    let endpoint = base_url
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| crate::tools::host_env_var("CURSOR_API_ENDPOINT"))
+        .or_else(|| crate::tools::host_env_var("CURSOR_API_BASE_URL"))
+        .unwrap_or_else(|| "https://api2.cursor.sh".to_string())
+        .trim_end_matches('/')
+        .to_string();
+    let url = format!("{endpoint}/auth/exchange_user_api_key");
+    let resp = ureq::post(&url)
+        .header("Content-Type", "application/json")
+        .header("Authorization", &format!("Bearer {key}"))
+        .config()
+        .timeout_global(Some(Duration::from_secs(12)))
+        .build()
+        .send(&b"{}"[..]);
+    let mut resp = match resp {
+        Ok(r) => r,
+        Err(ureq::Error::StatusCode(401 | 403)) => bail!("CURSOR_API_KEY 无效或没有权限"),
+        Err(ureq::Error::StatusCode(code)) => bail!("CURSOR_API_KEY 校验失败（HTTP {code}）"),
+        Err(_) => return Ok(None),
+    };
+    let Ok(body) = resp.body_mut().read_to_string() else {
+        return Ok(None);
+    };
+    let Ok(v) = serde_json::from_str::<Value>(&body) else {
+        return Ok(None);
+    };
+    let Some(token) = v["accessToken"].as_str().filter(|t| !t.is_empty()) else {
+        bail!("CURSOR_API_KEY 交换访问令牌失败");
+    };
+    let Ok(q) = cursor_usage_with_token(&endpoint, token) else {
+        return Ok(None);
+    };
+    let email = q["account"]["email"]
         .as_str()
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(String::from)
+        .map(String::from);
+    let plan = q["account"]["plan"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+    let ident = AccountIdentity {
+        account_key: email.clone(),
+        email,
+        plan,
+        workspace: base_url
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from),
+    };
+    Ok(Some((ident, q)))
+}
+
+pub fn cache_verified_cursor_quota(base_dir: &Path, acc: &AccountProfileView, raw_quota: Value) {
+    let now = now_ms();
+    let penv = ProbeEnv {
+        auth_kind: Some(acc.auth_kind),
+        identity: acc.identity.clone(),
+        account_id: Some(acc.id.clone()),
+        account_label: Some(acc.label.clone()),
+        ..Default::default()
+    };
+    let enriched = enrich_quota(raw_quota, ToolKind::Cursor, &penv, now);
+    store_quota_cache(base_dir, ToolKind::Cursor, Some(&acc.id), &enriched, now);
 }
 
 fn cursor_token_from_bytes(bytes: &[u8]) -> Result<String> {
@@ -504,11 +593,8 @@ async fn cursor_api_key_account(
 async fn cursor_account(settings: &DaemonSettings, penv: &ProbeEnv) -> Result<Value> {
     let endpoint = cursor_api_endpoint(penv);
     if penv.auth_kind.is_none() {
-        if let Ok(env_key) = std::env::var("CURSOR_API_KEY") {
-            let trimmed = env_key.trim();
-            if !trimmed.is_empty() {
-                return cursor_api_key_account(trimmed, &endpoint, &penv.identity).await;
-            }
+        if let Some(env_key) = crate::tools::host_env_var("CURSOR_API_KEY") {
+            return cursor_api_key_account(&env_key, &endpoint, &penv.identity).await;
         }
         if let Ok(bytes) = std::fs::read(cursor_auth_file()) {
             if let Some(file_key) = cursor_auth_api_key(&bytes) {
@@ -520,7 +606,7 @@ async fn cursor_account(settings: &DaemonSettings, penv: &ProbeEnv) -> Result<Va
     // If host auth.json was overwritten by a CURSOR_API_KEY run, probe the OAuth snapshot directly instead of touching disk.
     if penv.auth_kind == Some(AccountAuthKind::Oauth) {
         if let Ok(bytes) = std::fs::read(cursor_auth_file()) {
-            if cursor_auth_api_key(&bytes).is_some() {
+            if crate::accounts::cursor_bytes_are_api_key(&bytes) {
                 if let Some(clean_bytes) = &penv.cursor_fallback_auth {
                     let token = cursor_token_from_bytes(clean_bytes)?;
                     let ep = endpoint.clone();
@@ -532,7 +618,7 @@ async fn cursor_account(settings: &DaemonSettings, penv: &ProbeEnv) -> Result<Va
                     }
                     return Ok(q);
                 }
-                bail!("当前系统 Cursor auth.json 为 CURSOR_API_KEY 凭据而非 OAuth 登录，请重新登录 OAuth");
+                bail!("当前 Cursor 授权账号保存的凭据实际为 API Key 而非网页授权登录，请在账号管理中点击「重新登录」完成授权");
             }
         }
     }
@@ -984,10 +1070,6 @@ fn codebuddy_quota(user: &Value, summary: &Value, ent: &Value) -> Value {
     })
 }
 
-async fn run(tool: ToolKind, settings: &DaemonSettings, want_quota: bool) -> Result<Probe> {
-    run_with_env(tool, settings, &ProbeEnv::default(), want_quota).await
-}
-
 async fn run_with_env(
     tool: ToolKind,
     settings: &DaemonSettings,
@@ -1012,7 +1094,7 @@ async fn run_with_env(
     match tool {
         ToolKind::Claude => claude(settings, penv, want_quota).await,
         ToolKind::Codex => codex(settings, penv, want_quota).await,
-        ToolKind::Kiro => acp(tool, settings, want_quota).await,
+        ToolKind::Kiro => acp(tool, settings, penv, want_quota).await,
         ToolKind::Qoder if want_quota => Ok(Probe {
             models: vec![],
             quota: Some(qoder_account(settings).await?),
@@ -1021,17 +1103,17 @@ async fn run_with_env(
             models: vec![],
             quota: Some(codebuddy_account(settings).await?),
         }),
-        ToolKind::Qoder | ToolKind::Codebuddy => acp(tool, settings, false).await,
+        ToolKind::Qoder | ToolKind::Codebuddy => acp(tool, settings, penv, false).await,
         ToolKind::Cursor if want_quota => Ok(Probe {
             models: vec![],
             quota: Some(cursor_account(settings, penv).await?),
         }),
-        ToolKind::Cursor => acp(tool, settings, false).await,
+        ToolKind::Cursor => acp(tool, settings, penv, false).await,
         ToolKind::Antigravity if want_quota => Ok(Probe {
             models: vec![],
             quota: Some(antigravity_account(settings, penv).await?),
         }),
-        ToolKind::Antigravity => acp(tool, settings, false).await,
+        ToolKind::Antigravity => acp(tool, settings, penv, false).await,
         ToolKind::Shell => bail!("终端没有模型和额度"),
         ToolKind::Files => bail!("文件会话没有模型和额度"),
     }
@@ -1144,8 +1226,17 @@ fn enrich_quota(mut v: Value, tool: ToolKind, penv: &ProbeEnv, at: i64) -> Value
     v
 }
 
-pub async fn models(tool: ToolKind, settings: &DaemonSettings) -> Result<Vec<ModelOption>> {
-    Ok(run(tool, settings, false).await?.models)
+pub async fn models(hub: &Arc<Hub>, tool: ToolKind, settings: &DaemonSettings) -> Result<Vec<ModelOption>> {
+    let resolved = hub.accounts.resolve(tool, None);
+    if tool == ToolKind::Cursor {
+        if let Some(res) = &resolved {
+            if res.auth_kind == AccountAuthKind::Oauth {
+                hub.accounts.ensure_cursor_oauth_host_clean(&res.id)?;
+            }
+        }
+    }
+    let penv = resolved.as_ref().map(ProbeEnv::from_resolved).unwrap_or_default();
+    Ok(run_with_env(tool, settings, &penv, false).await?.models)
 }
 
 /// Account quota: {tool, accountId?, accountLabel?, account:{email,plan}, windows:[{label,usedPercent,resetsAt,detail?}], note?, fetchedAt}
@@ -1183,7 +1274,15 @@ pub async fn quota(
         .unwrap_or_default();
     if tool == ToolKind::Cursor && penv.auth_kind == Some(AccountAuthKind::Oauth) {
         if let Some(aid) = &penv.account_id {
+            if !hub.accounts.has_clean_cursor_oauth_snapshot(aid) {
+                bail!("当前 Cursor 授权账号保存的凭据实际为 API Key 而非网页授权登录，请在账号管理中点击「重新登录」完成授权");
+            }
             penv.cursor_fallback_auth = hub.accounts.load_cursor_oauth_auth_bytes(aid);
+            if hub.accounts.active_account_id(ToolKind::Cursor).as_deref() == Some(aid.as_str())
+                && !hub.has_running_host_session(ToolKind::Cursor)
+            {
+                let _ = hub.accounts.ensure_cursor_oauth_host_clean(aid);
+            }
         }
     }
 
@@ -1225,14 +1324,12 @@ pub async fn quota(
     if let Some(aid) = &effective_id {
         if v["error"].is_null() {
             hub.accounts.set_runtime_state(tool, aid, AccountState::Ready, None);
-            if tool == ToolKind::Cursor && penv.auth_kind == Some(AccountAuthKind::ApiKey) {
-                hub.accounts.update_identity_if_missing(
-                    tool,
-                    aid,
-                    v["account"]["email"].as_str(),
-                    v["account"]["plan"].as_str(),
-                );
-            }
+            hub.accounts.update_identity_if_missing(
+                tool,
+                aid,
+                v["account"]["email"].as_str(),
+                v["account"]["plan"].as_str(),
+            );
         }
     }
     Ok(v)

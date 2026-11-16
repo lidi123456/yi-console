@@ -259,6 +259,8 @@ export interface ToolNativeStatus {
   plan?: string | null;
   envOverride?: string | null;
   matchedAccountId?: string | null;
+  envApiKeyMatchedId?: string | null;
+  hasLocalOauth?: boolean;
   detail?: string | null;
 }
 

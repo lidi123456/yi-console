@@ -284,24 +284,36 @@ export function AccountManagerModal({
     }
   };
 
-  const handleCapture = async () => {
+  const handleCapture = async (source?: 'oauth' | 'apiKey') => {
     const nativeMethod = summary?.nativeStatus?.authMethod;
-    const suggested =
-      summary?.nativeStatus?.email ||
-      summary?.nativeStatus?.plan ||
-      `${TOOL_LABEL[tool]} ${nativeMethod === 'api_key' || nativeMethod === 'env_api_key' ? 'API Key' : 'OAuth'}`;
+    const isApiKeyCapture =
+      source === 'apiKey' || (!source && (nativeMethod === 'api_key' || nativeMethod === 'env_api_key'));
+    const defaultAutoLabel = `${TOOL_LABEL[tool]} ${isApiKeyCapture ? 'API Key' : 'OAuth'}`;
+    const suggested = isApiKeyCapture
+      ? summary?.nativeStatus?.email
+        ? `${summary.nativeStatus.email} (API Key)`
+        : defaultAutoLabel
+      : summary?.nativeStatus?.email || summary?.nativeStatus?.plan || defaultAutoLabel;
+    const title =
+      source === 'apiKey' && tool === 'cursor'
+        ? tx('importCursorEnvKey')
+        : source === 'oauth' && tool === 'cursor'
+          ? tx('captureLocalOauth')
+          : tx('captureCurrent');
     const label = await askText({
-      title: tx('captureCurrent'),
+      title,
       label: tx('capturePrompt'),
       value: suggested,
       okText: tx('save'),
     });
     if (label === null) return;
+    const trimmed = label.trim();
     setBusy(true);
     try {
       const view = await rpc<AccountProfileView>(hostId, 'tools.accounts.capture', {
         tool,
-        label: label.trim() || undefined,
+        source,
+        label: trimmed && trimmed !== defaultAutoLabel ? trimmed : undefined,
       });
       toast(tx('capturedToast', { label: view.label }), 'info');
       await loadAccounts(tool);
@@ -601,15 +613,46 @@ export function AccountManagerModal({
               )}
             </div>
             {summary.nativeStatus.envOverride && (
-              <div className="acc-warn small">{tx('envOverrideWarn', { env: summary.nativeStatus.envOverride })}</div>
+              <div className="row" style={{ gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
+                <div className="acc-warn small">{tx('envOverrideWarn', { env: summary.nativeStatus.envOverride })}</div>
+                {tool === 'cursor' &&
+                  summary.nativeStatus.authMethod === 'env_api_key' &&
+                  !summary.nativeStatus.envApiKeyMatchedId && (
+                    <button
+                      type="button"
+                      className="btn small primary"
+                      disabled={busy}
+                      onClick={() => void handleCapture('apiKey')}
+                    >
+                      <Icon name="plus" size={14} /> {tx('importCursorEnvKey')}
+                    </button>
+                  )}
+              </div>
             )}
             {summary.nativeStatus.detail && <div className="muted small">{trErr(summary.nativeStatus.detail)}</div>}
           </div>
         )}
 
         <div className="acc-actions">
-          <button className="btn small" disabled={busy} onClick={() => void handleCapture()}>
-            <Icon name="download" size={14} /> {tx('captureCurrent')}
+          <button
+            className="btn small"
+            disabled={busy}
+            onClick={() =>
+              void handleCapture(
+                tool === 'cursor' &&
+                  summary?.nativeStatus?.authMethod === 'env_api_key' &&
+                  summary?.nativeStatus?.hasLocalOauth
+                  ? 'oauth'
+                  : undefined,
+              )
+            }
+          >
+            <Icon name="download" size={14} />{' '}
+            {tool === 'cursor' &&
+            summary?.nativeStatus?.authMethod === 'env_api_key' &&
+            summary?.nativeStatus?.hasLocalOauth
+              ? tx('captureLocalOauth')
+              : tx('captureCurrent')}
           </button>
           {(summary?.supportsOauth ?? true) && (
             <button className="btn small" disabled={busy || loginJob?.running} onClick={handleLoginClick}>
@@ -625,7 +668,7 @@ export function AccountManagerModal({
                 setShowImport(false);
               }}
             >
-              <Icon name="plus" size={14} /> {tx('addApiKey')}
+              <Icon name="plus" size={14} /> {tool === 'cursor' ? tx('addCursorApiKey') : tx('addApiKey')}
             </button>
           )}
           <button
@@ -774,13 +817,20 @@ export function AccountManagerModal({
         {form && (
           <div className="acc-panel form">
             <div className="small" style={{ fontWeight: 600 }}>
-              {form.id ? tx('formEditTitle', { label: form.label }) : tx('formCreateTitle')}
+              {form.id
+                ? tx('formEditTitle', { label: form.label })
+                : tool === 'cursor'
+                  ? tx('formCreateCursorTitle')
+                  : tx('formCreateTitle')}
             </div>
+            {tool === 'cursor' && form.authKind === 'apiKey' && (
+              <div className="muted small">{tx('cursorApiKeyHint')}</div>
+            )}
             <label>
               {tx('fieldLabel')}
               <input
                 value={form.label}
-                placeholder={tx('fieldLabelPlaceholder')}
+                placeholder={tool === 'cursor' && form.authKind === 'apiKey' ? tx('fieldLabelCursorPlaceholder') : tx('fieldLabelPlaceholder')}
                 onChange={(e) => setForm({ ...form, label: e.target.value })}
               />
             </label>
@@ -788,34 +838,39 @@ export function AccountManagerModal({
               <>
                 <div className="acc-form-grid">
                   <label>
-                    {tx('fieldApiKey')}
+                    {tool === 'cursor' ? tx('fieldCursorApiKey') : tx('fieldApiKey')}
                     <input
                       value={form.apiKey}
+                      placeholder={tool === 'cursor' ? tx('fieldCursorApiKeyPlaceholder') : undefined}
                       onChange={(e) => setForm({ ...form, apiKey: e.target.value })}
                     />
                   </label>
+                  {tool !== 'cursor' && (
+                    <label>
+                      {tx('fieldAuthToken')}
+                      <input
+                        value={form.authToken}
+                        onChange={(e) => setForm({ ...form, authToken: e.target.value })}
+                      />
+                    </label>
+                  )}
                   <label>
-                    {tx('fieldAuthToken')}
-                    <input
-                      value={form.authToken}
-                      onChange={(e) => setForm({ ...form, authToken: e.target.value })}
-                    />
-                  </label>
-                  <label>
-                    {tx('fieldBaseUrl')}
+                    {tool === 'cursor' ? tx('fieldCursorEndpoint') : tx('fieldBaseUrl')}
                     <input
                       value={form.baseUrl}
-                      placeholder="https://..."
+                      placeholder={tool === 'cursor' ? 'https://api2.cursor.sh' : 'https://...'}
                       onChange={(e) => setForm({ ...form, baseUrl: e.target.value })}
                     />
                   </label>
-                  <label>
-                    {tx('fieldDefaultModel')}
-                    <input
-                      value={form.defaultModel}
-                      onChange={(e) => setForm({ ...form, defaultModel: e.target.value })}
-                    />
-                  </label>
+                  {tool !== 'cursor' && (
+                    <label>
+                      {tx('fieldDefaultModel')}
+                      <input
+                        value={form.defaultModel}
+                        onChange={(e) => setForm({ ...form, defaultModel: e.target.value })}
+                      />
+                    </label>
+                  )}
                   {tool === 'codex' && (
                     <label>
                       {tx('fieldProviderName')}

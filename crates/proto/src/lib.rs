@@ -802,6 +802,10 @@ pub struct ToolNativeStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub matched_account_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env_api_key_matched_id: Option<String>,
+    #[serde(default)]
+    pub has_local_oauth: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
 }
 

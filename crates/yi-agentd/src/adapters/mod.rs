@@ -188,6 +188,7 @@ pub struct JsonProc {
 }
 
 impl JsonProc {
+    #[allow(dead_code)]
     pub fn spawn(program: &Path, args: &[String], cwd: &Path) -> std::io::Result<JsonProc> {
         Self::spawn_with_env(program, args, cwd, &Default::default(), &[])
     }

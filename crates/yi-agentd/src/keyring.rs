@@ -75,6 +75,10 @@ impl KeyringEntry {
 struct KeyringSpec {
     prefixes: &'static [&'static str],
     known_pairs: &'static [(&'static str, &'static str)],
+    /// Services shared with a broader ecosystem (e.g. `agy` stores under service `"gemini"`
+    /// with the account set to `<appDataDir>/antigravity-oauth-token`); match only when the
+    /// account itself identifies the tool.
+    scoped_services: &'static [&'static str],
 }
 
 fn spec_for(tool: ToolKind) -> Option<KeyringSpec> {
@@ -90,35 +94,43 @@ fn spec_for(tool: ToolKind) -> Option<KeyringSpec> {
                 ("antigravity", "default"),
                 ("gemini-cli-oauth", "main-account"),
             ],
+            scoped_services: &["gemini"],
         }),
         ToolKind::Cursor => Some(KeyringSpec {
             prefixes: &["cursor"],
             known_pairs: &[
                 ("cursor-access-token", "cursor-user"),
                 ("cursor-refresh-token", "cursor-user"),
+                ("cursor-api-key", "cursor-user"),
                 ("Cursor", "cursor-access-token"),
                 ("cursor", "default"),
             ],
+            scoped_services: &[],
         }),
         ToolKind::Kiro => Some(KeyringSpec {
             prefixes: &["kiro", "q-cli", "amazon-q"],
             known_pairs: &[("kiro-cli", "default"), ("kiro", "default")],
+            scoped_services: &[],
         }),
         ToolKind::Qoder => Some(KeyringSpec {
             prefixes: &["qoder"],
             known_pairs: &[("qoder", "default"), ("qodercli", "default")],
+            scoped_services: &[],
         }),
         ToolKind::Codebuddy => Some(KeyringSpec {
             prefixes: &["codebuddy", "cbc"],
             known_pairs: &[("codebuddy", "default"), ("codebuddy-code", "default")],
+            scoped_services: &[],
         }),
         ToolKind::Claude => Some(KeyringSpec {
             prefixes: &["claude code", "claude-code", "claude"],
             known_pairs: &[("Claude Code-credentials", "")],
+            scoped_services: &[],
         }),
         ToolKind::Codex => Some(KeyringSpec {
             prefixes: &["codex auth", "codex", "openai-codex"],
             known_pairs: &[("Codex Auth", "default"), ("Codex Auth", "")],
+            scoped_services: &[],
         }),
         ToolKind::Shell | ToolKind::Files => None,
     }
@@ -137,7 +149,7 @@ fn matches_spec(spec: &KeyringSpec, service: &str, account: &str, label: Option<
             return true;
         }
     }
-    spec.prefixes.iter().any(|p| {
+    if spec.prefixes.iter().any(|p| {
         let p = p.to_ascii_lowercase();
         svc_low == p
             || svc_low.starts_with(&format!("{p}-"))
@@ -147,7 +159,20 @@ fn matches_spec(spec: &KeyringSpec, service: &str, account: &str, label: Option<
             || svc_low.contains(&format!(".{p}"))
             || lbl_low == p
             || acct_low.starts_with(&format!("{p}-"))
-    })
+    }) {
+        return true;
+    }
+    if spec.scoped_services.iter().any(|s| svc_low == *s) {
+        let acct_base = acct_low.rsplit(['/', '\\']).next().unwrap_or("");
+        return spec.prefixes.iter().any(|p| {
+            let p = p.to_ascii_lowercase();
+            acct_base == p
+                || acct_base.starts_with(&format!("{p}-"))
+                || acct_low.contains(&format!("/{p}-"))
+                || acct_low.contains(&format!("\\{p}-"))
+        });
+    }
+    false
 }
 
 /// Snapshot all OS keyring entries belonging to `tool`.
@@ -430,6 +455,24 @@ mod platform {
             }
         }
 
+        for svc in spec.scoped_services {
+            if let Ok(out) = Command::new("secret-tool")
+                .args(["search", "--all", "service", svc])
+                .output()
+            {
+                if out.status.success() {
+                    let text = String::from_utf8_lossy(&out.stdout);
+                    for entry in parse_secret_tool_search(&text) {
+                        if matches_spec(spec, &entry.service, &entry.account, entry.label.as_deref())
+                            && seen.insert(entry.key())
+                        {
+                            out_entries.push(entry);
+                        }
+                    }
+                }
+            }
+        }
+
         // Also query exact known pairs in case the item uses a different schema.
         let user = std::env::var("USER").unwrap_or_default();
         for (ks, ka) in spec.known_pairs {
@@ -512,6 +555,18 @@ mod platform {
     }
 }
 
+#[cfg(any(target_os = "windows", test))]
+fn windows_entry_target_matches(spec: &KeyringSpec, target: &str, user: &str) -> bool {
+    // go-keyring formats Windows TargetName as `service:user` or `service`
+    if let Some((svc, target_user)) = target.split_once(':') {
+        let acct = if user.is_empty() { target_user } else { user };
+        if matches_spec(spec, svc, acct, None) {
+            return true;
+        }
+    }
+    matches_spec(spec, target, user, None)
+}
+
 #[cfg(target_os = "windows")]
 mod platform {
     use super::*;
@@ -542,16 +597,6 @@ mod platform {
             .collect()
     }
 
-    fn entry_target_matches(spec: &KeyringSpec, target: &str, user: &str) -> bool {
-        // go-keyring formats Windows TargetName as `service:user` or `service`
-        if let Some((svc, _)) = target.split_once(':') {
-            if matches_spec(spec, svc, user, None) {
-                return true;
-            }
-        }
-        matches_spec(spec, target, user, None)
-    }
-
     pub fn snapshot(spec: &KeyringSpec) -> Result<Vec<KeyringEntry>> {
         let mut count: u32 = 0;
         let mut creds: *mut *mut CREDENTIALW = std::ptr::null_mut();
@@ -572,7 +617,7 @@ mod platform {
                 }
                 let target = pwstr_to_string(c.TargetName);
                 let user = pwstr_to_string(c.UserName);
-                if !entry_target_matches(spec, &target, &user) {
+                if !windows_entry_target_matches(spec, &target, &user) {
                     continue;
                 }
                 let bytes = if c.CredentialBlob.is_null() || c.CredentialBlobSize == 0 {
@@ -661,6 +706,23 @@ mod tests {
         assert!(matches_spec(&agy, "antigravity-oauth-token", "oauth-token", None));
         assert!(matches_spec(&agy, "gemini-cli-oauth", "main-account", None));
         assert!(matches_spec(&agy, "antigravity:user@example.com", "user", None));
+        assert!(matches_spec(
+            &agy,
+            "gemini",
+            "/Users/alice/.gemini/antigravity-cli/antigravity-oauth-token",
+            None
+        ));
+        assert!(windows_entry_target_matches(
+            &agy,
+            r"gemini:C:\Users\di3.li\.gemini\antigravity-cli\antigravity-oauth-token",
+            r"C:\Users\di3.li\.gemini\antigravity-cli\antigravity-oauth-token",
+        ));
+        assert!(windows_entry_target_matches(
+            &agy,
+            r"gemini:C:\Users\di3.li\.gemini\antigravity-cli\antigravity-oauth-token",
+            "",
+        ));
+        assert!(!matches_spec(&agy, "gemini", "unrelated-account", None));
         assert!(!matches_spec(&agy, "yi-console-antigravity", "user", None));
 
         let claude = spec_for(ToolKind::Claude).unwrap();

@@ -131,6 +131,7 @@ pub struct SaveAccountRequest {
     pub allow_auto_failover: Option<bool>,
     pub priority: Option<i32>,
     pub api_config: Option<ApiKeyConfig>,
+    pub verified_identity: Option<AccountIdentity>,
     pub activate: bool,
 }
 
@@ -144,6 +145,7 @@ impl Default for SaveAccountRequest {
             allow_auto_failover: None,
             priority: None,
             api_config: None,
+            verified_identity: None,
             activate: false,
         }
     }
@@ -300,33 +302,48 @@ impl AccountManager {
     /// Load Cursor's saved OAuth `auth.json` bytes if the snapshot exists and wasn't polluted with `apiKey`.
     pub fn load_cursor_oauth_auth_bytes(&self, account_id: &str) -> Option<Vec<u8>> {
         let snap = self.load_snapshot(ToolKind::Cursor, account_id)?;
+        if cursor_snapshot_is_api_key(&snap) {
+            return None;
+        }
         let bytes = snap
             .files
             .iter()
             .find(|(k, _)| k.ends_with("auth.json"))
             .and_then(|(_, b64)| base64::engine::general_purpose::STANDARD.decode(b64).ok())?;
-        if cursor_auth_api_key(&bytes).is_some() {
+        if cursor_bytes_are_api_key(&bytes) {
             return None;
         }
         Some(bytes)
     }
 
+    pub fn has_clean_cursor_oauth_snapshot(&self, account_id: &str) -> bool {
+        self.load_snapshot(ToolKind::Cursor, account_id)
+            .is_some_and(|s| !s.is_empty() && !cursor_snapshot_is_api_key(&s))
+    }
+
+    /// Ensure host Cursor credentials match the saved clean OAuth snapshot for `account_id`,
+    /// recovering automatically if an external `CURSOR_API_KEY` process polluted `auth.json` or Keychain,
+    /// and rejecting snapshots that are themselves API-key credentials.
+    pub fn ensure_cursor_oauth_host_clean(&self, account_id: &str) -> Result<()> {
+        let _guard = self.host_lock.lock().unwrap();
+        let Some(clean) = self.load_snapshot(ToolKind::Cursor, account_id) else {
+            bail!("当前 Cursor 授权账号缺少登录快照，请在账号管理中点击「重新登录」完成网页授权");
+        };
+        if clean.is_empty() || cursor_snapshot_is_api_key(&clean) {
+            bail!("当前 Cursor 授权账号保存的凭据实际为 API Key 而非网页授权登录，请在账号管理中点击「重新登录」完成授权");
+        }
+        let Ok(cur) = self.take_host_snapshot_unlocked(ToolKind::Cursor) else {
+            return Ok(());
+        };
+        if cur.is_empty() || cursor_snapshot_is_api_key(&cur) {
+            self.restore_host_snapshot_unlocked(ToolKind::Cursor, &clean)?;
+        }
+        Ok(())
+    }
+
     /// Restore a Cursor OAuth profile's host `auth.json` if a previous `CURSOR_API_KEY` process overwrote it.
     pub fn restore_cursor_oauth_if_api_key_polluted(&self, account_id: &str) {
-        let _guard = self.host_lock.lock().unwrap();
-        let Ok(cur) = self.take_host_snapshot_unlocked(ToolKind::Cursor) else {
-            return;
-        };
-        if cursor_snapshot_api_key(&cur).is_none() {
-            return;
-        }
-        let Some(clean) = self.load_snapshot(ToolKind::Cursor, account_id) else {
-            return;
-        };
-        if cursor_snapshot_api_key(&clean).is_some() {
-            return;
-        }
-        let _ = self.restore_host_snapshot_unlocked(ToolKind::Cursor, &clean);
+        let _ = self.ensure_cursor_oauth_host_clean(account_id);
     }
 
     pub fn update_identity_if_missing(
@@ -460,7 +477,17 @@ impl AccountManager {
         in_use_sessions: usize,
         quota: Option<serde_json::Value>,
     ) -> AccountProfileView {
-        let (state, state_detail) = self.runtime_state(acc.tool, &acc.id);
+        let (mut state, mut state_detail) = self.runtime_state(acc.tool, &acc.id);
+        if acc.tool == ToolKind::Cursor
+            && acc.auth_kind == AccountAuthKind::Oauth
+            && state == AccountState::Ready
+            && !self.has_clean_cursor_oauth_snapshot(&acc.id)
+        {
+            state = AccountState::NeedsLogin;
+            state_detail = Some(
+                "已保存凭据实际为 CURSOR_API_KEY 而非网页授权登录，请点击「重新登录」完成授权".into(),
+            );
+        }
         AccountProfileView {
             id: acc.id.clone(),
             tool: acc.tool,
@@ -674,16 +701,35 @@ impl AccountManager {
                 data_dir = Some(dir);
             }
             (ToolKind::Cursor, AccountAuthKind::Oauth) => {
-                env_unset.push("CURSOR_API_KEY".into());
-                env_unset.push("CURSOR_AUTH_TOKEN".into());
+                env_unset.extend(
+                    [
+                        "CURSOR_API_KEY",
+                        "CURSOR_AUTH_TOKEN",
+                        "AGENT_CLI_CREDENTIAL_STORE",
+                    ]
+                    .into_iter()
+                    .map(String::from),
+                );
             }
             (ToolKind::Cursor, AccountAuthKind::ApiKey) => {
+                // Keep exchanged API-key tokens strictly in process memory so `cursor-agent`
+                // neither reads cached host OAuth tokens nor overwrites host `auth.json` / Keychain.
+                env.insert("AGENT_CLI_CREDENTIAL_STORE".into(), "memory".into());
                 if let Some(cfg) = &acc.api_config {
                     if !cfg.api_key.is_empty() {
                         env.insert("CURSOR_API_KEY".into(), cfg.api_key.clone());
+                    } else {
+                        env_unset.push("CURSOR_API_KEY".into());
+                    }
+                    if !cfg.auth_token.is_empty() {
+                        env.insert("CURSOR_AUTH_TOKEN".into(), cfg.auth_token.clone());
+                    } else {
+                        env_unset.push("CURSOR_AUTH_TOKEN".into());
                     }
                     if !cfg.base_url.is_empty() {
-                        env.insert("OPENAI_BASE_URL".into(), cfg.base_url.clone());
+                        env.insert("CURSOR_API_ENDPOINT".into(), cfg.base_url.clone());
+                    } else {
+                        env_unset.push("CURSOR_API_ENDPOINT".into());
                     }
                     for (k, v) in &cfg.extra_env {
                         if !k.is_empty() {
@@ -718,6 +764,8 @@ impl AccountManager {
             }
             (_, AccountAuthKind::Oauth) => {}
         }
+
+        env_unset.retain(|k| !env.contains_key(k));
 
         let mut hasher = Sha256::new();
         hasher.update(acc.id.as_bytes());
@@ -757,22 +805,30 @@ impl AccountManager {
     }
 
     /// Capture the host tool's current native CLI login as a new AccountProfile.
+    #[cfg(test)]
     pub fn capture(&self, tool: ToolKind, label: Option<&str>) -> Result<AccountProfileView> {
+        self.capture_with_source(tool, label, None)
+    }
+
+    pub fn capture_with_source(
+        &self,
+        tool: ToolKind,
+        label: Option<&str>,
+        source: Option<&str>,
+    ) -> Result<AccountProfileView> {
         let cursor_env_key = if tool == ToolKind::Cursor {
-            std::env::var("CURSOR_API_KEY")
-                .ok()
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
+            crate::tools::host_env_var("CURSOR_API_KEY")
         } else {
             None
         };
-        self.capture_with_cursor_env(tool, label, cursor_env_key.as_deref())
+        self.capture_with_cursor_env(tool, label, source, cursor_env_key.as_deref())
     }
 
     fn capture_with_cursor_env(
         &self,
         tool: ToolKind,
         label: Option<&str>,
+        source: Option<&str>,
         cursor_env_key: Option<&str>,
     ) -> Result<AccountProfileView> {
         if !tool.supports_accounts() {
@@ -843,27 +899,55 @@ impl AccountManager {
             ToolKind::Cursor => {
                 let snap = self.take_host_snapshot_unlocked(ToolKind::Cursor).unwrap_or_default();
                 let file_api_key = cursor_snapshot_api_key(&snap);
+                let is_polluted = cursor_snapshot_is_api_key(&snap);
                 let env_key = cursor_env_key
                     .map(str::trim)
                     .filter(|s| !s.is_empty())
                     .map(String::from);
-                if let Some(key) = env_key.or_else(|| file_api_key.clone()) {
-                    let ident = if file_api_key.as_deref() == Some(key.as_str()) {
-                        self.parse_host_identity(ToolKind::Cursor, &snap)
-                    } else {
-                        AccountIdentity::default()
-                    };
-                    let api_cfg = ApiKeyConfig {
-                        api_key: key,
-                        ..Default::default()
-                    };
-                    (AccountAuthKind::ApiKey, ident, Some(api_cfg), None, false)
-                } else {
-                    if snap.is_empty() {
-                        bail!("当前系统 cursor 未检测到已保存的 OAuth 登录凭据");
+                match source {
+                    Some("oauth") => {
+                        if snap.is_empty() || is_polluted {
+                            bail!("当前系统未检测到网页授权登录凭据（本地保存的是 CURSOR_API_KEY 凭据），请点击「OAuth / CLI 登录」完成授权登录");
+                        }
+                        let ident = self.parse_host_identity(ToolKind::Cursor, &snap);
+                        (AccountAuthKind::Oauth, ident, None, Some(snap), true)
                     }
-                    let ident = self.parse_host_identity(ToolKind::Cursor, &snap);
-                    (AccountAuthKind::Oauth, ident, None, Some(snap), true)
+                    Some("apiKey") => {
+                        let Some(key) = env_key.or_else(|| file_api_key.clone()) else {
+                            bail!("当前系统未检测到 CURSOR_API_KEY 环境变量或 API Key 凭据");
+                        };
+                        let ident = if file_api_key.as_deref() == Some(key.as_str()) {
+                            self.parse_host_identity(ToolKind::Cursor, &snap)
+                        } else {
+                            AccountIdentity::default()
+                        };
+                        let api_cfg = ApiKeyConfig {
+                            api_key: key,
+                            ..Default::default()
+                        };
+                        (AccountAuthKind::ApiKey, ident, Some(api_cfg), None, false)
+                    }
+                    _ => {
+                        if let Some(key) = env_key.or_else(|| file_api_key.clone()) {
+                            let ident = if file_api_key.as_deref() == Some(key.as_str()) {
+                                self.parse_host_identity(ToolKind::Cursor, &snap)
+                            } else {
+                                AccountIdentity::default()
+                            };
+                            let api_cfg = ApiKeyConfig {
+                                api_key: key,
+                                ..Default::default()
+                            };
+                            (AccountAuthKind::ApiKey, ident, Some(api_cfg), None, false)
+                        } else if snap.is_empty() {
+                            bail!("当前系统 cursor 未检测到已保存的 OAuth 登录凭据");
+                        } else if is_polluted {
+                            bail!("当前系统未检测到网页授权登录凭据（本地保存的是 CURSOR_API_KEY 凭据），请点击「OAuth / CLI 登录」完成授权登录");
+                        } else {
+                            let ident = self.parse_host_identity(ToolKind::Cursor, &snap);
+                            (AccountAuthKind::Oauth, ident, None, Some(snap), true)
+                        }
+                    }
                 }
             }
             _ => {
@@ -1047,6 +1131,17 @@ impl AccountManager {
                     existing.identity.provider_or_url_update(&existing.api_config);
                 }
             }
+            if let Some(vi) = &req.verified_identity {
+                if vi.email.is_some() {
+                    existing.identity.email = vi.email.clone();
+                }
+                if vi.account_key.is_some() {
+                    existing.identity.account_key = vi.account_key.clone();
+                }
+                if vi.plan.is_some() {
+                    existing.identity.plan = vi.plan.clone();
+                }
+            }
             existing.updated_at = now;
             if req.tool == ToolKind::Codex && existing.auth_kind == AccountAuthKind::ApiKey {
                 let dir = self.base_dir.join("accounts").join(req.tool.as_str()).join(&existing_id).join("home");
@@ -1066,25 +1161,21 @@ impl AccountManager {
                 bail!("请填写 API Key 或 Auth Token");
             }
             let new_id = Self::new_account_id();
-            let mut ident = AccountIdentity::default();
-            if !merged.provider_name.is_empty() {
+            let mut ident = req.verified_identity.unwrap_or_default();
+            if ident.plan.is_none() && !merged.provider_name.is_empty() {
                 ident.plan = Some(merged.provider_name.clone());
-            } else if !merged.base_url.is_empty() {
+            }
+            if ident.workspace.is_none() && !merged.base_url.is_empty() {
                 ident.workspace = Some(merged.base_url.clone());
             }
-            let lbl = req
-                .label
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(String::from)
-                .unwrap_or_else(|| {
-                    if !merged.provider_name.is_empty() {
-                        format!("{} ({})", req.tool.as_str(), merged.provider_name)
-                    } else {
-                        format!("{} API Key", req.tool.as_str())
-                    }
-                });
+            let existing_labels: Vec<String> = td.accounts.iter().map(|a| a.label.clone()).collect();
+            let lbl = pick_api_key_label(
+                req.label.as_deref(),
+                &ident,
+                req.tool,
+                &merged,
+                &existing_labels,
+            );
             if req.tool == ToolKind::Codex {
                 let dir = self
                     .base_dir
@@ -1177,6 +1268,9 @@ impl AccountManager {
             let target_snap = self
                 .load_snapshot(tool, account_id)
                 .ok_or_else(|| anyhow!("账号 {} 缺少系统凭据快照，请重新登录或重新抓取", target.label))?;
+            if tool == ToolKind::Cursor && cursor_snapshot_is_api_key(&target_snap) {
+                bail!("当前 Cursor 授权账号保存的凭据实际为 API Key 而非网页授权登录，请在账号管理中点击「重新登录」完成授权");
+            }
             let backup = self.take_host_snapshot_unlocked(tool)?;
 
             // Save refreshed tokens from current host active account back into its snapshot before swapping out.
@@ -1184,7 +1278,7 @@ impl AccountManager {
                 if prev_id != account_id && !backup.is_empty() {
                     if let Some(prev_acc) = self.get_stored(tool, prev_id) {
                         if Self::effective_isolation(tool, prev_acc.auth_kind) == AccountIsolation::HostActive {
-                            let cursor_polluted = tool == ToolKind::Cursor && cursor_snapshot_api_key(&backup).is_some();
+                            let cursor_polluted = tool == ToolKind::Cursor && cursor_snapshot_is_api_key(&backup);
                             let cur_ident = self.parse_host_identity(tool, &backup);
                             if !cursor_polluted && cur_ident.matches_or_unknown(&prev_acc.identity) {
                                 let _ = self.save_snapshot(tool, prev_id, &backup);
@@ -1502,7 +1596,64 @@ impl AccountManager {
             crate::util::restrict_file(&abs);
         }
         keyring::restore_tool(tool, &snap.keyring)?;
+        if tool == ToolKind::Cursor {
+            self.sanitize_cursor_cli_config(snap);
+        }
         Ok(())
+    }
+
+    fn cursor_cli_config_paths(&self) -> Vec<PathBuf> {
+        let mut out = vec![
+            self.home_dir.join(".cursor/cli-config.json"),
+            self.home_dir.join(".config/cursor/cli-config.json"),
+        ];
+        if let Ok(custom) = std::env::var("CURSOR_CONFIG_DIR") {
+            if !custom.trim().is_empty() {
+                out.insert(0, PathBuf::from(custom.trim()).join("cli-config.json"));
+            }
+        }
+        out
+    }
+
+    /// Clear stale `authInfo` (such as `activeTeamId`) and `privacyCache` from Cursor's `cli-config.json`
+    /// when switching to an empty or different Cursor OAuth account, preserving user editor/model settings.
+    fn sanitize_cursor_cli_config(&self, snap: &SnapshotBundle) {
+        let target_sub = cursor_snapshot_sub(snap);
+        for cfg_path in self.cursor_cli_config_paths() {
+            let Ok(raw) = std::fs::read_to_string(&cfg_path) else {
+                continue;
+            };
+            let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&raw) else {
+                continue;
+            };
+            let Some(obj) = v.as_object_mut() else {
+                continue;
+            };
+            let cur_sub = obj
+                .get("authInfo")
+                .and_then(|a| a.get("authId"))
+                .and_then(|s| s.as_str());
+            let should_clear = snap.is_empty()
+                || match (cur_sub, target_sub.as_deref()) {
+                    (Some(c), Some(t)) => c != t,
+                    (Some(_), None) => true,
+                    _ => false,
+                };
+            if should_clear {
+                let mut modified = false;
+                if obj.remove("authInfo").is_some() {
+                    modified = true;
+                }
+                if obj.remove("privacyCache").is_some() {
+                    modified = true;
+                }
+                if modified {
+                    if let Ok(updated) = serde_json::to_string_pretty(&v) {
+                        let _ = std::fs::write(&cfg_path, updated);
+                    }
+                }
+            }
+        }
     }
 
     fn native_codex_home(&self) -> PathBuf {
@@ -1588,8 +1739,12 @@ impl AccountManager {
                     }
                 }
                 for e in &snap.keyring {
-                    if e.service.contains("antigravity-oauth-token") {
-                        if let Some(id) = parse_antigravity_token_bytes(e.secret.as_bytes()) {
+                    if e.service.contains("antigravity-oauth-token")
+                        || e.account.contains("antigravity-oauth-token")
+                        || e.service.contains("jetski-standalone-oauth-token")
+                        || e.account.contains("jetski-standalone-oauth-token")
+                    {
+                        if let Some(id) = parse_antigravity_token_bytes(&e.secret_bytes()) {
                             return id;
                         }
                     }
@@ -1608,26 +1763,71 @@ impl AccountManager {
                 AccountIdentity::default()
             }
             ToolKind::Cursor => {
+                let mut email: Option<String> = None;
+                let mut sub: Option<String> = None;
                 if let Some(bytes) = decode_file("auth.json") {
                     if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) {
-                        let email = v["email"]
+                        email = v["email"]
                             .as_str()
                             .or_else(|| v["user"]["email"].as_str())
-                            .map(String::from)
-                            .or_else(|| {
-                                v["accessToken"]
-                                    .as_str()
-                                    .and_then(decode_jwt_claims)
-                                    .and_then(|c| c["email"].as_str().map(String::from))
-                            });
-                        return AccountIdentity {
-                            account_key: email.clone(),
-                            email,
-                            ..Default::default()
-                        };
+                            .filter(|s| !s.is_empty())
+                            .map(String::from);
+                        if let Some(claims) = v["accessToken"].as_str().and_then(decode_jwt_claims) {
+                            if email.is_none() {
+                                email = claims["email"].as_str().filter(|s| !s.is_empty()).map(String::from);
+                            }
+                            sub = claims["sub"].as_str().filter(|s| !s.is_empty()).map(String::from);
+                        }
                     }
                 }
-                AccountIdentity::default()
+                if sub.is_none() {
+                    for e in &snap.keyring {
+                        if e.service.contains("cursor-access-token") {
+                            if let Some(claims) = decode_jwt_claims(e.secret.trim()) {
+                                if email.is_none() {
+                                    email = claims["email"].as_str().filter(|s| !s.is_empty()).map(String::from);
+                                }
+                                sub = claims["sub"].as_str().filter(|s| !s.is_empty()).map(String::from);
+                                break;
+                            }
+                        }
+                    }
+                }
+                let mut workspace: Option<String> = None;
+                for cfg_path in self.cursor_cli_config_paths() {
+                    let Ok(raw) = std::fs::read_to_string(&cfg_path) else {
+                        continue;
+                    };
+                    let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
+                        continue;
+                    };
+                    let ai = &v["authInfo"];
+                    if !ai.is_object() {
+                        continue;
+                    }
+                    let cfg_sub = ai["authId"].as_str().filter(|s| !s.is_empty());
+                    if let (Some(s), Some(cs)) = (sub.as_deref(), cfg_sub) {
+                        if s != cs {
+                            continue;
+                        }
+                    }
+                    if email.is_none() {
+                        email = ai["email"].as_str().filter(|s| !s.is_empty()).map(String::from);
+                    }
+                    if workspace.is_none() {
+                        workspace = ai["teamName"].as_str().filter(|s| !s.is_empty()).map(String::from);
+                    }
+                    if sub.is_none() {
+                        sub = cfg_sub.map(String::from);
+                    }
+                    break;
+                }
+                AccountIdentity {
+                    account_key: sub.or_else(|| email.clone()),
+                    email,
+                    workspace,
+                    ..Default::default()
+                }
             }
             ToolKind::Codex => {
                 if let Some(bytes) = decode_file("auth.json") {
@@ -1653,10 +1853,7 @@ impl AccountManager {
         active_id: Option<&str>,
     ) -> ToolNativeStatus {
         let cursor_env_key = if tool == ToolKind::Cursor {
-            std::env::var("CURSOR_API_KEY")
-                .ok()
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
+            crate::tools::host_env_var("CURSOR_API_KEY")
         } else {
             None
         };
@@ -1679,19 +1876,23 @@ impl AccountManager {
                 "CLAUDE_CONFIG_DIR",
             ],
             ToolKind::Antigravity => &["GEMINI_API_KEY", "GOOGLE_API_KEY"],
-            ToolKind::Cursor => &["CURSOR_API_KEY"],
+            ToolKind::Cursor => &["CURSOR_API_KEY", "CURSOR_AUTH_TOKEN"],
             _ => &[],
         };
         let mut present_envs: Vec<&str> = env_vars
             .iter()
             .copied()
-            .filter(|k| std::env::var_os(k).is_some_and(|v| !v.is_empty()))
+            .filter(|k| crate::tools::host_env_var(k).is_some())
             .collect();
         if tool == ToolKind::Cursor
             && cursor_env_key.is_some_and(|s| !s.trim().is_empty())
             && !present_envs.contains(&"CURSOR_API_KEY")
         {
-            present_envs.push("CURSOR_API_KEY");
+            present_envs.insert(0, "CURSOR_API_KEY");
+        }
+        if tool == ToolKind::Cursor && cursor_env_key.is_none() {
+            // In unit tests with explicit `None`, don't leak ambient process CURSOR_API_KEY.
+            present_envs.retain(|k| *k != "CURSOR_API_KEY");
         }
         let env_override = (!present_envs.is_empty()).then(|| present_envs.join(", "));
 
@@ -1716,6 +1917,8 @@ impl AccountManager {
                         plan: ident.plan,
                         env_override,
                         matched_account_id: matched,
+                        env_api_key_matched_id: None,
+                        has_local_oauth: ak == AccountAuthKind::Oauth,
                         detail: key_opt.map(|_| "使用 OPENAI_API_KEY 登录".to_string()),
                     }
                 } else {
@@ -1727,6 +1930,8 @@ impl AccountManager {
                         plan: None,
                         env_override,
                         matched_account_id: None,
+                        env_api_key_matched_id: None,
+                        has_local_oauth: false,
                         detail: if has_env_key {
                             Some("使用宿主环境变量 OPENAI_API_KEY".into())
                         } else {
@@ -1753,6 +1958,8 @@ impl AccountManager {
                         plan: ident.plan,
                         env_override,
                         matched_account_id: matched,
+                        env_api_key_matched_id: None,
+                        has_local_oauth: true,
                         detail: None,
                     }
                 } else {
@@ -1765,6 +1972,8 @@ impl AccountManager {
                         plan: None,
                         env_override,
                         matched_account_id: None,
+                        env_api_key_matched_id: None,
+                        has_local_oauth: false,
                         detail: if has_env {
                             Some("使用宿主环境变量 ANTHROPIC_API_KEY / AUTH_TOKEN".into())
                         } else {
@@ -1776,6 +1985,8 @@ impl AccountManager {
             ToolKind::Cursor => {
                 let snap = self.take_host_snapshot_unlocked(ToolKind::Cursor).unwrap_or_default();
                 let file_api_key = cursor_snapshot_api_key(&snap);
+                let is_api_key_snap = cursor_snapshot_is_api_key(&snap);
+                let has_local_oauth = !snap.is_empty() && !is_api_key_snap;
                 let env_key = cursor_env_key.map(str::trim).filter(|s| !s.is_empty());
                 if let Some(key) = env_key {
                     let matched = find_matching_api_key(accounts, key);
@@ -1787,10 +1998,10 @@ impl AccountManager {
                     };
                     let email = matched_acc.and_then(|a| a.identity.email.clone()).or(file_ident.email);
                     let plan = matched_acc.and_then(|a| a.identity.plan.clone()).or(file_ident.plan);
-                    let detail = if !snap.is_empty() && file_api_key.is_none() {
-                        Some("宿主环境变量 CURSOR_API_KEY 优先级高于本地 OAuth 登录；托管 OAuth 账号会自动隔离该变量".into())
+                    let detail = if has_local_oauth {
+                        Some("宿主环境变量 CURSOR_API_KEY 优先级高于本地 OAuth 登录；切换到授权登录账号时会自动屏蔽该变量".into())
                     } else {
-                        Some("使用宿主环境变量 CURSOR_API_KEY".into())
+                        Some("使用宿主环境变量 CURSOR_API_KEY；切换到授权登录账号时会自动屏蔽该变量".into())
                     };
                     ToolNativeStatus {
                         logged_in: true,
@@ -1798,12 +2009,16 @@ impl AccountManager {
                         email,
                         plan,
                         env_override,
-                        matched_account_id: matched,
+                        matched_account_id: matched.clone(),
+                        env_api_key_matched_id: matched,
+                        has_local_oauth,
                         detail,
                     }
-                } else if let Some(key) = file_api_key {
+                } else if is_api_key_snap {
                     let ident = self.parse_host_identity(ToolKind::Cursor, &snap);
-                    let matched = find_matching_api_key(accounts, &key)
+                    let matched = file_api_key
+                        .as_deref()
+                        .and_then(|key| find_matching_api_key(accounts, key))
                         .or_else(|| find_matching_account(accounts, &ident, AccountAuthKind::ApiKey));
                     ToolNativeStatus {
                         logged_in: true,
@@ -1812,6 +2027,8 @@ impl AccountManager {
                         plan: ident.plan,
                         env_override,
                         matched_account_id: matched,
+                        env_api_key_matched_id: None,
+                        has_local_oauth: false,
                         detail: Some("auth.json 中保存的是 CURSOR_API_KEY 凭据".into()),
                     }
                 } else if !snap.is_empty() {
@@ -1829,6 +2046,8 @@ impl AccountManager {
                         plan: ident.plan,
                         env_override,
                         matched_account_id: matched,
+                        env_api_key_matched_id: None,
+                        has_local_oauth: true,
                         detail: None,
                     }
                 } else {
@@ -1839,6 +2058,8 @@ impl AccountManager {
                         plan: None,
                         env_override,
                         matched_account_id: None,
+                        env_api_key_matched_id: None,
+                        has_local_oauth: false,
                         detail: Some("未检测到系统 Cursor 登录凭据或 CURSOR_API_KEY".into()),
                     }
                 }
@@ -1875,6 +2096,8 @@ impl AccountManager {
                     plan: ident.plan,
                     env_override,
                     matched_account_id: matched,
+                    env_api_key_matched_id: None,
+                    has_local_oauth: logged_in,
                     detail,
                 }
             }
@@ -1906,7 +2129,7 @@ impl IdentityExt for AccountIdentity {
     }
 }
 
-fn cursor_auth_api_key(bytes: &[u8]) -> Option<String> {
+pub fn cursor_auth_api_key(bytes: &[u8]) -> Option<String> {
     let v: serde_json::Value = serde_json::from_slice(bytes).ok()?;
     v["apiKey"]
         .as_str()
@@ -1915,12 +2138,82 @@ fn cursor_auth_api_key(bytes: &[u8]) -> Option<String> {
         .map(String::from)
 }
 
+fn cursor_jwt_is_api_key(jwt: &str) -> bool {
+    let Some(claims) = decode_jwt_claims(jwt) else {
+        return false;
+    };
+    claims["type"].as_str() == Some("api_key_token") || !claims["apiKeyId"].is_null()
+}
+
+pub fn cursor_bytes_are_api_key(bytes: &[u8]) -> bool {
+    if cursor_auth_api_key(bytes).is_some() {
+        return true;
+    }
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+        return false;
+    };
+    v["accessToken"].as_str().is_some_and(cursor_jwt_is_api_key)
+        || v["refreshToken"].as_str().is_some_and(cursor_jwt_is_api_key)
+}
+
 fn cursor_snapshot_api_key(snap: &SnapshotBundle) -> Option<String> {
-    snap.files
+    if let Some(k) = snap
+        .files
         .iter()
         .find(|(k, _)| k.ends_with("auth.json"))
         .and_then(|(_, b64)| base64::engine::general_purpose::STANDARD.decode(b64).ok())
         .and_then(|bytes| cursor_auth_api_key(&bytes))
+    {
+        return Some(k);
+    }
+    snap.keyring
+        .iter()
+        .find(|e| e.service.eq_ignore_ascii_case("cursor-api-key"))
+        .and_then(|e| String::from_utf8(e.secret_bytes()).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+pub fn cursor_snapshot_is_api_key(snap: &SnapshotBundle) -> bool {
+    if cursor_snapshot_api_key(snap).is_some() {
+        return true;
+    }
+    for (k, b64) in &snap.files {
+        if k.ends_with("auth.json") {
+            if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64) {
+                if cursor_bytes_are_api_key(&bytes) {
+                    return true;
+                }
+            }
+        }
+    }
+    snap.keyring.iter().any(|e| {
+        (e.service.contains("cursor-access-token") || e.service.contains("cursor-refresh-token"))
+            && cursor_jwt_is_api_key(e.secret.trim())
+    })
+}
+
+fn cursor_snapshot_sub(snap: &SnapshotBundle) -> Option<String> {
+    if let Some(sub) = snap
+        .files
+        .iter()
+        .find(|(k, _)| k.ends_with("auth.json"))
+        .and_then(|(_, b64)| base64::engine::general_purpose::STANDARD.decode(b64).ok())
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .and_then(|v| {
+            v["accessToken"]
+                .as_str()
+                .and_then(decode_jwt_claims)
+                .and_then(|c| c["sub"].as_str().filter(|s| !s.is_empty()).map(String::from))
+        })
+    {
+        return Some(sub);
+    }
+    snap.keyring
+        .iter()
+        .find(|e| e.service.contains("cursor-access-token"))
+        .and_then(|e| decode_jwt_claims(e.secret.trim()))
+        .and_then(|c| c["sub"].as_str().filter(|s| !s.is_empty()).map(String::from))
 }
 
 fn find_matching_api_key(accounts: &[StoredAccount], api_key: &str) -> Option<String> {
@@ -1953,6 +2246,42 @@ fn find_matching_account(
         .map(|a| a.id.clone())
 }
 
+fn unique_label(base: String, existing: &[&str]) -> String {
+    if !existing.contains(&base.as_str()) {
+        return base;
+    }
+    for i in 2..=999 {
+        let cand = format!("{base} #{i}");
+        if !existing.contains(&cand.as_str()) {
+            return cand;
+        }
+    }
+    format!("{base} ({})", crate::util::now_ms())
+}
+
+fn pick_api_key_label(
+    requested: Option<&str>,
+    ident: &AccountIdentity,
+    tool: ToolKind,
+    cfg: &ApiKeyConfig,
+    existing_owned: &[String],
+) -> String {
+    if let Some(s) = requested.map(str::trim).filter(|s| !s.is_empty()) {
+        return s.to_string();
+    }
+    let existing: Vec<&str> = existing_owned.iter().map(String::as_str).collect();
+    let base = if let Some(email) = &ident.email {
+        format!("{email} (API Key)")
+    } else if !cfg.provider_name.is_empty() {
+        format!("{} ({})", tool.as_str(), cfg.provider_name)
+    } else if tool == ToolKind::Cursor {
+        "Cursor API Key".to_string()
+    } else {
+        format!("{} API Key", tool.as_str())
+    };
+    unique_label(base, &existing)
+}
+
 fn pick_label(
     requested: Option<&str>,
     ident: &AccountIdentity,
@@ -1969,24 +2298,21 @@ fn pick_label(
         .get(target_tool.as_str())
         .map(|t| t.accounts.iter().map(|a| a.label.as_str()).collect())
         .unwrap_or_default();
-    let base = ident
-        .email
-        .clone()
-        .or_else(|| ident.workspace.clone())
-        .unwrap_or_else(|| match auth_kind {
+    let base = match (auth_kind, ident.email.as_deref()) {
+        (AccountAuthKind::ApiKey, Some(email)) => format!("{email} (API Key)"),
+        (_, Some(email)) => email.to_string(),
+        _ => ident.workspace.clone().unwrap_or_else(|| match auth_kind {
             AccountAuthKind::Oauth => format!("{} OAuth", tool.as_str()),
-            AccountAuthKind::ApiKey => format!("{} API Key", tool.as_str()),
-        });
-    if !existing.contains(&base.as_str()) {
-        return base;
-    }
-    for i in 2..=999 {
-        let cand = format!("{base} #{i}");
-        if !existing.contains(&cand.as_str()) {
-            return cand;
-        }
-    }
-    format!("{base} ({})", crate::util::now_ms())
+            AccountAuthKind::ApiKey => {
+                if tool == ToolKind::Cursor {
+                    "Cursor API Key".to_string()
+                } else {
+                    format!("{} API Key", tool.as_str())
+                }
+            }
+        }),
+    };
+    unique_label(base, &existing)
 }
 
 fn is_sensitive_env_key(k: &str) -> bool {
@@ -2149,7 +2475,17 @@ pub fn parse_claude_identity(cred_bytes: &[u8], dot_claude: Option<&serde_json::
 
 fn parse_antigravity_token_bytes(bytes: &[u8]) -> Option<AccountIdentity> {
     let v: serde_json::Value = serde_json::from_slice(bytes).ok()?;
-    let email = v["id_token_email"].as_str().filter(|s| !s.is_empty())?.to_string();
+    let email = v["id_token_email"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .or_else(|| {
+            v["token"]["id_token"]
+                .as_str()
+                .or_else(|| v["id_token"].as_str())
+                .and_then(decode_jwt_claims)
+                .and_then(|c| c["email"].as_str().filter(|s| !s.is_empty()).map(String::from))
+        })?;
     let auth_method = v["auth_method"].as_str().filter(|s| !s.is_empty()).map(String::from);
     Some(AccountIdentity {
         account_key: Some(email.clone()),
@@ -2409,16 +2745,35 @@ mod tests {
     fn cursor_env_api_key_takes_precedence_over_oauth_and_protects_snapshot() {
         let (_t, base, home) = temp_dirs();
         let cursor_dir = home.join(".config/cursor");
+        let dot_cursor = home.join(".cursor");
         std::fs::create_dir_all(&cursor_dir).unwrap();
-        let oauth_json = r#"{"accessToken":"oauth_tok","refreshToken":"oauth_ref","email":"oauth@example.com"}"#;
-        std::fs::write(cursor_dir.join("auth.json"), oauth_json).unwrap();
+        std::fs::create_dir_all(&dot_cursor).unwrap();
+
+        let oauth_payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(r#"{"sub":"auth0|user_oauth_1","type":"session"}"#);
+        let oauth_jwt = format!("eyJhbGciOiJub25lIn0.{oauth_payload}.sig");
+        let oauth_json = serde_json::json!({
+            "accessToken": oauth_jwt,
+            "refreshToken": oauth_jwt,
+        })
+        .to_string();
+        std::fs::write(cursor_dir.join("auth.json"), &oauth_json).unwrap();
+        std::fs::write(
+            dot_cursor.join("cli-config.json"),
+            r#"{"authInfo":{"email":"oauth@example.com","authId":"auth0|user_oauth_1","teamName":"Acme","activeTeamId":42},"editor":{"vimMode":true}}"#,
+        )
+        .unwrap();
 
         let mgr = AccountManager::with_dirs(base, home);
-        let oauth_acc = mgr.capture_with_cursor_env(ToolKind::Cursor, None, None).unwrap();
+        let oauth_acc = mgr
+            .capture_with_cursor_env(ToolKind::Cursor, None, None, None)
+            .unwrap();
         assert_eq!(oauth_acc.auth_kind, AccountAuthKind::Oauth);
         assert_eq!(oauth_acc.label, "oauth@example.com");
+        assert_eq!(oauth_acc.identity.account_key.as_deref(), Some("auth0|user_oauth_1"));
+        assert_eq!(oauth_acc.identity.workspace.as_deref(), Some("Acme"));
 
-        // When CURSOR_API_KEY is set, native status prioritizes env_api_key over OAuth.
+        // When CURSOR_API_KEY is set, native status prioritizes env_api_key over OAuth while reporting has_local_oauth.
         let stored_before = mgr.all_accounts_for_tool(ToolKind::Cursor);
         let st_unmatched = mgr.probe_native_status_with_cursor_env(
             ToolKind::Cursor,
@@ -2429,18 +2784,55 @@ mod tests {
         assert!(st_unmatched.logged_in);
         assert_eq!(st_unmatched.auth_method.as_deref(), Some("env_api_key"));
         assert_eq!(st_unmatched.matched_account_id, None);
+        assert_eq!(st_unmatched.env_api_key_matched_id, None);
+        assert!(st_unmatched.has_local_oauth);
         assert_eq!(st_unmatched.env_override.as_deref(), Some("CURSOR_API_KEY"));
 
-        // Capture while CURSOR_API_KEY is set creates an isolated ApiKey profile.
+        // Capture with source="oauth" still captures local OAuth even when CURSOR_API_KEY is set!
+        let oauth_acc_2 = mgr
+            .capture_with_cursor_env(ToolKind::Cursor, None, Some("oauth"), Some("key_env_123"))
+            .unwrap();
+        assert_eq!(oauth_acc_2.auth_kind, AccountAuthKind::Oauth);
+        assert_eq!(oauth_acc_2.label, "oauth@example.com #2");
+
+        // Capture while CURSOR_API_KEY is set creates an isolated ApiKey profile with memory credential store.
         let key_acc = mgr
-            .capture_with_cursor_env(ToolKind::Cursor, Some("My Cursor Key"), Some("key_env_123"))
+            .save(SaveAccountRequest {
+                tool: ToolKind::Cursor,
+                auth_kind: Some(AccountAuthKind::ApiKey),
+                api_config: Some(ApiKeyConfig {
+                    api_key: "key_env_123".into(),
+                    base_url: "https://api2.cursor.example".into(),
+                    ..Default::default()
+                }),
+                verified_identity: Some(AccountIdentity {
+                    email: Some("oauth@example.com".into()),
+                    plan: Some("Team".into()),
+                    account_key: Some("oauth@example.com".into()),
+                    workspace: None,
+                }),
+                ..Default::default()
+            })
             .unwrap();
         assert_eq!(key_acc.auth_kind, AccountAuthKind::ApiKey);
         assert_eq!(key_acc.isolation, AccountIsolation::Isolated);
+        assert_eq!(key_acc.label, "oauth@example.com (API Key)");
         let resolved_key = mgr.resolve(ToolKind::Cursor, Some(&key_acc.id)).unwrap();
         assert_eq!(resolved_key.env.get("CURSOR_API_KEY").unwrap(), "key_env_123");
+        assert_eq!(
+            resolved_key.env.get("AGENT_CLI_CREDENTIAL_STORE").unwrap(),
+            "memory"
+        );
+        assert_eq!(
+            resolved_key.env.get("CURSOR_API_ENDPOINT").unwrap(),
+            "https://api2.cursor.example"
+        );
         let resolved_oauth = mgr.resolve(ToolKind::Cursor, Some(&oauth_acc.id)).unwrap();
         assert!(resolved_oauth.env_unset.contains(&"CURSOR_API_KEY".to_string()));
+        assert!(resolved_oauth.env_unset.contains(&"CURSOR_AUTH_TOKEN".to_string()));
+        assert!(resolved_oauth
+            .env_unset
+            .contains(&"AGENT_CLI_CREDENTIAL_STORE".to_string()));
 
         // Native status now matches the ApiKey profile, not the OAuth profile.
         let stored_after = mgr.all_accounts_for_tool(ToolKind::Cursor);
@@ -2451,16 +2843,64 @@ mod tests {
             Some("key_env_123"),
         );
         assert_eq!(st_matched.matched_account_id.as_deref(), Some(key_acc.id.as_str()));
+        assert_eq!(
+            st_matched.env_api_key_matched_id.as_deref(),
+            Some(key_acc.id.as_str())
+        );
 
-        // If an external CURSOR_API_KEY run pollutes auth.json on disk, restore_cursor_oauth_if_api_key_polluted recovers OAuth.
+        // If an external CURSOR_API_KEY run pollutes auth.json (including JWT type=api_key_token), ensure_cursor_oauth_host_clean recovers OAuth.
+        let key_payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(r#"{"sub":"auth0|other_user","type":"api_key_token","apiKeyId":"999"}"#);
+        let key_jwt = format!("eyJhbGciOiJub25lIn0.{key_payload}.sig");
         std::fs::write(
             cursor_dir.join("auth.json"),
-            r#"{"accessToken":"key_tok","refreshToken":"key_ref","apiKey":"key_env_123"}"#,
+            serde_json::json!({ "accessToken": key_jwt, "refreshToken": key_jwt }).to_string(),
         )
         .unwrap();
-        mgr.restore_cursor_oauth_if_api_key_polluted(&oauth_acc.id);
+        assert!(mgr
+            .capture_with_cursor_env(ToolKind::Cursor, None, Some("oauth"), None)
+            .is_err());
+        mgr.ensure_cursor_oauth_host_clean(&oauth_acc.id).unwrap();
         let restored = std::fs::read_to_string(cursor_dir.join("auth.json")).unwrap();
-        assert!(restored.contains("oauth_tok"));
-        assert!(!restored.contains("key_env_123"));
+        assert!(restored.contains(&oauth_jwt));
+        assert!(!restored.contains(&key_jwt));
+    }
+
+    #[test]
+    fn antigravity_parse_host_identity_handles_gemini_scoped_keyring() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = AccountManager::new(tmp.path().join("yc"), tmp.path().join("home")).unwrap();
+        let payload = serde_json::json!({
+            "id_token_email": "alice@example.com",
+            "auth_method": "consumer"
+        })
+        .to_string();
+
+        // macOS / Linux layout: service="gemini", account="<appDataDir>/antigravity-oauth-token"
+        let unix_snap = SnapshotBundle {
+            keyring: vec![KeyringEntry::from_bytes(
+                "gemini".into(),
+                "/home/alice/.gemini/antigravity-cli/antigravity-oauth-token".into(),
+                None,
+                payload.as_bytes(),
+            )],
+            ..Default::default()
+        };
+        let unix_id = mgr.parse_host_identity(ToolKind::Antigravity, &unix_snap);
+        assert_eq!(unix_id.email.as_deref(), Some("alice@example.com"));
+        assert_eq!(unix_id.plan.as_deref(), Some("consumer"));
+
+        // Windows go-keyring layout: TargetName="gemini:<path>\\antigravity-oauth-token"
+        let win_snap = SnapshotBundle {
+            keyring: vec![KeyringEntry::from_bytes(
+                r"gemini:C:\Users\alice\.gemini\antigravity-cli\antigravity-oauth-token".into(),
+                r"C:\Users\alice\.gemini\antigravity-cli\antigravity-oauth-token".into(),
+                None,
+                payload.as_bytes(),
+            )],
+            ..Default::default()
+        };
+        let win_id = mgr.parse_host_identity(ToolKind::Antigravity, &win_snap);
+        assert_eq!(win_id.email.as_deref(), Some("alice@example.com"));
     }
 }

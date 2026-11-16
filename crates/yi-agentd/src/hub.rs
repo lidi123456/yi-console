@@ -149,6 +149,8 @@ struct SessionRt {
     pending_failover: Mutex<Option<(String, Option<i64>, Option<String>)>>,
     /// Accounts already attempted during the current rate-limit streak (cleared on clean turn completion)
     failover_tried: Mutex<Vec<String>>,
+    /// Last terminal viewport dimensions reported via `pty.resize`
+    term_size: Mutex<Option<(u16, u16)>>,
 }
 
 /// One terminal-mode process run
@@ -804,7 +806,7 @@ impl Hub {
         if info.tool == ToolKind::Cursor {
             if let Some(res) = &resolved {
                 if res.auth_kind == AccountAuthKind::Oauth {
-                    self.accounts.restore_cursor_oauth_if_api_key_polluted(&res.id);
+                    self.accounts.ensure_cursor_oauth_host_clean(&res.id)?;
                 }
             }
         }
@@ -854,7 +856,7 @@ impl Hub {
         // A new tool session has not seen the prompt yet; `launch` also sets this after the prompt changed
         let system_notice = system_prompt.is_some() && resume.is_none();
         let account_handoff = if info.mode == SessionMode::Structured
-            && info.tool == ToolKind::Codex
+            && matches!(info.tool, ToolKind::Codex | ToolKind::Cursor)
             && resume.is_some()
             && info.account_id.is_some()
         {
@@ -941,7 +943,13 @@ impl Hub {
         };
         em.status(SessionStatus::Starting, None);
         if spec.mode == SessionMode::Terminal || spec.tool == ToolKind::Shell {
-            tokio::spawn(start_when_sized(spec, em, rx));
+            if let Some((cols, rows)) = *rt.term_size.lock().unwrap() {
+                spec.cols = cols;
+                spec.rows = rows;
+                adapters::start(spec, em, rx);
+            } else {
+                tokio::spawn(start_when_sized(spec, em, rx));
+            }
         } else {
             adapters::start(spec, em, rx);
         }
@@ -969,6 +977,13 @@ impl Hub {
             bail!("终端模式不支持发送图片");
         }
         let busy = matches!(info.status, SessionStatus::Running | SessionStatus::WaitingPermission);
+        if info.tool == ToolKind::Cursor {
+            if let Some(res) = self.accounts.resolve(ToolKind::Cursor, info.account_id.as_deref()) {
+                if res.auth_kind == AccountAuthKind::Oauth {
+                    self.accounts.ensure_cursor_oauth_host_clean(&res.id)?;
+                }
+            }
+        }
         if !busy && info.mode == SessionMode::Structured && self.running_tx(&rt).is_some() {
             // Turning computer use off reloads the tool here without its MCP entry, as OpenBot reloads the session
             let desktop = info.computer_use && self.desktop.mcp_config(id).is_some();
@@ -1192,7 +1207,7 @@ impl Hub {
             }
         }
         if discover {
-            self.discover_model_config(base_model(model), &info.cwd);
+            self.discover_model_config(base_model(model), &info.cwd, info.account_id.clone());
         }
         Ok(())
     }
@@ -1230,19 +1245,24 @@ impl Hub {
 
     /// Parameters of a Cursor model for the new session page: from the cache, else asked from a short-lived
     /// Cursor process in `cwd` (several seconds)
-    pub async fn model_config_for(self: &Arc<Self>, model: &str, cwd: &str) -> Result<Vec<ModelConfigOption>> {
+    pub async fn model_config_for(
+        self: &Arc<Self>,
+        model: &str,
+        cwd: &str,
+        account_id: Option<&str>,
+    ) -> Result<Vec<ModelConfigOption>> {
         let model = base_model(model);
         if let Some(options) = self.stored_config(model) { return Ok(options); }
         let cwd = Some(crate::paths::expand(cwd)).filter(|p| p.is_dir()).unwrap_or_else(crate::paths::home);
         let settings = self.settings.read().unwrap().clone();
-        let options = crate::probe::cursor_model_config(&settings, model, &cwd).await?;
+        let options = crate::probe::cursor_model_config(self, &settings, model, &cwd, account_id).await?;
         self.save_config(model, &options);
         self.model_config_known(model, None);
         Ok(self.stored_config(model).unwrap_or(options))
     }
 
     /// Ask a short-lived Cursor process for a model's parameters, for a session whose process isn't running
-    fn discover_model_config(self: &Arc<Self>, model: &str, cwd: &str) {
+    fn discover_model_config(self: &Arc<Self>, model: &str, cwd: &str, account_id: Option<String>) {
         static RUNNING: Mutex<Option<HashSet<String>>> = Mutex::new(None);
         if !RUNNING.lock().unwrap().get_or_insert_with(HashSet::new).insert(model.to_string()) {
             return;
@@ -1250,7 +1270,7 @@ impl Hub {
         let (hub, model, cwd) = (self.clone(), model.to_string(), PathBuf::from(cwd));
         tokio::spawn(async move {
             let settings = hub.settings.read().unwrap().clone();
-            let found = crate::probe::cursor_model_config(&settings, &model, &cwd).await;
+            let found = crate::probe::cursor_model_config(&hub, &settings, &model, &cwd, account_id.as_deref()).await;
             RUNNING.lock().unwrap().get_or_insert_with(HashSet::new).remove(&model);
             match found {
                 Ok(options) => {
@@ -1430,7 +1450,7 @@ impl Hub {
             if let Some(model) = info.model.as_deref().filter(|m| !m.is_empty()).filter(|m| self.cached_config(m).is_none()) {
                 let model = base_model(model).to_string();
                 self.set_info_any(&rt, |i| { i.model_config_pending = true; true });
-                self.discover_model_config(&model, &info.cwd);
+                self.discover_model_config(&model, &info.cwd, info.account_id.clone());
             }
         }
         let mut models = rt.models.lock().unwrap().clone();
@@ -1962,6 +1982,11 @@ impl Hub {
 
     pub fn command(&self, id: &str, cmd: AdapterCmd) -> Result<()> {
         let rt = self.get(id)?;
+        if let AdapterCmd::PtyResize { cols, rows } = &cmd {
+            if *cols > 0 && *rows > 0 {
+                *rt.term_size.lock().unwrap() = Some((*cols, *rows));
+            }
+        }
         let tx = self.running_tx(&rt).ok_or_else(|| anyhow!("会话未在运行"))?;
         tx.send(cmd).map_err(|_| anyhow!("会话已结束"))
     }
@@ -2239,7 +2264,7 @@ impl Hub {
     /// The old rule: newest tool session in the same directory, used since this session was created and not claimed elsewhere
     async fn newest_in_dir(&self, info: &SessionInfo, taken: &HashSet<String>) -> Option<String> {
         let settings = self.settings.read().unwrap().clone();
-        let list = crate::history::list(Some(info.tool), &settings).await;
+        let list = crate::history::list(Some(info.tool), &settings, Some(&self.accounts)).await;
         let cwd = norm_cwd(&info.cwd);
         list.into_iter()
             .filter(|h| norm_cwd(&h.cwd) == cwd && h.updated_at >= info.created_at - 10_000 && !taken.contains(&h.id))
@@ -3051,14 +3076,22 @@ impl Hub {
             if let Some(acc) = &next_active {
                 self.apply_account_switch(&rt, acc, "account_deleted", true);
             } else {
-                let busy = {
+                let (sid, is_term, busy) = {
                     let i = rt.info.lock().unwrap();
-                    matches!(i.status, SessionStatus::Running | SessionStatus::WaitingPermission)
+                    (
+                        i.id.clone(),
+                        i.mode == SessionMode::Terminal,
+                        i.mode == SessionMode::Structured
+                            && matches!(i.status, SessionStatus::Running | SessionStatus::WaitingPermission),
+                    )
                 };
                 if !busy {
                     if let Some(tx) = rt.cmd.lock().unwrap().take() {
                         *rt.generation.lock().unwrap() += 1;
                         let _ = tx.send(AdapterCmd::Kill);
+                    }
+                    if is_term {
+                        crate::tmux::kill(&crate::tmux::session_name(&sid));
                     }
                 } else {
                     *rt.restart_pending.lock().unwrap() = true;
@@ -3152,6 +3185,68 @@ impl Hub {
         }
     }
 
+    pub async fn switch_session_account_async(
+        self: &Arc<Self>,
+        sid: &str,
+        account_id: &str,
+    ) -> Result<SessionInfo> {
+        let rt = self.get(sid)?;
+        let (tool, mode, cur_account_id) = {
+            let i = rt.info.lock().unwrap();
+            (i.tool, i.mode, i.account_id.clone())
+        };
+        if !tool.supports_accounts() {
+            bail!("{} 不支持多账号切换", tool.as_str());
+        }
+        let target = self
+            .accounts
+            .get_stored(tool, account_id)
+            .ok_or_else(|| anyhow!("目标账号不存在: {account_id}"))?;
+        if target.tool == ToolKind::Cursor
+            && target.auth_kind == AccountAuthKind::Oauth
+            && !self.accounts.has_clean_cursor_oauth_snapshot(&target.id)
+        {
+            bail!("当前 Cursor 授权账号保存的凭据实际为 API Key 而非网页授权登录，请在账号管理中点击「重新登录」完成授权");
+        }
+
+        let is_terminal = mode == SessionMode::Terminal;
+        let mut was_live_terminal = false;
+        if is_terminal && cur_account_id.as_deref() != Some(account_id) {
+            self.guess_terminal_session(sid).await;
+            let has_tx = self.running_tx(&rt).is_some();
+            let tmux_name = crate::tmux::session_name(sid);
+            was_live_terminal = has_tx || crate::tmux::alive(&tmux_name);
+            if was_live_terminal {
+                if let Some(tx) = rt.cmd.lock().unwrap().take() {
+                    *rt.generation.lock().unwrap() += 1;
+                    let _ = tx.send(AdapterCmd::Kill);
+                }
+                if !crate::tmux::kill_and_wait(&tmux_name).await {
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                }
+            }
+        }
+
+        let hub2 = self.clone();
+        let sid_owned = sid.to_string();
+        let aid_owned = account_id.to_string();
+        let updated = tokio::task::spawn_blocking(move || {
+            hub2.switch_session_account(&sid_owned, &aid_owned, Some("manual"), false)
+        })
+        .await??;
+
+        if was_live_terminal {
+            rt.term.lock().unwrap().clear();
+            let (cols, rows) = rt.term_size.lock().unwrap().unwrap_or((120, 32));
+            let hub3 = self.clone();
+            let sid_resume = sid.to_string();
+            let _ = tokio::task::spawn_blocking(move || hub3.resume(&sid_resume, cols, rows)).await?;
+            return Ok(rt.info.lock().unwrap().clone());
+        }
+
+        Ok(updated)
+    }
+
     pub fn switch_session_account(
         self: &Arc<Self>,
         sid: &str,
@@ -3164,7 +3259,10 @@ impl Hub {
         if !info.tool.supports_accounts() {
             bail!("{} 不支持多账号切换", info.tool.as_str());
         }
-        if !is_failover && matches!(info.status, SessionStatus::Running | SessionStatus::WaitingPermission) {
+        if info.mode == SessionMode::Structured
+            && !is_failover
+            && matches!(info.status, SessionStatus::Running | SessionStatus::WaitingPermission)
+        {
             bail!("请先停止当前回复，再切换账号");
         }
         let to_acc = self
@@ -3218,6 +3316,8 @@ impl Hub {
                 self.accounts
                     .copy_session_history_for_switch(cur.tool, cur.account_id.as_deref(), &to_acc.id, ext)
                     .unwrap_or(false)
+            } else if cur.tool == ToolKind::Cursor {
+                crate::history::cursor_session_exists(ext, cur.mode == SessionMode::Terminal)
             } else {
                 false
             }
@@ -3250,12 +3350,16 @@ impl Hub {
         _preserved_context: bool,
         has_handoff: bool,
     ) -> SessionInfo {
-
-        let busy = matches!(cur.status, SessionStatus::Running | SessionStatus::WaitingPermission);
+        let is_terminal = cur.mode == SessionMode::Terminal;
+        let busy = cur.mode == SessionMode::Structured
+            && matches!(cur.status, SessionStatus::Running | SessionStatus::WaitingPermission);
         if retire_running && !busy {
             if let Some(tx) = rt.cmd.lock().unwrap().take() {
                 *rt.generation.lock().unwrap() += 1;
                 let _ = tx.send(AdapterCmd::Kill);
+            }
+            if is_terminal {
+                crate::tmux::kill(&crate::tmux::session_name(&cur.id));
             }
         } else if self.running_tx(rt).is_some() {
             *rt.restart_pending.lock().unwrap() = true;
@@ -3271,7 +3375,9 @@ impl Hub {
                 i.external_id = None;
                 i.synced_users = None;
             }
-            if retired && matches!(i.status, SessionStatus::Idle | SessionStatus::Starting) {
+            if retired
+                && (is_terminal || matches!(i.status, SessionStatus::Idle | SessionStatus::Starting))
+            {
                 i.status = SessionStatus::Exited;
                 i.pending_permissions = 0;
                 i.pending = None;
@@ -3552,6 +3658,7 @@ fn new_rt(info: SessionInfo) -> SessionRt {
         pending_handoff: Mutex::new(None),
         pending_failover: Mutex::new(None),
         failover_tried: Mutex::new(vec![]),
+        term_size: Mutex::new(None),
     }
 }
 
@@ -4683,6 +4790,7 @@ mod tests {
             allow_auto_failover: None,
             priority: None,
             api_config: Some(ApiKeyConfig { api_key: "AIzaTestKey".into(), ..Default::default() }),
+            verified_identity: None,
             activate: false,
         }).unwrap();
         assert!(!agy_key.allow_auto_failover);
@@ -4727,6 +4835,32 @@ mod tests {
             _ => None,
         }).unwrap();
         assert_eq!(last_user, "continue fixing auth.rs");
+
+        // Terminal-mode running session: switching account is allowed and retires the old terminal process
+        let mut rx_term = live(&hub, "s-term", SessionMode::Terminal, SessionStatus::Running, 0);
+        {
+            let rt = hub.get("s-term").unwrap();
+            let mut i = rt.info.lock().unwrap();
+            i.tool = ToolKind::Cursor;
+        }
+        let cursor_key = accounts
+            .save(crate::accounts::SaveAccountRequest {
+                tool: ToolKind::Cursor,
+                label: Some("Cursor Key".into()),
+                auth_kind: Some(AccountAuthKind::ApiKey),
+                api_config: Some(ApiKeyConfig {
+                    api_key: "crsr_test_key".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .unwrap();
+        let switched_term = hub
+            .switch_session_account("s-term", &cursor_key.id, Some("manual"), false)
+            .unwrap();
+        assert_eq!(switched_term.account_id.as_deref(), Some(cursor_key.id.as_str()));
+        assert_eq!(switched_term.status, SessionStatus::Exited);
+        assert!(matches!(rx_term.try_recv(), Ok(AdapterCmd::Kill)));
     }
 
     #[tokio::test]
@@ -4754,6 +4888,7 @@ mod tests {
             allow_auto_failover: None, // defaults false
             priority: Some(100),
             api_config: Some(ApiKeyConfig { api_key: "sk-ant-test".into(), ..Default::default() }),
+            verified_identity: None,
             activate: false,
         }).unwrap();
         let oauth_b = accounts.save_oauth_from_dir(ToolKind::Claude, None, Some("Claude B"), Some(&dir2), None, false).unwrap();

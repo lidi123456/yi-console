@@ -243,6 +243,7 @@ impl LoginManager {
                 &["acp", "--login"],
                 &emit,
             ),
+            (ToolKind::Cursor, _) => self.run_piped(&job, &program, &["login"], &emit),
             (ToolKind::Codex, _) => self.run_pty(&job, &program, &["login"], &emit),
             (ToolKind::Claude, _) => self.run_pty(&job, &program, &["auth", "login"], &emit),
             _ => self.run_pty(&job, &program, &["login"], &emit),
@@ -338,6 +339,9 @@ impl LoginManager {
             if snap.is_empty() {
                 bail!("登录进程结束，但系统未保存任何新凭据");
             }
+            if job.tool == ToolKind::Cursor && crate::accounts::cursor_snapshot_is_api_key(&snap) {
+                bail!("登录进程未生成网页授权凭据，请重试");
+            }
             let view = self.accounts.save_oauth_from_dir(
                 job.tool,
                 job.target_account_id.as_deref(),
@@ -370,7 +374,12 @@ impl LoginManager {
                 unsets.extend(["GEMINI_API_KEY", "GOOGLE_API_KEY"]);
             }
             ToolKind::Cursor => {
-                unsets.push("CURSOR_API_KEY");
+                sets.push(("NO_OPEN_BROWSER", "1".into()));
+                unsets.extend([
+                    "CURSOR_API_KEY",
+                    "CURSOR_AUTH_TOKEN",
+                    "AGENT_CLI_CREDENTIAL_STORE",
+                ]);
             }
             _ => {}
         }

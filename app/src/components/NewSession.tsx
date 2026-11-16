@@ -294,13 +294,17 @@ export function NewSessionPage({ params }: { params: NewSessionParams }) {
     setCfgOptions(null);
     if (!hostId || !cursorModel) return;
     let alive = true;
-    rpc<ModelConfigOption[]>(hostId, 'tools.modelConfig', { model: cursorModel, cwd: cwdRef.current.trim() })
+    rpc<ModelConfigOption[]>(hostId, 'tools.modelConfig', {
+      model: cursorModel,
+      cwd: cwdRef.current.trim(),
+      accountId: accountId || undefined,
+    })
       .then((o) => alive && setCfgOptions(o))
       .catch(() => alive && setCfgOptions([]));
     return () => {
       alive = false;
     };
-  }, [hostId, cursorModel]);
+  }, [hostId, cursorModel, accountId]);
   const shownConfig = useMemo(() => {
     if (!cursorModel || !cfgOptions) return undefined;
     const chosen = pickConfig(cfgOptions, config);

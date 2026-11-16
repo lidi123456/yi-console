@@ -49,7 +49,11 @@ fn cached(p: &Path, f: impl FnOnce(&Path, i64) -> Option<HistoryEntry>) -> Optio
     v
 }
 
-pub async fn list(tool: Option<ToolKind>, settings: &DaemonSettings) -> Vec<HistoryEntry> {
+pub async fn list(
+    tool: Option<ToolKind>,
+    settings: &DaemonSettings,
+    accounts: Option<&crate::accounts::AccountManager>,
+) -> Vec<HistoryEntry> {
     let mut out = vec![];
     let want = |t: ToolKind| tool.map(|x| x == t).unwrap_or(true);
     if want(ToolKind::Claude) {
@@ -71,12 +75,28 @@ pub async fn list(tool: Option<ToolKind>, settings: &DaemonSettings) -> Vec<Hist
     }
     if want(ToolKind::Antigravity) {
         if let Some(p) = crate::tools::resolve(ToolKind::Antigravity, settings) {
-            out.extend(list_acp(ToolKind::Antigravity, &p).await.unwrap_or_default());
+            let resolved = accounts.and_then(|a| a.resolve(ToolKind::Antigravity, None));
+            let env = resolved.as_ref().map(|r| r.env.clone()).unwrap_or_default();
+            let unset = resolved.as_ref().map(|r| r.env_unset.clone()).unwrap_or_default();
+            let auth_method = resolved.and_then(|r| r.auth_method);
+            out.extend(
+                list_acp(ToolKind::Antigravity, &p, &env, &unset, auth_method.as_deref())
+                    .await
+                    .unwrap_or_default(),
+            );
         }
     }
     if want(ToolKind::Cursor) {
         if let Some(p) = crate::tools::resolve(ToolKind::Cursor, settings) {
-            match list_acp(ToolKind::Cursor, &p).await {
+            let resolved = accounts.and_then(|a| a.resolve(ToolKind::Cursor, None));
+            if let (Some(mgr), Some(res)) = (accounts, &resolved) {
+                if res.auth_kind == AccountAuthKind::Oauth {
+                    mgr.restore_cursor_oauth_if_api_key_polluted(&res.id);
+                }
+            }
+            let env = resolved.as_ref().map(|r| r.env.clone()).unwrap_or_default();
+            let unset = resolved.as_ref().map(|r| r.env_unset.clone()).unwrap_or_default();
+            match list_acp(ToolKind::Cursor, &p, &env, &unset, None).await {
                 Ok(v) if !v.is_empty() => out.extend(v),
                 _ => out.extend(list_cursor_dirs()),
             }
@@ -824,11 +844,17 @@ async fn list_kiro(program: &Path) -> Result<Vec<HistoryEntry>> {
 
 // ---------------- Cursor ----------------
 
-/// Start a short-lived `<tool> acp` to call session/list. Cursor needs `authenticate` first; Antigravity uses its
-/// cached sign-in (its first auth method is a browser sign-in)
-async fn list_acp(tool: ToolKind, program: &Path) -> Result<Vec<HistoryEntry>> {
+/// Start a short-lived `<tool> acp` to call session/list. Neither Cursor nor Antigravity calls `authenticate`
+/// with a browser login method (both check cached credentials / API key env vars at startup).
+async fn list_acp(
+    tool: ToolKind,
+    program: &Path,
+    env_set: &std::collections::BTreeMap<String, String>,
+    env_unset: &[String],
+    explicit_auth: Option<&str>,
+) -> Result<Vec<HistoryEntry>> {
     let home = crate::paths::home();
-    let mut p = crate::adapters::JsonProc::spawn(program, &["acp".into()], &home)?;
+    let mut p = crate::adapters::JsonProc::spawn_with_env(program, &["acp".into()], &home, env_set, env_unset)?;
     let fut = async {
         p.send(&json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,
             "clientCapabilities":{"fs":{"readTextFile":false,"writeTextFile":false},"terminal":false}}}))
@@ -842,7 +868,7 @@ async fn list_acp(tool: ToolKind, program: &Path) -> Result<Vec<HistoryEntry>> {
                     if v["result"]["agentCapabilities"]["sessionCapabilities"]["list"].is_null() {
                         break;
                     }
-                    if let Some(m) = v["result"]["authMethods"][0]["id"].as_str().filter(|_| tool == ToolKind::Cursor) {
+                    if let Some(m) = explicit_auth {
                         p.send(&json!({"jsonrpc":"2.0","id":2,"method":"authenticate","params":{"methodId":m}}))
                             .await?;
                     } else {
@@ -858,6 +884,9 @@ async fn list_acp(tool: ToolKind, program: &Path) -> Result<Vec<HistoryEntry>> {
                         .await?;
                 }
                 Some(id) if id == next_id => {
+                    if v.get("error").is_some() {
+                        break;
+                    }
                     let r = &v["result"];
                     for s in r["sessions"].as_array().into_iter().flatten() {
                         entries.push(HistoryEntry {
@@ -887,6 +916,36 @@ async fn list_acp(tool: ToolKind, program: &Path) -> Result<Vec<HistoryEntry>> {
     let res = tokio::time::timeout(Duration::from_secs(20), fut).await;
     let _ = p.child.start_kill();
     Ok(res??)
+}
+
+/// Whether Cursor has a persisted local `store.db` for `id` in the requested UI mode.
+pub fn cursor_session_exists(id: &str, terminal: bool) -> bool {
+    if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+        return false;
+    }
+    let home = crate::paths::home();
+    let mut roots = vec![home.join(".cursor")];
+    if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
+        if !xdg.trim().is_empty() {
+            roots.push(PathBuf::from(xdg.trim()).join("cursor"));
+        }
+    } else if !cfg!(windows) && !cfg!(target_os = "macos") {
+        roots.push(home.join(".config/cursor"));
+    }
+    if terminal {
+        roots.iter().any(|root| {
+            std::fs::read_dir(root.join("chats"))
+                .ok()
+                .into_iter()
+                .flatten()
+                .flatten()
+                .any(|w| w.path().join(id).join("store.db").is_file())
+        })
+    } else {
+        roots
+            .iter()
+            .any(|root| root.join("acp-sessions").join(id).join("store.db").is_file())
+    }
 }
 
 /// Cursor keeps separate session copies for chat mode (ACP) and the terminal UI: ACP in `~/.cursor/acp-sessions/<id>/`,

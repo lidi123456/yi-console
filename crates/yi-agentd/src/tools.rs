@@ -113,14 +113,14 @@ fn push_unique(v: &mut Vec<PathBuf>, p: PathBuf) {
 
 /// System PATH followed by user PATH from the registry (the order Windows uses for new processes), with %VARS% expanded
 #[cfg(windows)]
-fn registry_path() -> Vec<PathBuf> {
+fn registry_env_var(name: &str) -> Vec<String> {
     use windows_sys::Win32::System::Registry::{RegGetValueW, HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ};
     fn wide(s: &str) -> Vec<u16> {
         s.encode_utf16().chain(std::iter::once(0)).collect()
     }
-    fn read(root: HKEY, sub: &str) -> Option<String> {
+    fn read(root: HKEY, sub: &str, name: &str) -> Option<String> {
         const ERROR_MORE_DATA: u32 = 234;
-        let (sub, name) = (wide(sub), wide("Path"));
+        let (sub, name) = (wide(sub), wide(name));
         let mut buf = vec![0u16; 4096];
         loop {
             let mut len = (buf.len() * 2) as u32;
@@ -139,13 +139,44 @@ fn registry_path() -> Vec<PathBuf> {
         }
     }
     [
-        read(HKEY_LOCAL_MACHINE, r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment"),
-        read(HKEY_CURRENT_USER, "Environment"),
+        read(HKEY_LOCAL_MACHINE, r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment", name),
+        read(HKEY_CURRENT_USER, "Environment", name),
     ]
     .into_iter()
     .flatten()
-    .flat_map(|s| s.split(';').map(str::trim).filter(|x| !x.is_empty()).map(PathBuf::from).collect::<Vec<_>>())
     .collect()
+}
+
+#[cfg(windows)]
+fn registry_path() -> Vec<PathBuf> {
+    registry_env_var("Path")
+        .into_iter()
+        .flat_map(|s| s.split(';').map(str::trim).filter(|x| !x.is_empty()).map(PathBuf::from).collect::<Vec<_>>())
+        .collect()
+}
+
+/// Read an environment variable from the daemon process, falling back on Windows to user/system registry
+/// environment variables (user wins over system) when set after the daemon started.
+pub fn host_env_var(name: &str) -> Option<String> {
+    if let Ok(v) = std::env::var(name) {
+        let t = v.trim();
+        if !t.is_empty() {
+            return Some(t.to_string());
+        }
+    }
+    #[cfg(windows)]
+    {
+        // registry_env_var returns [HKLM, HKCU]; user scope wins for non-PATH variables
+        if let Some(v) = registry_env_var(name)
+            .into_iter()
+            .rev()
+            .map(|s| s.trim().to_string())
+            .find(|s| !s.is_empty())
+        {
+            return Some(v);
+        }
+    }
+    None
 }
 
 /// Variables that belong only to that shell process and shouldn't be carried into the daemon

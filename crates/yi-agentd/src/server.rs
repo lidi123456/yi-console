@@ -527,7 +527,7 @@ pub async fn dispatch(
             if cached.is_empty() {
                 // This tool hasn't been used yet: start a temporary process to ask
                 let settings = hub.settings.read().unwrap().clone();
-                let models = crate::probe::models(tool, &settings).await.unwrap_or_default();
+                let models = crate::probe::models(hub, tool, &settings).await.unwrap_or_default();
                 hub.remember_models(tool, &models);
                 serde_json::to_value(models)?
             } else {
@@ -537,7 +537,8 @@ pub async fn dispatch(
         TOOLS_MODEL_CONFIG => {
             let model = s(&p, "model")?;
             if model.is_empty() { return Err(anyhow!("缺少模型")); }
-            serde_json::to_value(hub.model_config_for(model, p["cwd"].as_str().unwrap_or("")).await?)?
+            let account_id = p["accountId"].as_str().filter(|s| !s.is_empty());
+            serde_json::to_value(hub.model_config_for(model, p["cwd"].as_str().unwrap_or(""), account_id).await?)?
         }
         TOOLS_LATEST => {
             let hub2 = hub.clone();
@@ -587,9 +588,42 @@ pub async fn dispatch(
         TOOLS_ACCOUNTS_CAPTURE => {
             let tool = ToolKind::parse(s(&p, "tool")?).ok_or_else(|| anyhow!("未知工具"))?;
             let label = p["label"].as_str().map(str::to_string);
+            let source = p["source"].as_str().map(str::to_string);
             let hub2 = hub.clone();
             let view = tokio::task::spawn_blocking(move || {
-                let v = hub2.accounts.capture(tool, label.as_deref())?;
+                let mut v = hub2
+                    .accounts
+                    .capture_with_source(tool, label.as_deref(), source.as_deref())?;
+                if v.tool == ToolKind::Cursor && v.auth_kind == AccountAuthKind::ApiKey {
+                    if let Some(stored) = hub2.accounts.get_stored(ToolKind::Cursor, &v.id) {
+                        if let Some(cfg) = &stored.api_config {
+                            if let Ok(Some((ident, raw_q))) = crate::probe::verify_cursor_api_key(
+                                &cfg.api_key,
+                                Some(cfg.base_url.as_str()).filter(|s| !s.is_empty()),
+                            ) {
+                                let auto_lbl = if label.as_deref().map(str::trim).filter(|s| !s.is_empty()).is_none() {
+                                    ident.email.as_ref().map(|e| format!("{e} (API Key)"))
+                                } else {
+                                    None
+                                };
+                                if let Ok(updated) = hub2.accounts.save(crate::accounts::SaveAccountRequest {
+                                    tool: ToolKind::Cursor,
+                                    id: Some(v.id.clone()),
+                                    label: auto_lbl,
+                                    verified_identity: Some(ident),
+                                    ..Default::default()
+                                }) {
+                                    v = updated;
+                                }
+                                crate::probe::cache_verified_cursor_quota(
+                                    hub2.accounts.base_dir(),
+                                    &v,
+                                    raw_q,
+                                );
+                            }
+                        }
+                    }
+                }
                 hub2.publish_accounts_updated(tool, v.active.then(|| v.id.clone()));
                 Ok::<_, anyhow::Error>(v)
             })
@@ -616,14 +650,36 @@ pub async fn dispatch(
                 allow_auto_failover: p["allowAutoFailover"].as_bool(),
                 priority: p["priority"].as_i64().map(|n| n as i32),
                 api_config,
+                verified_identity: None,
                 activate: p["activate"].as_bool().unwrap_or(false),
             };
             let clear_cache = req.api_config.is_some();
             let hub2 = hub.clone();
             let view = tokio::task::spawn_blocking(move || {
+                let mut req = req;
+                let mut verified_quota = None;
+                if tool == ToolKind::Cursor
+                    && req.auth_kind.unwrap_or(AccountAuthKind::ApiKey) == AccountAuthKind::ApiKey
+                {
+                    if let Some(cfg) = &req.api_config {
+                        let trimmed = cfg.api_key.trim();
+                        if !trimmed.is_empty() && trimmed != "********" {
+                            if let Some((ident, raw_q)) = crate::probe::verify_cursor_api_key(
+                                trimmed,
+                                Some(cfg.base_url.as_str()).filter(|s| !s.trim().is_empty()),
+                            )? {
+                                req.verified_identity = Some(ident);
+                                verified_quota = Some(raw_q);
+                            }
+                        }
+                    }
+                }
                 let v = hub2.accounts.save(req)?;
                 if clear_cache {
                     crate::probe::clear_account_cache(tool, &v.id);
+                }
+                if let Some(raw_q) = verified_quota {
+                    crate::probe::cache_verified_cursor_quota(hub2.accounts.base_dir(), &v, raw_q);
                 }
                 hub2.on_account_updated(tool, &v);
                 hub2.publish_accounts_updated(tool, v.active.then(|| v.id.clone()));
@@ -733,11 +789,7 @@ pub async fn dispatch(
         SESSION_SWITCH_ACCOUNT => {
             let sid = s(&p, "sessionId")?.to_string();
             let account_id = s(&p, "accountId")?.to_string();
-            let hub2 = hub.clone();
-            let info = tokio::task::spawn_blocking(move || {
-                hub2.switch_session_account(&sid, &account_id, Some("manual"), false)
-            })
-            .await??;
+            let info = hub.switch_session_account_async(&sid, &account_id).await?;
             serde_json::to_value(info)?
         }
         "session.resume" => {
@@ -804,7 +856,7 @@ pub async fn dispatch(
         HISTORY_LIST => {
             let tool = p["tool"].as_str().and_then(ToolKind::parse);
             let settings = hub.settings.read().unwrap().clone();
-            serde_json::to_value(crate::history::list(tool, &settings).await)?
+            serde_json::to_value(crate::history::list(tool, &settings, Some(&hub.accounts)).await)?
         }
         HISTORY_READ => {
             let tool = ToolKind::parse(s(&p, "tool")?).ok_or_else(|| anyhow!("未知工具"))?;
