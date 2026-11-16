@@ -77,6 +77,10 @@ impl LoginManager {
         if !req.tool.supports_accounts() {
             bail!("该工具不支持账号登录");
         }
+        let cap = AccountManager::capability(req.tool);
+        if !cap.supports_interactive_login && !cap.supports_device_auth {
+            bail!("{} 没有独立的登录命令，请在终端里登录后用「抓取当前登录」添加账号", req.tool.as_str());
+        }
         let program = crate::tools::resolve(req.tool, settings)
             .ok_or_else(|| anyhow!("未找到 {} 可执行文件", req.tool.as_str()))?;
         let isolation = AccountManager::effective_isolation(req.tool, AccountAuthKind::Oauth);
@@ -244,6 +248,9 @@ impl LoginManager {
                 &emit,
             ),
             (ToolKind::Cursor, _) => self.run_piped(&job, &program, &["login"], &emit),
+            // qodercli login with NO_BROWSER prints the sign-in URL and polls; it needs no input
+            (ToolKind::Qoder, _) => self.run_piped(&job, &program, &["login"], &emit),
+            (ToolKind::Kiro, _) => self.run_pty(&job, &program, &["login", "--license", "free", "--use-device-flow"], &emit),
             (ToolKind::Codex, _) => self.run_pty(&job, &program, &["login"], &emit),
             (ToolKind::Claude, _) => self.run_pty(&job, &program, &["auth", "login"], &emit),
             _ => self.run_pty(&job, &program, &["login"], &emit),
@@ -316,6 +323,7 @@ impl LoginManager {
             let has_creds = match job.tool {
                 ToolKind::Codex => dir.join("auth.json").is_file(),
                 ToolKind::Claude => dir.join(".credentials.json").is_file(),
+                ToolKind::Qoder => dir.join(".auth/user").is_file(),
                 _ => true,
             };
             if !has_creds {
@@ -372,6 +380,13 @@ impl LoginManager {
             }
             ToolKind::Antigravity => {
                 unsets.extend(["GEMINI_API_KEY", "GOOGLE_API_KEY"]);
+            }
+            ToolKind::Qoder => {
+                if let Some(dir) = &job.staging_dir {
+                    sets.push(("QODER_CONFIG_DIR", dir.display().to_string()));
+                }
+                sets.push(("NO_BROWSER", "true".into()));
+                unsets.push("QODER_PERSONAL_ACCESS_TOKEN");
             }
             ToolKind::Cursor => {
                 sets.push(("NO_OPEN_BROWSER", "1".into()));
@@ -587,7 +602,7 @@ fn default_mode(tool: ToolKind, req: Option<&str>) -> String {
         return m.to_string();
     }
     match tool {
-        ToolKind::Codex => "device_auth".into(),
+        ToolKind::Codex | ToolKind::Kiro => "device_auth".into(),
         ToolKind::Antigravity => "oauth".into(),
         _ => "interactive".into(),
     }

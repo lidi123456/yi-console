@@ -384,7 +384,7 @@ pub fn usage(store: &Store, days: i64, tz_offset_min: i64) -> anyhow::Result<Val
     let sources: [(&str, Vec<PathBuf>, fn(&str) -> Vec<Rec>); 4] = [
         ("claude", crate::history::claude_roots(), parse_claude),
         ("codex", crate::history::codex_roots(), parse_codex),
-        ("qoder", vec![crate::history::qoder_root()], parse_qoder),
+        ("qoder", crate::history::qoder_roots(), parse_qoder),
         ("codebuddy", vec![crate::history::codebuddy_root()], parse_codebuddy),
     ];
     for (tool, roots, parse) in sources {

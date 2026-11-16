@@ -2,9 +2,9 @@
 //!
 //! Credentials live strictly host-side under `<YI_CONSOLE_HOME>/accounts.json` (`0o600`) and
 //! `<YI_CONSOLE_HOME>/accounts/<tool>/<id>/`.
-//! - Isolated accounts (`Codex`, `Claude`, and any tool's `ApiKey` profile) run with per-profile
+//! - Isolated accounts (`Codex`, `Claude`, `Qoder`, and any tool's `ApiKey` profile) run with per-profile
 //!   env vars / config dirs so multiple sessions run concurrently with different accounts.
-//! - `HostActive` accounts (`Antigravity` OAuth, `Cursor`/`Kiro`/`Qoder`/`Codebuddy` OAuth)
+//! - `HostActive` accounts (`Antigravity` OAuth, `Cursor`/`Kiro`/`Codebuddy` OAuth)
 //!   capture and atomically swap host credential files + OS keyring snapshots with rollback.
 
 use crate::keyring::{self, KeyringEntry};
@@ -22,6 +22,20 @@ use yi_proto::{
 
 const REDACTED: &str = "********";
 const FILE_VERSION: u32 = 1;
+
+/// CodeBuddy Code's login (checked on 2.167.0), relative to the home dir: `<data dir>/CodeBuddyExtension/Data/Public/auth/
+/// <product.json authentication.id>.info`, with the data dir picked by OS from the home dir (not APPDATA / XDG).
+/// The same file holds the CodeBuddy IDE extension's login, so switching accounts switches both.
+/// `state` rows of Kiro's database that belong to the login (Identity Center start URL and region, selected profile)
+const KIRO_STATE_KEYS: [&str; 3] = ["auth.idc.start-url", "auth.idc.region", "api.codewhisperer.profile"];
+
+const CODEBUDDY_AUTH_FILE: &str = if cfg!(windows) {
+    "AppData/Local/CodeBuddyExtension/Data/Public/auth/Tencent-Cloud.coding-copilot.info"
+} else if cfg!(target_os = "macos") {
+    "Library/Application Support/CodeBuddyExtension/Data/Public/auth/Tencent-Cloud.coding-copilot.info"
+} else {
+    ".local/share/CodeBuddyExtension/Data/Public/auth/Tencent-Cloud.coding-copilot.info"
+};
 
 #[derive(Debug, Clone, Copy)]
 pub struct ToolCapabilities {
@@ -100,11 +114,26 @@ pub struct SnapshotBundle {
     /// Isolated home files relative to the profile's `home/` dir (used for cross-host sync).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub profile_files: BTreeMap<String, String>,
+    /// Login rows of a tool that keeps it in SQLite (Kiro's `data.sqlite3`)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub db_rows: Vec<DbRow>,
+}
+
+/// One row of `table` (`key` -> `value`); TEXT values in `text`, BLOB values base64 in `blob`
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DbRow {
+    pub table: String,
+    pub key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blob: Option<String>,
 }
 
 impl SnapshotBundle {
     pub fn is_empty(&self) -> bool {
-        self.files.is_empty() && self.keyring.is_empty() && self.profile_files.is_empty()
+        self.files.is_empty() && self.keyring.is_empty() && self.profile_files.is_empty() && self.db_rows.is_empty()
     }
 }
 
@@ -310,15 +339,39 @@ impl AccountManager {
                 supports_device_auth: false,
                 supports_interactive_login: true,
             },
-            ToolKind::Cursor | ToolKind::Kiro | ToolKind::Qoder | ToolKind::Codebuddy => {
-                ToolCapabilities {
-                    oauth_isolation: AccountIsolation::HostActive,
-                    supports_oauth: true,
-                    supports_api_key: true,
-                    supports_device_auth: false,
-                    supports_interactive_login: true,
-                }
-            }
+            ToolKind::Cursor => ToolCapabilities {
+                oauth_isolation: AccountIsolation::HostActive,
+                supports_oauth: true,
+                supports_api_key: true,
+                supports_device_auth: false,
+                supports_interactive_login: true,
+            },
+            // Each account runs with its own `QODER_CONFIG_DIR` (login, settings, sessions; nothing shared with ~/.qoder)
+            ToolKind::Qoder => ToolCapabilities {
+                oauth_isolation: AccountIsolation::Isolated,
+                supports_oauth: true,
+                supports_api_key: true,
+                supports_device_auth: false,
+                supports_interactive_login: true,
+            },
+            // `kiro-cli login` opens an arrow-key menu (Builder ID / Google / GitHub / organization) a pipe can't drive;
+            // `--license free --use-device-flow` goes straight to the Builder ID device code. Other sign-ins: capture
+            ToolKind::Kiro => ToolCapabilities {
+                oauth_isolation: AccountIsolation::HostActive,
+                supports_oauth: true,
+                supports_api_key: true,
+                supports_device_auth: true,
+                supports_interactive_login: false,
+            },
+            // CodeBuddy has no `login` subcommand (sign-in is `/login` inside its TUI, a menu a pipe can't drive):
+            // accounts come from capturing the host login
+            ToolKind::Codebuddy => ToolCapabilities {
+                oauth_isolation: AccountIsolation::HostActive,
+                supports_oauth: true,
+                supports_api_key: true,
+                supports_device_auth: false,
+                supports_interactive_login: false,
+            },
             ToolKind::Shell | ToolKind::Files => ToolCapabilities {
                 oauth_isolation: AccountIsolation::HostActive,
                 supports_oauth: false,
@@ -464,6 +517,7 @@ impl AccountManager {
         let Some(td) = g.tools.get_mut(tool.as_str()) else {
             return;
         };
+        let others: Vec<String> = td.accounts.iter().filter(|a| a.id != account_id).map(|a| a.label.clone()).collect();
         let Some(acc) = td.accounts.iter_mut().find(|a| a.id == account_id) else {
             return;
         };
@@ -473,6 +527,12 @@ impl AccountManager {
                 acc.identity.email = Some(e.to_string());
                 if acc.identity.account_key.is_none() {
                     acc.identity.account_key = Some(e.to_string());
+                }
+                // Tools whose credentials carry no email (Qoder, Kiro) get a placeholder label at capture;
+                // name the account after the email once a probe reports it
+                if acc.auth_kind == AccountAuthKind::Oauth && is_placeholder_oauth_label(&acc.label, tool, acc.identity.workspace.as_deref()) {
+                    let names: Vec<&str> = others.iter().map(String::as_str).collect();
+                    acc.label = unique_label(e.to_string(), &names);
                 }
                 changed = true;
             }
@@ -860,22 +920,22 @@ impl AccountManager {
                     }
                 }
             }
-            (t, AccountAuthKind::ApiKey) => {
-                let key_var = match t {
-                    ToolKind::Kiro => "KIRO_API_KEY",
-                    ToolKind::Qoder => "QODER_API_KEY",
-                    ToolKind::Codebuddy => "CODEBUDDY_API_KEY",
-                    _ => "API_KEY",
-                };
+            (ToolKind::Qoder, AccountAuthKind::Oauth) => {
+                let dir = self.profile_home(ToolKind::Qoder, &acc.id);
+                env.insert("QODER_CONFIG_DIR".into(), dir.display().to_string());
+                env_unset.push("QODER_PERSONAL_ACCESS_TOKEN".into());
+                data_dir = Some(dir);
+            }
+            (ToolKind::Qoder, AccountAuthKind::ApiKey) => {
+                // qodercli only reads a Personal Access Token from this variable; it has no base URL / auth token
+                // settings. A `/login` session takes precedence over it, so the profile gets its own empty config dir.
+                let dir = self.profile_home(ToolKind::Qoder, &acc.id);
+                let _ = std::fs::create_dir_all(&dir);
+                env.insert("QODER_CONFIG_DIR".into(), dir.display().to_string());
+                data_dir = Some(dir);
                 if let Some(cfg) = &acc.api_config {
                     if !cfg.api_key.is_empty() {
-                        env.insert(key_var.into(), cfg.api_key.clone());
-                    }
-                    if !cfg.auth_token.is_empty() {
-                        env.insert("AUTH_TOKEN".into(), cfg.auth_token.clone());
-                    }
-                    if !cfg.base_url.is_empty() {
-                        env.insert("OPENAI_BASE_URL".into(), cfg.base_url.clone());
+                        env.insert("QODER_PERSONAL_ACCESS_TOKEN".into(), cfg.api_key.clone());
                     }
                     for (k, v) in &cfg.extra_env {
                         if !k.is_empty() {
@@ -884,6 +944,39 @@ impl AccountManager {
                     }
                 }
             }
+            (ToolKind::Codebuddy, AccountAuthKind::ApiKey) => {
+                if let Some(cfg) = &acc.api_config {
+                    for (var, val) in [
+                        ("CODEBUDDY_API_KEY", &cfg.api_key),
+                        ("CODEBUDDY_AUTH_TOKEN", &cfg.auth_token),
+                        ("CODEBUDDY_BASE_URL", &cfg.base_url),
+                        ("CODEBUDDY_MODEL", &cfg.default_model),
+                    ] {
+                        if !val.is_empty() {
+                            env.insert(var.into(), val.clone());
+                        }
+                    }
+                    for (k, v) in &cfg.extra_env {
+                        if !k.is_empty() {
+                            env.insert(k.clone(), v.clone());
+                        }
+                    }
+                }
+            }
+            (ToolKind::Kiro, AccountAuthKind::ApiKey) => {
+                // kiro-cli's headless API key auth; it has no base URL / auth token / model variables
+                if let Some(cfg) = &acc.api_config {
+                    if !cfg.api_key.is_empty() {
+                        env.insert("KIRO_API_KEY".into(), cfg.api_key.clone());
+                    }
+                    for (k, v) in &cfg.extra_env {
+                        if !k.is_empty() {
+                            env.insert(k.clone(), v.clone());
+                        }
+                    }
+                }
+            }
+            (_, AccountAuthKind::ApiKey) => {}
             (_, AccountAuthKind::Oauth) => {}
         }
 
@@ -1049,6 +1142,14 @@ impl AccountManager {
                 }
                 let ident = parse_claude_identity(&bytes, dot_claude_meta.as_ref());
                 (AccountAuthKind::Oauth, ident, None, None, false)
+            }
+            ToolKind::Qoder => {
+                let src = self.home_dir.join(".qoder").join(".auth");
+                if !src.join("user").is_file() {
+                    bail!("当前系统 Qoder 未登录（没有找到 ~/.qoder/.auth/user），请先运行 qodercli login 或使用应用内登录");
+                }
+                copy_qoder_login(&src, &self.profile_home(ToolKind::Qoder, &id).join(".auth"))?;
+                (AccountAuthKind::Oauth, AccountIdentity::default(), None, None, false)
             }
             ToolKind::Cursor => {
                 let snap = self.take_host_snapshot_unlocked(ToolKind::Cursor).unwrap_or_default();
@@ -1543,12 +1644,14 @@ impl AccountManager {
                 }
                 Ok(true)
             }
-            ToolKind::Claude => {
-                let src_dir = match from_id {
-                    Some(fid) => self.profile_home(ToolKind::Claude, fid),
-                    None => self.native_claude_dir(),
+            // Qoder's `<config dir>/projects/<dir>/<id>.jsonl` is laid out like Claude's
+            ToolKind::Claude | ToolKind::Qoder => {
+                let src_dir = match (from_id, tool) {
+                    (Some(fid), _) => self.profile_home(tool, fid),
+                    (None, ToolKind::Qoder) => self.home_dir.join(".qoder"),
+                    (None, _) => self.native_claude_dir(),
                 };
-                let dst_dir = self.profile_home(ToolKind::Claude, to_id);
+                let dst_dir = self.profile_home(tool, to_id);
                 let src_projects = src_dir.join("projects");
                 let filename = format!("{external_id}.jsonl");
                 let Some(src_file) = find_exact_file_recursive(&src_projects, &filename) else {
@@ -1583,6 +1686,7 @@ impl AccountManager {
             let files: &[&str] = match tool {
                 ToolKind::Codex => &["auth.json", "config.toml"],
                 ToolKind::Claude => &[".credentials.json", ".claude.json"],
+                ToolKind::Qoder => &QODER_LOGIN_FILES,
                 _ => &[],
             };
             for rel in files {
@@ -1656,7 +1760,7 @@ impl AccountManager {
         if tool == ToolKind::Codex {
             ensure_codex_profile_files(&home, api_config.as_ref())?;
         }
-        if !snap.files.is_empty() || !snap.keyring.is_empty() {
+        if !snap.files.is_empty() || !snap.keyring.is_empty() || !snap.db_rows.is_empty() {
             let mut host_only = snap;
             host_only.profile_files.clear();
             self.save_snapshot(tool, &new_id, &host_only)?;
@@ -1722,14 +1826,119 @@ impl AccountManager {
             }
         }
         let keyring = keyring::snapshot_tool(tool).unwrap_or_default();
+        let db_rows = self.take_db_rows(tool)?;
         Ok(SnapshotBundle {
             files,
             keyring,
             profile_files: BTreeMap::new(),
+            db_rows,
         })
     }
 
+    /// Kiro's SQLite database: `<data dir>/kiro-cli/data.sqlite3` (`dirs::data_local_dir`, so XDG_DATA_HOME on Linux)
+    fn kiro_db_path(&self) -> PathBuf {
+        if cfg!(windows) {
+            return self.home_dir.join("AppData/Local/kiro-cli/data.sqlite3");
+        }
+        if cfg!(target_os = "macos") {
+            return self.home_dir.join("Library/Application Support/kiro-cli/data.sqlite3");
+        }
+        // Only the real home follows XDG_DATA_HOME (tests point home_dir elsewhere)
+        let xdg = std::env::var_os("XDG_DATA_HOME").map(PathBuf::from).filter(|p| p.is_absolute());
+        match xdg {
+            Some(x) if self.home_dir == crate::paths::home() => x.join("kiro-cli/data.sqlite3"),
+            _ => self.home_dir.join(".local/share/kiro-cli/data.sqlite3"),
+        }
+    }
+
+    /// Login rows of tools that keep them in SQLite. Kiro (checked on kiro-cli 2.35 / 2.37): tokens and the OIDC client
+    /// registration are `auth_kv` rows `kirocli:*` (`kirocli:odic:token`, `kirocli:social:token`, `kirocli:external-idp:token`,
+    /// `kirocli:odic:device-registration`, ...), and the Identity Center start URL / region / chosen profile are `state` rows.
+    /// Nothing is captured without a token row, so leftover state alone doesn't count as a login.
+    fn take_db_rows(&self, tool: ToolKind) -> Result<Vec<DbRow>> {
+        if tool != ToolKind::Kiro {
+            return Ok(vec![]);
+        }
+        let path = self.kiro_db_path();
+        if !path.is_file() {
+            return Ok(vec![]);
+        }
+        let conn = rusqlite::Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|e| anyhow!("打开 Kiro 数据库失败: {e}"))?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        let read = |table: &str, filter: &str, params: &[&str]| -> Result<Vec<DbRow>> {
+            let sql = format!("SELECT key, value FROM {table} WHERE {filter}");
+            let mut stmt = match conn.prepare(&sql) {
+                Ok(s) => s,
+                // An older or not yet migrated database without the table
+                Err(_) => return Ok(vec![]),
+            };
+            let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |r| {
+                let key: String = r.get(0)?;
+                let (text, blob) = match r.get_ref(1)? {
+                    rusqlite::types::ValueRef::Text(t) => (Some(String::from_utf8_lossy(t).into_owned()), None),
+                    rusqlite::types::ValueRef::Blob(b) => (None, Some(base64::engine::general_purpose::STANDARD.encode(b))),
+                    rusqlite::types::ValueRef::Integer(i) => (Some(i.to_string()), None),
+                    rusqlite::types::ValueRef::Real(f) => (Some(f.to_string()), None),
+                    rusqlite::types::ValueRef::Null => (None, None),
+                };
+                Ok(DbRow { table: table.to_string(), key, text, blob })
+            })?;
+            Ok(rows.collect::<std::result::Result<_, _>>()?)
+        };
+        let auth = read("auth_kv", "key LIKE 'kirocli:%'", &[])?;
+        if !auth.iter().any(|r| r.key.ends_with(":token")) {
+            return Ok(vec![]);
+        }
+        let mut out = auth;
+        out.extend(read("state", "key IN (?1, ?2, ?3)", &KIRO_STATE_KEYS)?);
+        Ok(out)
+    }
+
+    /// Replace the tool's login rows with `rows` in one transaction (empty `rows`: sign out)
+    fn restore_db_rows(&self, tool: ToolKind, rows: &[DbRow]) -> Result<()> {
+        if tool != ToolKind::Kiro {
+            return Ok(());
+        }
+        let path = self.kiro_db_path();
+        if !path.is_file() {
+            if rows.is_empty() {
+                return Ok(());
+            }
+            bail!("没有找到 Kiro 数据库 {}，请先在这台机器上运行一次 kiro-cli", path.display());
+        }
+        let mut conn = rusqlite::Connection::open(&path).map_err(|e| anyhow!("打开 Kiro 数据库失败: {e}"))?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM auth_kv WHERE key LIKE 'kirocli:%'", [])?;
+        tx.execute("DELETE FROM state WHERE key IN (?1, ?2, ?3)", KIRO_STATE_KEYS)?;
+        for r in rows {
+            let table = match r.table.as_str() {
+                "auth_kv" if r.key.starts_with("kirocli:") => "auth_kv",
+                "state" if KIRO_STATE_KEYS.contains(&r.key.as_str()) => "state",
+                _ => bail!("非法的 Kiro 凭据记录: {}.{}", r.table, r.key),
+            };
+            let sql = format!("INSERT OR REPLACE INTO {table} (key, value) VALUES (?1, ?2)");
+            match (&r.text, &r.blob) {
+                (_, Some(b64)) => {
+                    let bytes = base64::engine::general_purpose::STANDARD.decode(b64).map_err(|e| anyhow!("快照解码失败: {e}"))?;
+                    tx.execute(&sql, rusqlite::params![r.key, bytes])?;
+                }
+                (Some(t), None) => {
+                    tx.execute(&sql, rusqlite::params![r.key, t])?;
+                }
+                (None, None) => {
+                    tx.execute(&sql, rusqlite::params![r.key, rusqlite::types::Null])?;
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     fn restore_host_snapshot_unlocked(&self, tool: ToolKind, snap: &SnapshotBundle) -> Result<()> {
+        // The database first: it's the step that can fail (locked), before any file is touched
+        self.restore_db_rows(tool, &snap.db_rows)?;
         for (rel, abs) in self.host_auth_paths(tool) {
             if !snap.files.contains_key(&rel) && abs.exists() {
                 let _ = std::fs::remove_file(&abs);
@@ -1853,19 +2062,16 @@ impl AccountManager {
                 }
             }
             ToolKind::Kiro => {
-                for rel in [".kiro/auth.json", ".kiro/credentials.json"] {
-                    add(&mut res, rel);
-                }
+                // The login lives in SQLite (`take_db_rows`), not in files
             }
             ToolKind::Qoder => {
-                for rel in [".qoder/auth.json", ".qoder/.credentials.json", ".qoder/credentials.json"] {
+                // Only for the native status: accounts are isolated (`QODER_LOGIN_FILES` in each config dir)
+                for rel in [".qoder/.auth/user", ".qoder/.auth/id"] {
                     add(&mut res, rel);
                 }
             }
             ToolKind::Codebuddy => {
-                for rel in [".codebuddy/auth.json", ".codebuddy/.credentials.json", ".codebuddy/credentials.json"] {
-                    add(&mut res, rel);
-                }
+                add(&mut res, CODEBUDDY_AUTH_FILE);
             }
             ToolKind::Claude => {
                 add(&mut res, ".claude/.credentials.json");
@@ -1994,6 +2200,44 @@ impl AccountManager {
                     return parse_claude_identity(&bytes, None);
                 }
                 AccountIdentity::default()
+            }
+            ToolKind::Kiro => {
+                // The token rows carry no email (the quota probe fills it from `kiro-cli whoami`); the workspace says how it signed in
+                let json = |key: &str| {
+                    snap.db_rows
+                        .iter()
+                        .find(|r| r.table == "auth_kv" && r.key == key)
+                        .and_then(|r| r.text.as_deref())
+                        .and_then(|t| serde_json::from_str::<serde_json::Value>(t).ok())
+                };
+                let workspace = if let Some(t) = json("kirocli:odic:token") {
+                    match t["start_url"].as_str().filter(|s| !s.is_empty()) {
+                        Some(u) if !u.contains("view.awsapps.com/start") => Some(u.to_string()),
+                        _ => Some("Builder ID".to_string()),
+                    }
+                } else if json("kirocli:social:token").is_some() {
+                    Some("Google / GitHub".to_string())
+                } else if json("kirocli:external-idp:token").is_some() {
+                    Some("External IdP".to_string())
+                } else {
+                    None
+                };
+                AccountIdentity { workspace, ..Default::default() }
+            }
+            ToolKind::Codebuddy => {
+                // {"account": {"uid", "nickname", ...}, "auth": {"accessToken", "domain", ...}, "accounts": [...]};
+                // there is no email, the nickname stands in for it (as in the quota probe)
+                let Some(v) = decode_file(".info").and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok()) else {
+                    return AccountIdentity::default();
+                };
+                let s = |x: &serde_json::Value| x.as_str().filter(|s| !s.is_empty()).map(String::from);
+                let a = &v["account"];
+                AccountIdentity {
+                    email: s(&a["nickname"]),
+                    account_key: s(&a["uid"]).or_else(|| s(&a["uniqueUserId"])),
+                    workspace: s(&v["auth"]["domain"]),
+                    plan: None,
+                }
             }
             _ => AccountIdentity::default(),
         }
@@ -2256,9 +2500,12 @@ impl AccountManager {
                 } else {
                     AccountIdentity::default()
                 };
+                // Only a single-slot (HostActive) tool's active account is what the host is logged in as
+                let host_active = Self::capability(tool).oauth_isolation == AccountIsolation::HostActive;
                 let matched = if logged_in {
                     find_matching_account(accounts, &ident, AccountAuthKind::Oauth).or_else(|| {
                         active_id
+                            .filter(|_| host_active)
                             .and_then(|id| accounts.iter().find(|a| a.id == id))
                             .filter(|a| a.auth_kind == AccountAuthKind::Oauth)
                             .map(|a| a.id.clone())
@@ -2429,6 +2676,32 @@ fn find_matching_account(
                             .is_some_and(|(x, y)| x.eq_ignore_ascii_case(y))))
         })
         .map(|a| a.id.clone())
+}
+
+/// What qodercli's login is made of, under `<config dir>/.auth/`. `user` is encrypted with a key tied to `machine_id`
+/// (checked on 1.1.80: a copy without `machine_id` is not logged in), so all three move together
+const QODER_LOGIN_FILES: [&str; 3] = [".auth/user", ".auth/id", ".auth/machine_id"];
+
+fn copy_qoder_login(src_auth: &Path, dst_auth: &Path) -> Result<()> {
+    std::fs::create_dir_all(dst_auth)?;
+    for name in ["user", "id", "machine_id"] {
+        let from = src_auth.join(name);
+        if from.is_file() {
+            let to = dst_auth.join(name);
+            std::fs::copy(&from, &to)?;
+            crate::util::restrict_file(&to);
+        }
+    }
+    Ok(())
+}
+
+/// `pick_label`'s fallback for an OAuth account without an email: the workspace or "<tool> OAuth", maybe with " #n"
+fn is_placeholder_oauth_label(label: &str, tool: ToolKind, workspace: Option<&str>) -> bool {
+    let generic = format!("{} OAuth", tool.as_str());
+    let is = |base: &str| {
+        label == base || label.strip_prefix(&format!("{base} #")).is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+    };
+    is(&generic) || workspace.is_some_and(is)
 }
 
 fn unique_label(base: String, existing: &[&str]) -> String {
@@ -3100,6 +3373,186 @@ mod tests {
         let bundle = mgr.export_bundle(ToolKind::Antigravity, &u2.id).unwrap();
         let u2_copy = mgr.import_bundle(bundle).unwrap();
         assert_ne!(u2_copy.id, u2.id);
+    }
+
+    #[test]
+    fn qoder_accounts_are_isolated_config_dirs() {
+        let (_t, base, home) = temp_dirs();
+        let auth = home.join(".qoder/.auth");
+        std::fs::create_dir_all(&auth).unwrap();
+        std::fs::write(auth.join("user"), "enc-user-1").unwrap();
+        std::fs::write(auth.join("id"), "id-1").unwrap();
+        std::fs::write(auth.join("machine_id"), "machine").unwrap();
+        std::fs::write(home.join(".qoder/settings.json"), "{}").unwrap();
+
+        let mgr = AccountManager::with_dirs(base, home.clone());
+        let u1 = mgr.capture(ToolKind::Qoder, None).unwrap();
+        assert_eq!((u1.label.as_str(), u1.isolation), ("qoder OAuth", AccountIsolation::Isolated));
+        let dir1 = mgr.profile_home(ToolKind::Qoder, &u1.id);
+        assert_eq!(std::fs::read_to_string(dir1.join(".auth/user")).unwrap(), "enc-user-1");
+        assert_eq!(std::fs::read_to_string(dir1.join(".auth/machine_id")).unwrap(), "machine");
+        assert!(!dir1.join("settings.json").exists(), "only the login is copied");
+        let res = mgr.resolve(ToolKind::Qoder, Some(&u1.id)).unwrap();
+        assert_eq!(res.env.get("QODER_CONFIG_DIR").map(PathBuf::from), Some(dir1.clone()));
+        assert!(res.env_unset.contains(&"QODER_PERSONAL_ACCESS_TOKEN".to_string()));
+
+        // A second host login is a second account; activating one leaves ~/.qoder alone
+        std::fs::write(auth.join("user"), "enc-user-2").unwrap();
+        let u2 = mgr.capture(ToolKind::Qoder, None).unwrap();
+        assert_eq!(u2.label, "qoder OAuth #2");
+        assert!(!mgr.activate(ToolKind::Qoder, &u1.id).unwrap().host_switched);
+        assert_eq!(std::fs::read_to_string(auth.join("user")).unwrap(), "enc-user-2");
+        let st = mgr.probe_native_status(ToolKind::Qoder, &mgr.all_accounts_for_tool(ToolKind::Qoder), Some(&u1.id));
+        assert!(st.logged_in && st.matched_account_id.is_none(), "the active account isn't the host login");
+
+        // Continuing a session on another account carries its log over
+        let log = dir1.join("projects/d-git-x/sess-1.jsonl");
+        std::fs::create_dir_all(log.parent().unwrap()).unwrap();
+        std::fs::write(&log, "{}\n").unwrap();
+        assert!(mgr.copy_session_history_for_switch(ToolKind::Qoder, Some(&u1.id), &u2.id, "sess-1").unwrap());
+        assert!(mgr.profile_home(ToolKind::Qoder, &u2.id).join("projects/d-git-x/sess-1.jsonl").is_file());
+
+        // Export / import carries the login files
+        let copy = mgr.import_bundle(mgr.export_bundle(ToolKind::Qoder, &u1.id).unwrap()).unwrap();
+        assert_eq!(std::fs::read_to_string(mgr.profile_home(ToolKind::Qoder, &copy.id).join(".auth/user")).unwrap(), "enc-user-1");
+
+        // The quota probe reports the email: the placeholder label becomes the email, a user-chosen one stays
+        mgr.update_identity_if_missing(ToolKind::Qoder, &u1.id, Some("q1@example.com"), None);
+        assert_eq!(mgr.get_stored(ToolKind::Qoder, &u1.id).unwrap().label, "q1@example.com");
+        mgr.save(SaveAccountRequest { tool: ToolKind::Qoder, id: Some(u2.id.clone()), label: Some("work".into()), ..Default::default() }).unwrap();
+        mgr.update_identity_if_missing(ToolKind::Qoder, &u2.id, Some("q2@example.com"), None);
+        let s2 = mgr.get_stored(ToolKind::Qoder, &u2.id).unwrap();
+        assert_eq!((s2.label.as_str(), s2.identity.email.as_deref()), ("work", Some("q2@example.com")));
+
+        std::fs::remove_file(auth.join("user")).unwrap();
+        assert!(mgr.capture(ToolKind::Qoder, None).is_err());
+    }
+
+    #[test]
+    fn qoder_api_key_uses_personal_access_token() {
+        let (_t, base, home) = temp_dirs();
+        let mgr = AccountManager::with_dirs(base, home);
+        let v = mgr
+            .save(SaveAccountRequest {
+                tool: ToolKind::Qoder,
+                auth_kind: Some(AccountAuthKind::ApiKey),
+                api_config: Some(ApiKeyConfig { api_key: "pat-123".into(), base_url: "https://ignored".into(), ..Default::default() }),
+                ..Default::default()
+            })
+            .unwrap();
+        let res = mgr.resolve(ToolKind::Qoder, Some(&v.id)).unwrap();
+        assert_eq!(res.env.get("QODER_PERSONAL_ACCESS_TOKEN").map(String::as_str), Some("pat-123"));
+        // Its own empty config dir, so a host /login can't take precedence over the token
+        assert_eq!(res.env.get("QODER_CONFIG_DIR").map(PathBuf::from), Some(mgr.profile_home(ToolKind::Qoder, &v.id)));
+        assert!(!res.env.contains_key("QODER_API_KEY") && !res.env.contains_key("OPENAI_BASE_URL"));
+    }
+
+    fn kiro_db(mgr: &AccountManager) -> rusqlite::Connection {
+        let path = mgr.kiro_db_path();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let c = rusqlite::Connection::open(&path).unwrap();
+        c.execute_batch(
+            "CREATE TABLE IF NOT EXISTS auth_kv (key TEXT PRIMARY KEY, value TEXT);
+             CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value BLOB);",
+        )
+        .unwrap();
+        c
+    }
+
+    fn kiro_login(c: &rusqlite::Connection, token_key: &str, token: &str, start_url: Option<&str>) {
+        c.execute("DELETE FROM auth_kv WHERE key LIKE 'kirocli:%'", []).unwrap();
+        c.execute("DELETE FROM state WHERE key LIKE 'auth.idc.%'", []).unwrap();
+        c.execute("INSERT INTO auth_kv VALUES (?1, ?2)", rusqlite::params![token_key, token]).unwrap();
+        c.execute("INSERT INTO auth_kv VALUES ('kirocli:odic:device-registration', '{\"client_id\":\"c\"}')", []).unwrap();
+        if let Some(u) = start_url {
+            c.execute("INSERT INTO state VALUES ('auth.idc.start-url', ?1)", rusqlite::params![u.as_bytes()]).unwrap();
+        }
+    }
+
+    fn kiro_value(c: &rusqlite::Connection, table: &str, key: &str) -> Option<String> {
+        c.query_row(&format!("SELECT CAST(value AS TEXT) FROM {table} WHERE key = ?1"), [key], |r| r.get(0)).ok()
+    }
+
+    #[test]
+    fn kiro_swaps_login_rows_in_sqlite() {
+        let (_t, base, home) = temp_dirs();
+        let mgr = AccountManager::with_dirs(base, home);
+        let c = kiro_db(&mgr);
+        c.execute("INSERT INTO state VALUES ('telemetryClientId', 'keep-me')", []).unwrap();
+        // No token row: not logged in, even with leftover state
+        c.execute("INSERT INTO state VALUES ('auth.idc.region', 'us-east-1')", []).unwrap();
+        assert!(mgr.capture(ToolKind::Kiro, None).is_err());
+
+        let org = "https://acme.awsapps.com/start";
+        kiro_login(&c, "kirocli:odic:token", &format!("{{\"access_token\":\"t-org\",\"start_url\":\"{org}\"}}"), Some(org));
+        let a = mgr.capture(ToolKind::Kiro, None).unwrap();
+        assert_eq!((a.label.as_str(), a.identity.workspace.as_deref()), (org, Some(org)));
+
+        kiro_login(&c, "kirocli:social:token", "{\"access_token\":\"t-social\"}", None);
+        let b = mgr.capture(ToolKind::Kiro, None).unwrap();
+        assert_eq!(b.identity.workspace.as_deref(), Some("Google / GitHub"));
+
+        assert!(mgr.activate(ToolKind::Kiro, &a.id).unwrap().host_switched);
+        assert!(kiro_value(&c, "auth_kv", "kirocli:odic:token").unwrap().contains("t-org"));
+        assert_eq!(kiro_value(&c, "auth_kv", "kirocli:social:token"), None);
+        assert_eq!(kiro_value(&c, "state", "auth.idc.start-url").as_deref(), Some(org));
+        assert!(mgr.activate(ToolKind::Kiro, &b.id).unwrap().host_switched);
+        assert!(kiro_value(&c, "auth_kv", "kirocli:social:token").unwrap().contains("t-social"));
+        assert_eq!(kiro_value(&c, "auth_kv", "kirocli:odic:token"), None);
+        assert_eq!(kiro_value(&c, "state", "auth.idc.start-url"), None);
+        // Signing out before an in-app login only drops the login rows
+        mgr.clear_host_live(ToolKind::Kiro).unwrap();
+        assert_eq!(kiro_value(&c, "auth_kv", "kirocli:odic:device-registration"), None);
+        assert_eq!(kiro_value(&c, "state", "telemetryClientId").as_deref(), Some("keep-me"));
+
+        // The probe's email replaces the workspace label
+        mgr.update_identity_if_missing(ToolKind::Kiro, &a.id, Some("dev@acme.com"), None);
+        assert_eq!(mgr.get_stored(ToolKind::Kiro, &a.id).unwrap().label, "dev@acme.com");
+    }
+
+    #[test]
+    fn codebuddy_oauth_swaps_extension_auth_file() {
+        let (_t, base, home) = temp_dirs();
+        let file = home.join(CODEBUDDY_AUTH_FILE);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        let login = |uid: &str, nick: &str| {
+            serde_json::json!({"account": {"uid": uid, "nickname": nick}, "auth": {"accessToken": format!("tok-{uid}"), "domain": "www.codebuddy.cn"}, "accounts": []}).to_string()
+        };
+        std::fs::write(&file, login("u1", "alice")).unwrap();
+        let mgr = AccountManager::with_dirs(base, home);
+        let a = mgr.capture(ToolKind::Codebuddy, None).unwrap();
+        assert_eq!((a.label.as_str(), a.identity.account_key.as_deref(), a.identity.workspace.as_deref()), ("alice", Some("u1"), Some("www.codebuddy.cn")));
+
+        std::fs::write(&file, login("u2", "bob")).unwrap();
+        let b = mgr.capture(ToolKind::Codebuddy, None).unwrap();
+        let st = mgr.probe_native_status(ToolKind::Codebuddy, &mgr.all_accounts_for_tool(ToolKind::Codebuddy), Some(&b.id));
+        assert_eq!((st.logged_in, st.matched_account_id.as_deref()), (true, Some(b.id.as_str())));
+
+        assert!(mgr.activate(ToolKind::Codebuddy, &a.id).unwrap().host_switched);
+        assert!(std::fs::read_to_string(&file).unwrap().contains("tok-u1"));
+        // b's snapshot kept what was live when it was swapped out
+        assert!(mgr.activate(ToolKind::Codebuddy, &b.id).unwrap().host_switched);
+        assert!(std::fs::read_to_string(&file).unwrap().contains("tok-u2"));
+        assert!(!AccountManager::capability(ToolKind::Codebuddy).supports_interactive_login);
+    }
+
+    #[test]
+    fn codebuddy_api_key_uses_its_own_variables() {
+        let (_t, base, home) = temp_dirs();
+        let mgr = AccountManager::with_dirs(base, home);
+        let v = mgr
+            .save(SaveAccountRequest {
+                tool: ToolKind::Codebuddy,
+                auth_kind: Some(AccountAuthKind::ApiKey),
+                api_config: Some(ApiKeyConfig { api_key: "ck".into(), base_url: "https://cb.example".into(), default_model: "glm-4.7".into(), ..Default::default() }),
+                ..Default::default()
+            })
+            .unwrap();
+        let env = mgr.resolve(ToolKind::Codebuddy, Some(&v.id)).unwrap().env;
+        assert_eq!(env.get("CODEBUDDY_API_KEY").map(String::as_str), Some("ck"));
+        assert_eq!(env.get("CODEBUDDY_BASE_URL").map(String::as_str), Some("https://cb.example"));
+        assert_eq!(env.get("CODEBUDDY_MODEL").map(String::as_str), Some("glm-4.7"));
+        assert!(!env.contains_key("OPENAI_BASE_URL") && !env.contains_key("AUTH_TOKEN"));
     }
 
     #[test]

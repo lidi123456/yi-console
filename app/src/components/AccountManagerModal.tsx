@@ -378,6 +378,11 @@ export function AccountManagerModal({
     }
     void startLogin();
   };
+  // Tools whose API key profile is a single variable (the form hides the other fields)
+  const keyVar = tool === 'qoder' ? 'QODER_PERSONAL_ACCESS_TOKEN' : tool === 'kiro' ? 'KIRO_API_KEY' : undefined;
+  const keyOnly = keyVar !== undefined;
+  // CodeBuddy has no CLI login command: its accounts come from capturing a login made in the terminal
+  const canLogin = summary ? summary.supportsInteractiveLogin || summary.supportsDeviceAuth : true;
 
   const handleSendLoginInput = async () => {
     if (!loginJob) return;
@@ -711,7 +716,7 @@ export function AccountManagerModal({
               <Icon name="download" size={14} /> {tx('captureCodexOauth')}
             </button>
           )}
-          {(summary?.supportsOauth ?? true) && (
+          {(summary?.supportsOauth ?? true) && canLogin && (
             <button className="btn small" disabled={busy || loginJob?.running} onClick={handleLoginClick}>
               <Icon name="key" size={14} /> {tx('oauthLogin')}
             </button>
@@ -756,6 +761,8 @@ export function AccountManagerModal({
             </button>
           )}
         </div>
+        {tool === 'codebuddy' && !canLogin && <div className="muted small">{tx('codebuddyLoginHint')}</div>}
+        {tool === 'kiro' && <div className="muted small">{tx('kiroLoginHint')}</div>}
 
         {loginJob && (
           <div className="acc-panel">
@@ -894,15 +901,16 @@ export function AccountManagerModal({
             {form.authKind === 'apiKey' && (
               <>
                 <div className="acc-form-grid">
-                  <label>
+                  <label title={keyVar}>
                     {tool === 'cursor' ? tx('fieldCursorApiKey') : tx('fieldApiKey')}
                     <input
                       value={form.apiKey}
-                      placeholder={tool === 'cursor' ? tx('fieldCursorApiKeyPlaceholder') : undefined}
+                      placeholder={tool === 'cursor' ? tx('fieldCursorApiKeyPlaceholder') : keyVar}
                       onChange={(e) => setForm({ ...form, apiKey: e.target.value })}
                     />
                   </label>
-                  {tool !== 'cursor' && (
+                  {/* qodercli and kiro-cli take only a token / API key: no auth token, base URL or model setting */}
+                  {tool !== 'cursor' && !keyOnly && (
                     <label>
                       {tx('fieldAuthToken')}
                       <input
@@ -911,15 +919,17 @@ export function AccountManagerModal({
                       />
                     </label>
                   )}
-                  <label title={tool === 'cursor' ? 'CURSOR_API_ENDPOINT' : undefined}>
-                    {tool === 'cursor' ? tx('fieldCursorEndpoint') : tx('fieldBaseUrl')}
-                    <input
-                      value={form.baseUrl}
-                      placeholder={tool === 'cursor' ? 'https://api2.cursor.sh' : 'https://...'}
-                      onChange={(e) => setForm({ ...form, baseUrl: e.target.value })}
-                    />
-                  </label>
-                  {tool !== 'cursor' && (
+                  {!keyOnly && (
+                    <label title={tool === 'cursor' ? 'CURSOR_API_ENDPOINT' : undefined}>
+                      {tool === 'cursor' ? tx('fieldCursorEndpoint') : tx('fieldBaseUrl')}
+                      <input
+                        value={form.baseUrl}
+                        placeholder={tool === 'cursor' ? 'https://api2.cursor.sh' : 'https://...'}
+                        onChange={(e) => setForm({ ...form, baseUrl: e.target.value })}
+                      />
+                    </label>
+                  )}
+                  {tool !== 'cursor' && !keyOnly && (
                     <label>
                       {tx('fieldDefaultModel')}
                       <input
@@ -1074,7 +1084,8 @@ export function AccountManagerModal({
                         <Icon name="check" size={14} /> {tx('setDefault')}
                       </button>
                     )}
-                    {acc.authKind === 'oauth' && (
+                    {/* Kiro's in-app sign-in is Builder ID only: re-signing a Google / GitHub / Identity Center account would replace it */}
+                    {acc.authKind === 'oauth' && canLogin && (tool !== 'kiro' || acc.identity.workspace === 'Builder ID') && (
                       <button className="btn small" disabled={busy || loginJob?.running} onClick={() => void startLogin(undefined, acc.id, acc.label)}>
                         <Icon name="refresh" size={14} /> {tx('relogin')}
                       </button>

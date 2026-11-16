@@ -181,7 +181,7 @@ pub fn claude_session_exists(id: &str) -> bool {
 pub fn tool_session_exists(tool: ToolKind, id: &str) -> bool {
     let dir = match tool {
         ToolKind::Claude => return claude_session_exists(id),
-        ToolKind::Qoder => ".qoder",
+        ToolKind::Qoder => return find_qoder_file(id).is_some(),
         ToolKind::Codebuddy => ".codebuddy",
         _ => return true,
     };
@@ -202,19 +202,38 @@ pub(crate) fn qoder_root() -> PathBuf {
     projects_root(".qoder")
 }
 
+/// All Qoder projects directories (host default plus every managed account's `QODER_CONFIG_DIR`)
+pub(crate) fn qoder_roots() -> Vec<PathBuf> {
+    let mut roots = vec![qoder_root()];
+    let acct_dir = crate::paths::base_dir().join("accounts").join("qoder");
+    if let Ok(rd) = std::fs::read_dir(acct_dir) {
+        for e in rd.flatten() {
+            let p = e.path().join("home").join("projects");
+            if p.is_dir() && !roots.contains(&p) {
+                roots.push(p);
+            }
+        }
+    }
+    roots
+}
+
+fn qoder_files() -> Vec<PathBuf> {
+    qoder_roots().into_iter().flat_map(|r| jsonl_files(&r)).collect()
+}
+
 pub(crate) fn codebuddy_root() -> PathBuf {
     projects_root(".codebuddy")
 }
 
 /// Qoder session files have the same format as Claude's, so reuse the Claude parser
 pub(crate) fn find_qoder_file(id: &str) -> Option<PathBuf> {
-    jsonl_files(&qoder_root())
+    qoder_files()
         .into_iter()
         .find(|p| p.file_stem().and_then(|s| s.to_str()) == Some(id))
 }
 
 fn list_qoder() -> Vec<HistoryEntry> {
-    jsonl_files(&qoder_root())
+    qoder_files()
         .into_iter()
         .filter_map(|p| cached(&p, scan_claude))
         .map(|mut e| {
@@ -296,7 +315,7 @@ fn scan_codebuddy(p: &Path, mtime: i64) -> Option<HistoryEntry> {
 }
 
 pub fn tool_session_exists_in(tool: ToolKind, id: &str, data_dir: Option<&Path>) -> bool {
-    if let (ToolKind::Claude, Some(dir)) = (tool, data_dir) {
+    if let (ToolKind::Claude | ToolKind::Qoder, Some(dir)) = (tool, data_dir) {
         let root = dir.join("projects");
         let file = format!("{id}.jsonl");
         return std::fs::read_dir(root)

@@ -16,6 +16,8 @@
   "captureLocalOauth": "抓取本地授权登录",
   "capturePrompt": "新账号名称（留空则自动生成，始终作为新账号保存）",
   "oauthLogin": "OAuth / CLI 登录",
+  "kiroLoginHint": "应用内登录使用 Builder ID 设备码。要用 Google、GitHub 或组织账号（Identity Center）登录，请在终端运行 kiro-cli login，登录后点「抓取当前登录为新账号」。",
+  "codebuddyLoginHint": "CodeBuddy 没有独立的登录命令：在终端运行 codebuddy，输入 /login 登录后，点「抓取当前登录为新账号」。CodeBuddy IDE 插件和命令行共用登录凭据，切换账号会同时切换插件里的账号。",
   "loginDeviceAuth": "Device Auth 设备码登录（支持远程 / 无浏览器主机）",
   "loginInteractive": "交互式 CLI 登录（链接 / 回调粘贴）",
   "addApiKey": "添加 API Key / 自定义接口",

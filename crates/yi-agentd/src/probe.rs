@@ -408,6 +408,27 @@ fn kiro_quota(r: &Value) -> Value {
     json!({ "account": {"plan": d["planName"]}, "windows": windows, "note": note })
 }
 
+/// The signed-in email from `kiro-cli whoami --format json` (first line `{"accountType", "email", "region", "startUrl"}`,
+/// followed by the profile as plain text); Kiro's login rows don't hold it
+async fn kiro_whoami_email(settings: &DaemonSettings, penv: &ProbeEnv) -> Option<String> {
+    let program = crate::tools::resolve(ToolKind::Kiro, settings)?;
+    let args = ["whoami".to_string(), "--format".to_string(), "json".to_string()];
+    let mut cmd: tokio::process::Command = adapters::std_command(&program, &args).into();
+    for k in &penv.env_unset {
+        cmd.env_remove(k);
+    }
+    for (k, v) in &penv.env {
+        cmd.env(k, v);
+    }
+    cmd.stdin(std::process::Stdio::null()).kill_on_drop(true);
+    #[cfg(windows)]
+    cmd.creation_flags(0x0800_0000);
+    let out = tokio::time::timeout(TIMEOUT, cmd.output()).await.ok()?.ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let v: Value = serde_json::from_str(text.lines().find(|l| l.trim_start().starts_with('{'))?).ok()?;
+    v["email"].as_str().filter(|s| !s.is_empty()).map(str::to_string)
+}
+
 fn fmt_num(x: f64) -> String {
     if x.fract() == 0.0 {
         format!("{x:.0}")
@@ -788,13 +809,14 @@ fn cursor_quota(usage: &Value, plan: &Value, hard: &Value) -> Value {
 }
 
 /// Qoder: send get_usage_info over the stream-json control protocol to get the credit quota (--no-session-persistence avoids leaving an empty session)
-async fn qoder_account(settings: &DaemonSettings) -> Result<Value> {
+async fn qoder_account(settings: &DaemonSettings, penv: &ProbeEnv) -> Result<Value> {
     let mut account = Value::Null;
     let mut quota = Value::Null;
     let init = json!({"type":"control_request","request_id":"init","request":{"subtype":"initialize"}});
-    converse(
+    converse_env(
         ToolKind::Qoder,
         settings,
+        penv,
         &["-p", "--no-session-persistence", "--input-format", "stream-json", "--output-format", "stream-json"],
         vec![init],
         |v| {
@@ -1105,10 +1127,18 @@ async fn run_with_env(
     match tool {
         ToolKind::Claude => claude(settings, penv, want_quota).await,
         ToolKind::Codex => codex(settings, penv, want_quota).await,
-        ToolKind::Kiro => acp(tool, settings, penv, want_quota).await,
+        ToolKind::Kiro => {
+            let mut p = acp(tool, settings, penv, want_quota).await?;
+            if let Some(q) = p.quota.as_mut().filter(|q| q["account"]["email"].is_null()) {
+                if let Some(email) = kiro_whoami_email(settings, penv).await {
+                    q["account"]["email"] = json!(email);
+                }
+            }
+            Ok(p)
+        }
         ToolKind::Qoder if want_quota => Ok(Probe {
             models: vec![],
-            quota: Some(qoder_account(settings).await?),
+            quota: Some(qoder_account(settings, penv).await?),
         }),
         ToolKind::Codebuddy if want_quota => Ok(Probe {
             models: vec![],

@@ -16,6 +16,8 @@
   "captureLocalOauth": "Capture Local OAuth Login",
   "capturePrompt": "New account label (leave empty to auto-name; always saves as a new profile)",
   "oauthLogin": "OAuth / CLI Sign-In",
+  "kiroLoginHint": "In-app sign-in uses a Builder ID device code. To sign in with Google, GitHub or your organization (Identity Center), run kiro-cli login in a terminal, then click “Capture Current Login as New”.",
+  "codebuddyLoginHint": "CodeBuddy has no separate sign-in command: run codebuddy in a terminal, sign in with /login, then click “Capture Current Login as New”. The CodeBuddy IDE extension shares this login, so switching accounts here switches the extension's account too.",
   "loginDeviceAuth": "Device Auth (works on headless / remote hosts)",
   "loginInteractive": "Interactive CLI Sign-In (link / callback paste)",
   "addApiKey": "Add API Key / Custom Endpoint",

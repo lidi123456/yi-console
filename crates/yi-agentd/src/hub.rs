@@ -638,7 +638,7 @@ impl Hub {
             (None, None)
         };
         if let (Some(rid), Some(aid)) = (&p.resume_id, &account_id) {
-            if matches!(tool, ToolKind::Codex | ToolKind::Claude) {
+            if matches!(tool, ToolKind::Codex | ToolKind::Claude | ToolKind::Qoder) {
                 let target_dir = self.accounts.resolve_exact(tool, aid).and_then(|r| r.data_dir);
                 if !crate::history::tool_session_exists_in(tool, rid, target_dir.as_deref()) {
                     let _ = self.accounts.copy_session_history_for_switch(tool, None, aid, rid);
@@ -3319,7 +3319,7 @@ impl Hub {
     ) -> SessionInfo {
         let cur = rt.info.lock().unwrap().clone();
         let copied = if let Some(ext) = cur.external_id.as_deref() {
-            if matches!(cur.tool, ToolKind::Codex | ToolKind::Claude) {
+            if matches!(cur.tool, ToolKind::Codex | ToolKind::Claude | ToolKind::Qoder) {
                 self.accounts
                     .copy_session_history_for_switch(cur.tool, cur.account_id.as_deref(), &to_acc.id, ext)
                     .unwrap_or(false)
