@@ -60,7 +60,7 @@
   "fieldCursorApiKeyPlaceholder": "crsr_... 或 key_...",
   "fieldAuthToken": "Auth Token（可选）",
   "fieldBaseUrl": "Base URL（可选）",
-  "fieldCursorEndpoint": "API Endpoint（CURSOR_API_ENDPOINT，可选）",
+  "fieldCursorEndpoint": "API Endpoint（可选）",
   "cursorApiKeyHint": "保存时会自动校验 Key 并读取账号邮箱与套餐；API Key 仅在会话进程内存中生效，不会修改或覆盖宿主本地授权登录。",
   "fieldDefaultModel": "默认模型（可选）",
   "fieldProviderName": "Provider 名称（Codex 自定义接口可选）",

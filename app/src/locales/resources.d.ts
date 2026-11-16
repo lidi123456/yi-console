@@ -32,7 +32,7 @@ export default interface Resources {
     "fieldBaseUrl": "Base URL（可选）",
     "fieldCursorApiKey": "CURSOR_API_KEY",
     "fieldCursorApiKeyPlaceholder": "crsr_... 或 key_...",
-    "fieldCursorEndpoint": "API Endpoint（CURSOR_API_ENDPOINT，可选）",
+    "fieldCursorEndpoint": "API Endpoint（可选）",
     "fieldDefaultModel": "默认模型（可选）",
     "fieldExtraEnv": "附加环境变量（每行 KEY=VALUE，可选）",
     "fieldExtraEnvPlaceholder": "例如 API_TIMEOUT_MS=60000",

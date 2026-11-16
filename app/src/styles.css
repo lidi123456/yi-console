@@ -3181,6 +3181,10 @@ textarea {
   grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
   gap: 8px;
 }
+/* Keep inputs in one row aligned when a label wraps to two lines. */
+.acc-form-grid > label {
+  justify-content: flex-end;
+}
 .acc-code {
   padding: 2px 8px;
   border-radius: 6px;

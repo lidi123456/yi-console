@@ -854,7 +854,7 @@ export function AccountManagerModal({
                       />
                     </label>
                   )}
-                  <label>
+                  <label title={tool === 'cursor' ? 'CURSOR_API_ENDPOINT' : undefined}>
                     {tool === 'cursor' ? tx('fieldCursorEndpoint') : tx('fieldBaseUrl')}
                     <input
                       value={form.baseUrl}

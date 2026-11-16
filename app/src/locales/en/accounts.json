@@ -60,7 +60,7 @@
   "fieldCursorApiKeyPlaceholder": "crsr_... or key_...",
   "fieldAuthToken": "Auth Token (optional)",
   "fieldBaseUrl": "Base URL (optional)",
-  "fieldCursorEndpoint": "API Endpoint (CURSOR_API_ENDPOINT, optional)",
+  "fieldCursorEndpoint": "API Endpoint (optional)",
   "cursorApiKeyHint": "Validates the key and fetches email/plan on save; runs with in-memory credentials so local OAuth login is never overwritten.",
   "fieldDefaultModel": "Default Model (optional)",
   "fieldProviderName": "Provider Name (Codex, optional)",
