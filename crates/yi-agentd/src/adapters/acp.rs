@@ -124,6 +124,9 @@ struct State {
     compacting: Option<i64>,
     /// The last prompt we sent was /compact, so the next compaction is manual
     compact_manual: bool,
+    /// Cursor has no compaction over ACP; /compact is emulated (`cursor_compact_start`). `compacting` holds the queue meanwhile
+    is_cursor: bool,
+    cursor_compact: Option<CursorCompact>,
     /// Antigravity (`agy acp`): tracks asynchronous subagents and background tasks spawned in the current turn
     is_antigravity: bool,
     agy_pre_turn_steps: usize,
@@ -214,6 +217,7 @@ pub async fn run(spec: StartSpec, em: Emitter, mut rx: mpsc::UnboundedReceiver<A
         perm: spec.permission_mode.clone(),
         native_modes: spec.tool == ToolKind::Antigravity,
         is_antigravity: spec.tool == ToolKind::Antigravity,
+        is_cursor: spec.tool == ToolKind::Cursor,
         effort: spec.effort.clone().filter(|e| !e.is_empty() && spec.tool == ToolKind::Antigravity),
         desktop_notice: spec.mcp_servers.iter().any(|server| server["name"] == crate::mcp::DESKTOP_SERVER),
         system_notice: super::acp_system_notice(&spec),
@@ -500,6 +504,11 @@ fn prompt(st: &mut State, em: &Emitter, p: &Prompt) -> Value {
         _ => 0,
     };
     let sid = st.session_id.clone().unwrap_or_default();
+    if st.is_cursor {
+        if let Some((prior, extra)) = split_compact(&p.text) {
+            return cursor_compact_start(st, em, &prior, extra);
+        }
+    }
     let mut blocks = vec![];
     if !p.images.is_empty() {
         if st.image_ok {
@@ -635,6 +644,15 @@ fn chunk(st: &mut State, em: &Emitter, seg: Seg, text: &str) {
     if seg != Seg::User && !st.loading && !st.subagents.is_empty() {
         return;
     }
+    // The emulated /compact's summary is handed to the next session, not shown as a reply
+    if !st.loading {
+        if let Some(c) = st.cursor_compact.as_mut().filter(|c| !c.replacing) {
+            if seg == Seg::Agent {
+                c.summary.push_str(text);
+            }
+            return;
+        }
+    }
     let same = matches!(&st.seg, Some((s, _, _)) if *s == seg);
     if !same {
         flush(st, em);
@@ -703,6 +721,11 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Result<V
                          先退出那个 Kiro（比如关掉运行 kiro-cli 的终端窗口），再恢复会话"
                     ));
                 }
+            }
+            if st.cursor_compact.is_some() && matches!(kind, Pending::Prompt | Pending::Session) {
+                let msg = if kind == Pending::Session { format!("压缩上下文时创建新会话失败: {msg}") } else { msg };
+                cursor_compact_fail(st, em, Some(msg), "error");
+                return Ok(out);
             }
             return match kind {
                 // If the process went away after the session was created but before anything was said, some tools (Cursor) never saved the session and load reports not found.
@@ -804,6 +827,16 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Result<V
             }
             Pending::Auth => out.push(new_or_load(st, spec)),
             Pending::Session | Pending::Load => {
+                // The fresh session that replaces the compacted one
+                let compacted = match &st.cursor_compact {
+                    Some(c) if c.replacing && kind == Pending::Session => st.cursor_compact.take(),
+                    _ => None,
+                };
+                if let Some(c) = &compacted {
+                    // Sent after the model switch below, like the parameters restored on a resume
+                    st.config_queue = c.saved.clone();
+                    st.wanted = c.saved.clone();
+                }
                 if let Some(sid) = r["sessionId"].as_str() {
                     st.session_id = Some(sid.to_string());
                     em.external_id(sid);
@@ -911,9 +944,14 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Result<V
                         out.push(m);
                     }
                 }
-                if st.queue.is_empty() {
+                if let Some(c) = compacted {
+                    cursor_compact_done(st, spec, em, c);
+                } else if st.queue.is_empty() {
                     em.status(SessionStatus::Idle, None);
                 }
+            }
+            Pending::Prompt if st.cursor_compact.is_some() => {
+                out.extend(cursor_compact_summarized(st, spec, em, r));
             }
             Pending::Prompt => {
                 flush(st, em);
@@ -1228,6 +1266,130 @@ fn new_or_load(st: &mut State, spec: &StartSpec) -> Value {
 fn new_session(st: &mut State, spec: &StartSpec) -> Value {
     let cwd = spec.cwd.display().to_string();
     st.req(Pending::Session, "session/new", json!({"cwd":cwd,"mcpServers":spec.mcp_servers}))
+}
+
+/// Cursor's emulated /compact in progress
+#[derive(Default)]
+struct CursorCompact {
+    started: i64,
+    /// The summary the tool is writing (kept out of the chat)
+    summary: String,
+    /// The summary is done and `session/new` is out
+    replacing: bool,
+    /// The model's parameters, set again on the fresh session
+    saved: Vec<(String, String)>,
+}
+
+const CURSOR_COMPACT_PROMPT: &str = "The user ran /compact to free up context. Write a summary of this whole conversation that will \
+replace it: a fresh session will continue from your summary alone. Do not call any tools and do not continue the task. Cover the \
+user's goals and explicit requests, decisions and constraints, files and code touched (paths and the key changes), commands run and \
+their results, errors and how they were resolved, the current state, and pending next steps. Keep exact names, paths and values. \
+Reply with the summary only.";
+
+const CURSOR_COMPACT_INTRO: &str = "The earlier conversation in this session was compacted. This summary of it replaces the \
+history; continue from it without repeating completed work.";
+
+/// `/compact` or `/compact <instructions>` as typed by the user
+pub fn is_compact_command(text: &str) -> bool {
+    let t = text.trim();
+    t == "/compact" || t.strip_prefix("/compact").is_some_and(|rest| rest.starts_with(char::is_whitespace))
+}
+
+/// A /compact message, possibly behind context the hub put first (`<yi-…>…</yi-…>` blocks):
+/// returns that context and the user's extra instructions
+fn split_compact(text: &str) -> Option<(String, String)> {
+    let mut t = text.trim_start();
+    let mut prior = vec![];
+    while t.starts_with("<yi-") {
+        let name = &t[1..t.find('>')?];
+        let close = format!("</{name}>");
+        let end = t.find(&close)? + close.len();
+        prior.push(t[..end].to_string());
+        t = t[end..].trim_start();
+    }
+    is_compact_command(t).then(|| (prior.join("\n\n"), t.trim()["/compact".len()..].trim().to_string()))
+}
+
+/// Cursor's ACP has no compaction (its terminal UI's /summarize isn't exposed), and it treats /compact as a plain prompt.
+/// So the tool writes a summary (hidden), a fresh ACP session replaces the old one, and the hub puts the summary before
+/// the next message. Messages sent meanwhile wait in the queue (`compacting`)
+fn cursor_compact_start(st: &mut State, em: &Emitter, prior: &str, extra: String) -> Value {
+    let now = now_ms();
+    st.compacting = Some(now);
+    st.cursor_compact = Some(CursorCompact { started: now, ..Default::default() });
+    em.event(EventBody::Compact { phase: "start".into(), trigger: Some("manual".into()), pre_tokens: None, post_tokens: None, duration_ms: None });
+    let mut text = CURSOR_COMPACT_PROMPT.to_string();
+    if !prior.is_empty() {
+        text.push_str("\n\nContext carried over from before this session, to include in the summary:\n");
+        text.push_str(prior);
+    }
+    if !extra.is_empty() {
+        text.push_str("\n\nAdditional instructions from the user for the summary: ");
+        text.push_str(&extra);
+    }
+    let sid = st.session_id.clone().unwrap_or_default();
+    st.req(Pending::Prompt, "session/prompt", json!({"sessionId":sid,"prompt":[{"type":"text","text":text}]}))
+}
+
+/// The summary turn ended: open the fresh session, or give up and keep the old one
+fn cursor_compact_summarized(st: &mut State, spec: &StartSpec, em: &Emitter, r: &Value) -> Vec<Value> {
+    let stop = r["stopReason"].as_str().unwrap_or("end_turn").to_string();
+    if let Some(msg) = meta_error(r) {
+        cursor_compact_fail(st, em, Some(login_hint(spec, &msg)), "error");
+        return vec![];
+    }
+    if stop == "cancelled" {
+        cursor_compact_fail(st, em, None, "cancelled");
+        return vec![];
+    }
+    let saved: Vec<(String, String)> = st.config_options.iter()
+        .filter(|o| !o.current_value.is_empty())
+        .map(|o| (o.id.clone(), o.current_value.clone()))
+        .collect();
+    let Some(c) = st.cursor_compact.as_mut() else { return vec![] };
+    c.summary = c.summary.trim().to_string();
+    if c.summary.is_empty() {
+        cursor_compact_fail(st, em, Some("压缩上下文失败：Cursor 没有返回摘要，原会话保持不变".into()), &stop);
+        return vec![];
+    }
+    c.replacing = true;
+    c.saved = saved;
+    // Stay on the model in use, not the one the session was launched with
+    if st.parameterized {
+        st.want_model = st.config_model.clone();
+    }
+    st.spec_params_stale = true;
+    st.resumed = false;
+    vec![new_session(st, spec)]
+}
+
+/// The fresh session is up: the summary waits in the hub for the next message
+fn cursor_compact_done(st: &mut State, spec: &StartSpec, em: &Emitter, c: CursorCompact) {
+    st.compacting = None;
+    st.prompting = false;
+    st.end_subagents();
+    // A new tool session hasn't seen the appended system prompt or the computer use notice
+    st.system_notice = super::acp_system_reminder(spec);
+    st.desktop_notice = spec.mcp_servers.iter().any(|server| server["name"] == crate::mcp::DESKTOP_SERVER);
+    em.pending_context(format!("<yi-compact-summary>\n{CURSOR_COMPACT_INTRO}\n\n{}\n</yi-compact-summary>", c.summary));
+    em.context(0.0);
+    let duration = u64::try_from(now_ms() - c.started).ok();
+    em.event(EventBody::Compact { phase: "done".into(), trigger: Some("manual".into()), pre_tokens: None, post_tokens: None, duration_ms: duration });
+    em.event(EventBody::TurnEnd { stop_reason: Some("end_turn".into()), model: None });
+}
+
+fn cursor_compact_fail(st: &mut State, em: &Emitter, msg: Option<String>, stop: &str) {
+    let started = st.cursor_compact.take().map(|c| c.started).unwrap_or_else(now_ms);
+    st.compacting = None;
+    st.prompting = false;
+    st.want_model = None;
+    st.end_subagents();
+    if let Some(message) = msg {
+        em.event(EventBody::Error { message });
+    }
+    let duration = u64::try_from(now_ms() - started).ok();
+    em.event(EventBody::Compact { phase: "failed".into(), trigger: Some("manual".into()), pre_tokens: None, post_tokens: None, duration_ms: duration });
+    em.event(EventBody::TurnEnd { stop_reason: Some(stop.to_string()), model: None });
 }
 
 /// Kiro writes ~/.kiro/sessions/cli/<id>.lock ({"pid":..,"started_at":..}) when it opens a session and deletes it on exit.
@@ -3667,6 +3829,74 @@ mod model_config_tests {
             mcp_servers: vec![], mcp_fingerprint: String::new(), allow_mcp: vec![], system_prompt: None, system_notice: false, cols: 80, rows: 24, tmux: None, session_id: None,
             env: Default::default(), env_unset: vec![], data_dir: None, auth_method: None, account_handoff: None,
         }
+    }
+
+    #[test]
+    fn cursor_compact_summarizes_into_a_fresh_session() {
+        let (hub, em, _rx) = crate::hub::test_emitter();
+        crate::hub::test_set_tool(&hub, "s", ToolKind::Cursor);
+        let mut spec = cursor_spec("grok-4.7");
+        spec.system_prompt = Some("be brief".into());
+        let mut st = State { is_cursor: true, parameterized: true, session_id: Some("old".into()), config_model: Some("gpt-6".into()), ..Default::default() };
+        st.config_options = vec![ModelConfigOption { id: "fast".into(), name: "Fast".into(), category: "model_config".into(), description: String::new(),
+            current_value: "true".into(), options: vec![] }];
+        // Context the hub put first (an account hand-off) goes into the summary request
+        let req = prompt(&mut st, &em, &Prompt { text: "<yi-account-handoff>\nUser: fix x\n</yi-account-handoff>\n\n/compact keep paths".into(), images: vec![] });
+        let sent = req["params"]["prompt"][0]["text"].as_str().unwrap();
+        assert!(sent.contains("Write a summary") && sent.contains("User: fix x") && sent.ends_with("keep paths"), "{sent}");
+        assert_eq!(req["params"]["prompt"].as_array().unwrap().len(), 1);
+        assert!(st.compacting.is_some());
+        // The summary is hidden from the chat
+        update(&mut st, &em, &json!({"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Goal: fix x."}}));
+        let done = handle(&mut st, &spec, &json!({"id":req["id"],"result":{"stopReason":"end_turn"}}), &em).unwrap();
+        assert_eq!(done.len(), 1);
+        assert_eq!(done[0]["method"], "session/new");
+        assert!(st.compacting.is_some() && st.prompting, "queued messages still wait");
+        handle(&mut st, &spec, &json!({"id":done[0]["id"],"result":{"sessionId":"new",
+            "configOptions":[{"id":"model","category":"model","currentValue":"auto"}]}}), &em).unwrap();
+        assert_eq!(st.session_id.as_deref(), Some("new"));
+        assert!(st.compacting.is_none() && !st.prompting && st.cursor_compact.is_none());
+        // Back on the model and parameters in use
+        assert_eq!(st.config_queue, [("model".to_string(), "gpt-6".to_string()), ("fast".into(), "true".into())]);
+        assert!(st.system_notice.as_deref().is_some_and(|n| n.contains("be brief")));
+        let pending = crate::hub::test_pending_handoff(&hub, "s").unwrap();
+        assert!(pending.starts_with("<yi-compact-summary>") && pending.contains("Goal: fix x."), "{pending}");
+        let evs: Vec<String> = hub.store.events_since("s", 0, 100).unwrap().into_iter().filter_map(|e| match e.body {
+            EventBody::AssistantText { text, .. } => Some(format!("text:{text}")),
+            EventBody::Compact { phase, trigger, .. } => Some(format!("compact:{phase}:{}", trigger.unwrap_or_default())),
+            EventBody::TurnEnd { stop_reason, .. } => Some(format!("end:{}", stop_reason.unwrap_or_default())),
+            _ => None,
+        }).collect();
+        assert_eq!(evs, ["compact:start:manual", "compact:done:manual", "end:end_turn"]);
+        assert_eq!(hub.info("s").unwrap().external_id.as_deref(), Some("new"));
+        // The next real message carries the summary ahead of the user's text
+        let next = prompt(&mut st, &em, &Prompt { text: format!("{pending}\n\ncontinue"), images: vec![] });
+        let texts: Vec<&str> = next["params"]["prompt"].as_array().unwrap().iter().map(|b| b["text"].as_str().unwrap()).collect();
+        assert!(texts[0].contains("be brief") && texts[1].ends_with("continue"), "{texts:?}");
+    }
+
+    #[test]
+    fn cursor_compact_failure_keeps_the_old_session() {
+        let (hub, em, _rx) = crate::hub::test_emitter();
+        let spec = cursor_spec("grok-4.7");
+        for (result, stop) in [(json!({"result":{"stopReason":"cancelled"}}), "cancelled"), (json!({"result":{"stopReason":"end_turn"}}), "end_turn"),
+            (json!({"error":{"code":-32603,"message":"Internal error"}}), "error")] {
+            let mut st = State { is_cursor: true, session_id: Some("old".into()), ..Default::default() };
+            let req = prompt(&mut st, &em, &Prompt { text: "/compact".into(), images: vec![] });
+            let mut resp = result.clone();
+            resp["id"] = req["id"].clone();
+            assert!(handle(&mut st, &spec, &resp, &em).unwrap().is_empty(), "no session/new for {stop}");
+            assert_eq!(st.session_id.as_deref(), Some("old"));
+            assert!(st.compacting.is_none() && !st.prompting && st.cursor_compact.is_none());
+            let last: Vec<_> = hub.store.events_since("s", 0, 1000).unwrap().into_iter().rev().take(2).map(|e| e.body).collect();
+            assert!(matches!(&last[0], EventBody::TurnEnd { stop_reason: Some(s), .. } if s == stop), "{last:?}");
+            assert!(matches!(&last[1], EventBody::Compact { phase, .. } if phase == "failed"));
+        }
+        assert!(crate::hub::test_pending_handoff(&hub, "s").is_none());
+        // Other ACP tools still get /compact as is, and only /compact is matched
+        let mut kiro = State { session_id: Some("k".into()), ..Default::default() };
+        assert_eq!(prompt(&mut kiro, &em, &Prompt { text: "/compact".into(), images: vec![] })["params"]["prompt"][0]["text"], "/compact");
+        assert!(is_compact_command(" /compact focus on tests") && !is_compact_command("/compactly") && !is_compact_command("hi /compact"));
     }
 
     #[test]

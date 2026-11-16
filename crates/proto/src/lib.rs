@@ -785,6 +785,26 @@ pub struct AccountProfileView {
     pub quota: Option<serde_json::Value>,
     #[serde(default)]
     pub updated_at: i64,
+    /// What the tool really authenticates with when it differs from `auth_kind` (Codex: a custom provider selected in config.toml)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actual: Option<ActualAuth>,
+}
+
+/// Codex's `model_provider` in config.toml, when it isn't the built-in OpenAI one: requests go to that provider,
+/// so the ChatGPT login in auth.json isn't what the tool uses
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ActualAuth {
+    /// providerApiKey (key from `env_key`) | providerOpenaiAuth (`requires_openai_auth`, auth.json sent to the provider) | providerNoAuth
+    pub method: String,
+    pub provider: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env_key: Option<String>,
+    /// The key the provider needs is available (env var set, or stored in the account)
+    #[serde(default)]
+    pub key_set: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -807,6 +827,8 @@ pub struct ToolNativeStatus {
     pub has_local_oauth: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actual: Option<ActualAuth>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1190,6 +1212,9 @@ pub mod methods {
     pub const TOOLS_ACCOUNTS_EXPORT: &str = "tools.accounts.export";
     /// Import account credential bundle on this host {bundle}
     pub const TOOLS_ACCOUNTS_IMPORT: &str = "tools.accounts.import";
+    /// Codex account whose config.toml selects a custom provider {tool, accountId, to: apiKey | oauth} -> AccountProfileView:
+    /// apiKey keeps the provider and stores its key; oauth removes `model_provider` so the ChatGPT login is used
+    pub const TOOLS_ACCOUNTS_CONVERT: &str = "tools.accounts.convert";
     /// Switch account in-place inside an existing session {sessionId, accountId}
     pub const SESSION_SWITCH_ACCOUNT: &str = "session.switchAccount";
     /// {refresh?} -> {tools: {<tool>: {latest?, error?, via?, canUpdate}}, jobs: {<tool>: ToolJob}, info: [ToolInfo]}: the newest published

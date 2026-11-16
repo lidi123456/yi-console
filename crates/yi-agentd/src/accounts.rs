@@ -12,12 +12,12 @@ use anyhow::{anyhow, bail, Result};
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use yi_proto::{
     AccountAuthKind, AccountIdentity, AccountIsolation, AccountProfileView, AccountState,
-    ApiKeyConfig, ToolAccountsSummary, ToolKind, ToolNativeStatus,
+    ActualAuth, ApiKeyConfig, ToolAccountsSummary, ToolKind, ToolNativeStatus,
 };
 
 const REDACTED: &str = "********";
@@ -163,6 +163,8 @@ pub struct AccountManager {
     data: Mutex<AccountsFile>,
     runtime: Mutex<HashMap<(ToolKind, String), (AccountState, Option<String>)>>,
     host_lock: Mutex<()>,
+    /// Host environment as seen by tests (None: the real one, `tools::host_env_var`)
+    test_env: Mutex<Option<HashMap<String, String>>>,
 }
 
 impl AccountManager {
@@ -182,7 +184,107 @@ impl AccountManager {
             data: Mutex::new(data),
             runtime: Mutex::new(HashMap::new()),
             host_lock: Mutex::new(()),
+            test_env: Mutex::new(None),
         }
+    }
+
+    /// A host environment variable (Windows: also the registry, so values set after the daemon started count)
+    fn host_env(&self, name: &str) -> Option<String> {
+        if let Some(env) = self.test_env.lock().unwrap().as_ref() {
+            return env.get(name).map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+        }
+        crate::tools::host_env_var(name)
+    }
+
+    #[cfg(test)]
+    fn set_test_env(&self, vars: &[(&str, &str)]) {
+        *self.test_env.lock().unwrap() = Some(vars.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect());
+    }
+
+    /// What a Codex home's config.toml makes Codex use, when it's a custom provider. `stored_key`: the account holds the key itself
+    fn codex_actual(&self, home: &Path, stored_key: Option<&str>) -> Option<ActualAuth> {
+        let p = codex_provider(&std::fs::read_to_string(home.join("config.toml")).ok()?)?;
+        let key_set = stored_key.is_some_and(|k| !k.is_empty()) || p.env_key.as_deref().and_then(|k| self.host_env(k)).is_some();
+        Some(codex_actual_auth(p, key_set))
+    }
+
+    fn host_env_for(&self, actual: &ActualAuth) -> Option<String> {
+        actual.env_key.as_deref().and_then(|k| self.host_env(k))
+    }
+
+    /// A Codex account saved as one kind while its config.toml says another. `ApiKey`: keep the custom provider and store
+    /// its key (from the host variable named by `env_key`), so the account shows and fails over as what it is; the ChatGPT
+    /// login is kept in `auth.json.oauth-bak`. `Oauth`: drop the provider selection so the ChatGPT login is used (restoring that backup)
+    pub fn convert_codex(&self, account_id: &str, to: AccountAuthKind) -> Result<AccountProfileView> {
+        let home = self.profile_home(ToolKind::Codex, account_id);
+        let backup = home.join("auth.json.oauth-bak");
+        let mut g = self.data.lock().unwrap();
+        let td = g.tools.entry(ToolKind::Codex.as_str().to_string()).or_default();
+        let labels: Vec<String> = td.accounts.iter().filter(|a| a.id != account_id).map(|a| a.label.clone()).collect();
+        let acc = td.accounts.iter_mut().find(|a| a.id == account_id).ok_or_else(|| anyhow!("账号 {account_id} 不存在"))?;
+        match to {
+            AccountAuthKind::ApiKey => {
+                if acc.auth_kind == AccountAuthKind::ApiKey {
+                    bail!("这个账号已经是 API Key 账号");
+                }
+                let Some(actual) = self.codex_actual(&home, None) else {
+                    bail!("这个账号的 config.toml 没有选择自定义 provider，它使用的就是 ChatGPT 授权");
+                };
+                let Some(env_key) = actual.env_key.clone() else {
+                    bail!("provider {} 没有配置 env_key，无法转为 API Key 账号", actual.provider);
+                };
+                let Some(key) = self.host_env(&env_key) else {
+                    bail!("环境变量 {env_key} 未设置，无法转为 API Key 账号");
+                };
+                let auth = home.join("auth.json");
+                if auth.is_file() && !backup.exists() {
+                    std::fs::copy(&auth, &backup)?;
+                    crate::util::restrict_file(&backup);
+                }
+                let cfg = ApiKeyConfig {
+                    api_key: key,
+                    base_url: actual.base_url.clone().unwrap_or_default(),
+                    provider_name: actual.provider.clone(),
+                    ..Default::default()
+                };
+                ensure_codex_profile_files(&home, Some(&cfg))?;
+                // A label that was the ChatGPT email would now name the wrong thing
+                if acc.identity.email.as_deref() == Some(acc.label.as_str()) || acc.label.is_empty() {
+                    let names: Vec<&str> = labels.iter().map(String::as_str).collect();
+                    acc.label = unique_label(format!("codex ({})", actual.provider), &names);
+                }
+                acc.auth_kind = AccountAuthKind::ApiKey;
+                acc.identity = AccountIdentity { plan: Some(actual.provider.clone()), workspace: actual.base_url.clone(), ..Default::default() };
+                acc.api_config = Some(cfg);
+            }
+            AccountAuthKind::Oauth => {
+                if acc.auth_kind == AccountAuthKind::ApiKey {
+                    let raw = std::fs::read(&backup).map_err(|_| anyhow!("这个 API Key 账号没有保存过 ChatGPT 授权，请用「重新登录」或抓取当前登录"))?;
+                    let auth = home.join("auth.json");
+                    std::fs::write(&auth, &raw)?;
+                    crate::util::restrict_file(&auth);
+                    let _ = std::fs::remove_file(&backup);
+                    acc.identity = parse_codex_auth_bytes(&raw).1;
+                    acc.auth_kind = AccountAuthKind::Oauth;
+                    acc.api_config = None;
+                } else if self.codex_actual(&home, None).is_none() {
+                    bail!("这个账号已经在使用 ChatGPT 授权");
+                }
+                let cfg_path = home.join("config.toml");
+                let raw = std::fs::read_to_string(&cfg_path).unwrap_or_default();
+                std::fs::write(&cfg_path, strip_codex_provider(&raw))?;
+                crate::util::restrict_file(&cfg_path);
+            }
+        }
+        acc.updated_at = crate::util::now_ms();
+        // The quota cached for the old kind (ChatGPT plan limits) isn't this account's any more
+        let _ = std::fs::remove_file(self.account_dir(ToolKind::Codex, account_id).join("quota.json"));
+        let stored = acc.clone();
+        let active = td.active_account_id.clone();
+        self.save_file(&g)?;
+        drop(g);
+        self.set_runtime_state(ToolKind::Codex, account_id, AccountState::Ready, None);
+        Ok(self.to_view(&stored, active.as_deref(), 0, None))
     }
 
     pub fn capability(tool: ToolKind) -> ToolCapabilities {
@@ -504,6 +606,12 @@ impl AccountManager {
             state_detail,
             quota,
             updated_at: acc.updated_at,
+            actual: (acc.tool == ToolKind::Codex)
+                .then(|| {
+                    let key = acc.api_config.as_ref().map(|c| c.api_key.as_str()).filter(|k| !k.is_empty());
+                    self.codex_actual(&self.profile_home(ToolKind::Codex, &acc.id), key)
+                })
+                .flatten(),
         }
     }
 
@@ -606,6 +714,14 @@ impl AccountManager {
                 let home = self.profile_home(ToolKind::Codex, &acc.id);
                 env.insert("CODEX_HOME".into(), home.display().to_string());
                 env_unset.extend(["OPENAI_API_KEY", "OPENAI_BASE_URL"].into_iter().map(String::from));
+                // A custom provider's key set on the host after the daemon started (Windows registry)
+                if let Some(k) = self.codex_actual(&home, None).and_then(|a| a.env_key) {
+                    if std::env::var_os(&k).map_or(true, |v| v.is_empty()) {
+                        if let Some(v) = self.host_env(&k) {
+                            env.insert(k, v);
+                        }
+                    }
+                }
                 data_dir = Some(home);
             }
             (ToolKind::Codex, AccountAuthKind::ApiKey) => {
@@ -613,10 +729,16 @@ impl AccountManager {
                 env.insert("CODEX_HOME".into(), home.display().to_string());
                 if let Some(cfg) = &acc.api_config {
                     let _ = ensure_codex_profile_files(&home, Some(cfg));
+                    // The profile's config.toml selects a custom provider: its key goes in the variable it reads,
+                    // and the base URL is the provider's own (OPENAI_BASE_URL only applies to the built-in provider)
+                    let provider_key = self.codex_actual(&home, None).and_then(|a| a.env_key);
                     if !cfg.api_key.is_empty() {
                         env.insert("OPENAI_API_KEY".into(), cfg.api_key.clone());
+                        if let Some(k) = &provider_key {
+                            env.insert(k.clone(), cfg.api_key.clone());
+                        }
                     }
-                    if !cfg.base_url.is_empty() {
+                    if !cfg.base_url.is_empty() && provider_key.is_none() {
                         env.insert("OPENAI_BASE_URL".into(), cfg.base_url.clone());
                     } else {
                         env_unset.push("OPENAI_BASE_URL".into());
@@ -840,32 +962,64 @@ impl AccountManager {
         let (auth_kind, identity, api_config, snap_to_save, set_active) = match tool {
             ToolKind::Codex => {
                 let src = self.native_codex_home();
-                let mut auth_bytes = std::fs::read(src.join("auth.json")).ok();
-                if auth_bytes.is_none() {
-                    if let Ok(kr) = keyring::snapshot_tool(ToolKind::Codex) {
-                        if let Some(item) = kr.into_iter().find(|e| !e.secret.is_empty()) {
-                            auth_bytes = Some(item.secret.into_bytes());
+                let cfg_raw = std::fs::read_to_string(src.join("config.toml")).ok();
+                let provider = cfg_raw.as_deref().and_then(codex_provider);
+                // Default to what Codex really uses: a custom provider with its own key wins over auth.json
+                let want_key = match source {
+                    Some("apiKey") => true,
+                    Some("oauth") => false,
+                    _ => provider.as_ref().is_some_and(|p| p.env_key.is_some()),
+                };
+                if want_key {
+                    let Some((p, env_key)) = provider.and_then(|p| p.env_key.clone().map(|k| (p, k))) else {
+                        bail!("~/.codex/config.toml 没有选择带 env_key 的自定义 provider，无法按 API Key 抓取");
+                    };
+                    let Some(key) = self.host_env(&env_key) else {
+                        bail!("环境变量 {env_key} 未设置，无法抓取 provider {} 的 API Key", p.id);
+                    };
+                    let dst = self.profile_home(ToolKind::Codex, &id);
+                    std::fs::create_dir_all(&dst)?;
+                    if let Some(raw) = &cfg_raw {
+                        std::fs::write(dst.join("config.toml"), raw)?;
+                    }
+                    let cfg = ApiKeyConfig {
+                        api_key: key,
+                        base_url: p.base_url.clone().unwrap_or_default(),
+                        provider_name: p.id.clone(),
+                        ..Default::default()
+                    };
+                    ensure_codex_profile_files(&dst, Some(&cfg))?;
+                    let ident = AccountIdentity { plan: Some(p.id.clone()), workspace: p.base_url.clone(), ..Default::default() };
+                    (AccountAuthKind::ApiKey, ident, Some(cfg), None, false)
+                } else {
+                    let mut auth_bytes = std::fs::read(src.join("auth.json")).ok();
+                    if auth_bytes.is_none() {
+                        if let Ok(kr) = keyring::snapshot_tool(ToolKind::Codex) {
+                            if let Some(item) = kr.into_iter().find(|e| !e.secret.is_empty()) {
+                                auth_bytes = Some(item.secret.into_bytes());
+                            }
                         }
                     }
+                    let Some(bytes) = auth_bytes else {
+                        bail!("当前系统 Codex 未登录或未找到凭据，请先在系统登录或使用应用内登录");
+                    };
+                    let dst = self.profile_home(ToolKind::Codex, &id);
+                    std::fs::create_dir_all(&dst)?;
+                    let auth_path = dst.join("auth.json");
+                    std::fs::write(&auth_path, &bytes)?;
+                    crate::util::restrict_file(&auth_path);
+                    if let Some(raw) = &cfg_raw {
+                        // Capturing the login means using it: a custom provider in the host config would bypass it
+                        std::fs::write(dst.join("config.toml"), strip_codex_provider(raw))?;
+                    }
+                    ensure_codex_profile_files(&dst, None)?;
+                    let (ak, ident, key_opt) = parse_codex_auth_bytes(&bytes);
+                    let api_cfg = key_opt.map(|k| ApiKeyConfig {
+                        api_key: k,
+                        ..Default::default()
+                    });
+                    (ak, ident, api_cfg, None, false)
                 }
-                let Some(bytes) = auth_bytes else {
-                    bail!("当前系统 Codex 未登录或未找到凭据，请先在系统登录或使用应用内登录");
-                };
-                let dst = self.profile_home(ToolKind::Codex, &id);
-                std::fs::create_dir_all(&dst)?;
-                let auth_path = dst.join("auth.json");
-                std::fs::write(&auth_path, &bytes)?;
-                crate::util::restrict_file(&auth_path);
-                if let Ok(cfg_raw) = std::fs::read_to_string(src.join("config.toml")) {
-                    std::fs::write(dst.join("config.toml"), cfg_raw)?;
-                }
-                ensure_codex_profile_files(&dst, None)?;
-                let (ak, ident, key_opt) = parse_codex_auth_bytes(&bytes);
-                let api_cfg = key_opt.map(|k| ApiKeyConfig {
-                    api_key: k,
-                    ..Default::default()
-                });
-                (ak, ident, api_cfg, None, false)
             }
             ToolKind::Claude => {
                 let src = self.native_claude_dir();
@@ -1904,11 +2058,34 @@ impl AccountManager {
                         .ok()
                         .and_then(|k| k.into_iter().find(|e| !e.secret.is_empty()).map(|e| e.secret.into_bytes()))
                 });
+                // config.toml decides what Codex really uses: a custom model_provider takes over from auth.json
+                if let Some(actual) = self.codex_actual(&self.native_codex_home(), None) {
+                    let has_oauth = bytes.as_deref().is_some_and(|b| parse_codex_auth_bytes(b).0 == AccountAuthKind::Oauth);
+                    let logged_in = actual.key_set || (actual.method == "providerOpenaiAuth" && bytes.is_some()) || actual.method == "providerNoAuth";
+                    let matched = find_codex_provider_account(self, accounts, &actual, self.host_env_for(&actual).as_deref());
+                    return ToolNativeStatus {
+                        logged_in,
+                        auth_method: Some(match actual.method.as_str() {
+                            "providerApiKey" => "provider_api_key",
+                            "providerOpenaiAuth" => "provider_openai_auth",
+                            _ => "provider_no_auth",
+                        }.into()),
+                        email: None,
+                        plan: None,
+                        env_override: None,
+                        matched_account_id: matched,
+                        env_api_key_matched_id: None,
+                        has_local_oauth: has_oauth,
+                        detail: None,
+                        actual: Some(actual),
+                    };
+                }
                 if let Some(bytes) = bytes {
                     let (ak, ident, key_opt) = parse_codex_auth_bytes(&bytes);
                     let matched = find_matching_account(accounts, &ident, ak);
                     ToolNativeStatus {
                         logged_in: true,
+                        actual: None,
                         auth_method: Some(match ak {
                             AccountAuthKind::Oauth => "chatgpt".into(),
                             AccountAuthKind::ApiKey => "api_key".into(),
@@ -1925,6 +2102,7 @@ impl AccountManager {
                     let has_env_key = std::env::var_os("OPENAI_API_KEY").is_some_and(|v| !v.is_empty());
                     ToolNativeStatus {
                         logged_in: has_env_key,
+                        actual: None,
                         auth_method: has_env_key.then(|| "env_api_key".into()),
                         email: None,
                         plan: None,
@@ -1953,6 +2131,7 @@ impl AccountManager {
                     let matched = find_matching_account(accounts, &ident, AccountAuthKind::Oauth);
                     ToolNativeStatus {
                         logged_in: true,
+                        actual: None,
                         auth_method: Some("oauth".into()),
                         email: ident.email,
                         plan: ident.plan,
@@ -1967,6 +2146,7 @@ impl AccountManager {
                         || std::env::var_os("ANTHROPIC_AUTH_TOKEN").is_some_and(|v| !v.is_empty());
                     ToolNativeStatus {
                         logged_in: has_env,
+                        actual: None,
                         auth_method: has_env.then(|| "env_api_key".into()),
                         email: None,
                         plan: None,
@@ -2005,6 +2185,7 @@ impl AccountManager {
                     };
                     ToolNativeStatus {
                         logged_in: true,
+                        actual: None,
                         auth_method: Some("env_api_key".into()),
                         email,
                         plan,
@@ -2022,6 +2203,7 @@ impl AccountManager {
                         .or_else(|| find_matching_account(accounts, &ident, AccountAuthKind::ApiKey));
                     ToolNativeStatus {
                         logged_in: true,
+                        actual: None,
                         auth_method: Some("api_key".into()),
                         email: ident.email,
                         plan: ident.plan,
@@ -2041,6 +2223,7 @@ impl AccountManager {
                     });
                     ToolNativeStatus {
                         logged_in: true,
+                        actual: None,
                         auth_method: Some("oauth".into()),
                         email: ident.email,
                         plan: ident.plan,
@@ -2053,6 +2236,7 @@ impl AccountManager {
                 } else {
                     ToolNativeStatus {
                         logged_in: false,
+                        actual: None,
                         auth_method: None,
                         email: None,
                         plan: None,
@@ -2091,6 +2275,7 @@ impl AccountManager {
                 };
                 ToolNativeStatus {
                     logged_in,
+                    actual: None,
                     auth_method: logged_in.then(|| "oauth".into()),
                     email: ident.email,
                     plan: ident.plan,
@@ -2301,6 +2486,10 @@ fn pick_label(
     let base = match (auth_kind, ident.email.as_deref()) {
         (AccountAuthKind::ApiKey, Some(email)) => format!("{email} (API Key)"),
         (_, Some(email)) => email.to_string(),
+        // Codex custom provider: named after the provider
+        (AccountAuthKind::ApiKey, None) if tool == ToolKind::Codex && ident.plan.is_some() => {
+            format!("{} ({})", tool.as_str(), ident.plan.as_deref().unwrap_or_default())
+        }
         _ => ident.workspace.clone().unwrap_or_else(|| match auth_kind {
             AccountAuthKind::Oauth => format!("{} OAuth", tool.as_str()),
             AccountAuthKind::ApiKey => {
@@ -2522,13 +2711,195 @@ fn native_cursor_extra_auth(home: &Path) -> Option<PathBuf> {
     }
 }
 
+/// The provider a Codex config.toml selects (root `model_provider`, or the active `profile`'s), unless it's the built-in OpenAI one
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CodexProvider {
+    pub id: String,
+    pub base_url: Option<String>,
+    pub env_key: Option<String>,
+    pub requires_openai_auth: bool,
+    pub bearer_token: bool,
+}
+
+/// `key = value` lines of a TOML file with the table each is in. Enough for Codex's provider settings
+/// (plain tables, string / bool values); arrays and inline tables come back as raw text
+fn toml_entries(cfg: &str) -> Vec<(Vec<String>, String, String, usize)> {
+    let mut table: Vec<String> = vec![];
+    let mut out = vec![];
+    for (i, line) in cfg.lines().enumerate() {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with('#') {
+            continue;
+        }
+        if t.starts_with("[[") {
+            table = vec!["[[array]]".into()];
+            continue;
+        }
+        if let Some(inner) = t.strip_prefix('[') {
+            let inner = inner.split(']').next().unwrap_or("");
+            table = toml_key_path(inner);
+            continue;
+        }
+        let Some((k, v)) = t.split_once('=') else { continue };
+        let mut path = toml_key_path(k);
+        let Some(key) = path.pop() else { continue };
+        let mut full = table.clone();
+        full.extend(path);
+        out.push((full, key, toml_value(v.trim()), i));
+    }
+    out
+}
+
+/// `model_providers."my api"` -> ["model_providers", "my api"]
+fn toml_key_path(s: &str) -> Vec<String> {
+    let mut parts = vec![];
+    let mut cur = String::new();
+    let mut quote: Option<char> = None;
+    for c in s.trim().chars() {
+        match (quote, c) {
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), c) => cur.push(c),
+            (None, '"' | '\'') => quote = Some(c),
+            (None, '.') => parts.push(std::mem::take(&mut cur).trim().to_string()),
+            (None, c) => cur.push(c),
+        }
+    }
+    parts.push(cur.trim().to_string());
+    parts.retain(|p| !p.is_empty());
+    parts
+}
+
+fn toml_value(v: &str) -> String {
+    if let Some(rest) = v.strip_prefix('"') {
+        let mut out = String::new();
+        let mut esc = false;
+        for c in rest.chars() {
+            match (esc, c) {
+                (true, 'n') => { out.push('\n'); esc = false; }
+                (true, 't') => { out.push('\t'); esc = false; }
+                (true, c) => { out.push(c); esc = false; }
+                (false, '\\') => esc = true,
+                (false, '"') => break,
+                (false, c) => out.push(c),
+            }
+        }
+        return out;
+    }
+    if let Some(rest) = v.strip_prefix('\'') {
+        return rest.split('\'').next().unwrap_or("").to_string();
+    }
+    v.split('#').next().unwrap_or("").trim().to_string()
+}
+
+pub fn codex_provider(cfg: &str) -> Option<CodexProvider> {
+    let entries = toml_entries(cfg);
+    let get = |table: &[&str], key: &str| {
+        entries.iter().find(|(t, k, _, _)| k == key && t.iter().map(String::as_str).eq(table.iter().copied())).map(|e| e.2.clone())
+    };
+    let profile_provider = get(&[], "profile").and_then(|p| get(&["profiles", p.as_str()], "model_provider"));
+    let id = profile_provider.or_else(|| get(&[], "model_provider")).filter(|id| !id.is_empty() && id != "openai")?;
+    let sec = ["model_providers", id.as_str()];
+    let nonempty = |v: Option<String>| v.filter(|s| !s.trim().is_empty());
+    Some(CodexProvider {
+        base_url: nonempty(get(&sec, "base_url")),
+        env_key: nonempty(get(&sec, "env_key")),
+        requires_openai_auth: get(&sec, "requires_openai_auth").as_deref() == Some("true"),
+        bearer_token: nonempty(get(&sec, "experimental_bearer_token")).is_some(),
+        id,
+    })
+}
+
+fn codex_actual_auth(p: CodexProvider, key_set: bool) -> ActualAuth {
+    let method = if p.env_key.is_some() || p.bearer_token {
+        "providerApiKey"
+    } else if p.requires_openai_auth {
+        "providerOpenaiAuth"
+    } else {
+        "providerNoAuth"
+    };
+    ActualAuth {
+        method: method.into(),
+        key_set: key_set || p.bearer_token,
+        provider: p.id,
+        base_url: p.base_url,
+        env_key: p.env_key,
+    }
+}
+
+/// config.toml without the provider selection, so Codex uses its own login (root `model_provider`, and `profile` when that one picks the provider)
+fn strip_codex_provider(cfg: &str) -> String {
+    let entries = toml_entries(cfg);
+    let profile = entries.iter().find(|(t, k, _, _)| t.is_empty() && k == "profile").map(|e| e.2.clone());
+    let profile_picks = profile.as_deref().is_some_and(|p| {
+        entries.iter().any(|(t, k, _, _)| k == "model_provider" && t.len() == 2 && t[0] == "profiles" && t[1] == p)
+    });
+    let drop: HashSet<usize> = entries
+        .iter()
+        .filter(|(t, k, _, _)| t.is_empty() && (k == "model_provider" || (k == "profile" && profile_picks)))
+        .map(|e| e.3)
+        .collect();
+    let mut s: String = cfg.lines().enumerate().filter(|(i, _)| !drop.contains(i)).map(|(_, l)| format!("{l}\n")).collect();
+    if !cfg.ends_with('\n') && s.ends_with('\n') {
+        s.pop();
+    }
+    s
+}
+
+/// The custom provider's `base_url` in config.toml set to `url`
+fn set_codex_provider_base_url(cfg: &str, provider: &str, url: &str) -> String {
+    let entries = toml_entries(cfg);
+    let is_sec = |t: &Vec<String>| t.len() == 2 && t[0] == "model_providers" && t[1] == provider;
+    let line = format!("base_url = {url:?}");
+    let mut lines: Vec<String> = cfg.lines().map(String::from).collect();
+    if let Some(e) = entries.iter().find(|(t, k, _, _)| is_sec(t) && k == "base_url") {
+        if e.2 == url {
+            return cfg.to_string();
+        }
+        lines[e.3] = line;
+    } else if let Some(e) = entries.iter().find(|(t, _, _, _)| is_sec(t)) {
+        lines.insert(e.3, line);
+    } else {
+        return cfg.to_string();
+    }
+    let mut s = lines.join("\n");
+    if cfg.ends_with('\n') {
+        s.push('\n');
+    }
+    s
+}
+
+/// The saved account Codex is really using on the host: an API Key account holding the provider's key,
+/// else one whose profile selects the same provider
+fn find_codex_provider_account(mgr: &AccountManager, accounts: &[StoredAccount], actual: &ActualAuth, host_key: Option<&str>) -> Option<String> {
+    let by_key = host_key.filter(|k| !k.is_empty()).and_then(|k| {
+        accounts.iter().find(|a| a.auth_kind == AccountAuthKind::ApiKey && a.api_config.as_ref().is_some_and(|c| c.api_key == k))
+    });
+    by_key
+        .or_else(|| {
+            let mut same = accounts.iter().filter(|a| {
+                mgr.codex_actual(&mgr.profile_home(ToolKind::Codex, &a.id), None)
+                    .is_some_and(|x| x.provider == actual.provider && x.base_url == actual.base_url)
+            });
+            let first = same.next()?;
+            // Several accounts on one provider: only an API Key account can be told apart (by its key)
+            same.next().is_none().then_some(first)
+        })
+        .map(|a| a.id.clone())
+}
+
 /// Ensure `<codex_home>/config.toml` pins `cli_auth_credentials_store = "file"`, and for API-key
 /// profiles writes `auth.json` + optional `model` without mutating user-wide `~/.codex`.
 pub fn ensure_codex_profile_files(codex_home: &Path, api_cfg: Option<&ApiKeyConfig>) -> Result<()> {
     std::fs::create_dir_all(codex_home)?;
     let cfg_path = codex_home.join("config.toml");
     let existing = std::fs::read_to_string(&cfg_path).unwrap_or_default();
-    let updated = upsert_codex_config_toml(&existing, api_cfg.map(|c| c.default_model.as_str()).filter(|s| !s.is_empty()));
+    let mut updated = upsert_codex_config_toml(&existing, api_cfg.map(|c| c.default_model.as_str()).filter(|s| !s.is_empty()));
+    // An account on a custom provider edits that provider's URL (OPENAI_BASE_URL doesn't reach it)
+    if let Some(cfg) = api_cfg.filter(|c| !c.base_url.is_empty() && !c.provider_name.is_empty()) {
+        if codex_provider(&updated).is_some_and(|p| p.id == cfg.provider_name) {
+            updated = set_codex_provider_base_url(&updated, &cfg.provider_name, &cfg.base_url);
+        }
+    }
     if updated != existing {
         std::fs::write(&cfg_path, updated)?;
         crate::util::restrict_file(&cfg_path);
@@ -2902,5 +3273,123 @@ mod tests {
         };
         let win_id = mgr.parse_host_identity(ToolKind::Antigravity, &win_snap);
         assert_eq!(win_id.email.as_deref(), Some("alice@example.com"));
+    }
+
+    const GATEWAY_CFG: &str = "model = \"gpt-6.1-sol\"\nmodel_provider = \"myapi\"\n[projects.'d:\\git\\x']\ntrust_level = \"trusted\"\n\n[model_providers.myapi]\nname = \"myapi\"\nbase_url = \"https://gw.example/api/v1\"\nenv_key = \"API_GATEWAY_KEY\" # the gateway's key\nwire_api = \"responses\"\n";
+
+    fn write_codex_chatgpt_login(dir: &Path) {
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(r#"{"email":"a@example.com","https://api.openai.com/auth":{"chatgpt_plan_type":"plus","chatgpt_account_id":"acct_1"}}"#);
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(
+            dir.join("auth.json"),
+            serde_json::json!({ "auth_mode": "chatgpt", "OPENAI_API_KEY": null, "tokens": { "id_token": format!("eyJhbGciOiJub25lIn0.{payload}.sig"), "account_id": "acct_1" } }).to_string(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn codex_provider_is_read_from_config_toml() {
+        let p = codex_provider(GATEWAY_CFG).unwrap();
+        assert_eq!(p, CodexProvider { id: "myapi".into(), base_url: Some("https://gw.example/api/v1".into()), env_key: Some("API_GATEWAY_KEY".into()), requires_openai_auth: false, bearer_token: false });
+        assert!(codex_provider("model = \"x\"\n").is_none());
+        assert!(codex_provider("model_provider = \"openai\"\n").is_none());
+        // The active profile's provider wins; quoted table names
+        let prof = "profile = \"work\"\nmodel_provider = \"openai\"\n[profiles.work]\nmodel_provider = 'az ure'\n[model_providers.\"az ure\"]\nrequires_openai_auth = true\n";
+        let p = codex_provider(prof).unwrap();
+        assert_eq!((p.id.as_str(), p.requires_openai_auth, p.env_key), ("az ure", true, None));
+        // Keys inside other tables don't count as the root selection
+        assert!(codex_provider("[profiles.x]\nmodel_provider = \"myapi\"\n").is_none());
+        let stripped = strip_codex_provider(GATEWAY_CFG);
+        assert!(codex_provider(&stripped).is_none() && stripped.contains("[model_providers.myapi]") && stripped.contains("model = \"gpt-6.1-sol\""));
+        assert!(codex_provider(&strip_codex_provider(prof)).is_none());
+        let moved = set_codex_provider_base_url(GATEWAY_CFG, "myapi", "https://gw2.example/v1");
+        assert_eq!(codex_provider(&moved).unwrap().base_url.as_deref(), Some("https://gw2.example/v1"));
+    }
+
+    #[test]
+    fn codex_native_status_shows_the_provider_in_use() {
+        let (_t, base, home) = temp_dirs();
+        let native = home.join(".codex");
+        write_codex_chatgpt_login(&native);
+        std::fs::write(native.join("config.toml"), GATEWAY_CFG).unwrap();
+        let mgr = AccountManager::with_dirs(base, home);
+        mgr.set_test_env(&[("API_GATEWAY_KEY", "gw-secret")]);
+        let st = mgr.probe_native_status(ToolKind::Codex, &[], None);
+        assert!(st.logged_in);
+        assert_eq!(st.auth_method.as_deref(), Some("provider_api_key"));
+        assert_eq!(st.email, None, "the ChatGPT login isn't what Codex uses");
+        assert!(st.has_local_oauth);
+        let a = st.actual.unwrap();
+        assert_eq!((a.method.as_str(), a.provider.as_str(), a.env_key.as_deref(), a.key_set), ("providerApiKey", "myapi", Some("API_GATEWAY_KEY"), true));
+        mgr.set_test_env(&[]);
+        let st = mgr.probe_native_status(ToolKind::Codex, &[], None);
+        assert!(!st.logged_in && !st.actual.unwrap().key_set);
+        // Without a provider: the ChatGPT login as before
+        std::fs::write(native_codex_cfg(&mgr), "model = \"x\"\n").unwrap();
+        let st = mgr.probe_native_status(ToolKind::Codex, &[], None);
+        assert_eq!((st.auth_method.as_deref(), st.email.as_deref(), st.actual), (Some("chatgpt"), Some("a@example.com"), None));
+    }
+
+    fn native_codex_cfg(mgr: &AccountManager) -> PathBuf {
+        mgr.native_codex_home().join("config.toml")
+    }
+
+    #[test]
+    fn codex_capture_follows_the_provider_and_can_take_the_login_instead() {
+        let (_t, base, home) = temp_dirs();
+        let native = home.join(".codex");
+        write_codex_chatgpt_login(&native);
+        std::fs::write(native.join("config.toml"), GATEWAY_CFG).unwrap();
+        let mgr = AccountManager::with_dirs(base, home);
+        mgr.set_test_env(&[("API_GATEWAY_KEY", "gw-secret")]);
+        let key = mgr.capture(ToolKind::Codex, None).unwrap();
+        assert_eq!(key.auth_kind, AccountAuthKind::ApiKey);
+        assert_eq!(key.label, "codex (myapi)");
+        assert_eq!(key.actual.as_ref().unwrap().provider, "myapi");
+        let res = mgr.resolve(ToolKind::Codex, Some(&key.id)).unwrap();
+        assert_eq!(res.env.get("API_GATEWAY_KEY").map(String::as_str), Some("gw-secret"));
+        assert!(!res.env.contains_key("OPENAI_BASE_URL") && res.env_unset.contains(&"OPENAI_BASE_URL".to_string()));
+        let stored: Vec<StoredAccount> = mgr.data.lock().unwrap().tools["codex"].accounts.clone();
+        let st = mgr.probe_native_status(ToolKind::Codex, &stored, None);
+        assert_eq!(st.matched_account_id.as_deref(), Some(key.id.as_str()));
+
+        let login = mgr.capture_with_source(ToolKind::Codex, None, Some("oauth")).unwrap();
+        assert_eq!((login.auth_kind, login.identity.email.as_deref(), login.actual.clone()), (AccountAuthKind::Oauth, Some("a@example.com"), None));
+        let cfg = std::fs::read_to_string(mgr.profile_home(ToolKind::Codex, &login.id).join("config.toml")).unwrap();
+        assert!(codex_provider(&cfg).is_none() && cfg.contains("gpt-6.1-sol"));
+        mgr.set_test_env(&[]);
+        assert!(mgr.capture_with_source(ToolKind::Codex, None, Some("apiKey")).unwrap_err().to_string().contains("API_GATEWAY_KEY"));
+    }
+
+    #[test]
+    fn codex_oauth_account_on_a_provider_converts_both_ways() {
+        let (_t, base, home) = temp_dirs();
+        let native = home.join(".codex");
+        write_codex_chatgpt_login(&native);
+        std::fs::write(native.join("config.toml"), "model = \"x\"\n").unwrap();
+        let mgr = AccountManager::with_dirs(base, home);
+        mgr.set_test_env(&[("API_GATEWAY_KEY", "gw-secret")]);
+        // Captured before: an OAuth account whose copied config.toml routes to the gateway
+        let acc = mgr.capture(ToolKind::Codex, None).unwrap();
+        let profile = mgr.profile_home(ToolKind::Codex, &acc.id);
+        std::fs::write(profile.join("config.toml"), GATEWAY_CFG).unwrap();
+        let view = mgr.to_view(&mgr.get_stored(ToolKind::Codex, &acc.id).unwrap(), None, 0, None);
+        assert_eq!((view.auth_kind, view.actual.as_ref().unwrap().method.as_str()), (AccountAuthKind::Oauth, "providerApiKey"));
+        let res = mgr.resolve(ToolKind::Codex, Some(&acc.id)).unwrap();
+        assert!(res.env.contains_key("API_GATEWAY_KEY") || std::env::var_os("API_GATEWAY_KEY").is_some());
+
+        let key = mgr.convert_codex(&acc.id, AccountAuthKind::ApiKey).unwrap();
+        assert_eq!((key.auth_kind, key.label.as_str(), key.identity.email.clone()), (AccountAuthKind::ApiKey, "codex (myapi)", None));
+        assert_eq!(key.api_config.as_ref().unwrap().base_url, "https://gw.example/api/v1");
+        assert!(profile.join("auth.json.oauth-bak").is_file());
+        assert_eq!(mgr.resolve(ToolKind::Codex, Some(&acc.id)).unwrap().env.get("API_GATEWAY_KEY").map(String::as_str), Some("gw-secret"));
+        assert!(mgr.convert_codex(&acc.id, AccountAuthKind::ApiKey).is_err());
+
+        let back = mgr.convert_codex(&acc.id, AccountAuthKind::Oauth).unwrap();
+        assert_eq!((back.auth_kind, back.identity.email.as_deref(), back.actual), (AccountAuthKind::Oauth, Some("a@example.com"), None));
+        let auth = std::fs::read_to_string(profile.join("auth.json")).unwrap();
+        assert!(auth.contains("acct_1") && !profile.join("auth.json.oauth-bak").exists());
+        assert!(mgr.convert_codex(&acc.id, AccountAuthKind::Oauth).is_err());
     }
 }

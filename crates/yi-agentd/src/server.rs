@@ -688,6 +688,24 @@ pub async fn dispatch(
             .await??;
             serde_json::to_value(view)?
         }
+        TOOLS_ACCOUNTS_CONVERT => {
+            let tool = ToolKind::parse(s(&p, "tool")?).ok_or_else(|| anyhow!("未知工具"))?;
+            if tool != ToolKind::Codex {
+                return Err(anyhow!("只有 Codex 账号可以转换"));
+            }
+            let account_id = s(&p, "accountId")?.to_string();
+            let to = serde_json::from_value::<AccountAuthKind>(p["to"].clone()).map_err(|_| anyhow!("to 必须是 apiKey 或 oauth"))?;
+            let hub2 = hub.clone();
+            let view = tokio::task::spawn_blocking(move || {
+                let v = hub2.accounts.convert_codex(&account_id, to)?;
+                crate::probe::clear_account_cache(tool, &v.id);
+                hub2.on_account_updated(tool, &v);
+                hub2.publish_accounts_updated(tool, v.active.then(|| v.id.clone()));
+                Ok::<_, anyhow::Error>(v)
+            })
+            .await??;
+            serde_json::to_value(view)?
+        }
         TOOLS_ACCOUNTS_DELETE => {
             let tool = ToolKind::parse(s(&p, "tool")?).ok_or_else(|| anyhow!("未知工具"))?;
             let account_id = s(&p, "accountId")?.to_string();

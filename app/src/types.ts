@@ -250,6 +250,17 @@ export interface AccountProfileView {
   stateDetail?: string | null;
   quota?: Quota | null;
   updatedAt: number;
+  /** What the tool really authenticates with (Codex: a custom provider selected in config.toml) */
+  actual?: ActualAuth | null;
+}
+
+/** Codex `model_provider` from config.toml when it isn't the built-in OpenAI one */
+export interface ActualAuth {
+  method: 'providerApiKey' | 'providerOpenaiAuth' | 'providerNoAuth' | string;
+  provider: string;
+  baseUrl?: string | null;
+  envKey?: string | null;
+  keySet: boolean;
 }
 
 export interface ToolNativeStatus {
@@ -262,6 +273,7 @@ export interface ToolNativeStatus {
   envApiKeyMatchedId?: string | null;
   hasLocalOauth?: boolean;
   detail?: string | null;
+  actual?: ActualAuth | null;
 }
 
 export interface ToolAccountsSummary {

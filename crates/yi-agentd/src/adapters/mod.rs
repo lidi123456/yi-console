@@ -38,9 +38,13 @@ pub fn system_text(spec: &StartSpec) -> String {
 
 /// ACP tools take no system prompt: the session's appended prompt goes with the first prompt of a new tool session
 pub fn acp_system_notice(spec: &StartSpec) -> Option<String> {
+    acp_system_reminder(spec).filter(|_| spec.system_notice)
+}
+
+/// The session's appended system prompt as sent in a prompt, whether or not this tool session has seen it
+pub fn acp_system_reminder(spec: &StartSpec) -> Option<String> {
     spec.system_prompt
         .as_ref()
-        .filter(|_| spec.system_notice)
         .map(|p| format!("<system-reminder>\n{p}\n</system-reminder>"))
 }
 

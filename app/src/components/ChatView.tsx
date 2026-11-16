@@ -104,7 +104,7 @@ function desktopStatus(ev?: HubEvent & { kind: 'computer_use' }) {
   return null;
 }
 
-/** hideCompactCmd: when the tool reports compaction progress (Claude, Codex), don't show the user's "/compact" bubble */
+/** hideCompactCmd: when the tool reports compaction progress (Claude, Codex, Cursor's emulated one), don't show the user's "/compact" bubble */
 function buildItems(events: HubEvent[], hideCompactCmd = false): Item[] {
   const items: Item[] = [];
   const tools = new Map<string, Item & { k: 'tool' }>();
@@ -1531,7 +1531,7 @@ export function ChatView({
   /** Pending permission requests are already shown elsewhere (above the input box) */
   pendingOutside?: boolean;
 }) {
-  const hideCompactCmd = info?.tool === 'claude' || info?.tool === 'codex';
+  const hideCompactCmd = info?.tool === 'claude' || info?.tool === 'codex' || info?.tool === 'cursor';
   const [, lang] = useLang();
   const items = useMemo(() => buildItems(events, hideCompactCmd), [events, events.length, hideCompactCmd, lang]);
   const [limit, setLimit] = useState(PAGE);

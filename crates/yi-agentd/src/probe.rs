@@ -187,9 +187,12 @@ fn claude_quota(account: &Value, r: &Value) -> Value {
     })
 }
 
+const CODEX_LOGIN_EXPIRED: &str = "ChatGPT 登录已失效（令牌过期且无法刷新），请点击「重新登录」";
+
 async fn codex(settings: &DaemonSettings, penv: &ProbeEnv, want_quota: bool) -> Result<Probe> {
     let mut out = Probe::default();
     let (mut account, mut limits) = (Value::Null, Value::Null);
+    let mut requires_auth = false;
     let mut waiting = 0;
     let init = json!({"id":1,"method":"initialize",
         "params":{"clientInfo":{"name":crate::adapters::codex::CLIENT_NAME,"title":"Yi Console","version":DAEMON_VERSION}}});
@@ -212,7 +215,10 @@ async fn codex(settings: &DaemonSettings, penv: &ProbeEnv, want_quota: bool) -> 
                 }
                 return Step::Send(m);
             }
-            2 => account = r["account"].clone(),
+            2 => {
+                account = r["account"].clone();
+                requires_auth = r["requiresOpenaiAuth"].as_bool().unwrap_or(false);
+            }
             3 => limits = r["rateLimits"].clone(),
             4 => out.models = adapters::codex::parse_models(r),
             _ => return Step::Wait,
@@ -225,6 +231,11 @@ async fn codex(settings: &DaemonSettings, penv: &ProbeEnv, want_quota: bool) -> 
         }
     })
     .await?;
+    // Codex reports a ChatGPT login whose tokens can't be refreshed as "no account" (and rate limits fail with 401).
+    // Say so instead of "no quota (API key billing)". Only for OAuth accounts: API key accounts have no rate limits either.
+    if want_quota && penv.auth_kind == Some(AccountAuthKind::Oauth) && account.is_null() && requires_auth {
+        bail!("{CODEX_LOGIN_EXPIRED}");
+    }
     if want_quota {
         out.quota = Some(codex_quota(&account, &limits));
     }
@@ -1311,7 +1322,15 @@ pub async fn quota(
         }
     }
 
-    let p = run_with_env(tool, settings, &penv, true).await?;
+    let p = match run_with_env(tool, settings, &penv, true).await {
+        Ok(p) => p,
+        Err(e) => {
+            if let Some(aid) = effective_id.as_deref().filter(|_| e.to_string() == CODEX_LOGIN_EXPIRED) {
+                hub.accounts.set_runtime_state(tool, aid, AccountState::NeedsLogin, Some(CODEX_LOGIN_EXPIRED.into()));
+            }
+            return Err(e);
+        }
+    };
     if !p.models.is_empty() {
         hub.remember_models(tool, &p.models);
     }

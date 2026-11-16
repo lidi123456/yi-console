@@ -9,6 +9,7 @@ import {
   type AccountProfileView,
   type AccountQuotaEntry,
   type AccountState,
+  type ActualAuth,
   type ApiKeyConfig,
   type ToolAccountsSummary,
   type ToolKind,
@@ -20,6 +21,20 @@ import { QuotaBody, quotaErrText } from './QuotaBody';
 import { askConfirm, askText, openMenu } from './Overlay';
 
 const tx = getT('accounts');
+
+/** Short name for what a Codex custom provider authenticates with */
+function actualMethodLabel(a: ActualAuth) {
+  return a.method === 'providerApiKey'
+    ? tx('actualProviderApiKey', { provider: a.provider })
+    : a.method === 'providerOpenaiAuth'
+      ? tx('actualProviderOpenaiAuth', { provider: a.provider })
+      : tx('actualProviderNoAuth', { provider: a.provider });
+}
+
+/** The provider replaces the account's ChatGPT login (an OAuth account that doesn't send that login anywhere) */
+function actualMismatch(acc: AccountProfileView) {
+  return acc.authKind === 'oauth' && !!acc.actual && acc.actual.method !== 'providerOpenaiAuth';
+}
 const ACCOUNT_TOOLS: ToolKind[] = ['claude', 'codex', 'cursor', 'kiro', 'qoder', 'codebuddy', 'antigravity'];
 
 interface FormState {
@@ -286,10 +301,16 @@ export function AccountManagerModal({
 
   const handleCapture = async (source?: 'oauth' | 'apiKey') => {
     const nativeMethod = summary?.nativeStatus?.authMethod;
+    const nativeActual = summary?.nativeStatus?.actual;
+    const isProviderCapture = tool === 'codex' && source !== 'oauth' && nativeActual?.method === 'providerApiKey';
     const isApiKeyCapture =
-      source === 'apiKey' || (!source && (nativeMethod === 'api_key' || nativeMethod === 'env_api_key'));
+      isProviderCapture ||
+      source === 'apiKey' ||
+      (!source && (nativeMethod === 'api_key' || nativeMethod === 'env_api_key'));
     const defaultAutoLabel = `${TOOL_LABEL[tool]} ${isApiKeyCapture ? 'API Key' : 'OAuth'}`;
-    const suggested = isApiKeyCapture
+    const suggested = isProviderCapture
+      ? `codex (${nativeActual!.provider})`
+      : isApiKeyCapture
       ? summary?.nativeStatus?.email
         ? `${summary.nativeStatus.email} (API Key)`
         : defaultAutoLabel
@@ -299,7 +320,9 @@ export function AccountManagerModal({
         ? tx('importCursorEnvKey')
         : source === 'oauth' && tool === 'cursor'
           ? tx('captureLocalOauth')
-          : tx('captureCurrent');
+          : source === 'oauth' && tool === 'codex'
+            ? tx('captureCodexOauth')
+            : tx('captureCurrent');
     const label = await askText({
       title,
       label: tx('capturePrompt'),
@@ -499,6 +522,30 @@ export function AccountManagerModal({
     }
   };
 
+  const handleConvert = async (acc: AccountProfileView, to: 'apiKey' | 'oauth') => {
+    const provider = acc.actual?.provider ?? '';
+    const ok = await askConfirm({
+      title: to === 'apiKey' ? tx('convertToApiKey') : tx('convertToOauth'),
+      message:
+        to === 'apiKey'
+          ? tx('convertToApiKeyConfirm', { label: acc.label, provider, env: acc.actual?.envKey ?? '' })
+          : tx('convertToOauthConfirm', { label: acc.label, provider }),
+      okText: to === 'apiKey' ? tx('convertToApiKey') : tx('convertToOauth'),
+    });
+    if (!ok) return;
+    setBusy(true);
+    try {
+      const view = await rpc<AccountProfileView>(hostId, 'tools.accounts.convert', { tool, accountId: acc.id, to });
+      toast(tx('convertedToast', { label: view.label }), 'info');
+      await loadAccounts(tool);
+      void loadToolQuotas(tool, false, false);
+    } catch (e) {
+      errorToast(e);
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const handleDelete = async (acc: AccountProfileView) => {
     const ok = await askConfirm({
       title: tx('delete'),
@@ -594,7 +641,11 @@ export function AccountManagerModal({
                 {tx('nativeStatusTitle')}:
               </span>
               <span className={`acc-badge ${summary.nativeStatus.loggedIn ? 'acc-badge-ok' : 'acc-badge-muted'}`}>
-                {summary.nativeStatus.loggedIn
+                {summary.nativeStatus.actual
+                  ? summary.nativeStatus.loggedIn
+                    ? tx('nativeLoggedIn', { method: actualMethodLabel(summary.nativeStatus.actual) })
+                    : tx('nativeProviderKeyMissing', { method: actualMethodLabel(summary.nativeStatus.actual) })
+                  : summary.nativeStatus.loggedIn
                   ? summary.nativeStatus.authMethod
                     ? tx('nativeLoggedIn', { method: summary.nativeStatus.authMethod })
                     : tx('nativeLoggedInSimple')
@@ -629,6 +680,7 @@ export function AccountManagerModal({
                   )}
               </div>
             )}
+            {summary.nativeStatus.actual && <ActualAuthLines a={summary.nativeStatus.actual} oauthUnused={!!summary.nativeStatus.hasLocalOauth} />}
             {summary.nativeStatus.detail && <div className="muted small">{trErr(summary.nativeStatus.detail)}</div>}
           </div>
         )}
@@ -654,6 +706,11 @@ export function AccountManagerModal({
               ? tx('captureLocalOauth')
               : tx('captureCurrent')}
           </button>
+          {tool === 'codex' && summary?.nativeStatus?.actual && summary.nativeStatus.hasLocalOauth && (
+            <button className="btn small" disabled={busy} onClick={() => void handleCapture('oauth')}>
+              <Icon name="download" size={14} /> {tx('captureCodexOauth')}
+            </button>
+          )}
           {(summary?.supportsOauth ?? true) && (
             <button className="btn small" disabled={busy || loginJob?.running} onClick={handleLoginClick}>
               <Icon name="key" size={14} /> {tx('oauthLogin')}
@@ -685,7 +742,7 @@ export function AccountManagerModal({
           <button
             className="btn small"
             disabled={probingAll}
-            onClick={() => void loadToolQuotas(tool, true, false)}
+            onClick={() => void loadToolQuotas(tool, true, false).then(() => loadAccounts(tool))}
           >
             <Icon name="refresh" size={14} /> {tx('refreshQuotas')}
           </button>
@@ -693,7 +750,7 @@ export function AccountManagerModal({
             <button
               className="btn small"
               disabled={probingAll}
-              onClick={() => void loadToolQuotas(tool, true, true)}
+              onClick={() => void loadToolQuotas(tool, true, true).then(() => loadAccounts(tool))}
             >
               <Icon name="refresh" size={14} /> {tx('probeAllQuotas')}
             </button>
@@ -931,13 +988,21 @@ export function AccountManagerModal({
             summary.accounts.map((acc) => {
               const st = stateBadge(acc.state);
               const qEntry = quotasByAcc[acc.id];
-              const qVal = qEntry?.error ? quotaErrText(qEntry.error) : qEntry?.quota ?? acc.quota ?? undefined;
+              // The state line already says why (e.g. an expired login); don't repeat it as the quota error
+              const qVal = qEntry?.error
+                ? qEntry.error === acc.stateDetail
+                  ? undefined
+                  : quotaErrText(qEntry.error)
+                : qEntry?.quota ?? acc.quota ?? undefined;
               const isSessionAcc = sessionId && currentSessionAccountId === acc.id;
+              const mismatch = actualMismatch(acc);
               return (
                 <div key={acc.id} className={`acc-card ${acc.active ? 'active' : ''}`}>
                   <div className="row" style={{ gap: 6, flexWrap: 'wrap' }}>
                     <strong>{acc.label}</strong>
-                    <span className="acc-badge">{acc.authKind === 'apiKey' ? tx('authApiKey') : tx('authOauth')}</span>
+                    <span className="acc-badge" title={mismatch ? tx('savedAsOauth') : undefined}>
+                      {acc.actual ? actualMethodLabel(acc.actual) : acc.authKind === 'apiKey' ? tx('authApiKey') : tx('authOauth')}
+                    </span>
                     {acc.active && <span className="acc-badge acc-badge-accent">{tx('activeBadge')}</span>}
                     {isSessionAcc && <span className="acc-badge acc-badge-ok">{tx('sessionCurrentBadge')}</span>}
                     <span className={`acc-badge ${st.cls}`}>{st.text}</span>
@@ -949,10 +1014,12 @@ export function AccountManagerModal({
                   </div>
 
                   {(() => {
+                    // The ChatGPT identity of a provider-routed account isn't what it runs as
                     const meta = [
-                      acc.identity.email,
-                      acc.identity.plan,
+                      mismatch ? null : acc.identity.email,
+                      mismatch ? null : acc.identity.plan,
                       acc.identity.workspace,
+                      acc.actual?.baseUrl,
                       acc.apiConfig?.baseUrl,
                       acc.apiConfig?.defaultModel,
                       acc.stateDetail ? trErr(acc.stateDetail) : null,
@@ -960,7 +1027,23 @@ export function AccountManagerModal({
                     return meta.length > 0 ? <div className="muted small acc-meta">{meta.join(' · ')}</div> : null;
                   })()}
 
-                  {qVal && (
+                  {mismatch && acc.actual && (
+                    <div className="row" style={{ gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
+                      <div className="acc-warn small grow">
+                        {tx('codexMismatchWarn', { provider: acc.actual.provider, email: acc.identity.email ?? acc.label })}
+                      </div>
+                      {acc.actual.method === 'providerApiKey' && acc.actual.envKey && (
+                        <button className="btn small primary" disabled={busy} onClick={() => void handleConvert(acc, 'apiKey')}>
+                          <Icon name="key" size={14} /> {tx('convertToApiKey')}
+                        </button>
+                      )}
+                      <button className="btn small" disabled={busy} onClick={() => void handleConvert(acc, 'oauth')}>
+                        <Icon name="refresh" size={14} /> {tx('convertToOauth')}
+                      </button>
+                    </div>
+                  )}
+
+                  {qVal && !mismatch && (
                     <div className="quota acc-quota">
                       <div className="muted small" style={{ fontWeight: 600 }}>{tx('quotaTitle')}</div>
                       <QuotaBody q={qVal} />
@@ -1020,5 +1103,24 @@ export function AccountManagerModal({
         </div>
       </div>
     </div>
+  );
+}
+
+/** Codex: which provider config.toml selects and where its key comes from */
+function ActualAuthLines({ a, oauthUnused }: { a: ActualAuth; oauthUnused: boolean }) {
+  useLang();
+  return (
+    <>
+      <div className="small">
+        {a.baseUrl ? tx('actualProviderLine', { provider: a.provider, url: a.baseUrl }) : tx('actualProviderLineNoUrl', { provider: a.provider })}
+      </div>
+      {a.method === 'providerApiKey' && a.envKey && (
+        <div className={a.keySet ? 'muted small' : 'acc-warn small'}>
+          {a.keySet ? tx('actualKeyFromEnv', { env: a.envKey }) : tx('actualKeyMissing', { env: a.envKey })}
+        </div>
+      )}
+      {a.method === 'providerOpenaiAuth' && <div className="muted small">{tx('actualOpenaiAuthLine')}</div>}
+      {oauthUnused && a.method !== 'providerOpenaiAuth' && <div className="muted small">{tx('actualOauthUnused')}</div>}
+    </>
   );
 }

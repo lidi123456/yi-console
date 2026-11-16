@@ -1052,7 +1052,14 @@ impl Hub {
                 .map_err(|_| anyhow!("会话已结束"))?;
             return Ok(());
         }
-        let handoff = rt.pending_handoff.lock().unwrap().take();
+        // A slash command must stay first for the tool to recognize it, so the hand-off waits for the next message.
+        // Cursor's /compact is emulated in `acp.rs`, which folds the pending context into its summary
+        let slash = text.trim_start().starts_with('/');
+        let handoff = if slash && !(info.tool == ToolKind::Cursor && crate::adapters::acp::is_compact_command(text)) {
+            None
+        } else {
+            rt.pending_handoff.lock().unwrap().take()
+        };
         let adapter_text = match &handoff {
             Some(h) if !h.is_empty() => format!("{h}\n\n{text}"),
             _ => text.to_string(),
@@ -3758,6 +3765,11 @@ pub(crate) fn test_set_tool(hub: &Hub, id: &str, tool: ToolKind) {
 }
 
 #[cfg(test)]
+pub(crate) fn test_pending_handoff(hub: &Hub, id: &str) -> Option<String> {
+    hub.get(id).unwrap().pending_handoff.lock().unwrap().clone()
+}
+
+#[cfg(test)]
 pub(crate) fn test_emitter() -> (Arc<Hub>, Emitter, mpsc::UnboundedReceiver<AdapterCmd>) {
     let hub = Hub::new(Store::open_memory().unwrap(), DaemonSettings::default());
     let rx = tests::live(&hub, "s", SessionMode::Structured, SessionStatus::Running, 0);
@@ -3965,6 +3977,14 @@ impl Emitter {
     /// Notify hub that resuming an account's native tool session failed and fell back to a fresh thread/session
     pub fn resume_fallback(&self) {
         self.hub.resume_fallback(&self.sid, self.gen);
+    }
+
+    /// Context put before the next delivered message, replacing any pending hand-off (Cursor's emulated /compact
+    /// hands its summary to the fresh tool session this way). Kept by the hub, so it survives an adapter restart
+    pub fn pending_context(&self, text: String) {
+        if let Some(rt) = self.hub.alive(&self.sid, self.gen) {
+            *rt.pending_handoff.lock().unwrap() = Some(text);
+        }
     }
 }
 
