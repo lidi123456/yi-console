@@ -2868,8 +2868,8 @@ mod tests {
 
     #[test]
     fn antigravity_parse_host_identity_handles_gemini_scoped_keyring() {
-        let tmp = tempfile::tempdir().unwrap();
-        let mgr = AccountManager::new(tmp.path().join("yc"), tmp.path().join("home")).unwrap();
+        let (_t, base, home) = temp_dirs();
+        let mgr = AccountManager::with_dirs(base, home);
         let payload = serde_json::json!({
             "id_token_email": "alice@example.com",
             "auth_method": "consumer"
