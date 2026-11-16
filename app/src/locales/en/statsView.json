@@ -19,5 +19,8 @@
   "out": "Out",
   "cache": "Cache",
   "billedInCreditsNoTokens": "Billed in credits (no tokens reported)",
-  "dailyUsage": "Daily usage"
+  "dailyUsage": "Daily usage",
+  "probeAll": "Probe All",
+  "manageAccounts": "Manage",
+  "activeAccount": "Default"
 }

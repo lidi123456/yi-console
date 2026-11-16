@@ -61,6 +61,9 @@ export interface SessionInfo {
   turn?: TurnInfo;
   /** Set on a Bot's own session and on its tasks (see `bots.ts`) */
   bot?: BotLink;
+  /** Selected account profile id and display label for AI sessions */
+  accountId?: string | null;
+  accountLabel?: string | null;
   /** MCP servers served by a desktop client (the Bot tools) */
   clientMcp?: { name: string; clientId: string }[];
   appendSystemPrompt?: string;
@@ -197,10 +200,115 @@ export interface QuotaWindow {
 
 export interface Quota {
   tool: ToolKind;
+  accountId?: string | null;
+  accountLabel?: string | null;
+  authKind?: AccountAuthKind | null;
+  isolation?: AccountIsolation | null;
+  stale?: boolean;
+  needsActivationToProbe?: boolean;
   account?: { email?: string | null; plan?: string | null };
   windows: QuotaWindow[];
   note?: string | null;
-  fetchedAt: number;
+  fetchedAt: number | null;
+}
+
+export type AccountAuthKind = 'oauth' | 'apiKey';
+export type AccountIsolation = 'isolated' | 'hostActive';
+export type AccountState = 'ready' | 'needsLogin' | 'limited' | 'error';
+
+export interface AccountIdentity {
+  email?: string | null;
+  plan?: string | null;
+  workspace?: string | null;
+  accountKey?: string | null;
+}
+
+export interface ApiKeyConfig {
+  apiKey: string;
+  authToken: string;
+  baseUrl: string;
+  defaultModel: string;
+  providerName: string;
+  extraEnv: Record<string, string>;
+}
+
+export interface AccountProfileView {
+  id: string;
+  tool: ToolKind;
+  label: string;
+  authKind: AccountAuthKind;
+  isolation: AccountIsolation;
+  active: boolean;
+  inUseSessions: number;
+  allowAutoFailover: boolean;
+  priority: number;
+  identity: AccountIdentity;
+  apiConfig?: ApiKeyConfig | null;
+  state: AccountState;
+  stateDetail?: string | null;
+  quota?: Quota | null;
+  updatedAt: number;
+}
+
+export interface ToolNativeStatus {
+  loggedIn: boolean;
+  authMethod?: string | null;
+  email?: string | null;
+  plan?: string | null;
+  envOverride?: string | null;
+  matchedAccountId?: string | null;
+  detail?: string | null;
+}
+
+export interface ToolAccountsSummary {
+  tool: ToolKind;
+  oauthIsolation: AccountIsolation;
+  supportsOauth: boolean;
+  supportsApiKey: boolean;
+  supportsDeviceAuth: boolean;
+  supportsInteractiveLogin: boolean;
+  autoFailover: boolean;
+  activeAccountId?: string | null;
+  nativeStatus?: ToolNativeStatus | null;
+  accounts: AccountProfileView[];
+}
+
+export interface AccountLoginUpdate {
+  jobId: string;
+  tool: ToolKind;
+  accountId?: string | null;
+  mode: string;
+  running: boolean;
+  ok?: boolean | null;
+  url?: string | null;
+  code?: string | null;
+  prompt?: string | null;
+  needsInput: boolean;
+  output: string[];
+  error?: string | null;
+}
+
+export interface AccountQuotaEntry {
+  accountId: string;
+  label: string;
+  authKind: AccountAuthKind;
+  isolation: AccountIsolation;
+  active: boolean;
+  quota?: Quota | null;
+  error?: string | null;
+}
+
+export interface ToolQuotasGroup {
+  tool: ToolKind;
+  oauthIsolation: AccountIsolation;
+  activeAccountId?: string | null;
+  accounts: AccountQuotaEntry[];
+  nativeQuota?: Quota | null;
+  error?: string | null;
+}
+
+export interface ToolsQuotasResponse {
+  tools: ToolQuotasGroup[];
 }
 
 export interface FileDiff {
@@ -277,6 +385,15 @@ export type EventBody =
   | { kind: 'cleared' }
   /** Continue with another tool: `to` in the original session (the work went to sessionId), else in the new one */
   | { kind: 'handoff'; sessionId: string; tool: ToolKind; to: boolean }
+  | {
+      kind: 'account_switched';
+      fromId?: string | null;
+      fromLabel?: string | null;
+      toId: string;
+      toLabel: string;
+      reason: string;
+      contextCarried: string;
+    }
   /** A turn cut off because the daemon stopped (recorded when it started again) */
   | { kind: 'interrupted'; reason: string }
   /** Usage limit: hit (from the adapter) / scheduled / skipped (reason off|unknown|far|repeated) /
@@ -306,7 +423,13 @@ export interface ToolInfo {
   path: string | null;
   version: string | null;
   structured: boolean;
+  oauthIsolation?: AccountIsolation;
+  accountCount?: number;
+  activeAccountId?: string | null;
+  activeAccountLabel?: string | null;
 }
+
+export const supportsAccountsTool = (tool: ToolKind): boolean => tool !== 'shell' && tool !== 'files';
 
 /** A tool upgrade on a host (`tools.update`); versions are what `--version` printed before and after */
 export interface ToolJob {

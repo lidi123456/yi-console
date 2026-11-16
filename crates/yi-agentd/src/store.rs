@@ -354,6 +354,8 @@ mod tests {
             bot: None,
             client_mcp: vec![],
             append_system_prompt: None,
+            account_id: None,
+            account_label: None,
             queued: vec![],
             queue_paused: None,
             restart_interrupted: false,

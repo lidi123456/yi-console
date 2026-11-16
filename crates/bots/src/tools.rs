@@ -249,6 +249,7 @@ pub fn draft() -> Value {
                     "host": s("Host id (list_hosts)"),
                     "cwd": s("Leave empty: ~/.yi-console/bots/<bot id> on that host"),
                     "tool": tool.clone(),
+                    "accountId": s("Optional account profile id; omit for tool default"),
                     "model": s("Model id (list_models); omit for the tool's default"),
                     "effort": s("Reasoning effort; omit for the default"),
                     "permissionMode": s("Omit for the tool's default"),
@@ -261,6 +262,7 @@ pub fn draft() -> Value {
                 "properties": {
                     "tool": tool.clone(),
                     "tools": {"type": "array", "items": tool.clone(), "description": "Other tools the Bot may pick per task; say in prompt.role which suits what"},
+                    "accountId": s("Optional account profile id for tasks; omit for tool default"),
                     "model": s("Model for the default tool; omit for its default"),
                     "effort": s("Reasoning effort for the default tool"),
                     "permissionMode": {"type": "string", "description": "Default bypass (tasks run unattended)"},
@@ -486,8 +488,8 @@ mod tests {
         let mut c: crate::config::BotConfig = serde_json::from_value(json!({
             "name": "x",
             "workspaces": [{"host": "local", "cwd": "/repo", "name": "a", "about": "desc"}],
-            "bot": {"host": "local", "tool": "claude", "model": "m", "effort": "high", "permissionMode": "default"},
-            "task": {"tools": ["codex"], "model": "m", "effort": "high", "computerUse": true},
+            "bot": {"host": "local", "tool": "claude", "accountId": "acc1", "model": "m", "effort": "high", "permissionMode": "default"},
+            "task": {"tools": ["codex"], "accountId": "acc2", "model": "m", "effort": "high", "computerUse": true},
             "allow": [{"instance": "i", "ids": ["a"]}],
             "mcp": {"bot": ["a"], "task": ["b"]},
             "routines": [{"name": "r", "schedule": "0 9 * * *", "prompt": "p"}],

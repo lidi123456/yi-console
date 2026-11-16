@@ -35,5 +35,8 @@
   "open": "Open",
   "toolNotInstalled": "{{tool}} (not installed)",
   "titleShell": "Open a terminal",
-  "titleFiles": "Browse files"
+  "titleFiles": "Browse files",
+  "account": "Account",
+  "defaultAccount": "Default Account",
+  "manageAccounts": "Manage Accounts…"
 }

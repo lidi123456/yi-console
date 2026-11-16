@@ -35,5 +35,8 @@
   "open": "打开",
   "toolNotInstalled": "{{tool}}（未安装）",
   "titleShell": "打开终端",
-  "titleFiles": "浏览文件"
+  "titleFiles": "浏览文件",
+  "account": "账号",
+  "defaultAccount": "默认账号",
+  "manageAccounts": "管理账号…"
 }

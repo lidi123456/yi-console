@@ -107,14 +107,29 @@ pub fn read(tool: ToolKind, id: &str) -> Result<Vec<EventBody>> {
 // ---------------- Claude ----------------
 
 pub(crate) fn claude_root() -> PathBuf {
-    let base = std::env::var("CLAUDE_CONFIG_DIR")
+    std::env::var("CLAUDE_CONFIG_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| crate::paths::home().join(".claude"));
-    base.join("projects")
+        .unwrap_or_else(|_| crate::paths::home().join(".claude"))
+        .join("projects")
+}
+
+/// All Claude projects directories (host default plus every managed account profile).
+pub(crate) fn claude_roots() -> Vec<PathBuf> {
+    let mut roots = vec![claude_root()];
+    let acct_dir = crate::paths::base_dir().join("accounts").join("claude");
+    if let Ok(rd) = std::fs::read_dir(acct_dir) {
+        for e in rd.flatten() {
+            let p = e.path().join("home").join("projects");
+            if p.is_dir() && !roots.contains(&p) {
+                roots.push(p);
+            }
+        }
+    }
+    roots
 }
 
 fn claude_files() -> Vec<PathBuf> {
-    jsonl_files(&claude_root())
+    claude_roots().into_iter().flat_map(|r| jsonl_files(&r)).collect()
 }
 
 /// `<root>/<dir>/*.jsonl`
@@ -260,6 +275,19 @@ fn scan_codebuddy(p: &Path, mtime: i64) -> Option<HistoryEntry> {
     })
 }
 
+pub fn tool_session_exists_in(tool: ToolKind, id: &str, data_dir: Option<&Path>) -> bool {
+    if let (ToolKind::Claude, Some(dir)) = (tool, data_dir) {
+        let root = dir.join("projects");
+        let file = format!("{id}.jsonl");
+        return std::fs::read_dir(root)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .any(|d| d.path().join(&file).is_file());
+    }
+    tool_session_exists(tool, id)
+}
+
 /// For "continue with another tool": the session file the tool keeps itself (the new tool reads it directly); None for tools without a readable file (Cursor)
 pub fn session_file(tool: ToolKind, id: &str) -> Option<PathBuf> {
     // The id comes from the tool itself, but still block path separators and .. before building a path
@@ -388,7 +416,7 @@ pub fn has_user(tool: ToolKind, id: &str, path: &Path) -> bool {
     }
 }
 
-fn find_claude_file(id: &str) -> Option<PathBuf> {
+pub(crate) fn find_claude_file(id: &str) -> Option<PathBuf> {
     claude_files()
         .into_iter()
         .find(|p| p.file_stem().and_then(|s| s.to_str()) == Some(id))
@@ -535,6 +563,21 @@ pub(crate) fn codex_root() -> PathBuf {
         .join("sessions")
 }
 
+/// All Codex sessions directories (host default plus every managed account profile).
+pub(crate) fn codex_roots() -> Vec<PathBuf> {
+    let mut roots = vec![codex_root()];
+    let acct_dir = crate::paths::base_dir().join("accounts").join("codex");
+    if let Ok(rd) = std::fs::read_dir(acct_dir) {
+        for e in rd.flatten() {
+            let p = e.path().join("home").join("sessions");
+            if p.is_dir() && !roots.contains(&p) {
+                roots.push(p);
+            }
+        }
+    }
+    roots
+}
+
 pub(crate) fn walk_jsonl(dir: &Path, out: &mut Vec<PathBuf>, depth: u32) {
     if depth > 5 {
         return;
@@ -554,7 +597,9 @@ pub(crate) fn walk_jsonl(dir: &Path, out: &mut Vec<PathBuf>, depth: u32) {
 
 fn codex_files() -> Vec<PathBuf> {
     let mut v = vec![];
-    walk_jsonl(&codex_root(), &mut v, 0);
+    for root in codex_roots() {
+        walk_jsonl(&root, &mut v, 0);
+    }
     v
 }
 

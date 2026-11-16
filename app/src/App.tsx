@@ -23,6 +23,7 @@ import { customFrame, TitleBar } from './components/TitleBar';
 import { Lightbox } from './components/Lightbox';
 import { UpgradeOverlay } from './components/Upgrade';
 import { AppUpdateNotice } from './components/AppUpdate';
+import { AccountManagerHost } from './components/AccountManagerModal';
 import { getT, useLang } from './i18n';
 
 const t = getT('app');
@@ -136,6 +137,7 @@ export function App() {
       <Toasts />
       <Lightbox />
       <Overlays />
+      <AccountManagerHost />
       <UpgradeOverlay />
       <AppUpdateNotice />
     </div>

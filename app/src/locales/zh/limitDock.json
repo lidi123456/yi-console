@@ -8,5 +8,10 @@
   "cancel": "取消",
   "handOffToAnotherTool": "换工具继续",
   "switchTool": "换工具",
-  "handOffToAnotherToolTitle": "不等额度恢复，交给另一个工具接着做（第一轮先汇报）"
+  "handOffToAnotherToolTitle": "不等额度恢复，交给另一个工具接着做（第一轮先汇报）",
+  "switchBackupAccount": "切换备用账号",
+  "switchAccountShort": "换账号",
+  "switchBackupAccountTitle": "在当前会话原地切换到其他账号或 API Key",
+  "switchedBackupAccount": "已将当前会话切换至「{{label}}」",
+  "manageAccounts": "管理账号…"
 }

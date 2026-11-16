@@ -39,5 +39,10 @@
   "addSnippet": "添加片段",
   "startWithExamples": "用几个示例开始",
   "worktreeRoot": "worktree 根目录",
-  "worktreeRootHint": "Bot 派出的任务默认各用一个 git worktree，放在这个目录下（按仓库分子目录）。留空使用 ~/.yi-console/worktrees；修改后只影响新任务。"
+  "worktreeRootHint": "Bot 派出的任务默认各用一个 git worktree，放在这个目录下（按仓库分子目录）。留空使用 ~/.yi-console/worktrees；修改后只影响新任务。",
+  "toolAccounts": "工具多账号与 API Key",
+  "toolAccountsDesc": "按工具管理 OAuth 账号、API Key / Base URL 配置以及额度用尽时的自动故障转移策略。此配置保存在这台主机上。",
+  "configuredAccounts": "已配置 {{n}} 个账号",
+  "noConfiguredAccounts": "未保存独立账号（使用工具默认凭据）",
+  "manageAccounts": "管理账号"
 }

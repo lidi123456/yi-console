@@ -126,7 +126,7 @@ pub const CLIENT_NAME: &str = "codex_cli_rs";
 pub async fn run(spec: StartSpec, em: Emitter, mut rx: mpsc::UnboundedReceiver<AdapterCmd>) {
     let mut args = vec!["app-server".to_string()];
     args.extend(spec.extra_args.iter().cloned());
-    let mut p = match JsonProc::spawn(&spec.program, &args, &spec.cwd) {
+    let mut p = match JsonProc::spawn_with_env(&spec.program, &args, &spec.cwd, &spec.env, &spec.env_unset) {
         Ok(p) => p,
         Err(e) => return em.exited(Some(format!("启动 codex 失败: {e}"))),
     };
@@ -434,7 +434,17 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Vec<Valu
             if kind == Pending::Thread && st.resumed && is_missing_thread(&msg) {
                 st.resumed = false;
                 st.replaying = false;
-                let params = std::mem::take(&mut st.thread_params);
+                em.resume_fallback();
+                let mut params = std::mem::take(&mut st.thread_params);
+                if let Some(handoff) = spec.account_handoff.as_deref().filter(|s| !s.is_empty()) {
+                    let existing = params["developerInstructions"].as_str().unwrap_or("");
+                    let combined = if existing.is_empty() {
+                        handoff.to_string()
+                    } else {
+                        format!("{existing}\n\n{handoff}")
+                    };
+                    params["developerInstructions"] = json!(combined);
+                }
                 out.push(st.req(Pending::Thread, "thread/start", params));
                 return out;
             }
@@ -1261,6 +1271,11 @@ mod tests {
             rows: 24,
             tmux: None,
             session_id: None,
+            env: Default::default(),
+            env_unset: vec![],
+            data_dir: None,
+            auth_method: None,
+            account_handoff: None,
         }
     }
 

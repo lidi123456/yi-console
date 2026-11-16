@@ -187,7 +187,7 @@ pub fn build_args(spec: &StartSpec) -> Vec<String> {
 
 pub async fn run(spec: StartSpec, em: Emitter, mut rx: mpsc::UnboundedReceiver<AdapterCmd>) {
     let args = build_args(&spec);
-    let mut p = match JsonProc::spawn(&spec.program, &args, &spec.cwd) {
+    let mut p = match JsonProc::spawn_with_env(&spec.program, &args, &spec.cwd, &spec.env, &spec.env_unset) {
         Ok(p) => p,
         Err(e) => return em.exited(Some(format!("启动 {} 失败: {e}", spec.tool.as_str()))),
     };
@@ -712,14 +712,22 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Result<V
                 st.image_ok = r["agentCapabilities"]["promptCapabilities"]["image"]
                     .as_bool()
                     .unwrap_or(false);
-                // Antigravity's first method is a browser sign-in on the host; leave it to `agy acp --login`
-                st.auth_method = r["authMethods"]
-                    .as_array()
-                    .and_then(|a| a.first())
-                    .and_then(|m| m["id"].as_str())
-                    .filter(|_| spec.tool != ToolKind::Antigravity)
-                    .map(str::to_string);
-                out.push(new_or_load(st, spec));
+                // If an explicit auth_method (e.g. "gemini-api-key") is selected for the session,
+                // authenticate upfront before session/new so it wins over host cached OAuth.
+                if let Some(explicit) = &spec.auth_method {
+                    st.auth_method = Some(explicit.clone());
+                    st.auth_tried = true;
+                    out.push(st.req(Pending::Auth, "authenticate", json!({"methodId": explicit})));
+                } else {
+                    // Antigravity's first method is a browser sign-in on the host; leave it to `agy acp --login`
+                    st.auth_method = r["authMethods"]
+                        .as_array()
+                        .and_then(|a| a.first())
+                        .and_then(|m| m["id"].as_str())
+                        .filter(|_| spec.tool != ToolKind::Antigravity)
+                        .map(str::to_string);
+                    out.push(new_or_load(st, spec));
+                }
             }
             Pending::Auth => out.push(new_or_load(st, spec)),
             Pending::Session | Pending::Load => {
@@ -2822,6 +2830,7 @@ mod model_config_tests {
             replay_skip: 0, model: Some(model.into()), effort: None, model_config_options: vec![],
             permission_mode: "default".into(), command: None, program: "cursor-agent".into(), extra_args: vec![],
             mcp_servers: vec![], mcp_fingerprint: String::new(), allow_mcp: vec![], system_prompt: None, system_notice: false, cols: 80, rows: 24, tmux: None, session_id: None,
+            env: Default::default(), env_unset: vec![], data_dir: None, auth_method: None, account_handoff: None,
         }
     }
 
@@ -3183,6 +3192,11 @@ mod model_config_tests {
             rows: 24,
             tmux: None,
             session_id: None,
+            env: Default::default(),
+            env_unset: vec![],
+            data_dir: None,
+            auth_method: None,
+            account_handoff: None,
         }
     }
 

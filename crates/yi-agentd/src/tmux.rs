@@ -63,7 +63,22 @@ unbind C-b
 }
 
 /// Command line to start or attach to a session: tmux … new-session -A -s name -c dir -- program args…
+#[allow(dead_code)]
 pub fn wrap(tmux: &PathBuf, name: &str, cwd: &str, program: &str, args: &[String], cols: u16, rows: u16) -> (PathBuf, Vec<String>) {
+    wrap_env(tmux, name, cwd, program, args, cols, rows, &Default::default(), &[])
+}
+
+pub fn wrap_env(
+    tmux: &PathBuf,
+    name: &str,
+    cwd: &str,
+    program: &str,
+    args: &[String],
+    cols: u16,
+    rows: u16,
+    env_set: &std::collections::BTreeMap<String, String>,
+    env_unset: &[String],
+) -> (PathBuf, Vec<String>) {
     let mut a: Vec<String> = vec![
         "-L".into(),
         SOCKET.into(),
@@ -81,8 +96,19 @@ pub fn wrap(tmux: &PathBuf, name: &str, cwd: &str, program: &str, args: &[String
         cwd.into(),
         "-e".into(),
         "COLORTERM=truecolor".into(),
-        program.into(),
     ];
+    for (k, v) in env_set {
+        a.push("-e".into());
+        a.push(format!("{k}={v}"));
+    }
+    if !env_unset.is_empty() {
+        a.push("env".into());
+        for k in env_unset {
+            a.push("-u".into());
+            a.push(k.clone());
+        }
+    }
+    a.push(program.into());
     a.extend(args.iter().cloned());
     (tmux.clone(), a)
 }

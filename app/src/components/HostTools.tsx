@@ -2,8 +2,9 @@ import { useEffect, useState } from 'react';
 import { getT, trErr, useLang } from '../i18n';
 import { errorToast, setHostTools, setToolJob, useStore } from '../store';
 import { rpc } from '../transport';
-import { TOOL_LABEL, type ToolInfo, type ToolJob, type ToolLatest } from '../types';
+import { TOOL_LABEL, supportsAccountsTool, type ToolInfo, type ToolJob, type ToolLatest } from '../types';
 import { lsGet, lsSet } from '../util';
+import { openAccountManager } from './AccountManagerModal';
 import { Icon, ToolBadge } from './Icon';
 
 const tx = getT('hostTools');
@@ -146,6 +147,7 @@ export function HostTools({ hostId, tools }: { hostId: string; tools: ToolInfo[]
                   <span style={{ fontWeight: 600 }}>{TOOL_LABEL[t.kind]}</span>
                   {t.available && <span className="muted small mono"> {cur ?? t.version ?? ''}</span>}
                   {info?.via === 'npm' && <span className="muted small">{` · ${info.via}`}</span>}
+                  {t.activeAccountLabel && <span className="acc-badge acc-badge-accent" style={{ marginLeft: 6 }}>{t.activeAccountLabel}</span>}
                 </div>
                 {t.path && (
                   <div className="muted small mono truncate" title={t.path}>
@@ -157,6 +159,16 @@ export function HostTools({ hostId, tools }: { hostId: string; tools: ToolInfo[]
               {!!job?.output?.length && (
                 <button className="btn small" onClick={() => setOpen(open === t.kind ? null : t.kind)}>
                   {showLog ? tx('hideOutput') : tx('showOutput')}
+                </button>
+              )}
+              {supportsAccountsTool(t.kind) && (
+                <button
+                  className="btn small"
+                  onClick={() => openAccountManager({ hostId, tool: t.kind })}
+                  title={tx('manageAccounts')}
+                >
+                  <Icon name="key" size={14} />{' '}
+                  {t.accountCount ? tx('accountsCount', { n: t.accountCount }) : tx('accounts')}
                 </button>
               )}
               {t.available && latest !== null && (

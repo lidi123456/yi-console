@@ -59,6 +59,7 @@ type Item =
   /** One usage-limit episode: the hit plus the latest decision about the automatic continue */
   | { k: 'limit'; key: string; hit?: LimitEvent; last: LimitEvent }
   | { k: 'handoff'; key: string; ev: HubEvent & { kind: 'handoff' } }
+  | { k: 'account_switched'; key: string; ev: HubEvent & { kind: 'account_switched' } }
   | {
       k: 'turn';
       key: string;
@@ -260,6 +261,9 @@ function buildItems(events: HubEvent[], hideCompactCmd = false): Item[] {
       }
       case 'handoff':
         items.push({ k: 'handoff', key, ev: e });
+        break;
+      case 'account_switched':
+        items.push({ k: 'account_switched', key, ev: e });
         break;
       case 'interrupted':
         items.push({ k: 'note', key, text: t('turnCutOffByRestart'), tone: 'muted' });
@@ -861,6 +865,35 @@ function HandoffNote({ ev, hostId }: { ev: HubEvent & { kind: 'handoff' }; hostI
           {ev.to ? t('openNewSession') : t('openOriginalSession')}
         </button>
       )}
+    </div>
+  );
+}
+
+/** Account switch within the same session (manual, host-active change, or automatic rate-limit failover) */
+function AccountSwitchedNote({ ev }: { ev: HubEvent & { kind: 'account_switched' } }) {
+  const msg =
+    ev.reason === 'rate_limit'
+      ? ev.fromLabel
+        ? t('accountSwitchedLimit', { from: ev.fromLabel, to: ev.toLabel })
+        : t('accountSwitchedLimitNoFrom', { to: ev.toLabel })
+      : ev.reason === 'host_active'
+        ? ev.fromLabel
+          ? t('accountSwitchedHost', { from: ev.fromLabel, to: ev.toLabel })
+          : t('accountSwitchedHostNoFrom', { to: ev.toLabel })
+        : ev.fromLabel
+          ? t('accountSwitchedManual', { from: ev.fromLabel, to: ev.toLabel })
+          : t('accountSwitchedManualNoFrom', { to: ev.toLabel });
+  const ctxKey =
+    ev.contextCarried === 'native_resume'
+      ? 'accountContextNative'
+      : ev.contextCarried === 'summary_injected'
+        ? 'accountContextSummary'
+        : 'accountContextFresh';
+  return (
+    <div className="note note-muted handoff-note">
+      <Icon name="key" size={13} />
+      <span>{msg}</span>
+      <span className="acc-badge">{t(ctxKey)}</span>
     </div>
   );
 }
@@ -1779,6 +1812,8 @@ export function ChatView({
               return <LimitNote key={it.key} it={it} live={it.key === lastLimitKey} hostId={hostId} info={info} />;
             case 'handoff':
               return <HandoffNote key={it.key} ev={it.ev} hostId={hostId} />;
+            case 'account_switched':
+              return <AccountSwitchedNote key={it.key} ev={it.ev} />;
           }
         })}
         {textAsk && onSendText && (

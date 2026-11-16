@@ -25,5 +25,9 @@
   "resuming": "Resuming…",
   "resumeSession": "Resume session",
   "exitFullscreen": "Exit Fullscreen",
-  "dragToResize": "Drag to resize"
+  "dragToResize": "Drag to resize",
+  "switchAccountTitle": "Switch or manage account in this session",
+  "defaultAccount": "Default Account",
+  "manageAccounts": "Manage Accounts…",
+  "switchedAccount": "Switched this session to \"{{label}}\""
 }

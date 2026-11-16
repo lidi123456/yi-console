@@ -16,5 +16,8 @@
   "update": "升级",
   "runsCommand": "在这台主机上运行 {{cmd}}",
   "summary": "已安装 {{n}} 个",
-  "summaryWithUpdates": "已安装 {{n}} 个 · {{m}} 个有新版本"
+  "summaryWithUpdates": "已安装 {{n}} 个 · {{m}} 个有新版本",
+  "accounts": "账号",
+  "accountsCount": "账号 ({{n}})",
+  "manageAccounts": "管理此工具的账号与 API Key"
 }

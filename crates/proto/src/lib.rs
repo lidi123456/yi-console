@@ -108,6 +108,11 @@ impl ToolKind {
         !matches!(self, ToolKind::Files)
     }
 
+    /// AI coding tools that can manage multiple OAuth / API-key accounts
+    pub fn supports_accounts(&self) -> bool {
+        !matches!(self, ToolKind::Shell | ToolKind::Files)
+    }
+
     pub fn parse(s: &str) -> Option<ToolKind> {
         ToolKind::ALL.into_iter().find(|t| t.as_str() == s)
     }
@@ -250,6 +255,11 @@ pub struct SessionInfo {
     /// Codex `developerInstructions`, ACP tools a `<system-reminder>` before the first prompt of a new tool session)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub append_system_prompt: Option<String>,
+    /// Selected account/profile id for this session (None uses tool's active/default account or system default)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_label: Option<String>,
 }
 
 /// Which Bot a session belongs to. Bot state itself lives in the desktop client that runs the Bot
@@ -650,6 +660,19 @@ pub enum EventBody {
     },
     /// /clear: all events before this one were deleted; on receipt the client drops events it holds with a smaller seq
     Cleared {},
+    /// Account switched within the same session (manual switch, host-active change, or automatic rate-limit failover)
+    AccountSwitched {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from_label: Option<String>,
+        to_id: String,
+        to_label: String,
+        /// manual / rate_limit / host_active
+        reason: String,
+        /// native_resume / summary_injected / fresh
+        context_carried: String,
+    },
 }
 
 impl EventBody {
@@ -676,6 +699,151 @@ pub struct Event {
     pub body: EventBody,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum AccountAuthKind {
+    #[default]
+    Oauth,
+    ApiKey,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum AccountIsolation {
+    /// Directory and/or env-var isolated: concurrent sessions on one host can use different accounts
+    Isolated,
+    /// Shared host-level credentials / OS keyring: one account active per host at a time
+    #[default]
+    HostActive,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum AccountState {
+    #[default]
+    Ready,
+    NeedsLogin,
+    Limited,
+    Error,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountIdentity {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiKeyConfig {
+    #[serde(default)]
+    pub api_key: String,
+    #[serde(default)]
+    pub auth_token: String,
+    #[serde(default)]
+    pub base_url: String,
+    #[serde(default)]
+    pub default_model: String,
+    #[serde(default)]
+    pub provider_name: String,
+    #[serde(default)]
+    pub extra_env: std::collections::BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountProfileView {
+    pub id: String,
+    pub tool: ToolKind,
+    pub label: String,
+    pub auth_kind: AccountAuthKind,
+    pub isolation: AccountIsolation,
+    pub active: bool,
+    #[serde(default)]
+    pub in_use_sessions: usize,
+    pub allow_auto_failover: bool,
+    pub priority: i32,
+    #[serde(default)]
+    pub identity: AccountIdentity,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_config: Option<ApiKeyConfig>,
+    #[serde(default)]
+    pub state: AccountState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_detail: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota: Option<serde_json::Value>,
+    #[serde(default)]
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolNativeStatus {
+    pub logged_in: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_method: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env_override: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matched_account_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolAccountsSummary {
+    pub tool: ToolKind,
+    pub oauth_isolation: AccountIsolation,
+    pub supports_oauth: bool,
+    pub supports_api_key: bool,
+    pub supports_device_auth: bool,
+    pub supports_interactive_login: bool,
+    pub auto_failover: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_account_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_status: Option<ToolNativeStatus>,
+    pub accounts: Vec<AccountProfileView>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountLoginUpdate {
+    pub job_id: String,
+    pub tool: ToolKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
+    pub mode: String,
+    pub running: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ok: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
+    #[serde(default)]
+    pub needs_input: bool,
+    #[serde(default)]
+    pub output: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolInfo {
@@ -685,6 +853,14 @@ pub struct ToolInfo {
     pub version: Option<String>,
     /// Whether structured mode is supported
     pub structured: bool,
+    #[serde(default)]
+    pub oauth_isolation: AccountIsolation,
+    #[serde(default)]
+    pub account_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_account_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_account_label: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -981,8 +1157,34 @@ pub mod methods {
     /// Cursor model parameters for the new session page {model, cwd?} -> [ModelConfigOption]: cached, else read from a
     /// short-lived Cursor process (several seconds); an empty list is a model without parameters
     pub const TOOLS_MODEL_CONFIG: &str = "tools.modelConfig";
-    /// Tool account quota {tool, refresh?}
+    /// Tool account quota {tool, accountId?, refresh?}
     pub const TOOLS_QUOTA: &str = "tools.quota";
+    /// Quotas across all configured accounts {tool?, refresh?, refreshInactive?} -> {tools: [...]}
+    pub const TOOLS_QUOTAS: &str = "tools.quotas";
+    /// Multi-account configuration & current tool status {tool?, checkNative?} -> {tools: [ToolAccountsSummary]}
+    pub const TOOLS_ACCOUNTS_LIST: &str = "tools.accounts.list";
+    /// Capture current system/default CLI login as an AccountProfile {tool, label?} -> AccountProfileView
+    pub const TOOLS_ACCOUNTS_CAPTURE: &str = "tools.accounts.capture";
+    /// Create/update API-key profile or update account metadata/failover policy -> AccountProfileView
+    pub const TOOLS_ACCOUNTS_SAVE: &str = "tools.accounts.save";
+    /// Remove an account profile {tool, accountId}
+    pub const TOOLS_ACCOUNTS_DELETE: &str = "tools.accounts.delete";
+    /// Activate/set default account for a tool {tool, accountId}
+    pub const TOOLS_ACCOUNTS_ACTIVATE: &str = "tools.accounts.activate";
+    /// Set per-tool failover policy {tool, autoFailover}
+    pub const TOOLS_ACCOUNTS_SET_POLICY: &str = "tools.accounts.setPolicy";
+    /// Start an interactive / device-code / OAuth login flow inside Yi Console {tool, mode?, accountId?, label?, token?} -> AccountLoginUpdate
+    pub const TOOLS_ACCOUNTS_LOGIN_START: &str = "tools.accounts.loginStart";
+    /// Send auth code / callback URL / PTY input to a running login job {jobId, input}
+    pub const TOOLS_ACCOUNTS_LOGIN_INPUT: &str = "tools.accounts.loginInput";
+    /// Cancel a running login job {jobId}
+    pub const TOOLS_ACCOUNTS_LOGIN_CANCEL: &str = "tools.accounts.loginCancel";
+    /// Export account credential bundle for cross-host sync {tool, accountId}
+    pub const TOOLS_ACCOUNTS_EXPORT: &str = "tools.accounts.export";
+    /// Import account credential bundle on this host {bundle}
+    pub const TOOLS_ACCOUNTS_IMPORT: &str = "tools.accounts.import";
+    /// Switch account in-place inside an existing session {sessionId, accountId}
+    pub const SESSION_SWITCH_ACCOUNT: &str = "session.switchAccount";
     /// {refresh?} -> {tools: {<tool>: {latest?, error?, via?, canUpdate}}, jobs: {<tool>: ToolJob}, info: [ToolInfo]}: the newest published
     /// version of each tool (npm registry, where the tool is published there), how it was installed, and upgrade jobs
     pub const TOOLS_LATEST: &str = "tools.latest";
@@ -1030,6 +1232,10 @@ pub mod methods {
     pub const EV_NOTIFY: &str = "notify";
     /// {tool, job: ToolJob, line?, tools?}: an upgrade started, printed a line, or ended (then with the re-detected tools)
     pub const EV_TOOLS_UPDATING: &str = "tools.updating";
+    /// {tool?}: account list or active account changed on the host
+    pub const EV_ACCOUNTS_UPDATED: &str = "accounts.updated";
+    /// AccountLoginUpdate: interactive login progress, OAuth link / device code / completion
+    pub const EV_ACCOUNT_LOGIN: &str = "tools.accountLogin";
     /// {callId, sessionId, server, tool, arguments}: sent only to the client named in the session's `ClientMcp`;
     /// it answers with `clientMcp.result`
     pub const EV_CLIENT_MCP_CALL: &str = "clientMcp.call";

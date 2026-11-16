@@ -2,11 +2,12 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { useBack } from '../back';
 import { getT, useLang } from '../i18n';
 import { permModes } from '../perm';
-import { errorToast, hostStatus, redetectTools, replaceView, useStore, type NewSessionParams } from '../store';
+import { errorToast, hostStatus, onAccountsUpdated, redetectTools, replaceView, useStore, type NewSessionParams } from '../store';
 import { rpc } from '../transport';
 import { botCall, unmapHost } from '../bots';
 import { localHost } from './BotsSection';
-import { TOOL_LABEL, type DirEntry, type ModelConfigOption, type ModelOption, type SessionInfo, type SessionMode, type ToolKind } from '../types';
+import { openAccountManager } from './AccountManagerModal';
+import { TOOL_LABEL, supportsAccountsTool, type DirEntry, type ModelConfigOption, type ModelOption, type SessionInfo, type SessionMode, type ToolAccountsSummary, type ToolKind } from '../types';
 import { isMobile, lsGet, lsSet, shortPath } from '../util';
 import { type Attached, FILE_MAX, IMAGE_TYPES, localPaths, readImage, refOf, uploadChunked } from './Composer';
 import { useDrives } from './FilesView';
@@ -193,6 +194,8 @@ export function NewSessionPage({ params }: { params: NewSessionParams }) {
   const [hostId, setHostId] = useState(ns.hostId);
   const [cwd, setCwd] = useState(() => ns.cwd ?? recentDirs(ns.hostId)[0] ?? '~');
   const [tool, setTool] = useState<ToolKind>(() => initialTool(ns));
+  const [accountSummary, setAccountSummary] = useState<ToolAccountsSummary | null>(null);
+  const [accountId, setAccountId] = useState<string>('');
   const [mode, setMode] = useState<'structured' | 'terminal'>('structured');
   const [perm, setPerm] = useState('default');
   const [model, setModel] = useState('');
@@ -230,6 +233,34 @@ export function NewSessionPage({ params }: { params: NewSessionParams }) {
   // Continuing a history session keeps it as it was: no first message
   const hasInput = tool !== 'files' && !ns.resumeId;
   const canAttach = hasInput && aiTool && !bot;
+
+  useEffect(() => {
+    setAccountSummary(null);
+    setAccountId('');
+    if (!hostId || !connected || bot || !supportsAccountsTool(tool)) return;
+    let alive = true;
+    const loadAccs = () => {
+      rpc<{ tools: ToolAccountsSummary[] }>(hostId, 'tools.accounts.list', { tool, checkNative: false })
+        .then((r) => {
+          if (!alive) return;
+          const sum = r.tools?.[0] ?? null;
+          setAccountSummary(sum);
+          setAccountId((cur) => {
+            if (cur && sum?.accounts.some((a) => a.id === cur)) return cur;
+            return sum?.activeAccountId ?? '';
+          });
+        })
+        .catch(() => alive && setAccountSummary(null));
+    };
+    loadAccs();
+    const off = onAccountsUpdated((h, updatedTool) => {
+      if (h === hostId && (!updatedTool || updatedTool === tool)) loadAccs();
+    });
+    return () => {
+      alive = false;
+      off();
+    };
+  }, [hostId, tool, connected, bot]);
 
   // The tool's available models: returned directly if yi-agentd has them cached, otherwise it starts the tool once to ask (a few seconds)
   useEffect(() => {
@@ -413,6 +444,7 @@ export function NewSessionPage({ params }: { params: NewSessionParams }) {
         tool,
         cwd: cwd.trim(),
         mode: effectiveMode,
+        accountId: aiTool && !bot && accountId ? accountId : undefined,
         prompt: later ? undefined : prompt || undefined,
         images: later || !images.length ? undefined : images,
         permissionMode: aiTool && permModes(tool, mode).some((m) => m[0] === perm) ? perm : 'default',
@@ -611,6 +643,36 @@ export function NewSessionPage({ params }: { params: NewSessionParams }) {
             >
               <Icon name={mode === 'terminal' ? 'terminal' : 'chat'} size={14} />
               <span>{mode === 'terminal' ? tx('terminal') : tx('chat')}</span>
+              <Icon name="down" size={11} />
+            </button>
+          )}
+          {aiTool && !bot && (
+            <button
+              type="button"
+              className="ns-chip"
+              title={tx('account')}
+              onClick={(e) => {
+                const list = accountSummary?.accounts ?? [];
+                menuUnder(e, [
+                  ...list.map((acc) => ({
+                    label: acc.label,
+                    hint: [acc.authKind === 'apiKey' ? 'API' : 'OAuth', acc.identity.email].filter(Boolean).join(' · '),
+                    active: acc.id === accountId,
+                    run: () => setAccountId(acc.id),
+                  })),
+                  ...(list.length > 0 ? (['-'] as const) : []),
+                  {
+                    label: tx('manageAccounts'),
+                    icon: 'key',
+                    run: () => openAccountManager({ hostId, tool }),
+                  },
+                ]);
+              }}
+            >
+              <Icon name="key" size={14} />
+              <span className="truncate">
+                {accountSummary?.accounts.find((a) => a.id === accountId)?.label ?? tx('defaultAccount')}
+              </span>
               <Icon name="down" size={11} />
             </button>
           )}

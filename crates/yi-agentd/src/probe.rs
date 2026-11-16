@@ -6,10 +6,11 @@ use crate::util::now_ms;
 use anyhow::{anyhow, bail, Result};
 use yi_proto::*;
 use serde_json::{json, Value};
-use std::collections::HashMap;
-use std::path::PathBuf;
+use std::collections::{BTreeMap, HashMap};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tokio::sync::Semaphore;
 
 const TIMEOUT: Duration = Duration::from_secs(30);
 /// How long quota results are cached, to avoid restarting processes on every page switch
@@ -29,7 +30,30 @@ fn probe_dir() -> PathBuf {
     d
 }
 
-/// Start the process, send first, then pass each line received to on until Done or timeout
+#[derive(Clone, Default)]
+struct ProbeEnv {
+    env: BTreeMap<String, String>,
+    env_unset: Vec<String>,
+    auth_kind: Option<AccountAuthKind>,
+    identity: AccountIdentity,
+    account_id: Option<String>,
+    account_label: Option<String>,
+}
+
+impl ProbeEnv {
+    fn from_resolved(res: &crate::accounts::ResolvedAccount) -> Self {
+        Self {
+            env: res.env.clone(),
+            env_unset: res.env_unset.clone(),
+            auth_kind: Some(res.auth_kind),
+            identity: res.identity.clone(),
+            account_id: Some(res.id.clone()),
+            account_label: Some(res.label.clone()),
+        }
+    }
+}
+
+/// Start the process with profile env, send first, then pass each line received to on until Done or timeout
 async fn converse(
     tool: ToolKind,
     settings: &DaemonSettings,
@@ -37,7 +61,18 @@ async fn converse(
     first: Vec<Value>,
     on: impl FnMut(&Value) -> Step,
 ) -> Result<()> {
-    converse_in(tool, settings, args, &probe_dir(), TIMEOUT, first, on).await
+    converse_in_env(tool, settings, &ProbeEnv::default(), args, &probe_dir(), TIMEOUT, first, on).await
+}
+
+async fn converse_env(
+    tool: ToolKind,
+    settings: &DaemonSettings,
+    penv: &ProbeEnv,
+    args: &[&str],
+    first: Vec<Value>,
+    on: impl FnMut(&Value) -> Step,
+) -> Result<()> {
+    converse_in_env(tool, settings, penv, args, &probe_dir(), TIMEOUT, first, on).await
 }
 
 async fn converse_in(
@@ -47,12 +82,25 @@ async fn converse_in(
     cwd: &std::path::Path,
     timeout: Duration,
     first: Vec<Value>,
+    on: impl FnMut(&Value) -> Step,
+) -> Result<()> {
+    converse_in_env(tool, settings, &ProbeEnv::default(), args, cwd, timeout, first, on).await
+}
+
+async fn converse_in_env(
+    tool: ToolKind,
+    settings: &DaemonSettings,
+    penv: &ProbeEnv,
+    args: &[&str],
+    cwd: &std::path::Path,
+    timeout: Duration,
+    first: Vec<Value>,
     mut on: impl FnMut(&Value) -> Step,
 ) -> Result<()> {
     let program = crate::tools::resolve(tool, settings)
         .ok_or_else(|| anyhow!("这台机器上没有找到 {}", tool.as_str()))?;
     let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
-    let mut p = JsonProc::spawn(&program, &args, cwd)?;
+    let mut p = JsonProc::spawn_with_env(&program, &args, cwd, &penv.env, &penv.env_unset)?;
     for m in first {
         p.send(&m).await?;
     }
@@ -86,13 +134,14 @@ struct Probe {
     quota: Option<Value>,
 }
 
-async fn claude(settings: &DaemonSettings, want_quota: bool) -> Result<Probe> {
+async fn claude(settings: &DaemonSettings, penv: &ProbeEnv, want_quota: bool) -> Result<Probe> {
     let mut out = Probe::default();
     let mut account = Value::Null;
     let init = json!({"type":"control_request","request_id":"init","request":{"subtype":"initialize"}});
-    converse(
+    converse_env(
         ToolKind::Claude,
         settings,
+        penv,
         &["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose"],
         vec![init],
         |v| {
@@ -146,13 +195,13 @@ fn claude_quota(account: &Value, r: &Value) -> Value {
     })
 }
 
-async fn codex(settings: &DaemonSettings, want_quota: bool) -> Result<Probe> {
+async fn codex(settings: &DaemonSettings, penv: &ProbeEnv, want_quota: bool) -> Result<Probe> {
     let mut out = Probe::default();
     let (mut account, mut limits) = (Value::Null, Value::Null);
     let mut waiting = 0;
     let init = json!({"id":1,"method":"initialize",
         "params":{"clientInfo":{"name":crate::adapters::codex::CLIENT_NAME,"title":"Yi Console","version":DAEMON_VERSION}}});
-    converse(ToolKind::Codex, settings, &["app-server"], vec![init], |v| {
+    converse_env(ToolKind::Codex, settings, penv, &["app-server"], vec![init], |v| {
         let Some(id) = v["id"].as_u64().filter(|_| v.get("method").is_none()) else {
             return Step::Wait;
         };
@@ -638,10 +687,10 @@ async fn codebuddy_account(settings: &DaemonSettings) -> Result<Value> {
 
 /// Antigravity: `agy -p /usage` and `/credits` answer without starting a turn, and `--output-format json`
 /// carries the data under `command.data` (the slash command never reaches the model)
-async fn antigravity_account(settings: &DaemonSettings) -> Result<Value> {
+async fn antigravity_account(settings: &DaemonSettings, penv: &ProbeEnv) -> Result<Value> {
     let ask = |cmd: &'static str| async move {
         let mut data = Value::Null;
-        converse(ToolKind::Antigravity, settings, &["-p", cmd, "--output-format", "json"], vec![], |v| {
+        converse_env(ToolKind::Antigravity, settings, penv, &["-p", cmd, "--output-format", "json"], vec![], |v| {
             if v.get("status").is_none() {
                 return Step::Wait;
             }
@@ -655,7 +704,14 @@ async fn antigravity_account(settings: &DaemonSettings) -> Result<Value> {
         anyhow::Ok(data["command"]["data"].clone())
     };
     let (usage, credits) = tokio::join!(ask("/usage"), ask("/credits"));
-    Ok(antigravity_quota(&usage?, credits.as_ref().unwrap_or(&Value::Null)))
+    let mut q = antigravity_quota(&usage?, credits.as_ref().unwrap_or(&Value::Null));
+    if let Some(email) = &penv.identity.email {
+        q["account"]["email"] = json!(email);
+    }
+    if let Some(plan) = &penv.identity.plan {
+        q["account"]["plan"] = json!(plan);
+    }
+    Ok(q)
 }
 
 /// `/usage` data: groups of models sharing a 5-hour and a weekly bucket, each with remaining_fraction and reset_time
@@ -794,9 +850,24 @@ fn codebuddy_quota(user: &Value, summary: &Value, ent: &Value) -> Value {
 }
 
 async fn run(tool: ToolKind, settings: &DaemonSettings, want_quota: bool) -> Result<Probe> {
+    run_with_env(tool, settings, &ProbeEnv::default(), want_quota).await
+}
+
+async fn run_with_env(
+    tool: ToolKind,
+    settings: &DaemonSettings,
+    penv: &ProbeEnv,
+    want_quota: bool,
+) -> Result<Probe> {
+    if want_quota && penv.auth_kind == Some(AccountAuthKind::ApiKey) {
+        return Ok(Probe {
+            models: vec![],
+            quota: Some(api_key_quota(tool, penv)),
+        });
+    }
     match tool {
-        ToolKind::Claude => claude(settings, want_quota).await,
-        ToolKind::Codex => codex(settings, want_quota).await,
+        ToolKind::Claude => claude(settings, penv, want_quota).await,
+        ToolKind::Codex => codex(settings, penv, want_quota).await,
         ToolKind::Kiro => acp(tool, settings, want_quota).await,
         ToolKind::Qoder if want_quota => Ok(Probe {
             models: vec![],
@@ -814,7 +885,7 @@ async fn run(tool: ToolKind, settings: &DaemonSettings, want_quota: bool) -> Res
         ToolKind::Cursor => acp(tool, settings, false).await,
         ToolKind::Antigravity if want_quota => Ok(Probe {
             models: vec![],
-            quota: Some(antigravity_account(settings).await?),
+            quota: Some(antigravity_account(settings, penv).await?),
         }),
         ToolKind::Antigravity => acp(tool, settings, false).await,
         ToolKind::Shell => bail!("终端没有模型和额度"),
@@ -822,13 +893,137 @@ async fn run(tool: ToolKind, settings: &DaemonSettings, want_quota: bool) -> Res
     }
 }
 
+fn api_key_quota(tool: ToolKind, penv: &ProbeEnv) -> Value {
+    json!({
+        "tool": tool.as_str(),
+        "accountId": penv.account_id,
+        "accountLabel": penv.account_label,
+        "authKind": "apiKey",
+        "isolation": "isolated",
+        "account": {
+            "email": penv.identity.email,
+            "plan": penv.identity.plan.clone().or_else(|| penv.identity.workspace.clone()).or_else(|| Some("API Key".into())),
+        },
+        "windows": [],
+        "note": "API Key 按量计费（无固定订阅周期额度限制）",
+    })
+}
+
+fn quota_cache_key(tool: ToolKind, account_id: Option<&str>) -> String {
+    match account_id {
+        Some(id) => format!("{}:{id}", tool.as_str()),
+        None => tool.as_str().to_string(),
+    }
+}
+
+fn quota_file_path(base_dir: &Path, tool: ToolKind, account_id: &str) -> PathBuf {
+    base_dir
+        .join("accounts")
+        .join(tool.as_str())
+        .join(account_id)
+        .join("quota.json")
+}
+
+/// Read the latest cached quota for an account (in-memory first, then persistent snapshot).
+pub fn cached_quota(tool: ToolKind, account_id: &str, base_dir: &Path) -> Option<Value> {
+    let key = quota_cache_key(tool, Some(account_id));
+    if let Some((_, v)) = QUOTA_CACHE
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|m| m.get(&key))
+    {
+        return Some(v.clone());
+    }
+    let raw = std::fs::read_to_string(quota_file_path(base_dir, tool, account_id)).ok()?;
+    let v: Value = serde_json::from_str(&raw).ok()?;
+    let at = v["fetchedAt"].as_i64().unwrap_or(0);
+    QUOTA_CACHE
+        .lock()
+        .unwrap()
+        .get_or_insert_with(HashMap::new)
+        .insert(key, (at, v.clone()));
+    Some(v)
+}
+
+pub fn clear_account_cache(tool: ToolKind, account_id: &str) {
+    let key = quota_cache_key(tool, Some(account_id));
+    if let Some(m) = QUOTA_CACHE.lock().unwrap().as_mut() {
+        m.remove(&key);
+    }
+}
+
+fn store_quota_cache(base_dir: &Path, tool: ToolKind, account_id: Option<&str>, v: &Value, at: i64) {
+    let key = quota_cache_key(tool, account_id);
+    QUOTA_CACHE
+        .lock()
+        .unwrap()
+        .get_or_insert_with(HashMap::new)
+        .insert(key, (at, v.clone()));
+    if let Some(aid) = account_id {
+        let p = quota_file_path(base_dir, tool, aid);
+        if let Some(parent) = p.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(s) = serde_json::to_string_pretty(v) {
+            let _ = std::fs::write(&p, s);
+            crate::util::restrict_file(&p);
+        }
+    }
+}
+
+fn enrich_quota(mut v: Value, tool: ToolKind, penv: &ProbeEnv, at: i64) -> Value {
+    if v["account"].is_null() {
+        v["account"] = json!({});
+    }
+    if v["account"]["email"].is_null() {
+        if let Some(e) = &penv.identity.email {
+            v["account"]["email"] = json!(e);
+        }
+    }
+    if v["account"]["plan"].is_null() {
+        if let Some(p) = &penv.identity.plan {
+            v["account"]["plan"] = json!(p);
+        }
+    }
+    v["tool"] = json!(tool.as_str());
+    v["fetchedAt"] = json!(at);
+    if let Some(aid) = &penv.account_id {
+        v["accountId"] = json!(aid);
+    }
+    if let Some(lbl) = &penv.account_label {
+        v["accountLabel"] = json!(lbl);
+    }
+    if let Some(ak) = penv.auth_kind {
+        v["authKind"] = json!(ak);
+    }
+    v
+}
+
 pub async fn models(tool: ToolKind, settings: &DaemonSettings) -> Result<Vec<ModelOption>> {
     Ok(run(tool, settings, false).await?.models)
 }
 
-/// Account quota: {tool, account:{email,plan}, windows:[{label,usedPercent,resetsAt,detail?}], note?, fetchedAt}
-pub async fn quota(hub: &Arc<Hub>, tool: ToolKind, settings: &DaemonSettings, refresh: bool) -> Result<Value> {
-    let key = tool.as_str().to_string();
+/// Account quota: {tool, accountId?, accountLabel?, account:{email,plan}, windows:[{label,usedPercent,resetsAt,detail?}], note?, fetchedAt}
+pub async fn quota(
+    hub: &Arc<Hub>,
+    tool: ToolKind,
+    settings: &DaemonSettings,
+    account_id: Option<&str>,
+    refresh: bool,
+) -> Result<Value> {
+    let resolved = if let Some(aid) = account_id {
+        Some(
+            hub.accounts
+                .resolve_exact(tool, aid)
+                .ok_or_else(|| anyhow!("账号 {aid} 不存在"))?,
+        )
+    } else {
+        hub.accounts.resolve(tool, None)
+    };
+    let effective_id = resolved.as_ref().map(|r| r.id.clone());
+    let key = quota_cache_key(tool, effective_id.as_deref());
+
     if !refresh {
         let cache = QUOTA_CACHE.lock().unwrap();
         if let Some((at, v)) = cache.as_ref().and_then(|m| m.get(&key)) {
@@ -837,18 +1032,257 @@ pub async fn quota(hub: &Arc<Hub>, tool: ToolKind, settings: &DaemonSettings, re
             }
         }
     }
-    let p = run(tool, settings, true).await?;
-    hub.remember_models(tool, &p.models);
-    let mut v = p.quota.ok_or_else(|| anyhow!("{} 没有返回额度信息", tool.as_str()))?;
+
+    let penv = resolved
+        .as_ref()
+        .map(ProbeEnv::from_resolved)
+        .unwrap_or_default();
+
+    // Prevent touching host credentials passively if probing an inactive HostActive OAuth account without refresh.
+    if let Some(res) = &resolved {
+        let active_id = hub.accounts.active_account_id(tool);
+        if res.isolation == AccountIsolation::HostActive
+            && active_id.as_deref() != Some(res.id.as_str())
+        {
+            if let Some(mut cached) = cached_quota(tool, &res.id, hub.accounts.base_dir()) {
+                cached["stale"] = json!(true);
+                return Ok(cached);
+            }
+            return Ok(json!({
+                "tool": tool.as_str(),
+                "accountId": res.id,
+                "accountLabel": res.label,
+                "authKind": res.auth_kind,
+                "isolation": res.isolation,
+                "account": { "email": res.identity.email, "plan": res.identity.plan },
+                "windows": [],
+                "needsActivationToProbe": true,
+                "note": "系统级单活账号：切换为当前账号后自动探测，或点击「探测全部」",
+                "fetchedAt": Value::Null,
+            }));
+        }
+    }
+
+    let p = run_with_env(tool, settings, &penv, true).await?;
+    if !p.models.is_empty() {
+        hub.remember_models(tool, &p.models);
+    }
+    let raw_v = p
+        .quota
+        .ok_or_else(|| anyhow!("{} 没有返回额度信息", tool.as_str()))?;
     let now = now_ms();
-    v["tool"] = json!(key);
-    v["fetchedAt"] = json!(now);
-    QUOTA_CACHE
-        .lock()
-        .unwrap()
-        .get_or_insert_with(HashMap::new)
-        .insert(key, (now, v.clone()));
+    let v = enrich_quota(raw_v, tool, &penv, now);
+    store_quota_cache(hub.accounts.base_dir(), tool, effective_id.as_deref(), &v, now);
+    if let Some(aid) = &effective_id {
+        if v["error"].is_null() {
+            hub.accounts.set_runtime_state(tool, aid, AccountState::Ready, None);
+        }
+    }
     Ok(v)
+}
+
+/// Probe/collect quotas across all configured accounts (and native host defaults where unconfigured).
+pub async fn quotas(
+    hub: &Arc<Hub>,
+    tool_filter: Option<ToolKind>,
+    refresh: bool,
+    refresh_inactive: bool,
+) -> Result<Value> {
+    let settings = hub.settings.read().unwrap().clone();
+    let tools_list: Vec<ToolKind> = match tool_filter {
+        Some(t) if t.supports_accounts() => vec![t],
+        Some(_) => vec![],
+        None => ToolKind::ALL
+            .into_iter()
+            .filter(|t| t.supports_accounts())
+            .filter(|t| {
+                crate::tools::resolve(*t, &settings).is_some()
+                    || !hub.accounts.all_accounts_for_tool(*t).is_empty()
+            })
+            .collect(),
+    };
+
+    let mut out_tools = Vec::new();
+    for tool in tools_list {
+        let cap = crate::accounts::AccountManager::capability(tool);
+        let accounts = hub.accounts.all_accounts_for_tool(tool);
+        let active_id = hub.accounts.active_account_id(tool);
+
+        if accounts.is_empty() {
+            let native_res = if crate::tools::resolve(tool, &settings).is_some() {
+                Some(quota(hub, tool, &settings, None, refresh).await)
+            } else {
+                None
+            };
+            let (native_quota, error) = match native_res {
+                Some(Ok(q)) => (Some(q), None),
+                Some(Err(e)) => (None, Some(e.to_string())),
+                None => (None, None),
+            };
+            out_tools.push(json!({
+                "tool": tool.as_str(),
+                "oauthIsolation": cap.oauth_isolation,
+                "activeAccountId": Value::Null,
+                "accounts": [],
+                "nativeQuota": native_quota,
+                "error": error,
+            }));
+            continue;
+        }
+
+        // Split accounts into concurrently probeable (Isolated / active HostActive / ApiKey)
+        // vs inactive HostActive OAuth accounts.
+        let mut results: BTreeMap<String, Value> = BTreeMap::new();
+        let sem = Arc::new(Semaphore::new(4));
+        let mut isolated_tasks = tokio::task::JoinSet::new();
+        let mut inactive_host_ids = Vec::new();
+
+        for acc in &accounts {
+            let iso = crate::accounts::AccountManager::effective_isolation(tool, acc.auth_kind);
+            let is_active = active_id.as_deref() == Some(acc.id.as_str())
+                || (active_id.is_none() && accounts.first().map(|a| &a.id) == Some(&acc.id));
+
+            if iso == AccountIsolation::HostActive && !is_active {
+                if !refresh_inactive {
+                    let cached = cached_quota(tool, &acc.id, hub.accounts.base_dir()).map(|mut q| {
+                        let age = now_ms() - q["fetchedAt"].as_i64().unwrap_or(0);
+                        if age >= QUOTA_TTL_MS {
+                            q["stale"] = json!(true);
+                        }
+                        q
+                    });
+                    let q = cached.unwrap_or_else(|| {
+                        json!({
+                            "tool": tool.as_str(),
+                            "accountId": acc.id,
+                            "accountLabel": acc.label,
+                            "authKind": acc.auth_kind,
+                            "isolation": iso,
+                            "account": { "email": acc.identity.email, "plan": acc.identity.plan },
+                            "windows": [],
+                            "needsActivationToProbe": true,
+                            "note": "系统级单活账号：切换为当前账号后自动探测，或点击「切换探测全部」",
+                            "fetchedAt": Value::Null,
+                        })
+                    });
+                    results.insert(acc.id.clone(), json!({
+                        "accountId": acc.id,
+                        "label": acc.label,
+                        "authKind": acc.auth_kind,
+                        "isolation": iso,
+                        "active": false,
+                        "quota": q,
+                        "error": Value::Null,
+                    }));
+                } else {
+                    inactive_host_ids.push(acc.clone());
+                }
+                continue;
+            }
+
+            let hub_c = hub.clone();
+            let settings_c = settings.clone();
+            let acc_c = acc.clone();
+            let sem_c = sem.clone();
+            isolated_tasks.spawn(async move {
+                let _permit = sem_c.acquire_owned().await.ok();
+                let res = quota(&hub_c, tool, &settings_c, Some(&acc_c.id), refresh).await;
+                (acc_c, iso, is_active, res)
+            });
+        }
+
+        while let Some(joined) = isolated_tasks.join_next().await {
+            if let Ok((acc, iso, is_active, res)) = joined {
+                let (q, err) = match res {
+                    Ok(q) => (Some(q), None),
+                    Err(e) => (
+                        cached_quota(tool, &acc.id, hub.accounts.base_dir()),
+                        Some(e.to_string()),
+                    ),
+                };
+                results.insert(acc.id.clone(), json!({
+                    "accountId": acc.id,
+                    "label": acc.label,
+                    "authKind": acc.auth_kind,
+                    "isolation": iso,
+                    "active": is_active,
+                    "quota": q,
+                    "error": err,
+                }));
+            }
+        }
+
+        // Sequential snapshot swap probe for inactive HostActive accounts when explicitly requested.
+        if !inactive_host_ids.is_empty() {
+            if hub.has_running_host_session(tool) {
+                for acc in inactive_host_ids {
+                    results.insert(acc.id.clone(), json!({
+                        "accountId": acc.id,
+                        "label": acc.label,
+                        "authKind": acc.auth_kind,
+                        "isolation": AccountIsolation::HostActive,
+                        "active": false,
+                        "quota": cached_quota(tool, &acc.id, hub.accounts.base_dir()),
+                        "error": "当前有活跃会话正在运行，已跳过切换探测",
+                    }));
+                }
+            } else {
+                let orig_active = active_id.clone();
+                let mut swapped = false;
+                for acc in inactive_host_ids {
+                    if hub.accounts.activate(tool, &acc.id).is_ok() {
+                        swapped = true;
+                        let res = quota(hub, tool, &settings, Some(&acc.id), true).await;
+                        let (q, err) = match res {
+                            Ok(q) => (Some(q), None),
+                            Err(e) => (
+                                cached_quota(tool, &acc.id, hub.accounts.base_dir()),
+                                Some(e.to_string()),
+                            ),
+                        };
+                        results.insert(acc.id.clone(), json!({
+                            "accountId": acc.id,
+                            "label": acc.label,
+                            "authKind": acc.auth_kind,
+                            "isolation": AccountIsolation::HostActive,
+                            "active": false,
+                            "quota": q,
+                            "error": err,
+                        }));
+                    } else {
+                        results.insert(acc.id.clone(), json!({
+                            "accountId": acc.id,
+                            "label": acc.label,
+                            "authKind": acc.auth_kind,
+                            "isolation": AccountIsolation::HostActive,
+                            "active": false,
+                            "quota": cached_quota(tool, &acc.id, hub.accounts.base_dir()),
+                            "error": "无法切换该账号凭据以探测额度",
+                        }));
+                    }
+                }
+                if swapped {
+                    if let Some(orig) = orig_active {
+                        let _ = hub.accounts.activate(tool, &orig);
+                    }
+                }
+            }
+        }
+
+        let ordered: Vec<Value> = accounts
+            .iter()
+            .filter_map(|a| results.remove(&a.id))
+            .collect();
+        out_tools.push(json!({
+            "tool": tool.as_str(),
+            "oauthIsolation": cap.oauth_isolation,
+            "activeAccountId": active_id,
+            "accounts": ordered,
+            "nativeQuota": Value::Null,
+        }));
+    }
+
+    Ok(json!({ "tools": out_tools }))
 }
 
 #[cfg(test)]

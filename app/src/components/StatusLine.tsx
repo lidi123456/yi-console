@@ -25,6 +25,7 @@ const STATUS_FIELDS_ZH: [string, string, string][] = [
   ['cwd', '完整目录', '工作目录（~ 开头）'],
   ['status', '状态', '运行中 / 空闲 / 等待审批…'],
   ['tool', '工具', 'Claude Code / Codex …'],
+  ['account', '账号', '当前会话使用的账号配置'],
   ['quota', '账号额度', '最紧的额度窗口已用百分比（Cursor 没有）'],
 ];
 
@@ -39,6 +40,7 @@ const STATUS_FIELDS_EN: [string, string, string][] = [
   ['cwd', 'Full Path', 'Working directory (~ prefix)'],
   ['status', 'Status', 'Running / Idle / Waiting approval…'],
   ['tool', 'Tool', 'Claude Code / Codex …'],
+  ['account', 'Account', 'Active account label for the session'],
   ['quota', 'Account Quota', 'Tightest quota window usage % (not available for Cursor)'],
 ];
 
@@ -50,7 +52,7 @@ export function getStatusFields(): [string, string, string][] {
 export const STATUS_FIELDS = STATUS_FIELDS_ZH;
 
 /** Variables usable in the template */
-export const TEMPLATE_VARS = ['model', 'context', 'tokens', 'cost', 'lastTurn', 'branch', 'dirty', 'changed', 'ahead', 'behind', 'dir', 'cwd', 'status', 'tool', 'title', 'quota', 'command'];
+export const TEMPLATE_VARS = ['model', 'context', 'tokens', 'cost', 'lastTurn', 'branch', 'dirty', 'changed', 'ahead', 'behind', 'dir', 'cwd', 'status', 'tool', 'account', 'title', 'quota', 'command'];
 
 const GIT_KEYS = ['branch', 'dirty', 'changed', 'ahead', 'behind'];
 
@@ -206,6 +208,7 @@ function values(info: SessionInfo, events: HubEvent[], git: Git | null, quota: Q
     cwd: shortPath(info.cwd, home),
     status: STATUS_LABEL[info.status] ?? info.status,
     tool: TOOL_LABEL[info.tool] ?? info.tool,
+    account: info.accountLabel ?? '',
     title: info.title,
     quota: q ? `${q.label} ${Math.round(q.usedPercent ?? 0)}%` : '',
     command: cmd,
@@ -279,12 +282,12 @@ export function StatusLine({ hostId, info, events }: { hostId: string; info: Ses
 
   useEffect(() => {
     if (!wantQuota) return setQuota(null);
-    rpc<Quota>(hostId, 'tools.quota', { tool: info.tool })
+    rpc<Quota>(hostId, 'tools.quota', { tool: info.tool, accountId: info.accountId ?? undefined })
       .then(setQuota)
       .catch(() => setQuota(null));
     // yi-agentd caches quotas for 60 s, so refreshing every 3rd tick here is enough
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [hostId, info.tool, wantQuota, Math.floor(tick / 3)]);
+  }, [hostId, info.tool, info.accountId, wantQuota, Math.floor(tick / 3)]);
 
   if (!cfg) return null;
   const v = values(info, events, git, quota, cmd?.text ?? '', home);

@@ -194,7 +194,7 @@ pub fn start(spec: StartSpec, em: Emitter, mut rx: mpsc::UnboundedReceiver<Adapt
         .unwrap_or(false);
     let tmux = spec.tmux.as_ref().and_then(|n| crate::tmux::program().map(|t| (t, n.clone())));
     let mut cmd = if let Some((t, name)) = &tmux {
-        let (p, a) = crate::tmux::wrap(
+        let (p, a) = crate::tmux::wrap_env(
             t,
             name,
             &spec.cwd.to_string_lossy(),
@@ -202,6 +202,8 @@ pub fn start(spec: StartSpec, em: Emitter, mut rx: mpsc::UnboundedReceiver<Adapt
             &args,
             spec.cols.max(20),
             spec.rows.max(5),
+            &spec.env,
+            &spec.env_unset,
         );
         let mut c = CommandBuilder::new(p);
         c.args(a);
@@ -222,6 +224,12 @@ pub fn start(spec: StartSpec, em: Emitter, mut rx: mpsc::UnboundedReceiver<Adapt
     cmd.cwd(&spec.cwd);
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
+    for k in &spec.env_unset {
+        cmd.env_remove(k);
+    }
+    for (k, v) in &spec.env {
+        cmd.env(k, v);
+    }
 
     let mut child = match pair.slave.spawn_command(cmd) {
         Ok(c) => c,

@@ -168,12 +168,7 @@ fn trusted_in(cfg: &Value, cwd: &str) -> bool {
 
 fn claude_transcript(info: &SessionInfo) -> Option<PathBuf> {
     let id = info.external_id.as_deref()?;
-    let name = format!("{id}.jsonl");
-    std::fs::read_dir(crate::history::claude_root())
-        .ok()?
-        .flatten()
-        .map(|d| d.path().join(&name))
-        .find(|p| p.is_file())
+    crate::history::find_claude_file(id)
 }
 
 /// Field names follow Claude Code's statusLine input format; our extras go under yi_console
@@ -208,6 +203,8 @@ fn payload(info: &SessionInfo, git: Option<&Value>) -> Value {
             "tool": info.tool,
             "title": info.title,
             "status": info.status,
+            "account_id": info.account_id,
+            "account_label": info.account_label,
             "context_percent": info.context_percent,
             "usage": u,
             "git": git,

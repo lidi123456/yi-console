@@ -288,6 +288,13 @@ pub fn detect(settings: &DaemonSettings) -> Vec<ToolInfo> {
                 path: path.filter(|_| kind.has_process()).map(|p| p.display().to_string()),
                 version,
                 structured: !matches!(kind, ToolKind::Shell | ToolKind::Files),
+                oauth_isolation: match kind {
+                    ToolKind::Claude | ToolKind::Codex => yi_proto::AccountIsolation::Isolated,
+                    _ => yi_proto::AccountIsolation::HostActive,
+                },
+                account_count: 0,
+                active_account_id: None,
+                active_account_label: None,
             }
         })
         .collect()

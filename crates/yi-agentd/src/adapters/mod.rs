@@ -128,6 +128,17 @@ pub struct StartSpec {
     pub tmux: Option<String>,
     /// Session id preassigned (--session-id) when terminal mode starts a new Claude session; later restarts --resume it
     pub session_id: Option<String>,
+    /// Resolved account environment overrides
+    pub env: std::collections::BTreeMap<String, String>,
+    /// Conflicting environment variables to unset for the spawned process
+    pub env_unset: Vec<String>,
+    /// Profile-local data/config directory when isolated
+    #[allow(dead_code)]
+    pub data_dir: Option<PathBuf>,
+    /// Explicit ACP authenticate methodId (e.g. "gemini-api-key" for Antigravity API Key)
+    pub auth_method: Option<String>,
+    /// Compact `<yi-account-handoff>` summary if cross-account native resume falls back to fresh session
+    pub account_handoff: Option<String>,
 }
 
 pub fn start(spec: StartSpec, em: Emitter, rx: mpsc::UnboundedReceiver<AdapterCmd>) {
@@ -178,7 +189,23 @@ pub struct JsonProc {
 
 impl JsonProc {
     pub fn spawn(program: &Path, args: &[String], cwd: &Path) -> std::io::Result<JsonProc> {
+        Self::spawn_with_env(program, args, cwd, &Default::default(), &[])
+    }
+
+    pub fn spawn_with_env(
+        program: &Path,
+        args: &[String],
+        cwd: &Path,
+        env_set: &std::collections::BTreeMap<String, String>,
+        env_unset: &[String],
+    ) -> std::io::Result<JsonProc> {
         let mut cmd: Command = std_command(program, args).into();
+        for k in env_unset {
+            cmd.env_remove(k);
+        }
+        for (k, v) in env_set {
+            cmd.env(k, v);
+        }
         cmd.current_dir(cwd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

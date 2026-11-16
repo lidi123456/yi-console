@@ -9,9 +9,12 @@
 //!   yi-agentd relay pair        generate a one-time pairing QR code (scan with a phone to connect, valid for 10 minutes)
 //!   yi-agentd relay clients | revoke <id> | reset | disable
 
+mod account_login;
+mod accounts;
 mod adapters;
 mod fsapi;
 mod gitops;
+mod keyring;
 mod tmux;
 mod history;
 mod hub;

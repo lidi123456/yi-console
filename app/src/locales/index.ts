@@ -3,6 +3,7 @@
 // Every other language must have the same keys and {{placeholders}}; `npm run i18n:check` (part of the build) checks this.
 // To add a namespace: create zh/<ns>.json and en/<ns>.json and list them below.
 
+import zhAccounts from './zh/accounts.json';
 import zhApp from './zh/app.json';
 import zhAppUpdate from './zh/appUpdate.json';
 import zhBack from './zh/back.json';
@@ -57,6 +58,7 @@ import zhTransport from './zh/transport.json';
 import zhUpgrade from './zh/upgrade.json';
 import zhUsageDialog from './zh/usageDialog.json';
 import zhUtil from './zh/util.json';
+import enAccounts from './en/accounts.json';
 import enApp from './en/app.json';
 import enAppUpdate from './en/appUpdate.json';
 import enBack from './en/back.json';
@@ -114,6 +116,7 @@ import enUtil from './en/util.json';
 
 export const resources = {
   zh: {
+    accounts: zhAccounts,
     app: zhApp,
     appUpdate: zhAppUpdate,
     back: zhBack,
@@ -170,6 +173,7 @@ export const resources = {
     util: zhUtil,
   },
   en: {
+    accounts: enAccounts,
     app: enApp,
     appUpdate: enAppUpdate,
     back: enBack,

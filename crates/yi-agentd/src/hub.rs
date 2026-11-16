@@ -143,6 +143,12 @@ struct SessionRt {
     turn_files: Mutex<HashSet<String>>,
     /// Throttle for activity-only broadcasts: when the last one went out, and whether a trailing one is scheduled
     activity_push: Mutex<(i64, bool)>,
+    /// Compact Level-2 handoff context queued for injection into the next delivered structured prompt
+    pending_handoff: Mutex<Option<String>>,
+    /// Queued automatic account failover `(target_account_id, resets_at, limit)` to run right after TurnEnd
+    pending_failover: Mutex<Option<(String, Option<i64>, Option<String>)>>,
+    /// Accounts already attempted during the current rate-limit streak (cleared on clean turn completion)
+    failover_tried: Mutex<Vec<String>>,
 }
 
 /// One terminal-mode process run
@@ -252,6 +258,10 @@ pub struct Hub {
     tool_commands: Mutex<HashMap<String, Vec<SlashCommand>>>,
     /// Cursor models whose cached "no parameters" was confirmed by Cursor since this daemon started (see `stored_config`)
     config_checked: Mutex<HashSet<String>>,
+    /// Per-tool multi-account credential profiles & failover configuration
+    pub accounts: Arc<crate::accounts::AccountManager>,
+    /// Interactive / device-auth account login manager
+    pub logins: Arc<crate::account_login::LoginManager>,
 }
 
 #[derive(Debug, Clone, Default, serde::Deserialize)]
@@ -306,11 +316,16 @@ pub struct CreateParams {
     /// Start with Computer Use enabled right away (AI chat mode on supported hosts only)
     #[serde(default)]
     pub computer_use: bool,
+    /// Configured account id to bind this session to (when omitted, uses the tool's active account if configured)
+    #[serde(default)]
+    pub account_id: Option<String>,
 }
 
 impl Hub {
     pub fn new(store: Store, settings: DaemonSettings) -> Arc<Hub> {
         let (bus, _) = broadcast::channel(4096);
+        let accounts = Arc::new(crate::accounts::AccountManager::new());
+        let logins = Arc::new(crate::account_login::LoginManager::new(accounts.clone()));
         let hub = Arc::new(Hub {
             store,
             sessions: Mutex::new(HashMap::new()),
@@ -327,6 +342,34 @@ impl Hub {
             ),
             tool_commands: Mutex::new(HashMap::new()),
             config_checked: Mutex::new(HashSet::new()),
+            accounts,
+            logins,
+        });
+        hub.restore();
+        hub
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_accounts(
+        store: Store,
+        settings: DaemonSettings,
+        accounts: Arc<crate::accounts::AccountManager>,
+    ) -> Arc<Hub> {
+        let (bus, _) = broadcast::channel(4096);
+        let logins = Arc::new(crate::account_login::LoginManager::new(accounts.clone()));
+        let hub = Arc::new(Hub {
+            store,
+            sessions: Mutex::new(HashMap::new()),
+            bus,
+            settings: RwLock::new(settings),
+            shutdown: tokio::sync::Notify::new(),
+            desktop: crate::computer_use::Desktop::new(),
+            clients: Default::default(),
+            tool_models: Mutex::new(HashMap::new()),
+            tool_commands: Mutex::new(HashMap::new()),
+            config_checked: Mutex::new(HashSet::new()),
+            accounts,
+            logins,
         });
         hub.restore();
         hub
@@ -566,6 +609,40 @@ impl Hub {
         if p.computer_use && (mode != SessionMode::Structured || !crate::mcp::supported(tool)) {
             bail!("操作电脑仅支持 AI 工具的聊天模式");
         }
+        let (account_id, account_label) = if tool.supports_accounts() {
+            match p.account_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                Some(req_id) => {
+                    let acc = self
+                        .accounts
+                        .resolve_exact(tool, req_id)
+                        .ok_or_else(|| anyhow!("所选账号不存在: {req_id}"))?;
+                    if acc.isolation == AccountIsolation::HostActive {
+                        let outcome = self.accounts.activate(tool, &acc.id)?;
+                        if outcome.host_switched {
+                            if let Some(stored) = self.accounts.get_stored(tool, &acc.id) {
+                                self.sync_other_host_sessions(tool, None, &stored, "host_switched");
+                            }
+                            self.publish_accounts_updated(tool, Some(acc.id.clone()));
+                        }
+                    }
+                    (Some(acc.id), Some(acc.label))
+                }
+                None => match self.accounts.resolve(tool, None) {
+                    Some(acc) => (Some(acc.id), Some(acc.label)),
+                    None => (None, None),
+                },
+            }
+        } else {
+            (None, None)
+        };
+        if let (Some(rid), Some(aid)) = (&p.resume_id, &account_id) {
+            if matches!(tool, ToolKind::Codex | ToolKind::Claude) {
+                let target_dir = self.accounts.resolve_exact(tool, aid).and_then(|r| r.data_dir);
+                if !crate::history::tool_session_exists_in(tool, rid, target_dir.as_deref()) {
+                    let _ = self.accounts.copy_session_history_for_switch(tool, None, aid, rid);
+                }
+            }
+        }
         let id = uuid::Uuid::new_v4().to_string();
         if p.computer_use {
             self.desktop.configure(&id)?;
@@ -619,6 +696,8 @@ impl Hub {
             bot: p.bot.clone(),
             client_mcp: p.client_mcp.clone(),
             append_system_prompt: p.append_system_prompt.clone().filter(|s| !s.trim().is_empty()),
+            account_id,
+            account_label,
         };
         self.store.save_session(&info)?;
         let rt = Arc::new(new_rt(info.clone()));
@@ -721,13 +800,15 @@ impl Hub {
         let settings = self.settings.read().unwrap().clone();
         let program = crate::tools::resolve(info.tool, &settings)
             .ok_or_else(|| anyhow!("这台机器上没有找到 {}", info.tool.as_str()))?;
+        let resolved = self.accounts.resolve(info.tool, info.account_id.as_deref());
         // Claude in the terminal: pin the session id on first launch, and continue that session on later restarts.
         // If it was opened and exited without anything said, Claude leaves no record, so start a new one with the same id
         let mut resume = info.external_id.clone();
         let mut session_id = None;
         if info.mode == SessionMode::Terminal && crate::history::pins_session_id(info.tool) {
+            let data_dir = resolved.as_ref().and_then(|r| r.data_dir.as_deref());
             match &info.external_id {
-                Some(id) if crate::history::tool_session_exists(info.tool, id) => {}
+                Some(id) if crate::history::tool_session_exists_in(info.tool, id, data_dir) => {}
                 Some(id) => {
                     resume = None;
                     session_id = Some(id.clone());
@@ -749,7 +830,7 @@ impl Hub {
             if let Some(config) = self.desktop.mcp_config(&info.id) { servers.push(crate::mcp::desktop(config)?); desktop = true; }
         }
         let mcp_fingerprint = if info.mode == SessionMode::Structured {
-            launch_fingerprint(&settings, info, desktop)
+            self.session_launch_fingerprint(&settings, info, desktop, resolved.as_ref())
         } else {
             mcp_fingerprint(&[], false)
         };
@@ -765,6 +846,15 @@ impl Hub {
         let system_prompt = info.append_system_prompt.clone().filter(|_| structured_ai);
         // A new tool session has not seen the prompt yet; `launch` also sets this after the prompt changed
         let system_notice = system_prompt.is_some() && resume.is_none();
+        let account_handoff = if info.mode == SessionMode::Structured
+            && info.tool == ToolKind::Codex
+            && resume.is_some()
+            && info.account_id.is_some()
+        {
+            self.handoff_digest(&info.id)
+        } else {
+            None
+        };
         Ok(StartSpec {
             tool: info.tool,
             mode: info.mode,
@@ -793,6 +883,11 @@ impl Hub {
                 .then_some(())
                 .filter(|_| settings.terminal_tmux.unwrap_or(true) && crate::tmux::program().is_some())
                 .map(|_| crate::tmux::session_name(&info.id)),
+            env: resolved.as_ref().map(|r| r.env.clone()).unwrap_or_default(),
+            env_unset: resolved.as_ref().map(|r| r.env_unset.clone()).unwrap_or_default(),
+            data_dir: resolved.as_ref().and_then(|r| r.data_dir.clone()),
+            auth_method: resolved.as_ref().and_then(|r| r.auth_method.clone()),
+            account_handoff,
         })
     }
 
@@ -870,7 +965,8 @@ impl Hub {
         if !busy && info.mode == SessionMode::Structured && self.running_tx(&rt).is_some() {
             // Turning computer use off reloads the tool here without its MCP entry, as OpenBot reloads the session
             let desktop = info.computer_use && self.desktop.mcp_config(id).is_some();
-            let expected = launch_fingerprint(&self.settings.read().unwrap(), &info, desktop);
+            let resolved = self.accounts.resolve(info.tool, info.account_id.as_deref());
+            let expected = self.session_launch_fingerprint(&self.settings.read().unwrap(), &info, desktop, resolved.as_ref());
             if *rt.mcp_fingerprint.lock().unwrap() != expected { self.relaunch(&rt)?; }
         }
         // If the process must restart at turn end (permission mode change), messages the tool hasn't read would be lost with it, so queue in that case too
@@ -934,6 +1030,11 @@ impl Hub {
                 .map_err(|_| anyhow!("会话已结束"))?;
             return Ok(());
         }
+        let handoff = rt.pending_handoff.lock().unwrap().take();
+        let adapter_text = match &handoff {
+            Some(h) if !h.is_empty() => format!("{h}\n\n{text}"),
+            _ => text.to_string(),
+        };
         self.emit(
             id,
             0,
@@ -943,11 +1044,16 @@ impl Hub {
                 origin,
             },
         );
-        tx.send(AdapterCmd::Send(Prompt {
-            text: text.to_string(),
-            images: prompt_images,
-        }))
-        .map_err(|_| anyhow!("会话已结束"))?;
+        if tx
+            .send(AdapterCmd::Send(Prompt {
+                text: adapter_text,
+                images: prompt_images,
+            }))
+            .is_err()
+        {
+            *rt.pending_handoff.lock().unwrap() = handoff;
+            bail!("会话已结束");
+        }
         Ok(())
     }
 
@@ -1441,8 +1547,15 @@ impl Hub {
             }
         } else {
             skip = info.synced_users.take().unwrap_or(0) as usize;
+            let data_dir = self
+                .accounts
+                .resolve(tool, info.account_id.as_deref())
+                .and_then(|r| r.data_dir);
             if crate::history::pins_session_id(tool)
-                && info.external_id.as_deref().is_some_and(|e| !crate::history::tool_session_exists(tool, e))
+                && info
+                    .external_id
+                    .as_deref()
+                    .is_some_and(|e| !crate::history::tool_session_exists_in(tool, e, data_dir.as_deref()))
             {
                 // Claude was opened in the terminal but nothing was said, so there's no session to continue
                 info.external_id = None;
@@ -1648,7 +1761,8 @@ impl Hub {
         });
     }
 
-    /// Turn ended: restart the process first if needed (permission mode change), then send the next queued message
+    /// Turn ended: restart the process first if needed (permission mode change), execute queued account failover,
+    /// or send the next queued message.
     fn after_turn(self: &Arc<Self>, sid: &str, gen: u64, stop_reason: Option<&str>) {
         let Some(rt) = self.alive(sid, gen) else {
             return;
@@ -1658,6 +1772,35 @@ impl Hub {
         let limited = std::mem::take(&mut *rt.limited.lock().unwrap());
         if !limited && !was_interrupted {
             self.set_info(sid, gen, |i| std::mem::take(&mut i.limit_hits) > 0);
+            rt.failover_tried.lock().unwrap().clear();
+            let (tool, aid) = {
+                let i = rt.info.lock().unwrap();
+                (i.tool, i.account_id.clone())
+            };
+            if let Some(aid) = aid {
+                if self.accounts.clear_limited_state(tool, &aid) {
+                    self.publish_accounts_updated(tool, None);
+                }
+            }
+        }
+        if !was_interrupted {
+            if let Some((target_id, resets_at, limit)) = rt.pending_failover.lock().unwrap().take() {
+                match self.switch_session_account(sid, &target_id, Some("rate_limit_failover"), true) {
+                    Ok(switched) => {
+                        let text = self.failover_continue_text(&switched);
+                        if let Err(e) = self.send(sid, &text, vec![], false, None) {
+                            self.emit(sid, 0, EventBody::Error { message: format!("切换备用账号后自动继续失败: {e}") });
+                        }
+                        return;
+                    }
+                    Err(e) => {
+                        self.emit(sid, 0, EventBody::Error { message: format!("自动切换备用账号失败: {e}") });
+                        self.fallback_plan_resume(sid, resets_at, limit);
+                    }
+                }
+            }
+        } else {
+            *rt.pending_failover.lock().unwrap() = None;
         }
         // A restart would also end the background tasks (Claude's shells, subagents); it waits until they finish
         let tasks_left = !rt.info.lock().unwrap().background_tasks.is_empty();
@@ -2220,10 +2363,57 @@ impl Hub {
             return;
         };
         *rt.limited.lock().unwrap() = true;
-        let tool = {
+        let (tool, mode, account_id) = {
             let mut i = rt.info.lock().unwrap();
             i.limit_hits += 1;
-            i.tool
+            (i.tool, i.mode, i.account_id.clone())
+        };
+        if let Some(aid) = &account_id {
+            self.accounts.set_runtime_state(
+                tool,
+                aid,
+                AccountState::Limited,
+                limit.clone().or_else(|| Some("rate_limit".into())),
+            );
+            {
+                let mut tried = rt.failover_tried.lock().unwrap();
+                if !tried.iter().any(|x| x == aid) {
+                    tried.push(aid.clone());
+                }
+            }
+            self.publish_accounts_updated(tool, None);
+        }
+        if mode == SessionMode::Structured && tool.supports_accounts() {
+            let mut tried = rt.failover_tried.lock().unwrap().clone();
+            loop {
+                let Some(cand) = self
+                    .accounts
+                    .next_failover_candidate(tool, account_id.as_deref(), &tried)
+                else {
+                    break;
+                };
+                if crate::accounts::AccountManager::effective_isolation(tool, cand.auth_kind)
+                    == AccountIsolation::HostActive
+                    && self.has_busy_other_host_session(tool, sid)
+                {
+                    tried.push(cand.id.clone());
+                    continue;
+                }
+                rt.failover_tried.lock().unwrap().push(cand.id.clone());
+                *rt.pending_failover.lock().unwrap() = Some((cand.id, resets_at, limit));
+                return;
+            }
+        }
+        self.fallback_plan_resume(sid, resets_at, limit);
+    }
+
+    fn fallback_plan_resume(self: &Arc<Self>, sid: &str, resets_at: Option<i64>, limit: Option<String>) {
+        let Ok(rt) = self.get(sid) else {
+            return;
+        };
+        let (tool, account_id) = {
+            let i = rt.info.lock().unwrap();
+            (i.tool, i.account_id.clone())
         };
         if let Some(r) = resets_at {
             return self.plan_resume(sid, r, limit, false);
@@ -2234,7 +2424,7 @@ impl Hub {
         let sid = sid.to_string();
         tokio::spawn(async move {
             let settings = hub.settings.read().unwrap().clone();
-            let reset = crate::probe::quota(&hub, tool, &settings, true)
+            let reset = crate::probe::quota(&hub, tool, &settings, account_id.as_deref(), true)
                 .await
                 .ok()
                 .and_then(|q| exhausted_reset(&q, now_ms()));
@@ -2598,14 +2788,16 @@ impl Hub {
                     };
                     let reply = std::mem::take(&mut *rt.last_text.lock().unwrap());
                     if *rt.limited.lock().unwrap() {
-                        // The client builds the text in its own language from these fields
-                        let at = info.auto_resume.as_ref().map(|a| a.at);
-                        let probing = *rt.limit_probing.lock().unwrap() && self.settings.read().unwrap().auto_resume.unwrap_or(true);
-                        notify = Some((
-                            format!("{} 额度已用完", display_name(&info)),
-                            if at.is_some() || probing { "额度恢复后会自动继续".into() } else { "不会自动继续".into() },
-                        ));
-                        limit_notice = Some(json!({ "name": display_name(&info), "tool": info.tool, "resumeAt": at, "probing": probing }));
+                        if rt.pending_failover.lock().unwrap().is_none() {
+                            // The client builds the text in its own language from these fields
+                            let at = info.auto_resume.as_ref().map(|a| a.at);
+                            let probing = *rt.limit_probing.lock().unwrap() && self.settings.read().unwrap().auto_resume.unwrap_or(true);
+                            notify = Some((
+                                format!("{} 额度已用完", display_name(&info)),
+                                if at.is_some() || probing { "额度恢复后会自动继续".into() } else { "不会自动继续".into() },
+                            ));
+                            limit_notice = Some(json!({ "name": display_name(&info), "tool": info.tool, "resumeAt": at, "probing": probing }));
+                        }
                     } else {
                         notify = Some((title, snippet(&reply, 240)));
                     }
@@ -2749,6 +2941,456 @@ impl Hub {
         );
         // A failure still allows sending another message to trigger a restart, so after Error everything falls back to Exited semantics, handled by send
         *rt.cmd.lock().unwrap() = None;
+    }
+
+    pub fn has_running_host_session(&self, tool: ToolKind) -> bool {
+        let list: Vec<Arc<SessionRt>> = self.sessions.lock().unwrap().values().cloned().collect();
+        for rt in list {
+            if self.running_tx(&rt).is_none() {
+                continue;
+            }
+            let info = rt.info.lock().unwrap().clone();
+            if info.tool != tool || !self.session_uses_host_isolation(&info) {
+                continue;
+            }
+            if info.mode == SessionMode::Terminal
+                || matches!(info.status, SessionStatus::Running | SessionStatus::WaitingPermission | SessionStatus::Starting)
+                || !info.background_tasks.is_empty()
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn has_busy_other_host_session(&self, tool: ToolKind, exclude_sid: &str) -> bool {
+        let list: Vec<Arc<SessionRt>> = self.sessions.lock().unwrap().values().cloned().collect();
+        for rt in list {
+            let info = rt.info.lock().unwrap().clone();
+            if info.tool != tool || info.id == exclude_sid || self.running_tx(&rt).is_none() {
+                continue;
+            }
+            if !self.session_uses_host_isolation(&info) {
+                continue;
+            }
+            if info.mode == SessionMode::Terminal
+                || matches!(info.status, SessionStatus::Running | SessionStatus::WaitingPermission | SessionStatus::Starting)
+                || !info.background_tasks.is_empty()
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn session_uses_host_isolation(&self, info: &SessionInfo) -> bool {
+        match info.account_id.as_deref() {
+            Some(aid) => self
+                .accounts
+                .get_stored(info.tool, aid)
+                .is_some_and(|a| crate::accounts::AccountManager::effective_isolation(info.tool, a.auth_kind) == AccountIsolation::HostActive),
+            None => crate::accounts::AccountManager::capability(info.tool).oauth_isolation == AccountIsolation::HostActive,
+        }
+    }
+
+    pub fn account_in_use_counts(&self) -> HashMap<(ToolKind, String), usize> {
+        let list: Vec<Arc<SessionRt>> = self.sessions.lock().unwrap().values().cloned().collect();
+        let mut counts = HashMap::new();
+        for rt in list {
+            let live = self.running_tx(&rt).is_some();
+            let i = rt.info.lock().unwrap();
+            if !live && !matches!(i.status, SessionStatus::Running | SessionStatus::WaitingPermission | SessionStatus::Starting) {
+                continue;
+            }
+            if let Some(aid) = &i.account_id {
+                *counts.entry((i.tool, aid.clone())).or_insert(0) += 1;
+            }
+        }
+        counts
+    }
+
+    pub fn publish_accounts_updated(&self, tool: ToolKind, active_account_id: Option<String>) {
+        let active = active_account_id.or_else(|| self.accounts.active_account_id(tool));
+        self.publish(
+            None,
+            methods::EV_ACCOUNTS_UPDATED,
+            json!({
+                "tool": tool,
+                "activeAccountId": active,
+            }),
+        );
+    }
+
+    pub fn on_account_deleted(&self, tool: ToolKind, account_id: &str) {
+        let next_active = if crate::accounts::AccountManager::capability(tool).oauth_isolation == AccountIsolation::HostActive {
+            self.accounts
+                .active_account_id(tool)
+                .and_then(|aid| self.accounts.get_stored(tool, &aid))
+        } else {
+            None
+        };
+        let list: Vec<Arc<SessionRt>> = self.sessions.lock().unwrap().values().cloned().collect();
+        for rt in list {
+            let matches_deleted = {
+                let i = rt.info.lock().unwrap();
+                i.tool == tool && i.account_id.as_deref() == Some(account_id)
+            };
+            if !matches_deleted {
+                continue;
+            }
+            if let Some(acc) = &next_active {
+                self.apply_account_switch(&rt, acc, "account_deleted", true);
+            } else {
+                let busy = {
+                    let i = rt.info.lock().unwrap();
+                    matches!(i.status, SessionStatus::Running | SessionStatus::WaitingPermission)
+                };
+                if !busy {
+                    if let Some(tx) = rt.cmd.lock().unwrap().take() {
+                        *rt.generation.lock().unwrap() += 1;
+                        let _ = tx.send(AdapterCmd::Kill);
+                    }
+                } else {
+                    *rt.restart_pending.lock().unwrap() = true;
+                }
+                self.set_info_any(&rt, |i| {
+                    i.account_id = None;
+                    i.account_label = None;
+                    if !busy {
+                        i.status = SessionStatus::Exited;
+                        i.background_tasks.clear();
+                    }
+                    true
+                });
+            }
+        }
+        self.publish_accounts_updated(tool, next_active.map(|a| a.id));
+    }
+
+    pub fn on_account_updated(&self, tool: ToolKind, acc: &AccountProfileView) {
+        let list: Vec<Arc<SessionRt>> = self.sessions.lock().unwrap().values().cloned().collect();
+        for rt in list {
+            let matches_acc = {
+                let i = rt.info.lock().unwrap();
+                i.tool == tool && i.account_id.as_deref() == Some(acc.id.as_str())
+            };
+            if !matches_acc {
+                continue;
+            }
+            self.set_info_any(&rt, |i| {
+                if i.account_label.as_deref() == Some(acc.label.as_str()) {
+                    return false;
+                }
+                i.account_label = Some(acc.label.clone());
+                true
+            });
+            let info = rt.info.lock().unwrap().clone();
+            if self.running_tx(&rt).is_some() {
+                let desktop = info.computer_use && self.desktop.mcp_config(&info.id).is_some();
+                let resolved = self.accounts.resolve(info.tool, info.account_id.as_deref());
+                let expected = self.session_launch_fingerprint(&self.settings.read().unwrap(), &info, desktop, resolved.as_ref());
+                if *rt.mcp_fingerprint.lock().unwrap() != expected {
+                    if matches!(info.status, SessionStatus::Running | SessionStatus::WaitingPermission) {
+                        *rt.restart_pending.lock().unwrap() = true;
+                    } else if let Some(tx) = rt.cmd.lock().unwrap().take() {
+                        *rt.generation.lock().unwrap() += 1;
+                        let _ = tx.send(AdapterCmd::Kill);
+                        self.set_info_any(&rt, |i| {
+                            i.status = SessionStatus::Exited;
+                            i.background_tasks.clear();
+                            true
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn on_host_account_activated(&self, tool: ToolKind, account_id: &str, reason: Option<&str>) {
+        if let Some(stored) = self.accounts.get_stored(tool, account_id) {
+            self.sync_other_host_sessions(tool, None, &stored, reason.unwrap_or("host_switched"));
+        }
+        self.publish_accounts_updated(tool, Some(account_id.to_string()));
+    }
+
+    fn sync_other_host_sessions(
+        &self,
+        tool: ToolKind,
+        exclude_sid: Option<&str>,
+        to_acc: &crate::accounts::StoredAccount,
+        reason: &str,
+    ) {
+        let list: Vec<Arc<SessionRt>> = self.sessions.lock().unwrap().values().cloned().collect();
+        for rt in list {
+            let info = rt.info.lock().unwrap().clone();
+            if info.tool != tool || exclude_sid == Some(info.id.as_str()) {
+                continue;
+            }
+            if !self.session_uses_host_isolation(&info) {
+                continue;
+            }
+            if info.account_id.as_deref() == Some(to_acc.id.as_str()) {
+                if info.account_label.as_deref() != Some(to_acc.label.as_str()) {
+                    self.set_info_any(&rt, |i| {
+                        i.account_label = Some(to_acc.label.clone());
+                        true
+                    });
+                }
+                continue;
+            }
+            self.apply_account_switch(&rt, to_acc, reason, true);
+        }
+    }
+
+    pub fn switch_session_account(
+        self: &Arc<Self>,
+        sid: &str,
+        account_id: &str,
+        reason: Option<&str>,
+        is_failover: bool,
+    ) -> Result<SessionInfo> {
+        let rt = self.get(sid)?;
+        let info = rt.info.lock().unwrap().clone();
+        if !info.tool.supports_accounts() {
+            bail!("{} 不支持多账号切换", info.tool.as_str());
+        }
+        if !is_failover && matches!(info.status, SessionStatus::Running | SessionStatus::WaitingPermission) {
+            bail!("请先停止当前回复，再切换账号");
+        }
+        let to_acc = self
+            .accounts
+            .get_stored(info.tool, account_id)
+            .ok_or_else(|| anyhow!("目标账号不存在: {account_id}"))?;
+        let iso = crate::accounts::AccountManager::effective_isolation(info.tool, to_acc.auth_kind);
+        self.cancel_resume(sid, reason.unwrap_or("account_switched"));
+
+        if info.account_id.as_deref() == Some(account_id) {
+            if iso == AccountIsolation::HostActive {
+                let outcome = self.accounts.activate(info.tool, &to_acc.id)?;
+                if outcome.host_switched {
+                    self.sync_other_host_sessions(info.tool, Some(sid), &to_acc, "host_switched");
+                }
+                self.publish_accounts_updated(info.tool, Some(to_acc.id.clone()));
+            }
+            return Ok(rt.info.lock().unwrap().clone());
+        }
+
+        if iso == AccountIsolation::HostActive {
+            let outcome = self.accounts.activate(info.tool, &to_acc.id)?;
+            let updated = self.apply_account_switch(&rt, &to_acc, reason.unwrap_or(if is_failover { "auto_failover" } else { "manual" }), true);
+            if outcome.host_switched {
+                self.sync_other_host_sessions(info.tool, Some(sid), &to_acc, "host_switched");
+            }
+            self.publish_accounts_updated(info.tool, Some(to_acc.id.clone()));
+            return Ok(updated);
+        }
+
+        let updated = self.apply_account_switch(
+            &rt,
+            &to_acc,
+            reason.unwrap_or(if is_failover { "auto_failover" } else { "manual" }),
+            true,
+        );
+        self.publish_accounts_updated(info.tool, None);
+        Ok(updated)
+    }
+
+    fn apply_account_switch(
+        &self,
+        rt: &Arc<SessionRt>,
+        to_acc: &crate::accounts::StoredAccount,
+        reason: &str,
+        retire_running: bool,
+    ) -> SessionInfo {
+        let cur = rt.info.lock().unwrap().clone();
+        let copied = if let Some(ext) = cur.external_id.as_deref() {
+            if matches!(cur.tool, ToolKind::Codex | ToolKind::Claude) {
+                self.accounts
+                    .copy_session_history_for_switch(cur.tool, cur.account_id.as_deref(), &to_acc.id, ext)
+                    .unwrap_or(false)
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        let has_history = cur.external_id.is_some()
+            || self.store.count_user_messages(&cur.id).unwrap_or(0) > 0;
+        let preserved_context = !has_history || copied;
+
+        if preserved_context {
+            *rt.pending_handoff.lock().unwrap() = None;
+        } else if cur.mode == SessionMode::Structured {
+            let digest = self.handoff_digest(&cur.id);
+            let has_handoff = digest.is_some();
+            *rt.pending_handoff.lock().unwrap() = digest;
+            return self.finish_apply_account_switch(rt, &cur, to_acc, reason, retire_running, copied, preserved_context, has_handoff);
+        }
+        self.finish_apply_account_switch(rt, &cur, to_acc, reason, retire_running, copied, preserved_context, false)
+    }
+
+    fn finish_apply_account_switch(
+        &self,
+        rt: &Arc<SessionRt>,
+        cur: &SessionInfo,
+        to_acc: &crate::accounts::StoredAccount,
+        reason: &str,
+        retire_running: bool,
+        copied: bool,
+        _preserved_context: bool,
+        has_handoff: bool,
+    ) -> SessionInfo {
+
+        let busy = matches!(cur.status, SessionStatus::Running | SessionStatus::WaitingPermission);
+        if retire_running && !busy {
+            if let Some(tx) = rt.cmd.lock().unwrap().take() {
+                *rt.generation.lock().unwrap() += 1;
+                let _ = tx.send(AdapterCmd::Kill);
+            }
+        } else if self.running_tx(rt).is_some() {
+            *rt.restart_pending.lock().unwrap() = true;
+        }
+
+        let from_id = cur.account_id.clone();
+        let from_label = cur.account_label.clone();
+        let retired = retire_running && !busy && self.running_tx(rt).is_none();
+        self.set_info_any(rt, |i| {
+            i.account_id = Some(to_acc.id.clone());
+            i.account_label = Some(to_acc.label.clone());
+            if !copied {
+                i.external_id = None;
+                i.synced_users = None;
+            }
+            if retired && matches!(i.status, SessionStatus::Idle | SessionStatus::Starting) {
+                i.status = SessionStatus::Exited;
+                i.pending_permissions = 0;
+                i.pending = None;
+                i.background_tasks.clear();
+                i.model_config_pending = false;
+                if let Some(t) = &mut i.turn {
+                    t.activity = None;
+                    t.ended_at.get_or_insert(now_ms());
+                }
+            }
+            true
+        });
+
+        let context_carried = if copied {
+            "native_resume".to_string()
+        } else if cur.mode == SessionMode::Structured && has_handoff {
+            "summary_injected".to_string()
+        } else {
+            "fresh".to_string()
+        };
+        self.emit(
+            &cur.id,
+            0,
+            EventBody::AccountSwitched {
+                from_id,
+                from_label,
+                to_id: to_acc.id.clone(),
+                to_label: to_acc.label.clone(),
+                reason: if reason == "rate_limit_failover" {
+                    "rate_limit".to_string()
+                } else if reason == "host_switched" {
+                    "host_active".to_string()
+                } else {
+                    reason.to_string()
+                },
+                context_carried,
+            },
+        );
+        rt.info.lock().unwrap().clone()
+    }
+
+    fn resume_fallback(&self, sid: &str, gen: u64) {
+        let Some(rt) = self.alive(sid, gen) else {
+            return;
+        };
+        let tool = {
+            let mut info_changed = false;
+            let mut i = rt.info.lock().unwrap();
+            let tool = i.tool;
+            if i.external_id.take().is_some() {
+                info_changed = true;
+            }
+            if i.synced_users.take().is_some() {
+                info_changed = true;
+            }
+            let clone = i.clone();
+            drop(i);
+            if info_changed {
+                let _ = self.store.save_session(&clone);
+                self.broadcast_updated(&clone);
+            }
+            tool
+        };
+        if tool == ToolKind::Claude {
+            let mut pending = rt.pending_handoff.lock().unwrap();
+            if pending.is_none() {
+                *pending = self.handoff_digest(sid);
+            }
+        }
+    }
+
+    fn handoff_digest(&self, sid: &str) -> Option<String> {
+        let (evs, _) = self.store.events_tail(sid, None, 40).ok()?;
+        let mut lines = Vec::new();
+        for ev in evs {
+            match ev.body {
+                EventBody::UserMessage { text, .. } => {
+                    let clean = strip_handoff_prefix(&text);
+                    if !clean.is_empty() {
+                        lines.push(format!("User: {}", truncate(clean, 400)));
+                    }
+                }
+                EventBody::AssistantText { text, .. } => {
+                    let t = text.trim();
+                    if !t.is_empty() {
+                        lines.push(format!("Assistant: {}", truncate(t, 500)));
+                    }
+                }
+                EventBody::ToolCall { name, title, .. } => {
+                    lines.push(format!("Tool {name}: {}", truncate(&title, 160)));
+                }
+                EventBody::Error { message } => {
+                    lines.push(format!("Error: {}", truncate(&message, 160)));
+                }
+                _ => {}
+            }
+        }
+        if lines.is_empty() {
+            return None;
+        }
+        let body = lines.join("\n");
+        let capped = truncate(&body, 3200);
+        Some(format!(
+            "<yi-account-handoff>\nThis session switched accounts in place; native tool history was not available on the new account. Continue seamlessly from this recent context without repeating completed work:\n{capped}\n</yi-account-handoff>"
+        ))
+    }
+
+    fn failover_continue_text(&self, info: &SessionInfo) -> String {
+        if self.continue_text(info) == CONTINUE_ZH {
+            FAILOVER_CONTINUE_ZH
+        } else {
+            FAILOVER_CONTINUE_EN
+        }
+        .to_string()
+    }
+
+    fn session_launch_fingerprint(
+        &self,
+        settings: &DaemonSettings,
+        info: &SessionInfo,
+        desktop: bool,
+        resolved: Option<&crate::accounts::ResolvedAccount>,
+    ) -> String {
+        let mut base = launch_fingerprint(settings, info, desktop);
+        if let Some(acc) = resolved {
+            base.push('+');
+            base.push_str(&acc.fingerprint);
+        }
+        base
     }
 }
 
@@ -2897,6 +3539,18 @@ fn new_rt(info: SessionInfo) -> SessionRt {
         pending_briefs: Mutex::new(vec![]),
         turn_files: Mutex::new(HashSet::new()),
         activity_push: Mutex::new((0, false)),
+        pending_handoff: Mutex::new(None),
+        pending_failover: Mutex::new(None),
+        failover_tried: Mutex::new(vec![]),
+    }
+}
+
+fn strip_handoff_prefix(text: &str) -> &str {
+    let t = text.trim();
+    if let Some(idx) = t.find("</yi-account-handoff>") {
+        t[idx + "</yi-account-handoff>".len()..].trim()
+    } else {
+        t
     }
 }
 
@@ -2907,6 +3561,9 @@ const RESTART_CONTINUE_EN: &str = "Your last turn was cut off by a restart of th
 const CONTINUE_ZH: &str = "额度已恢复。请继续完成额度用完时正在做的任务，已经完成的部分不要重复做。";
 const CONTINUE_EN: &str =
     "Your usage limit has reset. Continue the task you were working on when the limit was reached; do not repeat work that is already complete.";
+const FAILOVER_CONTINUE_ZH: &str = "已自动切换到备用账号。请继续完成刚才因额度限制中断的任务，已经完成的部分不要重复做。";
+const FAILOVER_CONTINUE_EN: &str =
+    "Switched to a backup account due to usage limits. Continue the task that was interrupted; do not repeat work that is already complete.";
 
 fn limit_event(phase: &str, resets_at: Option<i64>, limit: Option<String>, resume_at: Option<i64>, reason: Option<&str>) -> EventBody {
     EventBody::RateLimit { phase: phase.into(), resets_at, limit, resume_at, reason: reason.map(str::to_string) }
@@ -3186,6 +3843,11 @@ impl Emitter {
 
     pub fn session_id(&self) -> &str {
         &self.sid
+    }
+
+    /// Notify hub that resuming an account's native tool session failed and fell back to a fresh thread/session
+    pub fn resume_fallback(&self) {
+        self.hub.resume_fallback(&self.sid, self.gen);
     }
 }
 
@@ -3577,6 +4239,8 @@ mod tests {
             bot: None,
             client_mcp: vec![],
             append_system_prompt: None,
+            account_id: None,
+            account_label: None,
         };
         let rt = new_rt(info);
         let (tx, rx) = mpsc::unbounded_channel();
@@ -3950,6 +4614,173 @@ mod tests {
                 .unwrap_err();
             assert!(err.to_string().contains("操作电脑仅支持 AI 工具的聊天模式"), "{err}");
         }
+    }
+
+    #[tokio::test]
+    async fn switch_account_keeps_same_session_and_prepares_handoff() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("yi-base");
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        let accounts = Arc::new(crate::accounts::AccountManager::with_dirs(base, home.clone()));
+        let hub = Hub::with_accounts(crate::store::Store::open_memory().unwrap(), Default::default(), accounts.clone());
+
+        // Codex (Isolated): two OAuth accounts; switching preserves external_id & copies rollout jsonl
+        let dir_a = tmp.path().join("codex-a");
+        std::fs::create_dir_all(&dir_a).unwrap();
+        std::fs::write(&dir_a.join("auth.json"), r#"{"tokens":{"access_token":"tok-a"}}"#).unwrap();
+        let acc_a = accounts.save_oauth_from_dir(ToolKind::Codex, None, Some("Codex A"), Some(&dir_a), None, true).unwrap();
+
+        let dir_b = tmp.path().join("codex-b");
+        std::fs::create_dir_all(&dir_b).unwrap();
+        std::fs::write(&dir_b.join("auth.json"), r#"{"tokens":{"access_token":"tok-b"}}"#).unwrap();
+        let acc_b = accounts.save_oauth_from_dir(ToolKind::Codex, None, Some("Codex B"), Some(&dir_b), None, false).unwrap();
+
+        let mut rx_codex = live(&hub, "s-codex", SessionMode::Structured, SessionStatus::Idle, 0);
+        {
+            let rt = hub.get("s-codex").unwrap();
+            let mut i = rt.info.lock().unwrap();
+            i.tool = ToolKind::Codex;
+            i.external_id = Some("thread-123".into());
+            i.account_id = Some(acc_a.id.clone());
+            i.account_label = Some(acc_a.label.clone());
+        }
+        let rollout_src = accounts.profile_home(ToolKind::Codex, &acc_a.id).join("sessions/2026/11/15/rollout-thread-123.jsonl");
+        std::fs::create_dir_all(rollout_src.parent().unwrap()).unwrap();
+        std::fs::write(&rollout_src, "{\"id\":\"thread-123\"}\n").unwrap();
+
+        let updated = hub.switch_session_account("s-codex", &acc_b.id, Some("manual"), false).unwrap();
+        assert_eq!(updated.id, "s-codex");
+        assert_eq!(updated.account_id.as_deref(), Some(acc_b.id.as_str()));
+        assert_eq!(updated.external_id.as_deref(), Some("thread-123"));
+        assert!(accounts.profile_home(ToolKind::Codex, &acc_b.id).join("sessions/2026/11/15/rollout-thread-123.jsonl").exists());
+        assert!(matches!(rx_codex.try_recv(), Ok(AdapterCmd::Kill)));
+        let evs = hub.backlog("s-codex", 0).unwrap();
+        assert!(evs.iter().any(|e| matches!(&e.body, EventBody::AccountSwitched { context_carried, to_label, .. } if context_carried == "native_resume" && to_label == "Codex B")));
+
+        // HostActive OAuth -> Isolated API Key on Antigravity: clears external_id, injects handoff cleanly without polluting UserMessage
+        let agy_snap_a = crate::accounts::SnapshotBundle {
+            files: [("~/.gemini/antigravity-cli/antigravity-oauth-token".into(), "{\"token\":\"t1\"}".into())].into_iter().collect(),
+            ..Default::default()
+        };
+        let agy_oauth = accounts.save_oauth_from_dir(ToolKind::Antigravity, None, Some("Google A"), None, Some(agy_snap_a), true).unwrap();
+        let agy_key = accounts.save(crate::accounts::SaveAccountRequest {
+            tool: ToolKind::Antigravity,
+            id: None,
+            label: Some("Gemini Key".into()),
+            auth_kind: Some(AccountAuthKind::ApiKey),
+            allow_auto_failover: None,
+            priority: None,
+            api_config: Some(ApiKeyConfig { api_key: "AIzaTestKey".into(), ..Default::default() }),
+            activate: false,
+        }).unwrap();
+        assert!(!agy_key.allow_auto_failover);
+
+        let mut rx_agy = live(&hub, "s-agy", SessionMode::Structured, SessionStatus::Idle, 0);
+        {
+            let rt = hub.get("s-agy").unwrap();
+            let mut i = rt.info.lock().unwrap();
+            i.tool = ToolKind::Antigravity;
+            i.external_id = Some("conv-old".into());
+            i.account_id = Some(agy_oauth.id.clone());
+            i.account_label = Some(agy_oauth.label.clone());
+        }
+        hub.emit("s-agy", 0, EventBody::UserMessage { text: "fix login bug".into(), images: vec![], origin: None });
+        hub.emit("s-agy", 0, EventBody::AssistantText { id: "a1".into(), text: "I inspected auth.rs and found the issue.".into() });
+        hub.emit("s-agy", 0, EventBody::TurnEnd { stop_reason: Some("end_turn".into()), model: None });
+
+        let updated_agy = hub.switch_session_account("s-agy", &agy_key.id, Some("manual"), false).unwrap();
+        assert_eq!(updated_agy.external_id, None);
+        assert_eq!(updated_agy.account_id.as_deref(), Some(agy_key.id.as_str()));
+        assert!(matches!(rx_agy.try_recv(), Ok(AdapterCmd::Kill)));
+        // Next prompt on the switched session (with a fresh running adapter channel attached for test)
+        let (tx_new, mut rx_new) = mpsc::unbounded_channel();
+        {
+            let rt = hub.get("s-agy").unwrap();
+            let resolved = accounts.resolve(ToolKind::Antigravity, Some(&agy_key.id));
+            let expected = hub.session_launch_fingerprint(&hub.settings.read().unwrap(), &updated_agy, false, resolved.as_ref());
+            *rt.mcp_fingerprint.lock().unwrap() = expected;
+            *rt.cmd.lock().unwrap() = Some(tx_new);
+        }
+        hub.send("s-agy", "continue fixing auth.rs", vec![], false, None).unwrap();
+        let sent_prompt = match rx_new.try_recv().unwrap() {
+            AdapterCmd::Send(p) => p.text,
+            other => panic!("expected Send prompt, got {other:?}"),
+        };
+        assert!(sent_prompt.contains("<yi-account-handoff>"), "{sent_prompt}");
+        assert!(sent_prompt.contains("fix login bug"), "{sent_prompt}");
+        assert!(sent_prompt.ends_with("continue fixing auth.rs"), "{sent_prompt}");
+        let agy_evs = hub.backlog("s-agy", 0).unwrap();
+        let last_user = agy_evs.iter().rev().find_map(|e| match &e.body {
+            EventBody::UserMessage { text, .. } => Some(text.as_str()),
+            _ => None,
+        }).unwrap();
+        assert_eq!(last_user, "continue fixing auth.rs");
+    }
+
+    #[tokio::test]
+    async fn rate_limit_auto_failover_respects_policy_and_resets() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("yi-base");
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        let accounts = Arc::new(crate::accounts::AccountManager::with_dirs(base, home));
+        let hub = Hub::with_accounts(crate::store::Store::open_memory().unwrap(), Default::default(), accounts.clone());
+
+        let dir1 = tmp.path().join("c1");
+        let dir2 = tmp.path().join("c2");
+        std::fs::create_dir_all(&dir1).unwrap();
+        std::fs::create_dir_all(&dir2).unwrap();
+        std::fs::write(&dir1.join(".credentials.json"), "{}").unwrap();
+        std::fs::write(&dir2.join(".credentials.json"), "{}").unwrap();
+        let oauth_a = accounts.save_oauth_from_dir(ToolKind::Claude, None, Some("Claude A"), Some(&dir1), None, true).unwrap();
+        let _api_no_failover = accounts.save(crate::accounts::SaveAccountRequest {
+            tool: ToolKind::Claude,
+            id: None,
+            label: Some("Anthropic API Key".into()),
+            auth_kind: Some(AccountAuthKind::ApiKey),
+            allow_auto_failover: None, // defaults false
+            priority: Some(100),
+            api_config: Some(ApiKeyConfig { api_key: "sk-ant-test".into(), ..Default::default() }),
+            activate: false,
+        }).unwrap();
+        let oauth_b = accounts.save_oauth_from_dir(ToolKind::Claude, None, Some("Claude B"), Some(&dir2), None, false).unwrap();
+
+        let mut rx = live(&hub, "s-failover", SessionMode::Structured, SessionStatus::Running, 0);
+        {
+            let rt = hub.get("s-failover").unwrap();
+            let mut i = rt.info.lock().unwrap();
+            i.tool = ToolKind::Claude;
+            i.account_id = Some(oauth_a.id.clone());
+            i.account_label = Some(oauth_a.label.clone());
+        }
+        // Simulate Turn 1 hit limit -> pending_failover skips API Key (allow_auto_failover=false) and picks Claude B
+        hub.limit_hit("s-failover", 0, None, Some("five_hour".into()));
+        let rt = hub.get("s-failover").unwrap();
+        let picked = rt.pending_failover.lock().unwrap().as_ref().map(|(id, _, _)| id.clone());
+        assert_eq!(picked.as_deref(), Some(oauth_b.id.as_str()));
+
+        // Completing TurnEnd triggers after_turn which switches account in place; mock next channel to capture failover continue
+        // First call after_turn manually right after TurnEnd (before killing old process, set up live idle -> switch retires rx, then send needs launch/mock)
+        // Here `switch_session_account` kills `rx`, and `send` will attempt to spawn claude if `cmd` is None; verify switch happened even without spawning binary
+        hub.emit("s-failover", 0, EventBody::TurnEnd { stop_reason: None, model: None });
+        hub.after_turn("s-failover", 0, None);
+        assert_eq!(hub.info("s-failover").unwrap().account_id.as_deref(), Some(oauth_b.id.as_str()));
+        assert!(matches!(rx.try_recv(), Ok(AdapterCmd::Kill)));
+        // Original account should be marked Limited
+        let summary = accounts.list(Some(ToolKind::Claude), &HashMap::new(), &|_, _| None, false);
+        assert_eq!(summary[0].accounts.iter().find(|a| a.id == oauth_a.id).unwrap().state, AccountState::Limited);
+
+        // A clean turn on oauth_b clears failover_tried and Limited state on current account
+        accounts.set_runtime_state(ToolKind::Claude, &oauth_b.id, AccountState::Limited, Some("transient".into()));
+        rt.failover_tried.lock().unwrap().push(oauth_a.id.clone());
+        hub.emit("s-failover", 0, EventBody::TurnEnd { stop_reason: Some("end_turn".into()), model: None });
+        hub.after_turn("s-failover", 0, Some("end_turn"));
+        assert!(rt.failover_tried.lock().unwrap().is_empty());
+        let summary2 = accounts.list(Some(ToolKind::Claude), &HashMap::new(), &|_, _| None, false);
+        assert_eq!(summary2[0].accounts.iter().find(|a| a.id == oauth_b.id).unwrap().state, AccountState::Ready);
     }
 }
 

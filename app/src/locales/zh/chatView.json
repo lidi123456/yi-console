@@ -82,5 +82,14 @@
   "openNewSession": "打开新会话",
   "openOriginalSession": "打开原会话",
   "turnCutOffByRestart": "后台服务重启，这一轮回复被打断",
-  "pathClickToOpen": "{{v}}（点击在右侧打开）"
+  "pathClickToOpen": "{{v}}（点击在右侧打开）",
+  "accountSwitchedManual": "已在当前会话将账号从「{{from}}」切换至「{{to}}」",
+  "accountSwitchedManualNoFrom": "已在当前会话切换至账号「{{to}}」",
+  "accountSwitchedLimit": "因触发用量上限，已自动从「{{from}}」切换至「{{to}}」",
+  "accountSwitchedLimitNoFrom": "因触发用量上限，已自动切换至账号「{{to}}」",
+  "accountSwitchedHost": "宿主活跃账号已变更，从「{{from}}」同步切换至「{{to}}」",
+  "accountSwitchedHostNoFrom": "宿主活跃账号已变更，同步切换至「{{to}}」",
+  "accountContextNative": "原生会话接续",
+  "accountContextSummary": "上下文摘要接力",
+  "accountContextFresh": "新进程启动"
 }

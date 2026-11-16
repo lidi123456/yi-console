@@ -14,11 +14,20 @@ use tokio::sync::{broadcast, mpsc};
 static TOOLS: Mutex<Option<Vec<ToolInfo>>> = Mutex::new(None);
 
 pub(crate) fn tools(hub: &Hub, refresh: bool) -> Vec<ToolInfo> {
-    let mut g = TOOLS.lock().unwrap();
-    if refresh || g.is_none() {
-        *g = Some(crate::tools::detect(&hub.settings.read().unwrap()));
+    let mut list = {
+        let mut g = TOOLS.lock().unwrap();
+        if refresh || g.is_none() {
+            *g = Some(crate::tools::detect(&hub.settings.read().unwrap()));
+        }
+        g.clone().unwrap_or_default()
+    };
+    for t in &mut list {
+        let (cnt, active_id, active_label) = hub.accounts.summary(t.kind);
+        t.account_count = cnt;
+        t.active_account_id = active_id;
+        t.active_account_label = active_label;
     }
-    g.clone().unwrap_or_default()
+    list
 }
 
 /// A local peer process started by this daemon (an AI tool or its children). Unknown pids count as such
@@ -541,8 +550,191 @@ pub async fn dispatch(
         }
         TOOLS_QUOTA => {
             let tool = ToolKind::parse(s(&p, "tool")?).ok_or_else(|| anyhow!("未知工具"))?;
+            let account_id = p["accountId"].as_str().filter(|s| !s.is_empty());
             let settings = hub.settings.read().unwrap().clone();
-            crate::probe::quota(hub, tool, &settings, p["refresh"].as_bool().unwrap_or(false)).await?
+            crate::probe::quota(hub, tool, &settings, account_id, p["refresh"].as_bool().unwrap_or(false)).await?
+        }
+        TOOLS_QUOTAS => {
+            let tool_filter = match p["tool"].as_str().filter(|s| !s.is_empty()) {
+                Some(name) => Some(ToolKind::parse(name).ok_or_else(|| anyhow!("未知工具"))?),
+                None => None,
+            };
+            let refresh = p["refresh"].as_bool().unwrap_or(false);
+            let refresh_inactive = p["refreshInactive"].as_bool().unwrap_or(false);
+            crate::probe::quotas(hub, tool_filter, refresh, refresh_inactive).await?
+        }
+        TOOLS_ACCOUNTS_LIST => {
+            let tool_filter = match p["tool"].as_str().filter(|s| !s.is_empty()) {
+                Some(name) => Some(ToolKind::parse(name).ok_or_else(|| anyhow!("未知工具"))?),
+                None => None,
+            };
+            let check_native = p["checkNative"].as_bool().unwrap_or(true);
+            let hub2 = hub.clone();
+            let list = tokio::task::spawn_blocking(move || {
+                let in_use = hub2.account_in_use_counts();
+                let base_dir = hub2.accounts.base_dir().to_path_buf();
+                hub2.accounts.list(
+                    tool_filter,
+                    &in_use,
+                    &|t, aid| crate::probe::cached_quota(t, aid, &base_dir),
+                    check_native,
+                )
+            })
+            .await?;
+            let active_logins = hub.logins.active_jobs(tool_filter);
+            json!({ "tools": list, "logins": active_logins })
+        }
+        TOOLS_ACCOUNTS_CAPTURE => {
+            let tool = ToolKind::parse(s(&p, "tool")?).ok_or_else(|| anyhow!("未知工具"))?;
+            let label = p["label"].as_str().map(str::to_string);
+            let hub2 = hub.clone();
+            let view = tokio::task::spawn_blocking(move || {
+                let v = hub2.accounts.capture(tool, label.as_deref())?;
+                hub2.publish_accounts_updated(tool, v.active.then(|| v.id.clone()));
+                Ok::<_, anyhow::Error>(v)
+            })
+            .await??;
+            serde_json::to_value(view)?
+        }
+        TOOLS_ACCOUNTS_SAVE => {
+            let tool = ToolKind::parse(s(&p, "tool")?).ok_or_else(|| anyhow!("未知工具"))?;
+            let auth_kind = p
+                .get("authKind")
+                .filter(|v| !v.is_null())
+                .map(|v| serde_json::from_value::<AccountAuthKind>(v.clone()))
+                .transpose()?;
+            let api_config = p
+                .get("apiConfig")
+                .filter(|v| !v.is_null())
+                .map(|v| serde_json::from_value::<ApiKeyConfig>(v.clone()))
+                .transpose()?;
+            let req = crate::accounts::SaveAccountRequest {
+                tool,
+                id: p["id"].as_str().map(str::to_string),
+                label: p["label"].as_str().map(str::to_string),
+                auth_kind,
+                allow_auto_failover: p["allowAutoFailover"].as_bool(),
+                priority: p["priority"].as_i64().map(|n| n as i32),
+                api_config,
+                activate: p["activate"].as_bool().unwrap_or(false),
+            };
+            let hub2 = hub.clone();
+            let view = tokio::task::spawn_blocking(move || {
+                let v = hub2.accounts.save(req)?;
+                hub2.on_account_updated(tool, &v);
+                hub2.publish_accounts_updated(tool, v.active.then(|| v.id.clone()));
+                Ok::<_, anyhow::Error>(v)
+            })
+            .await??;
+            serde_json::to_value(view)?
+        }
+        TOOLS_ACCOUNTS_DELETE => {
+            let tool = ToolKind::parse(s(&p, "tool")?).ok_or_else(|| anyhow!("未知工具"))?;
+            let account_id = s(&p, "accountId")?.to_string();
+            let hub2 = hub.clone();
+            tokio::task::spawn_blocking(move || {
+                hub2.accounts.delete(tool, &account_id)?;
+                crate::probe::clear_account_cache(tool, &account_id);
+                hub2.on_account_deleted(tool, &account_id);
+                Ok::<_, anyhow::Error>(())
+            })
+            .await??;
+            Value::Null
+        }
+        TOOLS_ACCOUNTS_ACTIVATE => {
+            let tool = ToolKind::parse(s(&p, "tool")?).ok_or_else(|| anyhow!("未知工具"))?;
+            let account_id = s(&p, "accountId")?.to_string();
+            let hub2 = hub.clone();
+            let outcome = tokio::task::spawn_blocking(move || {
+                let out = hub2.accounts.activate(tool, &account_id)?;
+                if out.host_switched {
+                    hub2.on_host_account_activated(tool, &account_id, Some("host_active"));
+                } else {
+                    hub2.publish_accounts_updated(tool, Some(account_id));
+                }
+                Ok::<_, anyhow::Error>(out)
+            })
+            .await??;
+            json!({ "account": outcome.account, "hostSwitched": outcome.host_switched })
+        }
+        TOOLS_ACCOUNTS_SET_POLICY => {
+            let tool = ToolKind::parse(s(&p, "tool")?).ok_or_else(|| anyhow!("未知工具"))?;
+            let auto_failover = p["autoFailover"].as_bool().ok_or_else(|| anyhow!("缺少参数 autoFailover"))?;
+            hub.accounts.set_policy(tool, auto_failover)?;
+            hub.publish_accounts_updated(tool, None);
+            Value::Null
+        }
+        TOOLS_ACCOUNTS_LOGIN_START => {
+            let tool = ToolKind::parse(s(&p, "tool")?).ok_or_else(|| anyhow!("未知工具"))?;
+            let req = crate::account_login::StartLoginRequest {
+                tool,
+                mode: p["mode"].as_str().map(str::to_string),
+                account_id: p["accountId"].as_str().map(str::to_string),
+                label: p["label"].as_str().map(str::to_string),
+            };
+            let settings = hub.settings.read().unwrap().clone();
+            let emit_hub = hub.clone();
+            let emit: crate::account_login::LoginEmitFn = Arc::new(move |upd| {
+                emit_hub.publish(None, methods::EV_ACCOUNT_LOGIN, serde_json::to_value(&upd).unwrap_or(Value::Null));
+            });
+            let changed_hub = hub.clone();
+            let on_changed: crate::account_login::AccountsChangedFn = Arc::new(move |t, aid, host_switched| {
+                if host_switched {
+                    if let Some(id) = aid {
+                        changed_hub.on_host_account_activated(t, &id, Some("host_active"));
+                        return;
+                    }
+                }
+                changed_hub.publish_accounts_updated(t, aid);
+            });
+            let upd = hub.logins.start(req, &settings, emit, on_changed)?;
+            serde_json::to_value(upd)?
+        }
+        TOOLS_ACCOUNTS_LOGIN_INPUT => {
+            let job_id = s(&p, "jobId")?;
+            let input = p["input"].as_str().unwrap_or("");
+            let emit_hub = hub.clone();
+            let emit: crate::account_login::LoginEmitFn = Arc::new(move |upd| {
+                emit_hub.publish(None, methods::EV_ACCOUNT_LOGIN, serde_json::to_value(&upd).unwrap_or(Value::Null));
+            });
+            let upd = hub.logins.send_input(job_id, input, emit)?;
+            serde_json::to_value(upd)?
+        }
+        TOOLS_ACCOUNTS_LOGIN_CANCEL => {
+            let job_id = s(&p, "jobId")?;
+            let emit_hub = hub.clone();
+            let emit: crate::account_login::LoginEmitFn = Arc::new(move |upd| {
+                emit_hub.publish(None, methods::EV_ACCOUNT_LOGIN, serde_json::to_value(&upd).unwrap_or(Value::Null));
+            });
+            let upd = hub.logins.cancel(job_id, emit)?;
+            serde_json::to_value(upd)?
+        }
+        TOOLS_ACCOUNTS_EXPORT => {
+            let tool = ToolKind::parse(s(&p, "tool")?).ok_or_else(|| anyhow!("未知工具"))?;
+            let account_id = s(&p, "accountId")?.to_string();
+            let hub2 = hub.clone();
+            tokio::task::spawn_blocking(move || hub2.accounts.export_bundle(tool, &account_id)).await??
+        }
+        TOOLS_ACCOUNTS_IMPORT => {
+            let bundle = if p.get("bundle").is_some() { p["bundle"].clone() } else { p.clone() };
+            let hub2 = hub.clone();
+            let view = tokio::task::spawn_blocking(move || {
+                let v = hub2.accounts.import_bundle(bundle)?;
+                hub2.publish_accounts_updated(v.tool, v.active.then(|| v.id.clone()));
+                Ok::<_, anyhow::Error>(v)
+            })
+            .await??;
+            serde_json::to_value(view)?
+        }
+        SESSION_SWITCH_ACCOUNT => {
+            let sid = s(&p, "sessionId")?.to_string();
+            let account_id = s(&p, "accountId")?.to_string();
+            let hub2 = hub.clone();
+            let info = tokio::task::spawn_blocking(move || {
+                hub2.switch_session_account(&sid, &account_id, Some("manual"), false)
+            })
+            .await??;
+            serde_json::to_value(info)?
         }
         "session.resume" => {
             let sid = s(&p, "sessionId")?.to_string();

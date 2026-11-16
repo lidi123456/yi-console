@@ -82,5 +82,14 @@
   "openNewSession": "Open new session",
   "openOriginalSession": "Open original session",
   "turnCutOffByRestart": "The background service restarted; this turn was cut off",
-  "pathClickToOpen": "{{v}} (click to open)"
+  "pathClickToOpen": "{{v}} (click to open)",
+  "accountSwitchedManual": "Switched account in this session from \"{{from}}\" to \"{{to}}\"",
+  "accountSwitchedManualNoFrom": "Switched account in this session to \"{{to}}\"",
+  "accountSwitchedLimit": "Usage limit reached; automatically switched from \"{{from}}\" to \"{{to}}\"",
+  "accountSwitchedLimitNoFrom": "Usage limit reached; automatically switched to \"{{to}}\"",
+  "accountSwitchedHost": "Host active account changed; synced from \"{{from}}\" to \"{{to}}\"",
+  "accountSwitchedHostNoFrom": "Host active account changed; synced to \"{{to}}\"",
+  "accountContextNative": "Native resume",
+  "accountContextSummary": "Context summary handoff",
+  "accountContextFresh": "Fresh context"
 }

@@ -1,10 +1,11 @@
 import { getT, isEn } from '../i18n';
 import { errorToast, getState, loadSession, navigate, openNewSession, skey, toast } from '../store';
 import { rpc } from '../transport';
-import { TOOL_LABEL, type HubEvent, type SessionInfo } from '../types';
+import { TOOL_LABEL, supportsAccountsTool, type HubEvent, type SessionInfo } from '../types';
 import { downloadText, isMobile, lsSet, safeFileName, sessionMarkdown, toB64 } from '../util';
 import { handoffPrompt } from '../handoff';
 import { writeClipboard } from '../clipboard';
+import { openAccountManager } from './AccountManagerModal';
 import { askConfirm, askText, type MenuItem } from './Overlay';
 
 const tx = getT('sessionActions');
@@ -375,6 +376,15 @@ export function sessionMenu(
         ]
       : []),
     ...(info.tool !== 'shell' && info.mode !== 'terminal' ? [{ label: tx('clearConversation'), icon: 'trash', run: () => clearSession(hostId, info) }] : []),
+    ...(supportsAccountsTool(info.tool) && !info.parentId
+      ? [
+          {
+            label: tx('switchOrManageAccount'),
+            icon: 'key',
+            run: () => openAccountManager({ hostId, tool: info.tool, sessionId: sid, accountId: info.accountId }),
+          },
+        ]
+      : []),
     // Chat mode: no tool session id means nothing has been said yet (or just /clear-ed), so there's nothing to hand off.
     // Terminal mode: the daemon works out the tool session when asked (session.logFile); Cursor's and Antigravity's
     // sessions have no readable log, and the Markdown export needs our events, which a terminal session doesn't have

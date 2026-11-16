@@ -91,6 +91,8 @@ pub struct SessionSpec {
     pub effort: Option<String>,
     #[serde(default)]
     pub permission_mode: Option<String>,
+    #[serde(default)]
+    pub account_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -106,6 +108,8 @@ pub struct TaskDefaults {
     pub model: Option<String>,
     #[serde(default)]
     pub effort: Option<String>,
+    #[serde(default)]
+    pub account_id: Option<String>,
     #[serde(default = "default_task_mode")]
     pub permission_mode: String,
     /// Allow tasks to operate the host's desktop GUI when `spawn_task` passes `computer_use: true`
@@ -147,6 +151,7 @@ impl Default for TaskDefaults {
             tools: vec![],
             model: None,
             effort: None,
+            account_id: None,
             permission_mode: default_task_mode(),
             computer_use: false,
             max_concurrent: default_max(),

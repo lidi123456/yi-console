@@ -8,7 +8,7 @@ import { fmtAt } from './limit';
 import { hubCall, onHubEvent, rpc, isTauri } from './transport';
 import { markSeen, recordChange } from './overview';
 import { dropRemoteHost, findBot, mapHost, refreshBots, refreshRemote, refreshRemoteHost, remoteKey, sourceOf } from './bots';
-import type { ClientSettings, HostConfig, HostStatus, HubEvent, NotifyPrefs, SessionInfo, Snippet, ToolInfo, ToolJob, ToolKind } from './types';
+import type { AccountLoginUpdate, ClientSettings, HostConfig, HostStatus, HubEvent, NotifyPrefs, SessionInfo, Snippet, ToolInfo, ToolJob, ToolKind } from './types';
 
 const t = getT('store');
 
@@ -432,6 +432,19 @@ export function setHostTools(hostId: string, tools: ToolInfo[]) {
   }));
 }
 
+const accountListeners = new Set<(hostId: string, tool?: ToolKind) => void>();
+const loginListeners = new Set<(hostId: string, upd: AccountLoginUpdate) => void>();
+
+export function onAccountsUpdated(fn: (hostId: string, tool?: ToolKind) => void): () => void {
+  accountListeners.add(fn);
+  return () => accountListeners.delete(fn);
+}
+
+export function onAccountLogin(fn: (hostId: string, upd: AccountLoginUpdate) => void): () => void {
+  loginListeners.add(fn);
+  return () => loginListeners.delete(fn);
+}
+
 export function sessionInfo(hostId: string, sid: string): SessionInfo | undefined {
   return state.sessions[hostId]?.find((s) => s.id === sid);
 }
@@ -811,6 +824,13 @@ function onNotification(hostId: string, method: string, p: any) {
     case 'tools.updating':
       setToolJob(hostId, p.tool, p.job, p.line);
       if (Array.isArray(p.tools)) setHostTools(hostId, p.tools);
+      break;
+    case 'accounts.updated':
+      redetectTools(hostId).catch(() => {});
+      for (const fn of accountListeners) fn(hostId, p?.tool);
+      break;
+    case 'tools.accountLogin':
+      if (p) for (const fn of loginListeners) fn(hostId, p as AccountLoginUpdate);
       break;
     case 'session.updated':
       upsertSession(hostId, p);

@@ -5,8 +5,9 @@ import { useBack } from '../back';
 import { getT, isEn } from '../i18n';
 import { errorToast, hostStatus, loadOlder, loadSession, navigate, setState, skey, toast, useSessionData, useStore } from '../store';
 import { rpc } from '../transport';
-import { TOOL_LABEL, type QuestionAnswer } from '../types';
+import { TOOL_LABEL, supportsAccountsTool, type QuestionAnswer, type ToolAccountsSummary } from '../types';
 import { fmtUsage, lsGet, lsSet, shortPath, STATUS_LABEL } from '../util';
+import { openAccountManager } from './AccountManagerModal';
 import { openMenu } from './Overlay';
 import { exportSession, OPEN_CHANGES, OPEN_FILE, renameSession, sessionMenu, showChanges, switchMode } from './SessionActions';
 import { FilePanel } from './FilePanel';
@@ -206,6 +207,51 @@ export function SessionView({ hostId, sessionId, seq }: { hostId: string; sessio
           </div>
           <div className="muted small truncate">
             {TOOL_LABEL[info.tool]}
+            {supportsAccountsTool(info.tool) && (
+              <>
+                {' · '}
+                <button
+                  type="button"
+                  className="link-btn small acc-session-btn"
+                  title={t('switchAccountTitle')}
+                  onClick={async (e) => {
+                    const coords = { clientX: e.clientX, clientY: e.clientY };
+                    try {
+                      const res = await rpc<{ tools: ToolAccountsSummary[] }>(hostId, 'tools.accounts.list', {
+                        tool: info.tool,
+                        checkNative: false,
+                      });
+                      const accounts = res.tools?.[0]?.accounts ?? [];
+                      openMenu(coords, [
+                        ...accounts.map((acc) => ({
+                          label: acc.label,
+                          hint: [acc.authKind === 'apiKey' ? 'API' : 'OAuth', acc.identity.email].filter(Boolean).join(' · '),
+                          active: acc.id === info.accountId,
+                          run: async () => {
+                            try {
+                              await rpc(hostId, 'session.switchAccount', { sessionId: info.id, accountId: acc.id });
+                              toast(t('switchedAccount', { label: acc.label }), 'info');
+                            } catch (err) {
+                              errorToast(err);
+                            }
+                          },
+                        })),
+                        ...(accounts.length ? (['-'] as const) : []),
+                        {
+                          label: t('manageAccounts'),
+                          icon: 'key',
+                          run: () => openAccountManager({ hostId, tool: info.tool, sessionId: info.id, accountId: info.accountId }),
+                        },
+                      ]);
+                    } catch (err) {
+                      errorToast(err);
+                    }
+                  }}
+                >
+                  {info.accountLabel ?? t('defaultAccount')}
+                </button>
+              </>
+            )}
             {info.mode === 'terminal' && info.model ? ` · ${info.model}` : ''} · {shortPath(info.cwd, home)}
             {info.contextPercent != null && ` · ${t('context')} ${Math.round(info.contextPercent)}%`}
           </div>

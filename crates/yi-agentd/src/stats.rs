@@ -381,29 +381,32 @@ pub fn usage(store: &Store, days: i64, tz_offset_min: i64) -> anyhow::Result<Val
     let mut agg = Agg::default();
     let mut from_logs: Vec<&str> = vec![];
 
-    let sources: [(&str, PathBuf, fn(&str) -> Vec<Rec>); 4] = [
-        ("claude", crate::history::claude_root(), parse_claude),
-        ("codex", crate::history::codex_root(), parse_codex),
-        ("qoder", crate::history::qoder_root(), parse_qoder),
-        ("codebuddy", crate::history::codebuddy_root(), parse_codebuddy),
+    let sources: [(&str, Vec<PathBuf>, fn(&str) -> Vec<Rec>); 4] = [
+        ("claude", crate::history::claude_roots(), parse_claude),
+        ("codex", crate::history::codex_roots(), parse_codex),
+        ("qoder", vec![crate::history::qoder_root()], parse_qoder),
+        ("codebuddy", vec![crate::history::codebuddy_root()], parse_codebuddy),
     ];
-    for (tool, root, parse) in sources {
-        if !root.is_dir() {
+    for (tool, roots, parse) in sources {
+        let existing: Vec<PathBuf> = roots.into_iter().filter(|r| r.is_dir()).collect();
+        if existing.is_empty() {
             continue;
         }
         from_logs.push(tool);
         let mut seen = HashSet::new();
-        for f in recent_files(&root, since) {
-            for r in cached(&f, parse).iter() {
-                if r.ts < since {
-                    continue;
-                }
-                if let Some(k) = &r.key {
-                    if !seen.insert(k.clone()) {
+        for root in existing {
+            for f in recent_files(&root, since) {
+                for r in cached(&f, parse).iter() {
+                    if r.ts < since {
                         continue;
                     }
+                    if let Some(k) = &r.key {
+                        if !seen.insert(k.clone()) {
+                            continue;
+                        }
+                    }
+                    agg.add(tool, day_of(r.ts, tz_offset_min), &r.model, &r.usage);
                 }
-                agg.add(tool, day_of(r.ts, tz_offset_min), &r.model, &r.usage);
             }
         }
     }

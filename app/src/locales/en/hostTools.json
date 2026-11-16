@@ -16,5 +16,8 @@
   "update": "Upgrade",
   "runsCommand": "Runs {{cmd}} on this host",
   "summary": "{{n}} installed",
-  "summaryWithUpdates": "{{n}} installed · {{m}} with updates"
+  "summaryWithUpdates": "{{n}} installed · {{m}} with updates",
+  "accounts": "Accounts",
+  "accountsCount": "Accounts ({{n}})",
+  "manageAccounts": "Manage accounts and API keys for this tool"
 }

@@ -45,6 +45,15 @@ pub fn build_args(spec: &StartSpec) -> Vec<String> {
         a.push("--append-system-prompt".into());
         a.push(super::system_text(spec));
     }
+    // Isolated multi-account sessions load user config from `CLAUDE_CONFIG_DIR`. When cwd is `~`,
+    // Claude would otherwise treat `~/.claude/settings.json` as project scope and override account env.
+    if spec.data_dir.is_some()
+        && is_home_dir(&spec.cwd)
+        && !spec.extra_args.iter().any(|x| x == "--setting-sources" || x.starts_with("--setting-sources="))
+    {
+        a.push("--setting-sources".into());
+        a.push("user".into());
+    }
     a.extend(spec.extra_args.iter().cloned());
     if !crate::computer_use::model_hint(&spec.extra_args).is_empty() {
         allow_tools(&mut a, "mcp__yi_computer_use__*");
@@ -54,6 +63,30 @@ pub fn build_args(spec: &StartSpec) -> Vec<String> {
         allow_tools(&mut a, &format!("mcp__{name}__*"));
     }
     a
+}
+
+fn is_home_dir(cwd: &std::path::Path) -> bool {
+    fn norm(p: &std::path::Path) -> String {
+        let can = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        let s = can.to_string_lossy().trim_end_matches(['/', '\\']).to_string();
+        #[cfg(windows)]
+        {
+            s.to_ascii_lowercase()
+        }
+        #[cfg(not(windows))]
+        s
+    }
+    let cwd_norm = norm(cwd);
+    let mut candidates = Vec::new();
+    if let Some(h) = dirs::home_dir() {
+        candidates.push(h);
+    }
+    for key in ["HOME", "USERPROFILE"] {
+        if let Some(v) = std::env::var_os(key).filter(|s| !s.is_empty()) {
+            candidates.push(std::path::PathBuf::from(v));
+        }
+    }
+    candidates.into_iter().any(|h| norm(&h) == cwd_norm)
 }
 
 /// Preauthorize the gateway at the CLI layer too: auto mode can run its classifier before can_use_tool.
@@ -136,7 +169,7 @@ struct State {
 
 pub async fn run(spec: StartSpec, em: Emitter, mut rx: mpsc::UnboundedReceiver<AdapterCmd>) {
     let args = build_args(&spec);
-    let mut p = match JsonProc::spawn(&spec.program, &args, &spec.cwd) {
+    let mut p = match JsonProc::spawn_with_env(&spec.program, &args, &spec.cwd, &spec.env, &spec.env_unset) {
         Ok(p) => p,
         Err(e) => return em.exited(Some(format!("启动 claude 失败: {e}"))),
     };
@@ -207,6 +240,16 @@ pub async fn run(spec: StartSpec, em: Emitter, mut rx: mpsc::UnboundedReceiver<A
         }
     }
     let msg = p.finish(killed).await;
+    if !st.ready
+        && spec.resume.is_some()
+        && !killed
+        && msg.as_deref().is_some_and(|m| {
+            let low = m.to_lowercase();
+            low.contains("no conversation") || low.contains("not found")
+        })
+    {
+        em.resume_fallback();
+    }
     em.exited(msg);
 }
 
@@ -878,6 +921,44 @@ mod tests {
         let v = json!({"type":"system","subtype":"api_retry","attempt":2,"retry_delay_ms":1500,"error_status":529});
         assert_eq!(system_notice(&v).unwrap(), "请求模型失败（HTTP 529），2 秒后重试，第 2 次重试");
         assert!(system_notice(&json!({"type":"system","subtype":"status","status":"requesting"})).is_none());
+    }
+
+    #[test]
+    fn isolated_home_cwd_sets_setting_sources_user() {
+        let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+        let mk = |cwd: std::path::PathBuf, data_dir: Option<std::path::PathBuf>| StartSpec {
+            tool: ToolKind::Claude,
+            mode: SessionMode::Structured,
+            cwd,
+            resume: None,
+            session_id: None,
+            replay: false,
+            replay_skip: 0,
+            model: None,
+            effort: None,
+            model_config_options: vec![],
+            permission_mode: "default".into(),
+            command: None,
+            program: "claude".into(),
+            extra_args: vec![],
+            mcp_servers: vec![],
+            mcp_fingerprint: String::new(),
+            allow_mcp: vec![],
+            system_notice: false,
+            system_prompt: None,
+            cols: 80,
+            rows: 24,
+            tmux: None,
+            env: std::collections::BTreeMap::new(),
+            env_unset: vec![],
+            data_dir,
+            auth_method: None,
+            account_handoff: None,
+        };
+        let args_home = build_args(&mk(home.clone(), Some("/tmp/acc1".into())));
+        assert!(args_home.windows(2).any(|w| w == ["--setting-sources", "user"]));
+        let args_project = build_args(&mk(std::env::temp_dir(), Some("/tmp/acc1".into())));
+        assert!(!args_project.iter().any(|a| a == "--setting-sources"));
     }
 }
 

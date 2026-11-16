@@ -1,4 +1,5 @@
 import { McpSettingsCard } from './McpSettingsCard';
+import { openAccountManager } from './AccountManagerModal';
 import { useEffect, useState } from 'react';
 import { getT, isEn } from '../i18n';
 import { Icon } from './Icon';
@@ -119,6 +120,36 @@ export function SettingsView({ hostId }: { hostId: string }) {
             />
           </label>
           <p className="muted small">{t('worktreeRootHint')}</p>
+        </div>
+      </div>
+      <div className="card">
+        <div className="card-title">{t('toolAccounts')}</div>
+        <p className="muted small">{t('toolAccountsDesc')}</p>
+        <div className="settings-acc-list">
+          {(['claude', 'codex', 'cursor', 'kiro', 'qoder', 'codebuddy', 'antigravity'] as ToolKind[]).map((k) => {
+            const detected = host?.status.hello?.tools.find((x) => x.kind === k);
+            return (
+              <div key={k} className="settings-acc-row">
+                <div className="grow">
+                  <div className="row" style={{ gap: 6, flexWrap: 'wrap' }}>
+                    <strong className="small">{TOOL_LABEL[k]}</strong>
+                    {!detected?.available && <span className="muted small">({t('notFound')})</span>}
+                    {detected?.activeAccountLabel && (
+                      <span className="acc-badge acc-badge-accent">{detected.activeAccountLabel}</span>
+                    )}
+                  </div>
+                  <div className="muted small">
+                    {detected?.accountCount
+                      ? t('configuredAccounts', { n: detected.accountCount })
+                      : t('noConfiguredAccounts')}
+                  </div>
+                </div>
+                <button className="btn small" onClick={() => openAccountManager({ hostId, tool: k })}>
+                  <Icon name="key" size={14} /> {t('manageAccounts')}
+                </button>
+              </div>
+            );
+          })}
         </div>
       </div>
       <McpSettingsCard servers={s.mcpServers ?? []} onChange={(mcpServers) => setS({ ...s, mcpServers })} />
