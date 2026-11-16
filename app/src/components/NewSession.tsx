@@ -511,7 +511,7 @@ export function NewSessionPage({ params }: { params: NewSessionParams }) {
   };
 
   const onKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-    if (e.nativeEvent.isComposing) return;
+    if (e.nativeEvent.isComposing || e.nativeEvent.keyCode === 229) return;
     if (e.key === 'Tab' && e.shiftKey && aiTool) {
       e.preventDefault();
       setPerm(nextPerm(tool, mode, perm));

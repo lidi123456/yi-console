@@ -17,6 +17,7 @@ The session page's "workspace files" (`FilePanel.tsx`), also used standalone by 
 - Expanded folders are stored in localStorage `wp-exp-<host>/<cwd>` (missing ones are dropped quietly).
 - Keyboard: VS Code's bindings (arrows, Home/End, Enter, F2, Delete) on a focus cursor separate from the open file; renaming a folder moves open tabs and expanded folders inside it.
 - On Windows, `fs.list` must strip the `\\?\` prefix canonicalize adds (`fsapi::strip_verbatim`) before building child paths, otherwise child paths don't match the root and git paths (a "?" in the breadcrumbs, git marks lost); the frontend's `unverbatim` handles old records.
+- `FilesView` breadcrumbs retain each path separator using a forward-only regular expression. Avoid regex lookbehind in statically imported frontend modules: macOS 13.0 WebKit rejects it during parsing, preventing the app from loading before any input handlers can run.
 
 ## Git: changes, diffs, history
 

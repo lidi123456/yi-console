@@ -675,7 +675,8 @@ export function Composer({
   const cyclePerm = () => setPermMode(hostId, info, nextPerm(info.tool, info.mode, info.permissionMode));
 
   const onKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-    if (e.nativeEvent.isComposing) return;
+    // WebKit can end composition before its confirming keydown; keyCode 229 still identifies the IME key.
+    if (e.nativeEvent.isComposing || e.nativeEvent.keyCode === 229) return;
     if (popOpen && items.length > 0) {
       if (e.key === 'ArrowDown') {
         e.preventDefault();

@@ -316,7 +316,7 @@ export function QuickStart({ hosts, sessions }: { hosts: HostEntry[]; sessions: 
               }
             }}
             onKeyDown={(e) => {
-              if (e.nativeEvent.isComposing) return;
+              if (e.nativeEvent.isComposing || e.nativeEvent.keyCode === 229) return;
               if (e.key === 'Enter' && !e.shiftKey && !isMobile()) {
                 e.preventDefault();
                 go();

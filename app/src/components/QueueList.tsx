@@ -132,7 +132,7 @@ export function QueueList({ hostId, info, onRecall }: { hostId: string; info: Se
                 onChange={(e) => setEditing({ id: q.id, text: e.target.value, refs: editing.refs })}
                 onBlur={saveEdit}
                 onKeyDown={(e) => {
-                  if (e.nativeEvent.isComposing) return;
+                  if (e.nativeEvent.isComposing || e.nativeEvent.keyCode === 229) return;
                   if (e.key === 'Enter') {
                     e.preventDefault();
                     saveEdit();

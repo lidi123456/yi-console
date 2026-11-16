@@ -121,7 +121,7 @@ export function QuestionCard({
                   placeholder={q.options.length ? t('otherTypeYourAnswer') : t('typeYourAnswer')}
                   onChange={(e) => set(q, { selected: q.multiSelect ? cur.selected : [], text: e.target.value })}
                   onKeyDown={(e) => {
-                    if (e.key === 'Enter' && !e.nativeEvent.isComposing && ready) submit();
+                    if (e.key === 'Enter' && !e.nativeEvent.isComposing && e.nativeEvent.keyCode !== 229 && ready) submit();
                   }}
                 />
               )}

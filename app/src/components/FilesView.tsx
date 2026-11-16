@@ -43,7 +43,8 @@ export function FilesView({ hostId, path }: { hostId: string; path?: string }) {
       .catch(errorToast);
   }, [hostId, cur, hidden]);
 
-  const crumbs = (list?.path ?? '').split(/(?<=[\\/])/).filter(Boolean);
+  // Keep separators without lookbehind, which older macOS WebKit cannot parse.
+  const crumbs = (list?.path ?? '').match(/[^\\/]*[\\/]|[^\\/]+$/g) ?? [];
   const open = (e: DirEntry) => {
     if (e.isDir) {
       setFile(null);
