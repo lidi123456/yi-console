@@ -88,7 +88,7 @@ Each machine runs a background service, `yi-agentd`, which starts and hosts the 
 
 ## Contributing
 
-Issues and pull requests are welcome. See the [development guide](docs/development.en.md) to build from source, and read [AGENTS.md](AGENTS.md) before changing code; it records the project layout and conventions.
+Issues and pull requests are welcome. See the [development guide](docs/development.en.md) to build from source; `python3 scripts/build.py --list` is the shared entry point for local components and CI platform installers. Read [AGENTS.md](AGENTS.md) before changing code for the project layout and conventions.
 
 ## License
 

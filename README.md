@@ -88,7 +88,7 @@ Yi Console 把它们统一管起来：
 
 ## 参与开发
 
-欢迎提交 Issue 和 Pull Request。从源码构建见[开发指南](docs/development.md)；改代码前请先读 [AGENTS.md](AGENTS.md)（英文，主要给 AI 编程助手看，也是项目结构和约定的说明）。
+欢迎提交 Issue 和 Pull Request。从源码构建见[开发指南](docs/development.md)，统一构建入口为 `python3 scripts/build.py --list`，支持本地组件和 CI 各平台安装包；改代码前请先读 [AGENTS.md](AGENTS.md)（英文，主要给 AI 编程助手看，也是项目结构和约定的说明）。
 
 ## 开源协议
 

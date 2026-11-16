@@ -37,9 +37,52 @@ English: [Development guide](development.en.md)
 
 - Rust stable
 - Node 20+
+- 快捷构建脚本需要 Python 3.9+；编译内置插件还需要 `rustup target add wasm32-wasip2`
 - 在 Linux 上构建 Tauri 桌面版，还要装 `libwebkit2gtk-4.1-dev` 等依赖，见 [Tauri 文档](https://v2.tauri.app/start/prerequisites/)
 
 ## 构建和运行
+
+统一入口是 `scripts/build.py`，从任何目录运行均可（Windows 可将 `python3` 换成 `python`）。默认使用 release 模式：
+
+```bash
+python3 scripts/build.py --list                         # 查看组件、平台和分组
+python3 scripts/build.py backend frontend               # 本机三个 Rust 程序和前端
+python3 scripts/build.py yi-agentd                      # 只编译守护进程
+python3 scripts/build.py yi-relay --debug                # 只编译中继的 debug 版
+python3 scripts/build.py yi-agentd --target aarch64-unknown-linux-musl --dry-run
+python3 scripts/build.py plugins                        # 构建并打包内置 GitHub / 飞书插件
+python3 scripts/build.py all                            # 本地所有组件，含插件
+```
+
+本地组件为 `frontend`、`yi-agentd`、`yi-relay`、`yi-web`、`plugins`，`backend` 是三个 Rust 程序的分组；可用空格或逗号组合。前端在缺少 `app/node_modules` 时自动执行 `npm ci`，加 `--npm-ci` 可强制重装依赖。Rust 产物在 `target/release/`（`--debug` 时为 `target/debug/`，指定 `--target` 时多一层目标目录，遵循 `CARGO_TARGET_DIR`），前端在 `app/dist/`，插件包在 `plugins/dist/`，并复制到桌面资源目录。`--debug` / `--target` 只作用于 Rust 程序，插件固定为 release。交叉编译所需的 Rust target 和链接器需要自行准备，脚本不会安装系统依赖；发布用的 Linux musl 守护进程仍由 CI 中的 `cross` 构建。
+
+正式安装包默认在 CI 构建。安装 [GitHub CLI](https://cli.github.com/)，运行 `gh auth login`，并先将代码和本次脚本 / workflow 改动推送到构建分支：
+
+```bash
+python3 scripts/build.py --ci all --download out         # 所有平台，等完成并下载产物
+python3 scripts/build.py --ci windows                    # 仅 Windows 安装包
+python3 scripts/build.py --ci windows android --wait     # 指定多个平台
+python3 scripts/build.py --ci macos-aarch64 --ref main   # 仅 Apple Silicon 安装包
+python3 scripts/build.py --ci daemons                    # 仅各平台守护进程和 Linux 中继
+python3 scripts/build.py --ci linux --dry-run            # 仅预览，不触发构建
+```
+
+`--ci` 可选 `windows-x86_64`、`macos-aarch64`、`macos-x86_64`、`linux-x86_64`、`android`、`daemons`；也可用 `windows`、`macos`、`linux`、`desktop`、`all` 分组。安装包格式沿用 CI：Windows EXE / MSI、macOS DMG、Linux DEB / RPM / AppImage、Android APK。桌面安装包仍会构建并内置各平台的 yi-agentd，以便部署到 SSH 主机；只选 Android 时跳过守护进程和桌面任务。
+
+CI 默认构建当前分支的**已推送代码**，不会上传本地未提交的改动；游离 HEAD 时必须指定 `--ref <分支或标签>`，`--repo OWNER/REPO` 可指定仓库。默认返回构建链接，`--wait` 等待完成并返回构建状态，`--download <目录>` 会等待成功后按 artifact 名称分目录下载。下载目录相对于运行脚本时的当前目录。不带 `--ci` 的 `all` 表示本地所有组件，带 `--ci` 的 `all` 表示所有平台包。所有模式均支持 `--dry-run`。
+
+本机已装好 JDK 17、Android SDK / NDK 和对应 Rust target 时，也可以显式构建 Android APK（`all` 不包含此入口）：
+
+```bash
+python3 scripts/build.py android                        # 默认 ARM64 release，未签名
+python3 scripts/build.py android --debug                # 可安装的 debug APK
+# 设置 ANDROID_KEYSTORE_PASSWORD 后，用已有密钥签名 release APK
+python3 scripts/build.py android --keystore /path/to/app.jks --key-alias app
+```
+
+设置 `ANDROID_HOME`、`NDK_HOME`、`JAVA_HOME`，可通过重复 `--android-target aarch64` / `--android-target armv7` / `--android-target x86_64` 选择 ABI。脚本刷新原生 Activity 和图标，构建 APK 并收集到项目 `out/`；指定 `--keystore`（或 `ANDROID_KEYSTORE_PATH`）时自动对齐、签名并校验，密码只从 `ANDROID_KEYSTORE_PASSWORD` 环境变量读取。复用原来的签名密钥才能覆盖安装旧包。此模式不会发布到 GitHub。
+
+以下是手动构建和调试命令：
 
 ```bash
 # 守护进程、中继、浏览器版
@@ -66,6 +109,7 @@ cd app && npx tauri dev
 
 ```bash
 cargo test
+python3 -m unittest discover -s scripts -p 'test_build.py'
 cd app && npm run build             # 先跑 tsc --noEmit，再 vite build
 ```
 
@@ -73,7 +117,7 @@ cd app && npm run build             # 先跑 tsc --noEmit，再 vite build
 
 ## 发布
 
-各平台安装包、各平台的 yi-agentd 和 Android APK 由 `.github/workflows/build.yml` 构建：推送 `v*` 标签时触发（也可以手动触发），打标签的构建会发布到 GitHub Releases。
+各平台安装包、各平台的 yi-agentd 和 Android APK 由 `.github/workflows/build.yml` 构建：推送 `v*` 标签时触发（也可以手动触发），打标签的构建会发布到 GitHub Releases。手动触发可通过 `packages` 输入框填写与 `build.py --ci` 相同的组件 / 分组，留空默认全部，也兼容原来的 `only_daemons` / `windows_only`；这两个旧选项不能与 `packages` 同时设置。标签构建始终构建完整发布包。
 
 发一个版本：
 

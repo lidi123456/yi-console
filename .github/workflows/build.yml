@@ -1,10 +1,19 @@
 name: build
+run-name: ${{ inputs.build_id && format('build ({0})', inputs.build_id) || github.ref_name }}
 
 on:
   push:
     tags: ['v*']
   workflow_dispatch:
     inputs:
+      packages:
+        description: 'Comma-separated packages: all, windows, macos, linux, desktop, android, daemons, or exact desktop names (see scripts/build.py --list); empty keeps legacy options'
+        type: string
+        default: ''
+      build_id:
+        description: Optional correlation ID used by scripts/build.py
+        type: string
+        default: ''
       only_daemons:
         description: Build only yi-agentd / yi-relay (no installers, saves CI minutes)
         type: boolean
@@ -18,42 +27,29 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # Work out which platforms to build: for a Windows-only build, drop the macOS yi-agentd and every non-Windows desktop bundle
-  # (matrix exclude can't remove entries added by include, so compute the list first and pass it to the matrix)
+  # The shortcut and CI share one package catalog. Desktop bundles need all SSH daemon targets.
   plan:
     runs-on: ubuntu-latest
     outputs:
       daemons: ${{ steps.m.outputs.daemons }}
       desktop: ${{ steps.m.outputs.desktop }}
+      android: ${{ steps.m.outputs.android }}
     steps:
+      - uses: actions/checkout@v5
+      - name: check build shortcut
+        run: python3 -m unittest discover -s scripts -p 'test_build.py'
       - id: m
         env:
+          PACKAGES: ${{ github.event_name == 'push' && 'all' || inputs.packages }}
+          ONLY_DAEMONS: ${{ inputs.only_daemons && 'true' || 'false' }}
           WINDOWS_ONLY: ${{ inputs.windows_only && 'true' || 'false' }}
         run: |
-          daemons='[
-            {"os":"ubuntu-latest","target":"x86_64-unknown-linux-musl","name":"linux-x86_64","cross":true},
-            {"os":"ubuntu-latest","target":"aarch64-unknown-linux-musl","name":"linux-aarch64","cross":true},
-            {"os":"macos-latest","target":"x86_64-apple-darwin","name":"macos-x86_64"},
-            {"os":"macos-latest","target":"aarch64-apple-darwin","name":"macos-aarch64"},
-            {"os":"windows-latest","target":"x86_64-pc-windows-msvc","name":"windows-x86_64","ext":".exe"}
-          ]'
-          desktop='[
-            {"os":"ubuntu-22.04","target":"x86_64-unknown-linux-gnu","daemon":"linux-x86_64"},
-            {"os":"macos-latest","target":"aarch64-apple-darwin","daemon":"macos-aarch64"},
-            {"os":"macos-latest","target":"x86_64-apple-darwin","daemon":"macos-x86_64"},
-            {"os":"windows-latest","target":"x86_64-pc-windows-msvc","daemon":"windows-x86_64","ext":".exe"}
-          ]'
-          if [ "$WINDOWS_ONLY" = true ]; then
-            # Keep the Linux yi-agentd: the Windows build needs it to deploy to SSH hosts
-            daemons=$(jq -c 'map(select(.os != "macos-latest"))' <<<"$daemons")
-            desktop=$(jq -c 'map(select(.os == "windows-latest"))' <<<"$desktop")
-          fi
-          echo "daemons=$(jq -c . <<<"$daemons")" >> "$GITHUB_OUTPUT"
-          echo "desktop=$(jq -c . <<<"$desktop")" >> "$GITHUB_OUTPUT"
+          python3 scripts/build.py --plan-ci "$PACKAGES"
 
   # yi-agentd for every platform (plus yi-relay on Linux). Desktop installers bundle all of them for automatic deployment to SSH hosts.
   daemons:
     needs: plan
+    if: needs.plan.outputs.daemons != '[]'
     strategy:
       fail-fast: false
       matrix:
@@ -103,7 +99,7 @@ jobs:
 
   desktop:
     needs: [plan, daemons]
-    if: ${{ !inputs.only_daemons }}
+    if: ${{ !cancelled() && needs.plan.result == 'success' && needs.daemons.result == 'success' && needs.plan.outputs.desktop != '[]' }}
     strategy:
       fail-fast: false
       matrix:
@@ -206,7 +202,8 @@ jobs:
           path: out/*
 
   android:
-    if: ${{ !inputs.only_daemons && !inputs.windows_only }}
+    needs: plan
+    if: needs.plan.outputs.android == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -282,7 +279,7 @@ jobs:
           path: out/*.apk
 
   release:
-    if: startsWith(github.ref, 'refs/tags/')
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
     needs: [daemons, desktop, android]
     runs-on: ubuntu-latest
     permissions:
