@@ -1286,7 +1286,18 @@ impl Engine {
                     }
                 }
                 let restricted = self.engine_turn(&c.id) || !event_ids.is_empty();
-                let (mode, host, ws_path) = resolve_spawn_location(c, &a, restricted)?;
+                let kind = match a["kind"].as_str().map(str::trim).filter(|k| !k.is_empty()) {
+                    None | Some("work") => "work",
+                    Some("plugin") => "plugin",
+                    Some(other) => bail!("Unknown kind \"{other}\"; use work or plugin."),
+                };
+                // A plugin is built in a scratch directory, never inside one of the owner's repositories
+                let location = if kind == "plugin" {
+                    json!({"mode": "scratch", "host": a["host"]})
+                } else {
+                    a.clone()
+                };
+                let (mode, host, ws_path) = resolve_spawn_location(c, &location, restricted)?;
                 let allowed = c.task_tools();
                 let tool = match a["tool"].as_str().filter(|t| !t.is_empty()) {
                     Some(t) if allowed.contains(&t) => t.to_string(),
@@ -1319,6 +1330,7 @@ impl Engine {
                     worktree: None,
                     spec: json!({
                         "mode": mode,
+                        "kind": kind,
                         "tool": tool,
                         "model": a["model"].as_str().filter(|m| !m.is_empty()).map(str::to_string).or(if default_tool { c.task.model.clone() } else { None }),
                         "effort": if default_tool { c.task.effort.clone() } else { None },
@@ -1964,8 +1976,7 @@ impl Engine {
             }
             "read_thread" => self.read_thread(&t.bot_id, &s("event_id"), a["cursor"].as_str()).await,
             "plugin_kit" => {
-                let dir = a["dir"].as_str().filter(|d| !d.is_empty()).map(str::to_string).unwrap_or_else(|| format!("{}/yi-plugin-kit", t.cwd.trim_end_matches(['/', '\\'])));
-                let dir = dir.trim_end_matches(['/', '\\']).to_string();
+                let dir = kit_dir(&t.cwd, a["dir"].as_str());
                 let mut written = vec![];
                 for (rel, content) in tools::plugin_kit() {
                     let path = format!("{dir}/{rel}");
@@ -1978,9 +1989,11 @@ impl Engine {
                 }
                 Ok(json!(format!(
                     "Wrote {dir}: {}. Read GUIDE.md first. Add the plugin as a new workspace member next to example/, build it with \
-                     `cargo build --release --target wasm32-wasip2 -p <crate>` (once: `rustup target add wasm32-wasip2`), copy \
-                     target/wasm32-wasip2/release/<crate_name>.wasm into a folder with its plugin.json (named as `main`) and \
-                     prompt.md, then report ready with that folder's path: the Bot checks it and submits it to the owner.",
+                     `cargo build --release --target wasm32-wasip2 -p <crate>` (check `cargo --version` and `rustup target list \
+                     --installed` first; if Rust or the wasm32-wasip2 target is missing, report blocked with the install commands \
+                     and install them only after the person's yes), copy target/wasm32-wasip2/release/<crate_name>.wasm into a \
+                     folder with its plugin.json (named as `main`) and prompt.md, then report ready with that folder's path \
+                     relative to your directory: the Bot checks it and submits it to the owner. Do not install it yourself.",
                     written.join(", ")
                 )))
             }
@@ -2055,6 +2068,7 @@ impl Engine {
             cwd: &cwd,
             workspace: &t.workspace,
             branch: branch.as_deref(),
+            plugin: t.is_plugin(),
         };
         let task_prompt = prompt::task_prompt_for(c, Some(&env));
         let want_cu = task_uses_computer(&t);
@@ -2118,6 +2132,7 @@ impl Engine {
             cwd: &cwd,
             workspace: &t.workspace,
             branch: branch.as_deref(),
+            plugin: t.is_plugin(),
         };
         let info = self
             .rpc(
@@ -3021,6 +3036,9 @@ fn brief(t: &TaskRow, events: &[EventRow], label: &dyn Fn(&str) -> String) -> St
     if let Some(r) = t.spec["request"].as_str().filter(|r| !r.is_empty()) {
         s.push_str(&format!("\n## Request from the owner\n\n{r}\n"));
     }
+    if t.is_plugin() {
+        s.push_str("\nThis task builds a Yi Console plugin: follow \"Building a plugin\" in your instructions, starting with plugin_kit.\n");
+    }
     if !events.is_empty() {
         s.push_str("\n## Events\n\n");
         for e in events {
@@ -3053,6 +3071,18 @@ fn task_view(t: &TaskRow) -> Value {
         "taskId": t.id, "title": t.title, "mode": t.mode(), "state": t.state, "host": t.host, "sessionId": t.session_id,
         "cwd": t.cwd, "computerUse": task_uses_computer(t), "lastReport": t.last_report, "manual": t.manual, "createdAt": t.created_at,
     })
+}
+
+/// Where plugin_kit writes: `dir` as given when absolute, else relative to the task's directory
+fn kit_dir(cwd: &str, dir: Option<&str>) -> String {
+    let cwd = cwd.trim_end_matches(['/', '\\']);
+    let dir = dir.map(str::trim).filter(|d| !d.is_empty()).unwrap_or("yi-plugin-kit");
+    let dir = dir.trim_end_matches(['/', '\\']);
+    if looks_like_path(dir) || dir.starts_with('\\') {
+        dir.to_string()
+    } else {
+        format!("{cwd}/{}", dir.trim_start_matches("./").trim_start_matches(".\\"))
+    }
 }
 
 fn scratch_dir(bot_id: &str, task_id: &str) -> String {
@@ -3736,6 +3766,20 @@ mod tests {
         };
         let b = brief(&t, &[], &|i| i.to_string());
         assert!(b.contains("please fix the typo") && b.contains("yi/task-1") && b.contains("see #3"));
+        assert!(!b.contains("Building a plugin"));
+        let p = TaskRow { spec: json!({"mode": "scratch", "kind": "plugin", "request": "Jira Server events"}), ..Default::default() };
+        assert!(p.is_plugin() && p.mode() == "scratch");
+        assert!(brief(&p, &[], &|i| i.to_string()).contains("follow \"Building a plugin\""));
+    }
+
+    #[test]
+    fn plugin_kit_dirs_are_relative_to_the_task() {
+        assert_eq!(kit_dir("C:\\w\\t1", None), "C:\\w\\t1/yi-plugin-kit");
+        assert_eq!(kit_dir("C:\\w\\t1\\", Some("connectors/jira/kit")), "C:\\w\\t1/connectors/jira/kit");
+        assert_eq!(kit_dir("/w/t1", Some("./kit/")), "/w/t1/kit");
+        assert_eq!(kit_dir("/w/t1", Some("D:\\kit")), "D:\\kit");
+        assert_eq!(kit_dir("/w/t1", Some("/opt/kit")), "/opt/kit");
+        assert_eq!(kit_dir("/w/t1", Some("~/kit")), "~/kit");
     }
 
     #[test]

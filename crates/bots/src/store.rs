@@ -132,6 +132,11 @@ impl TaskRow {
         matches!(self.state.as_str(), "queued" | "working" | "needsYou")
     }
 
+    /// A `kind: plugin` task (`spawn_task`): builds a Yi Console plugin in a scratch directory
+    pub fn is_plugin(&self) -> bool {
+        self.spec["kind"].as_str() == Some("plugin")
+    }
+
     pub fn mode(&self) -> &str {
         match self.spec["mode"].as_str() {
             Some(m @ ("worktree" | "repo" | "scratch")) => m,

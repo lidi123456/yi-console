@@ -30,7 +30,8 @@ pub fn bot_tools() -> Vec<Value> {
             json!({
                 "event_ids": {"type": "array", "items": {"type": "string"}, "description": "Events this task handles; may be empty when the owner asked in this session directly"},
                 "title": {"type": "string", "description": "Short title shown in the sidebar"},
-                "request": {"type": "string", "description": "Only when the owner asked in this session directly: their request, quoted as they wrote it"},
+                "request": {"type": "string", "description": "Only when the owner asked in this session directly: their request as they wrote it when it stands on its own; when it came out of your conversation (answers, a confirmed plan), written out with every fact and decision so a task that never saw the conversation can act on it"},
+                "kind": {"type": "string", "enum": ["work", "plugin"], "description": "plugin: build a Yi Console plugin with the plugin SDK (always runs in scratch; workspace, cwd and mode are ignored). Default: work"},
                 "note": {"type": "string", "description": "At most 30 words of routing information; never an implementation plan"},
                 "ack": {"type": "string", "description": "With event_ids: one sentence for the requester, sent to the event's conversation as the task is created; names the object and the expected result"},
                 "mode": {"type": "string", "enum": ["worktree", "repo", "scratch"], "description": "Isolation mode: worktree (own git worktree and branch, for changing files in a repo), repo (read-only in the project directory), or scratch (dedicated empty directory, no repo). Default: worktree when a workspace/cwd is used, scratch otherwise"},
@@ -200,9 +201,9 @@ pub fn task_tools() -> Vec<Value> {
         ),
         tool(
             "plugin_kit",
-            "Only for a task that builds a plugin: write the plugin SDK, the WIT interface, an example plugin and the \
-             author guide into a folder, as a cargo workspace to build the plugin in.",
-            json!({"dir": {"type": "string", "description": "Target folder (default: yi-plugin-kit in this task's directory)"}}),
+            "Build a Yi Console plugin (a task spawned with kind plugin): write the plugin SDK, the WIT interface, an \
+             example plugin and the author guide into a folder, as a cargo workspace to build the plugin in.",
+            json!({"dir": {"type": "string", "description": "Target folder, absolute or relative to this task's directory (default: yi-plugin-kit)"}}),
             &[],
         ),
     ]
