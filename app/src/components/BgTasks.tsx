@@ -15,6 +15,10 @@ function kindLabel(k: string) {
       return tx('subagent');
     case 'remote_agent':
       return tx('remoteAgent');
+    case 'workflow':
+      return tx('workflow');
+    case 'timer':
+      return tx('timer');
     default:
       return k;
   }
@@ -91,7 +95,7 @@ export function BgTasks({ hostId, info }: { hostId: string; info: SessionInfo })
         tasks.map((t) => (
           <div key={t.id} className="bg-task">
             <div className="bg-task-row">
-              <Icon name={t.kind === 'local_bash' ? 'terminal' : 'chat'} size={14} />
+              <Icon name={t.kind === 'local_bash' ? 'terminal' : t.kind === 'timer' ? 'clock' : 'chat'} size={14} />
               <span className="bg-task-kind">{kindLabel(t.kind)}</span>
               <span className="bg-task-desc truncate" title={`${t.description}\n${t.id}`}>
                 {oneLine(t.description || t.id)}
@@ -102,9 +106,11 @@ export function BgTasks({ hostId, info }: { hostId: string; info: SessionInfo })
                   {viewing === t.id ? tx('hide') : tx('output')}
                 </button>
               )}
-              <button className="btn small danger-ghost" onClick={() => stop(t)}>
-                {tx('stop')}
-              </button>
+              {!t.unstoppable && (
+                <button className="btn small danger-ghost" onClick={() => stop(t)}>
+                  {tx('stop')}
+                </button>
+              )}
             </div>
             {viewing === t.id && t.outputFile && <TaskOutput hostId={hostId} path={t.outputFile} />}
           </div>

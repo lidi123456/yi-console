@@ -117,7 +117,9 @@ export default interface Resources {
     "output": "输出",
     "remoteAgent": "远程代理",
     "stop": "停止",
-    "subagent": "子代理"
+    "subagent": "子代理",
+    "timer": "定时任务",
+    "workflow": "工作流"
   },
   "bots": {
     "acceptAuto": "自动处理",

@@ -923,6 +923,7 @@ fn publish_tasks(st: &State, em: &Emitter) {
             description: if s.name.is_empty() { id.clone() } else { s.name.clone() },
             started_at: s.started_at,
             output_file: None,
+            unstoppable: false,
         })
         .collect();
     tasks.sort_by(|a, b| a.started_at.cmp(&b.started_at).then_with(|| a.id.cmp(&b.id)));

@@ -2,6 +2,8 @@
   "bashCommand": "Bash Command",
   "subagent": "Subagent",
   "remoteAgent": "Remote Agent",
+  "workflow": "Workflow",
+  "timer": "Scheduled Task",
   "loading": "Loading…",
   "noOutputYet": "(no output yet)",
   "backgroundTaskS": "{{length}} background command(s)",

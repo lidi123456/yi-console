@@ -373,7 +373,7 @@ pub const AUTO_RESUME_DELAY_MS: i64 = 60 * 1000;
 #[serde(rename_all = "camelCase")]
 pub struct BackgroundTask {
     pub id: String,
-    /// Type given by the tool, e.g. local_bash, local_agent
+    /// Type given by the tool, e.g. local_bash, local_agent, workflow, timer
     pub kind: String,
     pub description: String,
     /// When this machine discovered it (milliseconds)
@@ -381,6 +381,9 @@ pub struct BackgroundTask {
     /// Output is written to this file on the host and can be viewed with fs.read
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_file: Option<String>,
+    /// True when the tool gives us no way to stop this task from outside (e.g. agy's internal background tasks)
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unstoppable: bool,
 }
 
 /// A queued message

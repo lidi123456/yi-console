@@ -6,7 +6,7 @@ use crate::hub::Emitter;
 use crate::util::now_ms;
 use yi_proto::*;
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use tokio::sync::mpsc;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -121,13 +121,17 @@ struct State {
     compacting: Option<i64>,
     /// The last prompt we sent was /compact, so the next compaction is manual
     compact_manual: bool,
-    /// Antigravity (`agy acp`): tracks asynchronous subagents spawned in the current turn
+    /// Antigravity (`agy acp`): tracks asynchronous subagents and background tasks spawned in the current turn
     is_antigravity: bool,
     agy_pre_turn_steps: usize,
     agy_pending_calls: HashMap<String, AgyPendingCall>,
     agy_send_baselines: HashMap<String, usize>,
+    agy_open_bg_calls: VecDeque<(String, String)>,
+    agy_bg_tasks: Vec<AgyBgTask>,
+    agy_parent_transcript: AgyTranscript,
+    agy_seen_system_steps: HashSet<usize>,
     agy_watch: Option<AgyWatch>,
-    /// Subagents still running when a new prompt went out: the prompt's own watch picks them up when it returns
+    /// Subagents / background tasks still running when a new prompt went out: the prompt's own watch picks them up when it returns
     agy_carry: AgyCarry,
 }
 
@@ -230,9 +234,13 @@ pub async fn run(spec: StartSpec, em: Emitter, mut rx: mpsc::UnboundedReceiver<A
                     let _ = p.send(&m).await;
                 }
             }
-            _ = agy_tick.tick(), if st.agy_watch.is_some() => {
-                if let Some(m) = poll_agy_watch(&mut st, &spec, &em) {
-                    let _ = p.send(&m).await;
+            _ = agy_tick.tick(), if st.agy_watch.is_some() || (st.is_antigravity && (!st.agy_open_bg_calls.is_empty() || !st.agy_bg_tasks.is_empty() || !st.agy_carry.bg_tasks.is_empty())) => {
+                if st.agy_watch.is_some() {
+                    if let Some(m) = poll_agy_watch(&mut st, &spec, &em) {
+                        let _ = p.send(&m).await;
+                    }
+                } else {
+                    poll_agy_prompt_bg(&mut st, &em);
                 }
                 if !st.prompting && st.session_id.is_some() && !config_pending(&st) && !st.loading && st.compacting.is_none() && !st.queue.is_empty() {
                     let next = st.queue.remove(0);
@@ -303,7 +311,7 @@ pub async fn run(spec: StartSpec, em: Emitter, mut rx: mpsc::UnboundedReceiver<A
                         st.prompting = false;
                         st.end_subagents();
                         em.event(EventBody::TurnEnd { stop_reason: Some("cancelled".into()), model: None });
-                        if !st.agy_carry.subs.is_empty() {
+                        if !st.agy_carry.is_empty() {
                             if let Some(sid) = st.session_id.clone() {
                                 let steps = count_agy_transcript_steps(&agy_brain_dir(), &sid);
                                 let mut w = AgyWatch::new(sid, agy_brain_dir(), steps, steps, None, HashMap::new(), HashMap::new(), st.perm != "bypass");
@@ -457,6 +465,9 @@ fn prompt(st: &mut State, em: &Emitter, p: &Prompt) -> Value {
     st.turn_credits = 0.0;
     st.agy_pending_calls.clear();
     st.agy_send_baselines.clear();
+    st.agy_open_bg_calls.clear();
+    st.agy_bg_tasks.clear();
+    st.agy_seen_system_steps.clear();
     // The watch can't run during a prompt (the parent's own steps would look like a wakeup): its running subagents
     // wait in agy_carry for this prompt's watch. A report arriving meanwhile is handed to this turn by agy itself
     carry_agy_watch(st, em);
@@ -878,14 +889,19 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Result<V
                     em.event(super::limit_hit(Some(crate::util::now_ms() + left), Some(limit.into())));
                 }
                 let stop_reason = r["stopReason"].as_str().map(str::to_string);
+                if st.is_antigravity {
+                    settle_agy_prompt_bg(st, em);
+                }
+                let has_pending_bg = st.agy_bg_tasks.iter().any(|t| !t.done && !t.is_daemon);
                 let should_watch = st.is_antigravity
-                    && (!st.agy_carry.subs.is_empty()
+                    && (!st.agy_carry.is_empty()
                         || (meta_err.is_none()
                             && limit_left.is_none()
                             && stop_reason.as_deref() != Some("cancelled")
                             && (!st.agy_pending_calls.is_empty()
+                                || has_pending_bg
                                 || st.session_id.as_deref().is_some_and(|sid| {
-                                    has_pending_agy_subagent_turn(&agy_brain_dir(), sid, st.agy_pre_turn_steps)
+                                    has_pending_agy_async_turn(&agy_brain_dir(), sid, st.agy_pre_turn_steps)
                                 }))));
                 if should_watch {
                     if let Some(sid) = st.session_id.clone() {
@@ -901,10 +917,12 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Result<V
                             st.perm != "bypass",
                         );
                         watch.adopt(std::mem::take(&mut st.agy_carry));
-                        // The turn ends now; the subagents go on as background tasks
+                        watch.adopt_bg(std::mem::take(&mut st.agy_bg_tasks), std::mem::take(&mut st.agy_seen_system_steps));
+                        // The turn ends now; subagents and background tasks go on in the background
                         watch.detached = true;
-                        // One pass right away, so subagents that already finished are picked up without waiting for a tick
+                        // One pass right away, so tasks that already finished are picked up without waiting for a tick
                         let step = step_agy_watch(&mut watch, spec, em, &mut st.next_id, &mut st.pending);
+                        mark_watch_settled(st, &mut watch);
                         st.prompting = false;
                         st.end_subagents();
                         // A wakeup already seen in this pass reopened the turn: that one ends it
@@ -930,6 +948,25 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Result<V
                         output: String::new(),
                         is_error: false,
                     });
+                }
+                for mut t in st.agy_bg_tasks.drain(..) {
+                    if !t.done {
+                        if let Some(id) = t.tc_id.take() {
+                            if let Some(tool) = st.tools.get_mut(&id) {
+                                tool.done = true;
+                            }
+                            em.event(EventBody::ToolResult {
+                                id,
+                                output: String::new(),
+                                is_error: false,
+                            });
+                        }
+                    }
+                }
+                st.agy_open_bg_calls.clear();
+                st.agy_seen_system_steps.clear();
+                if st.is_antigravity {
+                    em.background_tasks(current_agy_tasks(st));
                 }
                 st.prompting = false;
                 st.end_subagents();
@@ -1466,30 +1503,90 @@ fn update(st: &mut State, em: &Emitter, u: &Value) {
                         }
                     }
                     st.agy_pending_calls.insert(id.clone(), AgyPendingCall { name: agy_tool.to_string(), target_subagent: target, desc: agy_task_desc(&t.input) });
+                } else if !t.done
+                    && matches!(agy_tool.to_ascii_lowercase().as_str(), "run_command" | "run_workflow" | "schedule")
+                    && !st.agy_open_bg_calls.iter().any(|(x, _)| x == &id)
+                {
+                    st.agy_open_bg_calls.push_back((id.clone(), agy_tool.to_string()));
                 }
             }
             let status = u["status"].as_str().unwrap_or("");
             if (status == "completed" || status == "failed") && !t.done {
                 t.done = true;
                 st.subagents.remove(&id);
+                st.agy_open_bg_calls.retain(|(x, _)| x != &id);
                 let mut output = texts.join("\n");
                 if output.is_empty() && !command_text && u["rawOutput"]["output"].is_string() {
                     let raw = u["rawOutput"]["output"].as_str().unwrap_or("");
-                    command_text = true;
-                    output = antigravity_command_text(raw).unwrap_or_else(|| raw.to_string());
+                    match antigravity_command_text(raw) {
+                        Some(out) => {
+                            command_text = true;
+                            output = out;
+                        }
+                        None => output = raw.to_string(),
+                    }
                 }
                 if output.is_empty() && !command_text && !u["rawOutput"].is_null() {
                     output = raw_output_text(&crate::computer_use::display_value(&u["rawOutput"]));
                 }
-                // `agy acp` reports invoke_subagent / send_message completed immediately after spawning, with empty output.
-                // Hold the ToolResult until the background subagent actually finishes and produces its result.
-                let defer_agy = st.is_antigravity
+                // `agy acp` reports invoke_subagent / send_message completed immediately after spawning, with empty output,
+                // and background run_command / schedule / run_workflow with a "Tool is running as a background task" notice.
+                // Hold the ToolResult until the background work finishes and produces its real result.
+                let agy_tool = if t.name == "other" || t.name.is_empty() { t.title.as_str() } else { t.name.as_str() };
+                let bg_parsed = (st.is_antigravity && !st.loading && status == "completed" && !command_text)
+                    .then(|| parse_agy_bg_task(&output))
+                    .flatten();
+                let mut defer_agy = st.is_antigravity
                     && !st.loading
                     && status == "completed"
                     && output.is_empty()
                     && st.agy_pending_calls.contains_key(&id);
+                if let Some(parsed) = bg_parsed {
+                    let (kind, is_daemon, timer_cond, meta_desc) = agy_bg_meta(agy_tool, &t.input, &parsed.description);
+                    if !is_daemon {
+                        defer_agy = true;
+                        if let Some(existing) = st.agy_bg_tasks.iter_mut().find(|b| b.id == parsed.id) {
+                            if !existing.done {
+                                existing.tc_id.get_or_insert_with(|| id.clone());
+                            }
+                        } else {
+                            let desc = if !meta_desc.is_empty() { meta_desc } else { parsed.id.clone() };
+                            st.agy_bg_tasks.push(AgyBgTask {
+                                id: parsed.id,
+                                kind,
+                                description: desc,
+                                started_at: now_ms(),
+                                output_file: parsed.output_file,
+                                tc_id: Some(id.clone()),
+                                is_daemon: false,
+                                timer_cond,
+                                done: false,
+                                announced: false,
+                                result: None,
+                            });
+                            em.background_tasks(current_agy_tasks(st));
+                        }
+                    }
+                } else if st.is_antigravity
+                    && !st.loading
+                    && (status == "failed" || status == "completed")
+                    && (output.is_empty() || output == "{}")
+                    && st
+                        .agy_bg_tasks
+                        .iter()
+                        .chain(&st.agy_carry.bg_tasks)
+                        .chain(st.agy_watch.as_ref().into_iter().flat_map(|w| w.bg_tasks.iter()))
+                        .any(|b| !b.done && b.tc_id.as_deref() == Some(id.as_str()))
+                {
+                    defer_agy = true;
+                }
                 if !defer_agy {
                     st.agy_pending_calls.remove(&id);
+                    for b in st.agy_bg_tasks.iter_mut().chain(st.agy_carry.bg_tasks.iter_mut()) {
+                        if b.tc_id.as_deref() == Some(id.as_str()) {
+                            b.tc_id = None;
+                        }
+                    }
                     em.event(EventBody::ToolResult {
                         id: id.clone(),
                         output: crate::util::truncate(&output, 64 * 1024),
@@ -1692,15 +1789,144 @@ fn agy_background_task(content: &str) -> Option<&str> {
     rest.split_whitespace().next().filter(|s| !s.is_empty())
 }
 
+fn uri_to_path(uri: &str) -> String {
+    let s = uri.trim();
+    if let Some(rest) = s.strip_prefix("file:///") {
+        let bytes = rest.as_bytes();
+        if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+            return rest.to_string();
+        }
+        return format!("/{rest}");
+    }
+    s.strip_prefix("file://").unwrap_or(s).to_string()
+}
+
+fn arg_str(v: &Value) -> Option<String> {
+    let s = v.as_str()?.trim();
+    let s = s.strip_prefix('"').and_then(|x| x.strip_suffix('"')).unwrap_or(s).trim();
+    (!s.is_empty()).then(|| s.to_string())
+}
+
+fn arg_bool(v: &Value) -> bool {
+    v.as_bool() == Some(true) || matches!(arg_str(v).as_deref(), Some("true"))
+}
+
+#[derive(Debug, Clone)]
+struct AgyBgParsed {
+    id: String,
+    description: String,
+    output_file: Option<String>,
+}
+
+fn parse_agy_bg_task(content: &str) -> Option<AgyBgParsed> {
+    if content.contains("Completed At:") {
+        return None;
+    }
+    let id = agy_background_task(content)?.to_string();
+    let description = content
+        .split_once("Task Description: ")
+        .map(|(_, rest)| {
+            let end = [
+                "\nTask logs are available at:",
+                "\nLog output:",
+                "\nYOU MUST TAKE ",
+            ]
+            .iter()
+            .filter_map(|m| rest.find(m))
+            .min()
+            .unwrap_or(rest.len());
+            crate::util::truncate(rest[..end].trim(), 200)
+        })
+        .unwrap_or_default();
+    let output_file = content
+        .split_once("Task logs are available at: ")
+        .and_then(|(_, rest)| rest.lines().next())
+        .map(uri_to_path)
+        .filter(|s| !s.is_empty());
+    Some(AgyBgParsed { id, description, output_file })
+}
+
+fn agy_bg_meta(tool_name: &str, args: &Value, parsed_desc: &str) -> (String, bool, Option<String>, String) {
+    match tool_name.to_ascii_lowercase().as_str() {
+        "run_command" => {
+            let desc = arg_str(&args["toolSummary"])
+                .or_else(|| (!parsed_desc.is_empty()).then(|| parsed_desc.to_string()))
+                .or_else(|| arg_str(&args["CommandLine"]))
+                .unwrap_or_default();
+            ("local_bash".into(), arg_bool(&args["IsDaemon"]), None, crate::util::truncate(&desc, 200))
+        }
+        "run_workflow" => {
+            let desc = arg_str(&args["Description"])
+                .or_else(|| (!parsed_desc.is_empty()).then(|| parsed_desc.to_string()))
+                .unwrap_or_default();
+            ("workflow".into(), false, None, crate::util::truncate(&desc, 200))
+        }
+        "schedule" => {
+            let is_daemon = arg_bool(&args["IsDaemon"]) || arg_str(&args["CronExpression"]).is_some();
+            let timer_cond = arg_str(&args["TimerCondition"]).filter(|s| s != "never");
+            let desc = if !parsed_desc.is_empty() {
+                parsed_desc.to_string()
+            } else {
+                arg_str(&args["Prompt"]).unwrap_or_default()
+            };
+            ("timer".into(), is_daemon, timer_cond, crate::util::truncate(&desc, 200))
+        }
+        _ => {
+            let kind = if parsed_desc.starts_with("Timer:") || parsed_desc.starts_with("Cron:") {
+                "timer"
+            } else {
+                "local_bash"
+            };
+            (kind.into(), false, None, crate::util::truncate(parsed_desc, 200))
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum AgyTaskNotice {
+    Finished { id: String, output: String, is_error: bool },
+    Canceled { id: String, output: String },
+    Message { sender: String, output: String },
+}
+
+fn extract_task_result_body(rest: &str) -> String {
+    let result = rest.split("\n\nLog: ").next().unwrap_or(rest);
+    let result = result.split("\nLog: ").next().unwrap_or(result);
+    let result = result.split("</SYSTEM_MESSAGE>").next().unwrap_or(result).trim();
+    antigravity_command_body(result).unwrap_or_else(|| result.replace("\r\n", "\n"))
+}
+
+fn extract_system_sender(content: &str) -> Option<&str> {
+    let rest = content.split_once("sender=")?.1;
+    rest.split_whitespace().next().filter(|s| !s.is_empty())
+}
+
+fn agy_task_notice(content: &str) -> Option<AgyTaskNotice> {
+    if let Some(rest) = content.split_once("Task id \"") {
+        if let Some((task, after)) = rest.1.split_once('"') {
+            if let Some((_, body)) = after.split_once("finished with result:") {
+                let text = extract_task_result_body(body);
+                let is_error = text.contains("exit code: ");
+                return Some(AgyTaskNotice::Finished { id: task.to_string(), output: text, is_error });
+            }
+            if let Some((_, body)) = after.split_once("was canceled with result:") {
+                let text = extract_task_result_body(body);
+                return Some(AgyTaskNotice::Canceled { id: task.to_string(), output: text });
+            }
+        }
+    }
+    let sender = extract_system_sender(content)?;
+    let output = extract_system_message_content(content).unwrap_or_default();
+    Some(AgyTaskNotice::Message { sender: sender.to_string(), output })
+}
+
 /// A SYSTEM_MESSAGE `Task id "<id>" finished with result:\n<result>\n\nLog: …`: the task id and its result text
+#[cfg(test)]
 fn agy_task_finished(content: &str) -> Option<(&str, String)> {
     let rest = content.split_once("Task id \"")?.1;
     let (task, rest) = rest.split_once('"')?;
     let result = rest.split_once("finished with result:")?.1;
-    let result = result.split("\n\nLog: ").next().unwrap_or(result);
-    let result = result.split("</SYSTEM_MESSAGE>").next().unwrap_or(result).trim();
-    let text = antigravity_command_body(result).unwrap_or_else(|| result.replace("\r\n", "\n"));
-    Some((task, text))
+    Some((task, extract_task_result_body(result)))
 }
 
 /// Extract spawned subagent conversation IDs from `"Created the following subagent:\n{...}"` GENERIC step content
@@ -1752,18 +1978,49 @@ fn clean_agy_generic_output(raw: &str, media: Option<&Vec<Value>>) -> String {
     out
 }
 
-fn has_pending_agy_subagent_turn(brain_dir: &std::path::Path, parent_sid: &str, pre_turn_steps: usize) -> bool {
+fn has_pending_agy_async_turn(brain_dir: &std::path::Path, parent_sid: &str, pre_turn_steps: usize) -> bool {
     let steps = read_agy_transcript_steps(brain_dir, parent_sid);
     if pre_turn_steps >= steps.len() {
         return false;
     }
     let slice = &steps[pre_turn_steps..];
-    let launched = slice.iter().any(|s| {
-        s["tool_calls"].as_array().is_some_and(|tcs| {
-            tcs.iter().any(|tc| is_agy_subagent_tool(tc["name"].as_str().unwrap_or(""), &tc["args"]))
-        }) || !extract_created_subagent_ids(s["content"].as_str().unwrap_or("")).is_empty()
-    });
-    if !launched {
+    let mut launched_sub = false;
+    let mut has_bg = false;
+    let mut open_calls: VecDeque<(String, Value)> = VecDeque::new();
+    for s in slice {
+        match s["type"].as_str().unwrap_or("") {
+            "PLANNER_RESPONSE" => {
+                open_calls.clear();
+                for tc in s["tool_calls"].as_array().into_iter().flatten() {
+                    let name = tc["name"].as_str().unwrap_or("");
+                    if is_agy_subagent_tool(name, &tc["args"]) {
+                        launched_sub = true;
+                    }
+                    open_calls.push_back((name.to_string(), tc["args"].clone()));
+                }
+            }
+            "GENERIC" => {
+                let content = s["content"].as_str().unwrap_or("");
+                if !extract_created_subagent_ids(content).is_empty() {
+                    launched_sub = true;
+                }
+                let call = open_calls.pop_front();
+                if s["status"].as_str() == Some("RUNNING") {
+                    if let Some(parsed) = parse_agy_bg_task(content) {
+                        let (_, is_daemon, _, _) = match call {
+                            Some((name, args)) => agy_bg_meta(&name, &args, &parsed.description),
+                            None => agy_bg_meta("", &Value::Null, &parsed.description),
+                        };
+                        if !is_daemon {
+                            has_bg = true;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if !launched_sub && !has_bg {
         return false;
     }
     // Still pending unless a SYSTEM_MESSAGE already woke the parent and produced a finished empty-tool PLANNER_RESPONSE
@@ -1773,20 +2030,130 @@ fn has_pending_agy_subagent_turn(brain_dir: &std::path::Path, parent_sid: &str, 
     }
 }
 
+#[derive(Debug, Clone)]
+struct AgyBgTask {
+    id: String,
+    kind: String,
+    description: String,
+    started_at: i64,
+    output_file: Option<String>,
+    tc_id: Option<String>,
+    is_daemon: bool,
+    timer_cond: Option<String>,
+    done: bool,
+    announced: bool,
+    result: Option<(String, bool)>,
+}
+
+impl AgyBgTask {
+    fn to_proto(&self) -> BackgroundTask {
+        BackgroundTask {
+            id: self.id.clone(),
+            kind: self.kind.clone(),
+            description: if self.description.is_empty() { self.id.clone() } else { self.description.clone() },
+            started_at: self.started_at,
+            output_file: self.output_file.clone(),
+            unstoppable: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct AgyLaneCall {
+    id: String,
+    name: String,
+    args: Value,
+}
+
+fn settle_bg_tasks_with_system(tasks: &mut [AgyBgTask], step: &Value, out: &mut AgyOut, announce: bool) {
+    if !is_agy_system(step) || step["status"].as_str() != Some("DONE") {
+        return;
+    }
+    let content = step["content"].as_str().unwrap_or("");
+    let Some(notice) = agy_task_notice(content) else {
+        return;
+    };
+    let sender = match &notice {
+        AgyTaskNotice::Finished { id, .. } | AgyTaskNotice::Canceled { id, .. } => id.as_str(),
+        AgyTaskNotice::Message { sender, .. } => sender.as_str(),
+    };
+    for t in tasks.iter_mut() {
+        if t.done {
+            continue;
+        }
+        match &notice {
+            AgyTaskNotice::Finished { id, output, is_error } if t.id == *id => {
+                t.done = true;
+                let truncated = crate::util::truncate(output, 64 * 1024);
+                t.result = Some((truncated.clone(), *is_error));
+                if let Some(tc_id) = t.tc_id.take() {
+                    out.push(EventBody::ToolResult { id: tc_id, output: truncated, is_error: *is_error });
+                }
+                if announce && !t.announced {
+                    t.announced = true;
+                    let status = if *is_error { "后台任务失败" } else { "后台任务完成" };
+                    let what = if t.description.is_empty() { &t.id } else { &t.description };
+                    out.push(EventBody::System { text: format!("{status}：{what}") });
+                }
+            }
+            AgyTaskNotice::Canceled { id, output } if t.id == *id => {
+                t.done = true;
+                let truncated = crate::util::truncate(output, 64 * 1024);
+                t.result = Some((truncated.clone(), true));
+                if let Some(tc_id) = t.tc_id.take() {
+                    out.push(EventBody::ToolResult { id: tc_id, output: truncated, is_error: true });
+                }
+                if announce && !t.announced {
+                    t.announced = true;
+                    let what = if t.description.is_empty() { &t.id } else { &t.description };
+                    out.push(EventBody::System { text: format!("后台任务已停止：{what}") });
+                }
+            }
+            AgyTaskNotice::Message { sender: s, output } if t.id == *s => {
+                t.done = true;
+                let truncated = crate::util::truncate(output, 64 * 1024);
+                t.result = Some((truncated.clone(), false));
+                if let Some(tc_id) = t.tc_id.take() {
+                    out.push(EventBody::ToolResult { id: tc_id, output: truncated, is_error: false });
+                }
+                if announce && !t.announced {
+                    t.announced = true;
+                    let what = if t.description.is_empty() { &t.id } else { &t.description };
+                    out.push(EventBody::System { text: format!("后台任务完成：{what}") });
+                }
+            }
+            _ => {
+                if sender != "system" && (t.timer_cond.as_deref() == Some("any") || t.timer_cond.as_deref() == Some(sender)) {
+                    t.done = true;
+                    t.announced = true;
+                    t.result = Some((String::new(), false));
+                    if let Some(tc_id) = t.tc_id.take() {
+                        out.push(EventBody::ToolResult { id: tc_id, output: String::new(), is_error: false });
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Tool calls read from a transcript, waiting for the GENERIC steps that carry their results
 #[derive(Debug, Default)]
 struct AgyToolLane {
-    /// `(tool_call_id, tool_name)` in call order; GENERIC results come back in the same order
-    open: Vec<(String, String)>,
+    /// Open tool calls in call order; GENERIC results come back in the same order
+    open: Vec<AgyLaneCall>,
     /// Upcoming GENERIC steps that belong to calls we don't show (`send_message` back to the parent…)
     skip: usize,
-    /// Background commands: agy task id → our tool call id; the result arrives as a SYSTEM_MESSAGE
-    background: Vec<(String, String)>,
+    /// Background tasks (`run_command`, `run_workflow`, `schedule`): result arrives as a SYSTEM_MESSAGE
+    background: Vec<AgyBgTask>,
 }
 
 impl AgyToolLane {
     fn busy(&self) -> bool {
-        !self.open.is_empty() || !self.background.is_empty()
+        !self.open.is_empty() || self.background.iter().any(|b| !b.done)
+    }
+
+    fn push_open(&mut self, id: String, name: String, args: Value) {
+        self.open.push(AgyLaneCall { id, name, args });
     }
 
     /// A settled GENERIC step: the result of the oldest open call (or the start of its background task)
@@ -1798,35 +2165,50 @@ impl AgyToolLane {
         if self.open.is_empty() {
             return;
         }
-        let (tc_id, _) = self.open.remove(0);
+        let call = self.open.remove(0);
         let content = step["content"].as_str().unwrap_or("");
         if step["status"].as_str() == Some("RUNNING") {
-            if let Some(task) = agy_background_task(content) {
-                self.background.push((task.to_string(), tc_id));
-                return;
+            if let Some(parsed) = parse_agy_bg_task(content) {
+                let (kind, is_daemon, timer_cond, desc) = agy_bg_meta(&call.name, &call.args, &parsed.description);
+                if !is_daemon {
+                    self.background.push(AgyBgTask {
+                        id: parsed.id,
+                        kind,
+                        description: desc,
+                        started_at: now_ms(),
+                        output_file: parsed.output_file,
+                        tc_id: Some(call.id),
+                        is_daemon: false,
+                        timer_cond,
+                        done: false,
+                        announced: false,
+                        result: None,
+                    });
+                    return;
+                }
             }
         }
         let out = clean_agy_generic_output(content, step["media"].as_array());
         watch_out.push(EventBody::ToolResult {
-            id: tc_id,
+            id: call.id,
             output: crate::util::truncate(&out, 64 * 1024),
             is_error: matches!(step["status"].as_str(), Some("ERROR" | "INVALID")),
         });
     }
 
-    /// A SYSTEM_MESSAGE: fills a background command's result when it reports its task finished
+    /// A SYSTEM_MESSAGE: fills a background task's result when it reports finished/canceled
     fn system(&mut self, watch_out: &mut AgyOut, step: &Value) {
-        let Some((task, text)) = agy_task_finished(step["content"].as_str().unwrap_or("")) else {
-            return;
-        };
-        if let Some(i) = self.background.iter().position(|(t, _)| t == task) {
-            let (_, tc_id) = self.background.remove(i);
-            watch_out.push(EventBody::ToolResult { id: tc_id, output: crate::util::truncate(&text, 64 * 1024), is_error: text.contains("exit code: ") });
-        }
+        settle_bg_tasks_with_system(&mut self.background, step, watch_out, false);
+        self.background.retain(|b| !b.done);
     }
 
     fn close_all(&mut self, watch_out: &mut AgyOut) {
-        for (tc_id, _) in self.open.drain(..).chain(self.background.drain(..).map(|(_, id)| (id, String::new()))) {
+        for tc_id in self
+            .open
+            .drain(..)
+            .map(|c| c.id)
+            .chain(self.background.drain(..).filter(|b| !b.done).filter_map(|b| b.tc_id))
+        {
             watch_out.push(EventBody::ToolResult { id: tc_id, output: String::new(), is_error: false });
         }
     }
@@ -1878,11 +2260,18 @@ fn agy_task_desc(input: &Value) -> String {
     pick(first).or_else(|| pick(input)).unwrap_or_default()
 }
 
-/// Running subagents handed from one watch to the next across a prompt
+/// Running subagents and background tasks handed from one watch to the next across a prompt
 #[derive(Debug, Default)]
 struct AgyCarry {
     subs: Vec<(String, AgySubagentTracker)>,
     calls: HashMap<String, AgyPendingCall>,
+    bg_tasks: Vec<AgyBgTask>,
+}
+
+impl AgyCarry {
+    fn is_empty(&self) -> bool {
+        self.subs.is_empty() && self.bg_tasks.is_empty()
+    }
 }
 
 /// What a pass of the watch decided
@@ -1894,11 +2283,11 @@ enum AgyStep {
     Done(Option<Value>),
 }
 
-/// Antigravity subagents (`invoke_subagent`, `send_message` to one, `swarm`) run in the background: agy ends the
-/// prompt turn right after launching them, and when they report back it wakes the parent by itself, outside any
-/// ACP prompt, so none of that is streamed. This follows their transcripts on disk instead. Like Claude's
-/// background tasks, the turn ends with the prompt; running subagents are listed as the session's background
-/// tasks, and the parent's wakeup reopens the session (Running, then TurnEnd)
+/// Antigravity subagents (`invoke_subagent`, `send_message` to one, `swarm`) and background tasks (`run_command`,
+/// `run_workflow`, `schedule`) run asynchronously: agy ends the prompt turn after launching them, and when they report
+/// back it wakes the parent by itself, outside any ACP prompt, so none of that is streamed. This follows their
+/// transcripts on disk instead. Like Claude's background tasks, the turn ends with the prompt; running subagents and
+/// background tasks are listed in `background_tasks`, and the parent's wakeup reopens the session (Running, then TurnEnd)
 #[derive(Debug)]
 struct AgyWatch {
     parent_sid: String,
@@ -1908,10 +2297,13 @@ struct AgyWatch {
     /// SYSTEM_MESSAGE after them can be the wakeup
     wake_from: usize,
     next_parent_discover_step: usize,
+    discover_open: VecDeque<(String, Value)>,
     stop_reason: Option<String>,
     pending_calls: HashMap<String, AgyPendingCall>,
     subagents: HashMap<String, AgySubagentTracker>,
     subagent_order: Vec<String>,
+    bg_tasks: Vec<AgyBgTask>,
+    seen_system_steps: HashSet<usize>,
     wakeup_msg_idx: Option<usize>,
     next_parent_emit_step: usize,
     parent_lane: AgyToolLane,
@@ -1927,6 +2319,7 @@ struct AgyWatch {
     /// This pass produced the parent's own events (its wakeup), which reopen a detached turn
     wake: bool,
     out: AgyOut,
+    settled_tc_ids: Vec<String>,
 }
 
 impl AgyWatch {
@@ -1946,10 +2339,13 @@ impl AgyWatch {
             pre_turn_steps,
             wake_from: wake_from.max(pre_turn_steps),
             next_parent_discover_step: pre_turn_steps,
+            discover_open: VecDeque::new(),
             stop_reason,
             pending_calls,
             subagents: HashMap::new(),
             subagent_order: vec![],
+            bg_tasks: vec![],
+            seen_system_steps: HashSet::new(),
             wakeup_msg_idx: None,
             next_parent_emit_step: pre_turn_steps,
             parent_lane: AgyToolLane::default(),
@@ -1962,6 +2358,7 @@ impl AgyWatch {
             reopened: false,
             wake: false,
             out: vec![],
+            settled_tc_ids: vec![],
         };
         for (sid, baseline) in send_baselines {
             watch.add_subagent(sid, Some(baseline));
@@ -1989,7 +2386,17 @@ impl AgyWatch {
         self.all_subagents_done_at = None;
     }
 
-    /// Take over subagents still running from the previous watch
+    fn add_bg_task(&mut self, task: AgyBgTask) {
+        if self.bg_tasks.iter().any(|b| b.id == task.id) {
+            return;
+        }
+        if !task.done && !task.is_daemon {
+            self.all_subagents_done_at = None;
+        }
+        self.bg_tasks.push(task);
+    }
+
+    /// Take over subagents and background tasks still running from the previous watch
     fn adopt(&mut self, carry: AgyCarry) {
         for (id, t) in carry.subs {
             if !self.subagents.contains_key(&id) {
@@ -1999,11 +2406,22 @@ impl AgyWatch {
             }
         }
         self.pending_calls.extend(carry.calls);
+        for b in carry.bg_tasks {
+            self.add_bg_task(b);
+        }
     }
 
-    /// Running subagents as background tasks
+    fn adopt_bg(&mut self, bg_tasks: Vec<AgyBgTask>, seen_system_steps: HashSet<usize>) {
+        self.seen_system_steps.extend(seen_system_steps);
+        for b in bg_tasks {
+            self.add_bg_task(b);
+        }
+    }
+
+    /// Running subagents and background tasks
     fn tasks(&mut self) -> Vec<BackgroundTask> {
         let mut v = vec![];
+        let mut seen = HashSet::new();
         for id in &self.subagent_order {
             let Some(t) = self.subagents.get_mut(id) else { continue };
             if t.desc.is_empty() {
@@ -2011,14 +2429,25 @@ impl AgyWatch {
                     t.desc = c.desc.clone();
                 }
             }
-            if !t.done {
+            if !t.done && seen.insert(id.clone()) {
                 v.push(BackgroundTask {
                     id: id.clone(),
                     kind: "local_agent".into(),
                     description: if t.desc.is_empty() { id.chars().take(8).collect() } else { t.desc.clone() },
                     started_at: t.started_at,
                     output_file: None,
+                    unstoppable: false,
                 });
+            }
+            for b in &t.lane.background {
+                if !b.done && !b.is_daemon && seen.insert(b.id.clone()) {
+                    v.push(b.to_proto());
+                }
+            }
+        }
+        for b in &self.bg_tasks {
+            if !b.done && !b.is_daemon && seen.insert(b.id.clone()) {
+                v.push(b.to_proto());
             }
         }
         v
@@ -2061,6 +2490,9 @@ impl AgyWatch {
             em.status(SessionStatus::Running, None);
         }
         for body in self.out.drain(..) {
+            if let EventBody::ToolResult { id, .. } = &body {
+                self.settled_tc_ids.push(id.clone());
+            }
             em.event(body);
         }
     }
@@ -2114,10 +2546,17 @@ fn finish_agy_watch(watch: &mut AgyWatch, em: &Emitter) {
         }
     }
     watch.parent_lane.close_all(&mut watch.out);
+    for b in &mut watch.bg_tasks {
+        if !b.done {
+            if let Some(tc_id) = b.tc_id.take() {
+                watch.out.push(EventBody::ToolResult { id: tc_id, output: String::new(), is_error: false });
+            }
+        }
+    }
     watch.flush_out(em);
 }
 
-/// Stop following the subagents (the adapter exits)
+/// Stop following the subagents and background tasks (the adapter exits)
 fn drop_agy_watch(st: &mut State, em: &Emitter) {
     if let Some(mut watch) = st.agy_watch.take() {
         finish_agy_watch(&mut watch, em);
@@ -2125,12 +2564,18 @@ fn drop_agy_watch(st: &mut State, em: &Emitter) {
     }
 }
 
-/// End the watch but keep its running subagents (with their calls still waiting for a report) in `st.agy_carry`:
+/// End the watch but keep its running subagents and background tasks in `st.agy_carry`:
 /// a new prompt is going out (the parent's own steps would confuse the watch), or the wakeup turn was interrupted
 fn carry_agy_watch(st: &mut State, em: &Emitter) {
     let Some(mut watch) = st.agy_watch.take() else {
         return;
     };
+    let parent_steps = watch.parent.refresh(&watch.brain_dir, &watch.parent_sid);
+    for (idx, step) in parent_steps.iter().enumerate().skip(watch.pre_turn_steps) {
+        if is_agy_system(step) && step["status"].as_str() == Some("DONE") && watch.seen_system_steps.insert(idx) {
+            settle_bg_tasks_with_system(&mut watch.bg_tasks, step, &mut watch.out, true);
+        }
+    }
     for id in watch.running_subagents() {
         if let Some(t) = watch.subagents.remove(&id) {
             st.agy_carry.subs.push((id, t));
@@ -2149,7 +2594,23 @@ fn carry_agy_watch(st: &mut State, em: &Emitter) {
             st.agy_carry.calls.insert(k, c);
         }
     }
+    for b in watch.bg_tasks.drain(..) {
+        if !b.done && !b.is_daemon {
+            st.agy_carry.bg_tasks.push(b);
+        }
+    }
     finish_agy_watch(&mut watch, em);
+    mark_watch_settled(st, &mut watch);
+    em.background_tasks(current_agy_tasks(st));
+}
+
+fn mark_watch_settled(st: &mut State, watch: &mut AgyWatch) {
+    for id in watch.settled_tc_ids.drain(..) {
+        if let Some(t) = st.tools.get_mut(&id) {
+            t.done = true;
+        }
+        st.agy_open_bg_calls.retain(|(x, _)| x != &id);
+    }
 }
 
 /// session/cancel for a subagent stopped from the background task list (session/close doesn't stop it)
@@ -2187,7 +2648,8 @@ fn stop_agy_subagent(st: &mut State, em: &Emitter, id: &str) -> Option<Value> {
 }
 
 fn em_carry_tasks(c: &AgyCarry) -> Vec<BackgroundTask> {
-    c.subs
+    let mut v: Vec<BackgroundTask> = c
+        .subs
         .iter()
         .map(|(id, t)| BackgroundTask {
             id: id.clone(),
@@ -2195,13 +2657,135 @@ fn em_carry_tasks(c: &AgyCarry) -> Vec<BackgroundTask> {
             description: if t.desc.is_empty() { id.chars().take(8).collect() } else { t.desc.clone() },
             started_at: t.started_at,
             output_file: None,
+            unstoppable: false,
         })
-        .collect()
+        .collect();
+    for b in &c.bg_tasks {
+        if !b.done && !b.is_daemon {
+            v.push(b.to_proto());
+        }
+    }
+    v
+}
+
+fn current_agy_tasks(st: &State) -> Vec<BackgroundTask> {
+    let mut v = em_carry_tasks(&st.agy_carry);
+    let mut seen: HashSet<String> = v.iter().map(|t| t.id.clone()).collect();
+    for b in &st.agy_bg_tasks {
+        if !b.done && !b.is_daemon && seen.insert(b.id.clone()) {
+            v.push(b.to_proto());
+        }
+    }
+    v
+}
+
+fn settle_agy_bg_from_steps(st: &mut State, steps: &[Value], em: &Emitter) {
+    let mut out = vec![];
+    for (idx, step) in steps.iter().enumerate().skip(st.agy_pre_turn_steps) {
+        if is_agy_system(step) && step["status"].as_str() == Some("DONE") && st.agy_seen_system_steps.insert(idx) {
+            settle_bg_tasks_with_system(&mut st.agy_bg_tasks, step, &mut out, true);
+            settle_bg_tasks_with_system(&mut st.agy_carry.bg_tasks, step, &mut out, true);
+        }
+    }
+    if !out.is_empty() {
+        for body in out {
+            if let EventBody::ToolResult { id, .. } = &body {
+                if let Some(t) = st.tools.get_mut(id) {
+                    t.done = true;
+                }
+                st.agy_open_bg_calls.retain(|(x, _)| x != id);
+            }
+            em.event(body);
+        }
+        st.agy_carry.bg_tasks.retain(|b| !b.done);
+        em.background_tasks(current_agy_tasks(st));
+    }
+}
+
+fn discover_agy_bg_from_steps(st: &mut State, steps: &[Value]) -> bool {
+    let mut added = false;
+    let mut open_calls: VecDeque<(String, Value)> = VecDeque::new();
+    for step in steps.iter().skip(st.agy_pre_turn_steps) {
+        if !agy_step_settled(step) {
+            break;
+        }
+        match step["type"].as_str().unwrap_or("") {
+            "PLANNER_RESPONSE" => {
+                open_calls.clear();
+                for tc in step["tool_calls"].as_array().into_iter().flatten() {
+                    open_calls.push_back((tc["name"].as_str().unwrap_or("").to_string(), tc["args"].clone()));
+                }
+            }
+            "GENERIC" => {
+                let call = open_calls.pop_front();
+                if step["status"].as_str() == Some("RUNNING") {
+                    if let Some(parsed) = parse_agy_bg_task(step["content"].as_str().unwrap_or("")) {
+                        if !st.agy_bg_tasks.iter().any(|b| b.id == parsed.id) {
+                            let call_name = call.as_ref().map(|(n, _)| n.clone());
+                            let (kind, is_daemon, timer_cond, desc) = match call {
+                                Some((name, args)) => agy_bg_meta(&name, &args, &parsed.description),
+                                None => agy_bg_meta("", &Value::Null, &parsed.description),
+                            };
+                            let tc_id = call_name.as_deref().and_then(|cn| {
+                                st.agy_open_bg_calls
+                                    .iter()
+                                    .position(|(_, n)| n.eq_ignore_ascii_case(cn))
+                                    .and_then(|pos| st.agy_open_bg_calls.remove(pos))
+                                    .map(|(id, _)| id)
+                            });
+                            if !is_daemon {
+                                st.agy_bg_tasks.push(AgyBgTask {
+                                    id: parsed.id,
+                                    kind,
+                                    description: desc,
+                                    started_at: now_ms(),
+                                    output_file: parsed.output_file,
+                                    tc_id,
+                                    is_daemon: false,
+                                    timer_cond,
+                                    done: false,
+                                    announced: false,
+                                    result: None,
+                                });
+                                added = true;
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    added
+}
+
+fn poll_agy_prompt_bg(st: &mut State, em: &Emitter) {
+    let Some(sid) = st.session_id.as_deref() else {
+        return;
+    };
+    let steps = st.agy_parent_transcript.refresh(&agy_brain_dir(), sid);
+    if discover_agy_bg_from_steps(st, &steps) {
+        em.background_tasks(current_agy_tasks(st));
+    }
+    settle_agy_bg_from_steps(st, &steps, em);
+}
+
+fn settle_agy_prompt_bg(st: &mut State, em: &Emitter) {
+    let Some(sid) = st.session_id.as_deref() else {
+        return;
+    };
+    let steps = st.agy_parent_transcript.refresh(&agy_brain_dir(), sid);
+    discover_agy_bg_from_steps(st, &steps);
+    settle_agy_bg_from_steps(st, &steps, em);
+    st.agy_carry.bg_tasks.retain(|b| !b.done);
+    em.background_tasks(current_agy_tasks(st));
 }
 
 fn poll_agy_watch(st: &mut State, spec: &StartSpec, em: &Emitter) -> Option<Value> {
     let mut watch = st.agy_watch.take()?;
-    match step_agy_watch(&mut watch, spec, em, &mut st.next_id, &mut st.pending) {
+    let step = step_agy_watch(&mut watch, spec, em, &mut st.next_id, &mut st.pending);
+    mark_watch_settled(st, &mut watch);
+    match step {
         AgyStep::Wait => {
             st.agy_watch = Some(watch);
             None
@@ -2219,7 +2803,7 @@ fn poll_agy_watch(st: &mut State, spec: &StartSpec, em: &Emitter) -> Option<Valu
     }
 }
 
-/// Advance the Antigravity subagent + parent-wakeup watch by one tick
+/// Advance the Antigravity subagent + background-task + parent-wakeup watch by one tick
 fn step_agy_watch(
     watch: &mut AgyWatch,
     spec: &StartSpec,
@@ -2240,7 +2824,7 @@ fn step_agy_watch(
 
 fn step_agy_watch_inner(watch: &mut AgyWatch, spec: &StartSpec, next_id: &mut u64, pending: &mut HashMap<u64, Pending>) -> AgyStep {
     use std::time::Duration;
-    /// Give up on subagents whose transcripts (and the parent's) haven't moved for this long
+    /// Give up on subagents/tasks whose transcripts (and the parent's) haven't moved for this long
     const IDLE_TIMEOUT: Duration = Duration::from_secs(1800);
     const DISCOVER_GRACE: Duration = Duration::from_secs(3);
     const WAKEUP_GRACE: Duration = Duration::from_secs(20);
@@ -2262,7 +2846,7 @@ fn step_agy_watch_inner(watch: &mut AgyWatch, spec: &StartSpec, next_id: &mut u6
     };
     let timed_out = idle_for() >= IDLE_TIMEOUT;
 
-    // 1. Discover newly spawned/messaged subagents from parent transcript steps since pre_turn_steps
+    // 1. Discover newly spawned subagents and background tasks from parent transcript steps since pre_turn_steps
     while watch.next_parent_discover_step < parent_steps.len() {
         let step = &parent_steps[watch.next_parent_discover_step];
         if !agy_step_settled(step) {
@@ -2270,20 +2854,50 @@ fn step_agy_watch_inner(watch: &mut AgyWatch, spec: &StartSpec, next_id: &mut u6
         }
         match step["type"].as_str().unwrap_or("") {
             "PLANNER_RESPONSE" => {
+                watch.discover_open.clear();
                 for tc in step["tool_calls"].as_array().into_iter().flatten() {
-                    if tc["name"].as_str() == Some("send_message") {
+                    let name = tc["name"].as_str().unwrap_or("");
+                    if name == "send_message" {
                         if let Some(recip) = agy_recipient(&tc["args"]) {
                             watch.add_subagent(recip.to_string(), None);
                         }
                     }
+                    watch.discover_open.push_back((name.to_string(), tc["args"].clone()));
                 }
             }
             "GENERIC" => {
-                for sub_id in extract_created_subagent_ids(step["content"].as_str().unwrap_or("")) {
+                let call = watch.discover_open.pop_front();
+                let content = step["content"].as_str().unwrap_or("");
+                for sub_id in extract_created_subagent_ids(content) {
                     watch.add_subagent(sub_id.clone(), Some(0));
                     // Bind an unbound invoke_subagent call to the first subagent it created
                     if let Some(call) = watch.pending_calls.values_mut().find(|c| c.target_subagent.is_none() && c.name.eq_ignore_ascii_case("invoke_subagent")) {
                         call.target_subagent = Some(sub_id.clone());
+                    }
+                }
+                if step["status"].as_str() == Some("RUNNING") {
+                    if let Some(parsed) = parse_agy_bg_task(content) {
+                        if !watch.bg_tasks.iter().any(|b| b.id == parsed.id) {
+                            let (kind, is_daemon, timer_cond, desc) = match call {
+                                Some((name, args)) => agy_bg_meta(&name, &args, &parsed.description),
+                                None => agy_bg_meta("", &Value::Null, &parsed.description),
+                            };
+                            if !is_daemon {
+                                watch.add_bg_task(AgyBgTask {
+                                    id: parsed.id,
+                                    kind,
+                                    description: desc,
+                                    started_at: now_ms(),
+                                    output_file: parsed.output_file,
+                                    tc_id: None,
+                                    is_daemon: false,
+                                    timer_cond,
+                                    done: false,
+                                    announced: false,
+                                    result: None,
+                                });
+                            }
+                        }
                     }
                 }
             }
@@ -2292,7 +2906,7 @@ fn step_agy_watch_inner(watch: &mut AgyWatch, spec: &StartSpec, next_id: &mut u6
         watch.next_parent_discover_step += 1;
     }
 
-    if watch.subagents.is_empty() {
+    if watch.subagents.is_empty() && !watch.bg_tasks.iter().any(|b| !b.is_daemon) {
         if watch.started_at.elapsed() >= DISCOVER_GRACE {
             return AgyStep::Done(None);
         }
@@ -2324,8 +2938,8 @@ fn step_agy_watch_inner(watch: &mut AgyWatch, spec: &StartSpec, next_id: &mut u6
                             } else {
                                 // Transcript tool calls carry no id; the prefix also tells the frontend they're the subagent's
                                 let tc_id = tc["id"].as_str().map(str::to_string).unwrap_or_else(|| format!("agy-sub:{sub_id}:{step_idx}:{tc_idx}"));
-                                watch.out.push(EventBody::ToolCall { id: tc_id.clone(), name: tc_name.to_string(), title: tc_name.to_string(), input: tc_args, diffs: vec![] });
-                                tracker.lane.open.push((tc_id, tc_name.to_string()));
+                                watch.out.push(EventBody::ToolCall { id: tc_id.clone(), name: tc_name.to_string(), title: tc_name.to_string(), input: tc_args.clone(), diffs: vec![] });
+                                tracker.lane.push_open(tc_id, tc_name.to_string(), tc_args);
                             }
                         }
                     } else if let Some(text) = step["content"].as_str().map(str::trim).filter(|s| !s.is_empty()) {
@@ -2363,7 +2977,7 @@ fn step_agy_watch_inner(watch: &mut AgyWatch, spec: &StartSpec, next_id: &mut u6
         }
     }
 
-    // 3. Check parent transcript for SYSTEM_MESSAGE notifications from finished subagent(s)
+    // 3. Check parent transcript for SYSTEM_MESSAGE notifications from finished subagent(s) and background tasks
     for (idx, step) in parent_steps.iter().enumerate().skip(watch.pre_turn_steps) {
         if !is_agy_system(step) || step["status"].as_str() != Some("DONE") {
             continue;
@@ -2379,6 +2993,9 @@ fn step_agy_watch_inner(watch: &mut AgyWatch, spec: &StartSpec, next_id: &mut u6
                     }
                 }
             }
+        }
+        if watch.seen_system_steps.insert(idx) {
+            settle_bg_tasks_with_system(&mut watch.bg_tasks, step, &mut watch.out, true);
         }
         if idx >= watch.wake_from && is_agy_wakeup(step) && watch.wakeup_msg_idx.is_none_or(|prev| idx >= prev) {
             if watch.wakeup_msg_idx.is_none() {
@@ -2400,8 +3017,8 @@ fn step_agy_watch_inner(watch: &mut AgyWatch, spec: &StartSpec, next_id: &mut u6
 
     flush_ready_pending_calls(watch, false);
 
-    // 4. Wait until all tracked subagents are finished
-    if !watch.subagents.values().all(|t| t.done) {
+    // 4. Wait until all tracked subagents and background tasks are finished
+    if !watch.subagents.values().all(|t| t.done) || !watch.bg_tasks.iter().all(|b| b.done) {
         return if timed_out { AgyStep::Done(None) } else { AgyStep::Wait };
     }
 
@@ -2435,7 +3052,7 @@ fn step_agy_watch_inner(watch: &mut AgyWatch, spec: &StartSpec, next_id: &mut u6
                             // Its GENERIC step ("Message sent" / "Created the following subagent") isn't a shown result
                             watch.parent_lane.skip += 1;
                         } else {
-                            watch.parent_lane.open.push((tc_id, tc_name.to_string()));
+                            watch.parent_lane.push_open(tc_id, tc_name.to_string(), tc_args);
                         }
                     }
                     if let Some(text) = step["content"].as_str().filter(|s| !s.trim().is_empty()) {
@@ -2443,15 +3060,59 @@ fn step_agy_watch_inner(watch: &mut AgyWatch, spec: &StartSpec, next_id: &mut u6
                     }
                 }
                 "GENERIC" => {
-                    for sub_id in extract_created_subagent_ids(step["content"].as_str().unwrap_or("")) {
+                    let content = step["content"].as_str().unwrap_or("");
+                    for sub_id in extract_created_subagent_ids(content) {
                         if let Some(call) = watch.pending_calls.values_mut().find(|c| c.target_subagent.is_none() && c.name.eq_ignore_ascii_case("invoke_subagent")) {
                             call.target_subagent = Some(sub_id.clone());
                         }
                         watch.add_subagent(sub_id, Some(0));
                     }
-                    watch.parent_lane.generic(&mut watch.out, step);
+                    if watch.parent_lane.skip > 0 {
+                        watch.parent_lane.skip -= 1;
+                    } else if let Some(call) = (!watch.parent_lane.open.is_empty()).then(|| watch.parent_lane.open.remove(0)) {
+                        if step["status"].as_str() == Some("RUNNING") {
+                            if let Some(parsed) = parse_agy_bg_task(content) {
+                                let (kind, is_daemon, timer_cond, desc) = agy_bg_meta(&call.name, &call.args, &parsed.description);
+                                if is_daemon {
+                                    let out = clean_agy_generic_output(content, step["media"].as_array());
+                                    watch.out.push(EventBody::ToolResult { id: call.id, output: crate::util::truncate(&out, 64 * 1024), is_error: false });
+                                } else if let Some(b) = watch.bg_tasks.iter_mut().find(|b| b.id == parsed.id) {
+                                    if b.done {
+                                        let (out, is_error) = b.result.clone().unwrap_or_default();
+                                        watch.out.push(EventBody::ToolResult { id: call.id, output: out, is_error });
+                                    } else {
+                                        b.tc_id.get_or_insert(call.id);
+                                    }
+                                } else {
+                                    watch.add_bg_task(AgyBgTask {
+                                        id: parsed.id,
+                                        kind,
+                                        description: desc,
+                                        started_at: now_ms(),
+                                        output_file: parsed.output_file,
+                                        tc_id: Some(call.id),
+                                        is_daemon: false,
+                                        timer_cond,
+                                        done: false,
+                                        announced: false,
+                                        result: None,
+                                    });
+                                }
+                            } else {
+                                let out = clean_agy_generic_output(content, step["media"].as_array());
+                                watch.out.push(EventBody::ToolResult { id: call.id, output: crate::util::truncate(&out, 64 * 1024), is_error: false });
+                            }
+                        } else {
+                            let out = clean_agy_generic_output(content, step["media"].as_array());
+                            watch.out.push(EventBody::ToolResult {
+                                id: call.id,
+                                output: crate::util::truncate(&out, 64 * 1024),
+                                is_error: matches!(step["status"].as_str(), Some("ERROR" | "INVALID")),
+                            });
+                        }
+                    }
                 }
-                "SYSTEM_MESSAGE" => watch.parent_lane.system(&mut watch.out, step),
+                "SYSTEM_MESSAGE" => {}
                 _ => {}
             }
             watch.next_parent_emit_step += 1;
@@ -2459,8 +3120,8 @@ fn step_agy_watch_inner(watch: &mut AgyWatch, spec: &StartSpec, next_id: &mut u6
             watch.wake = true;
         }
 
-        // Did the wakeup turn launch another chained subagent? If so, wait for it
-        if !watch.subagents.values().all(|t| t.done) {
+        // Did the wakeup turn launch another chained subagent or background task? If so, wait for it
+        if !watch.subagents.values().all(|t| t.done) || !watch.bg_tasks.iter().all(|b| b.done) {
             return AgyStep::Wait;
         }
 
@@ -3302,6 +3963,280 @@ mod model_config_tests {
         }
         assert_eq!(count_agy_transcript_steps(&root, "s1"), 2);
         assert_eq!(count_agy_transcript_steps(&root, "../s1"), 0);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn antigravity_parent_background_command_and_wakeup() {
+        use super::*;
+        let root = std::env::temp_dir().join(format!("yi-agy-parent-bg-{}", uuid::Uuid::new_v4()));
+        let parent_id = "p-bg-1";
+        let (hub, em, _rx) = crate::hub::test_emitter();
+        let mut st = State {
+            is_antigravity: true,
+            session_id: Some(parent_id.into()),
+            ..Default::default()
+        };
+
+        let bg_notice = "Created At: 2026-11-16T09:38:36+08:00\nTool is running as a background task with task id: p-bg-1/task-2\nTask Description: npm run build\nTask logs are available at: file:///tmp/task-2.log\nYOU MUST TAKE ONE OF THE FOLLOWING TWO ACTIONS: end turn";
+        update(
+            &mut st,
+            &em,
+            &json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "tc-cmd-1",
+                "kind": "other",
+                "title": "run_command",
+                "rawInput": {"CommandLine": "npm run build", "toolSummary": "Frontend build"}
+            }),
+        );
+        update(
+            &mut st,
+            &em,
+            &json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "tc-cmd-1",
+                "status": "completed",
+                "rawOutput": {"output": bg_notice}
+            }),
+        );
+
+        assert_eq!(st.agy_bg_tasks.len(), 1);
+        assert!(!hub.store.events_since("s", 0, 100).unwrap().iter().any(|e| matches!(e.body, EventBody::ToolResult { .. })));
+        let tasks = hub.info("s").unwrap().background_tasks;
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].id, "p-bg-1/task-2");
+        assert_eq!(tasks[0].kind, "local_bash");
+        assert_eq!(tasks[0].description, "Frontend build");
+        assert_eq!(tasks[0].output_file.as_deref(), Some("/tmp/task-2.log"));
+        assert!(tasks[0].unstoppable);
+        assert!(hub.stop_task("s", "p-bg-1/task-2").unwrap_err().to_string().contains("不支持从外部停止"));
+
+        let mut steps = vec![
+            json!({"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","content":"build it"}),
+            json!({"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"run_command","args":{"CommandLine":"npm run build","toolSummary":"Frontend build"}}]}),
+            json!({"step_index":2,"source":"MODEL","type":"GENERIC","status":"RUNNING","content":bg_notice}),
+            json!({"step_index":3,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","content":"Running build in background."}),
+        ];
+        write_agy_steps(&root, parent_id, &steps);
+
+        let mut watch = AgyWatch::new(parent_id.into(), root.clone(), 0, 4, Some("end_turn".into()), HashMap::new(), HashMap::new(), true);
+        watch.adopt_bg(std::mem::take(&mut st.agy_bg_tasks), HashSet::new());
+        watch.detached = true;
+        let spec = agy_test_spec();
+        let (mut next_id, mut pending) = (10, HashMap::new());
+
+        assert!(matches!(step_agy_watch(&mut watch, &spec, &em, &mut next_id, &mut pending), AgyStep::Wait));
+        assert_eq!(hub.info("s").unwrap().background_tasks.len(), 1);
+        assert!(!watch.reopened);
+
+        steps.push(json!({
+            "step_index": 4,
+            "source": "SYSTEM",
+            "type": "SYSTEM_MESSAGE",
+            "status": "DONE",
+            "content": "<SYSTEM_MESSAGE>\n[Message] timestamp=x sender=p-bg-1/task-2 priority=MESSAGE_PRIORITY_HIGH content=Task id \"p-bg-1/task-2\" finished with result:\nCommand exited with code 0.\n\nCommand output:\nBUILD-OK\r\n\nLog: file:///tmp/task-2.log\n</SYSTEM_MESSAGE>"
+        }));
+        steps.push(json!({
+            "step_index": 5,
+            "source": "MODEL",
+            "type": "PLANNER_RESPONSE",
+            "status": "DONE",
+            "content": "Build finished: BUILD-OK"
+        }));
+        write_agy_steps(&root, parent_id, &steps);
+
+        assert!(matches!(step_agy_watch(&mut watch, &spec, &em, &mut next_id, &mut pending), AgyStep::Wait));
+        let AgyStep::Done(Some(sync)) = step_agy_watch(&mut watch, &spec, &em, &mut next_id, &mut pending) else {
+            panic!("should emit session/resume");
+        };
+        assert_eq!(sync["method"], "session/resume");
+        assert!(watch.reopened);
+        assert!(hub.info("s").unwrap().background_tasks.is_empty());
+
+        let evs = hub.store.events_since("s", 0, 100).unwrap();
+        assert!(evs.iter().any(|e| matches!(&e.body, EventBody::ToolResult { id, output, is_error } if id == "tc-cmd-1" && output == "BUILD-OK" && !is_error)));
+        assert!(evs.iter().any(|e| matches!(&e.body, EventBody::System { text } if text == "后台任务完成：Frontend build")));
+        assert!(evs.iter().any(|e| matches!(&e.body, EventBody::AssistantText { text, .. } if text == "Build finished: BUILD-OK")));
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn antigravity_schedule_workflow_cancel_and_daemon() {
+        use super::*;
+        assert_eq!(uri_to_path("file:///root/a.log"), "/root/a.log");
+        assert_eq!(uri_to_path("file:///C:/Users/di3.li/a.log"), "C:/Users/di3.li/a.log");
+
+        let root = std::env::temp_dir().join(format!("yi-agy-other-bg-{}", uuid::Uuid::new_v4()));
+        let parent_id = "p-bg-2";
+        let (hub, em, _rx) = crate::hub::test_emitter();
+        let mut st = State {
+            is_antigravity: true,
+            session_id: Some(parent_id.into()),
+            ..Default::default()
+        };
+
+        // 1. IsDaemon: true must NOT defer ToolResult or enter agy_bg_tasks
+        update(
+            &mut st,
+            &em,
+            &json!({"sessionUpdate": "tool_call", "toolCallId": "tc-daemon", "kind": "other", "title": "run_command", "rawInput": {"CommandLine": "npm run dev", "IsDaemon": true}}),
+        );
+        update(
+            &mut st,
+            &em,
+            &json!({"sessionUpdate": "tool_call_update", "toolCallId": "tc-daemon", "status": "completed", "rawOutput": {"output": "Created At: x\nTool is running as a background task with task id: p-bg-2/task-1\nTask Description: npm run dev"}}),
+        );
+        assert!(st.agy_bg_tasks.is_empty());
+        assert!(hub.store.events_since("s", 0, 100).unwrap().iter().any(|e| matches!(&e.body, EventBody::ToolResult { id, .. } if id == "tc-daemon")));
+
+        // 2. Workflow + Timer with TimerCondition + Canceled command in transcript
+        let wf_notice = "Created At: x\nTool is running as a background task with task id: p-bg-2/task-2\nTask Description: Review files\nTask logs are available at: file:///tmp/task-2.log";
+        let tm_notice = "Created At: x\nTool is running as a background task with task id: p-bg-2/task-3\nTask Description: Timer: 30s, Prompt: Check workflow\nTask logs are available at: file:///tmp/task-3.log";
+        let cmd_notice = "Created At: x\nTool is running as a background task with task id: p-bg-2/task-4\nTask Description: sleep 60\nTask logs are available at: file:///tmp/task-4.log";
+        let mut steps = vec![
+            json!({"step_index":0,"type":"USER_INPUT","status":"DONE","content":"go"}),
+            json!({"step_index":1,"type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[
+                {"name":"run_workflow","args":{"Description":"Review workflow"}},
+                {"name":"schedule","args":{"DurationSeconds":"30","Prompt":"\"Check workflow\"","TimerCondition":"\"p-bg-2/task-2\""}},
+                {"name":"run_command","args":{"CommandLine":"sleep 60"}}
+            ]}),
+            json!({"step_index":2,"type":"GENERIC","status":"RUNNING","content":wf_notice}),
+            json!({"step_index":3,"type":"GENERIC","status":"RUNNING","content":tm_notice}),
+            json!({"step_index":4,"type":"GENERIC","status":"RUNNING","content":cmd_notice}),
+            json!({"step_index":5,"type":"PLANNER_RESPONSE","status":"DONE","content":"Running."}),
+        ];
+        write_agy_steps(&root, parent_id, &steps);
+        assert!(has_pending_agy_async_turn(&root, parent_id, 0));
+
+        let mut watch = AgyWatch::new(parent_id.into(), root.clone(), 0, 6, Some("end_turn".into()), HashMap::new(), HashMap::new(), true);
+        watch.detached = true;
+        let spec = agy_test_spec();
+        let (mut next_id, mut pending) = (1, HashMap::new());
+
+        assert!(matches!(step_agy_watch(&mut watch, &spec, &em, &mut next_id, &mut pending), AgyStep::Wait));
+        let tasks = hub.info("s").unwrap().background_tasks;
+        assert_eq!(tasks.len(), 3);
+        assert_eq!((tasks[0].kind.as_str(), tasks[0].description.as_str()), ("workflow", "Review workflow"));
+        assert_eq!((tasks[1].kind.as_str(), tasks[2].kind.as_str()), ("timer", "local_bash"));
+
+        // Workflow completes -> TimerCondition automatically cancels task-3! Task-4 is cancelled explicitly.
+        steps.push(json!({"step_index":6,"type":"SYSTEM_MESSAGE","status":"DONE","content":"<SYSTEM_MESSAGE>\n[Message] timestamp=x sender=p-bg-2/task-2 priority=MESSAGE_PRIORITY_HIGH content=Task id \"p-bg-2/task-2\" finished with result:\nWorkflow done\nLog: file:///tmp/task-2.log\n</SYSTEM_MESSAGE>"}));
+        steps.push(json!({"step_index":7,"type":"SYSTEM_MESSAGE","status":"DONE","content":"<SYSTEM_MESSAGE>\n[Message] timestamp=x sender=p-bg-2/task-4 priority=MESSAGE_PRIORITY_LOW content=Task id \"p-bg-2/task-4\" was canceled with result:\nTool execution was canceled\nLog: file:///tmp/task-4.log\n</SYSTEM_MESSAGE>"}));
+        steps.push(json!({"step_index":8,"type":"PLANNER_RESPONSE","status":"DONE","content":"All settled."}));
+        write_agy_steps(&root, parent_id, &steps);
+
+        assert!(matches!(step_agy_watch(&mut watch, &spec, &em, &mut next_id, &mut pending), AgyStep::Wait));
+        assert!(matches!(step_agy_watch(&mut watch, &spec, &em, &mut next_id, &mut pending), AgyStep::Done(Some(_))));
+        assert!(hub.info("s").unwrap().background_tasks.is_empty());
+
+        let evs = hub.store.events_since("s", 0, 100).unwrap();
+        assert!(evs.iter().any(|e| matches!(&e.body, EventBody::System { text } if text == "后台任务完成：Review workflow")));
+        assert!(evs.iter().any(|e| matches!(&e.body, EventBody::System { text } if text == "后台任务已停止：sleep 60")));
+        assert!(!evs.iter().any(|e| matches!(&e.body, EventBody::System { text } if text.contains("Timer: 30s"))));
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn antigravity_in_progress_background_command_claimed_from_transcript() {
+        use super::*;
+        let root = std::env::temp_dir().join(format!("yi-agy-inprog-{}", uuid::Uuid::new_v4()));
+        let parent_id = "p-bg-3";
+        let (hub, em, _rx) = crate::hub::test_emitter();
+        let mut st = State {
+            is_antigravity: true,
+            session_id: Some(parent_id.into()),
+            ..Default::default()
+        };
+
+        // Real agy acp 1.5.9 leaves run_command in_progress over ACP when WaitMsBeforeAsync expires
+        update(
+            &mut st,
+            &em,
+            &json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "tc-live-1",
+                "name": "run_command",
+                "title": "ssh win build",
+                "status": "in_progress",
+                "rawInput": {"CommandLine": "ssh win build", "toolSummary": "Sync and build"}
+            }),
+        );
+        assert_eq!(st.agy_open_bg_calls.len(), 1);
+
+        let bg_notice = "Created At: x\nTool is running as a background task with task id: p-bg-3/task-1\nTask Description: ssh win build\nTask logs are available at: file:///tmp/task-1.log";
+        let mut steps = vec![
+            json!({"step_index":0,"type":"USER_INPUT","status":"DONE","content":"build"}),
+            json!({"step_index":1,"type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"run_command","args":{"CommandLine":"ssh win build","toolSummary":"Sync and build"}}]}),
+            json!({"step_index":2,"type":"GENERIC","status":"RUNNING","content":bg_notice}),
+            json!({"step_index":3,"type":"PLANNER_RESPONSE","status":"DONE","content":"Waiting."}),
+        ];
+        write_agy_steps(&root, parent_id, &steps);
+
+        assert!(discover_agy_bg_from_steps(&mut st, &steps));
+        assert!(st.agy_open_bg_calls.is_empty());
+        assert_eq!(st.agy_bg_tasks.len(), 1);
+        assert_eq!(st.agy_bg_tasks[0].tc_id.as_deref(), Some("tc-live-1"));
+
+        // Late empty failed update from agy acp when canceled must defer to SYSTEM_MESSAGE
+        update(
+            &mut st,
+            &em,
+            &json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "tc-live-1",
+                "status": "failed"
+            }),
+        );
+        assert!(!hub.store.events_since("s", 0, 100).unwrap().iter().any(|e| matches!(e.body, EventBody::ToolResult { .. })));
+
+        steps.push(json!({"step_index":4,"type":"SYSTEM_MESSAGE","status":"DONE","content":"<SYSTEM_MESSAGE>\n[Message] timestamp=x sender=p-bg-3/task-1 priority=MESSAGE_PRIORITY_LOW content=Task id \"p-bg-3/task-1\" was canceled with result:\nTool execution was canceled\nLog: file:///tmp/task-1.log\n</SYSTEM_MESSAGE>"}));
+        write_agy_steps(&root, parent_id, &steps);
+        settle_agy_bg_from_steps(&mut st, &steps, &em);
+
+        let evs = hub.store.events_since("s", 0, 100).unwrap();
+        assert!(evs.iter().any(|e| matches!(&e.body, EventBody::ToolResult { id, output, is_error } if id == "tc-live-1" && output == "Tool execution was canceled" && *is_error)));
+        assert!(evs.iter().any(|e| matches!(&e.body, EventBody::System { text } if text == "后台任务已停止：Sync and build")));
+
+        // Even after bg_tasks move into st.agy_watch on TurnEnd, a late empty `{}` completed update must defer to SYSTEM_MESSAGE
+        update(
+            &mut st,
+            &em,
+            &json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "tc-live-2",
+                "name": "run_command",
+                "title": "echo ok",
+                "status": "in_progress",
+                "rawInput": {"CommandLine": "echo ok", "toolSummary": "Watch defer test"}
+            }),
+        );
+        let bg2 = "Created At: x\nTool is running as a background task with task id: p-bg-3/task-2\nTask Description: echo ok\nTask logs are available at: file:///tmp/task-2.log";
+        steps.push(json!({"step_index":5,"type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"run_command","args":{"CommandLine":"echo ok","toolSummary":"Watch defer test"}}]}));
+        steps.push(json!({"step_index":6,"type":"GENERIC","status":"RUNNING","content":bg2}));
+        steps.push(json!({"step_index":7,"type":"PLANNER_RESPONSE","status":"DONE","content":"Waiting 2."}));
+        write_agy_steps(&root, parent_id, &steps);
+        assert!(discover_agy_bg_from_steps(&mut st, &steps));
+        let mut watch = AgyWatch::new(parent_id.into(), root.clone(), 0, 8, Some("end_turn".into()), HashMap::new(), HashMap::new(), true);
+        watch.adopt_bg(std::mem::take(&mut st.agy_bg_tasks), HashSet::new());
+        watch.detached = true;
+        st.agy_watch = Some(watch);
+
+        update(
+            &mut st,
+            &em,
+            &json!({"sessionUpdate": "tool_call_update", "toolCallId": "tc-live-2", "status": "completed", "rawOutput": {}}),
+        );
+        assert!(!hub.store.events_since("s", 0, 100).unwrap().iter().any(|e| matches!(&e.body, EventBody::ToolResult { id, .. } if id == "tc-live-2")));
+
+        steps.push(json!({"step_index":8,"type":"SYSTEM_MESSAGE","status":"DONE","content":"<SYSTEM_MESSAGE>\n[Message] timestamp=x sender=p-bg-3/task-2 priority=MESSAGE_PRIORITY_HIGH content=Task id \"p-bg-3/task-2\" finished with result:\nCommand exited with code 0.\n\nCommand output:\nWATCH_DEFER_OK\nLog: file:///tmp/task-2.log\n</SYSTEM_MESSAGE>"}));
+        write_agy_steps(&root, parent_id, &steps);
+        let _ = poll_agy_watch(&mut st, &agy_test_spec(), &em);
+        let evs2 = hub.store.events_since("s", 0, 100).unwrap();
+        assert!(evs2.iter().any(|e| matches!(&e.body, EventBody::ToolResult { id, output, is_error } if id == "tc-live-2" && output == "WATCH_DEFER_OK" && !*is_error)));
+
         std::fs::remove_dir_all(root).unwrap();
     }
 }

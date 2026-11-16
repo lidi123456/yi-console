@@ -1355,11 +1355,14 @@ impl Hub {
         Ok(())
     }
 
-    /// Stop a background task (only Claude supports this for now)
+    /// Stop a background task when supported by the tool
     pub fn stop_task(&self, id: &str, task_id: &str) -> Result<()> {
         let rt = self.get(id)?;
-        if !rt.info.lock().unwrap().background_tasks.iter().any(|t| t.id == task_id) {
+        let Some(task) = rt.info.lock().unwrap().background_tasks.iter().find(|t| t.id == task_id).cloned() else {
             bail!("后台任务已经结束");
+        };
+        if task.unstoppable {
+            bail!("该后台任务不支持从外部停止");
         }
         let tx = self.running_tx(&rt).ok_or_else(|| anyhow!("会话已结束"))?;
         tx.send(AdapterCmd::StopTask(task_id.to_string())).map_err(|_| anyhow!("会话已结束"))

@@ -2,6 +2,8 @@
   "bashCommand": "终端命令",
   "subagent": "子代理",
   "remoteAgent": "远程代理",
+  "workflow": "工作流",
+  "timer": "定时任务",
   "loading": "读取中…",
   "noOutputYet": "（还没有输出）",
   "backgroundTaskS": "{{length}} 个后台命令",

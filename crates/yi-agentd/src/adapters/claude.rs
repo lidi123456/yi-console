@@ -682,6 +682,7 @@ fn merge_tasks(old: &[BackgroundTask], tasks: &Value, now: i64) -> Vec<Backgroun
                 description: t["description"].as_str().unwrap_or("").to_string(),
                 started_at: prev.map(|p| p.started_at).unwrap_or(now),
                 output_file: prev.and_then(|p| p.output_file.clone()),
+                unstoppable: false,
             })
         })
         .collect()

@@ -122,12 +122,14 @@ export interface AutoResume {
 
 export interface BackgroundTask {
   id: string;
-  /** local_bash, local_agent, etc. */
+  /** local_bash, local_agent, workflow, timer, etc. */
   kind: string;
   description: string;
   startedAt: number;
   /** Path of the output file on the host */
   outputFile?: string;
+  /** True when the tool provides no way to stop this task from outside */
+  unstoppable?: boolean;
 }
 
 export interface QueuedMessage {
