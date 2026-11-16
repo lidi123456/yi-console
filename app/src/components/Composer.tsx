@@ -53,6 +53,20 @@ export interface Attached {
   name: string;
 }
 
+/** Draft images kept in memory per session (`${hostId}::${sessionId}`), since screenshots can exceed sessionStorage's quota */
+const draftImgs = new Map<string, Attached[]>();
+const draftImgSubs = new Map<string, Set<(list: Attached[]) => void>>();
+
+function imgsOf(k: string): Attached[] {
+  return draftImgs.get(k) ?? [];
+}
+
+function setImgsOf(k: string, list: Attached[]) {
+  if (list.length) draftImgs.set(k, list);
+  else draftImgs.delete(k);
+  draftImgSubs.get(k)?.forEach((fn) => fn(list));
+}
+
 /** Size limit for pasted / dropped regular files (same as yi-agentd's fs.upload) */
 export const FILE_MAX = 50 * 1024 * 1024;
 /** Upload item counter (React key) */
@@ -204,7 +218,7 @@ export function Composer({
   const hostKind = useStore((s) => s.hosts.find((h) => h.config.id === hostId)?.config.kind);
   /** Send was pressed during upload: send automatically once uploads finish */
   const [waitSend, setWaitSend] = useState(false);
-  const [imgs, setImgs] = useState<Attached[]>([]);
+  const [imgs, setImgs] = useState<Attached[]>(() => imgsOf(key));
   const [refs, setRefs] = useState<ContextRef[]>([]);
   const [drag, setDrag] = useState(false);
   const [permOpen, setPermOpen] = useState(false);
@@ -226,8 +240,15 @@ export function Composer({
   const steer = (info.tool === 'claude' || info.tool === 'codex') && queued.length === 0;
 
   useEffect(() => {
-    setImgs([]);
+    setImgs(imgsOf(key));
     setWaitSend(false);
+    const subs = draftImgSubs.get(key) ?? new Set<(list: Attached[]) => void>();
+    draftImgSubs.set(key, subs);
+    subs.add(setImgs);
+    return () => {
+      subs.delete(setImgs);
+      if (!subs.size) draftImgSubs.delete(key);
+    };
   }, [key]);
   /** Which session is currently shown (lets async callbacks tell whether the user has switched away) */
   const keyRef = useRef<string | null>(key);
@@ -525,7 +546,7 @@ export function Composer({
       try {
         if (IMAGE_TYPES.includes(f.type)) {
           const a = await readImage(f);
-          setImgs((l) => [...l, a]);
+          setImgsOf(from, [...imgsOf(from), a]);
           continue;
         }
         if (f.size > FILE_MAX) throw new Error(t('exceeds50mb', { name: f.name }));
@@ -578,10 +599,11 @@ export function Composer({
       return;
     }
     const t = text.trim();
+    const curImgs = imgs;
     const curRefs = refs;
-    if ((!t && imgs.length === 0 && curRefs.length === 0) || sending) return;
+    if ((!t && curImgs.length === 0 && curRefs.length === 0) || sending) return;
     // Typing /clear and pressing Enter (without picking from the menu) also uses Yi Console's clear, not sent to the tool
-    if (t === '/clear' && imgs.length === 0 && curRefs.length === 0 && info.mode !== 'terminal') {
+    if (t === '/clear' && curImgs.length === 0 && curRefs.length === 0 && info.mode !== 'terminal') {
       setText('');
       clearSession(hostId, info);
       return;
@@ -608,7 +630,7 @@ export function Composer({
       await rpc(hostId, 'session.send', {
         sessionId: info.id,
         text: payload,
-        images: imgs.map((i) => ({ mimeType: i.mimeType, data: i.data })),
+        images: curImgs.map((i) => ({ mimeType: i.mimeType, data: i.data })),
         // Turn still running: Claude and Codex read it at their next step; other tools queue it until the turn ends
         queue: true,
       });
@@ -616,11 +638,11 @@ export function Composer({
       // Only clear once sent. If we switched sessions mid-send, only clear the original session's draft and leave the current input box alone
       if (keyRef.current === from) {
         setText((cur) => (cur.trim() === t ? '' : cur));
-        setImgs([]);
         setRefs([]);
       }
       if (draftOf(from).trim() === t) setDraftOf(from, '');
       setRefsOf(from, []);
+      setImgsOf(from, imgsOf(from).filter((x) => !curImgs.includes(x)));
     } catch (e) {
       errorToast(e);
     } finally {
@@ -783,7 +805,7 @@ export function Composer({
             {imgs.map((im, i) => (
               <div key={i} className="attach" title={t('doubleClickToZoom', { name: im.name })}>
                 <img src={im.url} alt="" onDoubleClick={() => openImage(im.url)} onContextMenu={(e) => imageMenu(e, im.url)} />
-                <button className="attach-x" title={t('remove')} onClick={() => setImgs((l) => l.filter((_, j) => j !== i))}>
+                <button className="attach-x" title={t('remove')} onClick={() => setImgsOf(key, imgs.filter((_, j) => j !== i))}>
                   <Icon name="x" size={12} />
                 </button>
               </div>
