@@ -196,8 +196,11 @@ export function Palette() {
             onChange={(e) => setQ(e.target.value)}
             onKeyDown={(e) => {
               if (e.nativeEvent.isComposing) return;
-              if (e.key === 'Escape') close();
-              else if (e.key === 'ArrowDown') {
+              if (e.key === 'Escape') {
+                e.preventDefault();
+                e.stopPropagation();
+                close();
+              } else if (e.key === 'ArrowDown') {
                 e.preventDefault();
                 setSel((sel + 1) % entries.length);
               } else if (e.key === 'ArrowUp') {

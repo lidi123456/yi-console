@@ -4045,6 +4045,8 @@ kbd {
 /* ---------- Input dialog / confirm dialog ---------- */
 
 .modal-bg.dlg-bg {
+  /* Sit above regular modals (.modal-bg: 50) and global panels, below context menus (.ctx-scrim: 1000) and daemon upgrade (.upgrade-bg: 2000) */
+  z-index: 500;
   align-items: flex-start;
   padding-top: 18vh;
   background: rgba(10, 12, 16, 0.32);

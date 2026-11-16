@@ -111,6 +111,7 @@ function Editor({ initial, close, save }: { initial: McpServerConfig; close: () 
   return (
     <div className="modal-bg" onMouseDown={close}>
       <section
+        tabIndex={-1}
         className="modal mcp-editor"
         role="dialog"
         aria-modal="true"

@@ -17,7 +17,7 @@ pub fn setup(_app: &mut tauri::App) -> tauri::Result<()> {
     Ok(())
 }
 
-fn show(app: &AppHandle) {
+pub fn show(app: &AppHandle) {
     if let Some(w) = app.get_webview_window("main") {
         let _ = w.show();
         let _ = w.unminimize();

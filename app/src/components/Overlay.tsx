@@ -102,13 +102,26 @@ function Dialog({ d }: { d: TextReq | ConfirmReq }) {
       input.current?.select();
     } else ok.current?.focus();
   }, [d]);
-  useBack(true, () => done(false));
   const done = (yes: boolean) => {
     dialog = null;
     bump();
     if (d.kind === 'text') d.resolve(yes ? v : null);
     else d.resolve(yes);
   };
+  const cancelRef = useRef(() => done(false));
+  cancelRef.current = () => done(false);
+  useBack(true, () => cancelRef.current());
+  useEffect(() => {
+    // Handle Escape globally in capture phase so modals underneath don't also close when dismissing this dialog
+    const key = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape' || e.isComposing || menu) return;
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      cancelRef.current();
+    };
+    window.addEventListener('keydown', key, true);
+    return () => window.removeEventListener('keydown', key, true);
+  }, [d]);
   return (
     <div className="modal-bg dlg-bg" onMouseDown={() => done(false)}>
       <div
@@ -116,8 +129,7 @@ function Dialog({ d }: { d: TextReq | ConfirmReq }) {
         role="dialog"
         onMouseDown={(e) => e.stopPropagation()}
         onKeyDown={(e) => {
-          if (e.key === 'Escape') done(false);
-          else if (e.key === 'Enter' && !e.nativeEvent.isComposing && (d.kind === 'confirm' || v.trim())) {
+          if (e.key === 'Enter' && !e.nativeEvent.isComposing && (d.kind === 'confirm' || v.trim())) {
             e.preventDefault();
             done(true);
           }
@@ -165,15 +177,20 @@ function ContextMenu({ m }: { m: MenuReq }) {
   }, [m]);
   useEffect(() => {
     const off = () => closeMenu();
-    const key = (e: KeyboardEvent) => e.key === 'Escape' && closeMenu();
+    const key = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape' || e.isComposing) return;
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      closeMenu();
+    };
     window.addEventListener('blur', off);
     window.addEventListener('resize', off);
-    window.addEventListener('keydown', key);
+    window.addEventListener('keydown', key, true);
     window.addEventListener('wheel', off, { passive: true });
     return () => {
       window.removeEventListener('blur', off);
       window.removeEventListener('resize', off);
-      window.removeEventListener('keydown', key);
+      window.removeEventListener('keydown', key, true);
       window.removeEventListener('wheel', off);
     };
   }, []);

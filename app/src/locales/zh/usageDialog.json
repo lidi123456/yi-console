@@ -16,8 +16,8 @@
   "thisToolDidNotReport": "这个工具没有报告额度信息",
   "manageAccounts": "管理账号",
   "allAccountsQuota": "该工具已配置的全部账号额度",
+  "otherAccountsQuota": "该工具已配置的其他账号额度",
   "probeAll": "切换探测全部",
-  "currentSessionAccount": "当前会话",
   "switchToThisAccount": "切到此账号",
   "switchedAccount": "已将当前会话切换至「{{label}}」"
 }

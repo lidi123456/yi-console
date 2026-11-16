@@ -80,7 +80,13 @@ const LOCAL_SUPPORTED: bool = cfg!(not(any(target_os = "android", target_os = "i
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let builder = tauri::Builder::default()
+    let builder = tauri::Builder::default();
+    // Register first so duplicate launches exit before starting clients or Bots.
+    #[cfg(desktop)]
+    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _, _| {
+        tray::show(app);
+    }));
+    let builder = builder
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_clipboard_manager::init());
     #[cfg(mobile)]

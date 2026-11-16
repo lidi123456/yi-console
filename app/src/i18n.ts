@@ -149,6 +149,7 @@ const ERR_PATTERNS: [RegExp, string | ((...m: string[]) => string)][] = [
   [/任务已结束/, 'The task has ended'],
 
   // Accounts and same-session failover
+  [/^Cursor 启动超时（60 秒未创建会话），请检查账号登录状态和网络后重试$/, 'Cursor did not create a session within 60 seconds. Check your account sign-in and network, then try again'],
   [/所选账号不存在|目标账号不存在/, 'Selected account was not found'],
   [/^账号 (.+) 不存在$/, (_, id) => `Account "${id}" was not found`],
   [/请先停止当前回复，再切换账号/, 'Stop the current reply before switching accounts'],
@@ -165,6 +166,13 @@ const ERR_PATTERNS: [RegExp, string | ((...m: string[]) => string)][] = [
   [/^切换备用账号后自动继续失败[:：]\s*(.+)$/, (_, m) => `Auto-continue after account failover failed: ${m}`],
   [/登录超时/, 'Account sign-in timed out'],
   [/正在登录中/, 'Another sign-in flow is already running for this tool'],
+  [/CURSOR_API_KEY 无效或没有权限/, 'CURSOR_API_KEY is invalid or lacks permission'],
+  [/CURSOR_API_KEY 交换访问令牌失败/, 'Failed to exchange CURSOR_API_KEY for an access token'],
+  [/当前系统 Cursor auth\.json 为 CURSOR_API_KEY 凭据而非 OAuth 登录，请重新登录 OAuth/, 'System Cursor auth.json holds a CURSOR_API_KEY credential instead of an OAuth login; sign in with OAuth again'],
+  [/宿主环境变量 CURSOR_API_KEY 优先级高于本地 OAuth 登录；托管 OAuth 账号会自动隔离该变量/, 'Host CURSOR_API_KEY overrides local OAuth login; managed OAuth accounts isolate it automatically'],
+  [/使用宿主环境变量 CURSOR_API_KEY/, 'Using host environment variable CURSOR_API_KEY'],
+  [/auth\.json 中保存的是 CURSOR_API_KEY 凭据/, 'auth.json holds a CURSOR_API_KEY credential'],
+  [/未检测到系统 Cursor 登录凭据或 CURSOR_API_KEY/, 'No native Cursor login credentials or CURSOR_API_KEY detected'],
   // Sessions and general errors
   [/^未知方法[:：]\s*(.+)$/, (_, m) => `Unknown method: ${m}`],
   [/未知方法/, 'Unknown method'],

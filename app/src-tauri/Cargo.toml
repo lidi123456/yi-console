@@ -23,8 +23,10 @@ serde_json = "1"
 base64 = "0.22"
 yi-client = { path = "../../crates/client" }
 
-# "Save as" uses the system save dialog
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+# Reopening restores the existing window instead of starting another client and Bot engine.
+tauri-plugin-single-instance = "2"
+# "Save as" uses the system save dialog
 tauri-plugin-dialog = "2"
 # Remember window size and position
 tauri-plugin-window-state = "2"

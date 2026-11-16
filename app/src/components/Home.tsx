@@ -474,6 +474,7 @@ export function Home() {
   }, [filter, all, multi, lang]);
 
   return (
+    <>
     <div className="page ov-page">
       <div className="ov-head">
         <h2>{t('overview')}</h2>
@@ -556,7 +557,8 @@ export function Home() {
           </div>
         </div>
       )}
-      {quota && <QuotaDialog hosts={connected} onClose={() => setQuota(false)} />}
     </div>
+    {quota && <QuotaDialog hosts={connected} onClose={() => setQuota(false)} />}
+    </>
   );
 }

@@ -801,6 +801,13 @@ impl Hub {
         let program = crate::tools::resolve(info.tool, &settings)
             .ok_or_else(|| anyhow!("这台机器上没有找到 {}", info.tool.as_str()))?;
         let resolved = self.accounts.resolve(info.tool, info.account_id.as_deref());
+        if info.tool == ToolKind::Cursor {
+            if let Some(res) = &resolved {
+                if res.auth_kind == AccountAuthKind::Oauth {
+                    self.accounts.restore_cursor_oauth_if_api_key_polluted(&res.id);
+                }
+            }
+        }
         // Claude in the terminal: pin the session id on first launch, and continue that session on later restarts.
         // If it was opened and exited without anything said, Claude leaves no record, so start a new one with the same id
         let mut resume = info.external_id.clone();

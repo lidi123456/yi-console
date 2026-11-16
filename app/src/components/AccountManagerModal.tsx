@@ -107,6 +107,11 @@ export interface OpenAccountManagerReq {
 }
 
 const OPEN_ACCOUNTS_EVENT = 'yi-console:open-accounts';
+let accountManagerDepth = 0;
+
+export function isAccountManagerOpen() {
+  return accountManagerDepth > 0;
+}
 
 export function openAccountManager(req: OpenAccountManagerReq) {
   window.dispatchEvent(new CustomEvent<OpenAccountManagerReq>(OPEN_ACCOUNTS_EVENT, { detail: req }));
@@ -164,8 +169,18 @@ export function AccountManagerModal({
   useBack(true, onClose);
 
   useEffect(() => {
+    accountManagerDepth++;
+    return () => {
+      accountManagerDepth = Math.max(0, accountManagerDepth - 1);
+    };
+  }, []);
+
+  useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose();
+      if (e.key === 'Escape' && !e.defaultPrevented) {
+        e.preventDefault();
+        onClose();
+      }
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
@@ -270,7 +285,11 @@ export function AccountManagerModal({
   };
 
   const handleCapture = async () => {
-    const suggested = summary?.nativeStatus?.email || summary?.nativeStatus?.plan || `${TOOL_LABEL[tool]} OAuth`;
+    const nativeMethod = summary?.nativeStatus?.authMethod;
+    const suggested =
+      summary?.nativeStatus?.email ||
+      summary?.nativeStatus?.plan ||
+      `${TOOL_LABEL[tool]} ${nativeMethod === 'api_key' || nativeMethod === 'env_api_key' ? 'API Key' : 'OAuth'}`;
     const label = await askText({
       title: tx('captureCurrent'),
       label: tx('capturePrompt'),
@@ -507,8 +526,8 @@ export function AccountManagerModal({
   };
 
   return (
-    <div className="modal-bg" onClick={onClose}>
-      <div className="modal acc-modal" role="dialog" onClick={(e) => e.stopPropagation()}>
+    <div className="modal-bg" onMouseDown={onClose}>
+      <div className="modal acc-modal" role="dialog" onMouseDown={(e) => e.stopPropagation()}>
         <div className="modal-head">
           <div className="row" style={{ gap: 8 }}>
             <ToolBadge tool={tool} size={20} />

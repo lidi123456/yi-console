@@ -133,11 +133,11 @@ export function App() {
         </div>
       </main>
       </div>
+      <AccountManagerHost />
       <Palette />
       <Toasts />
       <Lightbox />
       <Overlays />
-      <AccountManagerHost />
       <UpgradeOverlay />
       <AppUpdateNotice />
     </div>

@@ -40,6 +40,16 @@ export function DirPicker({
     setPath(start || '~');
   }, [hostId, start]);
   useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && !e.defaultPrevented) {
+        e.preventDefault();
+        onClose();
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [onClose]);
+  useEffect(() => {
     rpc(hostId, 'fs.list', { path })
       .then((r) => {
         setList(r);

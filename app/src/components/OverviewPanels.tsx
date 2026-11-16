@@ -2,6 +2,7 @@
 // the quota dialog. Everything that asks a host for data does so only while the page is visible and the panel is on
 // screen, and caches the answer (see docs/internals/frontend-ui.md, "Overview").
 import { useEffect, useMemo, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { useBack } from '../back';
 import { getT, useLang } from '../i18n';
 import { addDraft, projKey, removeDraft, useDrafts, useFeed, usePageVisible, type Draft, type FeedItem } from '../overview';
@@ -470,27 +471,30 @@ export function QuickStart({ hosts, sessions }: { hosts: HostEntry[]; sessions: 
           </div>
         </div>
       )}
-      {picking && host && (
-        <div className="modal-bg" onClick={() => setPicking(false)}>
-          <div className="modal" onClick={(e) => e.stopPropagation()}>
-            <div className="modal-head">
-              <h3>{t('workingDirectory')}</h3>
-              <button className="icon-btn" onClick={() => setPicking(false)} aria-label={t('close')}>
-                <Icon name="x" />
-              </button>
+      {picking &&
+        host &&
+        createPortal(
+          <div className="modal-bg" onClick={() => setPicking(false)}>
+            <div className="modal" onClick={(e) => e.stopPropagation()}>
+              <div className="modal-head">
+                <h3>{t('workingDirectory')}</h3>
+                <button className="icon-btn" onClick={() => setPicking(false)} aria-label={t('close')}>
+                  <Icon name="x" />
+                </button>
+              </div>
+              <DirPicker
+                hostId={hostId}
+                start={cwd}
+                onPick={(p) => {
+                  setCwdPick((c) => ({ ...c, [hostId]: p }));
+                  setPicking(false);
+                }}
+                onClose={() => setPicking(false)}
+              />
             </div>
-            <DirPicker
-              hostId={hostId}
-              start={cwd}
-              onPick={(p) => {
-                setCwdPick((c) => ({ ...c, [hostId]: p }));
-                setPicking(false);
-              }}
-              onClose={() => setPicking(false)}
-            />
-          </div>
-        </div>
-      )}
+          </div>,
+          document.body,
+        )}
     </>
   );
 }
@@ -817,7 +821,12 @@ export function QuotaDialog({ hosts, onClose }: { hosts: HostEntry[]; onClose: (
   const host = hosts.find((h) => h.config.id === pick) ?? hosts[0];
   useBack(true, onClose);
   useEffect(() => {
-    const onKey = (e: KeyboardEvent) => e.key === 'Escape' && onClose();
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && !e.defaultPrevented) {
+        e.preventDefault();
+        onClose();
+      }
+    };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
   }, [onClose]);

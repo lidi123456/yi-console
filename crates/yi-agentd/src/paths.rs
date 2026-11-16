@@ -3,6 +3,13 @@
 use std::path::PathBuf;
 
 pub fn home() -> PathBuf {
+    // On Windows, dirs::home_dir() uses SHGetKnownFolderPath and ignores USERPROFILE; honor USERPROFILE in isolated E2E runs.
+    #[cfg(windows)]
+    if std::env::var_os("YI_CONSOLE_HOME").is_some_and(|v| !v.is_empty()) {
+        if let Some(p) = std::env::var_os("USERPROFILE").filter(|v| !v.is_empty()) {
+            return PathBuf::from(p);
+        }
+    }
     dirs::home_dir().unwrap_or_else(|| PathBuf::from("."))
 }
 

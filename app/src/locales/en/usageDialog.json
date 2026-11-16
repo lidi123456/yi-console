@@ -16,8 +16,8 @@
   "thisToolDidNotReport": "This tool did not report quota",
   "manageAccounts": "Accounts",
   "allAccountsQuota": "Quotas across all configured accounts",
+  "otherAccountsQuota": "Quotas across other configured accounts",
   "probeAll": "Probe All",
-  "currentSessionAccount": "This Session",
   "switchToThisAccount": "Use Here",
   "switchedAccount": "Switched this session to \"{{label}}\""
 }

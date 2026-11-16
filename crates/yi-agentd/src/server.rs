@@ -618,9 +618,13 @@ pub async fn dispatch(
                 api_config,
                 activate: p["activate"].as_bool().unwrap_or(false),
             };
+            let clear_cache = req.api_config.is_some();
             let hub2 = hub.clone();
             let view = tokio::task::spawn_blocking(move || {
                 let v = hub2.accounts.save(req)?;
+                if clear_cache {
+                    crate::probe::clear_account_cache(tool, &v.id);
+                }
                 hub2.on_account_updated(tool, &v);
                 hub2.publish_accounts_updated(tool, v.active.then(|| v.id.clone()));
                 Ok::<_, anyhow::Error>(v)

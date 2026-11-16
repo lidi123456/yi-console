@@ -438,7 +438,6 @@ export function SessionView({ hostId, sessionId, seq }: { hostId: string; sessio
           </div>
         </>
       )}
-      {usage && <UsageDialog hostId={hostId} info={info} onClose={() => setUsage(false)} />}
       {term && connected && info.tool !== 'shell' && <TermPanel key={key} hostId={hostId} info={info} onClose={toggleTerm} />}
     </div>
       {!filesOnly && files && connected && full && <div className="panel-scrim hide-mobile" onClick={() => setFull(false)} title={t('exitFullscreen')} />}
@@ -456,6 +455,7 @@ export function SessionView({ hostId, sessionId, seq }: { hostId: string; sessio
           onFileOpen={setFileOpen}
         />
       )}
+      {usage && <UsageDialog hostId={hostId} info={info} onClose={() => setUsage(false)} />}
     </div>
   );
 }

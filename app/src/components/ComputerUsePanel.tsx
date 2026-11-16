@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { useBack } from '../back';
 import { getT, trErr } from '../i18n';
 import { errorToast } from '../store';
@@ -118,8 +119,9 @@ export function ComputerUsePanel({
           <Icon name="laptop" size={15} />
         </button>
       </div>
-      {open && (
-        <div className="modal-bg" onMouseDown={() => setOpen(false)}>
+      {open &&
+        createPortal(
+          <div className="modal-bg" onMouseDown={() => setOpen(false)}>
           <section
             ref={dialog}
             tabIndex={-1}
@@ -207,8 +209,9 @@ export function ComputerUsePanel({
               <p role="status">{state?.supported === false ? t('windowsOnly') : t('unavailable')}</p>
             )}
           </section>
-        </div>
-      )}
+        </div>,
+          document.body,
+        )}
     </>
   );
 }

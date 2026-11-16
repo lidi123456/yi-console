@@ -111,7 +111,8 @@ struct State {
     /// Cursor's cursor/ask_question requests: request id -> (JSON-RPC id)
     asks: HashMap<String, Value>,
     /// Auth methods returned by initialize. We don't call authenticate up front (cursor_login opens a browser,
-    /// and with CURSOR_API_KEY set it isn't needed at all); only when session creation is refused do we log in with it and retry once.
+    /// and with CURSOR_API_KEY set it isn't needed at all). Cursor authentication failures must be
+    /// surfaced instead of starting a browser login on a headless host; other tools retry once.
     auth_method: Option<String>,
     auth_tried: bool,
     /// This run continues an existing session (session/load was sent) rather than a new one; reset to false when load fails and we fall back to a new session
@@ -133,6 +134,18 @@ struct State {
     agy_watch: Option<AgyWatch>,
     /// Subagents / background tasks still running when a new prompt went out: the prompt's own watch picks them up when it returns
     agy_carry: AgyCarry,
+    /// Tool call ids suppressed during muted `session/load` replay (never re-emit if flushed afterwards)
+    muted_tools: HashSet<String>,
+    /// Wakeup steps already streamed by `AgyWatch` before `session/resume` ran; suppressed if replayed on the next prompt
+    agy_replay_prefix: VecDeque<AgyWakeReplayItem>,
+    agy_replay_hidden: HashSet<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum AgyWakeReplayItem {
+    Thinking(String),
+    Assistant(String),
+    Tool { name: String, input: Value },
 }
 
 impl State {
@@ -217,8 +230,15 @@ pub async fn run(spec: StartSpec, em: Emitter, mut rx: mpsc::UnboundedReceiver<A
     let mut fatal: Option<String> = None;
     let mut agy_tick = tokio::time::interval(std::time::Duration::from_millis(250));
     agy_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let startup_timeout = tokio::time::sleep(std::time::Duration::from_secs(60));
+    tokio::pin!(startup_timeout);
     loop {
         tokio::select! {
+            _ = &mut startup_timeout, if spec.tool == ToolKind::Cursor && st.session_id.is_none() => {
+                fatal = Some("Cursor 启动超时（60 秒未创建会话），请检查账号登录状态和网络后重试".into());
+                killed = true;
+                break;
+            }
             line = p.stdout.next_line() => {
                 let Ok(Some(line)) = line else { break };
                 let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
@@ -471,6 +491,8 @@ fn prompt(st: &mut State, em: &Emitter, p: &Prompt) -> Value {
     // The watch can't run during a prompt (the parent's own steps would look like a wakeup): its running subagents
     // wait in agy_carry for this prompt's watch. A report arriving meanwhile is handed to this turn by agy itself
     carry_agy_watch(st, em);
+    st.agy_replay_hidden.clear();
+    st.agy_replay_prefix = std::mem::take(&mut st.agy_carry.unresumed_items);
     st.agy_pre_turn_steps = match st.session_id.as_deref() {
         Some(sid) if st.is_antigravity => count_agy_transcript_steps(&agy_brain_dir(), sid),
         _ => 0,
@@ -549,6 +571,24 @@ fn set_model(st: &mut State, model: &str) -> Value {
     )
 }
 
+fn consume_agy_replay(prefix: &mut VecDeque<AgyWakeReplayItem>, matches: impl Fn(&AgyWakeReplayItem) -> bool) -> bool {
+    if prefix.is_empty() {
+        return false;
+    }
+    if prefix.front().is_some_and(&matches) {
+        prefix.pop_front();
+        return true;
+    }
+    // agy may skip Thinking steps when replaying inside session/prompt
+    let skip_thinking = prefix.iter().take_while(|it| matches!(it, AgyWakeReplayItem::Thinking(_))).count();
+    if skip_thinking > 0 && prefix.get(skip_thinking).is_some_and(&matches) {
+        prefix.drain(..=skip_thinking);
+        return true;
+    }
+    prefix.clear();
+    false
+}
+
 fn flush(st: &mut State, em: &Emitter) {
     let Some((seg, id, text)) = st.seg.take() else {
         return;
@@ -558,6 +598,17 @@ fn flush(st: &mut State, em: &Emitter) {
     }
     if text.trim().is_empty() || st.muted() {
         return;
+    }
+    if st.is_antigravity && !st.loading && !st.agy_replay_prefix.is_empty() {
+        let trimmed = text.trim();
+        let matched = match seg {
+            Seg::Thought => consume_agy_replay(&mut st.agy_replay_prefix, |it| matches!(it, AgyWakeReplayItem::Thinking(t) if t == trimmed)),
+            Seg::Agent => consume_agy_replay(&mut st.agy_replay_prefix, |it| matches!(it, AgyWakeReplayItem::Assistant(t) if t == trimmed)),
+            Seg::User => false,
+        };
+        if matched {
+            return;
+        }
     }
     if seg == Seg::Agent && !st.loading {
         st.last_reply = text.clone();
@@ -570,8 +621,10 @@ fn flush(st: &mut State, em: &Emitter) {
 }
 
 fn chunk(st: &mut State, em: &Emitter, seg: Seg, text: &str) {
-    // Antigravity echoes the prompt as user_message_chunk in a live turn too; the hub already recorded it
+    // Antigravity echoes the prompt as user_message_chunk in a live turn too; the hub already recorded it.
+    // Flush any preceding segment first so a replayed reply before the prompt echo can't concatenate with the new turn.
     if seg == Seg::User && !st.loading {
+        flush(st, em);
         return;
     }
     if seg != Seg::User && !st.loading && !st.subagents.is_empty() {
@@ -585,7 +638,7 @@ fn chunk(st: &mut State, em: &Emitter, seg: Seg, text: &str) {
     }
     if let Some((_, id, buf)) = st.seg.as_mut() {
         buf.push_str(text);
-        if !st.loading {
+        if !st.loading && !(st.is_antigravity && !st.agy_replay_prefix.is_empty()) {
             match seg {
                 Seg::Agent => em.event(EventBody::AssistantDelta {
                     id: id.clone(),
@@ -655,7 +708,7 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Result<V
                     out.push(new_session(st, spec));
                     Ok(out)
                 }
-                Pending::Session | Pending::Load if !st.auth_tried && st.auth_method.is_some() => {
+                Pending::Session | Pending::Load if spec.tool != ToolKind::Cursor && !st.auth_tried && st.auth_method.is_some() => {
                     st.auth_tried = true;
                     let mid = st.auth_method.clone().unwrap_or_default();
                     out.push(st.req(Pending::Auth, "authenticate", json!({"methodId": mid})));
@@ -890,6 +943,8 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Result<V
                 }
                 let stop_reason = r["stopReason"].as_str().map(str::to_string);
                 if st.is_antigravity {
+                    st.agy_replay_prefix.clear();
+                    st.agy_replay_hidden.clear();
                     settle_agy_prompt_bg(st, em);
                 }
                 let has_pending_bg = st.agy_bg_tasks.iter().any(|t| !t.done && !t.is_daemon);
@@ -899,6 +954,7 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Result<V
                             && limit_left.is_none()
                             && stop_reason.as_deref() != Some("cancelled")
                             && (!st.agy_pending_calls.is_empty()
+                                || !st.agy_open_bg_calls.is_empty()
                                 || has_pending_bg
                                 || st.session_id.as_deref().is_some_and(|sid| {
                                     has_pending_agy_async_turn(&agy_brain_dir(), sid, st.agy_pre_turn_steps)
@@ -915,7 +971,8 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Result<V
                             std::mem::take(&mut st.agy_pending_calls),
                             std::mem::take(&mut st.agy_send_baselines),
                             st.perm != "bypass",
-                        );
+                        )
+                        .with_open_bg_calls(std::mem::take(&mut st.agy_open_bg_calls));
                         watch.adopt(std::mem::take(&mut st.agy_carry));
                         watch.adopt_bg(std::mem::take(&mut st.agy_bg_tasks), std::mem::take(&mut st.agy_seen_system_steps));
                         // The turn ends now; subagents and background tasks go on in the background
@@ -932,10 +989,22 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Result<V
                         }
                         match step {
                             AgyStep::Done(req) => {
+                                if req.is_some() {
+                                    st.agy_carry.unresumed_items.clear();
+                                    st.agy_replay_prefix.clear();
+                                }
                                 out.extend(req);
                                 if reopened {
                                     em.event(EventBody::TurnEnd { stop_reason: watch.stop_reason, model: None });
                                 }
+                            }
+                            AgyStep::CycleEnd => {
+                                if reopened {
+                                    watch.reopened = false;
+                                    em.event(EventBody::TurnEnd { stop_reason: watch.stop_reason.clone(), model: None });
+                                }
+                                watch.wake = false;
+                                st.agy_watch = Some(watch);
                             }
                             AgyStep::Wait => st.agy_watch = Some(watch),
                         }
@@ -1415,11 +1484,14 @@ fn update(st: &mut State, em: &Emitter, u: &Value) {
         "user_message_chunk" => chunk(st, em, Seg::User, &content_text(&u["content"])),
         "tool_call" | "tool_call_update" => {
             flush(st, em);
+            let id = u["toolCallId"].as_str().unwrap_or("").to_string();
             if st.muted() {
+                if !id.is_empty() {
+                    st.muted_tools.insert(id);
+                }
                 return;
             }
-            let id = u["toolCallId"].as_str().unwrap_or("").to_string();
-            if st.hidden.contains(&id) {
+            if st.hidden.contains(&id) || st.muted_tools.contains(&id) || st.agy_replay_hidden.contains(&id) {
                 return;
             }
             let known = st.tools.contains_key(&id);
@@ -1438,6 +1510,15 @@ fn update(st: &mut State, em: &Emitter, u: &Value) {
             }
             if !u["rawInput"].is_null() {
                 t.input = u["rawInput"].clone();
+            }
+            if !known && st.is_antigravity && !st.loading && !st.agy_replay_prefix.is_empty() && u["sessionUpdate"] == "tool_call" {
+                let agy_name = if t.name == "other" || t.name.is_empty() { t.title.as_str() } else { t.name.as_str() };
+                if consume_agy_replay(&mut st.agy_replay_prefix, |it| matches!(it, AgyWakeReplayItem::Tool { name, input } if name == agy_name && *input == t.input)) {
+                    if !id.is_empty() {
+                        st.agy_replay_hidden.insert(id);
+                    }
+                    return;
+                }
             }
             let is_agent = matches!(t.name.as_str(), "Agent" | "Task");
             if !known && !st.loading && !is_agent && !st.subagents.is_empty() {
@@ -1482,7 +1563,7 @@ fn update(st: &mut State, em: &Emitter, u: &Value) {
                 }
             }
             let after = (t.title.clone(), t.diffs.len(), t.input.clone());
-            if u["sessionUpdate"] == "tool_call" || before != after {
+            if (u["sessionUpdate"] == "tool_call" && !known) || (!t.done && before != after) {
                 em.event(EventBody::ToolCall {
                     id: id.clone(),
                     name: t.name.clone(),
@@ -2266,6 +2347,7 @@ struct AgyCarry {
     subs: Vec<(String, AgySubagentTracker)>,
     calls: HashMap<String, AgyPendingCall>,
     bg_tasks: Vec<AgyBgTask>,
+    unresumed_items: VecDeque<AgyWakeReplayItem>,
 }
 
 impl AgyCarry {
@@ -2279,6 +2361,8 @@ impl AgyCarry {
 enum AgyStep {
     /// Keep waiting
     Wait,
+    /// An intermediate wakeup turn finished while other subagents or background tasks keep running
+    CycleEnd,
     /// Finished; the request (if any) goes to agy
     Done(Option<Value>),
 }
@@ -2300,6 +2384,7 @@ struct AgyWatch {
     discover_open: VecDeque<(String, Value)>,
     stop_reason: Option<String>,
     pending_calls: HashMap<String, AgyPendingCall>,
+    open_bg_calls: VecDeque<(String, String)>,
     subagents: HashMap<String, AgySubagentTracker>,
     subagent_order: Vec<String>,
     bg_tasks: Vec<AgyBgTask>,
@@ -2318,6 +2403,8 @@ struct AgyWatch {
     reopened: bool,
     /// This pass produced the parent's own events (its wakeup), which reopen a detached turn
     wake: bool,
+    emitted_wake_text: bool,
+    unresumed_items: VecDeque<AgyWakeReplayItem>,
     out: AgyOut,
     settled_tc_ids: Vec<String>,
 }
@@ -2342,6 +2429,7 @@ impl AgyWatch {
             discover_open: VecDeque::new(),
             stop_reason,
             pending_calls,
+            open_bg_calls: VecDeque::new(),
             subagents: HashMap::new(),
             subagent_order: vec![],
             bg_tasks: vec![],
@@ -2357,6 +2445,8 @@ impl AgyWatch {
             detached: false,
             reopened: false,
             wake: false,
+            emitted_wake_text: false,
+            unresumed_items: VecDeque::new(),
             out: vec![],
             settled_tc_ids: vec![],
         };
@@ -2364,6 +2454,11 @@ impl AgyWatch {
             watch.add_subagent(sid, Some(baseline));
         }
         watch
+    }
+
+    fn with_open_bg_calls(mut self, calls: VecDeque<(String, String)>) -> Self {
+        self.open_bg_calls = calls;
+        self
     }
 
     fn add_subagent(&mut self, sub_id: String, explicit_start: Option<usize>) {
@@ -2409,6 +2504,7 @@ impl AgyWatch {
         for b in carry.bg_tasks {
             self.add_bg_task(b);
         }
+        self.unresumed_items.extend(carry.unresumed_items);
     }
 
     fn adopt_bg(&mut self, bg_tasks: Vec<AgyBgTask>, seen_system_steps: HashSet<usize>) {
@@ -2553,6 +2649,9 @@ fn finish_agy_watch(watch: &mut AgyWatch, em: &Emitter) {
             }
         }
     }
+    for (tc_id, _) in watch.open_bg_calls.drain(..) {
+        watch.out.push(EventBody::ToolResult { id: tc_id, output: String::new(), is_error: false });
+    }
     watch.flush_out(em);
 }
 
@@ -2599,6 +2698,7 @@ fn carry_agy_watch(st: &mut State, em: &Emitter) {
             st.agy_carry.bg_tasks.push(b);
         }
     }
+    st.agy_carry.unresumed_items.extend(watch.unresumed_items.drain(..));
     finish_agy_watch(&mut watch, em);
     mark_watch_settled(st, &mut watch);
     em.background_tasks(current_agy_tasks(st));
@@ -2702,6 +2802,14 @@ fn settle_agy_bg_from_steps(st: &mut State, steps: &[Value], em: &Emitter) {
     }
 }
 
+fn take_agy_open_bg_call(open: &mut VecDeque<(String, String)>, call_name: Option<&str>) -> Option<String> {
+    let cn = call_name?;
+    open.iter()
+        .position(|(_, n)| n.eq_ignore_ascii_case(cn))
+        .and_then(|pos| open.remove(pos))
+        .map(|(id, _)| id)
+}
+
 fn discover_agy_bg_from_steps(st: &mut State, steps: &[Value]) -> bool {
     let mut added = false;
     let mut open_calls: VecDeque<(String, Value)> = VecDeque::new();
@@ -2726,13 +2834,7 @@ fn discover_agy_bg_from_steps(st: &mut State, steps: &[Value]) -> bool {
                                 Some((name, args)) => agy_bg_meta(&name, &args, &parsed.description),
                                 None => agy_bg_meta("", &Value::Null, &parsed.description),
                             };
-                            let tc_id = call_name.as_deref().and_then(|cn| {
-                                st.agy_open_bg_calls
-                                    .iter()
-                                    .position(|(_, n)| n.eq_ignore_ascii_case(cn))
-                                    .and_then(|pos| st.agy_open_bg_calls.remove(pos))
-                                    .map(|(id, _)| id)
-                            });
+                            let tc_id = take_agy_open_bg_call(&mut st.agy_open_bg_calls, call_name.as_deref());
                             if !is_daemon {
                                 st.agy_bg_tasks.push(AgyBgTask {
                                     id: parsed.id,
@@ -2781,6 +2883,19 @@ fn settle_agy_prompt_bg(st: &mut State, em: &Emitter) {
     em.background_tasks(current_agy_tasks(st));
 }
 
+fn agy_resume_req(watch: &AgyWatch, spec: &StartSpec, next_id: &mut u64, pending: &mut HashMap<u64, Pending>) -> Value {
+    // agy only marks steps it streamed as seen; resuming moves that mark past the wakeup turn, so the
+    // next prompt doesn't replay it (session/resume sends no history)
+    *next_id += 1;
+    pending.insert(*next_id, Pending::Other);
+    json!({
+        "jsonrpc": "2.0",
+        "id": *next_id,
+        "method": "session/resume",
+        "params": {"sessionId": watch.parent_sid, "cwd": spec.cwd.display().to_string(), "mcpServers": spec.mcp_servers}
+    })
+}
+
 fn poll_agy_watch(st: &mut State, spec: &StartSpec, em: &Emitter) -> Option<Value> {
     let mut watch = st.agy_watch.take()?;
     let step = step_agy_watch(&mut watch, spec, em, &mut st.next_id, &mut st.pending);
@@ -2790,12 +2905,27 @@ fn poll_agy_watch(st: &mut State, spec: &StartSpec, em: &Emitter) -> Option<Valu
             st.agy_watch = Some(watch);
             None
         }
+        AgyStep::CycleEnd => {
+            if watch.reopened {
+                watch.reopened = false;
+                st.end_subagents();
+                em.event(EventBody::TurnEnd { stop_reason: Some("end_turn".into()), model: None });
+            }
+            watch.wake = false;
+            st.agy_watch = Some(watch);
+            None
+        }
         AgyStep::Done(req) => {
+            if req.is_some() {
+                st.agy_carry.unresumed_items.clear();
+                st.agy_replay_prefix.clear();
+            }
             if !watch.detached {
                 st.prompting = false;
                 st.end_subagents();
                 em.event(EventBody::TurnEnd { stop_reason: watch.stop_reason, model: None });
             } else if watch.reopened {
+                st.end_subagents();
                 em.event(EventBody::TurnEnd { stop_reason: Some("end_turn".into()), model: None });
             }
             req
@@ -2878,10 +3008,12 @@ fn step_agy_watch_inner(watch: &mut AgyWatch, spec: &StartSpec, next_id: &mut u6
                 if step["status"].as_str() == Some("RUNNING") {
                     if let Some(parsed) = parse_agy_bg_task(content) {
                         if !watch.bg_tasks.iter().any(|b| b.id == parsed.id) {
+                            let call_name = call.as_ref().map(|(n, _)| n.clone());
                             let (kind, is_daemon, timer_cond, desc) = match call {
                                 Some((name, args)) => agy_bg_meta(&name, &args, &parsed.description),
                                 None => agy_bg_meta("", &Value::Null, &parsed.description),
                             };
+                            let tc_id = take_agy_open_bg_call(&mut watch.open_bg_calls, call_name.as_deref());
                             if !is_daemon {
                                 watch.add_bg_task(AgyBgTask {
                                     id: parsed.id,
@@ -2889,7 +3021,7 @@ fn step_agy_watch_inner(watch: &mut AgyWatch, spec: &StartSpec, next_id: &mut u6
                                     description: desc,
                                     started_at: now_ms(),
                                     output_file: parsed.output_file,
-                                    tc_id: None,
+                                    tc_id,
                                     is_daemon: false,
                                     timer_cond,
                                     done: false,
@@ -3017,14 +3149,9 @@ fn step_agy_watch_inner(watch: &mut AgyWatch, spec: &StartSpec, next_id: &mut u6
 
     flush_ready_pending_calls(watch, false);
 
-    // 4. Wait until all tracked subagents and background tasks are finished
-    if !watch.subagents.values().all(|t| t.done) || !watch.bg_tasks.iter().all(|b| b.done) {
-        return if timed_out { AgyStep::Done(None) } else { AgyStep::Wait };
-    }
-
-    let done_at = *watch.all_subagents_done_at.get_or_insert_with(tokio::time::Instant::now);
-
-    // 5. Stream & capture parent's reactive wakeup turn once SYSTEM_MESSAGE arrives
+    // 4. Stream & capture parent's reactive wakeup turn once SYSTEM_MESSAGE arrives (even while other tasks still run)
+    let mut has_planner_after_wakeup = false;
+    let mut has_unsettled_after_wakeup = false;
     if let Some(wakeup_idx) = watch.wakeup_msg_idx {
         while watch.next_parent_emit_step < parent_steps.len() {
             let step_idx = watch.next_parent_emit_step;
@@ -3033,15 +3160,17 @@ fn step_agy_watch_inner(watch: &mut AgyWatch, spec: &StartSpec, next_id: &mut u6
                 watch.wakeup_stable_ticks = 0;
                 break;
             }
-            match step["type"].as_str().unwrap_or("") {
+            let emitted = match step["type"].as_str().unwrap_or("") {
                 "PLANNER_RESPONSE" => {
                     if let Some(thinking) = step["thinking"].as_str().map(str::trim).filter(|s| !s.is_empty()) {
+                        watch.unresumed_items.push_back(AgyWakeReplayItem::Thinking(thinking.to_string()));
                         watch.out.push(EventBody::Thinking { id: format!("agy-wake-{}-t-{}", watch.parent_sid, step_idx), text: thinking.to_string() });
                     }
                     for (tc_idx, tc) in step["tool_calls"].as_array().into_iter().flatten().enumerate() {
                         let tc_name = tc["name"].as_str().unwrap_or("tool");
                         let tc_args = tc["args"].clone();
                         let tc_id = tc["id"].as_str().map(str::to_string).unwrap_or_else(|| format!("agy-wake:{}:{}:{}", watch.parent_sid, step_idx, tc_idx));
+                        watch.unresumed_items.push_back(AgyWakeReplayItem::Tool { name: tc_name.to_string(), input: tc_args.clone() });
                         watch.out.push(EventBody::ToolCall { id: tc_id.clone(), name: tc_name.to_string(), title: tc_name.to_string(), input: tc_args.clone(), diffs: vec![] });
                         if is_agy_subagent_tool(tc_name, &tc_args) {
                             let target = agy_recipient(&tc_args).map(str::to_string);
@@ -3056,8 +3185,11 @@ fn step_agy_watch_inner(watch: &mut AgyWatch, spec: &StartSpec, next_id: &mut u6
                         }
                     }
                     if let Some(text) = step["content"].as_str().filter(|s| !s.trim().is_empty()) {
+                        watch.emitted_wake_text = true;
+                        watch.unresumed_items.push_back(AgyWakeReplayItem::Assistant(text.trim().to_string()));
                         watch.out.push(EventBody::AssistantText { id: format!("agy-wake-{}-a-{}", watch.parent_sid, step_idx), text: text.to_string() });
                     }
+                    true
                 }
                 "GENERIC" => {
                     let content = step["content"].as_str().unwrap_or("");
@@ -3111,47 +3243,76 @@ fn step_agy_watch_inner(watch: &mut AgyWatch, spec: &StartSpec, next_id: &mut u6
                             });
                         }
                     }
+                    true
                 }
-                "SYSTEM_MESSAGE" => {}
-                _ => {}
-            }
+                "SYSTEM_MESSAGE" => false,
+                _ => false,
+            };
             watch.next_parent_emit_step += 1;
             watch.wakeup_stable_ticks = 0;
-            watch.wake = true;
+            if emitted {
+                watch.wake = true;
+            }
         }
 
-        // Did the wakeup turn launch another chained subagent or background task? If so, wait for it
-        if !watch.subagents.values().all(|t| t.done) || !watch.bg_tasks.iter().all(|b| b.done) {
-            return AgyStep::Wait;
-        }
-
-        let has_planner_after_wakeup = parent_steps[wakeup_idx + 1..].iter().any(|s| s["type"].as_str() == Some("PLANNER_RESPONSE"));
-        let last_is_final_planner = parent_steps.last().is_some_and(is_agy_final_reply);
+        let all_done = watch.subagents.values().all(|t| t.done) && watch.bg_tasks.iter().all(|b| b.done);
+        has_planner_after_wakeup = parent_steps[wakeup_idx + 1..].iter().any(|s| s["type"].as_str() == Some("PLANNER_RESPONSE"));
+        has_unsettled_after_wakeup = parent_steps[wakeup_idx + 1..].iter().any(|s| !agy_step_settled(s));
+        let last_is_final_planner = parent_steps.last().is_some_and(|s| {
+            is_agy_final_reply(s)
+                || (s["type"].as_str() == Some("PLANNER_RESPONSE")
+                    && matches!(s["status"].as_str(), Some("ERROR" | "INVALID"))
+                    && s["tool_calls"].as_array().is_none_or(|a| a.is_empty()))
+        });
         if has_planner_after_wakeup && last_is_final_planner && !watch.parent_lane.busy() && watch.next_parent_emit_step == parent_steps.len() {
             watch.wakeup_stable_ticks += 1;
             if watch.wakeup_stable_ticks >= 2 {
-                flush_ready_pending_calls(watch, true);
-                // agy only marks steps it streamed as seen; resuming moves that mark past the wakeup turn, so the
-                // next prompt doesn't replay it (session/resume sends no history)
-                *next_id += 1;
-                pending.insert(*next_id, Pending::Other);
-                return AgyStep::Done(Some(json!({
-                    "jsonrpc": "2.0",
-                    "id": *next_id,
-                    "method": "session/resume",
-                    "params": {"sessionId": watch.parent_sid, "cwd": spec.cwd.display().to_string(), "mcpServers": spec.mcp_servers}
-                })));
+                if all_done {
+                    flush_ready_pending_calls(watch, true);
+                    return AgyStep::Done(Some(agy_resume_req(watch, spec, next_id, pending)));
+                }
+                // Another background task or subagent is still running: close this intermediate wakeup cycle and keep watching
+                watch.wake_from = parent_steps.len();
+                watch.wakeup_msg_idx = None;
+                watch.next_parent_emit_step = parent_steps.len();
+                watch.wakeup_stable_ticks = 0;
+                watch.all_subagents_done_at = None;
+                return AgyStep::CycleEnd;
             }
             return AgyStep::Wait;
         }
     }
 
-    if done_at.elapsed() >= WAKEUP_GRACE || timed_out {
-        let emitted_wakeup_text = watch.wakeup_msg_idx.is_some_and(|wi| {
-            parent_steps[wi + 1..watch.next_parent_emit_step.min(parent_steps.len())]
-                .iter()
-                .any(|s| s["type"].as_str() == Some("PLANNER_RESPONSE") && !s["content"].as_str().unwrap_or("").trim().is_empty())
-        });
+    // 5. Wait until all tracked subagents and background tasks are finished
+    if !watch.subagents.values().all(|t| t.done) || !watch.bg_tasks.iter().all(|b| b.done) {
+        return if timed_out {
+            AgyStep::Done(watch.wake.then(|| agy_resume_req(watch, spec, next_id, pending)))
+        } else {
+            AgyStep::Wait
+        };
+    }
+
+    let done_at = *watch.all_subagents_done_at.get_or_insert_with(tokio::time::Instant::now);
+
+    // 6. Never abort an active wakeup turn with WAKEUP_GRACE; only time out if no wakeup started (or SYSTEM_MESSAGE stayed unanswered)
+    let wakeup_active = watch.wakeup_msg_idx.is_some()
+        && (has_planner_after_wakeup || has_unsettled_after_wakeup || watch.parent_lane.busy());
+    let waiting_start = if watch.wakeup_msg_idx.is_some() {
+        watch.parent.changed_at.map_or(done_at, |t| t.max(done_at))
+    } else {
+        done_at
+    };
+    let grace_exceeded = !wakeup_active
+        && !parent_steps.get(watch.wake_from..).is_some_and(|tail| tail.iter().any(|s| !agy_step_settled(s)))
+        && waiting_start.elapsed() >= WAKEUP_GRACE;
+
+    if grace_exceeded || timed_out {
+        let emitted_wakeup_text = watch.emitted_wake_text
+            || watch.wakeup_msg_idx.is_some_and(|wi| {
+                parent_steps[wi + 1..watch.next_parent_emit_step.min(parent_steps.len())]
+                    .iter()
+                    .any(|s| s["type"].as_str() == Some("PLANNER_RESPONSE") && !s["content"].as_str().unwrap_or("").trim().is_empty())
+            });
         if !emitted_wakeup_text {
             let fallback: String = watch.subagent_order.iter().filter_map(|sid| watch.subagents.get(sid)).map(subagent_summary_text).filter(|s| !s.is_empty()).collect::<Vec<_>>().join("\n\n");
             if !fallback.is_empty() {
@@ -3160,7 +3321,7 @@ fn step_agy_watch_inner(watch: &mut AgyWatch, spec: &StartSpec, next_id: &mut u6
             }
         }
         flush_ready_pending_calls(watch, true);
-        return AgyStep::Done(None);
+        return AgyStep::Done(watch.wake.then(|| agy_resume_req(watch, spec, next_id, pending)));
     }
 
     AgyStep::Wait
@@ -3492,6 +3653,25 @@ mod model_config_tests {
             permission_mode: "default".into(), command: None, program: "cursor-agent".into(), extra_args: vec![],
             mcp_servers: vec![], mcp_fingerprint: String::new(), allow_mcp: vec![], system_prompt: None, system_notice: false, cols: 80, rows: 24, tmux: None, session_id: None,
             env: Default::default(), env_unset: vec![], data_dir: None, auth_method: None, account_handoff: None,
+        }
+    }
+
+    #[test]
+    fn cursor_auth_failure_does_not_start_a_browser_login() {
+        let (_hub, em, _rx) = crate::hub::test_emitter();
+        let spec = cursor_spec("grok-4.7");
+        for pending in [Pending::Session, Pending::Load] {
+            let mut st = State {
+                auth_method: Some("cursor_login".into()),
+                ..Default::default()
+            };
+            st.pending.insert(1, pending);
+            let err = handle(&mut st, &spec, &json!({"id":1,"error":{
+                "code":-32000,"message":"Authentication required"
+            }}), &em).unwrap_err();
+            assert!(err.contains("cursor-agent login"));
+            assert!(!st.auth_tried);
+            assert!(!st.pending.values().any(|p| *p == Pending::Auth));
         }
     }
 
@@ -4238,5 +4418,179 @@ mod model_config_tests {
         assert!(evs2.iter().any(|e| matches!(&e.body, EventBody::ToolResult { id, output, is_error } if id == "tc-live-2" && output == "WATCH_DEFER_OK" && !*is_error)));
 
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn antigravity_active_wakeup_survives_past_wakeup_grace() {
+        use super::*;
+        let root = std::env::temp_dir().join(format!("yi-agy-grace-{}", uuid::Uuid::new_v4()));
+        let parent_id = "p-wake-grace";
+        let (hub, em, _rx) = crate::hub::test_emitter();
+        let bg1 = "Created At: x\nTool is running as a background task with task id: p-wake-grace/task-1\nTask Description: build\nTask logs are available at: file:///tmp/t1.log";
+        let mut steps = vec![
+            json!({"step_index":0,"type":"USER_INPUT","status":"DONE","content":"go"}),
+            json!({"step_index":1,"type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"run_command","args":{"CommandLine":"sleep 5","toolSummary":"Step 1"}}]}),
+            json!({"step_index":2,"type":"GENERIC","status":"RUNNING","content":bg1}),
+            json!({"step_index":3,"type":"PLANNER_RESPONSE","status":"DONE","content":"Running step 1."}),
+            // Task 1 finished and woke the parent; the parent ran read_file and now a slow command is still in flight
+            json!({"step_index":4,"type":"SYSTEM_MESSAGE","status":"DONE","content":"<SYSTEM_MESSAGE>\n[Message] timestamp=x sender=p-wake-grace/task-1 priority=MESSAGE_PRIORITY_HIGH content=Task id \"p-wake-grace/task-1\" finished with result:\nCommand exited with code 0.\n\nCommand output:\nok-1\nLog: file:///tmp/t1.log\n</SYSTEM_MESSAGE>"}),
+            json!({"step_index":5,"type":"PLANNER_RESPONSE","status":"DONE","thinking":"Inspecting files","tool_calls":[{"name":"read_file","args":{"Path":"Cargo.toml"}}]}),
+            json!({"step_index":6,"type":"GENERIC","status":"DONE","content":"[workspace]"}),
+            json!({"step_index":7,"type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"run_command","args":{"CommandLine":"cargo test","toolSummary":"Step 2 test"}}]}),
+            json!({"step_index":8,"type":"GENERIC","status":"RUNNING","content":"waiting 10s..."}),
+        ];
+        write_agy_steps(&root, parent_id, &steps);
+
+        let mut st = State { is_antigravity: true, session_id: Some(parent_id.into()), ..Default::default() };
+        let mut watch = AgyWatch::new(parent_id.into(), root.clone(), 0, 4, Some("end_turn".into()), HashMap::new(), HashMap::new(), true);
+        watch.detached = true;
+        watch.add_bg_task(AgyBgTask {
+            id: "p-wake-grace/task-1".into(),
+            kind: "local_bash".into(),
+            description: "Step 1".into(),
+            started_at: 1,
+            output_file: None,
+            tc_id: Some("tc-1".into()),
+            is_daemon: false,
+            timer_cond: None,
+            done: false,
+            announced: false,
+            result: None,
+        });
+        st.agy_watch = Some(watch);
+
+        assert!(poll_agy_watch(&mut st, &agy_test_spec(), &em).is_none());
+        // Simulate WAKEUP_GRACE (20s) elapsing while the wakeup turn is actively running step 8
+        st.agy_watch.as_mut().unwrap().all_subagents_done_at = Some(tokio::time::Instant::now() - std::time::Duration::from_secs(25));
+        assert!(poll_agy_watch(&mut st, &agy_test_spec(), &em).is_none());
+        assert!(st.agy_watch.is_some(), "active wakeup turn must not be aborted by WAKEUP_GRACE");
+
+        // Now step 8 spills into background task-2 and the intermediate reply settles
+        steps[8] = json!({"step_index":8,"type":"GENERIC","status":"RUNNING","content":"Created At: x\nTool is running as a background task with task id: p-wake-grace/task-2\nTask Description: cargo test\nTask logs are available at: file:///tmp/t2.log"});
+        steps.push(json!({"step_index":9,"type":"PLANNER_RESPONSE","status":"DONE","content":"Launched step 2 test in background."}));
+        write_agy_steps(&root, parent_id, &steps);
+
+        assert!(poll_agy_watch(&mut st, &agy_test_spec(), &em).is_none());
+        assert!(poll_agy_watch(&mut st, &agy_test_spec(), &em).is_none());
+        let tasks = hub.info("s").unwrap().background_tasks;
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].id, "p-wake-grace/task-2");
+        assert!(!st.agy_watch.as_ref().unwrap().reopened);
+
+        // Task 2 finishes and writes final response
+        steps.push(json!({"step_index":10,"type":"SYSTEM_MESSAGE","status":"DONE","content":"<SYSTEM_MESSAGE>\n[Message] timestamp=x sender=p-wake-grace/task-2 priority=MESSAGE_PRIORITY_HIGH content=Task id \"p-wake-grace/task-2\" finished with result:\nCommand exited with code 0.\n\nCommand output:\nALL PASSED\nLog: file:///tmp/t2.log\n</SYSTEM_MESSAGE>"}));
+        steps.push(json!({"step_index":11,"type":"PLANNER_RESPONSE","status":"DONE","content":"Final result: all passed."}));
+        write_agy_steps(&root, parent_id, &steps);
+
+        assert!(poll_agy_watch(&mut st, &agy_test_spec(), &em).is_none());
+        let sync = poll_agy_watch(&mut st, &agy_test_spec(), &em).expect("final wakeup should send session/resume");
+        assert_eq!(sync["method"], "session/resume");
+        assert!(hub.info("s").unwrap().background_tasks.is_empty());
+
+        let evs = hub.store.events_since("s", 0, 100).unwrap();
+        assert!(evs.iter().any(|e| matches!(&e.body, EventBody::AssistantText { text, .. } if text == "Launched step 2 test in background.")));
+        assert!(evs.iter().any(|e| matches!(&e.body, EventBody::ToolResult { id, output, is_error } if id == "agy-wake:p-wake-grace:7:0" && output == "ALL PASSED" && !*is_error)));
+        assert!(evs.iter().any(|e| matches!(&e.body, EventBody::AssistantText { text, .. } if text == "Final result: all passed.")));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn antigravity_wakeup_streams_while_other_task_keeps_running() {
+        use super::*;
+        let root = std::env::temp_dir().join(format!("yi-agy-partial-{}", uuid::Uuid::new_v4()));
+        let parent_id = "p-partial";
+        let (hub, em, _rx) = crate::hub::test_emitter();
+        let bg_a = "Created At: x\nTool is running as a background task with task id: p-partial/task-a\nTask logs are available at: file:///tmp/ta.log";
+        let bg_b = "Created At: x\nTool is running as a background task with task id: p-partial/task-b\nTask logs are available at: file:///tmp/tb.log";
+        let mut steps = vec![
+            json!({"step_index":0,"type":"USER_INPUT","status":"DONE","content":"run two"}),
+            json!({"step_index":1,"type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"run_command","args":{"CommandLine":"a","toolSummary":"Task A"}},{"name":"run_command","args":{"CommandLine":"b","toolSummary":"Task B"}}]}),
+            json!({"step_index":2,"type":"GENERIC","status":"RUNNING","content":bg_a}),
+            json!({"step_index":3,"type":"GENERIC","status":"RUNNING","content":bg_b}),
+            json!({"step_index":4,"type":"PLANNER_RESPONSE","status":"DONE","content":"Both started."}),
+            // Only task-a finishes; task-b keeps running. Wakeup launches task-c and replies
+            json!({"step_index":5,"type":"SYSTEM_MESSAGE","status":"DONE","content":"<SYSTEM_MESSAGE>\n[Message] timestamp=x sender=p-partial/task-a priority=MESSAGE_PRIORITY_HIGH content=Task id \"p-partial/task-a\" finished with result:\nCommand exited with code 0.\n\nCommand output:\nA-FAIL\nLog: file:///tmp/ta.log\n</SYSTEM_MESSAGE>"}),
+            json!({"step_index":6,"type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"run_command","args":{"CommandLine":"c","toolSummary":"Task C"}}]}),
+            json!({"step_index":7,"type":"GENERIC","status":"RUNNING","content":"Created At: x\nTool is running as a background task with task id: p-partial/task-c\nTask logs are available at: file:///tmp/tc.log"}),
+            json!({"step_index":8,"type":"PLANNER_RESPONSE","status":"DONE","content":"Task A done; Task C started while Task B runs."}),
+        ];
+        write_agy_steps(&root, parent_id, &steps);
+
+        let mut st = State { is_antigravity: true, session_id: Some(parent_id.into()), ..Default::default() };
+        let mut watch = AgyWatch::new(parent_id.into(), root.clone(), 0, 5, Some("end_turn".into()), HashMap::new(), HashMap::new(), true);
+        watch.detached = true;
+        watch.add_bg_task(AgyBgTask { id: "p-partial/task-a".into(), kind: "local_bash".into(), description: "Task A".into(), started_at: 1, output_file: None, tc_id: Some("tc-a".into()), is_daemon: false, timer_cond: None, done: false, announced: false, result: None });
+        watch.add_bg_task(AgyBgTask { id: "p-partial/task-b".into(), kind: "local_bash".into(), description: "Task B".into(), started_at: 2, output_file: None, tc_id: Some("tc-b".into()), is_daemon: false, timer_cond: None, done: false, announced: false, result: None });
+        st.agy_watch = Some(watch);
+
+        // Two ticks settle the intermediate CycleEnd without blocking on task-b
+        assert!(poll_agy_watch(&mut st, &agy_test_spec(), &em).is_none());
+        assert!(poll_agy_watch(&mut st, &agy_test_spec(), &em).is_none());
+        let tasks: Vec<String> = hub.info("s").unwrap().background_tasks.into_iter().map(|t| t.id).collect();
+        assert_eq!(tasks, vec!["p-partial/task-b", "p-partial/task-c"]);
+        assert!(!st.agy_watch.as_ref().unwrap().reopened);
+
+        let mid_evs = hub.store.events_since("s", 0, 100).unwrap();
+        assert!(mid_evs.iter().any(|e| matches!(&e.body, EventBody::AssistantText { text, .. } if text == "Task A done; Task C started while Task B runs.")));
+        assert!(mid_evs.iter().any(|e| matches!(&e.body, EventBody::TurnEnd { .. })));
+
+        // Task B & C finish -> final reply & session/resume
+        steps.push(json!({"step_index":9,"type":"SYSTEM_MESSAGE","status":"DONE","content":"<SYSTEM_MESSAGE>\n[Message] timestamp=x sender=p-partial/task-b priority=MESSAGE_PRIORITY_HIGH content=Task id \"p-partial/task-b\" finished with result:\nCommand exited with code 0.\n\nCommand output:\nB-OK\nLog: file:///tmp/tb.log\n</SYSTEM_MESSAGE>"}));
+        steps.push(json!({"step_index":10,"type":"SYSTEM_MESSAGE","status":"DONE","content":"<SYSTEM_MESSAGE>\n[Message] timestamp=x sender=p-partial/task-c priority=MESSAGE_PRIORITY_HIGH content=Task id \"p-partial/task-c\" finished with result:\nCommand exited with code 0.\n\nCommand output:\nC-OK\nLog: file:///tmp/tc.log\n</SYSTEM_MESSAGE>"}));
+        steps.push(json!({"step_index":11,"type":"PLANNER_RESPONSE","status":"DONE","content":"All three complete."}));
+        write_agy_steps(&root, parent_id, &steps);
+
+        assert!(poll_agy_watch(&mut st, &agy_test_spec(), &em).is_none());
+        let sync = poll_agy_watch(&mut st, &agy_test_spec(), &em).expect("final session/resume");
+        assert_eq!(sync["method"], "session/resume");
+        let end_evs = hub.store.events_since("s", 0, 100).unwrap();
+        assert!(end_evs.iter().any(|e| matches!(&e.body, EventBody::ToolResult { id, output, .. } if id == "agy-wake:p-partial:6:0" && output == "C-OK")));
+        assert!(end_evs.iter().any(|e| matches!(&e.body, EventBody::AssistantText { text, .. } if text == "All three complete.")));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn antigravity_in_progress_bg_call_handed_to_watch_and_deduped_replay() {
+        use super::*;
+        // 1. Muted session/load suppresses repeated tool_call ids if emitted later
+        let (_hub, em, _rx) = crate::hub::test_emitter();
+        let mut st = State { is_antigravity: true, loading: true, ..Default::default() };
+        update(&mut st, &em, &json!({"sessionUpdate":"tool_call","toolCallId":"tc-muted-1","name":"read_file","status":"completed"}));
+        st.loading = false;
+        update(&mut st, &em, &json!({"sessionUpdate":"tool_call","toolCallId":"tc-muted-1","name":"read_file","status":"in_progress"}));
+        assert!(!st.tools.contains_key("tc-muted-1"));
+
+        // 2. Carry + unresumed wakeup prefix suppresses duplicate replay in the next prompt while passing new text
+        let (hub2, em2, _rx2) = crate::hub::test_emitter();
+        let mut st2 = State { is_antigravity: true, session_id: Some("p-dedup".into()), ..Default::default() };
+        st2.agy_carry.unresumed_items.push_back(AgyWakeReplayItem::Thinking("Wake thought".into()));
+        st2.agy_carry.unresumed_items.push_back(AgyWakeReplayItem::Tool { name: "read_file".into(), input: json!({"Path":"a.rs"}) });
+        st2.agy_carry.unresumed_items.push_back(AgyWakeReplayItem::Assistant("Part 1 done".into()));
+        let _ = prompt(&mut st2, &em2, &Prompt { text: "next".into(), images: vec![] });
+
+        // Replayed prefix is dropped silently (including the matched ToolCall's ToolResult)
+        update(&mut st2, &em2, &json!({"sessionUpdate":"agent_thought_chunk","content":{"text":"Wake thought"}}));
+        update(&mut st2, &em2, &json!({"sessionUpdate":"tool_call","toolCallId":"tc-rep-1","name":"read_file","status":"in_progress","rawInput":{"Path":"a.rs"}}));
+        update(&mut st2, &em2, &json!({"sessionUpdate":"tool_call_update","toolCallId":"tc-rep-1","status":"completed","rawOutput":{"output":"file body"}}));
+        update(&mut st2, &em2, &json!({"sessionUpdate":"agent_message_chunk","content":{"text":"Part 1 done"}}));
+        // Real agy emits user_message_chunk before starting the live turn
+        update(&mut st2, &em2, &json!({"sessionUpdate":"user_message_chunk","content":{"text":"next"}}));
+        // Now real live turn begins
+        update(&mut st2, &em2, &json!({"sessionUpdate":"agent_message_chunk","content":{"text":"Part 2 fresh"}}));
+        flush(&mut st2, &em2);
+
+        let evs = hub2.store.events_since("s", 0, 100).unwrap();
+        assert!(!evs.iter().any(|e| matches!(&e.body, EventBody::Thinking { text, .. } if text == "Wake thought")));
+        assert!(!evs.iter().any(|e| matches!(&e.body, EventBody::ToolCall { id, .. } if id == "tc-rep-1")));
+        assert!(!evs.iter().any(|e| matches!(&e.body, EventBody::ToolResult { id, .. } if id == "tc-rep-1")));
+        assert!(!evs.iter().any(|e| matches!(&e.body, EventBody::AssistantText { text, .. } if text == "Part 1 done")));
+        assert!(evs.iter().any(|e| matches!(&e.body, EventBody::AssistantText { text, .. } if text == "Part 2 fresh")));
+
+        // 3. take_agy_open_bg_call handoff works across open_bg_calls
+        let mut open = VecDeque::from([("tc-bg-lag".to_string(), "run_command".to_string())]);
+        let mut watch = AgyWatch::new("p".into(), std::env::temp_dir(), 0, 0, None, HashMap::new(), HashMap::new(), true)
+            .with_open_bg_calls(open.clone());
+        assert_eq!(take_agy_open_bg_call(&mut open, Some("run_command")).as_deref(), Some("tc-bg-lag"));
+        assert_eq!(take_agy_open_bg_call(&mut watch.open_bg_calls, Some("run_command")).as_deref(), Some("tc-bg-lag"));
     }
 }

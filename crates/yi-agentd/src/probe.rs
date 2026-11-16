@@ -38,6 +38,7 @@ struct ProbeEnv {
     identity: AccountIdentity,
     account_id: Option<String>,
     account_label: Option<String>,
+    cursor_fallback_auth: Option<Vec<u8>>,
 }
 
 impl ProbeEnv {
@@ -49,6 +50,7 @@ impl ProbeEnv {
             identity: res.identity.clone(),
             account_id: Some(res.id.clone()),
             account_label: Some(res.label.clone()),
+            cursor_fallback_auth: None,
         }
     }
 }
@@ -391,12 +393,160 @@ fn fmt_num(x: f64) -> String {
     }
 }
 
-/// Cursor: account from `cursor-agent about`, usage queried from Cursor's backend (same as cursor-agent's /usage)
-async fn cursor_account(settings: &DaemonSettings) -> Result<Value> {
+fn cursor_api_endpoint(penv: &ProbeEnv) -> String {
+    penv.env
+        .get("CURSOR_API_ENDPOINT")
+        .or_else(|| penv.env.get("CURSOR_API_BASE_URL"))
+        .map(String::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .map(str::to_string)
+        .or_else(|| std::env::var("CURSOR_API_ENDPOINT").ok().filter(|s| !s.trim().is_empty()))
+        .or_else(|| std::env::var("CURSOR_API_BASE_URL").ok().filter(|s| !s.trim().is_empty()))
+        .unwrap_or_else(|| "https://api2.cursor.sh".to_string())
+        .trim_end_matches('/')
+        .to_string()
+}
+
+fn cursor_auth_api_key(bytes: &[u8]) -> Option<String> {
+    let v: Value = serde_json::from_slice(bytes).ok()?;
+    v["apiKey"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+}
+
+fn cursor_token_from_bytes(bytes: &[u8]) -> Result<String> {
+    let auth: Value = serde_json::from_slice(bytes)?;
+    auth["accessToken"]
+        .as_str()
+        .filter(|t| !t.is_empty())
+        .map(String::from)
+        .ok_or_else(|| anyhow!("cursor-agent 还没有登录"))
+}
+
+fn cursor_exchange_api_key(endpoint: &str, api_key: &str) -> Result<String> {
+    let url = format!("{endpoint}/auth/exchange_user_api_key");
+    let mut resp = ureq::post(&url)
+        .header("Content-Type", "application/json")
+        .header("Authorization", &format!("Bearer {api_key}"))
+        .config()
+        .timeout_global(Some(Duration::from_secs(15)))
+        .build()
+        .send(&b"{}"[..])
+        .map_err(|e| match e {
+            ureq::Error::StatusCode(401 | 403) => anyhow!("CURSOR_API_KEY 无效或没有权限"),
+            e => anyhow!("{e}"),
+        })?;
+    let v: Value = serde_json::from_str(&resp.body_mut().read_to_string()?)?;
+    v["accessToken"]
+        .as_str()
+        .filter(|t| !t.is_empty())
+        .map(String::from)
+        .ok_or_else(|| anyhow!("CURSOR_API_KEY 交换访问令牌失败"))
+}
+
+fn cursor_call_at(endpoint: &str, token: &str, method: &str) -> Result<Value> {
+    let url = format!("{endpoint}/aiserver.v1.DashboardService/{method}");
+    let mut resp = ureq::post(&url)
+        .header("Content-Type", "application/json")
+        .header("Connect-Protocol-Version", "1")
+        .header("Authorization", &format!("Bearer {token}"))
+        .config()
+        .timeout_global(Some(Duration::from_secs(15)))
+        .build()
+        .send(&b"{}"[..])
+        .map_err(|e| match e {
+            ureq::Error::StatusCode(401 | 403) => anyhow!("登录已过期，运行一次 cursor-agent 刷新登录"),
+            e => anyhow!("{e}"),
+        })?;
+    Ok(serde_json::from_str(&resp.body_mut().read_to_string()?)?)
+}
+
+fn cursor_usage_with_token(endpoint: &str, token: &str) -> Result<Value> {
+    let usage = cursor_call_at(endpoint, token, "GetCurrentPeriodUsage")?;
+    let plan = cursor_call_at(endpoint, token, "GetPlanInfo").unwrap_or(Value::Null);
+    let hard = cursor_call_at(endpoint, token, "GetHardLimit").unwrap_or(Value::Null);
+    let me = cursor_call_at(endpoint, token, "GetMe").unwrap_or(Value::Null);
+    let mut q = cursor_quota(&usage, &plan, &hard);
+    if let Some(email) = me["email"].as_str().map(str::trim).filter(|s| !s.is_empty()) {
+        q["account"]["email"] = json!(email);
+    }
+    Ok(q)
+}
+
+async fn cursor_api_key_account(
+    api_key: &str,
+    endpoint: &str,
+    identity: &AccountIdentity,
+) -> Result<Value> {
+    let key = api_key.to_string();
+    let ep = endpoint.to_string();
+    let mut q = tokio::task::spawn_blocking(move || {
+        let token = cursor_exchange_api_key(&ep, &key)?;
+        cursor_usage_with_token(&ep, &token)
+    })
+    .await??;
+    if q["account"]["email"].is_null() {
+        if let Some(email) = &identity.email {
+            q["account"]["email"] = json!(email);
+        }
+    }
+    if q["account"]["plan"].is_null() {
+        if let Some(plan) = &identity.plan {
+            q["account"]["plan"] = json!(plan);
+        }
+    }
+    Ok(q)
+}
+
+/// Cursor: resolve host `CURSOR_API_KEY` precedence, or isolated OAuth account from `cursor-agent about` + DashboardService.
+async fn cursor_account(settings: &DaemonSettings, penv: &ProbeEnv) -> Result<Value> {
+    let endpoint = cursor_api_endpoint(penv);
+    if penv.auth_kind.is_none() {
+        if let Ok(env_key) = std::env::var("CURSOR_API_KEY") {
+            let trimmed = env_key.trim();
+            if !trimmed.is_empty() {
+                return cursor_api_key_account(trimmed, &endpoint, &penv.identity).await;
+            }
+        }
+        if let Ok(bytes) = std::fs::read(cursor_auth_file()) {
+            if let Some(file_key) = cursor_auth_api_key(&bytes) {
+                return cursor_api_key_account(&file_key, &endpoint, &penv.identity).await;
+            }
+        }
+    }
+
+    // If host auth.json was overwritten by a CURSOR_API_KEY run, probe the OAuth snapshot directly instead of touching disk.
+    if penv.auth_kind == Some(AccountAuthKind::Oauth) {
+        if let Ok(bytes) = std::fs::read(cursor_auth_file()) {
+            if cursor_auth_api_key(&bytes).is_some() {
+                if let Some(clean_bytes) = &penv.cursor_fallback_auth {
+                    let token = cursor_token_from_bytes(clean_bytes)?;
+                    let ep = endpoint.clone();
+                    let mut q = tokio::task::spawn_blocking(move || cursor_usage_with_token(&ep, &token)).await??;
+                    if q["account"]["email"].is_null() {
+                        if let Some(email) = &penv.identity.email {
+                            q["account"]["email"] = json!(email);
+                        }
+                    }
+                    return Ok(q);
+                }
+                bail!("当前系统 Cursor auth.json 为 CURSOR_API_KEY 凭据而非 OAuth 登录，请重新登录 OAuth");
+            }
+        }
+    }
+
     let program = crate::tools::resolve(ToolKind::Cursor, settings)
         .ok_or_else(|| anyhow!("这台机器上没有找到 cursor"))?;
     let mut cmd: tokio::process::Command =
         adapters::std_command(&program, &["about".to_string()]).into();
+    for k in &penv.env_unset {
+        cmd.env_remove(k);
+    }
+    for (k, v) in &penv.env {
+        cmd.env(k, v);
+    }
     cmd.stdin(std::process::Stdio::null()).kill_on_drop(true);
     #[cfg(windows)]
     cmd.creation_flags(0x0800_0000);
@@ -412,12 +562,17 @@ async fn cursor_account(settings: &DaemonSettings) -> Result<Value> {
     let email = field("User Email");
     let tier = field("Subscription Tier");
     // Same as /usage in cursor-agent: query the backend with the token it saved at login
-    match tokio::task::spawn_blocking(cursor_usage).await? {
+    let ep = endpoint.clone();
+    match tokio::task::spawn_blocking(move || cursor_usage(&ep)).await? {
         Ok(mut q) => {
             if q["account"]["plan"].is_null() {
                 q["account"]["plan"] = json!(tier);
             }
-            q["account"]["email"] = json!(email);
+            if q["account"]["email"].is_null() || email.is_some() {
+                if let Some(e) = email {
+                    q["account"]["email"] = json!(e);
+                }
+            }
             Ok(q)
         }
         Err(e) => Ok(json!({
@@ -448,31 +603,11 @@ fn cursor_auth_file() -> std::path::PathBuf {
     }
 }
 
-fn cursor_call(token: &str, method: &str) -> Result<Value> {
-    let url = format!("https://api2.cursor.sh/aiserver.v1.DashboardService/{method}");
-    let mut resp = ureq::post(&url)
-        .header("Content-Type", "application/json")
-        .header("Connect-Protocol-Version", "1")
-        .header("Authorization", &format!("Bearer {token}"))
-        .config()
-        .timeout_global(Some(Duration::from_secs(15)))
-        .build()
-        .send(&b"{}"[..])
-        .map_err(|e| match e {
-            ureq::Error::StatusCode(401 | 403) => anyhow!("登录已过期，运行一次 cursor-agent 刷新登录"),
-            e => anyhow!("{e}"),
-        })?;
-    Ok(serde_json::from_str(&resp.body_mut().read_to_string()?)?)
-}
-
-fn cursor_usage() -> Result<Value> {
+fn cursor_usage(endpoint: &str) -> Result<Value> {
     let path = cursor_auth_file();
-    let auth: Value = serde_json::from_slice(&std::fs::read(&path).map_err(|_| anyhow!("没有找到 cursor-agent 的登录信息"))?)?;
-    let token = auth["accessToken"].as_str().filter(|t| !t.is_empty()).ok_or_else(|| anyhow!("cursor-agent 还没有登录"))?;
-    let usage = cursor_call(token, "GetCurrentPeriodUsage")?;
-    let plan = cursor_call(token, "GetPlanInfo").unwrap_or(Value::Null);
-    let hard = cursor_call(token, "GetHardLimit").unwrap_or(Value::Null);
-    Ok(cursor_quota(&usage, &plan, &hard))
+    let bytes = std::fs::read(&path).map_err(|_| anyhow!("没有找到 cursor-agent 的登录信息"))?;
+    let token = cursor_token_from_bytes(&bytes)?;
+    cursor_usage_with_token(endpoint, &token)
 }
 
 /// Amounts are in cents, times are millisecond strings
@@ -860,6 +995,15 @@ async fn run_with_env(
     want_quota: bool,
 ) -> Result<Probe> {
     if want_quota && penv.auth_kind == Some(AccountAuthKind::ApiKey) {
+        if tool == ToolKind::Cursor {
+            if let Some(api_key) = penv.env.get("CURSOR_API_KEY").map(String::as_str).map(str::trim).filter(|s| !s.is_empty()) {
+                let endpoint = cursor_api_endpoint(penv);
+                return Ok(Probe {
+                    models: vec![],
+                    quota: Some(cursor_api_key_account(api_key, &endpoint, &penv.identity).await?),
+                });
+            }
+        }
         return Ok(Probe {
             models: vec![],
             quota: Some(api_key_quota(tool, penv)),
@@ -880,7 +1024,7 @@ async fn run_with_env(
         ToolKind::Qoder | ToolKind::Codebuddy => acp(tool, settings, false).await,
         ToolKind::Cursor if want_quota => Ok(Probe {
             models: vec![],
-            quota: Some(cursor_account(settings).await?),
+            quota: Some(cursor_account(settings, penv).await?),
         }),
         ToolKind::Cursor => acp(tool, settings, false).await,
         ToolKind::Antigravity if want_quota => Ok(Probe {
@@ -1033,10 +1177,15 @@ pub async fn quota(
         }
     }
 
-    let penv = resolved
+    let mut penv = resolved
         .as_ref()
         .map(ProbeEnv::from_resolved)
         .unwrap_or_default();
+    if tool == ToolKind::Cursor && penv.auth_kind == Some(AccountAuthKind::Oauth) {
+        if let Some(aid) = &penv.account_id {
+            penv.cursor_fallback_auth = hub.accounts.load_cursor_oauth_auth_bytes(aid);
+        }
+    }
 
     // Prevent touching host credentials passively if probing an inactive HostActive OAuth account without refresh.
     if let Some(res) = &resolved {
@@ -1076,6 +1225,14 @@ pub async fn quota(
     if let Some(aid) = &effective_id {
         if v["error"].is_null() {
             hub.accounts.set_runtime_state(tool, aid, AccountState::Ready, None);
+            if tool == ToolKind::Cursor && penv.auth_kind == Some(AccountAuthKind::ApiKey) {
+                hub.accounts.update_identity_if_missing(
+                    tool,
+                    aid,
+                    v["account"]["email"].as_str(),
+                    v["account"]["plan"].as_str(),
+                );
+            }
         }
     }
     Ok(v)
@@ -1380,5 +1537,25 @@ mod tests {
         assert_eq!(cb["windows"].as_array().unwrap().len(), 2);
         assert_eq!(cb["windows"][0]["detail"], "500 / 500");
         assert_eq!(cb["windows"][1]["detail"], "2561.73 / 4800");
+    }
+
+    #[test]
+    fn cursor_auth_helpers_detect_api_key_and_endpoint() {
+        assert_eq!(
+            cursor_auth_api_key(br#"{"accessToken":"t","apiKey":"key_abc"}"#).as_deref(),
+            Some("key_abc")
+        );
+        assert_eq!(
+            cursor_auth_api_key(br#"{"accessToken":"t"}"#),
+            None
+        );
+        assert_eq!(
+            cursor_token_from_bytes(br#"{"accessToken":"tok_1"}"#).unwrap(),
+            "tok_1"
+        );
+        let mut penv = ProbeEnv::default();
+        penv.env
+            .insert("CURSOR_API_ENDPOINT".into(), "https://custom.cursor.example/".into());
+        assert_eq!(cursor_api_endpoint(&penv), "https://custom.cursor.example");
     }
 }
