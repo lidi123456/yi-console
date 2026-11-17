@@ -1220,6 +1220,8 @@ pub mod methods {
     pub const TOOLS_ACCOUNTS_LOGIN_CANCEL: &str = "tools.accounts.loginCancel";
     /// Export account credential bundle for cross-host sync {tool, accountId}
     pub const TOOLS_ACCOUNTS_EXPORT: &str = "tools.accounts.export";
+    /// Read unredacted API-key config for revealing secrets when editing an account {tool, accountId} -> ApiKeyConfig
+    pub const TOOLS_ACCOUNTS_REVEAL: &str = "tools.accounts.reveal";
     /// Import account credential bundle on this host {bundle}
     pub const TOOLS_ACCOUNTS_IMPORT: &str = "tools.accounts.import";
     /// Codex account whose config.toml selects a custom provider {tool, accountId, to: apiKey | oauth} -> AccountProfileView:

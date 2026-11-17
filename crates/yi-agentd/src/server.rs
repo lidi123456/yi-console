@@ -819,6 +819,12 @@ pub async fn dispatch(
             let hub2 = hub.clone();
             tokio::task::spawn_blocking(move || hub2.accounts.export_bundle(tool, &account_id)).await??
         }
+        TOOLS_ACCOUNTS_REVEAL => {
+            let tool = ToolKind::parse(s(&p, "tool")?).ok_or_else(|| anyhow!("未知工具"))?;
+            let account_id = s(&p, "accountId")?.to_string();
+            let cfg = hub.accounts.reveal_api_config(tool, &account_id)?;
+            serde_json::to_value(cfg)?
+        }
         TOOLS_ACCOUNTS_IMPORT => {
             let bundle = if p.get("bundle").is_some() { p["bundle"].clone() } else { p.clone() };
             let hub2 = hub.clone();
@@ -1059,5 +1065,54 @@ mod tests {
             drop(reader);
             task.await.unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn accounts_reveal_returns_unredacted_api_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut hub = Hub::new(crate::store::Store::open_memory().unwrap(), DaemonSettings::default());
+        Arc::get_mut(&mut hub).unwrap().accounts = Arc::new(crate::accounts::AccountManager::with_dirs(
+            dir.path().join("yi"),
+            dir.path().join("home"),
+        ));
+        let view = hub
+            .accounts
+            .save(crate::accounts::SaveAccountRequest {
+                tool: ToolKind::Claude,
+                label: Some("Reveal Test".into()),
+                auth_kind: Some(AccountAuthKind::ApiKey),
+                api_config: Some(ApiKeyConfig {
+                    api_key: "sk-ant-plain-123".into(),
+                    auth_token: "tok-plain-456".into(),
+                    extra_env: [("CUSTOM_SECRET".into(), "sec-789".into())].into_iter().collect(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(view.api_config.as_ref().unwrap().api_key, "********");
+
+        let (mut client, server) = tokio::io::duplex(4096);
+        let (r, w) = tokio::io::split(server);
+        let task = tokio::spawn(serve_conn(hub, r, w, "local"));
+        let request = json!({
+            "id": 1,
+            "method": methods::TOOLS_ACCOUNTS_REVEAL,
+            "params": { "tool": "claude", "accountId": view.id }
+        });
+        client.write_all(format!("{request}\n").as_bytes()).await.unwrap();
+        let mut reader = BufReader::new(client);
+        let mut response = String::new();
+        tokio::time::timeout(std::time::Duration::from_secs(2), reader.read_line(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        let response: Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["id"], 1);
+        assert_eq!(response["result"]["apiKey"], "sk-ant-plain-123");
+        assert_eq!(response["result"]["authToken"], "tok-plain-456");
+        assert_eq!(response["result"]["extraEnv"]["CUSTOM_SECRET"], "sec-789");
+        drop(reader);
+        task.await.unwrap();
     }
 }

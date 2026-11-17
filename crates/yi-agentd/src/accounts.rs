@@ -653,6 +653,13 @@ impl AccountManager {
             .and_then(|t| t.accounts.iter().find(|a| a.id == account_id).cloned())
     }
 
+    pub fn reveal_api_config(&self, tool: ToolKind, account_id: &str) -> Result<ApiKeyConfig> {
+        let acc = self
+            .get_stored(tool, account_id)
+            .ok_or_else(|| anyhow!("账号 {account_id} 不存在"))?;
+        Ok(acc.api_config.unwrap_or_default())
+    }
+
     pub fn all_accounts_for_tool(&self, tool: ToolKind) -> Vec<StoredAccount> {
         let g = self.data.lock().unwrap();
         g.tools
@@ -3447,6 +3454,9 @@ mod tests {
         let resolved = mgr.resolve(ToolKind::Claude, Some(&view.id)).unwrap();
         assert_eq!(resolved.env.get("ANTHROPIC_AUTH_TOKEN").unwrap(), "sk-or-secret-123");
         assert!(resolved.env_unset.contains(&"ANTHROPIC_API_KEY".to_string()));
+
+        let revealed = mgr.reveal_api_config(ToolKind::Claude, &view.id).unwrap();
+        assert_eq!(revealed.auth_token, "sk-or-secret-123");
     }
 
     #[test]

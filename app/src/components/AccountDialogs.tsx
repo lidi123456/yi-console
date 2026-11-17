@@ -1,6 +1,6 @@
 // Account manager sub-dialogs: the add chooser, the sign-in dialog (device code / link / paste code / terminal),
 // the API key drawer, import and export. Each tool gets its own options and fields (`TOOL_SPEC`).
-import { useEffect, useMemo, useState, type ReactNode } from 'react';
+import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { getT, trErr, useLang } from '../i18n';
 import { errorToast, toast } from '../store';
 import { rpc } from '../transport';
@@ -640,6 +640,9 @@ export function TerminalGuide({
   );
 }
 
+const REDACTED = '********';
+const EMPTY_API: ApiKeyConfig = { apiKey: '', authToken: '', baseUrl: '', defaultModel: '', providerName: '', extraEnv: {} };
+
 interface EnvRow {
   k: string;
   v: string;
@@ -679,19 +682,95 @@ export function AccountDrawer({
   const [env, setEnv] = useState<EnvRow[]>(() => Object.entries(api?.extraEnv ?? {}).map(([k, v]) => ({ k, v })));
   const [allow, setAllow] = useState(acc ? acc.allowAutoFailover : false);
   const [reveal, setReveal] = useState(false);
+  const [revealing, setRevealing] = useState(false);
+  const [unredacted, setUnredacted] = useState<ApiKeyConfig | null>(null);
   const [busy, setBusy] = useState(false);
   const [test, setTest] = useState<{ running?: boolean; ok?: boolean; n?: number; err?: string } | null>(null);
   const [adv, setAdv] = useState(() => !!(api?.authToken || Object.keys(api?.extraEnv ?? {}).length));
   const keyEnv = tool === 'codex' && codexProvider ? acc?.actual?.envKey || undefined : spec.key.env;
+  const mounted = useRef(true);
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
 
-  const config = (): ApiKeyConfig => ({
-    apiKey: apiKey.trim(),
-    authToken: authToken.trim(),
-    baseUrl: baseUrl.trim(),
-    defaultModel: model.trim(),
-    providerName: tool === 'codex' && codexProvider ? provider.trim() : '',
-    extraEnv: Object.fromEntries(env.filter((r) => r.k.trim()).map((r) => [r.k.trim(), r.v])),
-  });
+  const config = (forSave = false): ApiKeyConfig => {
+    const keepIfUnchanged = (val: string, orig?: string) => {
+      const t = val.trim();
+      return forSave && acc && unredacted && orig && t === orig ? REDACTED : t;
+    };
+    return {
+      apiKey: keepIfUnchanged(apiKey, unredacted?.apiKey),
+      authToken: keepIfUnchanged(authToken, unredacted?.authToken),
+      baseUrl: baseUrl.trim(),
+      defaultModel: model.trim(),
+      providerName: tool === 'codex' && codexProvider ? provider.trim() : '',
+      extraEnv: Object.fromEntries(
+        env
+          .filter((r) => r.k.trim())
+          .map((r) => {
+            const k = r.k.trim();
+            const orig = unredacted?.extraEnv?.[k];
+            const v = forSave && acc && unredacted && orig !== undefined && r.v === orig && api?.extraEnv?.[k] === REDACTED ? REDACTED : r.v;
+            return [k, v];
+          }),
+      ),
+    };
+  };
+
+  const toggleReveal = async () => {
+    if (reveal) {
+      setReveal(false);
+      return;
+    }
+    const needsReveal =
+      !!acc &&
+      isApi &&
+      !unredacted &&
+      (apiKey === REDACTED || authToken === REDACTED || env.some((r) => r.v === REDACTED));
+    if (!needsReveal || !acc) {
+      setReveal(true);
+      return;
+    }
+    if (revealing) return;
+    setRevealing(true);
+    try {
+      let cfg: ApiKeyConfig | undefined;
+      try {
+        cfg = await rpc<ApiKeyConfig>(hostId, 'tools.accounts.reveal', { tool, accountId: acc.id });
+      } catch (e) {
+        // Older remote daemons lack tools.accounts.reveal: fall back to tools.accounts.export
+        if (String((e as Error)?.message ?? e).includes('未知方法')) {
+          const bundle = await rpc<{ account?: { apiConfig?: ApiKeyConfig | null } }>(hostId, 'tools.accounts.export', {
+            tool,
+            accountId: acc.id,
+          });
+          cfg = bundle.account?.apiConfig ?? undefined;
+        } else {
+          throw e;
+        }
+      }
+      if (!mounted.current) return;
+      const resolved = cfg ?? EMPTY_API;
+      setUnredacted(resolved);
+      setApiKey((cur) => (cur === REDACTED ? resolved.apiKey ?? '' : cur));
+      setAuthToken((cur) => (cur === REDACTED ? resolved.authToken ?? '' : cur));
+      setEnv((rows) =>
+        rows.map((r) => {
+          if (r.v !== REDACTED) return r;
+          const k = r.k.trim();
+          return k && resolved.extraEnv && k in resolved.extraEnv ? { ...r, v: resolved.extraEnv[k] } : r;
+        }),
+      );
+      setReveal(true);
+    } catch (e) {
+      if (mounted.current) errorToast(e);
+    } finally {
+      if (mounted.current) setRevealing(false);
+    }
+  };
 
   const save = async () => {
     setBusy(true);
@@ -702,7 +781,7 @@ export function AccountDrawer({
         label: label.trim() || undefined,
         authKind: isApi ? 'apiKey' : 'oauth',
         allowAutoFailover: allow,
-        apiConfig: isApi ? config() : undefined,
+        apiConfig: isApi ? config(true) : undefined,
       });
       toast(tx('savedToast', { label: view.label }), 'info');
       onSaved();
@@ -767,7 +846,7 @@ export function AccountDrawer({
       <div className="acc-drawer-body">
         {isApi && tool === 'cursor' && <div className="acc-hint">{tx('cursorKeyHint')}</div>}
         {isApi && tool === 'cursor' && (
-          <KeyInput label={kindName} env={undefined} value={apiKey} placeholder={spec.key.placeholder} reveal={reveal} onReveal={() => setReveal((v) => !v)} onPaste={() => void pasteKey()} onChange={setApiKey} />
+          <KeyInput label={kindName} env={undefined} value={apiKey} placeholder={spec.key.placeholder} reveal={reveal} revealing={revealing} onReveal={() => void toggleReveal()} onPaste={() => void pasteKey()} onChange={setApiKey} />
         )}
         <label className="acc-field">
           <span>{tool === 'cursor' && isApi ? tx('fieldNameCursor') : tx('fieldName')}</span>
@@ -806,7 +885,8 @@ export function AccountDrawer({
               value={apiKey}
               placeholder={spec.key.placeholder}
               reveal={reveal}
-              onReveal={() => setReveal((v) => !v)}
+              revealing={revealing}
+              onReveal={() => void toggleReveal()}
               onPaste={() => void pasteKey()}
               onChange={setApiKey}
             />
@@ -892,6 +972,7 @@ function KeyInput({
   value,
   placeholder,
   reveal,
+  revealing,
   onReveal,
   onPaste,
   onChange,
@@ -901,6 +982,7 @@ function KeyInput({
   value: string;
   placeholder?: string;
   reveal: boolean;
+  revealing?: boolean;
   onReveal: () => void;
   onPaste: () => void;
   onChange: (v: string) => void;
@@ -913,7 +995,7 @@ function KeyInput({
       </span>
       <span className="acc-input-wrap">
         <input className="grow" value={value} type={reveal ? 'text' : 'password'} placeholder={placeholder} autoComplete="off" onChange={(e) => onChange(e.target.value)} />
-        <button type="button" className="icon-btn" title={tx('reveal')} onClick={onReveal}>
+        <button type="button" className={`icon-btn ${reveal ? 'active' : ''}`} title={tx('reveal')} aria-pressed={reveal} disabled={revealing} onClick={onReveal}>
           <Icon name="eye" size={14} />
         </button>
         <button type="button" className="icon-btn" title={tx('paste')} onClick={onPaste}>
