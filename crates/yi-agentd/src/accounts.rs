@@ -736,6 +736,33 @@ impl AccountManager {
         }
     }
 
+    /// OAuth accounts saved without an email (e.g. Antigravity on Windows before its keyring entry was recognised):
+    /// read it from the saved snapshot, which also renames a placeholder label. Tried once per account per process
+    fn backfill_identity_from_snapshots(&self, tool: ToolKind) {
+        static TRIED: Mutex<Option<HashSet<(ToolKind, String)>>> = Mutex::new(None);
+        let ids: Vec<String> = {
+            let g = self.data.lock().unwrap();
+            let Some(td) = g.tools.get(tool.as_str()) else {
+                return;
+            };
+            td.accounts
+                .iter()
+                .filter(|a| a.auth_kind == AccountAuthKind::Oauth && a.identity.email.is_none())
+                .map(|a| a.id.clone())
+                .collect()
+        };
+        for id in ids {
+            if !TRIED.lock().unwrap().get_or_insert_with(HashSet::new).insert((tool, id.clone())) {
+                continue;
+            }
+            let Some(snap) = self.load_snapshot(tool, &id) else {
+                continue;
+            };
+            let ident = self.parse_host_identity(tool, &snap);
+            self.update_identity_if_missing(tool, &id, ident.email.as_deref(), ident.plan.as_deref());
+        }
+    }
+
     pub fn list(
         &self,
         tool_filter: Option<ToolKind>,
@@ -751,6 +778,9 @@ impl AccountManager {
                 .filter(|t| t.supports_accounts())
                 .collect(),
         };
+        for t in &tools {
+            self.backfill_identity_from_snapshots(*t);
+        }
 
         let snapshot: Vec<(ToolKind, ToolAccountsData)> = {
             let g = self.data.lock().unwrap();
@@ -2225,10 +2255,12 @@ impl AccountManager {
                     }
                 }
                 for e in &snap.keyring {
+                    // Windows keeps it as service `gemini:antigravity`, account `antigravity`
                     if e.service.contains("antigravity-oauth-token")
                         || e.account.contains("antigravity-oauth-token")
                         || e.service.contains("jetski-standalone-oauth-token")
                         || e.account.contains("jetski-standalone-oauth-token")
+                        || e.service == "gemini:antigravity"
                     {
                         if let Some(id) = parse_antigravity_token_bytes(&e.secret_bytes()) {
                             return id;
@@ -3883,6 +3915,13 @@ mod tests {
         };
         let win_id = mgr.parse_host_identity(ToolKind::Antigravity, &win_snap);
         assert_eq!(win_id.email.as_deref(), Some("alice@example.com"));
+
+        // Current agy on Windows: TargetName="gemini:antigravity", UserName="antigravity"
+        let win2_snap = SnapshotBundle {
+            keyring: vec![KeyringEntry::from_bytes("gemini:antigravity".into(), "antigravity".into(), None, payload.as_bytes())],
+            ..Default::default()
+        };
+        assert_eq!(mgr.parse_host_identity(ToolKind::Antigravity, &win2_snap).email.as_deref(), Some("alice@example.com"));
     }
 
     const GATEWAY_CFG: &str = "model = \"gpt-6.1-sol\"\nmodel_provider = \"myapi\"\n[projects.'d:\\git\\x']\ntrust_level = \"trusted\"\n\n[model_providers.myapi]\nname = \"myapi\"\nbase_url = \"https://gw.example/api/v1\"\nenv_key = \"API_GATEWAY_KEY\" # the gateway's key\nwire_api = \"responses\"\n";
