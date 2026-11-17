@@ -183,7 +183,7 @@ export function addOptions(tool: ToolKind, summary: ToolAccountsSummary | undefi
   return out;
 }
 
-/** A layer inside the account manager (scrim + content); Esc / Android back closes the top one */
+/** A layer inside the account manager (scrim + content); only explicit close actions or Esc / Android back dismiss it (not backdrop clicks) */
 export function Layer({ onClose, drawer, children, wide }: { onClose: () => void; drawer?: boolean; wide?: boolean; children: ReactNode }) {
   useBack(true, onClose);
   useEffect(() => {
@@ -198,8 +198,8 @@ export function Layer({ onClose, drawer, children, wide }: { onClose: () => void
     return () => window.removeEventListener('keydown', onKey, true);
   }, [onClose]);
   return (
-    <div className="acc-layer" onMouseDown={onClose}>
-      <div className={drawer ? 'acc-drawer' : `acc-dlg ${wide ? 'wide' : ''}`} role="dialog" onMouseDown={(e) => e.stopPropagation()}>
+    <div className="acc-layer">
+      <div className={drawer ? 'acc-drawer' : `acc-dlg ${wide ? 'wide' : ''}`} role="dialog">
         {children}
       </div>
     </div>
@@ -614,14 +614,14 @@ export function TerminalGuide({
               : tx('terminalNotDetected', { tool: TOOL_LABEL[tool] })}
         </span>
         <button
-          className="btn small ghost"
+          className="btn xs"
           disabled={checking}
           onClick={() => {
             setChecking(true);
             void onRecheck().finally(() => setChecking(false));
           }}
         >
-          <Icon name="refresh" size={13} /> {tx('recheck')}
+          <Icon name="refresh" size={12} /> {tx('recheck')}
         </button>
       </div>
       <div className="acc-note warn">{tool === 'kiro' ? tx('kiroTerminalNote') : tx('codebuddyIdeNote')}</div>
@@ -815,7 +815,7 @@ export function AccountDrawer({
             {spec.keyOnly && <div className="acc-hint">{tx('keyOnlyHint', { tool: TOOL_LABEL[tool] })}</div>}
             {spec.test && (
               <div className="acc-btn-row">
-                <button className="btn small" disabled={test?.running || !apiKey.trim()} onClick={() => void runTest()}>
+                <button className="btn xs" disabled={test?.running || !apiKey.trim()} onClick={() => void runTest()}>
                   {tx('testConnection')}
                 </button>
                 {test && (

@@ -505,7 +505,7 @@ export function AccountManagerModal({
   };
 
   return (
-    <div className="modal-bg" onMouseDown={onClose}>
+    <div className="modal-bg" onMouseDown={() => { if (!layer) onClose(); }}>
       <div className="modal acc2" role="dialog" onMouseDown={(e) => e.stopPropagation()}>
         <nav className="acc2-rail" aria-label={tx('toolSelector')}>
           <div className="acc2-rail-title">{tx('title')}</div>
@@ -562,14 +562,14 @@ export function AccountManagerModal({
               </label>
             )}
             <button className="icon-btn" title={tx('refreshQuotas')} disabled={probing} onClick={refreshClick}>
-              <Icon name="refresh" size={16} />
+              <Icon name="refresh" size={15} />
             </button>
             <button className="btn primary" onClick={() => setLayer({ k: 'add' })}>
-              <Icon name="plus" size={14} /> <span className="acc2-hide-sm">{tx('addAccount')}</span>
+              <Icon name="plus" size={13} /> <span className="acc2-hide-sm">{tx('addAccount')}</span>
               <span className="acc2-show-sm">{tx('addShort')}</span>
             </button>
             <button className="icon-btn" title={tx('close')} onClick={onClose}>
-              <Icon name="x" size={16} />
+              <Icon name="x" size={15} />
             </button>
           </div>
 
@@ -619,7 +619,7 @@ export function AccountManagerModal({
                   </>
                 ) : (
                   <button className="btn primary" onClick={() => setLayer({ k: 'add' })}>
-                    <Icon name="plus" size={14} /> {tx('addAccount')}
+                    <Icon name="plus" size={13} /> {tx('addAccount')}
                   </button>
                 )}
               </div>
@@ -699,11 +699,11 @@ export function AccountManagerModal({
                           </div>
                           <div className="acc-btn-row">
                             {acc.actual.method === 'providerApiKey' && acc.actual.envKey && (
-                              <button className="btn small primary" disabled={busy} onClick={() => void convert(acc, 'apiKey')}>
+                              <button className="btn xs primary" disabled={busy} onClick={() => void convert(acc, 'apiKey')}>
                                 {tx('convertToApiKey')}
                               </button>
                             )}
-                            <button className="btn small" disabled={busy} onClick={() => void convert(acc, 'oauth')}>
+                            <button className="btn xs" disabled={busy} onClick={() => void convert(acc, 'oauth')}>
                               {tx('convertToOauth')}
                             </button>
                           </div>
@@ -719,22 +719,22 @@ export function AccountManagerModal({
                     </div>
                     <div className="acc2-acts">
                       {primary === 'relogin' && (
-                        <button className="btn small primary" disabled={busy || loginJob?.running} onClick={() => void startLogin(reloginMode, acc)}>
+                        <button className="btn xs primary" disabled={busy || loginJob?.running} onClick={() => void startLogin(reloginMode, acc)}>
                           {tx('relogin')}
                         </button>
                       )}
                       {primary === 'session' && (
-                        <button className="btn small" disabled={busy} onClick={() => void switchSession(acc)}>
+                        <button className="btn xs" disabled={busy} onClick={() => void switchSession(acc)}>
                           {tx('useForSession')}
                         </button>
                       )}
                       {primary === 'default' && (
-                        <button className="btn small" disabled={busy} onClick={() => void activate(acc)}>
+                        <button className="btn xs" disabled={busy} onClick={() => void activate(acc)}>
                           {tx('setDefault')}
                         </button>
                       )}
                       <button className="icon-btn" title={tx('more')} onClick={(e) => cardMenu(e, acc, idx)}>
-                        <Icon name="more" size={16} />
+                        <Icon name="more" size={14} />
                       </button>
                     </div>
                   </div>
