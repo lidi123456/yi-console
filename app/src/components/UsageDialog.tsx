@@ -102,30 +102,42 @@ export function UsageDialog({ hostId, info, onClose }: { hostId: string; info: S
           const otherAccounts = allGroup ? allGroup.accounts.filter((acc) => acc.accountId !== shownAccountId) : [];
           return (
             <>
-              <div className="card-title row usage-quota-head" style={{ gap: 6, flexWrap: 'wrap', alignItems: 'center' }}>
+              <div className="card-title row usage-quota-head">
                 <ToolBadge tool={info.tool} size={16} />
                 <span style={{ whiteSpace: 'nowrap' }}>{TOOL_LABEL[info.tool]} {t('quota')}</span>
-                {accountBadge && <span className="acc-badge acc-badge-accent">{accountBadge}</span>}
-                {quotaObj && (quotaObj.account?.plan || quotaObj.account?.email) && (
-                  <span className="muted small" style={{ wordBreak: 'break-all' }}>
-                    {[quotaObj.account.plan, quotaObj.account.email].filter(Boolean).join(' · ')}
-                  </span>
-                )}
                 <span className="grow" />
-                {supportsAccountsTool(info.tool) && (
+                <span className="usage-quota-acts">
+                  {supportsAccountsTool(info.tool) && (
+                    <button
+                      className="btn xs"
+                      onClick={() =>
+                        openAccountManager({ hostId, tool: info.tool, sessionId: info.id, accountId: info.accountId })
+                      }
+                    >
+                      <Icon name="key" size={12} /> {t('manageAccounts')}
+                    </button>
+                  )}
                   <button
-                    className="btn small"
-                    onClick={() =>
-                      openAccountManager({ hostId, tool: info.tool, sessionId: info.id, accountId: info.accountId })
-                    }
+                    className="btn xs icon-only"
+                    title={t('refresh')}
+                    aria-label={t('refresh')}
+                    disabled={quota === undefined}
+                    onClick={() => load(true, false)}
                   >
-                    <Icon name="key" size={14} /> {t('manageAccounts')}
+                    <Icon name="refresh" size={12} />
                   </button>
-                )}
-                <button className="btn small" disabled={quota === undefined} onClick={() => load(true, false)}>
-                  {t('refresh')}
-                </button>
+                </span>
               </div>
+              {(accountBadge || (quotaObj && (quotaObj.account?.plan || quotaObj.account?.email))) && (
+                <div className="row usage-quota-sub">
+                  {accountBadge && <span className="acc-badge acc-badge-accent">{accountBadge}</span>}
+                  {quotaObj && (quotaObj.account?.plan || quotaObj.account?.email) && (
+                    <span className="muted small" style={{ wordBreak: 'break-all' }}>
+                      {[quotaObj.account.plan, quotaObj.account.email].filter(Boolean).join(' · ')}
+                    </span>
+                  )}
+                </div>
+              )}
               <div className="quota">
                 <QuotaBody q={quota} />
                 {quotaObj && quotaObj.windows.length === 0 && !quotaObj.note && (
@@ -141,7 +153,7 @@ export function UsageDialog({ hostId, info, onClose }: { hostId: string; info: S
                     <span className="grow" />
                     {allGroup?.oauthIsolation === 'hostActive' &&
                       otherAccounts.some((acc) => acc.isolation === 'hostActive' && !acc.active) && (
-                        <button className="btn small" disabled={quota === undefined} onClick={() => load(true, true)}>
+                        <button className="btn xs" disabled={quota === undefined} onClick={() => load(true, true)}>
                           {t('probeAll')}
                         </button>
                       )}
@@ -154,7 +166,7 @@ export function UsageDialog({ hostId, info, onClose }: { hostId: string; info: S
                           <span className="acc-badge">{acc.authKind === 'apiKey' ? 'API' : 'OAuth'}</span>
                           <span className="grow" />
                           <button
-                            className="btn small"
+                            className="btn xs"
                             disabled={switchingId === acc.accountId}
                             onClick={async () => {
                               setSwitchingId(acc.accountId);

@@ -667,7 +667,7 @@ textarea {
 
 /* ---------- Common components ---------- */
 
-/* Buttons come in two sizes only: regular (page header, form footer) and small (actions inside cards); same font size, different height */
+/* Buttons come in three sizes: regular (page header, form footer), small (card actions), and xs (dense headers and inline row actions) */
 .btn {
   display: inline-flex;
   align-items: center;
@@ -709,6 +709,37 @@ textarea {
 .btn.small {
   height: 28px;
   padding: 0 10px;
+}
+
+.btn.xs {
+  height: 22px;
+  padding: 0 7px;
+  border-radius: 6px;
+  font-size: 11.5px;
+  font-weight: 400;
+  gap: 4px;
+}
+
+.btn.xs.icon-only {
+  width: 22px;
+  padding: 0;
+  color: var(--text-2);
+}
+
+.btn.xs.icon-only:hover:not(:disabled) {
+  color: var(--text);
+}
+
+@media (pointer: coarse) {
+  .btn.xs {
+    height: 26px;
+    padding: 0 8px;
+  }
+
+  .btn.xs.icon-only {
+    width: 26px;
+    padding: 0;
+  }
 }
 .form > .btn,
 .step-body > .btn,
@@ -7625,7 +7656,23 @@ body.resizing .side-resizer::after {
 }
 .usage-quota-head {
   gap: 6px;
+  flex-wrap: wrap;
+  align-items: center;
   margin-top: 14px !important;
+}
+.usage-quota-head:has(+ .usage-quota-sub) {
+  margin-bottom: 5px;
+}
+.usage-quota-acts {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex: none;
+}
+.usage-quota-sub {
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-bottom: 10px;
 }
 
 /* ---- Sidebar: Bots section (BotsSection.tsx), above the hosts ---- */
