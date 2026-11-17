@@ -92,5 +92,15 @@
   "accountSwitchedHostNoFrom": "宿主活跃账号已变更，同步切换至「{{to}}」",
   "accountContextNative": "原生会话接续",
   "accountContextSummary": "上下文摘要接力",
-  "accountContextFresh": "新进程启动"
+  "accountContextFresh": "新进程启动",
+  "copyCode": "复制代码",
+  "copyTable": "复制表格",
+  "copyCommand": "复制命令",
+  "copyInput": "复制输入",
+  "copyOutput": "复制输出",
+  "selectText": "选择文本",
+  "selectTextHint": "长按文字自由拖选",
+  "copySelection": "复制选中",
+  "copyAll": "复制全文",
+  "close": "关闭"
 }

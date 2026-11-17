@@ -11,7 +11,7 @@ import { initTheme } from './theme';
 import { initFontPrefs } from './fontPrefs';
 import { initLang } from './i18n';
 import { isMobileApp, openUrl, openUrlExternal } from './components/PortsView';
-import { openMenu } from './components/Overlay';
+import { isTouchContextMenu, openMenu } from './components/Overlay';
 import { writeClipboard } from './clipboard';
 import { getT } from './i18n';
 import { startUpdateChecks } from './update';
@@ -37,10 +37,13 @@ document.addEventListener('auxclick', guardLink);
 // Right-click on a link (long press on mobile): open, open in another browser, copy link. Handled before the global edit menu
 function linkMenu(e: MouseEvent) {
   if (e.defaultPrevented) return;
-  const a = (e.target as Element | null)?.closest?.('a[href]') as HTMLAnchorElement | null;
+  const target = e.target instanceof Element ? e.target : (e.target as Node | null)?.parentElement ?? null;
+  const a = target?.closest?.('a[href]') as HTMLAnchorElement | null;
   if (!a || a.hasAttribute('download') || !/^https?:/i.test((a.getAttribute('href') ?? '').trim())) return;
   const url = a.href;
   const sel = window.getSelection()?.toString() ?? '';
+  // On touch screens, if the user already dragged a multi-word text selection across prose, keep the OS selection callout
+  if (isTouchContextMenu(e) && sel.trim() && sel.trim() !== (a.textContent ?? '').trim()) return;
   openMenu(e, [
     { label: isMobileApp ? t('openInApp') : t('openInBrowser'), icon: 'globe', run: () => openUrl(url) },
     ...(isMobileApp ? [{ label: t('openInAnotherBrowser'), icon: 'external', run: () => openUrlExternal(url) }] : []),

@@ -92,5 +92,15 @@
   "accountSwitchedHostNoFrom": "Host active account changed; synced to \"{{to}}\"",
   "accountContextNative": "Native resume",
   "accountContextSummary": "Context summary handoff",
-  "accountContextFresh": "Fresh context"
+  "accountContextFresh": "Fresh context",
+  "copyCode": "Copy code",
+  "copyTable": "Copy table",
+  "copyCommand": "Copy command",
+  "copyInput": "Copy input",
+  "copyOutput": "Copy output",
+  "selectText": "Select text",
+  "selectTextHint": "Long-press and drag to select",
+  "copySelection": "Copy selection",
+  "copyAll": "Copy all",
+  "close": "Close"
 }

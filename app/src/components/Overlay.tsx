@@ -298,13 +298,31 @@ export function editMenu(target: Element | null): (MenuItem | '-')[] {
   return [{ label: t('copy'), icon: 'copy', hint: `${MOD}C`, run: () => writeClipboard(text) }];
 }
 
+/** Whether a `contextmenu` event came from a touch / pen long-press rather than a mouse right-click */
+export function isTouchContextMenu(e: MouseEvent): boolean {
+  const pt = (e as PointerEvent).pointerType;
+  if (pt) return pt === 'touch' || pt === 'pen';
+  return window.matchMedia('(pointer: coarse)').matches;
+}
+
+const SELECTABLE_TEXT =
+  '.md, .bubble, pre, code, .thinking-body, .tl-out, .tl-err, .tl-diff, .note, .q-question, .q-opt-body, .perm-title, .select-text-body, .wp-preview';
+
 /** Suppress the WebView's built-in context menu globally; leave alone events components already handled (preventDefault) */
 export function useContextMenu() {
   useEffect(() => {
     const f = (e: MouseEvent) => {
       if (e.defaultPrevented) return;
+      const target = e.target instanceof Element ? e.target : (e.target as Node | null)?.parentElement ?? null;
+      if (isTouchContextMenu(e)) {
+        // On touch screens, keep the OS's native selection handles, magnifier and copy/paste callout in inputs and selectable text
+        if (editable(target) || target?.closest('[contenteditable="true"]')) return;
+        const sel = window.getSelection();
+        if (sel && !sel.isCollapsed && sel.toString().trim()) return;
+        if (target && !target.closest('button') && target.closest(SELECTABLE_TEXT)) return;
+      }
       e.preventDefault();
-      openMenu(e, editMenu(e.target as Element));
+      openMenu(e, editMenu(target));
     };
     window.addEventListener('contextmenu', f);
     return () => window.removeEventListener('contextmenu', f);

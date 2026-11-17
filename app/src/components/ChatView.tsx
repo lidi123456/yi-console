@@ -1,5 +1,7 @@
 import { ChatMarkdown } from './ChatMarkdown';
 import { createContext, memo, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
+import { useBack } from '../back';
 import { ENGINE_ORIGIN, EngineNote } from './EngineNote';
 import { ContextRefBar } from './ContextRefBar';
 import { parseContextMessage } from '../contextRefs';
@@ -378,8 +380,140 @@ function fmtMs(ms: number) {
   return isEn() ? `${m}m ${s}s` : `${m} 分 ${s} 秒`;
 }
 
+/** Copy button with brief checkmark feedback (1.5s), shared by tool detail blocks and approval command blocks */
+function InlineCopyBtn({
+  text,
+  label,
+  className = '',
+  size = 13,
+}: {
+  text: string;
+  label: string;
+  className?: string;
+  size?: number;
+}) {
+  useLang();
+  const [copied, setCopied] = useState(false);
+  const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(
+    () => () => {
+      if (timer.current) clearTimeout(timer.current);
+    },
+    [],
+  );
+  const title = copied ? t('copied') : label;
+  return (
+    <button
+      type="button"
+      className={`inline-copy-btn ${copied ? 'copied' : ''} ${className}`.trim()}
+      title={title}
+      aria-label={title}
+      onClick={async (e) => {
+        e.stopPropagation();
+        if (!(await writeClipboard(text))) {
+          toast(t('copyFailed'), 'error');
+          return;
+        }
+        setCopied(true);
+        if (timer.current) clearTimeout(timer.current);
+        timer.current = setTimeout(() => setCopied(false), 1500);
+      }}
+    >
+      <Icon name={copied ? 'check' : 'copy'} size={size} />
+    </button>
+  );
+}
+
+/** `<pre>` with a floating copy button positioned outside `<pre>` so manual drag-selection doesn't include it */
+function CopyPre({
+  text,
+  label,
+  className,
+  children,
+}: {
+  text: string;
+  label: string;
+  className?: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <div className="copy-pre-wrap">
+      {text ? <InlineCopyBtn text={text} label={label} className="copy-float-btn" size={13} /> : null}
+      <pre className={className}>{children}</pre>
+    </div>
+  );
+}
+
+/** Mobile-only plain-text selection sheet: clean text with no interactive links or cards, making partial drag-selection easy on phones */
+function SelectTextModal({ text, onClose }: { text: string; onClose: () => void }) {
+  useLang();
+  useBack(true, onClose);
+  const bodyRef = useRef<HTMLDivElement>(null);
+  const closeBtn = useRef<HTMLButtonElement>(null);
+  const [selected, setSelected] = useState('');
+  useLayoutEffect(() => {
+    const prev = document.activeElement as HTMLElement | null;
+    closeBtn.current?.focus();
+    return () => prev?.focus();
+  }, []);
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape' || e.isComposing) return;
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      onClose();
+    };
+    const onSel = () => {
+      const box = bodyRef.current;
+      const s = window.getSelection();
+      if (!box || !s || s.isCollapsed) {
+        setSelected('');
+        return;
+      }
+      const inBox = (!!s.anchorNode && box.contains(s.anchorNode)) || (!!s.focusNode && box.contains(s.focusNode));
+      setSelected(inBox ? s.toString() : '');
+    };
+    window.addEventListener('keydown', onKey, true);
+    document.addEventListener('selectionchange', onSel);
+    return () => {
+      window.removeEventListener('keydown', onKey, true);
+      document.removeEventListener('selectionchange', onSel);
+    };
+  }, [onClose]);
+  return (
+    <div className="select-text-modal" role="dialog" aria-modal="true" aria-label={t('selectText')}>
+      <div className="select-text-head">
+        <button ref={closeBtn} type="button" className="icon-btn" title={t('close')} aria-label={t('close')} onClick={onClose}>
+          <Icon name="back" size={18} />
+        </button>
+        <div className="select-text-titles">
+          <strong>{t('selectText')}</strong>
+          <span className="muted small">{t('selectTextHint')}</span>
+        </div>
+        <button
+          type="button"
+          className={`btn small ${selected.trim() ? 'primary' : ''}`}
+          // Keep the user's text selection intact when tapping the copy button
+          onPointerDown={(e) => e.preventDefault()}
+          onMouseDown={(e) => e.preventDefault()}
+          onClick={async () => {
+            const payload = selected.trim() ? selected : text;
+            toast((await writeClipboard(payload)) ? t('copied') : t('copyFailed'));
+          }}
+        >
+          <Icon name="copy" size={13} />
+          <span>{selected.trim() ? t('copySelection') : t('copyAll')}</span>
+        </button>
+      </div>
+      <div ref={bodyRef} className="select-text-body">
+        {text}
+      </div>
+    </div>
+  );
+}
+
 /** The line under each reply: duration, tokens, cost, tool call count, model, plus copying the whole turn */
-function TurnFooter({ it }: { it: Item & { k: 'turn' } }) {
+function TurnFooter({ it, onSelectText }: { it: Item & { k: 'turn' }; onSelectText?: (text: string) => void }) {
   const u = it.usage;
   const parts: string[] = [];
   if (it.ms != null && it.ms >= 0) parts.push(fmtMs(it.ms));
@@ -401,13 +535,27 @@ function TurnFooter({ it }: { it: Item & { k: 'turn' } }) {
       <span>{parts.join(' · ')}</span>
       <span className="turn-time">{clock(it.ts)}</span>
       {it.text && (
-        <button
-          className="turn-copy"
-          title={t('copyThisReply')}
-          onClick={async () => toast((await writeClipboard(it.text)) ? t('copied') : t('copyFailed'))}
-        >
-          <Icon name="copy" size={13} />
-        </button>
+        <>
+          <button
+            className="turn-copy"
+            title={t('copyThisReply')}
+            aria-label={t('copyThisReply')}
+            onClick={async () => toast((await writeClipboard(it.text)) ? t('copied') : t('copyFailed'))}
+          >
+            <Icon name="copy" size={13} />
+          </button>
+          {onSelectText && (
+            <button
+              type="button"
+              className="turn-copy mobile-select-btn"
+              title={t('selectText')}
+              aria-label={t('selectText')}
+              onClick={() => onSelectText(it.text)}
+            >
+              <Icon name="text" size={13} />
+            </button>
+          )}
+        </>
       )}
     </div>
   );
@@ -428,15 +576,16 @@ function Markdown({ text, streaming = false }: { text: string; streaming?: boole
   return <ChatMarkdown text={text} streaming={streaming} ctx={ctx} />;
 }
 
-/** The user is selecting text in this element (or is dragging with the mouse down) */
-function selectingIn(el: HTMLElement | null, mouseDown: boolean) {
+/** The user is selecting text in this element (or is pressing / dragging with mouse or touch) */
+function selectingIn(el: HTMLElement | null, pointerDown: boolean) {
   if (!el) return false;
-  if (mouseDown) return true;
+  if (pointerDown) return true;
   const s = window.getSelection();
-  return !!s && !s.isCollapsed && !!s.anchorNode && el.contains(s.anchorNode);
+  if (!s || s.isCollapsed) return false;
+  return (!!s.anchorNode && el.contains(s.anchorNode)) || (!!s.focusNode && el.contains(s.focusNode));
 }
 
-/** Streaming body: don't refresh while the user is selecting text, otherwise each new chunk redraws the block and the selection is lost */
+/** Streaming body: don't refresh while the user is selecting text (or holding touch), otherwise each new chunk redraws the block and breaks selection */
 function LiveMarkdown({ text }: { text: string }) {
   const ref = useRef<HTMLDivElement>(null);
   const latest = useRef(text);
@@ -455,17 +604,19 @@ function LiveMarkdown({ text }: { text: string }) {
       sync();
     };
     document.addEventListener('selectionchange', sync);
-    window.addEventListener('mouseup', up);
+    window.addEventListener('pointerup', up);
+    window.addEventListener('pointercancel', up);
     return () => {
       document.removeEventListener('selectionchange', sync);
-      window.removeEventListener('mouseup', up);
+      window.removeEventListener('pointerup', up);
+      window.removeEventListener('pointercancel', up);
     };
   }, []);
   return (
     <div
       ref={ref}
       className={`tl tl-text msg-assistant streaming ${shown !== text ? 'paused' : ''}`}
-      onMouseDown={() => (down.current = true)}
+      onPointerDown={() => (down.current = true)}
     >
       <span className="tl-dot" />
       <Markdown text={shown} streaming />
@@ -799,10 +950,21 @@ const ToolLine = memo(function ToolLine({ it, active, cwd }: { it: Item & { k: '
           <div className="tl-detail">
             {it.desktop && <DesktopShots ev={it.desktop} />}
             {kind === 'edit' && it.diffs.map((d, i) => <DiffView key={i} diff={d} />)}
-            {cmd ? <pre className="mono">{cmd}</pre> : taskDetail ? <pre className="mono">{taskDetail}</pre> : hasInput && <pre className="mono">{typeof it.input === 'string' ? it.input : JSON.stringify(it.input, null, 2)}</pre>}
+            {cmd ? (
+              <CopyPre text={cmd} label={t('copyCommand')} className="mono">{cmd}</CopyPre>
+            ) : taskDetail ? (
+              <CopyPre text={taskDetail} label={t('copyInput')} className="mono">{taskDetail}</CopyPre>
+            ) : (
+              hasInput && (() => {
+                const rawIn = typeof it.input === 'string' ? it.input : JSON.stringify(it.input, null, 2);
+                return <CopyPre text={rawIn} label={t('copyInput')} className="mono">{rawIn}</CopyPre>;
+              })()
+            )}
             {it.result && kind !== 'edit' && (
               <>
-                <pre className="mono">{(full ? out : out.split('\n').slice(0, 200).join('\n')) || t('noOutput')}</pre>
+                <CopyPre text={out} label={t('copyOutput')} className="mono">
+                  {(full ? out : out.split('\n').slice(0, 200).join('\n')) || t('noOutput')}
+                </CopyPre>
                 {!full && out.split('\n').length > 200 && (
                   <button className="link-btn small" onClick={() => setFull(true)}>
                     {t('showAllLines', { length: out.split('\n').length })}
@@ -1197,13 +1359,18 @@ function PermissionBody({
       </div>
       {!folded && (
         <>
-      {!it.resolved && typeof cmd === 'string' && <pre className="mono perm-cmd">{cmd}</pre>}
+      {!it.resolved && typeof cmd === 'string' && (
+        <CopyPre text={cmd} label={t('copyCommand')} className="mono perm-cmd">{cmd}</CopyPre>
+      )}
       {!it.resolved && it.input !== undefined && it.input !== null && typeof cmd !== 'string' && (
         <>
           <button className="link-btn small" onClick={() => setShowInput(!showInput)}>
             {showInput ? t('hideDetails') : t('showDetails')}
           </button>
-          {showInput && <pre className="mono perm-cmd">{JSON.stringify(it.input, null, 2)}</pre>}
+          {showInput && (() => {
+            const rawIn = JSON.stringify(it.input, null, 2);
+            return <CopyPre text={rawIn} label={t('copyInput')} className="mono perm-cmd">{rawIn}</CopyPre>;
+          })()}
         </>
       )}
       {!it.resolved && onAnswer && (
@@ -1361,17 +1528,27 @@ const ModernTool = memo(function ModernTool({ it, active, cwd }: { it: Item & { 
           ) : (
             <div className="mt-box mono">
               {input && (
-                <>
-                  <div className="mt-box-label">{t('input')}</div>
+                <div className="mt-sec">
+                  <div className="mt-box-head">
+                    <span className="mt-box-label">{t('input')}</span>
+                    <InlineCopyBtn text={input} label={v.kind === 'bash' ? t('copyCommand') : t('copyInput')} size={12} />
+                  </div>
                   <pre>{input}</pre>
-                </>
+                </div>
               )}
-              {it.result ? (
-                <>
-                  <div className="mt-box-label">{t('output')}</div>
-                  <pre className={v.err ? 'err' : ''}>{v.parsed.tasks ? v.parsed.tasks.map((t) => `${t.done ? '☑' : '☐'} ${t.text}`).join('\n') : out.split('\n').slice(0, 400).join('\n') || t('noOutput')}</pre>
-                </>
-              ) : (
+              {it.result ? (() => {
+                const outCopy = v.parsed.tasks ? v.parsed.tasks.map((x) => `${x.done ? '☑' : '☐'} ${x.text}`).join('\n') : out;
+                const outShown = v.parsed.tasks ? outCopy : out.split('\n').slice(0, 400).join('\n');
+                return (
+                  <div className="mt-sec">
+                    <div className="mt-box-head">
+                      <span className="mt-box-label">{t('output')}</span>
+                      {outCopy ? <InlineCopyBtn text={outCopy} label={t('copyOutput')} size={12} /> : null}
+                    </div>
+                    <pre className={v.err ? 'err' : ''}>{outShown || t('noOutput')}</pre>
+                  </div>
+                );
+              })() : (
                 <div className="mt-box-label">{running ? t('running') : t('noResult2')}</div>
               )}
             </div>
@@ -1528,8 +1705,16 @@ function fullTime(ms: number) {
   return `${t.getFullYear()}-${p(t.getMonth() + 1)}-${p(t.getDate())} ${p(t.getHours())}:${p(t.getMinutes())}`;
 }
 
-/** Compact-style action row under each reply: copy, duration and usage; the time shows on hover */
-function ModernTurnFooter({ it, latest }: { it: Item & { k: 'turn' }; latest: boolean }) {
+/** Compact-style action row under each reply: copy, mobile select-text, duration and usage; the time shows on hover */
+function ModernTurnFooter({
+  it,
+  latest,
+  onSelectText,
+}: {
+  it: Item & { k: 'turn' };
+  latest: boolean;
+  onSelectText?: (text: string) => void;
+}) {
   const u = it.usage;
   const parts: string[] = [];
   if (it.ms != null && it.ms >= 0) parts.push(`${t('took')} ${fmtDur(it.ms)}`);
@@ -1547,13 +1732,27 @@ function ModernTurnFooter({ it, latest }: { it: Item & { k: 'turn' }; latest: bo
     <div className={`m-actions ${latest ? 'latest' : ''}`}>
       {it.reason && <span className="attn-text">{it.reason}</span>}
       {it.text && (
-        <button
-          className="m-act-btn"
-          title={t('copyThisReply')}
-          onClick={async () => toast((await writeClipboard(it.text)) ? t('copied') : t('copyFailed'))}
-        >
-          <Icon name="copy" size={14} />
-        </button>
+        <>
+          <button
+            className="m-act-btn"
+            title={t('copyThisReply')}
+            aria-label={t('copyThisReply')}
+            onClick={async () => toast((await writeClipboard(it.text)) ? t('copied') : t('copyFailed'))}
+          >
+            <Icon name="copy" size={14} />
+          </button>
+          {onSelectText && (
+            <button
+              type="button"
+              className="m-act-btn mobile-select-btn"
+              title={t('selectText')}
+              aria-label={t('selectText')}
+              onClick={() => onSelectText(it.text)}
+            >
+              <Icon name="text" size={14} />
+            </button>
+          )}
+        </>
       )}
       <span className="m-act-meta" title={tip}>
         {parts.join(' · ')}
@@ -1646,6 +1845,7 @@ export function ChatView({
   const canOlder = items.length > shown.length || !!hasMore;
 
   const [away, setAway] = useState(false);
+  const [selectingText, setSelectingText] = useState<string | null>(null);
   const toBottom = (smooth = false) => {
     const el = ref.current;
     if (!el) return;
@@ -1700,6 +1900,7 @@ export function ChatView({
   useEffect(() => {
     stick.current = true;
     setLimit(PAGE);
+    setSelectingText(null);
   }, [info?.id]);
 
   // Jump to a given message: if it isn't loaded yet, keep fetching older ones until we find it or reach the start
@@ -1817,13 +2018,25 @@ export function ChatView({
                     <div className="msg-user-actions">
                       <span className="msg-time">{fullTime(it.ts)}</span>
                       {shownText.trim() && (
-                        <button
-                          className="m-act-btn"
-                          title={t('copyMessage')}
-                          onClick={async () => toast((await writeClipboard(shownText)) ? t('copied') : t('copyFailed'))}
-                        >
-                          <Icon name="copy" size={13} />
-                        </button>
+                        <>
+                          <button
+                            className="m-act-btn"
+                            title={t('copyMessage')}
+                            aria-label={t('copyMessage')}
+                            onClick={async () => toast((await writeClipboard(shownText)) ? t('copied') : t('copyFailed'))}
+                          >
+                            <Icon name="copy" size={13} />
+                          </button>
+                          <button
+                            type="button"
+                            className="m-act-btn mobile-select-btn"
+                            title={t('selectText')}
+                            aria-label={t('selectText')}
+                            onClick={() => setSelectingText(shownText)}
+                          >
+                            <Icon name="text" size={13} />
+                          </button>
+                        </>
                       )}
                     </div>
                   ) : (
@@ -1857,7 +2070,11 @@ export function ChatView({
             case 'plan':
               return <Plan key={it.key} plan={it.plan} busy={!!busy} />;
             case 'turn':
-              return modern ? <ModernTurnFooter key={it.key} it={it} latest={it.key === lastTurnKey} /> : <TurnFooter key={it.key} it={it} />;
+              return modern ? (
+                <ModernTurnFooter key={it.key} it={it} latest={it.key === lastTurnKey} onSelectText={setSelectingText} />
+              ) : (
+                <TurnFooter key={it.key} it={it} onSelectText={setSelectingText} />
+              );
             case 'bgdone':
               return <BgTaskNote key={it.key} it={it} />;
             case 'desktop':
@@ -1895,6 +2112,7 @@ export function ChatView({
         )}
       </div>
     </div>
+    {selectingText !== null && createPortal(<SelectTextModal text={selectingText} onClose={() => setSelectingText(null)} />, document.body)}
     </DesktopCtx.Provider>
     </ImgContext.Provider>
   );
