@@ -29,6 +29,67 @@ const FILE_VERSION: u32 = 1;
 /// `state` rows of Kiro's database that belong to the login (Identity Center start URL and region, selected profile)
 const KIRO_STATE_KEYS: [&str; 3] = ["auth.idc.start-url", "auth.idc.region", "api.codewhisperer.profile"];
 
+/// Emails `kiro-cli whoami` reported, by a hash of the token rows (Kiro's login rows don't hold the email)
+static KIRO_EMAILS: Mutex<BTreeMap<String, String>> = Mutex::new(BTreeMap::new());
+
+fn kiro_token_key(snap: &SnapshotBundle) -> Option<String> {
+    let mut h = Sha256::new();
+    let mut any = false;
+    for r in snap.db_rows.iter().filter(|r| r.table == "auth_kv" && r.key.ends_with(":token")) {
+        h.update(r.key.as_bytes());
+        h.update(r.text.as_deref().unwrap_or_default().as_bytes());
+        any = true;
+    }
+    any.then(|| h.finalize().iter().map(|b| format!("{b:02x}")).collect())
+}
+
+fn kiro_cached_email(snap: &SnapshotBundle) -> Option<String> {
+    KIRO_EMAILS.lock().unwrap().get(&kiro_token_key(snap)?).cloned()
+}
+
+/// Ask `kiro-cli whoami --format json` who is signed in, with HOME and the data dirs pointed at `home`
+/// (None: the host's own). Blocking, at most 15s.
+fn run_kiro_whoami(home: Option<&Path>) -> Option<String> {
+    let program = crate::tools::resolve(ToolKind::Kiro, &yi_proto::DaemonSettings::default())?;
+    let args = ["whoami".to_string(), "--format".to_string(), "json".to_string()];
+    let mut cmd = crate::adapters::std_command(&program, &args);
+    if let Some(h) = home {
+        cmd.env("HOME", h)
+            .env("USERPROFILE", h)
+            .env("APPDATA", h.join("AppData/Roaming"))
+            .env("LOCALAPPDATA", h.join("AppData/Local"))
+            .env("XDG_DATA_HOME", h.join(".local/share"))
+            .env("XDG_CONFIG_HOME", h.join(".config"))
+            .env_remove("HOMEDRIVE")
+            .env_remove("HOMEPATH");
+    }
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000);
+    }
+    let mut child = cmd.spawn().ok()?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if std::time::Instant::now() < deadline => std::thread::sleep(std::time::Duration::from_millis(50)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+    let mut out = String::new();
+    std::io::Read::read_to_string(&mut child.stdout.take()?, &mut out).ok()?;
+    let v: serde_json::Value = serde_json::from_str(out.lines().find(|l| l.trim_start().starts_with('{'))?).ok()?;
+    v["email"].as_str().filter(|s| !s.is_empty()).map(str::to_string)
+}
+
 const CODEBUDDY_AUTH_FILE: &str = if cfg!(windows) {
     "AppData/Local/CodeBuddyExtension/Data/Public/auth/Tencent-Cloud.coding-copilot.info"
 } else if cfg!(target_os = "macos") {
@@ -1208,6 +1269,7 @@ impl AccountManager {
                 if snap.is_empty() {
                     bail!("当前系统 {} 未检测到已保存的 OAuth 登录凭据", tool.as_str());
                 }
+                self.learn_kiro_email(tool, &snap, None);
                 let ident = self.parse_host_identity(tool, &snap);
                 (AccountAuthKind::Oauth, ident, None, Some(snap), true)
             }
@@ -2131,6 +2193,23 @@ impl AccountManager {
         res
     }
 
+    /// Kiro: remember who `snap` is signed in as (`kiro-cli whoami`), unless already known. `home` is where that
+    /// login lives (None: the host). The real home only: tests point `home_dir` elsewhere and must not run kiro-cli
+    pub fn learn_kiro_email(&self, tool: ToolKind, snap: &SnapshotBundle, home: Option<&Path>) {
+        if tool != ToolKind::Kiro || (home.is_none() && self.home_dir != crate::paths::home()) {
+            return;
+        }
+        let Some(key) = kiro_token_key(snap) else {
+            return;
+        };
+        if KIRO_EMAILS.lock().unwrap().contains_key(&key) {
+            return;
+        }
+        if let Some(email) = run_kiro_whoami(home) {
+            KIRO_EMAILS.lock().unwrap().insert(key, email);
+        }
+    }
+
     fn parse_host_identity(&self, tool: ToolKind, snap: &SnapshotBundle) -> AccountIdentity {
         let decode_file = |rel_suffix: &str| -> Option<Vec<u8>> {
             snap.files
@@ -2249,7 +2328,8 @@ impl AccountManager {
                 AccountIdentity::default()
             }
             ToolKind::Kiro => {
-                // The token rows carry no email (the quota probe fills it from `kiro-cli whoami`); the workspace says how it signed in
+                // The token rows carry no email: `learn_kiro_email` asks `kiro-cli whoami` once per login and caches it.
+                // The workspace says how it signed in
                 let json = |key: &str| {
                     snap.db_rows
                         .iter()
@@ -2269,7 +2349,8 @@ impl AccountManager {
                 } else {
                     None
                 };
-                AccountIdentity { workspace, ..Default::default() }
+                let email = kiro_cached_email(snap);
+                AccountIdentity { account_key: email.clone(), email, workspace, plan: None }
             }
             ToolKind::Codebuddy => {
                 // {"account": {"uid", "nickname", ...}, "auth": {"accessToken", "domain", ...}, "accounts": [...]};
@@ -2542,6 +2623,9 @@ impl AccountManager {
             _ => {
                 let snap = self.take_host_snapshot_unlocked(tool).unwrap_or_default();
                 let logged_in = !snap.is_empty();
+                if logged_in {
+                    self.learn_kiro_email(tool, &snap, None);
+                }
                 let ident = if logged_in {
                     self.parse_host_identity(tool, &snap)
                 } else {
@@ -3502,6 +3586,22 @@ mod tests {
         // Its own empty config dir, so a host /login can't take precedence over the token
         assert_eq!(res.env.get("QODER_CONFIG_DIR").map(PathBuf::from), Some(mgr.profile_home(ToolKind::Qoder, &v.id)));
         assert!(!res.env.contains_key("QODER_API_KEY") && !res.env.contains_key("OPENAI_BASE_URL"));
+    }
+
+    #[test]
+    fn kiro_identity_uses_the_whoami_email_of_that_login() {
+        let (_t, base, home) = temp_dirs();
+        let mgr = AccountManager::with_dirs(base, home);
+        let row = |t: &str| DbRow { table: "auth_kv".into(), key: "kirocli:odic:token".into(), text: Some(t.into()), blob: None };
+        let snap_a = SnapshotBundle { db_rows: vec![row("{\"access_token\":\"a\"}")], ..Default::default() };
+        let snap_b = SnapshotBundle { db_rows: vec![row("{\"access_token\":\"b\"}")], ..Default::default() };
+        KIRO_EMAILS.lock().unwrap().insert(kiro_token_key(&snap_a).unwrap(), "a@acme.com".into());
+        let id = mgr.parse_host_identity(ToolKind::Kiro, &snap_a);
+        assert_eq!((id.email.as_deref(), id.account_key.as_deref()), (Some("a@acme.com"), Some("a@acme.com")));
+        assert!(mgr.parse_host_identity(ToolKind::Kiro, &snap_b).email.is_none(), "another login isn't that email");
+        // Not the real home: no kiro-cli run, nothing learned
+        mgr.learn_kiro_email(ToolKind::Kiro, &snap_b, None);
+        assert!(kiro_cached_email(&snap_b).is_none());
     }
 
     fn kiro_db(mgr: &AccountManager) -> rusqlite::Connection {

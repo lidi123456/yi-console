@@ -360,6 +360,10 @@ impl LoginManager {
         } else {
             let home = job.login_home.as_ref().ok_or_else(|| anyhow!("缺少登录目录"))?;
             let snap = self.accounts.take_snapshot_in_home(job.tool, home);
+            if let Ok(snap) = &snap {
+                // While the login home still exists: Kiro's email comes from `kiro-cli whoami` in it
+                self.accounts.learn_kiro_email(job.tool, snap, Some(home));
+            }
             // Put the host's keyring back first, whatever happens next
             self.restore_host_keyring(job);
             let url = job.state.lock().unwrap().url.clone();
