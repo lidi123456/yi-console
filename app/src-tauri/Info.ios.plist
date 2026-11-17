@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>NSCameraUsageDescription</key>
+  <string>扫描配对二维码以连接电脑。 Scan a pairing QR code to connect to a computer.</string>
+  <key>NSLocalNetworkUsageDescription</key>
+  <string>连接局域网中的电脑和服务。 Connect to computers and services on your local network.</string>
+</dict>
+</plist>

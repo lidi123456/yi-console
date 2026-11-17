@@ -105,6 +105,18 @@ scripts/prepare-sidecar.sh          # build yi-agentd for this machine into app/
 cd app && npx tauri dev
 ```
 
+Build iOS development packages on a Mac with Xcode, XcodeGen, CocoaPods, libimobiledevice and, before Xcode 15, ios-deploy. Sign in to an Apple ID in Xcode's Settings → Accounts, then connect and trust the iPhone used for testing:
+
+```bash
+rustup target add aarch64-apple-ios x86_64-apple-ios
+cd app
+npm run tauri -- ios init
+# Use the Team ID shown in Xcode; never commit personal accounts or signing material
+APPLE_DEVELOPMENT_TEAM=YOUR_TEAM_ID npm run tauri -- ios build --target aarch64 --archive-only
+```
+
+`tauri.ios.conf.json` excludes desktop daemons and plugin resources; the iOS client only connects to remote hosts. The generated Xcode project is in `app/src-tauri/gen/apple/`; select a team and physical device there to run it. After archiving, export a Development package with Xcode; newer Xcode versions also support Tauri's `--export-method debugging`. A free Personal Team is for development on your own devices, uses expiring profiles, and does not provide general distribution signing. Export and installation depend on the account, device registration and provisioning profile. iOS is not included in the CI release matrix yet.
+
 ## Testing
 
 ```bash

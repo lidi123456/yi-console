@@ -105,6 +105,18 @@ scripts/prepare-sidecar.sh          # 编译本机的 yi-agentd，放到 app/src
 cd app && npx tauri dev
 ```
 
+iOS 开发包需要在 Mac 上构建，准备 Xcode、XcodeGen、CocoaPods、libimobiledevice，以及 Xcode 15 之前所需的 ios-deploy。在 Xcode 的 Settings → Accounts 中登录 Apple ID，并连接、信任用于调试的 iPhone：
+
+```bash
+rustup target add aarch64-apple-ios x86_64-apple-ios
+cd app
+npm run tauri -- ios init
+# 使用 Xcode 中显示的 Team ID；不要将个人账号或签名材料提交到仓库
+APPLE_DEVELOPMENT_TEAM=YOUR_TEAM_ID npm run tauri -- ios build --target aarch64 --archive-only
+```
+
+`tauri.ios.conf.json` 排除桌面守护进程和插件资源；iOS 客户端只连接远程主机。生成的 Xcode 工程位于 `app/src-tauri/gen/apple/`，可在 Xcode 中选择团队和真机运行。归档后，使用 Xcode 导出 Development 开发包；较新 Xcode 也可用 Tauri 的 `--export-method debugging`。免费 Personal Team 仅供本人设备开发测试，描述文件会过期，不能作为通用分发签名；可否导出和安装取决于账号、设备注册和描述文件。iOS 尚未加入 CI 发布矩阵。
+
 ## 测试
 
 ```bash
