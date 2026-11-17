@@ -2973,6 +2973,8 @@ impl Hub {
         });
         let failed = message.is_some();
         if let Some(m) = &message {
+            let tool = rt.info.lock().unwrap().tool;
+            crate::warn!("{} 会话 {sid} 出错退出: {m}", tool.as_str());
             self.emit(sid, gen, EventBody::Error { message: m.clone() });
         }
         self.emit(
