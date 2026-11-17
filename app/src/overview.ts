@@ -2,7 +2,7 @@
 // seen, drafts of sessions to start later, and the recent activity feed. Kept out of store.ts, which only feeds it
 // (`markSeen` on navigation, `recordChange` on session.updated).
 import { useEffect, useState, useSyncExternalStore } from 'react';
-import type { SessionInfo, ToolKind } from './types';
+import { isHostSession, type SessionInfo, type ToolKind } from './types';
 import { lsGet, lsSet } from './util';
 
 const key = (hostId: string, sid: string) => `${hostId}::${sid}`;
@@ -163,7 +163,7 @@ const push = (it: Omit<FeedItem, 'id' | 'at'>) => {
 /** Called for every session.updated with the info held before it. Only changes after the app started are recorded:
  *  the feed is in memory, so it starts empty on every launch */
 export function recordChange(hostId: string, prev: SessionInfo | undefined, next: SessionInfo) {
-  if (!prev || next.parentId) return;
+  if (!prev || !isHostSession(next)) return;
   const base = { hostId, sessionId: next.id };
   if (next.pending && next.pending.requestId !== prev.pending?.requestId) {
     const p = next.pending;

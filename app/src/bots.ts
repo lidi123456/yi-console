@@ -308,14 +308,6 @@ export function refreshBots(): Promise<void> {
   return inflight;
 }
 
-/**
- * A Bot's own session or one of its tasks whose Bot is listed here (this app's engine, or a reachable remote
- * desktop): shown under the Bots section instead of under the host
- */
-export function isListedBotSession(s: SessionInfo): boolean {
-  return !!s.bot && sourceOf(s.bot.clientId) !== null;
-}
-
 /** The source that runs Bots of desktop `clientId`: '' for this app, a remote key, or null when not listed */
 export function sourceOf(clientId: string | null | undefined): string | null {
   if (!clientId) return null;

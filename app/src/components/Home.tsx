@@ -5,7 +5,7 @@ import { permLabel } from '../perm';
 import { errorToast, navigate, openNewSession, useStore } from '../store';
 import { rpc } from '../transport';
 import type { HostEntry } from '../store';
-import type { SessionInfo } from '../types';
+import { isHostSession, type SessionInfo } from '../types';
 import { basename, fmtTokens, lsGet, lsSet, shortPath, timeAgo } from '../util';
 import { Icon, ToolBadge } from './Icon';
 import { FeedPanel, ProjectPanel, QuickStart, QuotaDialog, WeekPanel } from './OverviewPanels';
@@ -434,7 +434,7 @@ export function Home() {
     const out: Item[] = [];
     for (const h of hosts) {
       const home = h.status.hello?.home;
-      for (const s of sessions[h.config.id] ?? []) if (!s.parentId) out.push({ hostId: h.config.id, hostName: h.config.name, home, s });
+      for (const s of sessions[h.config.id] ?? []) if (isHostSession(s)) out.push({ hostId: h.config.id, hostName: h.config.name, home, s });
     }
     return out;
   }, [hosts, sessions]);

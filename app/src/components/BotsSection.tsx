@@ -1,12 +1,12 @@
 // Sidebar "Bots" sections: this app's Bots (desktop app) and those of each desktop app reachable through a host
-// (remote control from a phone or yi-web), each Bot with its tasks. Their Bot and task sessions are listed here
-// instead of under their host (`isListedBotSession`). Host ids in a remote desktop's data are its own; `openOn`
-// maps them to this client's hosts.
+// (remote control from a phone or yi-web), each Bot with its tasks. Bot and task sessions are listed only here,
+// never under their host (`isHostSession`). Host ids in a remote desktop's data are its own; `openOn` maps them to
+// this client's hosts.
 
 import { createContext, useEffect, useState } from 'react';
 import { getT, isEn, useLang } from '../i18n';
 import { errorToast, navigate, openNewSession, toast, useStore, getState, type HostEntry } from '../store';
-import { lsGet, lsSet } from '../util';
+import { fuzzyScore, lsGet, lsSet } from '../util';
 import { ACTIVE_TASK, botCall, mapHost, unmapHost, useBotCall, refreshRemote, sourceOf, useBotList, useBots, type Approval, type BotEntry, type SecretCard, type EventRow, type TaskRow } from '../bots';
 import { openUrl } from './PortsView';
 import { fmtTime } from './BotActivity';
@@ -122,10 +122,28 @@ export function localHost(src: string, host: string) {
 }
 
 /** After a Bot is deleted: go home if the page shows it, its session or one of its tasks' sessions */
-export function leaveBotPages(b: BotEntry) {
-  const v = getState().view;
-  const sessions = new Set([b.session?.sessionId, ...b.tasks.map((x) => x.sessionId)].filter(Boolean));
-  if (('botId' in v && v.botId === b.config.id) || ('sessionId' in v && sessions.has(v.sessionId))) navigate({ kind: 'home' });
+export function leaveBotPages(b: Pick<BotEntry, 'config'> & Partial<Pick<BotEntry, 'session' | 'tasks'>>) {
+  const s = getState();
+  const v = s.view;
+  const sessions = new Set([b.session?.sessionId, ...(b.tasks ?? []).map((x) => x.sessionId)].filter(Boolean));
+  const curBotId = 'sessionId' in v && 'hostId' in v ? s.sessions[v.hostId]?.find((x) => x.id === v.sessionId)?.bot?.botId : undefined;
+  if (('botId' in v && v.botId === b.config.id) || ('sessionId' in v && (sessions.has(v.sessionId) || curBotId === b.config.id))) {
+    navigate({ kind: 'home' });
+  }
+}
+
+export async function deleteBotWithConfirm(b: Pick<BotEntry, 'config'> & Partial<Pick<BotEntry, 'session' | 'tasks'>>, src = '') {
+  if (!(await askConfirm({ title: t('deleteBotTitle', { name: b.config.name }), message: t('deleteBotMessage'), danger: true })))
+    return;
+  try {
+    const r = await botCall<{ worktreesKept?: string[] } | null>('bots.delete', { id: b.config.id, sessions: true }, src);
+    if (r?.worktreesKept?.length) {
+      toast(t('deleteBotKeptWorktrees', { n: r.worktreesKept.length, paths: r.worktreesKept.join(', ') }));
+    }
+    leaveBotPages(b);
+  } catch (e) {
+    errorToast(e);
+  }
 }
 
 export function botMenu(b: BotEntry, src = ''): (MenuItem | '-')[] {
@@ -152,16 +170,7 @@ export function botMenu(b: BotEntry, src = ''): (MenuItem | '-')[] {
       label: t('deleteBot'),
       icon: 'trash',
       danger: true,
-      run: async () => {
-        if (!(await askConfirm({ title: t('deleteBotTitle', { name: b.config.name }), message: t('deleteBotMessage'), danger: true })))
-          return;
-        try {
-          await botCall('bots.delete', { id, sessions: false }, src);
-          leaveBotPages(b);
-        } catch (e) {
-          errorToast(e);
-        }
-      },
+      run: () => deleteBotWithConfirm(b, src),
     },
   ];
 }
@@ -269,7 +278,7 @@ function TaskLine({ task, active, showHost, src }: { task: TaskRow; active: bool
   );
 }
 
-function BotBlock({ b, src }: { b: BotEntry; src: string }) {
+function BotBlock({ b, src, filter }: { b: BotEntry; src: string; filter: string }) {
   const view = useStore((s) => s.view);
   const id = b.config.id;
   const [showEnded, setShowEnded] = useState(false);
@@ -278,12 +287,16 @@ function BotBlock({ b, src }: { b: BotEntry; src: string }) {
     lsSet(`collapse-bot-${id}`, !collapsed);
     setCollapsed(!collapsed);
   };
+  const q = filter.trim();
+  const botMatched = !q || fuzzyScore(b.config.name, q) >= 0;
+  const matchedTasks = q ? b.tasks.filter((x) => fuzzyScore(`${x.title} ${x.cwd}`, q) >= 0) : b.tasks;
   const dot = botDot(b);
   const isActive = (host: string, sid?: string | null) => view.kind === 'session' && view.hostId === localHost(src, host) && view.sessionId === sid;
   const botActive =
     (b.session && isActive(b.session.host, b.session.sessionId)) || (view.kind === 'bot' && view.botId === id && (view.src ?? '') === src);
   const live = b.tasks.filter((x) => ACTIVE_TASK.includes(x.state) || x.state === 'ready' || x.state === 'failed');
   const ended = b.tasks.filter((x) => !live.includes(x));
+  const shownTasks = q ? (botMatched && matchedTasks.length === 0 ? live : matchedTasks) : live;
   // Name the host on task rows once tasks of this Bot can land on more than one host
   const showHost = new Set([b.config.bot.host, ...b.config.workspaces.map((w) => w.host), ...b.tasks.map((x) => x.host)]).size > 1;
   const open = () =>
@@ -298,7 +311,7 @@ function BotBlock({ b, src }: { b: BotEntry; src: string }) {
           title={`${b.config.name}\n${botStateLabel(b.state)}${b.error ? `\n${b.error}` : ''}`}
         >
           <span
-            className={`chev bot-chev ${collapsed ? '' : 'open'}`}
+            className={`chev bot-chev ${collapsed && !q ? '' : 'open'}`}
             onClick={(e) => {
               e.stopPropagation();
               toggle();
@@ -311,7 +324,7 @@ function BotBlock({ b, src }: { b: BotEntry; src: string }) {
           </span>
           <span className="session-title">{b.config.name}</span>
           {needsYouCount(b) > 0 && <span className="pill pill-attn">{needsYouCount(b)}</span>}
-          {collapsed && live.length > 0 && <span className="project-count">{live.length}</span>}
+          {collapsed && !q && live.length > 0 && <span className="project-count">{live.length}</span>}
           <span className="row-end">{dot && <span className={`sdot sdot-${dot}`} />}</span>
         </button>
         <div className="row-actions">
@@ -330,12 +343,12 @@ function BotBlock({ b, src }: { b: BotEntry; src: string }) {
           </button>
         </div>
       </div>
-      {!collapsed && (
+      {(!collapsed || !!q) && (
         <div className="bot-tasks">
-          {live.map((x) => (
+          {shownTasks.map((x) => (
             <TaskLine key={x.id} task={x} active={isActive(x.host, x.sessionId)} showHost={showHost} src={src} />
           ))}
-          {ended.length > 0 && (
+          {!q && ended.length > 0 && (
             <button className="old-toggle" onClick={() => setShowEnded(!showEnded)}>
               <span className={`chev ${showEnded ? 'open' : ''}`}>
                 <Icon name="chevron" size={12} />
@@ -343,7 +356,7 @@ function BotBlock({ b, src }: { b: BotEntry; src: string }) {
               {showEnded ? t('hideEnded') : t('showEnded', { n: ended.length })}
             </button>
           )}
-          {showEnded && ended.map((x) => <TaskLine key={x.id} task={x} active={isActive(x.host, x.sessionId)} showHost={showHost} src={src} />)}
+          {!q && showEnded && ended.map((x) => <TaskLine key={x.id} task={x} active={isActive(x.host, x.sessionId)} showHost={showHost} src={src} />)}
         </div>
       )}
     </div>
@@ -754,19 +767,19 @@ export function SessionBotBar({ info }: { info: SessionInfo }) {
 }
 
 /** This app's Bots section, then one per remote desktop app */
-export function BotsSections() {
+export function BotsSections({ filter = '' }: { filter?: string }) {
   const remotes = useBots((s) => s.remotes);
   return (
     <>
-      <BotsSection src="" />
+      <BotsSection src="" filter={filter} />
       {remotes.map((r) => (
-        <BotsSection key={r.key} src={r.key} />
+        <BotsSection key={r.key} src={r.key} filter={filter} />
       ))}
     </>
   );
 }
 
-function BotsSection({ src }: { src: string }) {
+function BotsSection({ src, filter }: { src: string; filter: string }) {
   useLang();
   const list = useBotList(src);
   const remote = useBots((s) => s.remotes.find((r) => r.key === src));
@@ -774,6 +787,11 @@ function BotsSection({ src }: { src: string }) {
   const key = src ? `collapse-bots-${remote?.clientId}` : 'collapse-bots';
   const [collapsed, setCollapsed] = useState<boolean>(() => lsGet(key, false));
   if (!list && !remote) return null;
+  const q = filter.trim();
+  const shown = q
+    ? (list ?? []).filter((b) => fuzzyScore(b.config.name, q) >= 0 || b.tasks.some((x) => fuzzyScore(`${x.title} ${x.cwd}`, q) >= 0))
+    : list;
+  if (q && (!shown || shown.length === 0)) return null;
   const toggle = () => {
     lsSet(key, !collapsed);
     setCollapsed(!collapsed);
@@ -788,8 +806,8 @@ function BotsSection({ src }: { src: string }) {
             <Icon name="bot" size={13} />
           </span>
           <span className="truncate">{remote ? t('botsOf', { name: remote.name }) : t('bots')}</span>
-          {collapsed && attn > 0 && <span className="pill pill-attn">{attn}</span>}
-          <span className={`chev ${collapsed ? '' : 'open'}`}>
+          {collapsed && !q && attn > 0 && <span className="pill pill-attn">{attn}</span>}
+          <span className={`chev ${collapsed && !q ? '' : 'open'}`}>
             <Icon name="chevron" size={12} />
           </span>
         </button>
@@ -804,12 +822,12 @@ function BotsSection({ src }: { src: string }) {
           </>
         )}
       </div>
-      {!collapsed && (
+      {(!collapsed || !!q) && (
         <div className="host-body">
-          {list?.map((b) => (
-            <BotBlock key={b.config.id} b={b} src={src} />
+          {shown?.map((b) => (
+            <BotBlock key={b.config.id} b={b} src={src} filter={filter} />
           ))}
-          {list && list.length === 0 && <div className="muted small pad-x">{t('noBotsYet')}</div>}
+          {!q && list && list.length === 0 && <div className="muted small pad-x">{t('noBotsYet')}</div>}
           {!list && remote && (
             <div className="muted small pad-x">
               {remote.error ? t('desktopUnreachable', { error: remote.error }) : t('loading')}{' '}

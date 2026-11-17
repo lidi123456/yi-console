@@ -9,7 +9,7 @@ import { addDraft, projKey, removeDraft, useDrafts, useFeed, usePageVisible, typ
 import { permLabel, permModes } from '../perm';
 import { errorToast, navigate, openNewSession, toast, useStore, type HostEntry } from '../store';
 import { rpc } from '../transport';
-import { TOOL_LABEL, type GitStatus, type SessionInfo, type ToolKind, type Usage } from '../types';
+import { isHostSession, TOOL_LABEL, type GitStatus, type SessionInfo, type ToolKind, type Usage } from '../types';
 import { basename, clock, fmtTokens, isMobile, lsGet, lsSet, shortPath, timeAgo } from '../util';
 import { type Attached, FILE_MAX, IMAGE_TYPES, localPaths, readImage, refOf, uploadChunked } from './Composer';
 import type { Item } from './Home';
@@ -64,7 +64,7 @@ const aiTools = (h?: HostEntry): ToolKind[] =>
 /** Directories for the quick start menu: used recently from the new session page, then those of the host's sessions */
 function dirList(hostId: string, sessions: Record<string, SessionInfo[]>) {
   const fromSessions = (sessions[hostId] ?? [])
-    .filter((s) => !s.parentId)
+    .filter(isHostSession)
     .sort((a, b) => b.updatedAt - a.updatedAt)
     .map((s) => s.cwd);
   return [...new Set([...recentDirs(hostId), ...fromSessions])].slice(0, DIR_MENU_MAX);

@@ -79,6 +79,11 @@ export interface BotLink {
   clientId: string;
 }
 
+/** Ordinary top-level host session: neither a bottom-panel terminal (`parentId`) nor a Bot / Bot-task session (`bot`) */
+export function isHostSession(s: SessionInfo): boolean {
+  return !s.parentId && !s.bot;
+}
+
 export interface PendingBrief {
   requestId: string;
   toolName: string;

@@ -82,10 +82,16 @@ pub fn pipe_name() -> String {
     format!(r"\\.\pipe\yi-console-{user}")
 }
 
-/// Expand paths starting with `~` to absolute paths
+/// Expand paths starting with `~` to absolute paths; `~/.yi-console` honors `YI_CONSOLE_HOME` (`base_dir()`)
 pub fn expand(p: &str) -> PathBuf {
     if p == "~" || p.is_empty() {
         return home();
+    }
+    if p == "~/.yi-console" || p == "~\\.yi-console" {
+        return base_dir();
+    }
+    if let Some(rest) = p.strip_prefix("~/.yi-console/").or_else(|| p.strip_prefix("~\\.yi-console\\")) {
+        return base_dir().join(rest);
     }
     if let Some(rest) = p.strip_prefix("~/").or_else(|| p.strip_prefix("~\\")) {
         return home().join(rest);

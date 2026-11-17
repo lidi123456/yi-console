@@ -8,7 +8,7 @@ import { fmtAt } from './limit';
 import { hubCall, onHubEvent, rpc, isTauri } from './transport';
 import { markSeen, recordChange } from './overview';
 import { dropRemoteHost, findBot, mapHost, refreshBots, refreshRemote, refreshRemoteHost, remoteKey, sourceOf } from './bots';
-import type { AccountLoginUpdate, ClientSettings, HostConfig, HostStatus, HubEvent, NotifyPrefs, SessionInfo, Snippet, ToolInfo, ToolJob, ToolKind } from './types';
+import { isHostSession, type AccountLoginUpdate, type ClientSettings, type HostConfig, type HostStatus, type HubEvent, type NotifyPrefs, type SessionInfo, type Snippet, type ToolInfo, type ToolJob, type ToolKind } from './types';
 
 const t = getT('store');
 
@@ -383,6 +383,7 @@ export async function refreshHosts() {
   for (const h of hosts) if (h.status.status === 'connected') {
     refreshSessions(h.config.id);
     reportLang(h.config.id);
+    refreshRemoteHost(h.config.id);
   }
   return hosts;
 }
@@ -449,11 +450,11 @@ export function sessionInfo(hostId: string, sid: string): SessionInfo | undefine
   return state.sessions[hostId]?.find((s) => s.id === sid);
 }
 
-/** All sessions in sidebar order (for switching to the previous / next session) */
+/** All host sessions in sidebar order (for switching to the previous / next session and the command palette) */
 export function orderedSessions(): { hostId: string; s: SessionInfo }[] {
   const out: { hostId: string; s: SessionInfo }[] = [];
   for (const h of state.hosts) {
-    const list = (state.sessions[h.config.id] ?? []).filter((x) => !x.parentId);
+    const list = (state.sessions[h.config.id] ?? []).filter(isHostSession);
     const pinned = list.filter((x) => x.pinned);
     for (const s of [...pinned, ...list.filter((x) => !x.pinned)]) out.push({ hostId: h.config.id, s });
   }

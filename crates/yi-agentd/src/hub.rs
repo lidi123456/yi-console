@@ -2167,15 +2167,60 @@ impl Hub {
         if safe_sid(id) {
             let _ = std::fs::remove_dir_all(uploads_dir(id));
         }
-        if let Some(bot) = bot_link.filter(|b| b.role == "task") {
-            if let Some(tid) = bot.task_id.as_deref() {
-                let safe = |s: &str| !s.is_empty() && s.len() <= 64 && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
-                if safe(&bot.bot_id) && safe(tid) {
+        if let Some(bot) = bot_link {
+            let safe = |s: &str| !s.is_empty() && s.len() <= 64 && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+            let same_dir = |a: &str, b: &std::path::Path| norm_cwd(a) == norm_cwd(&b.to_string_lossy());
+            let remove_dir_with_retry = |target: std::path::PathBuf, parent_if_empty: Option<std::path::PathBuf>| {
+                let try_rm = |t: &std::path::Path, p: Option<&std::path::Path>| -> bool {
+                    let ok = !t.exists() || std::fs::remove_dir_all(t).is_ok();
+                    if ok {
+                        if let Some(parent) = p {
+                            let _ = std::fs::remove_dir(parent);
+                        }
+                    }
+                    ok
+                };
+                if !try_rm(&target, parent_if_empty.as_deref()) {
+                    std::thread::spawn(move || {
+                        for ms in [200u64, 500, 1000, 2000] {
+                            std::thread::sleep(std::time::Duration::from_millis(ms));
+                            if try_rm(&target, parent_if_empty.as_deref()) {
+                                break;
+                            }
+                        }
+                    });
+                }
+            };
+            let cur = std::path::Path::new(&session_cwd);
+            if bot.role == "task" {
+                if let Some(tid) = bot.task_id.as_deref().filter(|t| safe(&bot.bot_id) && safe(t)) {
                     let p1 = crate::paths::expand(&format!("~/.yi-console/bots/{}/tasks/{tid}", bot.bot_id));
                     let p2 = crate::paths::base_dir().join("bots").join(&bot.bot_id).join("tasks").join(tid);
-                    let cur = std::path::Path::new(&session_cwd);
-                    if cur == p1 || cur == p2 {
-                        let _ = std::fs::remove_dir_all(cur);
+                    if same_dir(&session_cwd, &p1) || same_dir(&session_cwd, &p2) {
+                        remove_dir_with_retry(cur.to_path_buf(), cur.parent().map(|p| p.to_path_buf()));
+                    }
+                }
+            } else if bot.role == "bot" && safe(&bot.bot_id) {
+                let p1 = crate::paths::expand(&format!("~/.yi-console/bots/{}", bot.bot_id));
+                let p2 = crate::paths::base_dir().join("bots").join(&bot.bot_id);
+                if same_dir(&session_cwd, &p1) || same_dir(&session_cwd, &p2) {
+                    let target = cur.to_path_buf();
+                    let try_bot_rm = |t: &std::path::Path| -> bool {
+                        if !t.exists() {
+                            return true;
+                        }
+                        let has_tasks = std::fs::read_dir(t.join("tasks")).ok().is_some_and(|mut d| d.next().is_some());
+                        !has_tasks && std::fs::remove_dir_all(t).is_ok()
+                    };
+                    if !try_bot_rm(&target) {
+                        std::thread::spawn(move || {
+                            for ms in [200u64, 500, 1000, 2000] {
+                                std::thread::sleep(std::time::Duration::from_millis(ms));
+                                if try_bot_rm(&target) {
+                                    break;
+                                }
+                            }
+                        });
                     }
                 }
             }

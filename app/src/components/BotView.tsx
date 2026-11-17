@@ -8,7 +8,7 @@ import { errorToast, navigate, toast } from '../store';
 import { TOOL_LABEL } from '../types';
 import { permLabel } from '../perm';
 import { useBotCall, useBotList, useBotSource, type BotConfig, type BotEntry, type EventRow, type PluginInstance, type RoutineRun } from '../bots';
-import { ApprovalCards, SecretCards, botMenu, botStateLabel, openOn, useSourceHosts } from './BotsSection';
+import { ApprovalCards, SecretCards, botMenu, botStateLabel, deleteBotWithConfirm, openOn, useSourceHosts } from './BotsSection';
 import { EventLine, fmtTime, PromptDiff, StatsCard } from './BotActivity';
 import { askConfirm, openMenu } from './Overlay';
 import { Icon } from './Icon';
@@ -492,18 +492,7 @@ export function BotView({ botId }: { botId: string }) {
           <div className="card-title">{t('deleteBot')}</div>
           <p className="muted small">{t('deleteBotMessage')}</p>
         </div>
-        <button
-          className="btn"
-          onClick={async () => {
-            if (!(await askConfirm({ title: t('deleteBotTitle', { name: c.name }), message: t('deleteBotMessage'), danger: true }))) return;
-            try {
-              await botCall('bots.delete', { id: botId, sessions: false });
-              navigate({ kind: 'home' });
-            } catch (e) {
-              errorToast(e);
-            }
-          }}
-        >
+        <button className="btn" onClick={() => deleteBotWithConfirm(entry ?? { config: c, session: row.session }, src)}>
           <Icon name="trash" size={14} /> {t('deleteBot')}
         </button>
       </div>

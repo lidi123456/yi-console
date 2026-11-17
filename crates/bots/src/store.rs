@@ -354,6 +354,7 @@ impl Store {
             "DELETE FROM attention WHERE bot_id = ?1",
             "DELETE FROM routine_runs WHERE bot_id = ?1",
             "DELETE FROM approvals WHERE bot_id = ?1",
+            "DELETE FROM outbox WHERE state = 'pending' AND json_extract(data, '$.botId') = ?1",
             // The engine's own counters (tokens) live next to plugin kv
             "DELETE FROM plugin_kv WHERE instance_id = 'bot:' || ?1",
         ] {
@@ -541,6 +542,20 @@ impl Store {
             "SELECT data FROM tasks WHERE (?1 IS NULL OR bot_id = ?1) ORDER BY created_at DESC LIMIT ?2",
         )?;
         let rows = st.query_map(params![bot_id, limit as i64], |r| r.get::<_, String>(0))?;
+        let mut out = vec![];
+        for r in rows {
+            if let Ok(t) = serde_json::from_str(&r?) {
+                out.push(t);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Every task of one Bot without a row cap (used when deleting a Bot)
+    pub fn bot_tasks(&self, bot_id: &str) -> Result<Vec<TaskRow>> {
+        let db = self.db.lock().unwrap();
+        let mut st = db.prepare("SELECT data FROM tasks WHERE bot_id = ?1 ORDER BY created_at DESC")?;
+        let rows = st.query_map(params![bot_id], |r| r.get::<_, String>(0))?;
         let mut out = vec![];
         for r in rows {
             if let Ok(t) = serde_json::from_str(&r?) {
@@ -851,9 +866,15 @@ mod tests {
         s.purge_instance("i").unwrap();
         assert!(s.outbox(None, 10).unwrap().is_empty());
 
+        let o2 = OutboxRow { key: "k2".into(), instance_id: "i2".into(), kind: "notify".into(), bot_id: Some("b1".into()), text: "bye".into(), state: "pending".into(), next_at: 5, created_at: 2, ..Default::default() };
+        assert!(s.outbox_add(&o2).unwrap());
+        assert_eq!(s.bot_tasks("b1").unwrap().len(), 1);
+
         s.delete_bot("b1").unwrap();
         assert!(s.bots().unwrap().is_empty());
         assert!(s.tasks(None, 10).unwrap().is_empty());
+        assert!(s.bot_tasks("b1").unwrap().is_empty());
+        assert!(s.outbox_due(10).unwrap().is_empty());
 
     }
 

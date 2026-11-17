@@ -352,6 +352,23 @@ impl Engine {
                 });
             }
         }
+        // Clean up any sessions of deleted Bots on hosts that are already connected at launch
+        {
+            let me = self.arc();
+            tokio::spawn(async move {
+                if let Ok(hub) = me.hub() {
+                    if let Ok(v) = hub.call("hosts.list", json!({})).await {
+                        for entry in v["hosts"].as_array().into_iter().flatten() {
+                            if entry["status"]["status"] == "connected" {
+                                if let Some(hid) = entry["config"]["id"].as_str() {
+                                    me.prune_deleted_bot_sessions(hid).await;
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+        }
         // Housekeeping: timeouts, queued tasks, retries
         let weak = self.me.clone();
         tokio::spawn(async move {
@@ -789,6 +806,7 @@ impl Engine {
         let me = self.arc();
         let host = host.to_string();
         tokio::spawn(async move {
+            me.prune_deleted_bot_sessions(&host).await;
             for b in me.store.bots().unwrap_or_default() {
                 if b.config.enabled && b.config.bot.host == host {
                     let needs = b.session.is_none() || me.bots.lock().unwrap().get(&b.config.id).map_or(true, |r| r.status.is_none());
@@ -2346,6 +2364,140 @@ impl Engine {
         let _ = self.store.save_task(t);
     }
 
+    /// Delete a Bot, optionally removing its session, all task sessions and clean worktrees.
+    /// Returns the paths of task worktrees kept because they have uncommitted changes.
+    async fn delete_bot(&self, id: &str, delete_sessions: bool) -> Result<Vec<String>> {
+        let b = self.store.bot(id)?;
+        // Pause immediately so ticks, triggers and inbox delivery ignore this Bot while we clean up
+        if b.config.enabled {
+            let mut off = b.config.clone();
+            off.enabled = false;
+            let _ = self.store.save_bot(&off, now_ms());
+        }
+        self.bots.lock().unwrap().remove(id);
+
+        let mut kept_worktrees: Vec<String> = vec![];
+        if delete_sessions {
+            let tasks = self.store.bot_tasks(id)?;
+            {
+                let mut busy = self.task_busy.lock().unwrap();
+                for t in &tasks {
+                    busy.remove(&t.id);
+                }
+            }
+            let mut dead_hosts: HashSet<String> = HashSet::new();
+            let mut deleted: HashSet<(String, String)> = HashSet::new();
+
+            for mut t in tasks {
+                if dead_hosts.contains(&t.host) {
+                    continue;
+                }
+                if let Ok(hub) = self.hub() {
+                    if !hub.connected(&t.host) && hub.call("hosts.connect", json!({"id": t.host})).await.is_err() {
+                        dead_hosts.insert(t.host.clone());
+                        continue;
+                    }
+                    // Stop an active process before inspecting / removing its worktree
+                    if t.worktree.is_some() {
+                        if let Some(sid) = &t.session_id {
+                            let _ = hub.host_rpc(&t.host, "session.kill", json!({"sessionId": sid})).await;
+                        }
+                        if !self.drop_worktree(&mut t).await {
+                            if let Some(p) = t.worktree.as_ref().filter(|w| w["dirty"] == true).and_then(|w| w["path"].as_str()) {
+                                kept_worktrees.push(p.to_string());
+                            }
+                        }
+                    }
+                    if let Some(sid) = &t.session_id {
+                        if deleted.insert((t.host.clone(), sid.clone())) {
+                            let _ = hub.host_rpc(&t.host, "session.delete", json!({"sessionId": sid})).await;
+                        }
+                    }
+                }
+            }
+
+            // Delete the Bot's own session after task sessions so its default directory can be removed cleanly
+            if let Some(sr) = &b.session {
+                if !dead_hosts.contains(&sr.host) {
+                    if let Ok(hub) = self.hub() {
+                        if hub.connected(&sr.host) || hub.call("hosts.connect", json!({"id": sr.host})).await.is_ok() {
+                            if deleted.insert((sr.host.clone(), sr.session_id.clone())) {
+                                let _ = hub.host_rpc(&sr.host, "session.delete", json!({"sessionId": sr.session_id})).await;
+                            }
+                        } else {
+                            dead_hosts.insert(sr.host.clone());
+                        }
+                    }
+                }
+            }
+
+            // Also sweep connected hosts for any orphaned sessions of this Bot (e.g. from an earlier host switch)
+            if let Ok(hub) = self.hub() {
+                if let Ok(v) = hub.call("hosts.list", json!({})).await {
+                    for entry in v["hosts"].as_array().into_iter().flatten() {
+                        if entry["status"]["status"] != "connected" {
+                            continue;
+                        }
+                        let Some(hid) = entry["config"]["id"].as_str() else { continue };
+                        let Ok(list) = hub.host_rpc(hid, "session.list", json!({})).await else { continue };
+                        let mut orphans: Vec<(bool, String)> = vec![];
+                        for s in list.as_array().into_iter().flatten() {
+                            let link = &s["bot"];
+                            if link["clientId"].as_str() == Some(self.client_id()) && link["botId"].as_str() == Some(id) {
+                                if let Some(sid) = s["id"].as_str() {
+                                    orphans.push((link["role"].as_str() == Some("bot"), sid.to_string()));
+                                }
+                            }
+                        }
+                        orphans.sort_by_key(|(is_bot, _)| *is_bot);
+                        for (_, sid) in orphans {
+                            if deleted.insert((hid.to_string(), sid.clone())) {
+                                let _ = hub.host_rpc(hid, "session.delete", json!({"sessionId": sid})).await;
+                            }
+                        }
+                    }
+                }
+            }
+        } else if let Some(sr) = &b.session {
+            // Keep the session as an ordinary one when explicitly requested
+            let _ = self.rpc(&sr.host, "session.setClientMcp", json!({"sessionId": sr.session_id, "clientMcp": []})).await;
+            let _ = self.rpc(&sr.host, "session.setBot", json!({"sessionId": sr.session_id, "bot": null})).await;
+        }
+
+        self.store.delete_bot(id)?;
+        self.bots.lock().unwrap().remove(id);
+        Ok(kept_worktrees)
+    }
+
+    /// Remove sessions on `host` owned by this desktop app whose Bot no longer exists (e.g. the host was offline when
+    /// the Bot was deleted, or an earlier version left task sessions behind).
+    async fn prune_deleted_bot_sessions(&self, host: &str) {
+        let Ok(hub) = self.hub() else { return };
+        if !hub.connected(host) {
+            return;
+        }
+        let Ok(bots) = self.store.bots() else { return };
+        let known: HashSet<String> = bots.into_iter().map(|b| b.config.id).collect();
+        let Ok(list) = hub.host_rpc(host, "session.list", json!({})).await else { return };
+        let mut orphans: Vec<(bool, String)> = vec![];
+        for s in list.as_array().into_iter().flatten() {
+            let link = &s["bot"];
+            if link["clientId"].as_str() != Some(self.client_id()) {
+                continue;
+            }
+            let Some(bid) = link["botId"].as_str().filter(|b| !b.is_empty()) else { continue };
+            if !known.contains(bid) && self.store.bot(bid).is_err() {
+                if let Some(sid) = s["id"].as_str() {
+                    orphans.push((link["role"].as_str() == Some("bot"), sid.to_string()));
+                }
+            }
+        }
+        orphans.sort_by_key(|(is_bot, _)| *is_bot);
+        for (_, sid) in orphans {
+            let _ = hub.host_rpc(host, "session.delete", json!({"sessionId": sid})).await;
+        }
+    }
+
     /// Events held outside active hours, delivered once they start (or the hours are removed)
     fn release_held(&self, c: &BotConfig) {
         if !in_active_hours(c) {
@@ -2401,24 +2553,9 @@ impl Engine {
             }
             "bots.delete" => {
                 let id = s("id")?;
-                let b = self.store.bot(&id)?;
-                if a["sessions"].as_bool().unwrap_or(false) {
-                    if let Some(sr) = &b.session {
-                        let _ = self.rpc(&sr.host, "session.delete", json!({"sessionId": sr.session_id})).await;
-                    }
-                    for t in self.store.tasks(Some(&id), 10_000)? {
-                        if let Some(sid) = &t.session_id {
-                            let _ = self.rpc(&t.host, "session.delete", json!({"sessionId": sid})).await;
-                        }
-                    }
-                } else if let Some(sr) = &b.session {
-                    // Keep the session as an ordinary one
-                    let _ = self.rpc(&sr.host, "session.setClientMcp", json!({"sessionId": sr.session_id, "clientMcp": []})).await;
-                    let _ = self.rpc(&sr.host, "session.setBot", json!({"sessionId": sr.session_id, "bot": null})).await;
-                }
-                self.store.delete_bot(&id)?;
-                self.bots.lock().unwrap().remove(&id);
-                Value::Null
+                let sessions = a["sessions"].as_bool().unwrap_or(true);
+                let kept = self.delete_bot(&id, sessions).await?;
+                json!({"worktreesKept": kept})
             }
             "bots.restart" => {
                 let id = s("id")?;
@@ -2882,8 +3019,14 @@ impl Engine {
         }
         let now = now_ms();
         self.store.save_bot(&c, now)?;
-        // Moving the Bot to another host starts a new session there
+        // Moving the Bot to another host starts a new session there; drop the old Bot session so it doesn't linger
         if old.as_ref().is_some_and(|o| o.config.bot.host != c.bot.host) {
+            if let Some(sr) = old.as_ref().and_then(|o| o.session.clone()) {
+                let me = self.arc();
+                tokio::spawn(async move {
+                    let _ = me.rpc(&sr.host, "session.delete", json!({"sessionId": sr.session_id})).await;
+                });
+            }
             self.store.set_bot_session(&c.id, None)?;
         } else if let Some(sr) = old.as_ref().filter(|o| o.config.name != c.name).and_then(|o| o.session.clone()) {
             // A Bot names itself in its first reply: keep its session title in step
@@ -3946,5 +4089,40 @@ mod tests {
             resolve_spawn_location(&c, &json!({}), true).unwrap(),
             ("scratch".into(), "local".into(), "".into())
         );
+    }
+
+    #[tokio::test]
+    async fn bots_delete_removes_bot_and_tasks_by_default() {
+        let dir = std::env::temp_dir().join(format!("yi-bots-del-{}", short_id("t")));
+        let _ = std::fs::create_dir_all(&dir);
+        let store = Store::open(&dir.join("bots.db")).unwrap();
+        let engine = Engine::for_tests(store);
+        let mut c: BotConfig = serde_json::from_value(json!({
+            "id": "b1", "name": "Helper", "enabled": true, "bot": {"host": "local", "tool": "claude"}
+        }))
+        .unwrap();
+        c.normalize();
+        engine.store.save_bot(&c, 1).unwrap();
+        engine.store.set_bot_session("b1", Some(&SessionRef { host: "local".into(), session_id: "s-bot".into() })).unwrap();
+        engine
+            .store
+            .save_task(&TaskRow {
+                id: "t1".into(),
+                bot_id: "b1".into(),
+                host: "local".into(),
+                session_id: Some("s-t1".into()),
+                state: "working".into(),
+                title: "task".into(),
+                created_at: 2,
+                ..Default::default()
+            })
+            .unwrap();
+        engine.task_busy.lock().unwrap().insert("t1".into(), true);
+        let r = engine.command("bots.delete", json!({"id": "b1"})).await.unwrap();
+        assert_eq!(r, json!({"worktreesKept": []}));
+        assert!(engine.store.bots().unwrap().is_empty());
+        assert!(engine.store.bot_tasks("b1").unwrap().is_empty());
+        assert!(!engine.task_busy.lock().unwrap().contains_key("t1"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -1,7 +1,7 @@
 import { getT, isEn } from '../i18n';
 import { errorToast, getState, loadSession, navigate, openNewSession, skey, toast } from '../store';
 import { rpc } from '../transport';
-import { TOOL_LABEL, supportsAccountsTool, type HubEvent, type SessionInfo } from '../types';
+import { isHostSession, TOOL_LABEL, supportsAccountsTool, type HubEvent, type SessionInfo } from '../types';
 import { downloadText, isMobile, lsSet, safeFileName, sessionMarkdown, toB64 } from '../util';
 import { handoffPrompt } from '../handoff';
 import { writeClipboard } from '../clipboard';
@@ -142,7 +142,7 @@ export async function handoffSession(hostId: string, info: SessionInfo, opts: { 
 
 /** Delete every session in one working directory (the sidebar's directory row). Bottom-panel terminals go with their chat in Hub::delete */
 export async function deleteDirSessions(hostId: string, cwd: string) {
-  const list = (getState().sessions[hostId] ?? []).filter((s) => s.cwd === cwd && !s.parentId);
+  const list = (getState().sessions[hostId] ?? []).filter((s) => s.cwd === cwd && isHostSession(s));
   if (list.length === 0) return;
   const busy = list.filter((s) => s.status === 'running' || s.status === 'starting' || s.status === 'waiting-permission').length;
   const name = cwd.split(/[\\/]/).filter(Boolean).pop() || cwd;
@@ -353,11 +353,19 @@ export function sessionMenu(
       hint: mobile ? undefined : opts.inSession ? tx('doubleClickTitle') : 'F2',
       run: () => renameSession(hostId, info),
     },
-    {
-      label: info.pinned ? tx('unpin') : tx('pin'),
-      icon: 'pin',
-      run: () => call(hostId, sid, 'session.pin', { pinned: !info.pinned }),
-    },
+    ...(info.parentId || info.bot
+      ? []
+      : [
+    ...(isHostSession(info)
+      ? [
+          {
+            label: info.pinned ? tx('unpin') : tx('pin'),
+            icon: 'pin',
+            run: () => call(hostId, sid, 'session.pin', { pinned: !info.pinned }),
+          },
+        ]
+      : []),
+        ]),
     ...(info.parentId ? [] : [{ label: tx('newWithSameSettings'), icon: 'plus', run: () => duplicateSession(hostId, info) }]),
     ...(info.tool !== 'shell' && !info.parentId
       ? [

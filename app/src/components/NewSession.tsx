@@ -7,7 +7,7 @@ import { rpc } from '../transport';
 import { botCall, unmapHost } from '../bots';
 import { localHost } from './BotsSection';
 import { openAccountManager } from './AccountManagerModal';
-import { TOOL_LABEL, supportsAccountsTool, type DirEntry, type ModelConfigOption, type ModelOption, type SessionInfo, type SessionMode, type ToolAccountsSummary, type ToolKind } from '../types';
+import { isHostSession, TOOL_LABEL, supportsAccountsTool, type DirEntry, type ModelConfigOption, type ModelOption, type SessionInfo, type SessionMode, type ToolAccountsSummary, type ToolKind } from '../types';
 import { isMobile, lsGet, lsSet, shortPath } from '../util';
 import { type Attached, FILE_MAX, IMAGE_TYPES, localPaths, readImage, refOf, uploadChunked } from './Composer';
 import { useDrives } from './FilesView';
@@ -359,7 +359,7 @@ export function NewSessionPage({ params }: { params: NewSessionParams }) {
   // Directory menu: directories used recently from this page, then those of this host's sessions (newest first)
   const dirs = useMemo(() => {
     const fromSessions = (hostSessions[hostId] ?? [])
-      .filter((s) => !s.parentId)
+      .filter(isHostSession)
       .sort((a, b) => b.updatedAt - a.updatedAt)
       .map((s) => s.cwd);
     return [...new Set([...recentDirs(hostId), ...fromSessions])].slice(0, DIR_MENU_MAX);

@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { getT, isEn } from '../i18n';
 import { hubCall, rpc } from '../transport';
 import { errorToast, navigate, openNewSession, setState, toast, useStore, type HostEntry } from '../store';
-import type { SessionInfo } from '../types';
+import { isHostSession, type SessionInfo } from '../types';
 import { basename, clock, fuzzyScore, lsGet, lsSet } from '../util';
 import { openMenu, type MenuItem } from './Overlay';
 import { writeClipboard } from '../clipboard';
@@ -10,7 +10,6 @@ import { deleteDirSessions, openTerminal, renameSession, sessionMenu } from './S
 import { Icon, ToolBadge } from './Icon';
 import { MOD } from './Palette';
 import { BotsSections } from './BotsSection';
-import { isListedBotSession, useBots } from '../bots';
 import { needsAttention } from '../overview';
 
 const tx = getT('sidebar');
@@ -268,15 +267,13 @@ function OldList({
   );
 }
 
-/** Sessions listed under a host: not sub-agents, not the Bots this app runs */
-const listed = (s: SessionInfo) => !s.parentId && !isListedBotSession(s);
+/** Sessions listed under a host: ordinary top-level sessions (not sub-agents/terminals, not Bot or task sessions) */
+const listed = isHostSession;
 
 function HostBlock({ h, filter }: { h: HostEntry; filter: string }) {
   const id = h.config.id;
   const sessions = useStore((s) => s.sessions[id]);
   const view = useStore((s) => s.view);
-  // Re-render when this app's client id is known: its Bot sessions move to the Bots section
-  const botClient = useBots((b) => b.clientId);
   const [collapsed, setCollapsed] = useState<boolean>(() => lsGet(`collapse-${id}`, false));
   // Directories whose "Earlier" list is expanded ('' = the flat list in time layout); not remembered
   const [showOld, setShowOld] = useState<string[]>([]);
@@ -313,7 +310,7 @@ function HostBlock({ h, filter }: { h: HostEntry; filter: string }) {
     }
     const groups = [...m.entries()].map(([cwd, list]) => ({ cwd, list, ...split(list) }));
     return { pinned, groups, flat: split(rest), matched: all.length };
-  }, [sessions, q, staleDays, now, botClient]);
+  }, [sessions, q, staleDays, now]);
 
   const allFolded = groups.length > 0 && groups.every((g) => folded.includes(g.cwd));
   const total = (sessions ?? []).filter(listed).length;
@@ -497,11 +494,11 @@ export function Sidebar() {
   const hosts = useStore((s) => s.hosts);
   const view = useStore((s) => s.view);
   const open = useStore((s) => s.sidebarOpen);
-  // Same rule as the overview's "Needs you" column: top-level sessions on every host
+  // Same rule as the overview's "Needs you" column: ordinary top-level host sessions
   const attn = useStore((s) => {
     const now = Date.now();
     let n = 0;
-    for (const h of s.hosts) for (const x of s.sessions[h.config.id] ?? []) if (!x.parentId && needsAttention(x, now)) n++;
+    for (const h of s.hosts) for (const x of s.sessions[h.config.id] ?? []) if (isHostSession(x) && needsAttention(x, now)) n++;
     return n;
   });
   const transport = useStore((s) => s.transport);
@@ -591,7 +588,7 @@ export function Sidebar() {
           </button>
         )}
         <div className="hosts-scroll">
-          {!filter && <BotsSections />}
+          <BotsSections filter={filter} />
           {hosts.map((h) => (
             <HostBlock key={h.config.id} h={h} filter={filter} />
           ))}
