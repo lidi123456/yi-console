@@ -2809,6 +2809,12 @@ impl Hub {
                         *rt.last_text.lock().unwrap() = text.clone();
                     }
                 }
+                // Doesn't block the turn, so no pending or status change; only tell the user someone is waiting
+                EventBody::AsyncQuestion { questions, .. } if info.turn.as_ref().is_some_and(|t| t.ended_at.is_none()) => {
+                    if let Some(q) = questions.first() {
+                        notify = Some((format!("{} 在等你回答", display_name(&info)), q.question.clone()));
+                    }
+                }
                 EventBody::TurnEnd { stop_reason, .. } => {
                     if !matches!(info.status, SessionStatus::Exited | SessionStatus::Error) {
                         info.status = SessionStatus::Idle;

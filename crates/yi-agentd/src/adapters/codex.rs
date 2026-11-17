@@ -994,6 +994,30 @@ fn codex_options(session: bool) -> Vec<PermissionOption> {
     v
 }
 
+/// `AsyncUserInputQuestion[]` ({title, options?: string[]}) -> questions. They have no ids, so they are numbered;
+/// option ids are the labels, and free text is always allowed (Codex's tool description promises that)
+fn async_questions(v: &Value) -> Vec<Question> {
+    v.as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|q| Some((q["title"].as_str().map(str::trim).filter(|t| !t.is_empty())?, q)))
+        .enumerate()
+        .map(|(i, (title, q))| Question {
+            id: (i + 1).to_string(),
+            question: title.to_string(),
+            options: q["options"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|o| o.as_str().map(str::trim).filter(|o| !o.is_empty()))
+                .map(|o| QuestionOption { id: o.to_string(), label: o.to_string(), description: String::new() })
+                .collect(),
+            allow_other: true,
+            ..Default::default()
+        })
+        .collect()
+}
+
 /// app-server ThreadItem -> unified events. With `with_user` true, user messages are emitted too (for replaying history)
 pub fn item_events(item: &Value, with_user: bool) -> Vec<EventBody> {
     let id = item["id"].as_str().unwrap_or("").to_string();
@@ -1011,11 +1035,16 @@ pub fn item_events(item: &Value, with_user: bool) -> Vec<EventBody> {
         }
         "agentMessage" => {
             let text = s("text");
-            if text.trim().is_empty() {
-                vec![]
-            } else {
-                vec![EventBody::AssistantText { id, text }]
+            let mut out = vec![];
+            if !text.trim().is_empty() {
+                out.push(EventBody::AssistantText { id: id.clone(), text });
             }
+            // request_user_input_async: the tool returns at once and the turn goes on; the questions ride on this message
+            let questions = if item["delivery"] == "async" { async_questions(&item["questions"]) } else { vec![] };
+            if !questions.is_empty() {
+                out.push(EventBody::AsyncQuestion { id, questions });
+            }
+            out
         }
         "reasoning" => {
             let mut parts: Vec<String> = item["summary"]
@@ -1233,6 +1262,24 @@ fn limit_reset(rl: &Value) -> Option<i64> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn async_user_input_questions() {
+        // Shape from codex-cli 0.166 app-server after the model calls request_user_input_async
+        let item = json!({"type":"agentMessage","id":"call_1","text":"合盖 30 秒后告诉我\n- 已合盖\n- 不方便",
+            "phase":"final_answer","delivery":"async",
+            "questions":[{"title":"合盖 30 秒后告诉我","options":["已合盖","不方便"]},{"title":" "},{"title":"备注？"}]});
+        let evs = item_events(&item, false);
+        assert!(matches!(&evs[0], EventBody::AssistantText { id, .. } if id == "call_1"));
+        let EventBody::AsyncQuestion { id, questions } = &evs[1] else { panic!("{evs:?}") };
+        assert_eq!(id, "call_1");
+        assert_eq!(questions.len(), 2);
+        assert_eq!((questions[0].id.as_str(), questions[0].options.len()), ("1", 2));
+        assert_eq!(questions[0].options[1].label, "不方便");
+        assert!(questions[1].options.is_empty() && questions[1].allow_other);
+        // Without delivery=async the questions are ignored
+        let plain = json!({"type":"agentMessage","id":"m","text":"hi","questions":[{"title":"x"}]});
+        assert_eq!(item_events(&plain, false).len(), 1);
+    }
     #[test]
     fn usage_limit_reset() {
         // Shapes from codex-rs app-server-protocol v2 (RateLimitSnapshot / TurnError)

@@ -10,6 +10,5 @@
   "submit": "提交",
   "cancelled": "已取消",
   "skipped": "已跳过",
-  "unanswered": "（未回答）",
-  "pleaseSelect": "请选择"
+  "unanswered": "（未回答）"
 }

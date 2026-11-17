@@ -10,6 +10,5 @@
   "submit": "Submit",
   "cancelled": "Cancelled",
   "skipped": "Skipped",
-  "unanswered": "(Unanswered)",
-  "pleaseSelect": "Please select"
+  "unanswered": "(Unanswered)"
 }

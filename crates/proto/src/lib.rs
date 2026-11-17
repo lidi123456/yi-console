@@ -478,8 +478,8 @@ pub struct PermissionOption {
     pub kind: String,
 }
 
-/// A question the AI asks the user (Claude's AskUserQuestion, Codex's requestUserInput, Cursor's ask_question,
-/// numbered options in Kiro's reply text), sent the same way as approvals: PermissionRequest carries questions, and answers come back in answers
+/// A question the AI asks the user (Claude's AskUserQuestion, Codex's requestUserInput, Cursor's ask_question),
+/// sent the same way as approvals: PermissionRequest carries questions, and answers come back in answers
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct Question {
@@ -541,6 +541,13 @@ pub enum EventBody {
     AssistantText {
         id: String,
         text: String,
+    },
+    /// Questions attached to the reply `id` that don't block the tool (Codex `request_user_input_async`): the turn
+    /// keeps running, and the answer is sent as an ordinary message (steered into the turn if it's still running).
+    /// Follows the AssistantText with the same id, which holds the readable text
+    AsyncQuestion {
+        id: String,
+        questions: Vec<Question>,
     },
     /// Streaming chunk, pushed but not persisted; AssistantText holds the final content
     AssistantDelta {

@@ -15,7 +15,7 @@ import { DiffView, diffLines } from './DiffView';
 import { openImage } from './Lightbox';
 import { imageMenu } from './ImageMenu';
 import { Icon } from './Icon';
-import { parseTextQuestions, QuestionCard, textAnswer } from './QuestionCard';
+import { asyncAnswer, asyncAnswers, QuestionCard } from './QuestionCard';
 import { isPlanTool, PlanTracker, viewEntries, type PlanState } from '../plan';
 import { limitHead, limitOutcome, type LimitEvent } from '../limit';
 
@@ -24,7 +24,7 @@ const t = getT('chatView');
 type Item =
   | { k: 'desktop'; key: string; ev: HubEvent & { kind: 'computer_use' } }
   | { k: 'user'; key: string; text: string; ts: number; images: ImageRef[]; origin?: string }
-  | { k: 'text'; key: string; ts: number; text: string }
+  | { k: 'text'; key: string; ts: number; text: string; id?: string; ask?: AsyncAsk }
   | { k: 'thinking'; key: string; ts: number; text: string }
   | {
       k: 'tool';
@@ -118,6 +118,7 @@ function buildItems(events: HubEvent[], hideCompactCmd = false): Item[] {
   let turnTools = 0;
   let turnTexts: string[] = [];
   let exitNote: Extract<Item, { k: 'note' }> | null = null;
+  let openAsk: AsyncAsk | null = null;
   for (const e of events) {
     const key = `e${e.seq}`;
     // Keep only the latest task list, positioned at its last update; if the list is cleared, keep the previous one
@@ -163,15 +164,33 @@ function buildItems(events: HubEvent[], hideCompactCmd = false): Item[] {
         break;
       }
       case 'user_message':
+        // The first message after an async question is its answer
+        if (openAsk && e.origin !== ENGINE_ORIGIN) {
+          openAsk.answer = e.text;
+          openAsk = null;
+        }
         if (!(hideCompactCmd && e.text.trim() === '/compact')) {
           items.push({ k: 'user', key, text: e.text, ts: e.ts, images: e.images ?? [], origin: e.origin });
         }
         turnStart ??= e.ts;
         break;
       case 'assistant_text':
-        items.push({ k: 'text', key, ts: e.ts, text: e.text });
+        items.push({ k: 'text', key, ts: e.ts, text: e.text, id: e.id });
         turnTexts.push(e.text);
         break;
+      case 'async_question': {
+        // Attach to the reply it came with: the answered card replaces that reply in the timeline
+        let it: (Item & { k: 'text' }) | undefined;
+        for (let i = items.length - 1; i >= 0 && !it; i--) {
+          const x = items[i];
+          if (x.k === 'text' && x.id === e.id) it = x;
+        }
+        const ask: AsyncAsk = { id: e.id, questions: e.questions };
+        if (it) it.ask = ask;
+        else items.push({ k: 'text', key, ts: e.ts, text: e.questions.map((q) => q.question).join('\n\n'), id: e.id, ask });
+        openAsk = ask;
+        break;
+      }
       case 'thinking':
         items.push({ k: 'thinking', key, ts: e.ts, text: e.text });
         break;
@@ -1056,6 +1075,56 @@ function Plan({ plan, busy }: { plan: PlanState; busy: boolean }) {
   );
 }
 
+/** A non-blocking question (Codex request_user_input_async); `answer` is the first user message after it */
+export type AsyncAsk = { id: string; questions: Question[]; answer?: string };
+
+/** The latest async question with no user message after it */
+export function openAsyncAsk(events: HubEvent[]): AsyncAsk | null {
+  let open: AsyncAsk | null = null;
+  for (const e of events) {
+    if (e.kind === 'async_question') open = { id: e.id, questions: e.questions };
+    else if (e.kind === 'user_message' && e.origin !== ENGINE_ORIGIN) open = null;
+  }
+  return open;
+}
+
+/** Card for an async question: interactive while waiting (the answer is sent as an ordinary message), otherwise its outcome */
+export function AsyncAskCard({
+  ask,
+  tool,
+  skipped,
+  onSend,
+  onSkip,
+  compact,
+}: {
+  ask: AsyncAsk;
+  tool?: SessionInfo['tool'];
+  skipped?: boolean;
+  onSend?: (text: string) => Promise<void> | void;
+  onSkip?: () => void;
+  compact?: boolean;
+}) {
+  const name = tool ? TOOL_LABEL[tool] : 'AI';
+  if (ask.answer !== undefined || skipped)
+    return (
+      <QuestionCard
+        title={t('questionFromAi', { name })}
+        questions={ask.questions}
+        resolved={ask.answer !== undefined ? { optionId: 'answer', answers: asyncAnswers(ask.questions, ask.answer) } : { optionId: 'skip', answers: [] }}
+      />
+    );
+  return (
+    <QuestionCard
+      title={t('aiIsWaitingForYourAnswer', { name })}
+      questions={ask.questions}
+      compact={compact}
+      submitLabel={t('sendAnswer')}
+      onSubmit={onSend ? (a) => onSend(asyncAnswer(ask.questions, a)) : undefined}
+      onSkip={onSkip}
+    />
+  );
+}
+
 export function PermissionCard({
   it,
   onAnswer,
@@ -1509,7 +1578,7 @@ export function ChatView({
   onLoadOlder,
   focusSeq,
   pendingOutside,
-  onSendText,
+  skippedAsks,
 }: {
   events: HubEvent[];
   live: Map<string, string>;
@@ -1518,8 +1587,6 @@ export function ChatView({
   /** Needed to show images in user messages */
   hostId?: string;
   onAnswer: (requestId: string, optionId: string, answers?: QuestionAnswer[]) => void | Promise<void>;
-  /** Questions in Kiro's reply text; the answers are joined into one message and sent */
-  onSendText?: (text: string) => Promise<void>;
   /** yi-agentd still has older events we haven't fetched */
   hasMore?: boolean;
   loadingOlder?: boolean;
@@ -1530,6 +1597,8 @@ export function ChatView({
   focusSeq?: number;
   /** Pending permission requests are already shown elsewhere (above the input box) */
   pendingOutside?: boolean;
+  /** Async questions (by id) the user skipped */
+  skippedAsks?: string[];
 }) {
   const hideCompactCmd = info?.tool === 'claude' || info?.tool === 'codex' || info?.tool === 'cursor';
   const [, lang] = useLang();
@@ -1661,23 +1730,6 @@ export function ChatView({
     return '';
   }, [blocks]);
 
-  // Kiro has no question tool: if the last reply lists numbered questions with a) b) options and nothing was sent after it, show a card the user can click through
-  const [dismissedAsk, setDismissedAsk] = useState('');
-  const textAsk = useMemo(() => {
-    if (info?.tool !== 'kiro' || busy || !onSendText) return null;
-    let last: (Item & { k: 'text' }) | undefined;
-    for (let i = items.length - 1; i >= 0; i--) {
-      const x = items[i];
-      if (x.k === 'user') return null;
-      if (x.k === 'text') {
-        last = x;
-        break;
-      }
-    }
-    if (!last || last.key === dismissedAsk) return null;
-    const qs = parseTextQuestions(last.text);
-    return qs.length ? { key: last.key, questions: qs } : null;
-  }, [items, info?.tool, busy, onSendText, dismissedAsk]);
 
   const host = useStore((st) => (hostId ? st.hosts.find((h) => h.config.id === hostId)?.config : undefined));
   const desktopCtx = useMemo(() => (hostId && info?.id ? { hostId, sessionId: info.id } : null), [hostId, info?.id]);
@@ -1781,6 +1833,17 @@ export function ChatView({
               );
             }
             case 'text':
+              if (it.ask) {
+                // Async question: waiting ones are pinned above the input box; answered or skipped ones show here as a card
+                const skipped = skippedAsks?.includes(it.ask.id);
+                if (it.ask.answer !== undefined || skipped)
+                  return (
+                    <div key={it.key} data-key={it.key}>
+                      <AsyncAskCard ask={it.ask} tool={info?.tool} skipped={skipped} />
+                    </div>
+                  );
+                if (pendingOutside) return null;
+              }
               return (
                 <div key={it.key} data-key={it.key} className="tl tl-text msg-assistant">
                   <span className="tl-dot" />
@@ -1816,19 +1879,6 @@ export function ChatView({
               return <AccountSwitchedNote key={it.key} ev={it.ev} />;
           }
         })}
-        {textAsk && onSendText && (
-          <QuestionCard
-            key={textAsk.key}
-            title={t('kiroIsWaitingForYour')}
-            questions={textAsk.questions}
-            submitLabel={t('sendAnswer')}
-            onSubmit={async (a) => {
-              await onSendText(textAnswer(textAsk.questions, a));
-              setDismissedAsk(textAsk.key);
-            }}
-            onSkip={() => setDismissedAsk(textAsk.key)}
-          />
-        )}
         {liveThought && !liveText && !modern && <Thinking text={liveThought} live />}
         {liveThought && !liveText && modern && !tailGroup && <ActGroup key="live-think" items={[]} running end={null} liveThought={liveThought} />}
         {liveText.trim() && <LiveMarkdown text={liveText} />}

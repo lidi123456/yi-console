@@ -6,7 +6,7 @@ import { Icon } from './Icon';
 const t = getT('questionCard');
 
 // Card for questions from the AI: one or more questions, each answered by clicking options (single / multiple choice), with free text if allowed; submit or skip.
-// Used for question requests from Claude, Codex and Cursor, and for numbered options in Kiro's reply text
+// Used for question requests from Claude, Codex and Cursor, and Codex's async questions
 
 type Draft = Record<string, { selected: string[]; text: string }>;
 
@@ -181,47 +181,29 @@ function Resolved({ title, questions, resolved }: { title: string; questions: Qu
   );
 }
 
-/**
- * Kiro has no question tool; when it needs the user to choose, it lists numbered questions with a) b) c) options in its reply and asks for a "1=a, 2=b" reply.
- * Recognize that structure in the reply text, and send answers as one message in the same format
- */
-export function parseTextQuestions(text: string): Question[] {
-  const clean = (s: string) => s.replace(/\*\*|__|`/g, '').trim();
-  const qs: Question[] = [];
-  let lastLine = '';
-  for (const raw of text.split('\n')) {
-    const line = raw.replace(/\s+$/, '');
-    const opt = /^\s*(?:[-*]\s+)?\(?([a-hA-H])[).:]\s+(.+)$/.exec(line);
-    const num = /^\s*(?:[-*]\s+)?(?:\*\*)?(\d{1,2})[.)、]\s*(.+)$/.exec(line);
-    if (opt) {
-      let q = qs[qs.length - 1];
-      // A single question without a number: the line before the options is the question
-      if (!q) {
-        q = { id: '1', question: clean(lastLine) || t('pleaseSelect'), options: [], allowOther: true };
-        qs.push(q);
-      }
-      const label = clean(opt[2]);
-      const [head, ...rest] = label.split(/\s+[—–-]\s+|：|:\s/);
-      q.options.push({ id: opt[1].toLowerCase(), label: rest.length ? head : label, description: rest.length ? rest.join(' - ') : undefined });
-    } else if (num) {
-      qs.push({ id: num[1], question: clean(num[2]), options: [], allowOther: true });
-    } else if (line.trim()) lastLine = line;
-  }
-  const good = qs.filter((q) => q.options.length >= 2);
-  // Require a proper option structure, and only accept questions near the end (so ordinary numbered lists aren't mistaken for questions)
-  if (!good.length) return [];
-  const hint = /reply with your choices|1\s*=\s*a|请回复|回复.*选择/i.test(text);
-  return hint || good.length === qs.length ? good : [];
+/** Answers to Codex's async questions as a plain message: just the answer for one question, else one "title: answer" line each */
+export function asyncAnswer(questions: Question[], answers: QuestionAnswer[]) {
+  const one = (q: Question) => answerLabel(q, answers.find((a) => a.questionId === q.id));
+  if (questions.length === 1) return one(questions[0]);
+  return questions
+    .map((q) => [q, one(q)] as const)
+    .filter(([, v]) => v)
+    .map(([q, v]) => `${q.question}: ${v}`)
+    .join('\n');
 }
 
-/** Join answers as "1=a, 2=b, 3=free text" */
-export function textAnswer(questions: Question[], answers: QuestionAnswer[]) {
-  return questions
-    .map((q) => {
-      const a = answers.find((x) => x.questionId === q.id);
-      const v = [...(a?.selected ?? []), a?.text?.trim() ?? ''].filter(Boolean).join('+');
-      return v ? `${q.id}=${v}` : '';
-    })
-    .filter(Boolean)
-    .join(', ');
+/** Read an async question's answer back from the message that answered it (the reverse of asyncAnswer) */
+export function asyncAnswers(questions: Question[], text: string): QuestionAnswer[] {
+  const pick = (q: Question, v: string): QuestionAnswer => {
+    const opt = q.options.find((o) => o.label === v.trim());
+    return opt ? { questionId: q.id, selected: [opt.id] } : { questionId: q.id, selected: [], text: v.trim() };
+  };
+  if (questions.length === 1) return [pick(questions[0], text)];
+  const out: QuestionAnswer[] = [];
+  for (const line of text.split('\n')) {
+    const q = questions.find((q) => line.startsWith(`${q.question}: `));
+    if (q) out.push(pick(q, line.slice(q.question.length + 2)));
+  }
+  // Typed by hand rather than through the card: show it under the first question
+  return out.length || !questions.length ? out : [pick(questions[0], text)];
 }

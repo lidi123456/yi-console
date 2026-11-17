@@ -376,6 +376,8 @@ export type EventBody =
   /** `origin`: who sent it when not the person (`bot-engine`: the desktop app's Bot engine) */
   | { kind: 'user_message'; text: string; images?: ImageRef[]; origin?: string }
   | { kind: 'assistant_text'; id: string; text: string }
+  /** Questions on the reply `id` that don't block the turn (Codex request_user_input_async); answered with an ordinary message */
+  | { kind: 'async_question'; id: string; questions: Question[] }
   | { kind: 'assistant_delta'; id: string; delta: string }
   | { kind: 'thinking'; id: string; text: string }
   | { kind: 'thinking_delta'; id: string; delta: string }

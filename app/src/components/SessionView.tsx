@@ -12,7 +12,7 @@ import { openMenu } from './Overlay';
 import { exportSession, OPEN_CHANGES, OPEN_FILE, renameSession, sessionMenu, showChanges, switchMode } from './SessionActions';
 import { FilePanel } from './FilePanel';
 import { TermPanel } from './TermPanel';
-import { ChatView, PermissionCard, setChatStyle, useChatStyle } from './ChatView';
+import { AsyncAskCard, ChatView, openAsyncAsk, PermissionCard, setChatStyle, useChatStyle } from './ChatView';
 import { PlanDock } from './PlanDock';
 import { LimitDock } from './LimitDock';
 import { Composer } from './Composer';
@@ -131,6 +131,17 @@ export function SessionView({ hostId, sessionId, seq }: { hostId: string; sessio
     }
     return [...open.values()];
   }, [data.events, data.events.length]);
+  // Async questions (Codex request_user_input_async) don't block the tool; the one still unanswered is pinned with the approvals
+  const ask = useMemo(() => openAsyncAsk(data.events), [data.events, data.events.length]);
+  const skipKey = `asyncAskSkipped:${hostId}:${sessionId}`;
+  const [skippedAsks, setSkippedAsks] = useState<string[]>(() => lsGet<string[]>(skipKey, []));
+  useEffect(() => setSkippedAsks(lsGet<string[]>(skipKey, [])), [skipKey]);
+  const skipAsk = (id: string) => {
+    const next = [...skippedAsks.filter((x) => x !== id), id].slice(-50);
+    setSkippedAsks(next);
+    lsSet(skipKey, next);
+  };
+  const openAsk = ask && !skippedAsks.includes(ask.id) ? ask : null;
 
   if (!info) {
     return (
@@ -400,7 +411,7 @@ export function SessionView({ hostId, sessionId, seq }: { hostId: string; sessio
             onLoadOlder={() => loadOlder(hostId, sessionId).catch(errorToast)}
             focusSeq={seq}
             pendingOutside
-            onSendText={sendText}
+            skippedAsks={skippedAsks}
           />
           <div className="composer-wrap">
             <BgTasks hostId={hostId} info={info} />
@@ -417,11 +428,14 @@ export function SessionView({ hostId, sessionId, seq }: { hostId: string; sessio
                 </button>
               </div>
             )}
-            {pending.length > 0 && (
+            {(pending.length > 0 || openAsk) && (
               <div className="pending-perms">
                 {pending.map((p) => (
                   <PermissionCard key={p.requestId} it={p} onAnswer={answer} compact />
                 ))}
+                {openAsk && (
+                  <AsyncAskCard key={openAsk.id} ask={openAsk} tool={info.tool} compact onSend={sendText} onSkip={() => skipAsk(openAsk.id)} />
+                )}
               </div>
             )}
             <Composer
