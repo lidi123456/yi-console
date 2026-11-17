@@ -735,6 +735,32 @@ pub async fn dispatch(
             .await??;
             json!({ "account": outcome.account, "hostSwitched": outcome.host_switched })
         }
+        TOOLS_ACCOUNTS_REORDER => {
+            let tool = ToolKind::parse(s(&p, "tool")?).ok_or_else(|| anyhow!("未知工具"))?;
+            let ids: Vec<String> = serde_json::from_value(p["ids"].clone()).map_err(|_| anyhow!("缺少参数 ids"))?;
+            hub.accounts.reorder(tool, &ids)?;
+            hub.publish_accounts_updated(tool, None);
+            Value::Null
+        }
+        TOOLS_ACCOUNTS_TEST => {
+            let tool = ToolKind::parse(s(&p, "tool")?).ok_or_else(|| anyhow!("未知工具"))?;
+            let mut cfg: ApiKeyConfig = serde_json::from_value(p["apiConfig"].clone()).map_err(|_| anyhow!("缺少参数 apiConfig"))?;
+            if let Some(id) = p["accountId"].as_str() {
+                if let Some(saved) = hub.accounts.get_stored(tool, id).and_then(|a| a.api_config) {
+                    if cfg.api_key == "********" {
+                        cfg.api_key = saved.api_key;
+                    }
+                    if cfg.auth_token == "********" {
+                        cfg.auth_token = saved.auth_token;
+                    }
+                }
+            }
+            tokio::task::spawn_blocking(move || match crate::probe::test_api_key(tool, &cfg) {
+                Ok(models) => json!({ "ok": true, "models": models }),
+                Err(e) => json!({ "ok": false, "error": e.to_string() }),
+            })
+            .await?
+        }
         TOOLS_ACCOUNTS_SET_POLICY => {
             let tool = ToolKind::parse(s(&p, "tool")?).ok_or_else(|| anyhow!("未知工具"))?;
             let auto_failover = p["autoFailover"].as_bool().ok_or_else(|| anyhow!("缺少参数 autoFailover"))?;

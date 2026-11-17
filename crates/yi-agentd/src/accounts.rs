@@ -883,15 +883,13 @@ impl AccountManager {
                 data_dir = Some(dir);
             }
             (ToolKind::Cursor, AccountAuthKind::Oauth) => {
-                env_unset.extend(
-                    [
-                        "CURSOR_API_KEY",
-                        "CURSOR_AUTH_TOKEN",
-                        "AGENT_CLI_CREDENTIAL_STORE",
-                    ]
-                    .into_iter()
-                    .map(String::from),
-                );
+                env_unset.extend(["CURSOR_API_KEY", "CURSOR_AUTH_TOKEN"].into_iter().map(String::from));
+                // macOS: keep the login in files (~/.cursor) rather than the Keychain, so account swaps never write the Keychain
+                if cursor_file_store() {
+                    env.insert("AGENT_CLI_CREDENTIAL_STORE".into(), "file".into());
+                } else {
+                    env_unset.push("AGENT_CLI_CREDENTIAL_STORE".into());
+                }
             }
             (ToolKind::Cursor, AccountAuthKind::ApiKey) => {
                 // Keep exchanged API-key tokens strictly in process memory so `cursor-agent`
@@ -1488,6 +1486,20 @@ impl AccountManager {
         Ok(())
     }
 
+    /// Put the accounts in `ids` order (unknown ids ignored, missing ones keep their place after them) and reset
+    /// priorities, so automatic failover follows the list order
+    pub fn reorder(&self, tool: ToolKind, ids: &[String]) -> Result<()> {
+        let mut g = self.data.lock().unwrap();
+        let td = g.tools.get_mut(tool.as_str()).ok_or_else(|| anyhow!("没有 {} 账号", tool.as_str()))?;
+        let rank = |id: &str| ids.iter().position(|x| x == id).unwrap_or(usize::MAX);
+        td.accounts.sort_by_key(|a| rank(&a.id));
+        for a in td.accounts.iter_mut() {
+            a.priority = 0;
+        }
+        self.save_file(&g)?;
+        Ok(())
+    }
+
     pub fn set_policy(&self, tool: ToolKind, auto_failover: bool) -> Result<()> {
         if !tool.supports_accounts() {
             bail!("该工具不支持账号管理");
@@ -1797,6 +1809,38 @@ impl AccountManager {
         Ok(self.to_view(&stored, active_id.as_deref(), 0, None))
     }
 
+    /// The login a sign-in left in `home`, a staging home it ran in (HOME / USERPROFILE / APPDATA... pointed there), with
+    /// the same relative paths as the host's. Keyring entries are global: read live only for Antigravity, whose CLI can't
+    /// be told to use files (the caller puts the host's entries back right after)
+    pub fn take_snapshot_in_home(&self, tool: ToolKind, home: &Path) -> Result<SnapshotBundle> {
+        let tmp = AccountManager::with_dirs(self.base_dir.clone(), home.to_path_buf());
+        let mut paths = tmp.host_auth_paths(tool);
+        if tool == ToolKind::Cursor {
+            for rel in ["AppData/Roaming/Cursor/auth.json", ".cursor/auth.json", ".config/cursor/auth.json"] {
+                if !paths.iter().any(|(r, _)| r == rel) {
+                    paths.push((rel.to_string(), home.join(rel)));
+                }
+            }
+        }
+        let mut files = BTreeMap::new();
+        for (rel, abs) in paths {
+            if !abs.starts_with(home) || !abs.is_file() {
+                continue;
+            }
+            if let Ok(bytes) = std::fs::read(&abs) {
+                files.insert(rel, base64::engine::general_purpose::STANDARD.encode(bytes));
+            }
+        }
+        let keyring = if tool == ToolKind::Antigravity && keyring_managed(tool) {
+            keyring::snapshot_tool(tool).unwrap_or_default()
+        } else {
+            vec![]
+        };
+        let db_rows = tmp.take_db_rows(tool)?;
+        Ok(SnapshotBundle { files, keyring, profile_files: BTreeMap::new(), db_rows })
+    }
+
+    #[allow(dead_code)]
     pub fn take_host_snapshot(&self, tool: ToolKind) -> Result<SnapshotBundle> {
         let _guard = self.host_lock.lock().unwrap();
         self.take_host_snapshot_unlocked(tool)
@@ -1807,6 +1851,7 @@ impl AccountManager {
         self.restore_host_snapshot_unlocked(tool, snap)
     }
 
+    #[allow(dead_code)]
     pub fn clear_host_live(&self, tool: ToolKind) -> Result<()> {
         let _guard = self.host_lock.lock().unwrap();
         let empty = SnapshotBundle::default();
@@ -1825,7 +1870,7 @@ impl AccountManager {
                 }
             }
         }
-        let keyring = keyring::snapshot_tool(tool).unwrap_or_default();
+        let keyring = if keyring_managed(tool) { keyring::snapshot_tool(tool).unwrap_or_default() } else { vec![] };
         let db_rows = self.take_db_rows(tool)?;
         Ok(SnapshotBundle {
             files,
@@ -1958,7 +2003,9 @@ impl AccountManager {
             std::fs::write(&abs, bytes)?;
             crate::util::restrict_file(&abs);
         }
-        keyring::restore_tool(tool, &snap.keyring)?;
+        if keyring_managed(tool) {
+            keyring::restore_tool(tool, &snap.keyring)?;
+        }
         if tool == ToolKind::Cursor {
             self.sanitize_cursor_cli_config(snap);
         }
@@ -2967,6 +3014,16 @@ fn extract_claude_safe_meta(dot_claude_path: &Path) -> Option<serde_json::Value>
         }
     }
     Some(serde_json::Value::Object(out))
+}
+
+/// macOS Cursor processes we start keep their login in files (`AGENT_CLI_CREDENTIAL_STORE=file`), never the Keychain
+pub fn cursor_file_store() -> bool {
+    cfg!(target_os = "macos")
+}
+
+/// Whether account swaps read and write the OS keyring for `tool` (not Cursor on macOS, see `cursor_file_store`)
+pub fn keyring_managed(tool: ToolKind) -> bool {
+    !(tool == ToolKind::Cursor && cursor_file_store())
 }
 
 fn native_cursor_extra_auth(home: &Path) -> Option<PathBuf> {

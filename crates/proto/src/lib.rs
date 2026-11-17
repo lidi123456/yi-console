@@ -878,6 +878,9 @@ pub struct AccountLoginUpdate {
     pub output: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// When the device code stops working (ms since the epoch), if the CLI said so
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1222,6 +1225,11 @@ pub mod methods {
     /// Codex account whose config.toml selects a custom provider {tool, accountId, to: apiKey | oauth} -> AccountProfileView:
     /// apiKey keeps the provider and stores its key; oauth removes `model_provider` so the ChatGPT login is used
     pub const TOOLS_ACCOUNTS_CONVERT: &str = "tools.accounts.convert";
+    /// {tool, ids: [accountId]}: new list order; automatic failover tries accounts top to bottom
+    pub const TOOLS_ACCOUNTS_REORDER: &str = "tools.accounts.reorder";
+    /// {tool, apiConfig, accountId?} -> {ok, models?, error?}: whether an API key profile's endpoint answers
+    /// (Claude / Codex / Antigravity: GET the models list). A redacted key falls back to the saved account's
+    pub const TOOLS_ACCOUNTS_TEST: &str = "tools.accounts.test";
     /// Switch account in-place inside an existing session {sessionId, accountId}
     pub const SESSION_SWITCH_ACCOUNT: &str = "session.switchAccount";
     /// {refresh?} -> {tools: {<tool>: {latest?, error?, via?, canUpdate}}, jobs: {<tool>: ToolJob}, info: [ToolInfo]}: the newest published

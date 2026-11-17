@@ -1705,3 +1705,46 @@ mod tests {
         assert_eq!(cursor_api_endpoint(&penv), "https://custom.cursor.example");
     }
 }
+
+/// Check an API key profile against its endpoint's models list; returns how many models it lists.
+/// Claude: `/v1/models` (x-api-key, or Bearer for an auth token); Codex: OpenAI-style `/models` (Bearer);
+/// Antigravity: Gemini `/v1beta/models` (x-goog-api-key). Other tools have no endpoint we can check.
+pub fn test_api_key(tool: ToolKind, cfg: &ApiKeyConfig) -> Result<usize> {
+    let key = cfg.api_key.trim();
+    let token = cfg.auth_token.trim();
+    if key.is_empty() && token.is_empty() {
+        bail!("没有填写 API Key");
+    }
+    let base = cfg.base_url.trim().trim_end_matches('/');
+    let with_v1 = |default: &str| {
+        let b = if base.is_empty() { default } else { base };
+        if b.ends_with("/v1") { format!("{b}/models") } else { format!("{b}/v1/models") }
+    };
+    let req = match tool {
+        ToolKind::Claude => {
+            let r = ureq::get(&with_v1("https://api.anthropic.com")).header("anthropic-version", "2023-06-01");
+            if key.is_empty() { r.header("Authorization", &format!("Bearer {token}")) } else { r.header("x-api-key", key) }
+        }
+        ToolKind::Codex => {
+            let b = if base.is_empty() { "https://api.openai.com/v1" } else { base };
+            ureq::get(&format!("{b}/models")).header("Authorization", &format!("Bearer {}", if key.is_empty() { token } else { key }))
+        }
+        ToolKind::Antigravity => {
+            let b = if base.is_empty() { "https://generativelanguage.googleapis.com" } else { base };
+            ureq::get(&format!("{b}/v1beta/models")).header("x-goog-api-key", key)
+        }
+        _ => bail!("{} 不支持测试连接", tool.as_str()),
+    };
+    let resp = req.config().timeout_global(Some(Duration::from_secs(15))).build().call();
+    let mut resp = match resp {
+        Ok(r) => r,
+        Err(ureq::Error::StatusCode(401 | 403)) => bail!("Key 无效或没有权限（HTTP 401/403）"),
+        Err(ureq::Error::StatusCode(404)) => bail!("接口地址不对：没有找到模型列表（HTTP 404）"),
+        Err(ureq::Error::StatusCode(code)) => bail!("接口返回 HTTP {code}"),
+        Err(e) => bail!("连接失败：{e}"),
+    };
+    let body = resp.body_mut().read_to_string().unwrap_or_default();
+    let v: Value = serde_json::from_str(&body).map_err(|_| anyhow!("接口返回的不是模型列表"))?;
+    let n = v["data"].as_array().or_else(|| v["models"].as_array()).map(|a| a.len());
+    n.ok_or_else(|| anyhow!("接口返回的不是模型列表"))
+}

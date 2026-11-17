@@ -5,7 +5,8 @@
 //! codes for headless/remote users, accepts pasted callback URLs or codes via RPC,
 //! and rolls back HostActive snapshots automatically on failure or cancellation.
 
-use crate::accounts::{ensure_codex_profile_files, AccountManager, SnapshotBundle};
+use crate::accounts::{ensure_codex_profile_files, AccountManager};
+use crate::keyring::KeyringEntry;
 use anyhow::{anyhow, bail, Result};
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use regex::Regex;
@@ -41,7 +42,13 @@ struct LoginJob {
     staging_id: String,
     staging_dir: Option<PathBuf>,
     cleanup_dir_on_abort: bool,
-    host_backup: Mutex<Option<SnapshotBundle>>,
+    /// HostActive tools: the home the CLI signs in under (HOME / USERPROFILE / APPDATA... point here), so the
+    /// host's own login is never touched while the user signs in
+    login_home: Option<PathBuf>,
+    /// Antigravity: the host's keyring entries before the sign-in (its CLI always writes the global keyring)
+    keyring_backup: Mutex<Option<Vec<KeyringEntry>>>,
+    /// Processes the sign-in CLI started (a browser it opened), ended with the staging home on Windows
+    spawned: Arc<Mutex<Vec<u32>>>,
     state: Mutex<AccountLoginUpdate>,
     handles: Mutex<RunningHandles>,
 }
@@ -104,18 +111,22 @@ impl LoginManager {
             .unwrap_or_else(AccountManager::new_account_id);
         let cleanup_dir_on_abort = req.account_id.is_none();
 
-        let (staging_dir, host_backup) = if isolation == AccountIsolation::Isolated {
+        let (staging_dir, login_home, keyring_backup) = if isolation == AccountIsolation::Isolated {
             let dir = self.accounts.profile_home(req.tool, &staging_id);
             std::fs::create_dir_all(&dir)?;
             if req.tool == ToolKind::Codex {
                 ensure_codex_profile_files(&dir, None)?;
             }
-            (Some(dir), None)
+            (Some(dir), None, None)
         } else {
-            let snap = self.accounts.take_host_snapshot(req.tool)?;
-            // Preserve live host auth in backup and clear live slots so CLI always starts a fresh login.
-            self.accounts.clear_host_live(req.tool)?;
-            (None, Some(snap))
+            let home = self.accounts.account_dir(req.tool, &staging_id).join("login-home");
+            let _ = std::fs::remove_dir_all(&home);
+            for sub in ["AppData/Roaming", "AppData/Local", ".local/share", ".config"] {
+                std::fs::create_dir_all(home.join(sub))?;
+            }
+            let backup = (req.tool == ToolKind::Antigravity && crate::accounts::keyring_managed(req.tool))
+                .then(|| crate::keyring::snapshot_tool(req.tool).unwrap_or_default());
+            (None, Some(home), backup)
         };
 
         let init_state = AccountLoginUpdate {
@@ -131,6 +142,7 @@ impl LoginManager {
             needs_input: false,
             output: Vec::new(),
             error: None,
+            expires_at: None,
         };
 
         let job = Arc::new(LoginJob {
@@ -139,7 +151,9 @@ impl LoginManager {
             staging_id,
             staging_dir,
             cleanup_dir_on_abort,
-            host_backup: Mutex::new(host_backup),
+            login_home,
+            keyring_backup: Mutex::new(keyring_backup),
+            spawned: Arc::new(Mutex::new(Vec::new())),
             state: Mutex::new(init_state.clone()),
             handles: Mutex::new(RunningHandles {
                 cancel_fn: None,
@@ -214,8 +228,10 @@ impl LoginManager {
     }
 
     fn restore_on_abort(&self, job: &LoginJob) {
-        if let Some(backup) = job.host_backup.lock().unwrap().take() {
-            let _ = self.accounts.restore_host_snapshot(job.tool, &backup);
+        self.restore_host_keyring(job);
+        if let Some(home) = &job.login_home {
+            let url = job.state.lock().unwrap().url.clone();
+            remove_login_home(home, &job.spawned, url.as_deref());
         }
         if job.cleanup_dir_on_abort {
             let dir = self.accounts.account_dir(job.tool, &job.staging_id);
@@ -265,7 +281,6 @@ impl LoginManager {
             Ok(()) => {
                 match self.finalize_success(&job, label.as_deref()) {
                     Ok((view, host_switched)) => {
-                        *job.host_backup.lock().unwrap() = None;
                         let acc_id = view.id.clone();
                         let updated = {
                             let mut st = job.state.lock().unwrap();
@@ -343,28 +358,59 @@ impl LoginManager {
             )?;
             Ok((view, false))
         } else {
-            let snap = self.accounts.take_host_snapshot(job.tool)?;
+            let home = job.login_home.as_ref().ok_or_else(|| anyhow!("缺少登录目录"))?;
+            let snap = self.accounts.take_snapshot_in_home(job.tool, home);
+            // Put the host's keyring back first, whatever happens next
+            self.restore_host_keyring(job);
+            let url = job.state.lock().unwrap().url.clone();
+            remove_login_home(home, &job.spawned, url.as_deref());
+            let snap = snap?;
             if snap.is_empty() {
-                bail!("登录进程结束，但系统未保存任何新凭据");
+                bail!("登录进程结束，但没有找到新的登录凭据");
             }
             if job.tool == ToolKind::Cursor && crate::accounts::cursor_snapshot_is_api_key(&snap) {
                 bail!("登录进程未生成网页授权凭据，请重试");
             }
+            // Signing in again to the host's current account refreshes the host too; any other account is only saved
+            let refresh_host = job
+                .target_account_id
+                .as_deref()
+                .is_some_and(|id| self.accounts.active_account_id(job.tool).as_deref() == Some(id));
+            let host_snap = refresh_host.then(|| snap.clone());
             let view = self.accounts.save_oauth_from_dir(
                 job.tool,
                 job.target_account_id.as_deref(),
                 label,
                 None,
                 Some(snap),
-                true,
+                false,
             )?;
-            Ok((view, true))
+            if let Some(snap) = host_snap {
+                self.accounts.restore_host_snapshot(job.tool, &snap)?;
+            }
+            Ok((view, refresh_host))
+        }
+    }
+
+    fn restore_host_keyring(&self, job: &LoginJob) {
+        if let Some(entries) = job.keyring_backup.lock().unwrap().take() {
+            let _ = crate::keyring::restore_tool(job.tool, &entries);
         }
     }
 
     fn resolve_env(&self, job: &LoginJob) -> (Vec<(&'static str, String)>, Vec<&'static str>) {
         let mut sets = Vec::new();
         let mut unsets = Vec::new();
+        if let Some(home) = &job.login_home {
+            let h = |sub: &str| home.join(sub).display().to_string();
+            sets.push(("HOME", home.display().to_string()));
+            sets.push(("USERPROFILE", home.display().to_string()));
+            sets.push(("APPDATA", h("AppData/Roaming")));
+            sets.push(("LOCALAPPDATA", h("AppData/Local")));
+            sets.push(("XDG_DATA_HOME", h(".local/share")));
+            sets.push(("XDG_CONFIG_HOME", h(".config")));
+            unsets.extend(["HOMEDRIVE", "HOMEPATH", "CURSOR_CONFIG_DIR"]);
+        }
         match job.tool {
             ToolKind::Codex => {
                 if let Some(dir) = &job.staging_dir {
@@ -390,11 +436,9 @@ impl LoginManager {
             }
             ToolKind::Cursor => {
                 sets.push(("NO_OPEN_BROWSER", "1".into()));
-                unsets.extend([
-                    "CURSOR_API_KEY",
-                    "CURSOR_AUTH_TOKEN",
-                    "AGENT_CLI_CREDENTIAL_STORE",
-                ]);
+                // Files under the login home, never the system keychain
+                sets.push(("AGENT_CLI_CREDENTIAL_STORE", "file".into()));
+                unsets.extend(["CURSOR_API_KEY", "CURSOR_AUTH_TOKEN"]);
             }
             _ => {}
         }
@@ -431,6 +475,7 @@ impl LoginManager {
             }
         }
         let mut child = cmd.spawn()?;
+        watch_spawned(job, Some(child.id()));
         #[cfg(unix)]
         let pid = child.id();
 
@@ -473,12 +518,12 @@ impl LoginManager {
         let t1 = stdout.map(|r| {
             let j = job.clone();
             let e = emit.clone();
-            std::thread::spawn(move || read_stream_chunks(r, &j, &e))
+            std::thread::spawn(move || read_stream_chunks(r, &j, &e, None))
         });
         let t2 = stderr.map(|r| {
             let j = job.clone();
             let e = emit.clone();
-            std::thread::spawn(move || read_stream_chunks(r, &j, &e))
+            std::thread::spawn(move || read_stream_chunks(r, &j, &e, None))
         });
 
         let status = loop {
@@ -528,7 +573,8 @@ impl LoginManager {
         let pty = native_pty_system();
         let pair = pty.openpty(PtySize {
             rows: 30,
-            cols: 120,
+            // Wide enough that ConPTY doesn't wrap long authorization URLs across lines
+            cols: 2000,
             pixel_width: 0,
             pixel_height: 0,
         })?;
@@ -547,16 +593,16 @@ impl LoginManager {
         }
         let mut child = pair.slave.spawn_command(cmd)?;
         drop(pair.slave);
+        watch_spawned(job, child.process_id());
 
         let reader = pair.master.try_clone_reader()?;
-        let mut writer = pair.master.take_writer()?;
+        let writer: Arc<Mutex<Box<dyn Write + Send>>> = Arc::new(Mutex::new(pair.master.take_writer()?));
         let (tx, rx) = mpsc::channel::<String>();
+        let w_in = writer.clone();
         std::thread::spawn(move || {
             while let Ok(line) = rx.recv() {
-                if writer.write_all(line.as_bytes()).is_err()
-                    || writer.write_all(b"\r").is_err()
-                    || writer.flush().is_err()
-                {
+                let mut w = w_in.lock().unwrap();
+                if w.write_all(line.as_bytes()).is_err() || w.write_all(b"\r").is_err() || w.flush().is_err() {
                     break;
                 }
             }
@@ -577,7 +623,15 @@ impl LoginManager {
 
         let j_r = job.clone();
         let e_r = emit.clone();
-        let t = std::thread::spawn(move || read_stream_chunks(reader, &j_r, &e_r));
+        // Windows ConPTY starts by asking for the cursor position (ESC[6n) and the child prints nothing until
+        // someone answers; a real terminal (xterm.js) does that, here we answer "row 1, column 1"
+        let w_q = writer.clone();
+        let answer: Box<dyn Fn() + Send> = Box::new(move || {
+            let mut w = w_q.lock().unwrap();
+            let _ = w.write_all(b"\x1b[1;1R");
+            let _ = w.flush();
+        });
+        let t = std::thread::spawn(move || read_stream_chunks(reader, &j_r, &e_r, Some(answer)));
 
         let status = child.wait()?;
         drop(job.handles.lock().unwrap().pty_master.take());
@@ -608,7 +662,12 @@ fn default_mode(tool: ToolKind, req: Option<&str>) -> String {
     }
 }
 
-fn read_stream_chunks<R: Read>(mut reader: R, job: &LoginJob, emit: &LoginEmitFn) {
+fn read_stream_chunks<R: Read>(
+    mut reader: R,
+    job: &LoginJob,
+    emit: &LoginEmitFn,
+    on_cursor_query: Option<Box<dyn Fn() + Send>>,
+) {
     let mut buf = [0u8; 2048];
     let mut pending = String::new();
     loop {
@@ -621,6 +680,11 @@ fn read_stream_chunks<R: Read>(mut reader: R, job: &LoginJob, emit: &LoginEmitFn
             }
             Ok(n) => {
                 let chunk = String::from_utf8_lossy(&buf[..n]);
+                if let Some(answer) = &on_cursor_query {
+                    for _ in 0..chunk.matches("\x1b[6n").count() {
+                        answer();
+                    }
+                }
                 pending.push_str(&chunk);
                 while let Some(pos) = pending.find('\n') {
                     let line = pending[..pos].to_string();
@@ -650,8 +714,16 @@ fn ingest_line(job: &LoginJob, raw_line: &str, emit: &LoginEmitFn) {
             st.output.remove(0);
         }
         st.output.push(clean.clone());
-        if let Some(u) = extract_url(&clean) {
-            st.url = Some(u);
+        // The first sign-in URL wins; local callback servers (http://localhost:1455) aren't one
+        if st.url.is_none() {
+            if let Some(u) = extract_url(&clean).filter(|u| !is_local_url(u)) {
+                st.url = Some(u);
+            }
+        }
+        if st.expires_at.is_none() {
+            if let Some(mins) = expiry_minutes(&clean) {
+                st.expires_at = Some(crate::util::now_ms() + mins as i64 * 60_000);
+            }
         }
         if let Some(c) = extract_device_code(&clean) {
             st.code = Some(c);
@@ -685,14 +757,115 @@ fn extract_url(line: &str) -> Option<String> {
     Some(m.as_str().trim_end_matches([',', '.', ')', ']']).to_string())
 }
 
+/// Delete a sign-in's staging home. On Windows the CLI may have opened the browser from it (with USERPROFILE pointing
+/// there, Chrome / Edge make a fresh profile inside it), and those processes keep files open: end them first
+fn remove_login_home(home: &std::path::Path, spawned: &Mutex<Vec<u32>>, url: Option<&str>) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // The browser's main process doesn't name the profile dir in its command line; it's a child of the CLI
+        // (or of a `cmd /c start` the CLI ran), recorded while the sign-in ran
+        for pid in std::mem::take(&mut *spawned.lock().unwrap()) {
+            let _ = Command::new("taskkill")
+                .args(["/F", "/T", "/PID", &pid.to_string()])
+                .creation_flags(0x0800_0000)
+                .output();
+        }
+        // A browser opened through a short-lived helper (`cmd /c start`) isn't below the CLI any more: it's the one
+        // whose command line is the sign-in URL (`chrome.exe --single-argument <url>`) or names the staging home
+        let q = |v: &str| v.replace('\'', "''");
+        let p = q(&home.display().to_string());
+        let u = url.map(q).unwrap_or_else(|| p.clone());
+        let script = format!(
+            "Get-CimInstance Win32_Process | ? {{ $_.ProcessId -ne $PID -and $_.CommandLine -and ($_.CommandLine.Contains('{p}') -or $_.CommandLine.Contains('{u}')) }} | % {{ taskkill /F /T /PID $_.ProcessId 2>&1 | Out-Null }}"
+        );
+        let _ = Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .creation_flags(0x0800_0000)
+            .output();
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = url;
+        drop(spawned.lock().unwrap().drain(..));
+    }
+    // Processes that just ended can hold files for a moment
+    for _ in 0..10 {
+        if std::fs::remove_dir_all(home).is_ok() || !home.exists() {
+            break;
+        }
+        // Windows creates system + hidden INetCache folders in there, which remove_dir_all can't delete
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            let _ = Command::new("cmd")
+                .arg("/c")
+                .arg("rmdir")
+                .arg("/s")
+                .arg("/q")
+                .arg(home)
+                .creation_flags(0x0800_0000)
+                .output();
+            if !home.exists() {
+                break;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+}
+
+/// Windows, sign-ins in a staging home: note every process below the CLI while it runs (see `remove_login_home`)
+fn watch_spawned(job: &Arc<LoginJob>, cli_pid: Option<u32>) {
+    if !cfg!(windows) || job.login_home.is_none() {
+        return;
+    }
+    let Some(root) = cli_pid else { return };
+    let job = job.clone();
+    std::thread::spawn(move || {
+        while job.state.lock().unwrap().running {
+            let found = crate::proctree::descendants(root);
+            let mut g = job.spawned.lock().unwrap();
+            for pid in found {
+                if !g.contains(&pid) {
+                    g.push(pid);
+                }
+            }
+            drop(g);
+            std::thread::sleep(std::time::Duration::from_millis(700));
+        }
+    });
+}
+
+fn is_local_url(u: &str) -> bool {
+    let rest = u.split_once("://").map(|(_, r)| r).unwrap_or(u);
+    rest.starts_with("localhost") || rest.starts_with("127.0.0.1") || rest.starts_with("[::1]")
+}
+
+/// "expires in 15 minutes" (Codex device auth) -> 15
+fn expiry_minutes(line: &str) -> Option<u64> {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| Regex::new(r"(?i)expires?\s+in\s+(\d{1,3})\s*(?:minutes?|mins?)\b").unwrap());
+    re.captures(line)?[1].parse().ok()
+}
+
 fn extract_device_code(line: &str) -> Option<String> {
     static RE: OnceLock<Regex> = OnceLock::new();
     // Codex device-auth uses uppercase alphanumeric segments like ABCD-12345.
     let re = RE.get_or_init(|| Regex::new(r"\b([A-Z0-9]{4,5}-[A-Z0-9]{4,6})\b").unwrap());
-    if line.contains("http://") || line.contains("https://") {
-        return None;
+    // Kiro's URL carries it (`...device?user_code=MJCG-RMTN`); otherwise look outside URLs (a pty may put both on one line)
+    static URL_RE: OnceLock<Regex> = OnceLock::new();
+    let url_re = URL_RE.get_or_init(|| Regex::new(r"https?://\S+").unwrap());
+    for u in url_re.find_iter(line) {
+        if let Some(c) = u.as_str().split("user_code=").nth(1) {
+            let c: String = c.chars().take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '-').collect();
+            if re.is_match(&c) {
+                return Some(c);
+            }
+        }
     }
-    for cap in re.captures_iter(line) {
+    let line = url_re.replace_all(line, " ");
+    for cap in re.captures_iter(&line) {
         let token = &cap[1];
         if token.bytes().any(|b| b.is_ascii_uppercase()) {
             return Some(token.to_string());
@@ -723,6 +896,14 @@ mod tests {
         assert_eq!(code.as_deref(), Some("W4K9-P2X8M"));
         // Plain dates must not be misidentified as device codes.
         assert_eq!(extract_device_code("2026-1115"), None);
+        assert_eq!(
+            extract_device_code("Code: MJCG-RMTNOpen this URL: https://view.awsapps.com/start/#/device?user_code=MJCG-RMTN").as_deref(),
+            Some("MJCG-RMTN")
+        );
+        assert_eq!(extract_device_code("https://auth.openai.com/codex/device?x=ABCD-EFGH1"), None);
+        assert_eq!(expiry_minutes("2. Enter this one-time code (expires in 15 minutes)"), Some(15));
+        assert!(is_local_url("http://localhost:1455"));
+        assert!(!is_local_url("https://auth.openai.com/oauth/authorize?x=1"));
     }
 
     #[test]

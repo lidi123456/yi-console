@@ -302,6 +302,8 @@ export interface AccountLoginUpdate {
   needsInput: boolean;
   output: string[];
   error?: string | null;
+  /** When the device code expires (ms since the epoch) */
+  expiresAt?: number | null;
 }
 
 export interface AccountQuotaEntry {
