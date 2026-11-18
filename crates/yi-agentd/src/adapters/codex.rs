@@ -736,7 +736,7 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Vec<Valu
                     .to_string(),
                 })
                 .collect();
-            em.event(EventBody::Plan { entries });
+            em.event(EventBody::Plan { entries, session_scoped: false });
         }
         "thread/tokenUsage/updated" => {
             let tu = &params["tokenUsage"];

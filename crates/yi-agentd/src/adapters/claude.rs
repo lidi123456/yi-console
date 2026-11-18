@@ -780,7 +780,7 @@ pub fn blocks_to_events(block: &Value, bid: &str) -> Vec<EventBody> {
                         status: t["status"].as_str().unwrap_or("pending").to_string(),
                     })
                     .collect();
-                evs.push(EventBody::Plan { entries });
+                evs.push(EventBody::Plan { entries, session_scoped: false });
             }
             evs
         }

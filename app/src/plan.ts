@@ -11,6 +11,8 @@ export interface PlanState {
   entries: PlanEntry[];
   /** The tool itself has no "in progress" (Kiro): while the turn runs, treat the first unfinished item as in progress */
   infer?: boolean;
+  /** Qoder keeps the list on disk and updates it between turns. */
+  sessionScoped?: boolean;
   /** The turn that last updated the list has ended. Tools often stop without ticking the last items (Kiro's "Report to
    *  user"), so such a list is left behind: no bar above the input box, and no inferred "in progress" in later turns.
    *  Set in place, so the timeline card holding this object sees it; every update makes a new object */
@@ -74,11 +76,13 @@ export class PlanTracker {
         this.todoBase.clear();
         return false;
       case 'plan':
-        this.plan = { entries: e.entries };
-        return true;
+        this.plan = { entries: e.entries, sessionScoped: e.sessionScoped };
+        return !e.sessionScoped || e.entries.length > 0;
       case 'tool_call': {
         if (isCursorTodos(e.input)) return this.cursorTodos(e.id, e.input as Rec);
         if (!PLAN_TOOLS.has(e.name)) return false;
+        // Qoder's full task list is authoritative once it is available.
+        if (this.plan?.sessionScoped && (e.name === 'TaskCreate' || e.name === 'TaskUpdate')) return false;
         const input = (e.input && typeof e.input === 'object' ? e.input : {}) as Rec;
         this.calls.set(e.id, { name: e.name, input });
         if (e.name !== 'TaskUpdate') return false;
@@ -97,6 +101,7 @@ export class PlanTracker {
         const c = this.calls.get(e.id);
         if (!c || e.isError) return false;
         if (c.name === 'TaskCreate') {
+          if (this.plan?.sessionScoped) return false;
           const m = /^Task #(\S+) created successfully/.exec(e.output.trim());
           if (!m) return false;
           this.tasks.set(m[1], { content: str(c.input.subject), status: 'pending' });
@@ -158,12 +163,11 @@ export class PlanTracker {
   }
 }
 
-/** The task list of the turn in progress (for the bar above the input box). One left by an ended turn, finished,
- *  interrupted or not, isn't shown until the tool updates the list again; the timeline card still shows it */
+/** The task list above the input box. Session-scoped lists can progress between turns. */
 export function latestPlan(events: HubEvent[]): PlanState | null {
   const t = new PlanTracker();
   for (const e of events) t.feed(e);
-  return t.plan && !t.plan.ended ? t.plan : null;
+  return t.plan && (!t.plan.ended || t.plan.sessionScoped) ? t.plan : null;
 }
 
 /** Status for display: with infer, while the list's own turn runs, the first unfinished item counts as in progress */

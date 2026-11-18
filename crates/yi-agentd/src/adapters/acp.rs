@@ -1,12 +1,13 @@
 //! ACP (Agent Client Protocol) adapter, for `cursor-agent acp`, `kiro-cli acp`, `qodercli --acp`, `codebuddy --acp`.
 //! Protocol: JSON-RPC 2.0 over stdio; session/update notifications push content, session/request_permission asks for approval.
 
-use super::{AdapterCmd, JsonProc, Prompt, StartSpec};
+use super::{qoder_tasks, AdapterCmd, JsonProc, Prompt, StartSpec};
 use crate::hub::Emitter;
 use crate::util::now_ms;
 use yi_proto::*;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::PathBuf;
 use tokio::sync::mpsc;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -42,6 +43,7 @@ struct ToolState {
 
 #[derive(Default)]
 struct State {
+    qoder_config_dir: Option<PathBuf>,
     /// The computer use notice still has to go out with the next prompt (once per launch)
     desktop_notice: bool,
     /// The session's appended system prompt still has to go out with the next prompt (new tool session or changed)
@@ -214,6 +216,7 @@ pub async fn run(spec: StartSpec, em: Emitter, mut rx: mpsc::UnboundedReceiver<A
         Err(e) => return em.exited(Some(format!("启动 {} 失败: {e}", spec.tool.as_str()))),
     };
     let mut st = State {
+        qoder_config_dir: (spec.tool == ToolKind::Qoder).then(|| qoder_tasks::config_dir(&spec.cwd, &spec.env, &spec.env_unset)),
         perm: spec.permission_mode.clone(),
         native_modes: spec.tool == ToolKind::Antigravity,
         is_antigravity: spec.tool == ToolKind::Antigravity,
@@ -236,6 +239,8 @@ pub async fn run(spec: StartSpec, em: Emitter, mut rx: mpsc::UnboundedReceiver<A
     let mut fatal: Option<String> = None;
     let mut agy_tick = tokio::time::interval(std::time::Duration::from_millis(250));
     agy_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut qoder_tick = tokio::time::interval(std::time::Duration::from_secs(1));
+    qoder_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let startup_timeout = tokio::time::sleep(std::time::Duration::from_secs(60));
     tokio::pin!(startup_timeout);
     loop {
@@ -272,6 +277,12 @@ pub async fn run(spec: StartSpec, em: Emitter, mut rx: mpsc::UnboundedReceiver<A
                     let next = st.queue.remove(0);
                     let m = prompt(&mut st, &em, &next);
                     let _ = p.send(&m).await;
+                }
+            }
+            // Task notifications can wake Qoder after the ACP prompt has returned. Its task files still change.
+            _ = qoder_tick.tick(), if st.qoder_config_dir.is_some() && st.session_id.is_some() && !st.loading => {
+                if let Some(dir) = &st.qoder_config_dir {
+                    em.sync_qoder_plan(dir);
                 }
             }
             cmd = rx.recv() => match cmd {
@@ -1857,6 +1868,9 @@ fn update(st: &mut State, em: &Emitter, u: &Value) {
             if st.muted() {
                 return;
             }
+            if st.qoder_config_dir.as_ref().is_some_and(|dir| em.sync_qoder_plan(dir)) {
+                return;
+            }
             let entries = u["entries"]
                 .as_array()
                 .into_iter()
@@ -1866,7 +1880,7 @@ fn update(st: &mut State, em: &Emitter, u: &Value) {
                     status: e["status"].as_str().unwrap_or("pending").to_string(),
                 })
                 .collect();
-            em.event(EventBody::Plan { entries });
+            em.event(EventBody::Plan { entries, session_scoped: false });
         }
         _ => {}
     }

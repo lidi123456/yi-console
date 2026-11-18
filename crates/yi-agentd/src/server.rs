@@ -284,7 +284,7 @@ pub async fn dispatch(
             let since = p["sinceSeq"].as_i64().unwrap_or(0);
             // Register the subscription before fetching the backlog; events in between may be duplicated, and clients dedupe by seq
             subs.lock().unwrap().insert(sid.clone());
-            let info = hub.info(&sid)?;
+            let info = hub.subscription_info(&sid)?;
             // On first open, only the latest tail events may be requested; older ones are paged in with session.history
             let tail = p["tail"].as_u64().filter(|_| since == 0);
             let mut r = match tail {

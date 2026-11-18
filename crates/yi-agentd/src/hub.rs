@@ -1,13 +1,13 @@
 //! Hub: the session manager. Holds the runtime state of every session and handles event numbering, persistence and broadcasting.
 
-use crate::adapters::{self, AdapterCmd, Prompt, PromptImage, StartSpec};
+use crate::adapters::{self, qoder_tasks, AdapterCmd, Prompt, PromptImage, StartSpec};
 use crate::store::Store;
 use crate::util::{now_ms, truncate};
 use anyhow::{anyhow, bail, Result};
 use yi_proto::*;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use tokio::sync::{broadcast, mpsc};
 
@@ -151,6 +151,8 @@ struct SessionRt {
     failover_tried: Mutex<Vec<String>>,
     /// Last terminal viewport dimensions reported via `pty.resize`
     term_size: Mutex<Option<(u16, u16)>>,
+    /// Last task snapshot read from the Qoder account and tool session's own directory
+    qoder_plan: Mutex<Option<(PathBuf, Vec<PlanEntry>)>>,
 }
 
 /// One terminal-mode process run
@@ -587,6 +589,52 @@ impl Hub {
 
     pub fn info(&self, id: &str) -> Result<SessionInfo> {
         Ok(self.get(id)?.info.lock().unwrap().clone())
+    }
+
+    pub fn subscription_info(&self, id: &str) -> Result<SessionInfo> {
+        let rt = self.get(id)?;
+        let gen = *rt.generation.lock().unwrap();
+        let info = rt.info.lock().unwrap().clone();
+        // An open session is refreshed by its adapter. A saved session can recover its list without starting Qoder.
+        if info.tool != ToolKind::Qoder || info.mode != SessionMode::Structured || info.external_id.is_none()
+            || self.running_tx(&rt).is_some()
+        {
+            return Ok(info);
+        }
+        let account = self.accounts.resolve(info.tool, info.account_id.as_deref());
+        let cwd = Path::new(&info.cwd);
+        let dir = match &account {
+            Some(account) => qoder_tasks::config_dir(cwd, &account.env, &account.env_unset),
+            None => qoder_tasks::config_dir(cwd, &Default::default(), &[]),
+        };
+        self.sync_qoder_plan(id, gen, &dir);
+        self.info(id)
+    }
+
+    /// Return whether the native task list owns this session's plan, even if the last read needs retrying.
+    fn sync_qoder_plan(&self, id: &str, gen: u64, config_dir: &Path) -> bool {
+        let Ok(rt) = self.get(id) else { return false };
+        let mut cache = rt.qoder_plan.lock().unwrap();
+        let dir = {
+            let info = rt.info.lock().unwrap();
+            info.external_id.as_deref().filter(|_| info.tool == ToolKind::Qoder && info.mode == SessionMode::Structured)
+                .and_then(|sid| qoder_tasks::task_dir(config_dir, sid))
+        };
+        let Some(dir) = dir else { return false };
+        let previous = cache.as_ref().filter(|(path, _)| *path == dir);
+        let Some(entries) = qoder_tasks::read(&dir) else { return previous.is_some() };
+        if *rt.generation.lock().unwrap() != gen {
+            return false;
+        }
+        if previous.is_some_and(|(_, last)| *last == entries) {
+            return true;
+        }
+        let event = EventBody::Plan { entries: entries.clone(), session_scoped: true };
+        if previous.is_some() || self.store.last_plan(id).ok().flatten().as_ref() != Some(&event) {
+            self.emit(id, gen, event);
+        }
+        *cache = Some((dir, entries));
+        true
     }
 
     pub fn create(self: &Arc<Self>, p: CreateParams) -> Result<SessionInfo> {
@@ -1377,6 +1425,7 @@ impl Hub {
         rt.last_text.lock().unwrap().clear();
         *rt.interrupted.lock().unwrap() = false;
         *rt.restart_pending.lock().unwrap() = false;
+        *rt.qoder_plan.lock().unwrap() = None;
         self.store.delete_events(id)?;
         self.store.save_session(&info)?;
         // Images and attachments in the chat are only referenced by the deleted records, so delete them too
@@ -3719,6 +3768,7 @@ fn new_rt(info: SessionInfo) -> SessionRt {
         pending_failover: Mutex::new(None),
         failover_tried: Mutex::new(vec![]),
         term_size: Mutex::new(None),
+        qoder_plan: Mutex::new(None),
     }
 }
 
@@ -3839,6 +3889,10 @@ pub struct Emitter {
 }
 
 impl Emitter {
+    pub(crate) fn sync_qoder_plan(&self, config_dir: &Path) -> bool {
+        self.hub.sync_qoder_plan(&self.sid, self.gen, config_dir)
+    }
+
     pub fn desktop_tool_allowed(&self, name: &str) -> bool {
         self.hub.desktop.authorizes(&self.sid, name)
     }
@@ -4265,6 +4319,41 @@ mod tests {
         // A process exit ends the turn, so the next message doesn't continue it
         em.event(EventBody::Status { status: SessionStatus::Exited, message: None });
         assert!(hub.info("s").unwrap().turn.unwrap().ended_at.is_some());
+    }
+
+    #[test]
+    fn qoder_plan_tracks_disk_changes_after_a_turn_ends() {
+        let (hub, em, _rx) = test_emitter();
+        test_set_tool(&hub, "s", ToolKind::Qoder);
+        let config = tempfile::tempdir().unwrap();
+        let native_id = uuid::Uuid::new_v4().to_string();
+        hub.set_external_id("s", &native_id);
+        let dir = config.path().join("tasks").join(native_id);
+        std::fs::create_dir_all(&dir).unwrap();
+        let task = dir.join("2.json");
+        std::fs::write(dir.join("10.json"), r#"{"subject":"Second","status":"pending"}"#).unwrap();
+        std::fs::write(&task, r#"{"subject":"First","status":"pending"}"#).unwrap();
+        assert!(em.sync_qoder_plan(config.path()));
+        em.event(EventBody::TurnEnd { stop_reason: Some("end_turn".into()), model: None });
+
+        // A poll can overlap a write, and the task list should keep its last complete snapshot.
+        std::fs::write(&task, b"{").unwrap();
+        assert!(em.sync_qoder_plan(config.path()));
+        std::fs::write(&task, r#"{"subject":"First","status":"completed"}"#).unwrap();
+        assert!(em.sync_qoder_plan(config.path()));
+        assert!(em.sync_qoder_plan(config.path()));
+
+        let events = hub.backlog("s", 0).unwrap();
+        assert_eq!(events.len(), 3);
+        assert!(matches!(events[1].body, EventBody::TurnEnd { .. }));
+        assert_eq!(events[2].body, EventBody::Plan {
+            entries: vec![
+                PlanEntry { content: "#2 First".into(), status: "completed".into() },
+                PlanEntry { content: "#10 Second".into(), status: "pending".into() },
+            ],
+            session_scoped: true,
+        });
+        assert_eq!(hub.info("s").unwrap().status, SessionStatus::Idle);
     }
 
     #[test]

@@ -606,6 +606,9 @@ pub enum EventBody {
     },
     Plan {
         entries: Vec<PlanEntry>,
+        /// The tool keeps this list for the session and can update it after a turn ends.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        session_scoped: bool,
     },
     Status {
         status: SessionStatus,

@@ -204,6 +204,16 @@ impl Store {
         Ok(out)
     }
 
+    pub fn last_plan(&self, session_id: &str) -> Result<Option<EventBody>> {
+        let body: Option<String> = self.conn.lock().unwrap().query_row(
+            "SELECT body FROM events WHERE session_id = ?1 AND json_extract(body, '$.kind') = 'plan'
+             ORDER BY seq DESC LIMIT 1",
+            [session_id],
+            |r| r.get(0),
+        ).optional()?;
+        Ok(body.and_then(|body| serde_json::from_str(&body).ok()))
+    }
+
     /// The last limit events with seq < before (ascending by seq), and whether there are older ones. before=None means the latest
     pub fn events_tail(
         &self,

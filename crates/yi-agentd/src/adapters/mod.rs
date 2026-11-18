@@ -5,6 +5,7 @@ pub mod acp;
 pub mod claude;
 pub mod codex;
 pub mod pty;
+pub(crate) mod qoder_tasks;
 
 use crate::hub::Emitter;
 use yi_proto::{QuestionAnswer, SessionMode, ToolKind};

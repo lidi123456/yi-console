@@ -400,7 +400,7 @@ export type EventBody =
       questions?: Question[];
     }
   | { kind: 'permission_resolved'; requestId: string; optionId: string; answers?: QuestionAnswer[] }
-  | { kind: 'plan'; entries: PlanEntry[] }
+  | { kind: 'plan'; entries: PlanEntry[]; sessionScoped?: boolean }
   | { kind: 'status'; status: SessionStatus; message?: string }
   | { kind: 'turn_end'; stopReason?: string | null; model?: string | null }
   | { kind: 'usage'; usage: Usage }

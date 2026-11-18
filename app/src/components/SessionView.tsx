@@ -415,7 +415,7 @@ export function SessionView({ hostId, sessionId, seq }: { hostId: string; sessio
           />
           <div className="composer-wrap">
             <BgTasks hostId={hostId} info={info} />
-            <PlanDock events={data.events} busy={info.status === 'running' || info.status === 'starting'} />
+            <PlanDock events={data.events} busy={info.status === 'running' || info.status === 'starting'} alive={connected && alive} />
             <LimitDock hostId={hostId} info={info} connected={connected} />
             {info.status === 'error' && (
               <div className="session-recover" role="status">
