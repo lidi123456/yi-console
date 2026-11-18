@@ -9387,6 +9387,21 @@ button.wp-commit-title .chev {
   flex-direction: column;
   background: #fff;
 }
+.wb-native {
+  flex: 1;
+  min-height: 0;
+  position: relative;
+  background: #fff;
+}
+/* Picture of the page while a modal covers the native view (NativeWeb.tsx) */
+.wb-still {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: fill;
+  pointer-events: none;
+}
 .wb-frame {
   flex: 1;
   width: 100%;
@@ -9427,6 +9442,217 @@ button.wp-commit-title .chev {
 }
 .wb-port .mono {
   font-weight: 600;
+}
+
+/* AI browser tab (AiBrowser.tsx): the canvas keeps the page's aspect ratio, centered on a dark backdrop */
+.aiweb-status {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  padding: 3px 12px;
+  font-size: 11.5px;
+  color: var(--text-2);
+  background: var(--bg-2);
+  border-bottom: 1px solid var(--border);
+}
+.aiweb-dot {
+  flex: none;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--text-3);
+}
+.aiweb-status.acting .aiweb-dot {
+  background: #2563eb;
+  animation: aiweb-pulse 1s ease-in-out infinite;
+}
+.aiweb-status.paused .aiweb-dot {
+  background: #d97706;
+}
+.aiweb-title {
+  margin-left: auto;
+  max-width: 45%;
+}
+@keyframes aiweb-pulse {
+  50% {
+    opacity: 0.3;
+  }
+}
+.aiweb-tabs {
+  font-size: 11px;
+  font-weight: 600;
+  min-width: 22px;
+}
+.aiweb-dialog {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 12px;
+  font-size: 12.5px;
+  background: var(--bg-2);
+  border-bottom: 1px solid var(--border);
+}
+.aiweb-dialog .dlg-actions {
+  margin-top: 0;
+}
+.aiweb-body {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  background: var(--bg-3);
+}
+.aiweb-canvas {
+  display: block;
+  background: #fff;
+  box-shadow: 0 0 0 1px var(--border);
+  touch-action: none;
+  cursor: default;
+  outline: none;
+}
+.aiweb-stage {
+  position: relative;
+  line-height: 0;
+}
+.aiweb-stage.hidden {
+  display: none;
+}
+/* While the AI acts: a glowing orange frame round the page, like Claude in Chrome */
+.aiweb-stage::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  border-radius: 2px;
+  opacity: 0;
+  transition: opacity 0.3s;
+  box-shadow: inset 0 0 0 2px #f97316, inset 0 0 18px 2px rgba(249, 115, 22, 0.55), 0 0 14px 2px rgba(249, 115, 22, 0.45);
+}
+.aiweb-stage.glow::after {
+  opacity: 1;
+  animation: aiweb-glow 2s ease-in-out infinite;
+}
+@keyframes aiweb-glow {
+  50% {
+    opacity: 0.55;
+  }
+}
+.aiweb-acting {
+  position: absolute;
+  left: 50%;
+  bottom: 14px;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 6px 5px 12px;
+  border-radius: 999px;
+  background: rgba(24, 24, 27, 0.88);
+  color: #fff;
+  font-size: 12px;
+  line-height: 18px;
+  white-space: nowrap;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.25);
+  z-index: 2;
+}
+.aiweb-acting-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #f97316;
+  animation: aiweb-pulse 1s ease-in-out infinite;
+}
+.aiweb-stop {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 10px;
+  border: none;
+  border-radius: 999px;
+  background: #f97316;
+  color: #fff;
+  font-size: 12px;
+  cursor: pointer;
+}
+.aiweb-stop:hover {
+  background: #ea580c;
+}
+.aiweb-tab-icon {
+  position: relative;
+  display: inline-flex;
+}
+.aiweb-tab-icon.busy {
+  color: #ea580c;
+}
+.aiweb-tab-icon.busy::after {
+  content: '';
+  position: absolute;
+  right: -3px;
+  top: -2px;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #f97316;
+  animation: aiweb-pulse 1s ease-in-out infinite;
+}
+/* The AI's mouse: its tip sits on the point, it glides between points, a ring pulses on a click */
+.aiweb-cursor {
+  position: absolute;
+  width: 0;
+  height: 0;
+  pointer-events: none;
+  transition: left 0.25s ease-out, top 0.25s ease-out;
+}
+.aiweb-cursor svg {
+  position: absolute;
+  left: -1px;
+  top: -1px;
+  filter: drop-shadow(0 1px 1px rgba(0, 0, 0, 0.35));
+}
+.aiweb-click {
+  position: absolute;
+  left: -14px;
+  top: -14px;
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  border: 2px solid #f97316;
+  opacity: 0;
+  animation: aiweb-click 0.6s ease-out;
+}
+@keyframes aiweb-click {
+  from {
+    transform: scale(0.3);
+    opacity: 0.9;
+  }
+  to {
+    transform: scale(1.4);
+    opacity: 0;
+  }
+}
+/* Takes keyboard and IME input for the page; kept in the layout (not display:none) so it can hold focus */
+.aiweb-keys {
+  position: absolute;
+  left: 0;
+  bottom: 0;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  resize: none;
+  border: none;
+  padding: 0;
+  pointer-events: none;
+}
+.aiweb-empty {
+  position: absolute;
+  inset: 0;
+  gap: 8px;
 }
 
 /* Menu items that are too long (paths in the file dropdown): truncate instead of overflowing; scroll inside the menu when there are many items */

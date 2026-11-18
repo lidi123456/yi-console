@@ -5,7 +5,7 @@ import { getT, isEn } from '../i18n';
 import { Icon } from './Icon';
 import { errorToast, invalidateSnippets, redetectTools, toast, useStore } from '../store';
 import { rpc } from '../transport';
-import { TOOL_LABEL, type DaemonSettings, type Snippet, type StatusLineSettings, type ToolKind } from '../types';
+import { TOOL_LABEL, type BrowserSettings, type DaemonSettings, type Snippet, type StatusLineSettings, type ToolKind } from '../types';
 import { DEFAULT_STATUS_LINE, getStatusFields, invalidateStatusLine, TEMPLATE_VARS } from './StatusLine';
 
 const t = getT('settingsView');
@@ -152,6 +152,7 @@ export function SettingsView({ hostId }: { hostId: string }) {
           })}
         </div>
       </div>
+      <BrowserCard v={s.browser ?? {}} onChange={(browser) => setS({ ...s, browser })} />
       <McpSettingsCard servers={s.mcpServers ?? []} onChange={(mcpServers) => setS({ ...s, mcpServers })} />
       <SnippetsCard list={s.snippets} onChange={(snippets) => setS({ ...s, snippets })} />
       <StatusLineCard v={s.statusLine} onChange={(statusLine) => setS({ ...s, statusLine })} />
@@ -189,6 +190,86 @@ input=$(cat)
 model=$(echo "$input" | jq -r '.model.display_name')
 dir=$(echo "$input" | jq -r '.workspace.current_dir')
 printf '\\033[36m%s\\033[0m in %s' "$model" "\${dir##*/}"`;
+
+const DOMAINS_SAMPLE = ['example.com', '*.example.com', 'localhost'].join('\n');
+
+/** Categories the host can always refuse (`deniedActions`), the risky ones first */
+const DENIABLE = ['eval', 'upload', 'download', 'network', 'storage', 'fill', 'click', 'interact'] as const;
+
+/** Host settings of the AI browser (`yi_browser`) */
+function BrowserCard({ v, onChange }: { v: BrowserSettings; onChange: (v: BrowserSettings) => void }) {
+  const b = getT('browserUse');
+  const denied = new Set(v.deniedActions ?? []);
+  const [domains, setDomains] = useState((v.allowedDomains ?? []).join('\n'));
+  const label: Record<(typeof DENIABLE)[number], string> = {
+    eval: b('catEval'),
+    upload: b('catUpload'),
+    download: b('catDownload'),
+    network: b('catNetwork'),
+    storage: b('catStorage'),
+    fill: b('catFill'),
+    click: b('catClick'),
+    interact: b('catInteract'),
+  };
+  return (
+    <div className="card">
+      <div className="card-title">{b('settingsTitle')}</div>
+      <p className="muted small">{b('settingsDesc')}</p>
+      <div className="form">
+        <label>
+          {b('settingsPath')}
+          <input
+            value={v.executablePath ?? ''}
+            placeholder={b('settingsPathPlaceholder')}
+            onChange={(e) => onChange({ ...v, executablePath: e.target.value.trim() || undefined })}
+          />
+        </label>
+        <label className="check">
+          <input type="checkbox" checked={!!v.persistentProfile} onChange={(e) => onChange({ ...v, persistentProfile: e.target.checked || undefined })} />
+          {b('settingsPersistent')}
+        </label>
+        <p className="muted small">{b('settingsPersistentHint')}</p>
+        <label className="check">
+          <input type="checkbox" checked={!!v.ignoreHttpsErrors} onChange={(e) => onChange({ ...v, ignoreHttpsErrors: e.target.checked || undefined })} />
+          {b('settingsIgnoreCert')}
+        </label>
+        <p className="muted small">{b('settingsIgnoreCertHint')}</p>
+        <label>
+          {b('settingsDomains')}
+          <textarea
+            rows={3}
+            value={domains}
+            placeholder={DOMAINS_SAMPLE}
+            onChange={(e) => {
+              setDomains(e.target.value);
+              const list = e.target.value.split(/[\s,]+/).map((x) => x.trim()).filter(Boolean);
+              onChange({ ...v, allowedDomains: list.length ? list : undefined });
+            }}
+          />
+        </label>
+        <p className="muted small">{b('settingsDomainsHint')}</p>
+        <div className="small">{b('settingsDenied')}</div>
+        <div className="row" style={{ gap: 12, flexWrap: 'wrap' }}>
+          {DENIABLE.map((c) => (
+            <label key={c} className="check">
+              <input
+                type="checkbox"
+                checked={denied.has(c)}
+                onChange={(e) => {
+                  const next = new Set(denied);
+                  if (e.target.checked) next.add(c);
+                  else next.delete(c);
+                  onChange({ ...v, deniedActions: next.size ? [...next] : undefined });
+                }}
+              />
+              {label[c]}
+            </label>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
 
 function StatusLineCard({ v, onChange }: { v: StatusLineSettings; onChange: (v: StatusLineSettings) => void }) {
   const [sample, setSample] = useState(false);

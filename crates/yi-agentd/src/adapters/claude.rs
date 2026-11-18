@@ -58,6 +58,9 @@ pub fn build_args(spec: &StartSpec) -> Vec<String> {
     if !crate::computer_use::model_hint(&spec.extra_args).is_empty() {
         allow_tools(&mut a, "mcp__yi_computer_use__*");
     }
+    if !crate::browser::model_hint(&spec.extra_args).is_empty() {
+        allow_tools(&mut a, "mcp__yi_browser__*");
+    }
     // Client MCP tools (a Bot's own tools) are answered by the desktop app, which does its own checks
     for name in &spec.allow_mcp {
         allow_tools(&mut a, &format!("mcp__{name}__*"));

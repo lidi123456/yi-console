@@ -446,6 +446,13 @@ export function onAccountLogin(fn: (hostId: string, upd: AccountLoginUpdate) => 
   return () => loginListeners.delete(fn);
 }
 
+/** Live views of AI browsers: `browser.frame` / `browser.status` arrive only on connections that attached */
+const browserViewListeners = new Set<(hostId: string, method: string, p: any) => void>();
+export function onBrowserView(fn: (hostId: string, method: string, p: any) => void): () => void {
+  browserViewListeners.add(fn);
+  return () => browserViewListeners.delete(fn);
+}
+
 export function sessionInfo(hostId: string, sid: string): SessionInfo | undefined {
   return state.sessions[hostId]?.find((s) => s.id === sid);
 }
@@ -829,6 +836,10 @@ function onNotification(hostId: string, method: string, p: any) {
     case 'accounts.updated':
       redetectTools(hostId).catch(() => {});
       for (const fn of accountListeners) fn(hostId, p?.tool);
+      break;
+    case 'browser.frame':
+    case 'browser.status':
+      for (const fn of browserViewListeners) fn(hostId, method, p);
       break;
     case 'tools.accountLogin':
       if (p) for (const fn of loginListeners) fn(hostId, p as AccountLoginUpdate);

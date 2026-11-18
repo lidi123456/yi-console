@@ -13,6 +13,7 @@ import zhBrowser from './zh/browser.json';
 import zhChatImages from './zh/chatImages.json';
 import zhChatView from './zh/chatView.json';
 import zhComputerUse from './zh/computerUse.json';
+import zhBrowserUse from './zh/browserUse.json';
 import zhMcpSettings from './zh/mcpSettings.json';
 import zhComposer from './zh/composer.json';
 import zhDiffView from './zh/diffView.json';
@@ -68,6 +69,7 @@ import enBrowser from './en/browser.json';
 import enChatImages from './en/chatImages.json';
 import enChatView from './en/chatView.json';
 import enComputerUse from './en/computerUse.json';
+import enBrowserUse from './en/browserUse.json';
 import enMcpSettings from './en/mcpSettings.json';
 import enComposer from './en/composer.json';
 import enDiffView from './en/diffView.json';
@@ -126,6 +128,7 @@ export const resources = {
     chatImages: zhChatImages,
     chatView: zhChatView,
     computerUse: zhComputerUse,
+    browserUse: zhBrowserUse,
     mcpSettings: zhMcpSettings,
     composer: zhComposer,
     diffView: zhDiffView,
@@ -183,6 +186,7 @@ export const resources = {
     chatImages: enChatImages,
     chatView: enChatView,
     computerUse: enComputerUse,
+    browserUse: enBrowserUse,
     mcpSettings: enMcpSettings,
     composer: enComposer,
     diffView: enDiffView,

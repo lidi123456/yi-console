@@ -1,0 +1,5 @@
+yi-browser follows the design of vercel-labs/agent-browser
+(https://github.com/vercel-labs/agent-browser), Copyright Vercel, Inc.,
+licensed under the Apache License, Version 2.0: launch arguments, the
+DevToolsActivePort handshake, snapshot role lists and ref rules, click
+checks, dialog handling and content boundary markers.

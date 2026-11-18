@@ -759,12 +759,13 @@ fn save_images(sid: &str, value: &Value) -> Result<Vec<ImageRef>> {
             mime_type: mime.into(),
         });
     }
-    prune_images(sid);
+    prune_images(sid, "desktop-");
     Ok(images)
 }
 
-/// Keep only this feature's bounded checkpoint cache; user attachments are never removed here.
-fn prune_images(sid: &str) {
+/// Keep only a bounded cache of one feature's screenshots (files starting with `prefix`); user attachments are never
+/// removed here.
+pub(crate) fn prune_images(sid: &str, prefix: &str) {
     let dir = crate::paths::base_dir().join("uploads").join(sid);
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -773,7 +774,7 @@ fn prune_images(sid: &str) {
         .filter_map(Result::ok)
         .filter_map(|entry| {
             let name = entry.file_name().to_string_lossy().to_string();
-            if !name.starts_with("desktop-")
+            if !name.starts_with(prefix)
                 || !matches!(
                     entry.path().extension().and_then(|s| s.to_str()),
                     Some("png" | "jpg" | "webp")

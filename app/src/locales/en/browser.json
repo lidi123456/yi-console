@@ -22,5 +22,8 @@
   "hostPort": "{{name}} port {{port}}",
   "hostFallback": "host",
   "addressOrPortRemote": "Address or port. localhost means {{name}}",
-  "theHostFallback": "the host"
+  "theHostFallback": "the host",
+  "back": "Back",
+  "forward": "Forward",
+  "blockedNavigation": "Blocked navigation to {{url}}: only http and https pages open here"
 }

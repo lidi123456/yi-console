@@ -254,6 +254,8 @@ pub struct Hub {
     pub settings: RwLock<DaemonSettings>,
     pub shutdown: tokio::sync::Notify,
     pub desktop: crate::computer_use::Desktop,
+    /// The AI browser (`yi_browser`), one Chrome per session that turned it on
+    pub browsers: crate::browser::Browsers,
     /// Clients that said who they are (`client.hello`), and the client MCP bridge
     pub clients: crate::clientmcp::Clients,
     /// Each tool's most recently reported model list (persisted, used for new sessions)
@@ -320,6 +322,9 @@ pub struct CreateParams {
     /// Start with Computer Use enabled right away (AI chat mode on supported hosts only)
     #[serde(default)]
     pub computer_use: bool,
+    /// Start with the AI browser (`yi_browser`) enabled (AI chat mode only)
+    #[serde(default)]
+    pub browser_use: bool,
     /// Configured account id to bind this session to (when omitted, uses the tool's active account if configured)
     #[serde(default)]
     pub account_id: Option<String>,
@@ -337,6 +342,7 @@ impl Hub {
             settings: RwLock::new(settings),
             shutdown: tokio::sync::Notify::new(),
             desktop: crate::computer_use::Desktop::new(),
+            browsers: crate::browser::Browsers::new(),
             clients: Default::default(),
             tool_models: Mutex::new(
                 std::fs::read(models_path())
@@ -368,6 +374,7 @@ impl Hub {
             settings: RwLock::new(settings),
             shutdown: tokio::sync::Notify::new(),
             desktop: crate::computer_use::Desktop::new(),
+            browsers: crate::browser::Browsers::new(),
             clients: Default::default(),
             tool_models: Mutex::new(HashMap::new()),
             tool_commands: Mutex::new(HashMap::new()),
@@ -424,7 +431,7 @@ impl Hub {
             } else {
                 info.queue_paused.take().or_else(|| Some("restart".to_string()))
             };
-            if info.computer_use { info.computer_use = false; let _ = self.store.save_session(&info); }
+            if info.computer_use || info.browser_use { info.computer_use = false; info.browser_use = false; let _ = self.store.save_session(&info); }
             info.last_seq = self.store.max_seq(&info.id).unwrap_or(info.last_seq);
             if !info.tool.has_process() {
                 // Files sessions have no process: always idle
@@ -478,13 +485,82 @@ impl Hub {
         v
     }
 
+    /// Kill, delete, /clear and mode switches end computer use and the AI browser
     fn revoke_desktop(&self, sid: &str) {
         let _ = self.desktop.change(sid, "stop");
+        let _ = self.browsers.change(sid, "stop");
         if let Ok(rt) = self.get(sid) {
-            let updated = { let mut info = rt.info.lock().unwrap(); if !info.computer_use { return; } info.computer_use = false; info.clone() };
+            let updated = {
+                let mut info = rt.info.lock().unwrap();
+                if !info.computer_use && !info.browser_use { return; }
+                info.computer_use = false;
+                info.browser_use = false;
+                info.clone()
+            };
             let _ = self.store.save_session(&updated);
             self.broadcast_updated(&updated);
         }
+    }
+
+    fn revoke_browser(&self, sid: &str) {
+        let _ = self.browsers.change(sid, "stop");
+        if let Ok(rt) = self.get(sid) {
+            let updated = { let mut info = rt.info.lock().unwrap(); if !info.browser_use { return; } info.browser_use = false; info.clone() };
+            let _ = self.store.save_session(&updated);
+            self.broadcast_updated(&updated);
+        }
+    }
+
+    /// `browserUse.status`
+    pub fn browser_status(&self, sid: Option<&str>) -> Value {
+        self.browsers.status(sid, &self.settings.read().unwrap())
+    }
+
+    /// `session.browserUse`: enable / stop / pause / resume. Enabling relaunches the tool (same tool session) with the
+    /// `yi_browser` entry; stopping closes the browser but doesn't interrupt the reply, and the next message reloads
+    /// the tool without the entry (it is part of the launch fingerprint), as computer use does
+    pub async fn browser_use(self: &Arc<Self>, sid: &str, action: &str, p: &Value) -> Result<Value> {
+        let rt = self.get(sid)?;
+        let info = rt.info.lock().unwrap().clone();
+        if info.mode != SessionMode::Structured || !crate::mcp::supported(info.tool) {
+            bail!("浏览器仅支持 AI 工具的聊天模式");
+        }
+        let settings = self.settings.read().unwrap().clone();
+        match action {
+            // The person's own use of the live view: no timeline entry
+            "start" => {
+                self.browsers.start(sid, &settings).await?;
+                return Ok(self.browser_status(Some(sid)));
+            }
+            "open" | "back" | "forward" | "reload" | "tab" => {
+                self.browsers.navigate(sid, action, p, &settings).await?;
+                return Ok(self.browser_status(Some(sid)));
+            }
+            "headed" | "headless" => {
+                self.browsers.restart(sid, action == "headless", &settings).await?;
+                self.desktop_event(sid, EventBody::BrowserUse { action_id: uuid::Uuid::new_v4().to_string(), tool: action.into(), status: "control".into(), message: String::new(), duration_ms: 0, url: String::new(), images: vec![] });
+                return Ok(self.browser_status(Some(sid)));
+            }
+            _ => {}
+        }
+        if action == "enable" {
+            if info.status == SessionStatus::Running || info.status == SessionStatus::WaitingPermission { bail!("请先停止当前回复，再开启浏览器"); }
+            self.browsers.configure(sid, &settings)?;
+        } else {
+            self.browsers.change(sid, action)?;
+        }
+        let updated = {
+            let mut info = rt.info.lock().unwrap();
+            info.browser_use = self.browsers.enabled(sid);
+            info.clone()
+        };
+        self.store.save_session(&updated)?;
+        self.broadcast_updated(&updated);
+        if action == "enable" {
+            if let Err(error) = self.relaunch(&rt) { self.revoke_browser(sid); return Err(error); }
+        }
+        self.desktop_event(sid, EventBody::BrowserUse { action_id: uuid::Uuid::new_v4().to_string(), tool: action.into(), status: "control".into(), message: String::new(), duration_ms: 0, url: String::new(), images: vec![] });
+        Ok(self.browser_status(Some(sid)))
     }
 
     pub fn desktop_event(&self, sid: &str, event: EventBody) { self.emit(sid, 0, event); }
@@ -659,6 +735,9 @@ impl Hub {
         if p.computer_use && (mode != SessionMode::Structured || !crate::mcp::supported(tool)) {
             bail!("操作电脑仅支持 AI 工具的聊天模式");
         }
+        if p.browser_use && (mode != SessionMode::Structured || !crate::mcp::supported(tool)) {
+            bail!("浏览器仅支持 AI 工具的聊天模式");
+        }
         let (account_id, account_label) = if tool.supports_accounts() {
             match p.account_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
                 Some(req_id) => {
@@ -696,6 +775,13 @@ impl Hub {
         let id = uuid::Uuid::new_v4().to_string();
         if p.computer_use {
             self.desktop.configure(&id)?;
+        }
+        if p.browser_use {
+            let settings = self.settings.read().unwrap().clone();
+            if let Err(e) = self.browsers.configure(&id, &settings) {
+                let _ = self.desktop.change(&id, "stop");
+                return Err(e);
+            }
         }
         let now = now_ms();
         // Cursor: an old `model[k=v,…]` string is split into the model and its values, so the session (and what it
@@ -741,6 +827,7 @@ impl Hub {
             auto_resume: None,
             limit_hits: 0,
             computer_use: p.computer_use,
+            browser_use: p.browser_use,
             pending: None,
             turn: None,
             bot: p.bot.clone(),
@@ -780,7 +867,7 @@ impl Hub {
         let started = self
             .spec_for(&info, replay, p.cols.unwrap_or(120), p.rows.unwrap_or(32))
             .and_then(|spec| self.launch(&rt, spec));
-        if started.is_err() && p.computer_use {
+        if started.is_err() && (p.computer_use || p.browser_use) {
             self.revoke_desktop(&info.id);
         }
         self.broadcast_updated(&self.info(&info.id)?);
@@ -797,6 +884,9 @@ impl Hub {
                     images: vec![],
                 },
             );
+        }
+        if p.browser_use {
+            self.desktop_event(&info.id, EventBody::BrowserUse { action_id: uuid::Uuid::new_v4().to_string(), tool: "enable".into(), status: "control".into(), message: String::new(), duration_ms: 0, url: String::new(), images: vec![] });
         }
         let from = p
             .handoff_from
@@ -886,6 +976,9 @@ impl Hub {
         if info.mode == SessionMode::Structured && info.computer_use {
             if let Some(config) = self.desktop.mcp_config(&info.id) { servers.push(crate::mcp::desktop(config)?); desktop = true; }
         }
+        if info.mode == SessionMode::Structured && info.browser_use {
+            if let Some(config) = self.browsers.mcp_config(&info.id) { servers.push(crate::mcp::browser(config)?); }
+        }
         let mcp_fingerprint = if info.mode == SessionMode::Structured {
             self.session_launch_fingerprint(&settings, info, desktop, resolved.as_ref())
         } else {
@@ -958,6 +1051,7 @@ impl Hub {
         }
         // The new tool process starts its own desktop and client MCP proxies
         self.desktop.release_proxy(&sid);
+        self.browsers.release_proxy(&sid);
         self.clients.release_proxies(&sid);
         if std::mem::take(&mut *rt.prompt_dirty.lock().unwrap()) {
             spec.system_notice = spec.system_prompt.is_some();
@@ -1017,6 +1111,7 @@ impl Hub {
         // The user carried on by hand: the automatic continue is no longer needed
         self.cancel_resume(id, "manual");
         self.desktop.resume_if_paused(id);
+        self.browsers.resume_if_paused(id);
         let info = rt.info.lock().unwrap().clone();
         if !info.tool.has_process() {
             bail!("文件会话不能发送消息");
@@ -1935,6 +2030,7 @@ impl Hub {
 
     pub fn interrupt(&self, id: &str) -> Result<()> {
         let _ = self.desktop.change(id, "pause");
+        let _ = self.browsers.change(id, "pause");
         let rt = self.get(id)?;
         let tx = self.running_tx(&rt).ok_or_else(|| anyhow!("会话未在运行"))?;
         *rt.interrupted.lock().unwrap() = true;
@@ -3611,6 +3707,10 @@ impl Hub {
         resolved: Option<&crate::accounts::ResolvedAccount>,
     ) -> String {
         let mut base = launch_fingerprint(settings, info, desktop);
+        // The yi_browser entry, like computer use: turning it off reloads the tool on the next message
+        if info.mode == SessionMode::Structured && info.browser_use && self.browsers.enabled(&info.id) {
+            base.push_str("+browser");
+        }
         if let Some(acc) = resolved {
             base.push('+');
             base.push_str(&acc.fingerprint);
@@ -3868,6 +3968,11 @@ pub(crate) fn test_set_tool(hub: &Hub, id: &str, tool: ToolKind) {
 }
 
 #[cfg(test)]
+pub(crate) fn test_set_permission_mode(hub: &Hub, id: &str, mode: &str) {
+    hub.get(id).unwrap().info.lock().unwrap().permission_mode = Some(mode.into());
+}
+
+#[cfg(test)]
 pub(crate) fn test_pending_handoff(hub: &Hub, id: &str) -> Option<String> {
     hub.get(id).unwrap().pending_handoff.lock().unwrap().clone()
 }
@@ -3893,8 +3998,13 @@ impl Emitter {
         self.hub.sync_qoder_plan(&self.sid, self.gen, config_dir)
     }
 
+    /// A yi_browser tool may run without asking: the browser is on and not paused (ACP permission requests)
+    pub fn browser_tool_allowed(&self, name: &str) -> bool {
+        self.hub.browsers.authorizes(&self.sid, name)
+    }
+
     pub fn desktop_tool_allowed(&self, name: &str) -> bool {
-        self.hub.desktop.authorizes(&self.sid, name)
+        self.hub.desktop.authorizes(&self.sid, name) || self.hub.browsers.authorizes(&self.sid, name)
     }
 
     pub fn event(&self, body: EventBody) {
@@ -4513,6 +4623,7 @@ mod tests {
             auto_resume: None,
             limit_hits: 0,
             computer_use: false,
+            browser_use: false,
             pending: None,
             turn: None,
             bot: None,

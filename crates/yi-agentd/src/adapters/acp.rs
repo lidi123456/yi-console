@@ -46,6 +46,8 @@ struct State {
     qoder_config_dir: Option<PathBuf>,
     /// The computer use notice still has to go out with the next prompt (once per launch)
     desktop_notice: bool,
+    /// The same for the AI browser (yi_browser)
+    browser_notice: bool,
     /// The session's appended system prompt still has to go out with the next prompt (new tool session or changed)
     system_notice: Option<String>,
     /// Compact cross-account handoff summary injected if `session/load` fell back to a fresh ACP session
@@ -198,13 +200,23 @@ pub fn build_args(spec: &StartSpec) -> Vec<String> {
         a.push("--dangerously-skip-permissions".into());
     }
     a.extend(spec.extra_args.iter().cloned());
-    if spec.tool == ToolKind::Kiro && spec.permission_mode != "bypass" && spec.mcp_servers.iter().any(|server| server["name"] == "yi_computer_use") {
-        // Trust only the user-selected gateway server; its live window grant still gates every native call.
-        let rules = crate::computer_use::tool_names().map(|name| format!("@yi_computer_use/{name}")).collect::<Vec<_>>().join(",");
-        if let Some(index) = a.iter().rposition(|arg| arg == "--trust-tools" || arg.starts_with("--trust-tools=")) {
-            if a[index].contains('=') { a[index].push(','); a[index].push_str(&rules); }
-            else if let Some(value) = a.get_mut(index + 1) { value.push(','); value.push_str(&rules); }
-        } else { a.extend(["--trust-tools".into(), rules]); }
+    if spec.tool == ToolKind::Kiro && spec.permission_mode != "bypass" {
+        // Trust only the gateway servers the user turned on; their live grants still gate every call
+        let has = |name: &str| spec.mcp_servers.iter().any(|server| server["name"] == name);
+        let mut rules = vec![];
+        if has(crate::mcp::DESKTOP_SERVER) {
+            rules.extend(crate::computer_use::tool_names().map(|name| format!("@{}/{name}", crate::mcp::DESKTOP_SERVER)));
+        }
+        if has(crate::mcp::BROWSER_SERVER) {
+            rules.extend(yi_browser::tool_names().map(|name| format!("@{}/{name}", crate::mcp::BROWSER_SERVER)));
+        }
+        if !rules.is_empty() {
+            let rules = rules.join(",");
+            if let Some(index) = a.iter().rposition(|arg| arg == "--trust-tools" || arg.starts_with("--trust-tools=")) {
+                if a[index].contains('=') { a[index].push(','); a[index].push_str(&rules); }
+                else if let Some(value) = a.get_mut(index + 1) { value.push(','); value.push_str(&rules); }
+            } else { a.extend(["--trust-tools".into(), rules]); }
+        }
     }
     a
 }
@@ -223,6 +235,7 @@ pub async fn run(spec: StartSpec, em: Emitter, mut rx: mpsc::UnboundedReceiver<A
         is_cursor: spec.tool == ToolKind::Cursor,
         effort: spec.effort.clone().filter(|e| !e.is_empty() && spec.tool == ToolKind::Antigravity),
         desktop_notice: spec.mcp_servers.iter().any(|server| server["name"] == crate::mcp::DESKTOP_SERVER),
+        browser_notice: spec.mcp_servers.iter().any(|server| server["name"] == crate::mcp::BROWSER_SERVER),
         system_notice: super::acp_system_notice(&spec),
         ..Default::default()
     };
@@ -544,6 +557,10 @@ fn prompt(st: &mut State, em: &Emitter, p: &Prompt) -> Value {
     if st.desktop_notice && !p.text.trim_start().starts_with('/') {
         st.desktop_notice = false;
         blocks.push(json!({"type":"text","text":crate::computer_use::acp_notice()}));
+    }
+    if st.browser_notice && !p.text.trim_start().starts_with('/') {
+        st.browser_notice = false;
+        blocks.push(json!({"type":"text","text":crate::browser::acp_notice()}));
     }
     if !p.text.trim().is_empty() || blocks.is_empty() {
         blocks.push(json!({"type":"text","text":p.text}));
@@ -1157,6 +1174,19 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Result<V
                     return Ok(out);
                 }
             }
+            // A yi_browser call while the browser is on: turning it on was the user's approval (as Claude's
+            // allowedTools / Kiro's trust list). The gateway still enforces plan mode and the live grant
+            if !question {
+                if let Some(name) = gateway_tool(&known.name, &title, &tc["rawInput"]) {
+                    if em.browser_tool_allowed(&name) {
+                        if let Some(o) = options.iter().find(|o| o.kind == "allow_once").or_else(|| options.iter().find(|o| o.kind.starts_with("allow"))) {
+                            out.push(json!({"jsonrpc":"2.0","id":v["id"],
+                                "result":{"outcome":{"outcome":"selected","optionId":o.id}}}));
+                            return Ok(out);
+                        }
+                    }
+                }
+            }
             st.perms.insert(rid.clone(), v["id"].clone());
             em.event(EventBody::PermissionRequest {
                 request_id: rid,
@@ -1231,6 +1261,25 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Result<V
         _ => {}
     }
     Ok(out)
+}
+
+/// The `mcp__yi_browser__<tool>` name of a permission request for a yi_browser tool. Exact forms only, never a
+/// substring of free input (a shell command mentioning the name must not be approved): Qoder names the call
+/// `mcp__yi_browser__<tool>` and titles it `<tool> (yi_browser)`; CodeBuddy wraps it in `DeferExecuteTool` with
+/// `toolName` in the input
+fn gateway_tool(name: &str, title: &str, input: &Value) -> Option<String> {
+    let prefix = format!("mcp__{}__", crate::mcp::BROWSER_SERVER);
+    let known = |n: &str| n.strip_prefix(&prefix).filter(|t| yi_browser::tool_names().any(|x| x == *t)).map(|_| n.to_string());
+    if let Some(n) = known(name) {
+        return Some(n);
+    }
+    if name == "DeferExecuteTool" {
+        if let Some(n) = input["toolName"].as_str().and_then(known) {
+            return Some(n);
+        }
+    }
+    let suffix = format!(" ({})", crate::mcp::BROWSER_SERVER);
+    title.strip_suffix(&suffix).filter(|t| yi_browser::tool_names().any(|x| x == *t)).map(|t| format!("{prefix}{t}"))
 }
 
 /// Kiro's `_kiro.dev/compaction/status`: status.type is started, then completed (or failed)
@@ -1382,6 +1431,7 @@ fn cursor_compact_done(st: &mut State, spec: &StartSpec, em: &Emitter, c: Cursor
     // A new tool session hasn't seen the appended system prompt or the computer use notice
     st.system_notice = super::acp_system_reminder(spec);
     st.desktop_notice = spec.mcp_servers.iter().any(|server| server["name"] == crate::mcp::DESKTOP_SERVER);
+    st.browser_notice = spec.mcp_servers.iter().any(|server| server["name"] == crate::mcp::BROWSER_SERVER);
     em.pending_context(format!("<yi-compact-summary>\n{CURSOR_COMPACT_INTRO}\n\n{}\n</yi-compact-summary>", c.summary));
     em.context(0.0);
     let duration = u64::try_from(now_ms() - c.started).ok();
@@ -3569,6 +3619,55 @@ mod tests {
         assert!(first[0].contains("yi_computer_use") && first[0].contains("outdated"), "{first:?}");
         assert_eq!(first[1], "open Feishu");
         assert_eq!(texts(&prompt(&mut st, &em, &ask("again"))), ["again"]);
+        let mut st = State { browser_notice: true, ..Default::default() };
+        let first = texts(&prompt(&mut st, &em, &ask("check the page")));
+        assert!(first[0].contains("yi_browser") && first[0].contains("YI_BROWSER_PAGE_CONTENT"), "{first:?}");
+        assert_eq!(texts(&prompt(&mut st, &em, &ask("again"))), ["again"]);
+    }
+
+    #[test]
+    fn gateway_permissions_are_recognized_only_in_exact_forms() {
+        use super::*;
+        let none = Value::Null;
+        assert_eq!(gateway_tool("mcp__yi_browser__browser_click", "", &none).as_deref(), Some("mcp__yi_browser__browser_click"));
+        assert_eq!(gateway_tool("tool", "browser_snapshot (yi_browser)", &none).as_deref(), Some("mcp__yi_browser__browser_snapshot"));
+        let wrapped = json!({"toolName": "mcp__yi_browser__browser_open", "params": {"url": "x"}});
+        assert_eq!(gateway_tool("DeferExecuteTool", "DeferExecuteTool", &wrapped).as_deref(), Some("mcp__yi_browser__browser_open"));
+        // Unknown tools, other servers, and anything that only mentions the name are left to the user
+        assert_eq!(gateway_tool("mcp__yi_browser__browser_nope", "", &none), None);
+        assert_eq!(gateway_tool("mcp__yi_computer_use__click", "", &none), None);
+        assert_eq!(gateway_tool("Bash", "echo browser_click (yi_browser) && rm -rf x", &json!({"command": "mcp__yi_browser__browser_click"})), None);
+        assert_eq!(gateway_tool("Bash", "Bash", &json!({"toolName": "mcp__yi_browser__browser_click"})), None);
+    }
+
+    #[test]
+    fn browser_permission_is_answered_only_while_the_browser_is_on() {
+        use super::*;
+        let (hub, em, _rx) = crate::hub::test_emitter();
+        let req = json!({"jsonrpc": "2.0", "id": 7, "method": "session/request_permission", "params": {
+            "toolCall": {"toolCallId": "c1", "title": "browser_click (yi_browser)", "rawInput": {"ref": "e1"}},
+            "options": [{"optionId": "once", "name": "Allow", "kind": "allow_once"}, {"optionId": "no", "name": "Reject", "kind": "reject_once"}]}});
+        let mut st = State { perm: "default".into(), ..Default::default() };
+        // Off: the user decides
+        let out = handle(&mut st, &super::model_config_tests::agy_test_spec(), &req, &em).unwrap();
+        assert!(out.is_empty(), "{out:?}");
+        assert_eq!(st.perms.len(), 1);
+        // On: answered with allow once
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("chrome");
+        std::fs::write(&exe, b"").unwrap();
+        let mut settings = yi_proto::DaemonSettings::default();
+        settings.browser.executable_path = Some(exe.to_string_lossy().into_owned());
+        std::env::set_var("YI_CONSOLE_HOME", std::env::temp_dir().join(format!("yi-acp-test-{}", std::process::id())));
+        hub.browsers.configure("s", &settings).unwrap();
+        let mut st = State { perm: "default".into(), ..Default::default() };
+        let out = handle(&mut st, &super::model_config_tests::agy_test_spec(), &req, &em).unwrap();
+        assert_eq!(out[0]["result"]["outcome"]["optionId"], "once");
+        // Paused: the user decides again
+        hub.browsers.change("s", "pause").unwrap();
+        let mut st = State { perm: "default".into(), ..Default::default() };
+        assert!(handle(&mut st, &super::model_config_tests::agy_test_spec(), &req, &em).unwrap().is_empty());
+        hub.browsers.change("s", "stop").unwrap();
     }
 
     /// Qoder streams its subagents' text, thinking and tool calls as the parent's own updates
@@ -4266,7 +4365,7 @@ mod model_config_tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    fn agy_test_spec() -> StartSpec {
+    pub(super) fn agy_test_spec() -> StartSpec {
         StartSpec {
             tool: ToolKind::Antigravity,
             mode: SessionMode::Structured,

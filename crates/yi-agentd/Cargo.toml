@@ -9,6 +9,7 @@ description = "Yi Console daemon: hosts AI coding tool sessions"
 yi-proto = { path = "../proto" }
 yi-link = { path = "../link" }
 yi-client = { path = "../client" }
+yi-browser = { path = "../browser" }
 qrcode = { version = "0.14", default-features = false }
 serde.workspace = true
 serde_json.workspace = true

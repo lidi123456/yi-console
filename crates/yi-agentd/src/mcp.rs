@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, HashSet};
 use yi_proto::{DaemonSettings, McpServerConfig, McpTransport, ToolKind};
 
 pub const DESKTOP_SERVER: &str = "yi_computer_use";
+pub const BROWSER_SERVER: &str = crate::browser::SERVER;
 const MASK: &str = "********";
 
 pub fn supported(tool: ToolKind) -> bool {
@@ -34,6 +35,9 @@ pub fn validate(settings: &DaemonSettings) -> Result<()> {
         }
         if server.name == DESKTOP_SERVER {
             bail!("MCP 名称 yi_computer_use 为内置操作电脑保留");
+        }
+        if server.name == BROWSER_SERVER {
+            bail!("MCP 名称 yi_browser 为内置浏览器保留");
         }
         if !names.insert(&server.name) {
             bail!("MCP 名称重复：{}", server.name);
@@ -121,6 +125,10 @@ pub fn desktop(config: Value) -> Result<McpServerConfig> {
     Ok(serde_json::from_value(
         json!({"name":DESKTOP_SERVER,"command":config["command"],"args":config["args"]}),
     )?)
+}
+
+pub fn browser(config: Value) -> Result<McpServerConfig> {
+    Ok(serde_json::from_value(json!({"name":BROWSER_SERVER,"command":config["command"],"args":config["args"]}))?)
 }
 
 /// Cache identity only; the digest is not used as an authorization credential.

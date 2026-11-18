@@ -1,8 +1,8 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Main window",
-  "windows": [
+  "description": "Main window's own webview only: child webviews of web tabs (webtab.rs) get nothing",
+  "webviews": [
     "main"
   ],
   "permissions": [

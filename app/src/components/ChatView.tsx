@@ -24,7 +24,7 @@ import { limitHead, limitOutcome, type LimitEvent } from '../limit';
 const t = getT('chatView');
 
 type Item =
-  | { k: 'desktop'; key: string; ev: HubEvent & { kind: 'computer_use' } }
+  | { k: 'desktop'; key: string; ev: GatewayEvent }
   | { k: 'user'; key: string; text: string; ts: number; images: ImageRef[]; origin?: string }
   | { k: 'text'; key: string; ts: number; text: string; id?: string; ask?: AsyncAsk }
   | { k: 'thinking'; key: string; ts: number; text: string }
@@ -40,7 +40,7 @@ type Item =
       diffs: FileDiff[];
       result?: { output: string; isError: boolean };
       /** The gateway's record of this desktop tool call: status and screenshots */
-      desktop?: HubEvent & { kind: 'computer_use' };
+      desktop?: GatewayEvent;
     }
   | {
       k: 'perm';
@@ -75,30 +75,56 @@ type Item =
     };
 
 const DESKTOP_SERVER = 'yi_computer_use';
+const BROWSER_SERVER = 'yi_browser';
 
-/** The tool row is a call of the desktop MCP server (Claude/Qoder mcp__yi_computer_use__x, Codex yi_computer_use.x, ACP titles) */
-function isDesktopTool(it: Item & { k: 'tool' }, tool: string) {
-  const id = `${it.name} ${it.title}`;
-  return id.includes(DESKTOP_SERVER) ? id.includes(tool) : false;
+/** A gateway's record of an AI tool's MCP call: the desktop (`yi_computer_use`) or the AI browser (`yi_browser`) */
+type GatewayEvent = HubEvent & { kind: 'computer_use' | 'browser_use' };
+
+/** The tool row is a call of the gateway's MCP server (Claude/Qoder mcp__yi_computer_use__x, Codex yi_computer_use.x, ACP titles) */
+function isDesktopTool(it: Item & { k: 'tool' }, ev: GatewayEvent) {
+  // CodeBuddy calls MCP tools through DeferExecuteTool, whose input names the real tool
+  const wrapped = (it.input as { toolName?: unknown } | null)?.toolName;
+  const id = `${it.name} ${it.title} ${typeof wrapped === 'string' ? wrapped : ''}`;
+  return id.includes(ev.kind === 'browser_use' ? BROWSER_SERVER : DESKTOP_SERVER) ? id.includes(ev.tool) : false;
 }
 
-function desktopControlText(action: string) {
+/** Texts of a gateway event, from the namespace of its gateway (literal calls, so i18n:check sees every key) */
+function gatewayText(ev: GatewayEvent) {
+  const seconds = (ev.durationMs / 1000).toFixed(1);
+  if (ev.kind === 'browser_use') {
+    const tx = getT('browserUse');
+    return {
+      notes: { enable: tx('noteEnabled'), pause: tx('notePaused'), resume: tx('noteResumed'), stop: tx('noteStopped'), disable: tx('noteStopped'), headed: tx('noteHeaded'), headless: tx('noteHeadless') } as Record<string, string>,
+      status: { running: tx('running'), completed: tx('completed'), failed: tx('failed'), control: tx('control'), unverified: tx('unverified'), interrupted: tx('interrupted') } as Record<string, string>,
+      action: tx('action', { tool: ev.tool }),
+      elapsed: tx('elapsed', { seconds }),
+    };
+  }
   const tx = getT('computerUse');
-  const map: Record<string, string> = { enable: tx('noteEnabled'), pause: tx('notePaused'), resume: tx('noteResumed'), stop: tx('noteStopped'), disable: tx('noteStopped') };
-  return map[action] ?? tx('control');
+  return {
+    notes: { enable: tx('noteEnabled'), pause: tx('notePaused'), resume: tx('noteResumed'), stop: tx('noteStopped'), disable: tx('noteStopped') } as Record<string, string>,
+    status: { running: tx('running'), completed: tx('completed'), failed: tx('failed'), control: tx('control'), unverified: tx('unverified'), interrupted: tx('interrupted') } as Record<string, string>,
+    action: tx('action', { tool: ev.tool }),
+    elapsed: tx('elapsed', { seconds }),
+  };
+}
+
+function desktopControlText(ev: GatewayEvent) {
+  const x = gatewayText(ev);
+  return x.notes[ev.tool] ?? x.status.control;
 }
 
 /** Host and session for screenshots inside tool rows */
 const DesktopCtx = createContext<{ hostId: string; sessionId: string } | null>(null);
 
-function DesktopShots({ ev }: { ev: HubEvent & { kind: 'computer_use' } }) {
+function DesktopShots({ ev }: { ev: GatewayEvent }) {
   const ctx = useContext(DesktopCtx);
   if (!ev.images?.length || !ctx) return null;
   return <div className="computer-use-images">{ev.images.map((img) => <MsgImage key={img.id} hostId={ctx.hostId} sessionId={ctx.sessionId} img={img} />)}</div>;
 }
 
 /** Status worth flagging on a desktop tool row; a plain return is not proof, so "unverified" is shown too */
-function desktopStatus(ev?: HubEvent & { kind: 'computer_use' }) {
+function desktopStatus(ev?: GatewayEvent) {
   if (!ev) return null;
   const tx = getT('computerUse');
   if (ev.status === 'unverified') return tx('unverified');
@@ -111,6 +137,8 @@ function buildItems(events: HubEvent[], hideCompactCmd = false): Item[] {
   const items: Item[] = [];
   const tools = new Map<string, Item & { k: 'tool' }>();
   const desktopTools = new Map<string, Item & { k: 'tool' }>();
+  // Gateway actions that started before their tool row arrived (Codex reports the MCP call after it began)
+  const earlyRuns: GatewayEvent[] = [];
   const perms = new Map<string, Item & { k: 'perm' }>();
   let planIdx = -1;
   const planner = new PlanTracker();
@@ -130,7 +158,8 @@ function buildItems(events: HubEvent[], hideCompactCmd = false): Item[] {
       planIdx = items.length - 1;
     }
     switch (e.kind) {
-      case 'computer_use': {
+      case 'computer_use':
+      case 'browser_use': {
         // A desktop action is the AI tool's own MCP call seen from the gateway: fold it into that tool row
         // (OpenBot shows them as ordinary tool steps). Match by server and tool name first; otherwise take the
         // latest call of this turn still waiting for its result, since the gateway action runs inside it
@@ -143,7 +172,7 @@ function buildItems(events: HubEvent[], hideCompactCmd = false): Item[] {
             const it = items[i];
             if (it.k === 'user') break;
             if (it.k !== 'tool' || it.desktop) continue;
-            if (isDesktopTool(it, e.tool)) {
+            if (isDesktopTool(it, e)) {
               tool = it;
               break;
             }
@@ -157,12 +186,13 @@ function buildItems(events: HubEvent[], hideCompactCmd = false): Item[] {
           break;
         }
         if (e.status === 'control') {
-          items.push({ k: 'note', key: `desktop-${e.actionId}`, tone: 'muted', text: desktopControlText(e.tool) });
+          items.push({ k: 'note', key: `desktop-${e.actionId}`, tone: 'muted', text: desktopControlText(e) });
           break;
         }
         const old = items.findIndex((item) => item.k === 'desktop' && item.ev.actionId === e.actionId);
         const next: Item = { k: 'desktop', key: `desktop-${e.actionId}`, ev: e };
         if (old >= 0) items[old] = next; else if (e.images?.length || e.status !== 'running') items.push(next);
+        else earlyRuns.push(e);
         break;
       }
       case 'user_message':
@@ -216,6 +246,12 @@ function buildItems(events: HubEvent[], hideCompactCmd = false): Item[] {
           tools.set(e.id, it);
           items.push(it);
           turnTools++;
+          const early = earlyRuns.findIndex((r) => desktopTools.get(r.actionId) === undefined && isDesktopTool(it, r));
+          if (early >= 0) {
+            it.desktop = earlyRuns[early];
+            desktopTools.set(earlyRuns[early].actionId, it);
+            earlyRuns.splice(early, 1);
+          }
         }
         break;
       }
@@ -1456,9 +1492,23 @@ function toolView(it: Item & { k: 'tool' }, cwd?: string) {
   const err = !!it.result?.isError || (parsed.exitCode ?? 0) !== 0;
   if (it.desktop) {
     const desktopErr = err || it.desktop.status === 'failed';
-    return { shown, kind, arg: it.desktop.message, parsed, err: desktopErr, label: getT('computerUse')('action', { tool: it.desktop.tool }) };
+    return { shown, kind, arg: it.desktop.message, parsed, err: desktopErr, label: gatewayText(it.desktop).action };
   }
+  // A yi_browser call before its gateway event arrives (Codex shows the row first): label it the same way
+  const browserTool = browserToolName(it);
+  if (browserTool) return { shown, kind, arg, parsed, err, label: getT('browserUse')('action', { tool: browserTool }) };
   return { shown, kind, arg, parsed, err, label: generic ? it.title : toolUiLabel(shown) };
+}
+
+/** The yi_browser tool a row calls, from the forms the AI tools use: mcp__yi_browser__x (Claude), yi_browser.x
+ *  (Codex), "x (yi_browser)" (Qoder), DeferExecuteTool with toolName (CodeBuddy) */
+function browserToolName(it: Item & { k: 'tool' }): string | null {
+  const wrapped = (it.input as { toolName?: unknown } | null)?.toolName;
+  for (const s of [it.name, typeof wrapped === 'string' ? wrapped : '', it.title]) {
+    const m = /^(?:mcp__yi_browser__|yi_browser\.)(browser_[a-z_]+)$/.exec(s ?? '') ?? /^(browser_[a-z_]+) \(yi_browser\)$/.exec(s ?? '');
+    if (m) return m[1];
+  }
+  return null;
 }
 
 function fmtDur(ms: number) {
@@ -2136,14 +2186,14 @@ function BgTaskNote({ it }: { it: Extract<Item, { k: 'bgdone' }> }) {
   );
 }
 
-function DesktopAction({ ev, hostId, sessionId }: { ev: HubEvent & { kind: 'computer_use' }; hostId?: string; sessionId?: string }) {
-  const tx = getT('computerUse');
+function DesktopAction({ ev, hostId, sessionId }: { ev: GatewayEvent; hostId?: string; sessionId?: string }) {
   useLang();
-  const status = ev.status === 'running' ? tx('running') : ev.status === 'completed' ? tx('completed') : ev.status === 'failed' ? tx('failed') : ev.status === 'control' ? tx('control') : ev.status === 'unverified' ? tx('unverified') : tx('interrupted');
+  const x = gatewayText(ev);
+  const status = x.status[ev.status] ?? x.status.interrupted;
   return <div className="computer-use-action">
-    <div className="computer-use-action-head"><Icon name="laptop" size={15} /><strong>{tx('action', { tool: ev.tool })}</strong><span className="muted small">{status}</span></div>
+    <div className="computer-use-action-head"><Icon name={ev.kind === 'browser_use' ? 'globe' : 'laptop'} size={15} /><strong>{x.action}</strong><span className="muted small">{status}</span></div>
     {ev.message && <div className="muted small truncate">{ev.message}</div>}
-    {!!ev.durationMs && <div className="muted small">{tx('elapsed', { seconds: (ev.durationMs / 1000).toFixed(1) })}</div>}
+    {!!ev.durationMs && <div className="muted small">{x.elapsed}</div>}
     {!!ev.images?.length && hostId && sessionId && <div className="computer-use-images">{ev.images.map((img) => <MsgImage key={img.id} hostId={hostId} sessionId={sessionId} img={img} />)}</div>}
   </div>;
 }

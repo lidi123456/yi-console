@@ -21,6 +21,7 @@ mod hub;
 mod install;
 mod log;
 mod clientmcp;
+mod browser;
 mod computer_use;
 mod mcp;
 mod paths;
@@ -55,6 +56,7 @@ fn main() {
     let cmd = args.first().map(String::as_str).unwrap_or("help");
     let res = match cmd {
         "computer-use-mcp" => computer_use::proxy_main(&args[1..]),
+        "browser-mcp" => browser::proxy_main(&args[1..]),
         "client-mcp" => clientmcp::proxy_main(&args[1..]),
         "serve" => serve(args.iter().any(|a| a == "-f" || a == "--foreground")),
         "bridge" => bridge(args.iter().any(|a| a == "--local")),
@@ -184,6 +186,7 @@ fn daemon_request(method: &str, params: serde_json::Value, start: bool, timeout_
                     break;
                 }
                 Err(_) if !start && method == yi_proto::methods::COMPUTER_USE_MCP => anyhow::bail!("连不上守护进程，请重新开启操作电脑"),
+                Err(_) if !start && method == yi_proto::methods::BROWSER_USE_MCP => anyhow::bail!("连不上守护进程，请重新开启浏览器"),
                 Err(_) if !start => anyhow::bail!("连不上守护进程"),
                 Err(_) if i == 0 => {
                     paths::ensure_base()?;

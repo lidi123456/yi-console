@@ -1,27 +1,35 @@
 import { useEffect, useRef, useState } from 'react';
 import { getT } from '../i18n';
-import { toast, useStore } from '../store';
+import { errorToast, hostStatus, sessionInfo, toast, useStore } from '../store';
 import { hubCall, isTauri, rpc } from '../transport';
 import { writeClipboard } from '../clipboard';
 import { Icon } from './Icon';
 import { forwardPort, openUrlExternal } from './PortsView';
+import { AI_PREFIX, handToAiBrowser, isAiTab } from './AiBrowser';
+import { canUseBrowser } from '../browserUse';
+import { NATIVE_WEB, NativeWeb, type WebEvent } from './NativeWeb';
 
 const tx = getT('browser');
+const ai = getT('browserUse');
 
-// Browser tab (iframe) in the file panel.
+// Browser tab in the file panel: a native child webview on Windows desktop (NativeWeb.tsx), an iframe elsewhere.
+// With the native webview, sites that forbid embedding work and the address bar follows navigation; the
+// notes below about the iframe apply to the other platforms and to HTML previews (always a sandboxed iframe).
 // - localhost addresses on a remote host are first port-forwarded to this machine, then opened in the iframe;
 // - HTML files on the host are fetched by directory via the ahfs protocol (/fsv/ in yi-web), so relative resources load too;
 // - addresses on the app's own origin are never loaded, and HTML previews go into a sandbox without allow-same-origin, so pages can't touch the app's APIs.
 // After navigating via a link in a cross-origin page we can't read the new URL, so the address bar doesn't follow; sites that forbid embedding show blank, and we offer "Open in system browser".
 
-/** Tab key: web:<url>, an empty url is a new tab; file:<absolute path> is an HTML file on the host */
+/** Tab key: web:<url>, an empty url is a new tab; file:<absolute path> is an HTML file on the host; aiweb:<session> is
+ *  that session's AI browser (AiBrowser.tsx), counted as a web tab so file operations leave it alone */
 export const WEB_PREFIX = 'web:';
-export const isWebTab = (t: string) => t.startsWith(WEB_PREFIX);
-export const webTabUrl = (t: string) => t.slice(WEB_PREFIX.length);
+export const isWebTab = (t: string) => t.startsWith(WEB_PREFIX) || isAiTab(t);
+export const webTabUrl = (t: string) => (isAiTab(t) ? '' : t.slice(WEB_PREFIX.length));
 export const webTabFile = (t: string) => (webTabUrl(t).startsWith('file:') ? webTabUrl(t).slice(5) : null);
 
 /** Name shown on the tab */
 export function webTabTitle(t: string): string {
+  if (isAiTab(t)) return ai('title');
   const u = webTabUrl(t);
   if (!u) return tx('newTab');
   const f = webTabFile(t);
@@ -70,7 +78,9 @@ export async function previewUrl(hostId: string, root: string, abs: string): Pro
   return `${base}${token}/${rel}`;
 }
 
-type Resolved = { src: string; sandboxed: boolean; via?: string } | { error: string };
+/** `back`: the original origin when `src` is a port forwarded to this machine, to map navigation back to it */
+/** `view`: the webview identity it was resolved for (a native view only shows a resolution of its own tab) */
+type Resolved = { src: string; sandboxed: boolean; via?: string; back?: string; view?: string } | { error: string };
 
 export function BrowserPane({
   hostId,
@@ -78,9 +88,14 @@ export function BrowserPane({
   tab,
   reload,
   onNavigate,
+  sessionId,
+  onOpenTab,
 }: {
   hostId: string;
   root: string;
+  /** The session of the file panel: "Hand to AI browser" opens the page in its AI browser */
+  sessionId?: string;
+  onOpenTab?: (tab: string) => void;
   /** Tab key (web:…) */
   tab: string;
   /** Reload when this changes (e.g. after saving an HTML file) */
@@ -97,12 +112,32 @@ export function BrowserPane({
   const [n, setN] = useState(0);
   const [loading, setLoading] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
+  // Native webview: the page it shows now, and the tab key we switched to because of that (not a new address)
+  const [shown, setShown] = useState('');
+  const [nav, setNav] = useState<{ n: number; action: 'back' | 'forward' }>({ n: 0, action: 'back' });
+  const selfNav = useRef<string | null>(null);
+  // The tab key we switched to from our own address bar: same webview, it just navigates
+  const typedNav = useRef<string | null>(null);
+  // Identity of the native webview: changes only when the panel switches to another tab, not when this tab's
+  // key follows the page or the address bar (worked out during render, so the key and the pool key change together)
+  const ident = useRef({ tab, view: tab });
+  if (ident.current.tab !== tab) {
+    const same = selfNav.current === tab || typedNav.current === tab;
+    ident.current = { tab, view: same ? ident.current.view : tab };
+  }
+  const view = ident.current.view;
 
   useEffect(() => setInput(file ?? url), [tab]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
+    if (selfNav.current === tab) {
+      selfNav.current = null;
+      return;
+    }
+    typedNav.current = null;
     let alive = true;
-    setRes(null);
+    // A native webview stays and navigates to the new address once it's resolved
+    setRes((r) => (NATIVE_WEB && r && 'src' in r && !r.sandboxed ? r : null));
     if (!url) {
       inputRef.current?.focus();
       return;
@@ -121,15 +156,16 @@ export function BrowserPane({
         const port = Number(u.port || (u.protocol === 'https:' ? 443 : 80));
         const f = await forwardPort(hostId, port);
         const remote = tx('hostPort', { name: host?.config.name ?? tx('hostFallback'), port });
+        const back = u.origin;
         u.hostname = 'localhost';
         u.port = String(f.localPort);
-        return { src: u.toString(), sandboxed: false, via: `${remote} → localhost:${f.localPort}` };
+        return { src: u.toString(), sandboxed: false, via: `${remote} → localhost:${f.localPort}`, back };
       }
       // Pages on the app's own origin could call the app's APIs directly; don't open them here
       if (u.origin === location.origin) return { error: tx('thisAddressIsYiConsole') };
       return { src: u.toString(), sandboxed: false };
     })()
-      .then((r) => alive && (setRes(r), setLoading(!('error' in r))))
+      .then((r) => alive && (setRes('src' in r ? { ...r, view } : r), setLoading(!('error' in r))))
       .catch((e) => alive && setRes({ error: String(e?.message ?? e) }));
     return () => {
       alive = false;
@@ -144,16 +180,60 @@ export function BrowserPane({
     const v = input.trim();
     if (file && v === file) return setN((x) => x + 1);
     const next = WEB_PREFIX + normalizeUrl(v);
+    typedNav.current = next;
     if (next === tab) setN((x) => x + 1);
     else onNavigate(next);
   };
   const src = res && 'src' in res ? res.src : '';
-  const external = res && 'src' in res && !res.sandboxed ? res.src : '';
-  const remoteHint = !file && url && !LOOPBACK.has(safeHost(url));
+  const native = NATIVE_WEB && !!res && 'src' in res && !res.sandboxed;
+  const nativeReady = native && 'view' in res && res.view === view;
+  const external = res && 'src' in res && !res.sandboxed ? (native && shown) || res.src : '';
+  const remoteHint = !native && !file && url && !LOOPBACK.has(safeHost(url));
+  /** A page address in the webview -> the address as the user knows it (undoing the port forward) */
+  const mapBack = (u: string) => {
+    if (!res || !('back' in res) || !res.back) return u;
+    try {
+      const a = new URL(u);
+      return a.origin === new URL(res.src).origin ? res.back + a.pathname + a.search + a.hash : u;
+    } catch {
+      return u;
+    }
+  };
+  const onWeb = (e: WebEvent) => {
+    if (e.kind === 'loading') setLoading(true);
+    else if (e.kind === 'loaded') setLoading(false);
+    if ((e.kind === 'loading' || e.kind === 'loaded' || e.kind === 'title') && e.url && /^https?:/i.test(e.url)) {
+      setShown(e.url);
+      const key = WEB_PREFIX + mapBack(e.url);
+      if (key !== tab) {
+        selfNav.current = key;
+        onNavigate(key);
+      }
+    } else if (e.kind === 'newWindow' && e.url) {
+      if (/^https?:/i.test(e.url)) onOpenTab?.(WEB_PREFIX + mapBack(e.url));
+    } else if (e.kind === 'blocked') {
+      toast(tx('blockedNavigation', { url: e.url ?? '' }));
+    } else if (e.kind === 'error') {
+      setRes({ error: e.title ?? '' });
+    }
+  };
+  const info = sessionId ? sessionInfo(hostId, sessionId) : undefined;
+  // The original address: on a remote host, localhost is that host, which is where the AI browser runs too
+  const aiOk = !!info && !!onOpenTab && canUseBrowser(hostStatus(hostId).hello, info) && /^https?:/i.test(url);
 
   return (
     <div className="wb">
       <div className="wb-bar">
+        {native && (
+          <>
+            <button className="icon-btn" title={tx('back')} onClick={() => setNav((v) => ({ n: v.n + 1, action: 'back' }))}>
+              <Icon name="back" size={14} />
+            </button>
+            <button className="icon-btn" title={tx('forward')} onClick={() => setNav((v) => ({ n: v.n + 1, action: 'forward' }))}>
+              <Icon name="forward" size={14} />
+            </button>
+          </>
+        )}
         <button className="icon-btn" title={tx('reload')} disabled={!src} onClick={() => setN((x) => x + 1)}>
           <Icon name="refresh" size={14} />
         </button>
@@ -186,6 +266,20 @@ export function BrowserPane({
         <button className="icon-btn" title={tx('openInSystemBrowser')} disabled={!external} onClick={() => openUrlExternal(external)}>
           <Icon name="external" size={14} />
         </button>
+        {aiOk && (
+          <button
+            className="icon-btn"
+            title={ai('handToAi')}
+            disabled={!url || !!file}
+            onClick={() =>
+              handToAiBrowser(hostId, sessionId!, url)
+                .then(() => onOpenTab?.(AI_PREFIX + sessionId))
+                .catch(errorToast)
+            }
+          >
+            <Icon name="bot" size={14} />
+          </button>
+        )}
       </div>
       {remoteHint && src && (
         <div className="wb-tip">
@@ -203,6 +297,8 @@ export function BrowserPane({
             <div className="wp-empty-title">{tx('cannotOpenThisAddress')}</div>
             <div className="muted small">{res.error}</div>
           </div>
+        ) : src && native ? (
+          nativeReady ? <NativeWeb key={view} src={src} poolKey={`${hostId}|${tab}`} reload={n} nav={nav} onEvent={onWeb} /> : <div className="wb-native" />
         ) : src ? (
           <iframe
             key={`${src}#${n}`}

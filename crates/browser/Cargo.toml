@@ -1,0 +1,19 @@
+[package]
+name = "yi-browser"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Chrome DevTools Protocol engine behind Yi Console's yi_browser MCP tools"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+base64.workspace = true
+tokio-tungstenite = "0.28"
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+md5 = "0.7"
+
+[dev-dependencies]
+tempfile = "3"

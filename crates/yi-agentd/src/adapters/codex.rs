@@ -1137,7 +1137,7 @@ pub fn item_events(item: &Value, with_user: bool) -> Vec<EventBody> {
             if status == "completed" || status == "failed" {
                 v.push(EventBody::ToolResult {
                     id,
-                    output: if s("server") == "yi_computer_use" { crate::computer_use::display_result(&item["result"]) } else { crate::util::truncate(&item["result"].to_string(), 64 * 1024) },
+                    output: if matches!(s("server").as_str(), "yi_computer_use" | "yi_browser") { crate::computer_use::display_result(&item["result"]) } else { crate::util::truncate(&item["result"].to_string(), 64 * 1024) },
                     is_error: status == "failed",
                 });
             }

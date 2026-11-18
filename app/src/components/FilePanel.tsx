@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { useBack } from '../back';
 import { getT, trErr, useLang } from '../i18n';
-import { errorToast, skey, toast, useSessionData, useStore } from '../store';
+import { errorToast, hostStatus, skey, toast, useSessionData, useStore } from '../store';
 import { isTauri, rpc } from '../transport';
 import type { DirEntry, FileDiff } from '../types';
 import { fmtSize, lsGet, lsSet } from '../util';
@@ -17,9 +17,13 @@ import { GrepPanel } from './GrepPanel';
 import { QuickOpen, type QuickMode } from './QuickOpen';
 import { OPEN_CHANGES, OPEN_FILE, takeOpenChanges, takeOpenFile } from './SessionActions';
 import { BrowserPane, isWebTab, WEB_PREFIX, webTabFile, webTabTitle } from './Browser';
+import { AI_PREFIX, aiTabSession, AiBrowserPane, isAiTab, useAiBrowserBusy } from './AiBrowser';
+import { registerWebTabs } from './NativeWeb';
+import { canUseBrowser } from '../browserUse';
 import { CommitDetails, GitHistory, isCommitTab, parseCommitTab } from './GitHistory';
 
 const tx = getT('filePanel');
+const aiT = getT('browserUse');
 
 // The "workspace files" panel on the right of the session page, modeled on the VS Code / Cursor explorer:
 // - on desktop the panel always shows the preview area on the left and the tree on the right (collapsible), with a placeholder until a file is opened;
@@ -552,6 +556,11 @@ export function FilePanel({
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
   // Opened files (tabs); the current file is file
   const [tabs, setTabs] = useState<string[]>([]);
+  // Native webviews (NativeWeb.tsx) stay parked while their tab is open, so switching tabs doesn't reload them
+  const panelId = useRef(`${Math.random()}`).current;
+  useLayoutEffect(() => registerWebTabs(panelId, tabs.filter(isWebTab).map((t) => `${hostId}|${t}`)), [tabs, hostId]); // eslint-disable-line react-hooks/exhaustive-deps
+  // Later than the webviews' own unmount, which parks them (closing the panel, switching sessions keeps them)
+  useEffect(() => () => void setTimeout(() => registerWebTabs(panelId, null), 0), []); // eslint-disable-line react-hooks/exhaustive-deps
   const [git, setGit] = useState<GitInfo | null>(() => gitCache.get(gitKey(hostId, cwd))?.git ?? null);
   const [view, setView] = useState<'all' | 'changes' | 'search'>(() => lsGet('wp-view', 'all'));
   const [showDiff, setShowDiff] = useState(false);
@@ -878,6 +887,8 @@ export function FilePanel({
     if (!f) return;
     setFile(f);
     setTabs((t) => (t.includes(path) ? t : [...t, path].slice(-30)));
+    // The live picture needs the room: hide the tree for it (not remembered)
+    if (isAiTab(path)) setTreeOpen(false);
     setSaveState(null);
     previewFor(path, at);
     setCompare(null);
@@ -941,7 +952,7 @@ export function FilePanel({
       const r = takeOpenFile(hostId, sessionId);
       if (!r) return;
       // A folder link: show it in the tree instead of trying to read it as a file
-      if (!r.line && !r.diff && (await revealRef.current(r.path))) return;
+      if (!r.line && !r.diff && !isWebTab(r.path) && (await revealRef.current(r.path))) return;
       openFileRef.current(r.path, !!r.diff, r.line ? { line: r.line, endLine: r.endLine } : undefined);
     };
     take();
@@ -1111,7 +1122,7 @@ export function FilePanel({
     const r = norm(root);
     const inRoot = (p: string) => norm(p).startsWith(r + '/');
     const keep = [...new Set(saved.tabs.map((t) => (isWebTab(t) || isUntitled(t) ? t : unverbatim(t))))].filter((t) =>
-      isUntitled(t) ? untitled.has(t) : isWebTab(t) ? !webTabFile(t) || inRoot(webTabFile(t)!) : inRoot(t),
+      isUntitled(t) ? untitled.has(t) : isAiTab(t) ? aiTabSession(t) === sessionId : isWebTab(t) ? !webTabFile(t) || inRoot(webTabFile(t)!) : inRoot(t),
     );
     const cur = saved.current && keep.includes(saved.current) ? saved.current : keep[keep.length - 1];
     if (!cur) return;
@@ -1849,6 +1860,8 @@ export function FilePanel({
     </div>
   );
 
+  const sessInfo = useStore((st) => st.sessions[hostId]?.find((x) => x.id === sessionId));
+  const aiBrowserOk = !!sessInfo && canUseBrowser(hostStatus(hostId).hello, sessInfo);
   const toggleHidden = () => (lsSet('wp-hidden', !hidden), setHidden(!hidden));
   const newMenu = (e: React.MouseEvent<HTMLElement>) => {
     const r = e.currentTarget.getBoundingClientRect();
@@ -1857,6 +1870,7 @@ export function FilePanel({
       { label: tx('newFolder'), icon: 'folder', run: () => root && create(root, 'dir') },
       '-',
       { label: tx('openWebPage'), icon: 'globe', run: () => openWeb() },
+      ...(aiBrowserOk ? [{ label: aiT('openAiBrowser'), icon: 'bot', run: () => openFile(AI_PREFIX + sessionId) }] : []),
     ]);
   };
   const panelBtns = standalone ? null : (
@@ -2141,8 +2155,10 @@ export function FilePanel({
         <div className="muted small">{tx('fileIsTooLargeBinary')}</div>
       </div>
     )
+  ) : file.web && isAiTab(file.path) ? (
+    <AiBrowserPane hostId={hostId} sessionId={aiTabSession(file.path)} />
   ) : file.web ? (
-    <BrowserPane hostId={hostId} root={root ?? cwd} tab={file.path} onNavigate={(t) => navigateWeb(file.path, t)} />
+    <BrowserPane hostId={hostId} root={root ?? cwd} tab={file.path} onNavigate={(t) => navigateWeb(file.path, t)} sessionId={sessionId} onOpenTab={(t) => openFile(t)} />
   ) : html && preview && viewing === 'file' ? (
     <BrowserPane hostId={hostId} root={root ?? cwd} tab={`${WEB_PREFIX}file:${file.path}`} reload={file.modified} onNavigate={(t) => openFile(t)} />
   ) : viewing === 'compare' && full ? (
@@ -2389,7 +2405,7 @@ export function FilePanel({
                     role="tab"
                     aria-selected={cur}
                     className={`wp-ftab ${cur ? 'active' : ''}`}
-                    title={t.slice(WEB_PREFIX.length) || tx('newTab')}
+                    title={isAiTab(t) ? webTabTitle(t) : t.slice(WEB_PREFIX.length) || tx('newTab')}
                     onClick={() => openFile(t)}
                     onAuxClick={(e) => e.button === 1 && closeTab(t)}
                     onContextMenu={(e) =>
@@ -2399,7 +2415,7 @@ export function FilePanel({
                       ])
                     }
                   >
-                    <Icon name="globe" size={13} />
+                    {isAiTab(t) ? <AiTabIcon hostId={hostId} sessionId={aiTabSession(t)} /> : <Icon name="globe" size={13} />}
                     <span className="truncate">{webTabTitle(t)}</span>
                     <button
                       className="wp-ftab-x"
@@ -2826,5 +2842,15 @@ function DirPopover({
         />
       )}
     </div>
+  );
+}
+
+/** The AI browser tab's icon: it pulses while the AI acts in that browser */
+function AiTabIcon({ hostId, sessionId }: { hostId: string; sessionId: string }) {
+  const busy = useAiBrowserBusy(hostId, sessionId);
+  return (
+    <span className={`aiweb-tab-icon ${busy ? 'busy' : ''}`}>
+      <Icon name="bot" size={13} />
+    </span>
   );
 }

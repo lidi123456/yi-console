@@ -4242,6 +4242,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "yi-browser"
+version = "0.3.1"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "futures-util",
+ "md5 0.7.0",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-tungstenite",
+]
+
+[[package]]
 name = "yi-client"
 version = "0.3.1"
 dependencies = [

@@ -1,15 +1,18 @@
 import { ComputerUsePanel } from './ComputerUsePanel';
+import { BrowserUsePanel } from './BrowserUsePanel';
 import { canUseComputer } from '../computerUse';
+import { canUseBrowser } from '../browserUse';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useBack } from '../back';
 import { getT, isEn } from '../i18n';
 import { errorToast, hostStatus, loadOlder, loadSession, navigate, setState, skey, toast, useSessionData, useStore } from '../store';
 import { rpc } from '../transport';
 import { TOOL_LABEL, supportsAccountsTool, type QuestionAnswer, type ToolAccountsSummary } from '../types';
-import { fmtUsage, lsGet, lsSet, shortPath, STATUS_LABEL } from '../util';
+import { fmtUsage, isMobile, lsGet, lsSet, shortPath, STATUS_LABEL } from '../util';
 import { openAccountManager } from './AccountManagerModal';
 import { openMenu } from './Overlay';
-import { exportSession, OPEN_CHANGES, OPEN_FILE, renameSession, sessionMenu, showChanges, switchMode } from './SessionActions';
+import { exportSession, OPEN_CHANGES, OPEN_FILE, openFileInPanel, renameSession, sessionMenu, showChanges, switchMode } from './SessionActions';
+import { AI_PREFIX } from './AiBrowser';
 import { FilePanel } from './FilePanel';
 import { TermPanel } from './TermPanel';
 import { AsyncAskCard, ChatView, openAsyncAsk, PermissionCard, setChatStyle, useChatStyle } from './ChatView';
@@ -24,6 +27,8 @@ import { UsageDialog } from './UsageDialog';
 import { SessionBotBar } from './BotsSection';
 
 const t = getT('sessionView');
+/** Sessions whose AI browser view was opened automatically in this window */
+const autoOpened = new Set<string>();
 
 export function SessionView({ hostId, sessionId, seq }: { hostId: string; sessionId: string; seq?: number }) {
   const key = skey(hostId, sessionId);
@@ -35,6 +40,30 @@ export function SessionView({ hostId, sessionId, seq }: { hostId: string; sessio
   );
   const home = hostStatus(hostId).hello?.home;
   const desktopRevision = useMemo(() => data.events.reduce((seq, event) => event.kind === 'computer_use' && event.status === 'control' ? event.seq : seq, 0), [data.events, data.events.length]);
+  const browserRevision = useMemo(() => data.events.reduce((seq, event) => event.kind === 'browser_use' ? event.seq : seq, 0), [data.events, data.events.length]);
+  // The AI starts using the browser: show its live view in the file panel, once per session (closing the tab sticks)
+  const lastAiAction = useMemo(() => {
+    for (let i = data.events.length - 1; i >= 0; i--) {
+      const e = data.events[i];
+      if (e.kind === 'browser_use' && e.status === 'running') return e.seq;
+    }
+    return 0;
+  }, [data.events, data.events.length]);
+  const seenAiAction = useRef<number | null>(null);
+  useEffect(() => {
+    if (!data.loaded) return;
+    if (seenAiAction.current === null) {
+      seenAiAction.current = lastAiAction;
+      return;
+    }
+    if (lastAiAction <= seenAiAction.current) return;
+    seenAiAction.current = lastAiAction;
+    if (autoOpened.has(key) || isMobile()) return;
+    autoOpened.add(key);
+    // Wide enough to read the page (not remembered as the panel width)
+    setPanelW((w) => Math.max(w, Math.min(960, Math.round(window.innerWidth * 0.55))));
+    openFileInPanel(hostId, sessionId, AI_PREFIX + sessionId);
+  }, [lastAiAction, data.loaded]); // eslint-disable-line react-hooks/exhaustive-deps
   const style = useChatStyle();
   // Files session: no process and no chat, the page is the file panel (plus the bottom terminal)
   const filesOnly = info?.tool === 'files';
@@ -442,7 +471,14 @@ export function SessionView({ hostId, sessionId, seq }: { hostId: string; sessio
               hostId={hostId}
               info={info}
               connected={connected}
-              desktopControls={canUseComputer(hostStatus(hostId).hello, info) ? <ComputerUsePanel hostId={hostId} info={info} connected={connected} revision={desktopRevision} /> : undefined}
+              desktopControls={
+                canUseComputer(hostStatus(hostId).hello, info) || canUseBrowser(hostStatus(hostId).hello, info) ? (
+                  <>
+                    {canUseComputer(hostStatus(hostId).hello, info) && <ComputerUsePanel hostId={hostId} info={info} connected={connected} revision={desktopRevision} />}
+                    {canUseBrowser(hostStatus(hostId).hello, info) && <BrowserUsePanel hostId={hostId} info={info} connected={connected} revision={browserRevision} />}
+                  </>
+                ) : undefined
+              }
               onPrewarm={prewarm}
               onInterrupt={() => act('session.interrupt')}
               onExport={() => exportSession(hostId, info, 'download')}

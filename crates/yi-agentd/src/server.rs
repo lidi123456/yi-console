@@ -76,6 +76,8 @@ where
     }
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<String>();
     let subs: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+    // Live views of AI browsers on this connection; dropping one stops its frames
+    let views: Arc<Mutex<std::collections::HashMap<String, crate::browser::View>>> = Arc::default();
     // Identifies this connection to the client MCP bridge (`client.hello`)
     static NEXT_CONN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let conn_id = NEXT_CONN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -148,6 +150,7 @@ where
         };
         let hub = hub.clone();
         let subs = subs.clone();
+        let views = views.clone();
         let tx = out_tx.clone();
         let local = peer == "local";
         let peer_pid = crate::transport::PEER_PID.try_with(|pid| *pid).ok().flatten();
@@ -162,6 +165,38 @@ where
                     (Ok(sid), Ok(ticket)) => hub.desktop.proxy_call(&hub, sid, ticket, p["packet"].clone(), peer_pid).await,
                     (Err(e), _) | (_, Err(e)) => Err(e),
                 }
+            } else if req.method == methods::BROWSER_USE_MCP && !local {
+                Err(anyhow!("浏览器代理只接受本机连接"))
+            } else if req.method == methods::BROWSER_USE_MCP {
+                let p = &req.params;
+                match (s(p, "sessionId"), s(p, "ticket")) {
+                    (Ok(sid), Ok(ticket)) => hub.browsers.proxy_call(&hub, sid, ticket, p["packet"].clone(), peer_pid).await,
+                    (Err(e), _) | (_, Err(e)) => Err(e),
+                }
+            } else if req.method == methods::BROWSER_VIEW_ATTACH {
+                // Frames go only to this connection, never through the hub's broadcast
+                match s(&req.params, "sessionId") {
+                    Ok(sid) => {
+                        let opts = crate::browser::ViewOpts::new(local, &req.params);
+                        hub.browsers.attach(hub.clone(), sid, opts, tx.clone()).map(|view| {
+                            views.lock().unwrap().insert(sid.to_string(), view);
+                            json!({"maxFps": opts.max_fps, "maxWidth": opts.max_width, "quality": opts.quality})
+                        })
+                    }
+                    Err(e) => Err(e),
+                }
+            } else if req.method == methods::BROWSER_VIEW_DETACH {
+                s(&req.params, "sessionId").map(|sid| {
+                    views.lock().unwrap().remove(sid);
+                    Value::Null
+                })
+            } else if req.method == methods::BROWSER_VIEW_ACK {
+                s(&req.params, "sessionId").map(|sid| {
+                    if let Some(v) = views.lock().unwrap().get(sid) {
+                        v.ack(req.params["seq"].as_u64().unwrap_or(0));
+                    }
+                    Value::Null
+                })
             } else if req.method == methods::CLIENT_MCP_PROXY && !local {
                 Err(anyhow!("MCP 代理只接受本机连接"))
             } else if req.method == methods::CLIENT_MCP_PROXY {
@@ -220,6 +255,7 @@ where
         });
     }
     forward.abort();
+    views.lock().unwrap().clear();
     if hub.clients.disconnected(conn_id) {
         clients_changed(&hub);
     }
@@ -272,6 +308,14 @@ pub async fn dispatch(
         }
         // Handled in serve_conn, which knows the peer and its process id
         COMPUTER_USE_MCP => anyhow::bail!("桌面代理只接受本机连接"),
+        BROWSER_USE_STATUS => hub.browser_status(p["sessionId"].as_str()),
+        SESSION_BROWSER_USE => hub.browser_use(s(&p, "sessionId")?, s(&p, "action")?, &p).await?,
+        BROWSER_VIEW_INPUT => {
+            let events = p["events"].as_array().cloned().unwrap_or_default();
+            hub.browsers.input(s(&p, "sessionId")?, &events).await?;
+            Value::Null
+        }
+        BROWSER_USE_MCP => anyhow::bail!("浏览器代理只接受本机连接"),
         SESSION_LIST => serde_json::to_value(hub.list())?,
         SESSION_CREATE => {
             let params: CreateParams = serde_json::from_value(p)?;
@@ -1003,6 +1047,7 @@ pub async fn dispatch(
             crate::settings::save(&new)?;
             *hub.settings.write().unwrap() = new.clone();
             hub.mcp_settings_changed(&old, &new);
+            hub.browsers.settings_changed(&old, &new);
             *TOOLS.lock().unwrap() = None;
             serde_json::to_value(crate::mcp::redact(new))?
         }
@@ -1048,12 +1093,19 @@ mod tests {
 
     #[tokio::test]
     async fn desktop_proxy_rejects_remote_peers_and_forwarded_local_connections() {
-        for (peer, marker) in [("ssh", ""), ("relay", ""), ("local", yi_proto::BRIDGE_REMOTE_MARK)] {
+        for (method, error, peer, marker) in [
+            (methods::COMPUTER_USE_MCP, "桌面代理只接受本机连接", "ssh", ""),
+            (methods::COMPUTER_USE_MCP, "桌面代理只接受本机连接", "relay", ""),
+            (methods::COMPUTER_USE_MCP, "桌面代理只接受本机连接", "local", yi_proto::BRIDGE_REMOTE_MARK),
+            (methods::BROWSER_USE_MCP, "浏览器代理只接受本机连接", "ssh", ""),
+            (methods::BROWSER_USE_MCP, "浏览器代理只接受本机连接", "relay", ""),
+            (methods::BROWSER_USE_MCP, "浏览器代理只接受本机连接", "local", yi_proto::BRIDGE_REMOTE_MARK),
+        ] {
             let hub = Hub::new(crate::store::Store::open_memory().unwrap(), DaemonSettings::default());
             let (mut client, server) = tokio::io::duplex(4096);
             let (r, w) = tokio::io::split(server);
             let task = tokio::spawn(serve_conn(hub, r, w, peer));
-            let request = json!({"id":1,"method":methods::COMPUTER_USE_MCP,"params":{}});
+            let request = json!({"id":1,"method":method,"params":{}});
             let packet = format!("{}{}{}\n", marker, if marker.is_empty() { "" } else { "\n" }, request);
             client.write_all(packet.as_bytes()).await.unwrap();
             let mut reader = BufReader::new(client);
@@ -1061,7 +1113,7 @@ mod tests {
             tokio::time::timeout(std::time::Duration::from_secs(2), reader.read_line(&mut response)).await.unwrap().unwrap();
             let response: Value = serde_json::from_str(&response).unwrap();
             assert_eq!(response["id"], 1);
-            assert_eq!(response["error"]["message"], "桌面代理只接受本机连接");
+            assert_eq!(response["error"]["message"], error);
             drop(reader);
             task.await.unwrap();
         }

@@ -55,6 +55,8 @@ export interface SessionInfo {
   /** Usage limit hits in a row since the last normal turn end */
   limitHits?: number;
   computerUse?: boolean;
+  /** The AI browser (`yi_browser`) is on */
+  browserUse?: boolean;
   /** The oldest approval / question still waiting (overview board) */
   pending?: PendingBrief;
   /** The current or last chat turn (chat mode only) */
@@ -377,9 +379,12 @@ export interface PlanEntry {
 }
 
 export type ComputerUseEvent = { kind: 'computer_use'; actionId: string; tool: string; status: string; message: string; durationMs: number; images: ImageRef[] };
+/** An AI browser (`yi_browser`) action; `url` is the page it ended on */
+export type BrowserUseEvent = { kind: 'browser_use'; actionId: string; tool: string; status: string; message: string; durationMs: number; url?: string; images: ImageRef[] };
 
 export type EventBody =
   | ComputerUseEvent
+  | BrowserUseEvent
   /** `origin`: who sent it when not the person (`bot-engine`: the desktop app's Bot engine) */
   | { kind: 'user_message'; text: string; images?: ImageRef[]; origin?: string }
   | { kind: 'assistant_text'; id: string; text: string }
@@ -600,6 +605,39 @@ export interface DaemonSettings {
   uiLang?: string;
   /** Where `git.worktreeAdd` puts worktrees (Bot tasks); `~/.yi-console/worktrees` if unset */
   worktreeRoot?: string;
+  /** The AI browser (`yi_browser`) */
+  browser?: BrowserSettings;
+}
+
+export interface BrowserSettings {
+  /** Chrome / Edge / Chromium to use instead of the one found on the host */
+  executablePath?: string;
+  /** One shared profile that keeps logins (one session at a time) */
+  persistentProfile?: boolean;
+  /** Hosts pages may reach (`example.com`, `*.example.com`); empty: no limit */
+  allowedDomains?: string[];
+  /** Action categories always refused (`eval`, `upload`, `download`, `network`, `storage`) */
+  deniedActions?: string[];
+  /** Accept invalid HTTPS certificates on every site (localhost always accepts them) */
+  ignoreHttpsErrors?: boolean;
+}
+
+/** `browser.status`: where a watched AI browser is */
+export interface BrowserViewStatus {
+  sessionId: string;
+  enabled: boolean;
+  paused: boolean;
+  running: boolean;
+  headless: boolean;
+  url: string;
+  title: string;
+  loading: boolean;
+  tabs: { id: string; url: string; title: string; current: boolean }[];
+  dialog?: { kind: string; message: string; defaultPrompt: string } | null;
+  frame?: string | null;
+  busy?: string | null;
+  /** The AI's mouse in viewport CSS pixels; `clicks` grows with every press */
+  pointer?: { x: number; y: number; clicks: number } | null;
 }
 
 export const TOOL_LABEL: Record<ToolKind, string> = new Proxy(

@@ -359,6 +359,7 @@ mod tests {
             auto_resume: None,
             limit_hits: 0,
             computer_use: false,
+            browser_use: false,
             pending: None,
             turn: None,
             bot: None,

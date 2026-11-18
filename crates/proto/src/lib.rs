@@ -237,6 +237,9 @@ pub struct SessionInfo {
     /// Optional desktop control; disabled again after daemon restart.
     #[serde(default)]
     pub computer_use: bool,
+    /// Optional AI browser (`yi_browser`); disabled again after daemon restart.
+    #[serde(default)]
+    pub browser_use: bool,
     /// The oldest approval or question still waiting, so lists (the overview board) can show it without subscribing to
     /// the session. Cleared together with `pending_permissions`
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -570,6 +573,18 @@ pub enum EventBody {
         status: String,
         message: String,
         duration_ms: u64,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<ImageRef>,
+    },
+    /// AI browser action metadata (`yi_browser`), like ComputerUse plus the page it ended on
+    BrowserUse {
+        action_id: String,
+        tool: String,
+        status: String,
+        message: String,
+        duration_ms: u64,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        url: String,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         images: Vec<ImageRef>,
     },
@@ -992,6 +1007,35 @@ pub struct DaemonSettings {
     /// Where `git.worktreeAdd` puts new worktrees (`~` allowed); `~/.yi-console/worktrees` if unset
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree_root: Option<String>,
+    /// The AI browser (`yi_browser`)
+    #[serde(default, skip_serializing_if = "BrowserSettings::is_default")]
+    pub browser: BrowserSettings,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserSettings {
+    /// Chrome / Edge / Chromium to use instead of the one found on this host
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executable_path: Option<String>,
+    /// Keep cookies and logins in one shared profile (one session at a time) instead of a fresh one per session
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub persistent_profile: bool,
+    /// Hosts pages may reach (`example.com`, `*.example.com`); empty means no limit
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_domains: Vec<String>,
+    /// Action categories always refused (`eval`, `upload`, `download`, `network`, `storage`, ...)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub denied_actions: Vec<String>,
+    /// Accept invalid HTTPS certificates on every site (localhost always accepts them)
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ignore_https_errors: bool,
+}
+
+impl BrowserSettings {
+    pub fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -1083,6 +1127,18 @@ pub mod methods {
     pub const SESSION_COMPUTER_USE: &str = "session.computerUse";
     /// Private, locally authenticated MCP proxy traffic; remote peers cannot invoke it.
     pub const COMPUTER_USE_MCP: &str = "computerUse.mcp";
+    pub const BROWSER_USE_STATUS: &str = "browserUse.status";
+    pub const SESSION_BROWSER_USE: &str = "session.browserUse";
+    /// Private, locally authenticated `yi_browser` MCP proxy traffic; remote peers cannot invoke it.
+    pub const BROWSER_USE_MCP: &str = "browserUse.mcp";
+    /// Watch a session's AI browser on this connection: `browser.frame` / `browser.status` notifications follow
+    /// (`sessionId`, optional `maxFps` / `maxWidth` / `quality`). Only the latest frame is kept; the next is sent after
+    /// `browser.view.ack`
+    pub const BROWSER_VIEW_ATTACH: &str = "browser.view.attach";
+    pub const BROWSER_VIEW_DETACH: &str = "browser.view.detach";
+    pub const BROWSER_VIEW_ACK: &str = "browser.view.ack";
+    /// A person's input on the live view: `events` of mouse / key / text / touch / dialog, in viewport CSS pixels
+    pub const BROWSER_VIEW_INPUT: &str = "browser.view.input";
     pub const SESSION_CREATE: &str = "session.create";
     pub const SESSION_SUBSCRIBE: &str = "session.subscribe";
     pub const SESSION_UNSUBSCRIBE: &str = "session.unsubscribe";
@@ -1297,6 +1353,10 @@ pub mod methods {
     pub const EV_CLIENT_EVENT: &str = "client.event";
     /// {}: a desktop app registered or went away; refetch `clients.list`
     pub const EV_CLIENTS_CHANGED: &str = "clients.changed";
+    /// A JPEG frame of a watched AI browser, only to connections that attached
+    pub const EV_BROWSER_FRAME: &str = "browser.frame";
+    /// Address, tabs, dialog, busy and paused state of a watched AI browser
+    pub const EV_BROWSER_STATUS: &str = "browser.status";
 }
 
 #[cfg(test)]

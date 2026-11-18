@@ -6,6 +6,44 @@ mod clipfiles;
 mod tray;
 #[cfg(desktop)]
 mod updater;
+#[cfg(windows)]
+mod webtab;
+
+/// Native web tabs need multiple webviews per window (tauri `unstable`), enabled only on Windows so far;
+/// elsewhere the frontend keeps the iframe (`NATIVE_WEB` in NativeWeb.tsx) and these commands are never called
+#[cfg(not(windows))]
+mod webtab {
+    #[derive(serde::Deserialize)]
+    pub struct Bounds {}
+    const NO: &str = "这个平台不支持原生网页标签";
+    #[tauri::command]
+    pub async fn webtab_open(label: String, url: String, bounds: Bounds) -> Result<(), String> {
+        let _ = (label, url, bounds);
+        Err(NO.into())
+    }
+    #[tauri::command]
+    pub async fn webtab_bounds(label: String, bounds: Bounds, visible: bool, holes: Option<Vec<Bounds>>) -> Result<(), String> {
+        let _ = (label, bounds, visible, holes);
+        Err(NO.into())
+    }
+    #[tauri::command]
+    pub async fn webtab_nav(label: String, action: String, url: Option<String>) -> Result<(), String> {
+        let _ = (label, action, url);
+        Err(NO.into())
+    }
+    #[tauri::command]
+    pub async fn webtab_close(label: String) -> Result<(), String> {
+        let _ = label;
+        Err(NO.into())
+    }
+    #[tauri::command]
+    pub async fn webtab_reset() {}
+    #[tauri::command]
+    pub async fn webtab_capture(label: String) -> Result<String, String> {
+        let _ = label;
+        Err(NO.into())
+    }
+}
 
 /// No tauri-plugin-updater on mobile: Android updates itself in MainActivity.kt (YiConsoleAndroid.update*), these only keep the handler list the same
 #[cfg(mobile)]
@@ -175,7 +213,13 @@ pub fn run() {
             save_file,
             clipfiles::clipboard_files,
             updater::update_check,
-            updater::update_install
+            updater::update_install,
+            webtab::webtab_open,
+            webtab::webtab_bounds,
+            webtab::webtab_nav,
+            webtab::webtab_close,
+            webtab::webtab_reset,
+            webtab::webtab_capture
         ])
         .run(tauri::generate_context!())
         .expect("启动 Yi Console 失败");

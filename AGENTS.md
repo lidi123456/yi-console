@@ -10,6 +10,7 @@ See [README.md](README.md) for an overview and usage. This file has the project 
 - `crates/client/src/api.rs`: `ClientHub::call` is the complete set of commands the frontend can call. Tauri (`app/src-tauri/src/lib.rs`) and yi-web are thin wrappers around it.
 - `crates/bots`: the Bot engine and plugins, desktop app only; plugs into `ClientHub` through the `Extension` trait (`crates/client/src/ext.rs`).
 - `plugins/`: WASM plugin SDK (`yi-plugin`), first-party plugins and the packer; a separate cargo workspace built for `wasm32-wasip2`. The interface is `plugins/wit/yi-plugin.wit`, implemented by `crates/bots/src/plugins/wasm.rs`; change both together. `github` / `feishu` ship inside the desktop app: run `scripts/bundle-plugins.py` before `tauri build`. Author guide: [docs/plugins.en.md](docs/plugins.en.md).
+- `crates/browser`: the CDP engine behind the `yi_browser` MCP tools (no yi dependencies; the gateway is `crates/yi-agentd/src/browser/`).
 - `crates/link`, `crates/relay`: relay protocol and server.
 - `app/src/store.ts`: frontend state and the event loop; components live in `app/src/components/`.
 
@@ -24,6 +25,7 @@ See [README.md](README.md) for an overview and usage. This file has the project 
 | Terminal mode, tmux, bottom terminal panel | [docs/internals/terminal.md](docs/internals/terminal.md) |
 | Frontend UI: chat timeline, theme, fonts, scrollbars, sidebar, links, overlays, i18n | [docs/internals/frontend-ui.md](docs/internals/frontend-ui.md) |
 | Computer Use: bundled Windows driver, macOS CuaDriver.app, session MCP, control leases, screenshots | [docs/internals/computer-use.md](docs/internals/computer-use.md) |
+| AI browser (`yi_browser`): per-session Chrome over CDP, snapshots and refs, gateway rules | [docs/internals/browser.md](docs/internals/browser.md) |
 | Remote: SSH bridge, relay, forwarding, port forwarding | [docs/internals/remote.md](docs/internals/remote.md) |
 | Daemon lifecycle, versions, auto-upgrade | [docs/internals/daemon.md](docs/internals/daemon.md) |
 | App self-update, Android | [docs/internals/release.md](docs/internals/release.md) |

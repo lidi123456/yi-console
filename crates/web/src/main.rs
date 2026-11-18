@@ -213,7 +213,10 @@ fn csp() -> &'static str {
                 v => format!("{k} {}", v.as_str().unwrap_or_default()),
             })
             .collect();
-        parts.push("frame-ancestors 'none'".into());
+        // tauri.conf.json carries it too now (the desktop app's native web tabs must not frame the app)
+        if !map.contains_key("frame-ancestors") {
+            parts.push("frame-ancestors 'none'".into());
+        }
         parts.join("; ")
     })
 }
@@ -271,7 +274,7 @@ mod tests {
         let p = super::csp();
         assert!(p.starts_with("default-src 'self'") || p.contains("default-src 'self'"));
         assert!(p.contains("script-src 'self'"));
-        assert!(p.ends_with("frame-ancestors 'none'"));
+        assert_eq!(p.matches("frame-ancestors 'none'").count(), 1);
         assert!(!p.contains("unsafe-eval"));
     }
 }

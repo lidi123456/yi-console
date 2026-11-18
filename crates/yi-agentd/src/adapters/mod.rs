@@ -29,7 +29,7 @@ and omit configuration directives, HTML, external resources, click actions and c
 
 /// Everything we add to the system prompt of Claude (`--append-system-prompt`) and Codex (`developerInstructions`)
 pub fn system_text(spec: &StartSpec) -> String {
-    let mut s = format!("{}{}", IMAGE_HINT, crate::computer_use::model_hint(&spec.extra_args));
+    let mut s = format!("{}{}{}", IMAGE_HINT, crate::computer_use::model_hint(&spec.extra_args), crate::browser::model_hint(&spec.extra_args));
     if let Some(p) = &spec.system_prompt {
         s.push_str("\n\n");
         s.push_str(p);

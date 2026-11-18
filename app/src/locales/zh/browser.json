@@ -22,5 +22,8 @@
   "hostPort": "{{name}} 的 {{port}} 端口",
   "hostFallback": "主机",
   "addressOrPortRemote": "输入地址或端口号，localhost 指 {{name}}",
-  "theHostFallback": "主机"
+  "theHostFallback": "主机",
+  "back": "后退",
+  "forward": "前进",
+  "blockedNavigation": "已阻止跳转到 {{url}}：只能在这里打开 http 和 https 网页"
 }
