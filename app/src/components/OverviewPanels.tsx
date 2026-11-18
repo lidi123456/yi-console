@@ -18,7 +18,7 @@ import { openImage } from './Lightbox';
 import { DirPicker, PREFS_KEY, prefModel, recentDirs, rememberDir, type ToolPrefs } from './NewSession';
 import { openMenu, type MenuItem } from './Overlay';
 import { showChanges } from './SessionActions';
-import { QUOTA_TOOLS, QuotaCard, TOOL_VAR } from './StatsView';
+import { QuotaCard, quotaToolsFor, TOOL_VAR } from './StatsView';
 
 const t = getT('home');
 const tc = getT('composer');
@@ -830,7 +830,7 @@ export function QuotaDialog({ hosts, onClose }: { hosts: HostEntry[]; onClose: (
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
   }, [onClose]);
-  const hasTools = QUOTA_TOOLS.some((k) => host?.status.hello?.tools.some((x) => x.kind === k && x.available));
+  const hasTools = quotaToolsFor(host?.status.hello?.tools).length > 0;
   return (
     <div className="modal-bg" onClick={onClose}>
       <div className="modal ov-quota" onClick={(e) => e.stopPropagation()}>

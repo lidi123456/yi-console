@@ -2,6 +2,7 @@ import { getT, isEn, trErr } from '../i18n';
 import type { Quota } from '../types';
 
 const tx = getT('statsView');
+const usage = getT('usageDialog');
 
 export const quotaErrText = (e: unknown) => {
   const m = String((e as Error)?.message ?? e);
@@ -21,13 +22,14 @@ export const fmtQuotaReset = (v: number | string | null | undefined) => {
   return isEn() ? `resets ${clock}` : `${clock} 重置`;
 };
 
-/** Quota windows for one tool or account profile: undefined while loading, a string is an error message */
-export function QuotaBody({ q }: { q: Quota | string | undefined }) {
+/** Quota windows for one tool or account profile: undefined while loading, null if unavailable, a string on error */
+export function QuotaBody({ q }: { q: Quota | string | null | undefined }) {
   return (
     <>
       {q === undefined && <div className="muted small">{tx('loading')}</div>}
+      {q === null && <div className="muted small">{usage('thisToolDidNotReport')}</div>}
       {typeof q === 'string' && <div className="muted small">{tx('failed')}{q}</div>}
-      {typeof q === 'object' && (
+      {q !== null && typeof q === 'object' && (
         <>
           {q.windows.map((w) => (
             <div key={w.label} className="quota-win">

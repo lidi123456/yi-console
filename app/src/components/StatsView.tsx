@@ -1,8 +1,8 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { getT, useLang } from '../i18n';
-import { errorToast, onAccountsUpdated, useStore } from '../store';
+import { onAccountsUpdated, useStore } from '../store';
 import { rpc } from '../transport';
-import { TOOL_LABEL, type ToolKind, type ToolQuotasGroup, type ToolsQuotasResponse, type Usage } from '../types';
+import { TOOL_LABEL, type ToolInfo, type ToolKind, type ToolQuotasGroup, type ToolsQuotasResponse, type Usage } from '../types';
 import { fmtTokens } from '../util';
 import { openAccountManager } from './AccountManagerModal';
 import { ToolBadge } from './Icon';
@@ -33,107 +33,137 @@ export const TOOL_VAR: Record<string, string> = {
   shell: 'var(--c-shell)',
 };
 
-export const QUOTA_TOOLS: ToolKind[] = ['claude', 'codex', 'cursor', 'kiro', 'qoder', 'codebuddy', 'antigravity'];
+const QUOTA_TOOLS: ToolKind[] = ['claude', 'codex', 'cursor', 'kiro', 'qoder', 'codebuddy', 'antigravity'];
+
+export function quotaToolsFor(tools: readonly ToolInfo[] | undefined): ToolKind[] {
+  return QUOTA_TOOLS.filter((tool) => tools?.some((t) => t.kind === tool && (t.available || (t.accountCount ?? 0) > 0)));
+}
+
+interface ToolQuotaState {
+  group?: ToolQuotasGroup;
+  error?: string;
+  loading: boolean;
+}
 
 /** Account quotas across all configured accounts per tool */
 export function QuotaCard({ hostId }: { hostId: string }) {
   useLang();
-  const hello = useStore((s) => s.hosts.find((h) => h.config.id === hostId)?.status.hello);
-  const tools = useMemo(
-    () => QUOTA_TOOLS.filter((k) => hello?.tools.some((t) => t.kind === k && t.available)),
-    [hello],
-  );
-  const [groups, setGroups] = useState<ToolQuotasGroup[] | null>(null);
-  const [loadErr, setLoadErr] = useState<string>('');
-  const [loading, setLoading] = useState(false);
+  const toolNames = useStore((s) => quotaToolsFor(s.hosts.find((h) => h.config.id === hostId)?.status.hello?.tools).join(','));
+  const tools = useMemo(() => (toolNames ? toolNames.split(',') as ToolKind[] : []), [toolNames]);
+  const [byTool, setByTool] = useState<Partial<Record<ToolKind, ToolQuotaState>>>({});
+  const pending = useRef(new Map<ToolKind, { reload: boolean }>());
 
-  const load = async (refresh: boolean, refreshInactive = false) => {
-    setLoading(true);
-    setLoadErr('');
+  const loadTool = useCallback(async function loadTool(tool: ToolKind, refresh: boolean, refreshInactive = false) {
+    const requests = pending.current;
+    if (requests.has(tool)) return;
+    const request = { reload: false };
+    requests.set(tool, request);
+    setByTool((prev) => ({ ...prev, [tool]: { group: prev[tool]?.group, loading: true } }));
+    let group: ToolQuotasGroup | undefined;
+    let error: string | undefined;
     try {
-      const r = await rpc<ToolsQuotasResponse>(hostId, 'tools.quotas', { refresh, refreshInactive });
-      setGroups(r.tools ?? []);
+      const result = await rpc<ToolsQuotasResponse>(hostId, 'tools.quotas', { tool, refresh, refreshInactive });
+      group = result.tools?.find((g) => g.tool === tool);
     } catch (e) {
-      setLoadErr(quotaErrText(e));
-      if (refresh || refreshInactive) errorToast(e);
-    } finally {
-      setLoading(false);
+      error = String((e as Error)?.message ?? e);
     }
-  };
+    if (requests.get(tool) !== request) return;
+    requests.delete(tool);
+    // An account change can invalidate the result and cache of an in-flight probe.
+    if (request.reload) {
+      void loadTool(tool, true);
+      return;
+    }
+    setByTool((prev) => ({ ...prev, [tool]: { group: error === undefined ? group : prev[tool]?.group, error, loading: false } }));
+  }, [hostId]);
 
   useEffect(() => {
-    void load(false, false);
-    const off = onAccountsUpdated((h) => {
-      if (h === hostId) void load(false, false);
-    });
-    return off;
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [hostId, tools.join()]);
+    const requests = pending.current;
+    return () => requests.clear();
+  }, [hostId]);
 
-  const visibleGroups = groups ?? [];
-  const hasInactiveHost = visibleGroups.some((g) => g.oauthIsolation === 'hostActive' && g.accounts.length > 1);
-  if (tools.length === 0 && visibleGroups.length === 0) return null;
+  useEffect(() => {
+    for (const tool of tools) void loadTool(tool, false);
+    return onAccountsUpdated((h, changedTool) => {
+      if (h !== hostId) return;
+      for (const tool of tools) {
+        if (changedTool && tool !== changedTool) continue;
+        const request = pending.current.get(tool);
+        if (request) request.reload = true;
+        else void loadTool(tool, false);
+      }
+    });
+  }, [hostId, loadTool, tools]);
+
+  if (!tools.length) return null;
+  const hasInactiveHost = tools.some((tool) => {
+    const group = byTool[tool]?.group;
+    return group?.oauthIsolation === 'hostActive' && group.accounts.length > 1;
+  });
+  const isLoading = (tool: ToolKind) => byTool[tool]?.loading ?? true;
+  const allLoading = tools.every(isLoading);
+  const refresh = (refreshInactive: boolean) => {
+    for (const tool of tools) void loadTool(tool, true, refreshInactive);
+  };
   return (
     <div className="card">
       <div className="card-title row" style={{ gap: 6 }}>
         <span>{tx('accountQuota')}</span>
         <span className="grow" />
         {hasInactiveHost && (
-          <button className="btn small" disabled={loading} onClick={() => void load(true, true)}>
+          <button className="btn small" disabled={tools.some(isLoading)} onClick={() => refresh(true)}>
             {tx('probeAll')}
           </button>
         )}
-        <button className="btn small" disabled={loading} onClick={() => void load(true, false)}>
-          {loading ? tx('loading') : tx('refresh')}
+        <button className="btn small" disabled={allLoading} onClick={() => refresh(false)}>
+          {allLoading ? tx('loading') : tx('refresh')}
         </button>
       </div>
-      {loadErr && <div className="muted small" style={{ marginBottom: 8 }}>{tx('failed')}{loadErr}</div>}
-      {!groups && loading ? (
-        <div className="muted small">{tx('loading')}</div>
-      ) : (
-        <div className="quota-list">
-          {visibleGroups.map((g) => (
-            <div key={g.tool} className="quota">
-              <div className="row" style={{ gap: 6 }}>
-                <ToolBadge tool={g.tool} size={18} />
-                <b>{TOOL_LABEL[g.tool]}</b>
-                <span className="grow" />
-                <button
-                  className="link-btn small"
-                  onClick={() => openAccountManager({ hostId, tool: g.tool })}
-                >
-                  {tx('manageAccounts')}
-                </button>
+      <div className="quota-list">
+        {tools.map((tool) => <ToolQuotaCard key={tool} hostId={hostId} tool={tool} state={byTool[tool]} />)}
+      </div>
+    </div>
+  );
+}
+
+function ToolQuotaCard({ hostId, tool, state }: { hostId: string; tool: ToolKind; state?: ToolQuotaState }) {
+  const { group, error, loading = true } = state ?? {};
+  const native = group?.nativeQuota;
+  const failure = error ?? group?.error;
+  return (
+    <div className="quota" aria-busy={loading}>
+      <div className="row" style={{ gap: 6 }}>
+        <ToolBadge tool={tool} size={18} />
+        <b>{TOOL_LABEL[tool]}</b>
+        <span className="grow" />
+        <button className="link-btn small" onClick={() => openAccountManager({ hostId, tool })}>
+          {tx('manageAccounts')}
+        </button>
+      </div>
+      {loading && <QuotaBody q={undefined} />}
+      {failure != null && <QuotaBody q={quotaErrText(failure)} />}
+      {group?.accounts.length ? (
+        <div className="quota-accounts">
+          {group.accounts.map((acc) => (
+            <div key={acc.accountId} className={`quota-acc ${acc.active ? 'active' : ''}`}>
+              <div className="row small" style={{ gap: 6, flexWrap: 'wrap' }}>
+                <strong>{acc.label}</strong>
+                <span className="acc-badge">{acc.authKind === 'apiKey' ? 'API' : 'OAuth'}</span>
+                {acc.active && <span className="acc-badge acc-badge-accent">{tx('activeAccount')}</span>}
+                {acc.quota?.account?.email && <span className="muted">{acc.quota.account.email}</span>}
               </div>
-              {g.accounts.length === 0 ? (
-                <>
-                  {g.nativeQuota && (g.nativeQuota.account?.plan || g.nativeQuota.account?.email) && (
-                    <div className="muted small">
-                      {[g.nativeQuota.account.plan, g.nativeQuota.account.email].filter(Boolean).join(' · ')}
-                    </div>
-                  )}
-                  <QuotaBody q={g.error ? quotaErrText(g.error) : g.nativeQuota ?? undefined} />
-                </>
-              ) : (
-                <div className="quota-accounts">
-                  {g.accounts.map((acc) => (
-                    <div key={acc.accountId} className={`quota-acc ${acc.active ? 'active' : ''}`}>
-                      <div className="row small" style={{ gap: 6, flexWrap: 'wrap' }}>
-                        <strong>{acc.label}</strong>
-                        <span className="acc-badge">{acc.authKind === 'apiKey' ? 'API' : 'OAuth'}</span>
-                        {acc.active && <span className="acc-badge acc-badge-accent">{tx('activeAccount')}</span>}
-                        {acc.quota?.account?.email && (
-                          <span className="muted">{acc.quota.account.email}</span>
-                        )}
-                      </div>
-                      <QuotaBody q={acc.error ? quotaErrText(acc.error) : acc.quota ?? undefined} />
-                    </div>
-                  ))}
-                </div>
-              )}
+              <QuotaBody q={acc.error ? quotaErrText(acc.error) : acc.quota ?? null} />
             </div>
           ))}
         </div>
+      ) : (
+        <>
+          {native && (native.account?.plan || native.account?.email) && (
+            <div className="muted small">{[native.account.plan, native.account.email].filter(Boolean).join(' · ')}</div>
+          )}
+          {native && <QuotaBody q={native} />}
+          {!loading && failure == null && !native && <QuotaBody q={null} />}
+        </>
       )}
     </div>
   );
