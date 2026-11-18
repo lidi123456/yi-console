@@ -620,6 +620,8 @@ export interface BrowserSettings {
   deniedActions?: string[];
   /** Accept invalid HTTPS certificates on every site (localhost always accepts them) */
   ignoreHttpsErrors?: boolean;
+  /** Sharp (2x) live view; only offered for the local host */
+  hiDpi?: boolean;
 }
 
 /** `browser.status`: where a watched AI browser is */
@@ -638,6 +640,8 @@ export interface BrowserViewStatus {
   busy?: string | null;
   /** The AI's mouse in viewport CSS pixels; `clicks` grows with every press */
   pointer?: { x: number; y: number; clicks: number } | null;
+  /** Device preset in force (the size menu or the AI's browser_set) */
+  device?: string | null;
 }
 
 export const TOOL_LABEL: Record<ToolKind, string> = new Proxy(

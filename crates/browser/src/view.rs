@@ -48,6 +48,8 @@ pub struct ViewState {
     pub busy: Option<String>,
     /// The AI's mouse on the current tab
     pub pointer: Option<Pointer>,
+    /// Device preset in force (browser_set device or the size menu)
+    pub device: Option<String>,
 }
 
 impl PartialEq for Dialog {
@@ -159,6 +161,7 @@ impl Browser {
             frame: cur.and_then(|t| t.frame.as_ref().map(|f| f.label.clone())),
             busy: st.busy.clone(),
             pointer: st.pointer.clone().filter(|p| st.current.as_deref() == Some(p.tab.as_str())),
+            device: st.emulation.device.clone(),
         }
     }
 

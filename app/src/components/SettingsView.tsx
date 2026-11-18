@@ -152,7 +152,7 @@ export function SettingsView({ hostId }: { hostId: string }) {
           })}
         </div>
       </div>
-      <BrowserCard v={s.browser ?? {}} onChange={(browser) => setS({ ...s, browser })} />
+      <BrowserCard v={s.browser ?? {}} local={hostId === 'local'} onChange={(browser) => setS({ ...s, browser })} />
       <McpSettingsCard servers={s.mcpServers ?? []} onChange={(mcpServers) => setS({ ...s, mcpServers })} />
       <SnippetsCard list={s.snippets} onChange={(snippets) => setS({ ...s, snippets })} />
       <StatusLineCard v={s.statusLine} onChange={(statusLine) => setS({ ...s, statusLine })} />
@@ -197,7 +197,7 @@ const DOMAINS_SAMPLE = ['example.com', '*.example.com', 'localhost'].join('\n');
 const DENIABLE = ['eval', 'upload', 'download', 'network', 'storage', 'fill', 'click', 'interact'] as const;
 
 /** Host settings of the AI browser (`yi_browser`) */
-function BrowserCard({ v, onChange }: { v: BrowserSettings; onChange: (v: BrowserSettings) => void }) {
+function BrowserCard({ v, local, onChange }: { v: BrowserSettings; local: boolean; onChange: (v: BrowserSettings) => void }) {
   const b = getT('browserUse');
   const denied = new Set(v.deniedActions ?? []);
   const [domains, setDomains] = useState((v.allowedDomains ?? []).join('\n'));
@@ -234,6 +234,15 @@ function BrowserCard({ v, onChange }: { v: BrowserSettings; onChange: (v: Browse
           {b('settingsIgnoreCert')}
         </label>
         <p className="muted small">{b('settingsIgnoreCertHint')}</p>
+        {local && (
+          <>
+            <label className="check">
+              <input type="checkbox" checked={!!v.hiDpi} onChange={(e) => onChange({ ...v, hiDpi: e.target.checked || undefined })} />
+              {b('settingsHiDpi')}
+            </label>
+            <p className="muted small">{b('settingsHiDpiHint')}</p>
+          </>
+        )}
         <label>
           {b('settingsDomains')}
           <textarea

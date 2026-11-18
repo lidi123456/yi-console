@@ -4,7 +4,7 @@ import { errorToast, onBrowserView, sessionInfo, useStore } from '../store';
 import { rpc } from '../transport';
 import type { BrowserViewStatus } from '../types';
 import { Icon } from './Icon';
-import { openMenu } from './Overlay';
+import { askText, openMenu } from './Overlay';
 
 const t = getT('browserUse');
 
@@ -31,6 +31,23 @@ export function useAiBrowserBusy(hostId: string, sessionId: string): boolean {
   return busyMap.get(`${hostId}/${sessionId}`) ?? false;
 }
 
+/** Page size presets of the size menu (as agent-browser's dashboard): the largest size of that ratio in the panel */
+const RATIOS: [number, number][] = [
+  [16, 9],
+  [4, 3],
+  [1, 1],
+  [9, 16],
+];
+/** Device presets known to the engine (`browser_set device`) */
+const DEVICES = ['iPhone 15', 'iPhone SE', 'Pixel 8', 'Galaxy S23', 'iPad'];
+const MIN_SIZE = 200;
+
+/** Largest w×h of ratio rw:rh inside aw×ah */
+export function ratioSize(rw: number, rh: number, aw: number, ah: number): [number, number] {
+  const s = Math.min(aw / rw, ah / rh);
+  return [Math.max(MIN_SIZE, Math.floor(rw * s)), Math.max(MIN_SIZE, Math.floor(rh * s))];
+}
+
 interface Meta {
   deviceWidth?: number;
   deviceHeight?: number;
@@ -40,7 +57,7 @@ interface Meta {
 const QUALITY: Record<string, { maxFps: number; maxWidth: number; quality: number }> = {
   low: { maxFps: 2, maxWidth: 640, quality: 40 },
   medium: { maxFps: 6, maxWidth: 960, quality: 55 },
-  high: { maxFps: 20, maxWidth: 1280, quality: 70 },
+  high: { maxFps: 20, maxWidth: 2560, quality: 80 },
 };
 
 const MOD = (e: { altKey: boolean; ctrlKey: boolean; metaKey: boolean; shiftKey: boolean }) =>
@@ -344,6 +361,38 @@ export function AiBrowserPane({ hostId, sessionId }: { hostId: string; sessionId
       ],
     );
   };
+  const sizeMenu = (e: React.MouseEvent<HTMLElement>) => {
+    const r = e.currentTarget.getBoundingClientRect();
+    const b = box.current;
+    const aw = Math.max(MIN_SIZE, Math.floor(b?.clientWidth ?? 0));
+    const ah = Math.max(MIN_SIZE, Math.floor(b?.clientHeight ?? 0));
+    const cw = meta.current.deviceWidth ?? 0;
+    const ch = meta.current.deviceHeight ?? 0;
+    const device = status?.device ?? null;
+    // Scrollbars may take a few pixels off the reported viewport
+    const near = (w: number, h: number) => !device && Math.abs(cw - w) <= 20 && Math.abs(ch - h) <= 2;
+    const size = (w: number, h: number) => void control('size', { width: w, height: h });
+    openMenu({ clientX: r.right - 220, clientY: r.bottom + 4 }, [
+      { label: t('sizeFit'), hint: `${aw}×${ah}`, icon: 'fit', active: near(aw, ah), run: () => size(aw, ah) },
+      ...RATIOS.map(([rw, rh]) => {
+        const [w, h] = ratioSize(rw, rh, aw, ah);
+        return { label: `${rw}:${rh}`, hint: `${w}×${h}`, active: near(w, h) && !near(aw, ah), run: () => size(w, h) };
+      }),
+      '-',
+      ...DEVICES.map((d) => ({ label: d, active: device === d, run: () => void control('size', { device: d }) })),
+      '-',
+      {
+        label: t('sizeCustom'),
+        hint: cw && ch ? `${cw}×${ch}` : undefined,
+        run: async () => {
+          const v = await askText({ title: t('sizeCustomTitle'), value: cw && ch ? `${cw}x${ch}` : '1280x720', placeholder: '1280x720' });
+          const m = v?.trim().match(/^(\d+)\s*[x×*, ]\s*(\d+)$/i);
+          if (m) size(Number(m[1]), Number(m[2]));
+        },
+      },
+      { label: t('sizeDefault'), run: () => void control('size') },
+    ]);
+  };
   const running = !!status?.running;
   const dialog = status?.dialog;
   return (
@@ -387,6 +436,9 @@ export function AiBrowserPane({ hostId, sessionId }: { hostId: string; sessionId
             {tabs.length}
           </button>
         )}
+        <button className="icon-btn" title={t('sizeMenu')} disabled={!running || busy} onClick={sizeMenu}>
+          <Icon name="maximize" size={14} />
+        </button>
         <button className="icon-btn" title={t('quality')} onClick={qualityMenu}>
           <Icon name="settings" size={14} />
         </button>

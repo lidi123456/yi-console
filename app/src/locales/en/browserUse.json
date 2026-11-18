@@ -88,5 +88,12 @@
   "viewStopHint": "Stop the AI's reply; browser actions pause until your next message",
   "catStorage": "Change cookies and storage",
   "settingsIgnoreCert": "Ignore certificate errors",
-  "settingsIgnoreCertHint": "HTTPS sites with invalid certificates open anyway (for example self-signed certificates of an internal test server). localhost never checks certificates. The browser restarts after a change."
+  "settingsIgnoreCertHint": "HTTPS sites with invalid certificates open anyway (for example self-signed certificates of an internal test server). localhost never checks certificates. The browser restarts after a change.",
+  "settingsHiDpi": "Sharp live view",
+  "settingsHiDpiHint": "The AI browser renders at 2x, so the live view is sharp on high-DPI screens; page layout is unchanged. It uses more CPU, and pages load their high-resolution images. The AI's screenshots keep their size. Local host only; the browser restarts after a change.",
+  "sizeMenu": "Page size",
+  "sizeFit": "Fit the panel",
+  "sizeCustom": "Custom…",
+  "sizeCustomTitle": "Page size (width × height, CSS pixels)",
+  "sizeDefault": "Default size"
 }

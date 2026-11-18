@@ -649,6 +649,8 @@ export default interface Resources {
     "settingsDesc": "AI 会话开启浏览器后，在这台主机上运行的 Chrome。这些设置对之后启动的浏览器生效；改动浏览器路径或允许域名会让正在运行的浏览器重新启动。",
     "settingsDomains": "允许的域名",
     "settingsDomainsHint": "每行一个，例如 example.com 或 *.example.com；留空表示不限制。开启后其他域名的页面、子资源、WebSocket 和 sendBeacon 都会被拦截。页面脚本仍可能绕过，建议同时禁止“执行脚本”。",
+    "settingsHiDpi": "高清画面",
+    "settingsHiDpiHint": "AI 浏览器按 2 倍分辨率渲染，高分屏上实时画面更清楚，网页排版不变；更耗 CPU，网页会按高清屏加载图片。AI 的截图大小不变。只对本机生效，改动后浏览器会重新启动。",
     "settingsIgnoreCert": "忽略证书错误",
     "settingsIgnoreCertHint": "打开后，证书无效的 HTTPS 网站也能直接打开（例如内网测试环境的自签名证书）。localhost 本来就不检查证书。改动后浏览器会重新启动。",
     "settingsPath": "浏览器路径",

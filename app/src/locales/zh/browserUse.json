@@ -88,5 +88,12 @@
   "viewStopHint": "停止 AI 的这次回复；浏览器操作会暂停，你发下一条消息后恢复",
   "catStorage": "改 Cookie 和存储",
   "settingsIgnoreCert": "忽略证书错误",
-  "settingsIgnoreCertHint": "打开后，证书无效的 HTTPS 网站也能直接打开（例如内网测试环境的自签名证书）。localhost 本来就不检查证书。改动后浏览器会重新启动。"
+  "settingsIgnoreCertHint": "打开后，证书无效的 HTTPS 网站也能直接打开（例如内网测试环境的自签名证书）。localhost 本来就不检查证书。改动后浏览器会重新启动。",
+  "settingsHiDpi": "高清画面",
+  "settingsHiDpiHint": "AI 浏览器按 2 倍分辨率渲染，高分屏上实时画面更清楚，网页排版不变；更耗 CPU，网页会按高清屏加载图片。AI 的截图大小不变。只对本机生效，改动后浏览器会重新启动。",
+  "sizeMenu": "网页尺寸",
+  "sizeFit": "适应面板",
+  "sizeCustom": "自定义…",
+  "sizeCustomTitle": "网页尺寸（宽×高，CSS 像素）",
+  "sizeDefault": "默认大小"
 }

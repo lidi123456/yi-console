@@ -1030,6 +1030,9 @@ pub struct BrowserSettings {
     /// Accept invalid HTTPS certificates on every site (localhost always accepts them)
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub ignore_https_errors: bool,
+    /// Render a headless browser at 2x so the local live view is sharp on high-DPI screens (SSH / relay views stay small)
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hi_dpi: bool,
 }
 
 impl BrowserSettings {

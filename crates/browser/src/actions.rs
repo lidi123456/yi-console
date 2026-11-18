@@ -930,6 +930,13 @@ impl Browser {
     pub async fn screenshot_as(&self, full: bool, labels: &[(String, String)], element: Option<&str>, jpeg: Option<u8>) -> Result<Vec<u8>> {
         self.no_dialog()?;
         let tab = self.current()?;
+        // Screenshots stay at CSS pixel size (the live view renders at 2x) unless the AI set a device scale
+        let shrink = if self.state().emulation.scale.is_some() {
+            1.0
+        } else {
+            let d = self.eval(&tab.session, "devicePixelRatio").await.ok().and_then(|v| v.as_f64()).unwrap_or(1.0);
+            if d > 1.0 { 1.0 / d } else { 1.0 }
+        };
         let clip = match element {
             Some(r) => {
                 let t = self.resolve(r).await?;
@@ -942,7 +949,7 @@ impl Browser {
                 let m = self.cdp().call(Some(&tab.session), "Page.getLayoutMetrics", json!({})).await?;
                 let vv = &m["cssVisualViewport"];
                 let f = |v: &Value| v.as_f64().unwrap_or(0.0);
-                Some(json!({"x": f(&b["x"]) + f(&vv["pageX"]), "y": f(&b["y"]) + f(&vv["pageY"]), "width": f(&b["w"]).max(1.0), "height": f(&b["h"]).max(1.0), "scale": 1}))
+                Some(json!({"x": f(&b["x"]) + f(&vv["pageX"]), "y": f(&b["y"]) + f(&vv["pageY"]), "width": f(&b["w"]).max(1.0), "height": f(&b["h"]).max(1.0), "scale": shrink}))
             }
             None => None,
         };
@@ -966,7 +973,12 @@ impl Browser {
             let m = self.cdp().call(Some(&tab.session), "Page.getLayoutMetrics", json!({})).await?;
             let size = &m["cssContentSize"];
             let (w, h) = (size["width"].as_f64().unwrap_or(1280.0), size["height"].as_f64().unwrap_or(720.0).min(16_000.0));
-            p = json!({"format": "png", "captureBeyondViewport": true, "clip": {"x": 0, "y": 0, "width": w, "height": h, "scale": 1}});
+            p = json!({"format": "png", "captureBeyondViewport": true, "clip": {"x": 0, "y": 0, "width": w, "height": h, "scale": shrink}});
+        } else if shrink < 1.0 {
+            let m = self.cdp().call(Some(&tab.session), "Page.getLayoutMetrics", json!({})).await?;
+            let vv = &m["cssVisualViewport"];
+            let f = |v: &Value| v.as_f64().unwrap_or(0.0);
+            p["clip"] = json!({"x": f(&vv["pageX"]), "y": f(&vv["pageY"]), "width": f(&vv["clientWidth"]).max(1.0), "height": f(&vv["clientHeight"]).max(1.0), "scale": shrink});
         }
         if let Some(q) = jpeg {
             p["format"] = json!("jpeg");

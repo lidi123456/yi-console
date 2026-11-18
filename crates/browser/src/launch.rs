@@ -7,6 +7,8 @@ use std::time::{Duration, Instant};
 use tokio::process::{Child, Command};
 
 pub const DEFAULT_VIEWPORT: (u32, u32) = (1280, 720);
+/// Device scale factor of a headless browser with `hi_dpi`
+pub const HI_DPI_SCALE: u32 = 2;
 
 /// The browser to use: an explicit path if it exists, else the first known Chrome / Edge / Chromium install
 pub fn find_browser(explicit: Option<&Path>) -> Option<PathBuf> {
@@ -111,11 +113,13 @@ pub struct LaunchOptions {
     pub env: Vec<(String, String)>,
     /// Accept invalid certificates everywhere (a host setting); localhost always accepts them
     pub ignore_https_errors: bool,
+    /// Headless only: render at `HI_DPI_SCALE`
+    pub hi_dpi: bool,
 }
 
 impl LaunchOptions {
     pub fn new(executable: PathBuf, profile_dir: PathBuf, headless: bool) -> Self {
-        Self { executable, profile_dir, headless, viewport: DEFAULT_VIEWPORT, extra_args: vec![], allowed_domains: vec![], download_dir: None, env: vec![], ignore_https_errors: false }
+        Self { executable, profile_dir, headless, viewport: DEFAULT_VIEWPORT, extra_args: vec![], allowed_domains: vec![], download_dir: None, env: vec![], ignore_https_errors: false, hi_dpi: false }
     }
 }
 
@@ -198,6 +202,11 @@ pub fn build_args(o: &LaunchOptions) -> Vec<String> {
         a.push("--headless=new".into());
         a.push("--hide-scrollbars".into());
         a.push("--enable-unsafe-swiftshader".into());
+        if o.hi_dpi {
+            // Render at 2x so the live view stays sharp on high-DPI screens; layout is unchanged (CSS pixels),
+            // and the AI's screenshots are scaled back to CSS size (agent-browser leaves this to `--args`)
+            a.push(format!("--force-device-scale-factor={HI_DPI_SCALE}"));
+        }
     }
     if o.ignore_https_errors {
         a.push("--ignore-certificate-errors".into());
@@ -337,10 +346,13 @@ mod tests {
         let a = build_args(&o);
         assert!(a.contains(&"--remote-debugging-port=0".to_string()));
         assert!(a.contains(&"--headless=new".to_string()));
+        assert!(!a.iter().any(|x| x.starts_with("--force-device-scale")));
+        let sharp = build_args(&LaunchOptions { hi_dpi: true, ..o.clone() });
+        assert!(sharp.contains(&"--force-device-scale-factor=2".to_string()));
         assert!(a.contains(&"--window-size=800,600".to_string()));
         assert_eq!(a.last().map(String::as_str), Some("about:blank"));
         let headed = build_args(&LaunchOptions { headless: false, ..o });
-        assert!(!headed.iter().any(|x| x.starts_with("--headless")));
+        assert!(!headed.iter().any(|x| x.starts_with("--headless") || x.starts_with("--force-device-scale")));
     }
 
     #[test]

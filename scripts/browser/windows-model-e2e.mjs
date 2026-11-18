@@ -295,6 +295,32 @@ try {
     await sleep(1200);
     await view.screenshot({ path: `out/${tool}-takeover.png` });
     report.models[report.models.length - 1].takeover = person.get(tool);
+
+    // Page size menu: fit the panel fills the body; a phone preset; back to the default size
+    const sizeMenu = async (label) => {
+      await view.locator('.aiweb .wb-bar button[title="网页尺寸"], .aiweb .wb-bar button[title="Page size"]').click();
+      await view.locator('.ctx-menu button').filter({ hasText: label }).first().click();
+    };
+    const fill = async () => {
+      const body = await view.locator('.aiweb-body').boundingBox();
+      const c = await view.locator('.aiweb-canvas').boundingBox();
+      return { w: c.width / body.width, h: c.height / body.height };
+    };
+    report.models[report.models.length - 1].sizeBefore = await fill();
+    await sizeMenu(/适应面板|Fit the panel/);
+    await wait(async () => {
+      const f = await fill();
+      return f.w > 0.97 && f.h > 0.97;
+    }, 15000);
+    await sleep(800);
+    await view.screenshot({ path: `out/${tool}-fit.png` });
+    report.models[report.models.length - 1].sizeFit = await fill();
+    await sizeMenu('iPhone 15');
+    await wait(async () => (await fill()).w < 0.6, 15000);
+    await sleep(800);
+    await view.screenshot({ path: `out/${tool}-phone.png` });
+    await sizeMenu(/默认大小|Default size/);
+    await wait(async () => (await fill()).w > 0.9, 15000);
     await ctx.close();
     report.models[report.models.length - 1].ok = true;
     console.log(`PASS ${tool}: order ${order.code} placed through the real page and read back by the model`);

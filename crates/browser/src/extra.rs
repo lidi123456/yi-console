@@ -119,6 +119,7 @@ impl Browser {
             e.mobile = phone;
             e.touch = phone;
             e.user_agent = if phone { Some(ua.to_string()) } else { None };
+            e.device = Some(device_name(d).to_string());
             done.push(format!("设备 {d}（{w}×{h}，缩放 {scale}；已打开的页面重新加载后才完全按这个设备显示）"));
         }
         match (a["width"].as_u64(), a["height"].as_u64()) {
@@ -127,6 +128,9 @@ impl Browser {
                     bail!("视口宽度要在 200 到 3840 之间，高度在 200 到 2160 之间");
                 }
                 e.viewport = Some((w as u32, h as u32));
+                if a["device"].as_str().is_none_or(|d| d.is_empty()) {
+                    e.device = None;
+                }
                 done.push(format!("视口 {w}×{h}"));
             }
             (None, None) => {}
@@ -258,17 +262,65 @@ impl Browser {
         if had_ua && e.user_agent.is_none() {
             e.reset_ua = true;
         }
+        self.commit_emulation(e).await?;
+        Ok(format!("已设置：{}", done.join("，")))
+    }
+
+    async fn commit_emulation(&self, e: Emulation) -> Result<()> {
         self.state().emulation = e.clone();
         let tabs: Vec<String> = self.state().tabs.iter().map(|t| t.session.clone()).collect();
         for s in tabs {
             self.apply_emulation(&s, &e).await?;
         }
-        {
-            let mut st = self.state();
-            st.emulation.reset = false;
-            st.emulation.reset_ua = false;
+        let mut st = self.state();
+        st.emulation.reset = false;
+        st.emulation.reset_ua = false;
+        st.emulation.reset_metrics = false;
+        Ok(())
+    }
+
+    /// A person's page size from the live view's size menu: a size (fit to the panel, a ratio, custom), a device
+    /// preset, or neither for the default window size. Other settings stay. Takes the tool lock, so it waits for
+    /// the AI's current step; returns the text for the AI's next result
+    pub async fn set_view_size(&self, size: Option<(u32, u32)>, device: Option<&str>) -> Result<String> {
+        let _op = self.op.lock().await;
+        let mut e = self.state().emulation.clone();
+        let had_ua = e.user_agent.is_some();
+        let what = if let Some(d) = device {
+            let (w, h, scale, ua) = self::device(d).ok_or_else(|| anyhow!("未知的设备 {d}"))?;
+            let phone = !ua.is_empty();
+            e.viewport = Some((w, h));
+            e.scale = Some(scale);
+            e.mobile = phone;
+            e.touch = phone;
+            e.user_agent = phone.then(|| ua.to_string());
+            e.device = Some(device_name(d).to_string());
+            format!("设备 {}（{w}×{h}）", device_name(d))
+        } else {
+            e.scale = None;
+            e.mobile = false;
+            e.touch = false;
+            e.user_agent = None;
+            e.device = None;
+            e.reset_metrics = true;
+            match size {
+                Some((w, h)) => {
+                    let (w, h) = (w.clamp(200, 3840), h.clamp(200, 2160));
+                    e.viewport = Some((w, h));
+                    format!("{w}×{h}")
+                }
+                None => {
+                    e.viewport = None;
+                    "默认大小".to_string()
+                }
+            }
+        };
+        if had_ua && e.user_agent.is_none() {
+            e.reset_ua = true;
         }
-        Ok(format!("已设置：{}", done.join("，")))
+        self.commit_emulation(e).await?;
+        self.inner.bump();
+        Ok(format!("用户把 AI 浏览器的网页尺寸改成了{what}，排版和元素位置可能已经变化：先 browser_snapshot 再继续"))
     }
 
     /// browser_cookies: get / set / delete / clear (httpOnly ones too, which page scripts can't see)
@@ -441,18 +493,22 @@ pub fn device(name: &str) -> Option<(u32, u32, f64, &'static str)> {
     DEVICES.iter().find(|d| d.0.to_ascii_lowercase() == n).map(|d| (d.1, d.2, d.3, d.4))
 }
 
+/// The preset's own spelling of a device name
+fn device_name(name: &str) -> &'static str {
+    let n = name.trim().to_ascii_lowercase().replace(['_', '-'], " ");
+    DEVICES.iter().find(|d| d.0.to_ascii_lowercase() == n).map(|d| d.0).unwrap_or("")
+}
+
 pub(crate) async fn apply_emulation(cdp: &crate::cdp::Cdp, session: &str, e: &Emulation) -> Result<()> {
     let s = Some(session);
     match e.viewport {
         Some((w, h)) => {
-            cdp.call(s, "Emulation.setDeviceMetricsOverride", json!({"width": w, "height": h, "deviceScaleFactor": e.scale.unwrap_or(1.0), "mobile": e.mobile})).await?;
+            cdp.call(s, "Emulation.setDeviceMetricsOverride", json!({"width": w, "height": h, "deviceScaleFactor": e.scale.unwrap_or(0.0), "mobile": e.mobile})).await?;
         }
-        None if e.reset => {
-            cdp.call(s, "Emulation.clearDeviceMetricsOverride", json!({})).await?;
-        }
+        // Cleared at the end: touch and user agent changes after a clear bring the phone metrics back
         None => {}
     }
-    if e.touch || e.reset {
+    if e.touch || e.reset || e.reset_metrics {
         let _ = cdp.call(s, "Emulation.setTouchEmulationEnabled", json!({"enabled": e.touch, "maxTouchPoints": if e.touch { 5 } else { 1 }})).await;
     }
     match &e.user_agent {
@@ -503,6 +559,9 @@ pub(crate) async fn apply_emulation(cdp: &crate::cdp::Cdp, session: &str, e: &Em
     if !e.headers.is_empty() || e.reset {
         let h: serde_json::Map<String, Value> = e.headers.iter().map(|(k, v)| (k.clone(), json!(v))).collect();
         cdp.call(s, "Network.setExtraHTTPHeaders", json!({"headers": h})).await?;
+    }
+    if e.viewport.is_none() && (e.reset || e.reset_metrics) {
+        cdp.call(s, "Emulation.clearDeviceMetricsOverride", json!({})).await?;
     }
     Ok(())
 }

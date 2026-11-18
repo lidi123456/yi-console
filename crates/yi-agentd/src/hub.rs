@@ -532,6 +532,10 @@ impl Hub {
                 self.browsers.start(sid, &settings).await?;
                 return Ok(self.browser_status(Some(sid)));
             }
+            "size" => {
+                self.browsers.view_size(sid, p, &settings).await?;
+                return Ok(self.browser_status(Some(sid)));
+            }
             "open" | "back" | "forward" | "reload" | "tab" => {
                 self.browsers.navigate(sid, action, p, &settings).await?;
                 return Ok(self.browser_status(Some(sid)));

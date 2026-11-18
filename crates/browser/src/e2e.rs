@@ -3,6 +3,7 @@
 
 use crate::{find_browser, Browser, Hooks, LaunchOptions};
 use serde_json::json;
+use base64::Engine as _;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const INDEX: &str = r##"<!doctype html><html><head><title>Fixture</title>
@@ -593,7 +594,58 @@ async fn e2e_borrowed_real_browser() {
     call("browser_tabs", json!({"action": "select", "tab": "t1"})).await.unwrap();
     call("browser_snapshot", json!({})).await.unwrap();
 
+    // The size menu: a size, a phone preset (touch, UA), then the default window size with touch and UA back
+    let note = b.set_view_size(Some((900, 1000)), None).await.unwrap();
+    assert!(note.contains("900×1000"), "{note}");
+    let v = metrics(&b).await;
+    assert_eq!((v[0].as_u64(), v[1].as_u64()), (Some(900), Some(1000)), "{v}");
+    b.set_view_size(None, Some("iPhone 15")).await.unwrap();
+    let v = metrics(&b).await;
+    assert_eq!(v[4].as_u64(), Some(393), "{v}");
+    assert!(v[3] == true, "{v}");
+    assert_eq!(b.view_state().device.as_deref(), Some("iPhone 15"));
+    b.set_view_size(None, None).await.unwrap();
+    let v = metrics(&b).await;
+    assert!(v[0].as_u64().unwrap() > 1000 && v[3] == false, "{v}");
+    assert_eq!(b.view_state().device, None);
+
+    // Default 1x like agent-browser: the frame is the viewport size
+    let (fw, vw, pw) = frame_and_shot(&b).await;
+    assert_eq!((fw, pw), (vw, vw));
+
     // Nothing left waiting in the CDP client
     assert!(b.cdp().pending_count() < 3, "{}", b.cdp().pending_count());
+
+    // hi_dpi renders at 2x for a sharp live view; the AI's screenshot stays at CSS size
+    let exe = find_browser(std::env::var_os("YI_BROWSER_EXE").map(std::path::PathBuf::from).as_deref()).unwrap();
+    let profile2 = tempfile::tempdir().unwrap();
+    let mut opts = LaunchOptions::new(exe, profile2.path().to_path_buf(), true);
+    opts.hi_dpi = true;
+    let sharp = Browser::launch(opts, Hooks { prepare: &none, attach: &attach }).await.expect("launch");
+    sharp.call("browser_open", &json!({"url": format!("{base}/")})).await.unwrap();
+    let (fw, vw, pw) = frame_and_shot(&sharp).await;
+    assert_eq!((fw, pw), (vw * 2, vw));
+    sharp.close().await;
     b.close().await;
+}
+
+/// Live-view frame width, viewport width and AI screenshot width, in pixels
+async fn frame_and_shot(b: &Browser) -> (u32, u32, u32) {
+    let png = b.screenshot(false, &[]).await.unwrap();
+    let pw = u32::from_be_bytes(png[16..20].try_into().unwrap());
+    let vw = b.eval(&b.current().unwrap().session, "innerWidth").await.unwrap().as_f64().unwrap() as u32;
+    let mut frames = b.frames();
+    b.set_screencast(Some(crate::CastConfig { max_width: 2560, max_height: 2560, quality: 80 }));
+    let frame = tokio::time::timeout(std::time::Duration::from_secs(10), frames.wait_for(|f| f.is_some())).await.expect("no frame").unwrap().clone().unwrap();
+    b.set_screencast(None);
+    let jpg = base64::engine::general_purpose::STANDARD.decode(&frame.data).unwrap();
+    let sof = jpg.windows(2).position(|w| w[0] == 0xFF && (w[1] == 0xC0 || w[1] == 0xC2)).unwrap();
+    let fw = u16::from_be_bytes([jpg[sof + 7], jpg[sof + 8]]) as u32;
+    eprintln!("frame {fw}px for viewport {vw}px, screenshot {pw}px");
+    (fw, vw, pw)
+}
+
+async fn metrics(b: &Browser) -> serde_json::Value {
+    let s = b.current().unwrap().session;
+    b.eval(&s, "[innerWidth, innerHeight, navigator.maxTouchPoints, navigator.userAgent.includes('iPhone'), screen.width]").await.unwrap()
 }

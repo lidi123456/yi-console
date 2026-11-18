@@ -74,6 +74,10 @@ pub struct Emulation {
     pub reset: bool,
     /// The user agent override was removed
     pub reset_ua: bool,
+    /// The viewport override was removed (back to the window size) and touch turned off
+    pub reset_metrics: bool,
+    /// Device preset in force, for the live view's size menu
+    pub device: Option<String>,
 }
 
 impl Emulation {

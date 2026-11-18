@@ -164,8 +164,8 @@ fn downloads_dir(sid: &str) -> PathBuf {
 }
 
 /// Settings that change how a browser is launched: a change closes running browsers so the next call uses them
-fn launch_policy(b: &BrowserSettings) -> (Option<&str>, Vec<String>, bool) {
-    (b.executable_path.as_deref(), clean_domains(&b.allowed_domains), b.ignore_https_errors)
+fn launch_policy(b: &BrowserSettings) -> (Option<&str>, Vec<String>, bool, bool) {
+    (b.executable_path.as_deref(), clean_domains(&b.allowed_domains), b.ignore_https_errors, b.hi_dpi)
 }
 
 fn clean_domains(list: &[String]) -> Vec<String> {
@@ -208,6 +208,7 @@ impl Browsers {
             "deniedActions": b.denied_actions,
             "persistentProfile": b.persistent_profile,
             "ignoreHttpsErrors": b.ignore_https_errors,
+            "hiDpi": b.hi_dpi,
             "hasDisplay": yi_browser::has_display(),
             "runningBrowsers": grants.values().filter(|g| g.slot.live().is_some()).count(),
         })
@@ -475,6 +476,21 @@ impl Browsers {
         Ok(())
     }
 
+    /// Page size from the live view's size menu: `{width, height}`, `{device}`, or neither for the default
+    pub async fn view_size(&self, sid: &str, p: &Value, settings: &DaemonSettings) -> Result<()> {
+        let slot = self.slot(sid)?;
+        let (b, _) = ensure(&slot, settings).await?;
+        let size = match (p["width"].as_u64(), p["height"].as_u64()) {
+            (Some(w), Some(h)) => Some((w as u32, h as u32)),
+            _ => None,
+        };
+        let note = b.set_view_size(size, p["device"].as_str().filter(|d| !d.is_empty())).await;
+        *slot.last_used.lock().unwrap() = Some(Instant::now());
+        *slot.note.lock().unwrap() = Some(note?);
+        slot.tick();
+        Ok(())
+    }
+
     /// Restart the session's browser headed (a real window on this host) or headless, keeping the profile and
     /// reopening the tabs. Unsent form data, page script state and sessionStorage are lost; the AI is told its refs
     /// are gone
@@ -641,6 +657,7 @@ impl Browsers {
             "frame": v.as_ref().and_then(|v| v.frame.clone()),
             "busy": v.as_ref().and_then(|v| v.busy.clone()),
             "pointer": v.as_ref().and_then(|v| v.pointer.as_ref()).map(|p| json!({"x": p.x, "y": p.y, "clicks": p.clicks})),
+            "device": v.as_ref().and_then(|v| v.device.clone()),
         })
     }
 }
@@ -657,9 +674,9 @@ impl ViewOpts {
     /// Local connections get full frames; SSH and relay connections share the link with the chat, so they default to
     /// 2 fps at 640 px (agent-browser measured about 9 KB per 640×360 frame at quality 20)
     pub fn new(local: bool, p: &Value) -> Self {
-        let (fps, width, quality) = if local { (30, 1280, 70) } else { (2, 640, 40) };
+        let (fps, width, quality) = if local { (30, 2560, 80) } else { (2, 640, 40) };
         let get = |k: &str, d: u32, lo: u32, hi: u32| p[k].as_u64().map(|v| (v as u32).clamp(lo, hi)).unwrap_or(d);
-        ViewOpts { max_fps: get("maxFps", fps, 1, 30), max_width: get("maxWidth", width, 320, 1920), quality: get("quality", quality, 20, 90) }
+        ViewOpts { max_fps: get("maxFps", fps, 1, 30), max_width: get("maxWidth", width, 320, 2560), quality: get("quality", quality, 20, 90) }
     }
 }
 
@@ -711,6 +728,7 @@ async fn launch(slot: &Arc<Slot>, settings: &DaemonSettings) -> Result<Arc<Brows
     let mut options = LaunchOptions::new(exe, slot.profile.clone(), slot.headless.load(Ordering::SeqCst));
     options.allowed_domains = clean_domains(&settings.browser.allowed_domains);
     options.ignore_https_errors = settings.browser.ignore_https_errors;
+    options.hi_dpi = settings.browser.hi_dpi;
     options.download_dir = Some(slot.downloads.clone());
     let prepare = |cmd: &mut tokio::process::Command| crate::proctree::prepare(cmd);
     let attach = |child: &tokio::process::Child| -> Box<dyn std::any::Any + Send + Sync> { Box::new(crate::proctree::Tree::attach(child)) };
@@ -997,7 +1015,7 @@ mod tests {
 
     #[test]
     fn view_limits_follow_the_connection() {
-        assert_eq!(ViewOpts::new(true, &json!({})), ViewOpts { max_fps: 30, max_width: 1280, quality: 70 });
+        assert_eq!(ViewOpts::new(true, &json!({})), ViewOpts { max_fps: 30, max_width: 2560, quality: 80 });
         assert_eq!(ViewOpts::new(false, &json!({})), ViewOpts { max_fps: 2, max_width: 640, quality: 40 });
         assert_eq!(ViewOpts::new(false, &json!({"maxFps": 500, "maxWidth": 10, "quality": 75})), ViewOpts { max_fps: 30, max_width: 320, quality: 75 });
         assert_eq!(clean_domains(&[" https://Example.com/ ".into(), "".into(), "*.a.dev".into()]), ["example.com", "*.a.dev"]);
