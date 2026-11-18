@@ -1752,21 +1752,43 @@ impl AccountManager {
                     None => self.native_codex_home(),
                 };
                 let dst_home = self.profile_home(ToolKind::Codex, to_id);
+                if to_acc.auth_kind == AccountAuthKind::ApiKey {
+                    let _ = ensure_codex_profile_files_with_label(
+                        &dst_home,
+                        to_acc.api_config.as_ref(),
+                        Some(&to_acc.label),
+                    );
+                }
                 let src_sessions = src_home.join("sessions");
                 let Some(src_file) = find_jsonl_containing_id(&src_sessions, external_id) else {
                     return Ok(false);
                 };
                 let rel = src_file.strip_prefix(&src_sessions).unwrap_or(Path::new("migrated.jsonl"));
                 let dst_file = dst_home.join("sessions").join(rel);
-                if let Some(parent) = dst_file.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
-                if !dst_file.exists() {
-                    if std::fs::hard_link(&src_file, &dst_file).is_err() {
-                        std::fs::copy(&src_file, &dst_file)?;
+                let should_copy = if src_file == dst_file {
+                    false
+                } else if !dst_file.exists() || is_hard_linked(&dst_file) {
+                    true
+                } else {
+                    match (std::fs::metadata(&src_file), std::fs::metadata(&dst_file)) {
+                        (Ok(sm), Ok(dm)) => match (sm.modified().ok(), dm.modified().ok()) {
+                            (Some(s), Some(d)) => s >= d || sm.len() > dm.len(),
+                            _ => true,
+                        },
+                        _ => true,
                     }
+                };
+                if should_copy {
+                    if let Some(parent) = dst_file.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    // Never hard-link Codex rollouts: rewriting provider metadata or appending
+                    // later turns in one account must not mutate the source account's rollout.
+                    let _ = std::fs::remove_file(&dst_file);
+                    std::fs::copy(&src_file, &dst_file)?;
                     crate::util::restrict_file(&dst_file);
                 }
+                let _ = self.sync_codex_rollout_provider(Some(&dst_home), external_id);
                 Ok(true)
             }
             // Qoder's `<config dir>/projects/<dir>/<id>.jsonl` is laid out like Claude's
@@ -1797,6 +1819,142 @@ impl AccountManager {
             }
             _ => Ok(false),
         }
+    }
+
+    /// Rewrite a Codex rollout's recorded provider (`session_meta.payload.model_provider` and
+    /// `event_msg.payload.thread_settings.model_provider_id`) to match `<codex_home>/config.toml`,
+    /// breaking any hard link and invalidating stale SQLite thread/history cache rows so `thread/resume`
+    /// succeeds across accounts using different providers (e.g. `openai` OAuth <-> custom API Key).
+    pub fn sync_codex_rollout_provider(&self, codex_home: Option<&Path>, external_id: &str) -> Result<bool> {
+        let home = codex_home
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| self.native_codex_home());
+        let target_provider = codex_active_provider_id(&home);
+        let Some(rollout_file) = find_jsonl_containing_id(&home.join("sessions"), external_id) else {
+            return Ok(false);
+        };
+        let raw = std::fs::read_to_string(&rollout_file)?;
+        let mut changed = false;
+        let mut out_lines = Vec::new();
+        for line in raw.lines() {
+            if line.trim().is_empty() {
+                out_lines.push(line.to_string());
+                continue;
+            }
+            let Ok(mut v) = serde_json::from_str::<serde_json::Value>(line) else {
+                out_lines.push(line.to_string());
+                continue;
+            };
+            let mut line_changed = false;
+            match v.get("type").and_then(|t| t.as_str()) {
+                Some("session_meta") => {
+                    if let Some(payload) = v.get_mut("payload").and_then(|p| p.as_object_mut()) {
+                        if payload.get("model_provider").and_then(|m| m.as_str()) != Some(target_provider.as_str()) {
+                            payload.insert("model_provider".to_string(), serde_json::json!(target_provider));
+                            line_changed = true;
+                        }
+                    }
+                }
+                Some("event_msg") => {
+                    if let Some(ts) = v
+                        .get_mut("payload")
+                        .and_then(|p| p.get_mut("thread_settings"))
+                        .and_then(|ts| ts.as_object_mut())
+                    {
+                        if ts
+                            .get("model_provider_id")
+                            .and_then(|m| m.as_str())
+                            .is_some_and(|m| m != target_provider.as_str())
+                        {
+                            ts.insert("model_provider_id".to_string(), serde_json::json!(target_provider));
+                            line_changed = true;
+                        }
+                    }
+                }
+                _ => {}
+            }
+            if line_changed {
+                changed = true;
+                out_lines.push(serde_json::to_string(&v)?);
+            } else {
+                out_lines.push(line.to_string());
+            }
+        }
+        if changed || is_hard_linked(&rollout_file) {
+            let mut out = out_lines.join("\n");
+            if raw.ends_with('\n') && !out.ends_with('\n') {
+                out.push('\n');
+            }
+            // Unlink before writing so a previously hard-linked file never mutates another account.
+            let _ = std::fs::remove_file(&rollout_file);
+            std::fs::write(&rollout_file, out)?;
+            crate::util::restrict_file(&rollout_file);
+        }
+
+        let mut sqlite_cleared = false;
+        if let Ok(rd) = std::fs::read_dir(&home) {
+            let mut state_dbs = Vec::new();
+            let mut history_dbs = Vec::new();
+            for entry in rd.flatten() {
+                let p = entry.path();
+                if !p.is_file() {
+                    continue;
+                }
+                let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
+                    continue;
+                };
+                if name.starts_with("state_") && name.ends_with(".sqlite") {
+                    state_dbs.push(p);
+                } else if name.starts_with("thread_history_") && name.ends_with(".sqlite") {
+                    history_dbs.push(p);
+                }
+            }
+            for db_path in state_dbs {
+                if let Ok(conn) = rusqlite::Connection::open(&db_path) {
+                    let _ = conn.busy_timeout(std::time::Duration::from_secs(2));
+                    let needs_delete = if changed {
+                        true
+                    } else {
+                        conn.query_row(
+                            "SELECT model_provider, rollout_path FROM threads WHERE id = ?1",
+                            rusqlite::params![external_id],
+                            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+                        )
+                        .ok()
+                        .is_some_and(|(prov, rpath)| {
+                            prov != target_provider || Path::new(&rpath) != rollout_file.as_path()
+                        })
+                    };
+                    if needs_delete {
+                        if let Ok(n) = conn.execute(
+                            "DELETE FROM threads WHERE id = ?1",
+                            rusqlite::params![external_id],
+                        ) {
+                            if n > 0 {
+                                sqlite_cleared = true;
+                            }
+                        }
+                    }
+                }
+            }
+            if changed || sqlite_cleared {
+                for db_path in history_dbs {
+                    if let Ok(conn) = rusqlite::Connection::open(&db_path) {
+                        let _ = conn.busy_timeout(std::time::Duration::from_secs(2));
+                        for tbl in [
+                            "thread_turns",
+                            "thread_items",
+                            "thread_history_projection_state",
+                            "thread_realtime_items",
+                        ] {
+                            let sql = format!("DELETE FROM {tbl} WHERE thread_id = ?1");
+                            let _ = conn.execute(&sql, rusqlite::params![external_id]);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(changed || sqlite_cleared)
     }
 
     pub fn export_bundle(&self, tool: ToolKind, account_id: &str) -> Result<serde_json::Value> {
@@ -3026,6 +3184,19 @@ fn is_safe_rel(rel: &str) -> bool {
             .all(|c| matches!(c, std::path::Component::Normal(_)))
 }
 
+fn is_hard_linked(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        return std::fs::metadata(path).is_ok_and(|m| m.nlink() > 1);
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        false
+    }
+}
+
 fn find_jsonl_containing_id(dir: &Path, id: &str) -> Option<PathBuf> {
     let rd = std::fs::read_dir(dir).ok()?;
     for entry in rd.flatten() {
@@ -3257,6 +3428,14 @@ fn toml_value(v: &str) -> String {
         return rest.split('\'').next().unwrap_or("").to_string();
     }
     v.split('#').next().unwrap_or("").trim().to_string()
+}
+
+pub fn codex_active_provider_id(codex_home: &Path) -> String {
+    std::fs::read_to_string(codex_home.join("config.toml"))
+        .ok()
+        .and_then(|raw| codex_provider(&raw))
+        .map(|p| p.id)
+        .unwrap_or_else(|| "openai".to_string())
 }
 
 pub fn codex_provider(cfg: &str) -> Option<CodexProvider> {
@@ -4424,5 +4603,123 @@ mod tests {
         .unwrap();
         let cleared_cfg = std::fs::read_to_string(mgr.profile_home(ToolKind::Codex, &regional.id).join("config.toml")).unwrap();
         assert!(!cleared_cfg.contains("openai_base_url"));
+    }
+
+    #[test]
+    fn codex_switch_to_custom_provider_rewrites_rollout_and_clears_sqlite() {
+        let (_t, base, home) = temp_dirs();
+        let mgr = AccountManager::with_dirs(base, home);
+
+        let src_dir = mgr.base_dir.join("seed-oauth");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(r#"{"email":"oauth@example.com","https://api.openai.com/auth":{"chatgpt_plan_type":"plus","chatgpt_account_id":"acct_1"}}"#);
+        let jwt = format!("eyJhbGciOiJub25lIn0.{payload}.sig");
+        std::fs::write(
+            src_dir.join("auth.json"),
+            serde_json::json!({ "tokens": { "id_token": jwt, "account_id": "acct_1" } }).to_string(),
+        )
+        .unwrap();
+        let oauth_acc = mgr
+            .save_oauth_from_dir(ToolKind::Codex, None, Some("oauth@example.com"), Some(&src_dir), None, true)
+            .unwrap();
+
+        let api_acc = mgr
+            .save(SaveAccountRequest {
+                tool: ToolKind::Codex,
+                label: Some("turing".into()),
+                auth_kind: Some(AccountAuthKind::ApiKey),
+                api_config: Some(ApiKeyConfig {
+                    api_key: "sk-turing-123".into(),
+                    base_url: "https://coding.efficient.center/api/v1".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .unwrap();
+
+        let tid = "01a1ec12-7ea4-7053-81df-d752e04882eb";
+        let rel = "sessions/2026/11/18/rollout-2026-11-18T08-33-17-01a1ec12-7ea4-7053-81df-d752e04882eb.jsonl";
+        let src_rollout = mgr.profile_home(ToolKind::Codex, &oauth_acc.id).join(rel);
+        std::fs::create_dir_all(src_rollout.parent().unwrap()).unwrap();
+        let rollout_body = concat!(
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"01a1ec12-7ea4-7053-81df-d752e04882eb\",\"model_provider\":\"openai\"}}\n",
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"thread_settings_applied\",\"thread_id\":\"01a1ec12-7ea4-7053-81df-d752e04882eb\",\"thread_settings\":{\"model\":\"gpt-6.2-sol\",\"model_provider_id\":\"openai\"}}}\n"
+        );
+        std::fs::write(&src_rollout, rollout_body).unwrap();
+
+        // Simulate stale state_5.sqlite + thread_history_1.sqlite cached under the target API Key home,
+        // plus an old hard-linked rollout.
+        let dst_home = mgr.profile_home(ToolKind::Codex, &api_acc.id);
+        let dst_rollout = dst_home.join(rel);
+        std::fs::create_dir_all(dst_rollout.parent().unwrap()).unwrap();
+        let _ = std::fs::hard_link(&src_rollout, &dst_rollout);
+
+        let state_db = dst_home.join("state_5.sqlite");
+        let conn = rusqlite::Connection::open(&state_db).unwrap();
+        conn.execute(
+            "CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL, model_provider TEXT NOT NULL)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO threads (id, rollout_path, model_provider) VALUES (?1, ?2, 'openai')",
+            rusqlite::params![tid, src_rollout.display().to_string()],
+        )
+        .unwrap();
+
+        let hist_db = dst_home.join("thread_history_1.sqlite");
+        let hconn = rusqlite::Connection::open(&hist_db).unwrap();
+        for sql in [
+            "CREATE TABLE thread_turns (thread_id TEXT NOT NULL, turn_id TEXT NOT NULL)",
+            "CREATE TABLE thread_items (thread_id TEXT NOT NULL, turn_id TEXT NOT NULL, item_id TEXT NOT NULL)",
+            "CREATE TABLE thread_history_projection_state (thread_id TEXT PRIMARY KEY)",
+            "CREATE TABLE thread_realtime_items (thread_id TEXT NOT NULL, item_id TEXT NOT NULL)",
+        ] {
+            hconn.execute(sql, []).unwrap();
+        }
+        hconn
+            .execute("INSERT INTO thread_turns (thread_id, turn_id) VALUES (?1, 't1')", rusqlite::params![tid])
+            .unwrap();
+        hconn
+            .execute("INSERT INTO thread_history_projection_state (thread_id) VALUES (?1)", rusqlite::params![tid])
+            .unwrap();
+        drop(conn);
+        drop(hconn);
+
+        assert!(mgr
+            .copy_session_history_for_switch(ToolKind::Codex, Some(&oauth_acc.id), &api_acc.id, tid)
+            .unwrap());
+
+        // Target rollout has `turing` in both fields, while source rollout remains `openai`.
+        let dst_text = std::fs::read_to_string(&dst_rollout).unwrap();
+        assert!(dst_text.contains("\"model_provider\":\"turing\""), "{dst_text}");
+        assert!(dst_text.contains("\"model_provider_id\":\"turing\""), "{dst_text}");
+        let src_text = std::fs::read_to_string(&src_rollout).unwrap();
+        assert!(src_text.contains("\"model_provider\":\"openai\""), "{src_text}");
+        assert!(src_text.contains("\"model_provider_id\":\"openai\""), "{src_text}");
+
+        // Stale sqlite rows for `tid` were cleared.
+        let conn = rusqlite::Connection::open(&state_db).unwrap();
+        let cnt: i64 = conn
+            .query_row("SELECT COUNT(*) FROM threads WHERE id = ?1", rusqlite::params![tid], |r| r.get(0))
+            .unwrap();
+        assert_eq!(cnt, 0);
+        let hconn = rusqlite::Connection::open(&hist_db).unwrap();
+        let hcnt: i64 = hconn
+            .query_row("SELECT COUNT(*) FROM thread_turns WHERE thread_id = ?1", rusqlite::params![tid], |r| r.get(0))
+            .unwrap();
+        assert_eq!(hcnt, 0);
+
+        // Switching back from `turing` to `oauth` updates target rollout back to `openai`.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&dst_rollout, format!("{dst_text}{{\"type\":\"event_msg\",\"payload\":{{\"type\":\"extra\"}}}}\n")).unwrap();
+        assert!(mgr
+            .copy_session_history_for_switch(ToolKind::Codex, Some(&api_acc.id), &oauth_acc.id, tid)
+            .unwrap());
+        let oauth_text = std::fs::read_to_string(&src_rollout).unwrap();
+        assert!(oauth_text.contains("\"model_provider\":\"openai\""), "{oauth_text}");
+        assert!(oauth_text.contains("\"model_provider_id\":\"openai\""), "{oauth_text}");
+        assert!(oauth_text.contains("\"type\":\"extra\""), "{oauth_text}");
     }
 }

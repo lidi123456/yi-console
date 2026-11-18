@@ -971,6 +971,14 @@ impl Hub {
                 }
             }
         }
+        if info.tool == ToolKind::Codex {
+            if let Some(ext_id) = resume.as_deref() {
+                let _ = self.accounts.sync_codex_rollout_provider(
+                    resolved.as_ref().and_then(|r| r.data_dir.as_deref()),
+                    ext_id,
+                );
+            }
+        }
         let mut extra_args = crate::tools::extra_args(info.tool, &settings);
         if info.mode == SessionMode::Terminal && info.tool == ToolKind::Codex && crate::tools::codex_no_daemon(&program) {
             extra_args.push("--no-daemon".into());
@@ -3650,7 +3658,7 @@ impl Hub {
             }
             tool
         };
-        if tool == ToolKind::Claude {
+        if matches!(tool, ToolKind::Claude | ToolKind::Codex) {
             let mut pending = rt.pending_handoff.lock().unwrap();
             if pending.is_none() {
                 *pending = self.handoff_digest(sid);

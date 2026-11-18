@@ -170,7 +170,14 @@ pub async fn run(spec: StartSpec, em: Emitter, mut rx: mpsc::UnboundedReceiver<A
                         st.steers.insert(st.next_id, prompt);
                         let _ = p.send(&m).await;
                     } else {
+                        let needs_thread = st.thread_id.is_none()
+                            && !st.pending.values().any(|k| matches!(k, Pending::Init | Pending::Thread))
+                            && st.thread_params.is_object();
                         st.queue.push(prompt);
+                        if needs_thread {
+                            let m = st.req(Pending::Thread, "thread/start", st.thread_params.clone());
+                            let _ = p.send(&m).await;
+                        }
                     }
                 }
                 Some(AdapterCmd::SetModel(model)) => {
@@ -412,6 +419,12 @@ fn is_missing_thread(msg: &str) -> bool {
     m.contains("no rollout found") || (m.contains("thread") && m.contains("not found"))
 }
 
+/// thread/resume rejected because the rollout uses another model_provider (e.g. `openai` vs custom API Key provider)
+fn is_provider_mismatch(err: &Value, msg: &str) -> bool {
+    err["data"]["type"].as_str() == Some("modelProviderMismatch")
+        || (msg.contains("This chat uses ") && msg.contains("current provider is"))
+}
+
 fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Vec<Value> {
     let mut out = vec![];
     // 1) Responses to our requests
@@ -430,12 +443,12 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Vec<Valu
             }
             let msg = err["message"].as_str().unwrap_or("codex 返回错误").to_string();
             // If a thread was opened but no message was ever sent, Codex doesn't write a rollout file, so it can't be resumed once the process is gone (just created or just /clear-ed).
-            // The old thread had no content anyway, so just start a new one
-            if kind == Pending::Thread && st.resumed && is_missing_thread(&msg) {
+            // The old thread had no content anyway, so just start a new one; same if provider mismatch prevented native resume.
+            if kind == Pending::Thread && st.resumed && (is_missing_thread(&msg) || is_provider_mismatch(err, &msg)) {
                 st.resumed = false;
                 st.replaying = false;
                 em.resume_fallback();
-                let mut params = std::mem::take(&mut st.thread_params);
+                let mut params = st.thread_params.clone();
                 if let Some(handoff) = spec.account_handoff.as_deref().filter(|s| !s.is_empty()) {
                     let existing = params["developerInstructions"].as_str().unwrap_or("");
                     let combined = if existing.is_empty() {
@@ -449,6 +462,19 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Vec<Valu
                 return out;
             }
             em.event(EventBody::Error { message: msg.clone() });
+            if kind == Pending::Thread {
+                let had_turn = !st.queue.is_empty() || st.turn_id.take().is_some();
+                st.queue.clear();
+                if had_turn {
+                    em.event(EventBody::TurnEnd {
+                        stop_reason: Some("error".into()),
+                        model: None,
+                    });
+                } else {
+                    em.status(SessionStatus::Idle, None);
+                }
+                return out;
+            }
             if kind == Pending::Turn {
                 if is_usage_limit(&err["data"]) || super::is_usage_limit_text(&msg) {
                     em.event(super::limit_hit(limit_reset(&st.rate_limits), None));
@@ -480,8 +506,8 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Vec<Valu
                 if spec.permission_mode == "auto" {
                     params["approvalsReviewer"] = json!("auto_review");
                 }
+                st.thread_params = params.clone();
                 let msg = if let Some(tid) = &spec.resume {
-                    st.thread_params = params.clone();
                     st.resumed = true;
                     params["threadId"] = json!(tid);
                     st.replaying = spec.replay;
@@ -1416,5 +1442,50 @@ mod tests {
         assert_eq!(review_target("commit abc123"), json!({"type":"commit","sha":"abc123"}));
         assert_eq!(review_target("重点看并发安全"), json!({"type":"custom","instructions":"重点看并发安全"}));
         assert_eq!(review_target("branch"), json!({"type":"custom","instructions":"branch"}));
+    }
+
+    #[test]
+    fn provider_mismatch_falls_back_to_fresh_thread_with_handoff() {
+        let (hub, em, _rx) = crate::hub::test_emitter();
+        let mut sp = spec();
+        sp.resume = Some("old-thread-1".into());
+        sp.account_handoff = Some("<yi-account-handoff>summary</yi-account-handoff>".into());
+        let mut st = State::default();
+
+        let init_resp = json!({"id": 1, "result": {}});
+        let init_out = handle(&mut st, &sp, &init_resp, &em);
+        assert_eq!(init_out.len(), 3);
+        let resume_id = init_out[2]["id"].as_u64().unwrap();
+        assert_eq!(init_out[2]["method"], "thread/resume");
+
+        let mismatch = json!({
+            "id": resume_id,
+            "error": {
+                "code": -32600,
+                "data": {"type": "modelProviderMismatch", "modelProvider": "openai", "currentModelProvider": "turing"},
+                "message": "This chat uses openai, but your current provider is turing. Switch to openai to continue."
+            }
+        });
+        let fb_out = handle(&mut st, &sp, &mismatch, &em);
+        assert_eq!(fb_out.len(), 1);
+        assert_eq!(fb_out[0]["method"], "thread/start");
+        let dev = fb_out[0]["params"]["developerInstructions"].as_str().unwrap();
+        assert!(dev.contains("<yi-account-handoff>summary</yi-account-handoff>"), "{dev}");
+        assert!(!st.resumed);
+
+        // Unrecoverable thread/start failure clears queued turn and resets status to Idle instead of wedging.
+        st.queue.push(Prompt { text: "hello".into(), images: vec![] });
+        let start_id = fb_out[0]["id"].as_u64().unwrap();
+        let fatal = json!({
+            "id": start_id,
+            "error": {"code": -32600, "message": "bad config"}
+        });
+        let fatal_out = handle(&mut st, &sp, &fatal, &em);
+        assert!(fatal_out.is_empty());
+        assert!(st.queue.is_empty());
+        assert_eq!(hub.info("s").unwrap().status, SessionStatus::Idle);
+        let evs = hub.store.events_since("s", 0, 100).unwrap();
+        assert!(evs.iter().any(|e| matches!(&e.body, EventBody::Error { message } if message == "bad config")));
+        assert!(evs.iter().any(|e| matches!(&e.body, EventBody::TurnEnd { stop_reason: Some(r), .. } if r == "error")));
     }
 }
