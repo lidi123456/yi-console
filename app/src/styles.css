@@ -11973,6 +11973,26 @@ button.wp-commit-title .chev {
 
 /* ---- Quota dialog ---- */
 
+/* Fit the window (.modal-bg padding is 8vh top, 16px bottom) and scroll the
+   list inside, so the title and host tabs stay put. */
+.modal.ov-quota {
+  display: flex;
+  flex-direction: column;
+  max-height: calc(100dvh - 8vh - 16px);
+}
+
+.ov-quota > .ov-seg {
+  align-self: flex-start;
+  flex-shrink: 0;
+}
+
+.ov-quota-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
 .ov-quota .card {
   margin: 0;
 }

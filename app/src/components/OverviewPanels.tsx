@@ -849,7 +849,9 @@ export function QuotaDialog({ hosts, onClose }: { hosts: HostEntry[]; onClose: (
             ))}
           </div>
         )}
-        {host && hasTools ? <QuotaCard key={host.config.id} hostId={host.config.id} /> : <div className="muted small">{t('noQuotaTools')}</div>}
+        <div className="ov-quota-body">
+          {host && hasTools ? <QuotaCard key={host.config.id} hostId={host.config.id} /> : <div className="muted small">{t('noQuotaTools')}</div>}
+        </div>
       </div>
     </div>
   );
