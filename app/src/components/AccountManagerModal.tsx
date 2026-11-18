@@ -688,7 +688,11 @@ export function AccountManagerModal({
                         <span className="acc-chip" title={mismatch ? tx('savedAsOauth') : undefined}>
                           {authChip(tool, acc)}
                         </span>
-                        {acc.identity.plan && !mismatch && acc.identity.plan !== acc.actual?.provider && <span className="acc-chip blue">{acc.identity.plan}</span>}
+                        {acc.identity.plan &&
+                          !mismatch &&
+                          acc.identity.plan !== acc.actual?.provider &&
+                          acc.identity.plan !== acc.identity.workspace &&
+                          !/^https?:\/\//i.test(acc.identity.plan) && <span className="acc-chip blue">{acc.identity.plan}</span>}
                         <span className={`acc-chip ${st.cls}`}>{st.text}</span>
                       </div>
                       {sub.length > 0 && <div className="acc-sub">{sub.join(' · ')}</div>}

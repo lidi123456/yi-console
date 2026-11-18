@@ -271,11 +271,31 @@ function Steps({ items, cur }: { items: string[]; cur: number }) {
 
 const hostOf = (url: string) => {
   try {
-    return new URL(url).host;
+    return new URL(url.includes('://') ? url : `https://${url}`).host;
   } catch {
     return url;
   }
 };
+
+function isOfficialOpenaiUrl(url: string) {
+  const u = url.trim();
+  if (!u) return true;
+  try {
+    const h = new URL(u.includes('://') ? u : `https://${u}`).hostname.toLowerCase();
+    return h === 'api.openai.com' || h.endsWith('.api.openai.com');
+  } catch {
+    return false;
+  }
+}
+
+function slugProviderId(raw: string) {
+  const s = raw
+    .trim()
+    .replace(/[^A-Za-z0-9_-]+/g, '-')
+    .replace(/^[-_]+|[-_]+$/g, '');
+  if (!s) return '';
+  return /^(openai|amazon-bedrock|amazon-bedrock-runtime|gcp|ollama|lmstudio|ollama-chat)$/i.test(s) ? `${s}-custom` : s;
+}
 
 function useNow(active: boolean) {
   const [now, setNow] = useState(Date.now());
@@ -677,8 +697,10 @@ export function AccountDrawer({
   const [authToken, setAuthToken] = useState(api?.authToken ?? '');
   const [baseUrl, setBaseUrl] = useState(api?.baseUrl ?? '');
   const [model, setModel] = useState(api?.defaultModel ?? '');
-  const [provider, setProvider] = useState(api?.providerName ?? '');
-  const [codexProvider, setCodexProvider] = useState(!!(api?.providerName || acc?.actual));
+  const [provider, setProvider] = useState(api?.providerName || acc?.actual?.provider || '');
+  const [codexProvider, setCodexProvider] = useState(
+    () => !!(api?.providerName || acc?.actual || (tool === 'codex' && api?.baseUrl && !isOfficialOpenaiUrl(api.baseUrl))),
+  );
   const [env, setEnv] = useState<EnvRow[]>(() => Object.entries(api?.extraEnv ?? {}).map(([k, v]) => ({ k, v })));
   const [allow, setAllow] = useState(acc ? acc.allowAutoFailover : false);
   const [reveal, setReveal] = useState(false);
@@ -686,8 +708,17 @@ export function AccountDrawer({
   const [unredacted, setUnredacted] = useState<ApiKeyConfig | null>(null);
   const [busy, setBusy] = useState(false);
   const [test, setTest] = useState<{ running?: boolean; ok?: boolean; n?: number; err?: string } | null>(null);
-  const [adv, setAdv] = useState(() => !!(api?.authToken || Object.keys(api?.extraEnv ?? {}).length));
-  const keyEnv = tool === 'codex' && codexProvider ? acc?.actual?.envKey || undefined : spec.key.env;
+  const [adv, setAdv] = useState(
+    () =>
+      !!(
+        api?.authToken ||
+        Object.keys(api?.extraEnv ?? {}).length ||
+        (spec.baseUrl?.adv && api?.baseUrl) ||
+        (spec.model?.adv && api?.defaultModel)
+      ),
+  );
+  const keyEnv = tool === 'codex' && codexProvider ? acc?.actual?.envKey || 'OPENAI_API_KEY' : spec.key.env;
+  const suggestedProvider = slugProviderId(label) || slugProviderId(hostOf(baseUrl)) || 'custom';
   const mounted = useRef(true);
   useEffect(() => {
     mounted.current = true;
@@ -706,7 +737,7 @@ export function AccountDrawer({
       authToken: keepIfUnchanged(authToken, unredacted?.authToken),
       baseUrl: baseUrl.trim(),
       defaultModel: model.trim(),
-      providerName: tool === 'codex' && codexProvider ? provider.trim() : '',
+      providerName: tool === 'codex' && codexProvider ? provider.trim() || suggestedProvider : '',
       extraEnv: Object.fromEntries(
         env
           .filter((r) => r.k.trim())
@@ -815,13 +846,26 @@ export function AccountDrawer({
   const kindName = tool === 'cursor' ? 'CURSOR_API_KEY' : spec.key.label ?? 'API Key';
   const title = acc ? tx('drawerEdit', { label: acc.label }) : tx('drawerNew', { kind: kindName });
   const envTag = (e?: string) => (e ? <span className="acc-env">{e}</span> : null);
+  const baseUrlEnv =
+    tool === 'codex' ? (codexProvider ? 'config.toml base_url' : 'config.toml openai_base_url') : spec.baseUrl?.env;
+  const onBaseUrlChange = (v: string) => {
+    setBaseUrl(v);
+    if (tool === 'codex' && v.trim() && !isOfficialOpenaiUrl(v)) {
+      setCodexProvider(true);
+    }
+  };
   const urlField = spec.baseUrl && (
     <label className="acc-field">
       <span>
-        {tool === 'cursor' ? tx('fieldEndpoint') : tx('fieldBaseUrl')} {tool !== 'cursor' && <em>{tx('fieldBaseUrlHint')}</em>}
-        {envTag(spec.baseUrl.env)}
+        {tool === 'cursor' ? tx('fieldEndpoint') : tx('fieldBaseUrl')}{' '}
+        {tool !== 'cursor' && !(tool === 'codex' && codexProvider) && <em>{tx('fieldBaseUrlHint')}</em>}
+        {envTag(baseUrlEnv)}
       </span>
-      <input value={baseUrl} placeholder={spec.baseUrl.placeholder} onChange={(e) => setBaseUrl(e.target.value)} />
+      <input
+        value={baseUrl}
+        placeholder={tool === 'codex' && codexProvider ? 'https://…/v1' : spec.baseUrl.placeholder}
+        onChange={(e) => onBaseUrlChange(e.target.value)}
+      />
     </label>
   );
   const modelField = spec.model && (
@@ -860,7 +904,14 @@ export function AccountDrawer({
               <div className="acc-field">
                 <span>{tx('fieldInterface')}</span>
                 <div className="acc-seg">
-                  <button type="button" className={!codexProvider ? 'on' : ''} onClick={() => setCodexProvider(false)}>
+                  <button
+                    type="button"
+                    className={!codexProvider ? 'on' : ''}
+                    onClick={() => {
+                      setCodexProvider(false);
+                      if (!isOfficialOpenaiUrl(baseUrl)) setBaseUrl('');
+                    }}
+                  >
                     {tx('codexKindOfficial')}
                   </button>
                   <button type="button" className={codexProvider ? 'on' : ''} onClick={() => setCodexProvider(true)}>
@@ -872,10 +923,10 @@ export function AccountDrawer({
             {spec.provider && codexProvider && (
               <label className="acc-field">
                 <span>
-                  {tx('fieldProvider')}
+                  {tx('fieldProvider')} <em>{tx('fieldProviderHint')}</em>
                   {envTag('config.toml model_provider')}
                 </span>
-                <input value={provider} placeholder="myapi" onChange={(e) => setProvider(e.target.value)} />
+                <input value={provider} placeholder={suggestedProvider} onChange={(e) => setProvider(e.target.value)} />
               </label>
             )}
             {spec.provider && urlField}
@@ -958,7 +1009,15 @@ export function AccountDrawer({
         <button className="btn" onClick={onClose}>
           {tx('cancel')}
         </button>
-        <button className="btn primary" disabled={busy || (isApi && !acc && !apiKey.trim())} onClick={() => void save()}>
+        <button
+          className="btn primary"
+          disabled={
+            busy ||
+            (isApi && !acc && !apiKey.trim()) ||
+            (isApi && tool === 'codex' && codexProvider && !baseUrl.trim() && !acc?.actual?.baseUrl)
+          }
+          onClick={() => void save()}
+        >
           {tx('save')}
         </button>
       </div>

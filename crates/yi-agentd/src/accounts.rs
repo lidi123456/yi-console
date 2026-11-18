@@ -736,8 +736,12 @@ impl AccountManager {
             updated_at: acc.updated_at,
             actual: (acc.tool == ToolKind::Codex)
                 .then(|| {
+                    let home = self.profile_home(ToolKind::Codex, &acc.id);
+                    if acc.auth_kind == AccountAuthKind::ApiKey {
+                        let _ = ensure_codex_profile_files_with_label(&home, acc.api_config.as_ref(), Some(&acc.label));
+                    }
                     let key = acc.api_config.as_ref().map(|c| c.api_key.as_str()).filter(|k| !k.is_empty());
-                    self.codex_actual(&self.profile_home(ToolKind::Codex, &acc.id), key)
+                    self.codex_actual(&home, key)
                 })
                 .flatten(),
         }
@@ -886,9 +890,9 @@ impl AccountManager {
                 let home = self.profile_home(ToolKind::Codex, &acc.id);
                 env.insert("CODEX_HOME".into(), home.display().to_string());
                 if let Some(cfg) = &acc.api_config {
-                    let _ = ensure_codex_profile_files(&home, Some(cfg));
+                    let _ = ensure_codex_profile_files_with_label(&home, Some(cfg), Some(&acc.label));
                     // The profile's config.toml selects a custom provider: its key goes in the variable it reads,
-                    // and the base URL is the provider's own (OPENAI_BASE_URL only applies to the built-in provider)
+                    // and the base URL is the provider's own (built-in OpenAI uses `openai_base_url` in config.toml)
                     let provider_key = self.codex_actual(&home, None).and_then(|a| a.env_key);
                     if !cfg.api_key.is_empty() {
                         env.insert("OPENAI_API_KEY".into(), cfg.api_key.clone());
@@ -1098,6 +1102,16 @@ impl AccountManager {
         }
         if let Some(m) = &auth_method {
             hasher.update(m.as_bytes());
+        }
+        if acc.tool == ToolKind::Codex {
+            if let Some(cfg) = &acc.api_config {
+                hasher.update(b"\ncodex-cfg:");
+                hasher.update(cfg.provider_name.as_bytes());
+                hasher.update(b"|");
+                hasher.update(cfg.base_url.as_bytes());
+                hasher.update(b"|");
+                hasher.update(cfg.default_model.as_bytes());
+            }
         }
         let fingerprint = format!("{:x}", hasher.finalize())[..16].to_string();
 
@@ -1497,7 +1511,7 @@ impl AccountManager {
             existing.updated_at = now;
             if req.tool == ToolKind::Codex && existing.auth_kind == AccountAuthKind::ApiKey {
                 let dir = self.base_dir.join("accounts").join(req.tool.as_str()).join(&existing_id).join("home");
-                let _ = ensure_codex_profile_files(&dir, existing.api_config.as_ref());
+                let _ = ensure_codex_profile_files_with_label(&dir, existing.api_config.as_ref(), Some(&existing.label));
             }
             existing_id
         } else {
@@ -1535,7 +1549,7 @@ impl AccountManager {
                     .join(req.tool.as_str())
                     .join(&new_id)
                     .join("home");
-                ensure_codex_profile_files(&dir, Some(&merged))?;
+                ensure_codex_profile_files_with_label(&dir, Some(&merged), Some(&lbl))?;
             }
             td.accounts.push(StoredAccount {
                 id: new_id.clone(),
@@ -1791,13 +1805,14 @@ impl AccountManager {
             .ok_or_else(|| anyhow!("账号 {account_id} 不存在"))?;
         let mut snap = self.load_snapshot(tool, account_id).unwrap_or_default();
         if Self::effective_isolation(tool, acc.auth_kind) == AccountIsolation::Isolated
-            && acc.auth_kind == AccountAuthKind::Oauth
+            && (acc.auth_kind == AccountAuthKind::Oauth || tool == ToolKind::Codex)
         {
             let home = self.profile_home(tool, account_id);
-            let files: &[&str] = match tool {
-                ToolKind::Codex => &["auth.json", "config.toml"],
-                ToolKind::Claude => &[".credentials.json", ".claude.json"],
-                ToolKind::Qoder => &QODER_LOGIN_FILES,
+            let files: &[&str] = match (tool, acc.auth_kind) {
+                (ToolKind::Codex, AccountAuthKind::Oauth) => &["auth.json", "config.toml"],
+                (ToolKind::Codex, AccountAuthKind::ApiKey) => &["config.toml"],
+                (ToolKind::Claude, _) => &[".credentials.json", ".claude.json"],
+                (ToolKind::Qoder, _) => &QODER_LOGIN_FILES,
                 _ => &[],
             };
             for rel in files {
@@ -1868,9 +1883,6 @@ impl AccountManager {
             std::fs::write(&dst, raw)?;
             crate::util::restrict_file(&dst);
         }
-        if tool == ToolKind::Codex {
-            ensure_codex_profile_files(&home, api_config.as_ref())?;
-        }
         if !snap.files.is_empty() || !snap.keyring.is_empty() || !snap.db_rows.is_empty() {
             let mut host_only = snap;
             host_only.profile_files.clear();
@@ -1880,6 +1892,9 @@ impl AccountManager {
         let mut g = self.data.lock().unwrap();
         let raw_label = meta["label"].as_str();
         let label = pick_label(raw_label, &identity, tool, auth_kind, &*g, tool);
+        if tool == ToolKind::Codex {
+            ensure_codex_profile_files_with_label(&home, api_config.as_ref(), Some(&label))?;
+        }
         let stored = StoredAccount {
             id: new_id.clone(),
             tool,
@@ -3340,27 +3355,252 @@ fn find_codex_provider_account(mgr: &AccountManager, accounts: &[StoredAccount],
         .map(|a| a.id.clone())
 }
 
+fn url_host(url: &str) -> Option<&str> {
+    let u = url.trim();
+    let rest = u.split_once("://").map(|(_, r)| r).unwrap_or(u);
+    let authority = rest.split(['/', '?', '#']).next()?;
+    let host_port = authority.rsplit('@').next()?;
+    let host = if let Some(h) = host_port.strip_prefix('[') {
+        h.split(']').next()?
+    } else {
+        host_port.split(':').next()?
+    };
+    (!host.is_empty()).then_some(host)
+}
+
+/// True when `url` points at OpenAI's own API (`api.openai.com` or regional `*.api.openai.com`),
+/// which uses the built-in `openai` provider (with WebSocket transport and `openai_base_url`).
+/// Third-party gateways must use a custom `[model_providers.<id>]` entry instead.
+pub fn is_official_openai_base_url(url: &str) -> bool {
+    let Some(host) = url_host(url) else {
+        return false;
+    };
+    host.eq_ignore_ascii_case("api.openai.com")
+        || (host.len() > ".api.openai.com".len()
+            && host[host.len() - ".api.openai.com".len()..].eq_ignore_ascii_case(".api.openai.com"))
+}
+
+fn is_reserved_codex_provider(id: &str) -> bool {
+    matches!(
+        id.to_ascii_lowercase().as_str(),
+        "openai"
+            | "amazon-bedrock"
+            | "amazon-bedrock-runtime"
+            | "gcp"
+            | "ollama"
+            | "lmstudio"
+            | "ollama-chat"
+    )
+}
+
+fn slugify_provider_id(raw: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut prev_dash = false;
+    for c in raw.trim().chars() {
+        if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+            out.push(c);
+            prev_dash = false;
+        } else if c.is_ascii() && !out.is_empty() && !prev_dash {
+            out.push('-');
+            prev_dash = true;
+        }
+    }
+    let trimmed = out.trim_matches(['-', '_']).to_string();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if is_reserved_codex_provider(&trimmed) {
+        Some(format!("{trimmed}-custom"))
+    } else {
+        Some(trimmed)
+    }
+}
+
+fn is_generic_codex_api_label(label: &str) -> bool {
+    let t = label.trim();
+    t.eq_ignore_ascii_case("codex api key")
+        || t.strip_prefix("codex API Key #")
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
+fn has_codex_provider_section(cfg: &str, provider: &str) -> bool {
+    cfg.lines().any(|line| {
+        let t = line.trim();
+        if t.starts_with("[[") {
+            return false;
+        }
+        let Some(inner) = t.strip_prefix('[') else { return false };
+        let inner = inner.split(']').next().unwrap_or("");
+        let path = toml_key_path(inner);
+        path.len() >= 2 && path[0] == "model_providers" && path[1] == provider
+    }) || toml_entries(cfg)
+        .iter()
+        .any(|(t, _, _, _)| t.len() >= 2 && t[0] == "model_providers" && t[1] == provider)
+}
+
+fn ensure_codex_provider_section(cfg: &str, provider: &str, base_url: &str, has_api_key: bool) -> String {
+    if has_codex_provider_section(cfg, provider) {
+        let mut out = if !base_url.is_empty() {
+            set_codex_provider_base_url(cfg, provider, base_url)
+        } else {
+            cfg.to_string()
+        };
+        let entries = toml_entries(&out);
+        let is_sec = |t: &Vec<String>| t.len() == 2 && t[0] == "model_providers" && t[1] == provider;
+        let has_name = entries
+            .iter()
+            .any(|(t, k, v, _)| is_sec(t) && k == "name" && !v.trim().is_empty());
+        let has_auth = entries.iter().any(|(t, k, v, _)| {
+            (is_sec(t)
+                && matches!(k.as_str(), "env_key" | "experimental_bearer_token" | "requires_openai_auth")
+                && !v.trim().is_empty())
+                || (t.len() >= 3
+                    && t[0] == "model_providers"
+                    && t[1] == provider
+                    && matches!(t[2].as_str(), "auth" | "gateway_oauth" | "aws"))
+        });
+        if !has_name || (!has_auth && has_api_key) {
+            let mut lines: Vec<String> = out.lines().map(String::from).collect();
+            let header_idx = lines.iter().position(|line| {
+                let t = line.trim();
+                if t.starts_with("[[") {
+                    return false;
+                }
+                t.strip_prefix('[')
+                    .map(|inner| toml_key_path(inner.split(']').next().unwrap_or("")))
+                    .is_some_and(|p| p.len() == 2 && p[0] == "model_providers" && p[1] == provider)
+            });
+            if let Some(mut insert_at) = header_idx.map(|i| i + 1).or_else(|| {
+                entries.iter().find(|(t, _, _, _)| is_sec(t)).map(|e| e.3)
+            }) {
+                if !has_name {
+                    lines.insert(insert_at, format!("name = {provider:?}"));
+                    insert_at += 1;
+                }
+                if !has_auth && has_api_key {
+                    lines.insert(insert_at, "env_key = \"OPENAI_API_KEY\"".to_string());
+                }
+                out = lines.join("\n");
+                if !out.ends_with('\n') {
+                    out.push('\n');
+                }
+            }
+        }
+        return out;
+    }
+
+    let sec_key = if provider
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        provider.to_string()
+    } else {
+        format!("{provider:?}")
+    };
+    let mut out = cfg.to_string();
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    if !out.trim().is_empty() && !out.ends_with("\n\n") {
+        out.push('\n');
+    }
+    out.push_str(&format!("[model_providers.{sec_key}]\n"));
+    out.push_str(&format!("name = {provider:?}\n"));
+    if !base_url.is_empty() {
+        out.push_str(&format!("base_url = {base_url:?}\n"));
+    }
+    if has_api_key {
+        out.push_str("env_key = \"OPENAI_API_KEY\"\n");
+    }
+    out.push_str("wire_api = \"responses\"\n");
+    out
+}
+
 /// Ensure `<codex_home>/config.toml` pins `cli_auth_credentials_store = "file"`, and for API-key
-/// profiles writes `auth.json` + optional `model` without mutating user-wide `~/.codex`.
+/// profiles configures custom `[model_providers.<id>]` (or `openai_base_url` for official regional
+/// OpenAI endpoints), `auth.json` and optional `model` without mutating user-wide `~/.codex`.
 pub fn ensure_codex_profile_files(codex_home: &Path, api_cfg: Option<&ApiKeyConfig>) -> Result<()> {
+    ensure_codex_profile_files_with_label(codex_home, api_cfg, None)
+}
+
+pub fn ensure_codex_profile_files_with_label(
+    codex_home: &Path,
+    api_cfg: Option<&ApiKeyConfig>,
+    label_hint: Option<&str>,
+) -> Result<()> {
     std::fs::create_dir_all(codex_home)?;
     let cfg_path = codex_home.join("config.toml");
     let existing = std::fs::read_to_string(&cfg_path).unwrap_or_default();
-    let mut updated = upsert_codex_config_toml(&existing, api_cfg.map(|c| c.default_model.as_str()).filter(|s| !s.is_empty()));
-    // An account on a custom provider edits that provider's URL (OPENAI_BASE_URL doesn't reach it)
-    if let Some(cfg) = api_cfg.filter(|c| !c.base_url.is_empty() && !c.provider_name.is_empty()) {
-        if codex_provider(&updated).is_some_and(|p| p.id == cfg.provider_name) {
-            updated = set_codex_provider_base_url(&updated, &cfg.provider_name, &cfg.base_url);
+    let default_model = api_cfg
+        .map(|c| c.default_model.as_str().trim())
+        .filter(|s| !s.is_empty());
+
+    let updated = if let Some(cfg) = api_cfg {
+        let base_url = cfg.base_url.trim();
+        let req_provider = cfg.provider_name.trim();
+        let custom_provider: Option<String> = if !req_provider.is_empty() {
+            if has_codex_provider_section(&existing, req_provider) && !is_reserved_codex_provider(req_provider) {
+                Some(req_provider.to_string())
+            } else {
+                let pid = slugify_provider_id(req_provider)
+                    .or_else(|| url_host(base_url).and_then(slugify_provider_id))
+                    .unwrap_or_else(|| "custom".to_string());
+                (!base_url.is_empty() || has_codex_provider_section(&existing, &pid)).then_some(pid)
+            }
+        } else if !base_url.is_empty() && !is_official_openai_base_url(base_url) {
+            let pid = codex_provider(&existing)
+                .map(|p| p.id)
+                .or_else(|| {
+                    label_hint
+                        .filter(|l| !is_generic_codex_api_label(l))
+                        .and_then(slugify_provider_id)
+                })
+                .or_else(|| url_host(base_url).and_then(slugify_provider_id))
+                .unwrap_or_else(|| "custom".to_string());
+            Some(pid)
+        } else {
+            None
+        };
+
+        if let Some(pid) = custom_provider {
+            let already_selected = codex_provider(&existing).is_some_and(|p| p.id == pid);
+            let base_cfg = if already_selected {
+                existing.clone()
+            } else {
+                strip_codex_provider(&existing)
+            };
+            let with_root = upsert_codex_config_toml_ex(
+                &base_cfg,
+                default_model,
+                (!already_selected).then_some(pid.as_str()),
+                Some(None),
+            );
+            let has_key = !cfg.api_key.trim().is_empty() || !cfg.auth_token.trim().is_empty();
+            ensure_codex_provider_section(&with_root, &pid, base_url, has_key)
+        } else {
+            let stripped = strip_codex_provider(&existing);
+            let openai_url = (!base_url.is_empty()).then_some(base_url);
+            upsert_codex_config_toml_ex(&stripped, default_model, None, Some(openai_url))
         }
-    }
+    } else {
+        upsert_codex_config_toml(&existing, default_model)
+    };
+
     if updated != existing {
         std::fs::write(&cfg_path, updated)?;
         crate::util::restrict_file(&cfg_path);
     }
     if let Some(cfg) = api_cfg {
-        if !cfg.api_key.is_empty() {
+        let key = if !cfg.api_key.is_empty() {
+            Some(cfg.api_key.as_str())
+        } else if !cfg.auth_token.is_empty() {
+            Some(cfg.auth_token.as_str())
+        } else {
+            None
+        };
+        if let Some(k) = key {
             let auth_path = codex_home.join("auth.json");
-            let body = serde_json::json!({ "OPENAI_API_KEY": cfg.api_key });
+            let body = serde_json::json!({ "OPENAI_API_KEY": k });
             std::fs::write(&auth_path, serde_json::to_string_pretty(&body)?)?;
             crate::util::restrict_file(&auth_path);
         }
@@ -3369,29 +3609,65 @@ pub fn ensure_codex_profile_files(codex_home: &Path, api_cfg: Option<&ApiKeyConf
 }
 
 fn upsert_codex_config_toml(existing: &str, default_model: Option<&str>) -> String {
+    upsert_codex_config_toml_ex(existing, default_model, None, None)
+}
+
+fn upsert_codex_config_toml_ex(
+    existing: &str,
+    default_model: Option<&str>,
+    set_model_provider: Option<&str>,
+    openai_base_url: Option<Option<&str>>,
+) -> String {
     let mut lines: Vec<String> = existing.lines().map(String::from).collect();
     // Root-level keys must appear before the first `[table]` header.
-    let first_section = lines
+    let mut sec = lines
         .iter()
         .position(|l| l.trim_start().starts_with('['))
         .unwrap_or(lines.len());
 
-    let set_root_key = |lines: &mut Vec<String>, first_section: &mut usize, key: &str, val_toml: &str| {
-        if let Some(idx) = lines[..*first_section]
-            .iter()
-            .position(|l| l.trim_start().starts_with(&format!("{key} ")) || l.trim_start().starts_with(&format!("{key}=")))
-        {
+    let matches_root_key = |line: &str, key: &str| {
+        line.trim_start()
+            .strip_prefix(key)
+            .is_some_and(|rest| rest.trim_start().starts_with('='))
+    };
+
+    let set_root_key = |lines: &mut Vec<String>, sec: &mut usize, key: &str, val_toml: &str| {
+        if let Some(idx) = lines[..*sec].iter().position(|l| matches_root_key(l, key)) {
             lines[idx] = format!("{key} = {val_toml}");
         } else {
-            lines.insert(*first_section, format!("{key} = {val_toml}"));
-            *first_section += 1;
+            let mut insert_at = *sec;
+            while insert_at > 0 && lines[insert_at - 1].trim().is_empty() {
+                insert_at -= 1;
+            }
+            lines.insert(insert_at, format!("{key} = {val_toml}"));
+            *sec += 1;
         }
     };
 
-    let mut sec = first_section;
+    let remove_root_key = |lines: &mut Vec<String>, sec: &mut usize, key: &str| {
+        let mut i = 0;
+        while i < *sec {
+            if matches_root_key(&lines[i], key) {
+                lines.remove(i);
+                *sec -= 1;
+            } else {
+                i += 1;
+            }
+        }
+    };
+
     set_root_key(&mut lines, &mut sec, "cli_auth_credentials_store", "\"file\"");
     if let Some(model) = default_model {
         set_root_key(&mut lines, &mut sec, "model", &format!("{model:?}"));
+    }
+    if let Some(mp) = set_model_provider {
+        set_root_key(&mut lines, &mut sec, "model_provider", &format!("{mp:?}"));
+    }
+    if let Some(url_opt) = openai_base_url {
+        match url_opt {
+            Some(url) => set_root_key(&mut lines, &mut sec, "openai_base_url", &format!("{url:?}")),
+            None => remove_root_key(&mut lines, &mut sec, "openai_base_url"),
+        }
     }
     let mut s = lines.join("\n");
     if !s.ends_with('\n') {
@@ -4050,5 +4326,103 @@ mod tests {
         let auth = std::fs::read_to_string(profile.join("auth.json")).unwrap();
         assert!(auth.contains("acct_1") && !profile.join("auth.json.oauth-bak").exists());
         assert!(mgr.convert_codex(&acc.id, AccountAuthKind::Oauth).is_err());
+    }
+
+    #[test]
+    fn codex_api_key_custom_base_url_writes_provider_section_and_repairs_legacy_profiles() {
+        let (_t, base, home) = temp_dirs();
+        let mgr = AccountManager::with_dirs(base, home);
+
+        // 1) Third-party Base URL saved without providerName (like existing accounts added on the default tab):
+        // config.toml gets `model_provider = "turing"` + `[model_providers.turing]` with `env_key = "OPENAI_API_KEY"`.
+        let turing = mgr
+            .save(SaveAccountRequest {
+                tool: ToolKind::Codex,
+                label: Some("turing".into()),
+                auth_kind: Some(AccountAuthKind::ApiKey),
+                api_config: Some(ApiKeyConfig {
+                    api_key: "sk-turing-123".into(),
+                    base_url: "https://coding.efficient.center/api/v1".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .unwrap();
+        let actual = turing.actual.as_ref().expect("custom provider configured");
+        assert_eq!(actual.provider, "turing");
+        assert_eq!(actual.base_url.as_deref(), Some("https://coding.efficient.center/api/v1"));
+        assert_eq!(actual.env_key.as_deref(), Some("OPENAI_API_KEY"));
+        assert!(actual.key_set);
+
+        let cfg_raw = std::fs::read_to_string(mgr.profile_home(ToolKind::Codex, &turing.id).join("config.toml")).unwrap();
+        assert!(cfg_raw.contains("model_provider = \"turing\""));
+        assert!(cfg_raw.contains("[model_providers.turing]"));
+        assert!(cfg_raw.contains("wire_api = \"responses\""));
+
+        let res1 = mgr.resolve(ToolKind::Codex, Some(&turing.id)).unwrap();
+        assert_eq!(res1.env.get("OPENAI_API_KEY").map(String::as_str), Some("sk-turing-123"));
+        assert!(res1.env_unset.contains(&"OPENAI_BASE_URL".to_string()));
+
+        // Simulate a legacy broken config.toml (only cli_auth_credentials_store + [projects...]): resolve repairs it.
+        let cfg_path = mgr.profile_home(ToolKind::Codex, &turing.id).join("config.toml");
+        std::fs::write(&cfg_path, "cli_auth_credentials_store = \"file\"\n\n[projects.\"/data/git/yi-console\"]\ntrust_level = \"trusted\"\n").unwrap();
+        let _ = mgr.resolve(ToolKind::Codex, Some(&turing.id)).unwrap();
+        let repaired = std::fs::read_to_string(&cfg_path).unwrap();
+        assert!(repaired.find("model_provider = \"turing\"").unwrap() < repaired.find("[projects.").unwrap());
+        assert!(repaired.contains("[model_providers.turing]"));
+        assert!(repaired.contains("base_url = \"https://coding.efficient.center/api/v1\""));
+
+        // 2) Explicit reserved provider name ("openai") is remapped to "openai-custom" so Codex doesn't reject config.toml.
+        let edited = mgr
+            .save(SaveAccountRequest {
+                tool: ToolKind::Codex,
+                id: Some(turing.id.clone()),
+                api_config: Some(ApiKeyConfig {
+                    api_key: REDACTED.into(),
+                    base_url: "https://gw2.example/v1".into(),
+                    provider_name: "openai".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(edited.actual.as_ref().unwrap().provider, "openai-custom");
+        assert_eq!(edited.actual.as_ref().unwrap().base_url.as_deref(), Some("https://gw2.example/v1"));
+        let res2 = mgr.resolve(ToolKind::Codex, Some(&turing.id)).unwrap();
+        assert_ne!(res1.fingerprint, res2.fingerprint, "base_url/provider change rotates launch fingerprint");
+
+        // 3) Official regional OpenAI endpoint uses built-in `openai` provider with top-level `openai_base_url`.
+        let regional = mgr
+            .save(SaveAccountRequest {
+                tool: ToolKind::Codex,
+                label: Some("OpenAI US".into()),
+                auth_kind: Some(AccountAuthKind::ApiKey),
+                api_config: Some(ApiKeyConfig {
+                    api_key: "sk-us-456".into(),
+                    base_url: "https://us.api.openai.com/v1".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(regional.actual.is_none());
+        let reg_cfg = std::fs::read_to_string(mgr.profile_home(ToolKind::Codex, &regional.id).join("config.toml")).unwrap();
+        assert!(reg_cfg.contains("openai_base_url = \"https://us.api.openai.com/v1\""));
+        assert!(codex_provider(&reg_cfg).is_none());
+
+        // Clearing base_url removes `openai_base_url`.
+        mgr.save(SaveAccountRequest {
+            tool: ToolKind::Codex,
+            id: Some(regional.id.clone()),
+            api_config: Some(ApiKeyConfig {
+                api_key: REDACTED.into(),
+                base_url: String::new(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .unwrap();
+        let cleared_cfg = std::fs::read_to_string(mgr.profile_home(ToolKind::Codex, &regional.id).join("config.toml")).unwrap();
+        assert!(!cleared_cfg.contains("openai_base_url"));
     }
 }

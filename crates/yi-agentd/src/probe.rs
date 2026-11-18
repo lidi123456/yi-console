@@ -1169,7 +1169,7 @@ fn api_key_quota(tool: ToolKind, penv: &ProbeEnv) -> Value {
         "isolation": "isolated",
         "account": {
             "email": penv.identity.email,
-            "plan": penv.identity.plan.clone().or_else(|| penv.identity.workspace.clone()).or_else(|| Some("API Key".into())),
+            "plan": penv.identity.plan,
         },
         "windows": [],
         "note": "API Key 按量计费（无固定订阅周期额度限制）",

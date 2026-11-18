@@ -90,6 +90,7 @@ export default interface Resources {
     "fieldNameCursor": "名称（留空按邮箱命名）",
     "fieldNamePlaceholder": "例如：工作中转",
     "fieldProvider": "Provider 名称",
+    "fieldProviderHint": "留空自动生成",
     "hostActiveHint": "切换默认账号会改本机 {{tool}} 的登录，终端里直接运行的 {{tool}} 也会跟着变。",
     "hostActiveLoginNote": "登录过程不会动本机现在的 {{tool}} 登录；成功后另存为新账号，需要时再设为默认。",
     "importBundle": "导入凭据包",

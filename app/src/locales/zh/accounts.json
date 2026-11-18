@@ -173,6 +173,7 @@
   "fieldAuthTokenHint": "部分中转用它代替 API Key",
   "fieldEndpoint": "API Endpoint",
   "fieldProvider": "Provider 名称",
+  "fieldProviderHint": "留空自动生成",
   "codexKindOfficial": "OpenAI 官方",
   "codexKindProvider": "自定义 provider",
   "fieldInterface": "接口类型",

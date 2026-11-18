@@ -173,6 +173,7 @@
   "fieldAuthTokenHint": "some relays use it instead of an API key",
   "fieldEndpoint": "API Endpoint",
   "fieldProvider": "Provider name",
+  "fieldProviderHint": "empty: auto",
   "codexKindOfficial": "OpenAI",
   "codexKindProvider": "Custom provider",
   "fieldInterface": "Endpoint type",
