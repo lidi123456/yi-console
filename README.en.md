@@ -16,11 +16,16 @@ Yi Console brings them together:
 - **Sessions that don't die**: a background service on each machine hosts every session. Close the window, put the computer to sleep, or send the phone app to the background, and the tools keep working; come back and pick up where you left off.
 - **Two views, switch any time**: a chat view (messages, tool calls, file changes, approval buttons) or the tool's own terminal UI. Switch the same session back and forth without losing context.
 - **Remote machines**: connect to servers over SSH, with automatic deployment on first connect and nothing to install by hand. Reach computers on a home or office network from your phone or another computer through a relay, end-to-end encrypted.
-- **A handy workspace**: file browsing and editing, git changes and diffs, full-text search, built-in browser tabs, port forwarding, and a bottom terminal panel.
+- **A handy workspace**: file browsing and editing, git changes and diffs, full-text search, built-in browser tabs (on Windows the page is embedded natively, so sites that refuse to be framed still open), port forwarding, and a bottom terminal panel.
+- **AI browser**: the AI opens pages in its own Chrome / Edge, clicks, fills forms, and reads requests and the console, for example to test the app you're developing. The page shows live in the file panel, and you can take over or stop it at any time.
+- **Computer use**: the AI operates the signed-in Windows or macOS desktop of a host: opens apps, clicks, types, and brings screenshots back to the chat.
+- **External MCP servers**: configure them once in host settings and choose which tools get them; every tool's chat view can use them.
+- **Bots** (desktop app): always-on AI sessions that take messages from plugins such as GitHub and Feishu, answer themselves or send out task sessions to do the work, and only call you when a person is needed. Phones can view and manage them remotely.
+- **Multiple accounts**: save several sign-ins and API keys per tool, switch them inside a session, and move on to the next account in order when quota runs out; after a quota resets, "continue" is sent automatically.
 - **Usage at a glance**: tokens, cost and account quotas per tool; system notifications when a reply finishes or needs approval.
 - **Continue earlier work**: import each tool's own history sessions and keep chatting, or hand a session over to a different tool.
 
-Runs on Windows, macOS and Linux desktops, and on Android phones. The UI is available in English and Chinese.
+Runs on Windows, macOS and Linux desktops, and on Android phones (you can build an iOS development package yourself). The desktop and Android apps update themselves in the app. The UI is available in English and Chinese.
 
 ## Install
 
@@ -82,6 +87,9 @@ Each machine runs a background service, `yi-agentd`, which starts and hosts the 
 
 - [User guide](docs/guide.en.md): sessions, the input box, terminals, files and changes, shortcuts, notifications, where data lives
 - [Remote access and relay](docs/remote.en.md): SSH hosts, connecting through a relay, deploying a relay server, network proxies
+- [Computer use](docs/computer-use.en.md): what is supported, permissions, how to use it
+- [External MCP servers](docs/mcp.en.md)
+- [Writing Bot plugins](docs/plugins.en.md)
 - [Development guide](docs/development.en.md): building from source, project layout, packaging and releases
 - [Relay security design](docs/relay-security.en.md)
 - [Adding a new AI tool](docs/adding-a-tool.en.md)
