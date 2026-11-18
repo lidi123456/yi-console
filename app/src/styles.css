@@ -5438,22 +5438,28 @@ button.md-rimg-ph:hover {
 
 /* Tables: rounded border around the outside, only horizontal lines inside */
 .md table {
+  display: table;
+  overflow: visible;
   margin: 1em 0;
   font-size: calc(var(--fs-chat, 14px) - 1px);
-  line-height: 1.6;
+  line-height: 1.55;
   border: 1px solid var(--border);
   border-radius: 10px;
   border-collapse: separate;
   border-spacing: 0;
   width: max-content;
   max-width: 100%;
+  word-break: normal;
+  overflow-wrap: break-word;
 }
 
 .md th,
 .md td {
-  padding: 8px 16px;
+  padding: 8px 12px;
   border: none;
   border-top: 1px solid var(--border);
+  vertical-align: top;
+  text-align: left;
 }
 
 .md tr:first-child > th,
@@ -5464,7 +5470,23 @@ button.md-rimg-ph:hover {
 .md th {
   background: var(--bg-2);
   font-weight: 600;
-  text-align: left;
+  color: var(--text-strong);
+}
+
+.md tbody tr:hover td {
+  background: color-mix(in srgb, var(--bg-2) 55%, transparent);
+}
+
+.md th code,
+.md td code {
+  font-size: max(11px, calc(var(--fs-chat, 14px) - 2px));
+  line-height: 1.45;
+  padding: 1px 4px;
+}
+
+.md th code.md-code-nowrap,
+.md td code.md-code-nowrap {
+  white-space: nowrap;
 }
 
 .md thead tr:first-child > th:first-child {
@@ -5473,6 +5495,13 @@ button.md-rimg-ph:hover {
 
 .md thead tr:first-child > th:last-child {
   border-top-right-radius: 9px;
+}
+
+@media (max-width: 760px) {
+  .md th,
+  .md td {
+    padding: 7px 10px;
+  }
 }
 
 .md hr {
@@ -7169,6 +7198,11 @@ body.resizing .side-resizer::after {
   border-radius: 4px;
   background: var(--inline-code-bg);
   color: var(--text-strong);
+}
+.chat.modern .msg-assistant .md :is(th, td) :not(pre) > code {
+  font-size: max(11px, calc(var(--m-fs) - 2px));
+  line-height: 1.45;
+  padding: 1px 4px;
 }
 .chat.modern .msg-assistant .md pre {
   font-size: var(--fs-code);
@@ -10393,10 +10427,95 @@ button.wp-commit-title .chev {
   position: relative;
   width: fit-content;
   max-width: 100%;
-  margin: 1em 0;
+  margin: 20px 0 14px;
 }
-.md-table-wrap > table {
+.md > .md-table-wrap:first-child {
+  margin-top: 20px;
+}
+/* Straddles the top border at rest so header text is never covered, and sticks 4px below the top edge when scrolling a tall table */
+.md-table-wrap > .copy-float-anchor {
+  top: 18px;
+  padding: 0 8px 0 0;
+}
+.md-table-wrap .table-actions {
+  transform: translateY(-14px);
+}
+.md-table-scroll {
+  overflow-x: auto;
+  max-width: 100%;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg);
+}
+.md-table-scroll > table {
   margin: 0;
+  border: none;
+  border-radius: 0;
+  max-width: none;
+  width: max-content;
+  min-width: 100%;
+}
+.md-table-scroll > table thead tr:first-child > th:first-child,
+.md-table-scroll > table thead tr:first-child > th:last-child {
+  border-radius: 0;
+}
+.md-table-wrap.has-scroll-left::before,
+.md-table-wrap.has-scroll-right::after {
+  content: '';
+  position: absolute;
+  top: 1px;
+  bottom: 1px;
+  width: 24px;
+  pointer-events: none;
+  z-index: 1;
+}
+.md-table-wrap.has-scroll-left::before {
+  left: 1px;
+  border-radius: 9px 0 0 9px;
+  background: linear-gradient(to left, transparent, color-mix(in srgb, var(--bg) 88%, transparent));
+}
+.md-table-wrap.has-scroll-right::after {
+  right: 1px;
+  border-radius: 0 9px 9px 0;
+  background: linear-gradient(to right, transparent, color-mix(in srgb, var(--bg) 88%, transparent));
+}
+
+/* Offscreen single-table measurement probe used by tableEnhance.ts */
+.md-table-probe {
+  position: fixed;
+  left: -99999px;
+  top: 0;
+  visibility: hidden;
+  pointer-events: none;
+  width: auto;
+  max-width: none;
+}
+.md-table-probe > table.yi-probe-nowrap {
+  width: max-content !important;
+  min-width: 0 !important;
+  max-width: none !important;
+  table-layout: auto !important;
+  margin: 0 !important;
+}
+.md-table-probe > table.yi-probe-nowrap th,
+.md-table-probe > table.yi-probe-nowrap td {
+  white-space: nowrap !important;
+}
+.md-table-probe > table.yi-probe-min {
+  width: 1px !important;
+  min-width: 0 !important;
+  max-width: none !important;
+  table-layout: auto !important;
+  margin: 0 !important;
+}
+.md-table-probe > table.yi-probe-min th,
+.md-table-probe > table.yi-probe-min td {
+  white-space: normal !important;
+  word-break: normal !important;
+  overflow-wrap: normal !important;
+}
+.md-table-probe > table.yi-probe-min code.md-code-nowrap {
+  white-space: nowrap !important;
 }
 .streaming .md > .md-code-wrap:last-child::after {
   content: none;
@@ -10443,7 +10562,35 @@ button.wp-commit-title .chev {
 .copy-pre-wrap {
   position: relative;
 }
-.table-copy-btn,
+/* Sticky pill inside `.md-table-wrap > .copy-float-anchor`: stays reachable while scrolling tall tables without scrolling sideways */
+.table-actions {
+  pointer-events: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px;
+  border-radius: 7px;
+  border: 1px solid var(--border);
+  background: color-mix(in srgb, var(--bg) 90%, transparent);
+  backdrop-filter: blur(4px);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.05);
+  opacity: 0;
+  transition: opacity 0.15s;
+  user-select: none;
+  -webkit-user-select: none;
+}
+.table-actions .copy-float-btn {
+  opacity: 1;
+  width: 24px;
+  height: 24px;
+  border: none;
+  background: transparent;
+  box-shadow: none;
+  backdrop-filter: none;
+}
+.table-actions .copy-float-btn:hover {
+  background: var(--bg-2);
+}
 .copy-pre-wrap > .copy-float-btn {
   position: absolute;
   top: 5px;
@@ -10452,8 +10599,9 @@ button.wp-commit-title .chev {
 }
 .md-code-wrap:hover .copy-float-btn,
 .md-code-wrap:focus-within .copy-float-btn,
-.md-table-wrap:hover .copy-float-btn,
-.md-table-wrap:focus-within .copy-float-btn,
+.md-table-wrap:hover .table-actions,
+.md-table-wrap:focus-within .table-actions,
+.table-actions:has(.copied),
 .copy-pre-wrap:hover > .copy-float-btn,
 .copy-pre-wrap:focus-within > .copy-float-btn,
 .copy-float-btn.copied {
@@ -10515,8 +10663,12 @@ button.wp-commit-title .chev {
 
 @media (hover: none) {
   .copy-float-btn,
+  .table-actions,
   .mt-box-head .inline-copy-btn {
     opacity: 1;
+  }
+  .md-table-wrap:has(.table-actions) > .md-table-scroll > table thead th:last-child {
+    padding-right: 74px;
   }
 }
 @media (pointer: coarse) {
@@ -10524,7 +10676,17 @@ button.wp-commit-title .chev {
     height: 40px;
     margin-bottom: -40px;
   }
+  .md-table-wrap > .copy-float-anchor {
+    top: 20px;
+  }
+  .md-table-wrap .table-actions {
+    transform: translateY(-16px);
+  }
   .copy-float-btn {
+    width: 30px;
+    height: 30px;
+  }
+  .table-actions .copy-float-btn {
     width: 30px;
     height: 30px;
   }
@@ -10543,7 +10705,8 @@ button.wp-commit-title .chev {
 .tl-fold,
 .mt-head,
 .mt-box-label,
-.ag-head {
+.ag-head,
+.table-actions {
   user-select: none;
   -webkit-user-select: none;
 }
@@ -10600,6 +10763,99 @@ button.wp-commit-title .chev {
   word-break: break-word;
   user-select: text;
   -webkit-user-select: text;
+}
+
+/* Fullscreen Markdown table viewer modal */
+.table-viewer-bg {
+  position: fixed;
+  inset: 0;
+  z-index: 1500;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: rgba(10, 12, 16, 0.45);
+}
+.table-viewer-card {
+  display: flex;
+  flex-direction: column;
+  width: min(1320px, 100%);
+  max-height: 100%;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  box-shadow: var(--shadow);
+  overflow: hidden;
+  font-family: var(--font-chat);
+}
+.table-viewer-head {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-2);
+  user-select: none;
+  -webkit-user-select: none;
+}
+.table-viewer-title {
+  flex: 1;
+  min-width: 0;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-strong);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.table-viewer-head .btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+.table-viewer-head .btn.copied {
+  color: var(--ok);
+  border-color: color-mix(in srgb, var(--ok) 45%, var(--border));
+}
+.table-viewer-head .icon-btn {
+  width: 28px;
+  height: 28px;
+}
+.table-viewer-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 16px 20px 20px;
+}
+.table-viewer-body .md-table-wrap {
+  margin: 0;
+}
+@media (max-width: 760px) {
+  .table-viewer-bg {
+    padding: 0;
+    background: var(--bg);
+  }
+  .table-viewer-card {
+    width: 100%;
+    height: 100%;
+    max-height: none;
+    border: none;
+    border-radius: 0;
+    box-shadow: none;
+  }
+  .table-viewer-head {
+    padding: calc(8px + env(safe-area-inset-top)) 12px 8px;
+  }
+  .table-viewer-head .icon-btn {
+    width: 34px;
+    height: 34px;
+  }
+  .table-viewer-body {
+    padding: 12px 12px calc(16px + env(safe-area-inset-bottom));
+  }
 }
 
 /* ======================================================================

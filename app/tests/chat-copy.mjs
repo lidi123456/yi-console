@@ -93,6 +93,73 @@ try {
       ].join('\n'),
     );
 
+    // Wide 5-column table: stays within chat column width, keeps short code tokens unbroken, scrolls horizontally, and opens fullscreen viewer
+    const wideWrap = desk.locator('.md-table-wrap').nth(1);
+    const wideMetrics = await wideWrap.evaluate((w) => {
+      const scroll = w.querySelector('.md-table-scroll');
+      const table = scroll.querySelector('table');
+      const actions = w.querySelector('.table-actions');
+      const wRect = w.getBoundingClientRect();
+      const aRect = actions.getBoundingClientRect();
+      const codeRects = [...table.querySelectorAll('code.md-code-nowrap')].map((c) => ({
+        text: c.textContent,
+        lines: c.getClientRects().length,
+      }));
+      return {
+        wrapW: Math.round(wRect.width),
+        parentW: Math.round(w.parentElement.getBoundingClientRect().width),
+        scrollW: scroll.scrollWidth,
+        clientW: scroll.clientWidth,
+        hasScrollRight: w.classList.contains('has-scroll-right'),
+        actionsInsideWrap: aRect.top >= wRect.top - 16 && aRect.bottom <= wRect.top + 16 && aRect.right <= wRect.right + 1,
+        codeRects,
+        firstColW: Math.round(table.rows[0].cells[0].getBoundingClientRect().width),
+      };
+    });
+    assert.ok(wideMetrics.wrapW <= wideMetrics.parentW, `wide table stays inside 768px column: ${JSON.stringify(wideMetrics)}`);
+    assert.ok(wideMetrics.scrollW > wideMetrics.clientW && wideMetrics.hasScrollRight, `wide table scrolls horizontally with hint: ${JSON.stringify(wideMetrics)}`);
+    assert.ok(wideMetrics.firstColW >= 84, `first column is not crushed: ${wideMetrics.firstColW}`);
+    assert.ok(wideMetrics.actionsInsideWrap, `sticky table actions sit cleanly inside top-right corner: ${JSON.stringify(wideMetrics)}`);
+    for (const c of wideMetrics.codeRects) {
+      assert.equal(c.lines, 1, `short code token "${c.text}" stays on a single line`);
+    }
+
+    await wideWrap.scrollIntoViewIfNeeded();
+    await wideWrap.hover();
+    await desk.waitForFunction(() => getComputedStyle(document.querySelectorAll('.md-table-wrap')[1].querySelector('.table-actions')).opacity === '1');
+    await desk.screenshot({ path: 'out/desktop-wide-table.png' });
+    await wideWrap.locator('button.table-expand-btn').click();
+    const viewer = desk.locator('.table-viewer-bg');
+    await viewer.waitFor();
+    const viewerFit = await viewer.evaluate((v) => {
+      const scroll = v.querySelector('.md-table-scroll');
+      return { scrollW: scroll.scrollWidth, clientW: scroll.clientWidth };
+    });
+    assert.ok(viewerFit.scrollW <= viewerFit.clientW + 2, `fullscreen table fits wide viewport without scroll: ${JSON.stringify(viewerFit)}`);
+    await clickCopy(viewer.locator('.table-viewer-head button.btn'));
+    assert.match(await readClip(desk), /SKILL\.md/);
+    const htmlClip = await desk.evaluate(async () => {
+      const items = await navigator.clipboard.read();
+      for (const item of items) {
+        if (item.types.includes('text/html')) {
+          const blob = await item.getType('text/html');
+          return await blob.text();
+        }
+      }
+      return '';
+    });
+    assert.match(htmlClip, /<br>.*<code>AGENTS\.md<\/code>/);
+    assert.match(htmlClip, /<strong>RFC 2119/);
+    await desk.screenshot({ path: 'out/desktop-table-viewer.png' });
+    await desk.keyboard.press('Escape');
+    assert.equal(await viewer.count(), 0);
+    await wideWrap.hover();
+    await wideWrap.locator('button.table-expand-btn').click();
+    await viewer.waitFor();
+    await desk.waitForFunction(() => document.activeElement?.closest('.table-viewer-head') !== null);
+    assert.equal(await desk.evaluate(() => window.__yiConsoleBack()), true);
+    await viewer.waitFor({ state: 'detached' });
+
     // Sticky behavior on tall code block while scrolling `.chat`
     const tallWrap = desk.locator('.md-code-wrap').nth(1);
     const tallBtn = tallWrap.locator('button.copy-float-btn');

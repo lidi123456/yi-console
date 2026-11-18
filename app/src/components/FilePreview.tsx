@@ -1,10 +1,12 @@
 import { useDeferredValue, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import { getT } from '../i18n';
+import { getT, useLang } from '../i18n';
 import { marked, type Token, type TokensList } from 'marked';
 import DOMPurify from 'dompurify';
 import { rpc } from '../transport';
+import { enhanceTables, fitTables, handleBlockActionClick } from '../tableEnhance';
 import { Icon } from './Icon';
 import { openImage } from './Lightbox';
+import { TableViewer } from './TableViewer';
 
 const t = getT('filePreview');
 
@@ -225,13 +227,24 @@ export function MdPreview({
   /** Jump to the block containing a line (outline) */
   goto?: { line: number; n: number } | null;
 }) {
+  const [, lang] = useLang();
   const box = useRef<HTMLDivElement>(null);
   const src = useDeferredValue(text);
   const html = useMemo(() => renderMdLines(src), [src]);
   const imgs = useRef(new Map<string, Promise<string>>());
   const anchors = useRef<Anchor[]>([]);
   const muted = useRef(false);
+  const copiedUntil = useRef<Map<string, number>>(new Map());
+  const timers = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
+  const [expandedTable, setExpandedTable] = useState<HTMLTableElement | null>(null);
   const dir = path.slice(0, Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\')));
+
+  useLayoutEffect(() => {
+    return () => {
+      for (const timer of timers.current.values()) clearTimeout(timer);
+      timers.current.clear();
+    };
+  }, []);
 
   const measure = () => {
     const el = box.current;
@@ -246,6 +259,7 @@ export function MdPreview({
   useLayoutEffect(() => {
     const el = box.current;
     if (!el) return;
+    enhanceTables(el, copiedUntil.current);
     measure();
     for (const img of el.querySelectorAll<HTMLImageElement>('img[data-src]')) {
       const raw = img.dataset.src ?? '';
@@ -273,15 +287,30 @@ export function MdPreview({
           img.title = t('couldNotLoadImage', { raw });
         },
       );
-      img.addEventListener('load', measure, { once: true });
+      img.addEventListener(
+        'load',
+        () => {
+          fitTables(el);
+          measure();
+        },
+        { once: true },
+      );
     }
-  }, [html]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [html, lang]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Width changed (panel dragged, rewrapped): re-measure the anchors
+  // Width changed (panel dragged, rewrapped): refit tables and re-measure anchors
   useEffect(() => {
     const el = box.current;
     if (!el) return;
-    const ro = new ResizeObserver(measure);
+    let prevW = el.clientWidth;
+    const ro = new ResizeObserver(() => {
+      const nextW = el.clientWidth;
+      if (nextW && nextW !== prevW) {
+        prevW = nextW;
+        fitTables(el);
+      }
+      measure();
+    });
     ro.observe(el);
     return () => ro.disconnect();
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
@@ -307,7 +336,7 @@ export function MdPreview({
     onTopLine(Math.floor(L), L - Math.floor(L));
   };
 
-  const onClick = (e: React.MouseEvent) => {
+  const onLinkClick = (e: React.MouseEvent) => {
     const a = (e.target as HTMLElement).closest('a');
     const href = a?.getAttribute('href');
     if (!a || !href) return;
@@ -333,7 +362,17 @@ export function MdPreview({
     if (rel) onOpen(resolvePath(dir, rel));
   };
 
-  return <div ref={box} className="wp-md md" onScroll={onScroll} onClick={onClick} dangerouslySetInnerHTML={{ __html: html }} />;
+  const onClick = (e: React.MouseEvent) => {
+    if (handleBlockActionClick(e, box.current, copiedUntil.current, timers.current, setExpandedTable)) return;
+    onLinkClick(e);
+  };
+
+  return (
+    <>
+      <div ref={box} className="wp-md md" onScroll={onScroll} onClick={onClick} dangerouslySetInnerHTML={{ __html: html }} />
+      {expandedTable && <TableViewer table={expandedTable} onLinkClick={onLinkClick} onClose={() => setExpandedTable(null)} />}
+    </>
+  );
 }
 
 // ---------- Images ----------

@@ -95,6 +95,8 @@
   "accountContextFresh": "Fresh context",
   "copyCode": "Copy code",
   "copyTable": "Copy table",
+  "expandTable": "View table fullscreen",
+  "tablePreviewTitle": "Table · {{cols}} cols × {{rows}} rows",
   "copyCommand": "Copy command",
   "copyInput": "Copy input",
   "copyOutput": "Copy output",

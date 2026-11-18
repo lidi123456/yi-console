@@ -95,6 +95,8 @@
   "accountContextFresh": "新进程启动",
   "copyCode": "复制代码",
   "copyTable": "复制表格",
+  "expandTable": "全屏查看表格",
+  "tablePreviewTitle": "表格 · {{cols}} 列 × {{rows}} 行",
   "copyCommand": "复制命令",
   "copyInput": "复制输入",
   "copyOutput": "复制输出",
