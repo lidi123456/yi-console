@@ -4,12 +4,15 @@ use crate::adapters::{self, JsonProc};
 use crate::hub::Hub;
 use crate::util::now_ms;
 use anyhow::{anyhow, bail, Result};
+use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+use regex::Regex;
 use yi_proto::*;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
 
 const TIMEOUT: Duration = Duration::from_secs(30);
@@ -940,7 +943,9 @@ async fn codebuddy_account(settings: &DaemonSettings) -> Result<Value> {
 }
 
 /// Antigravity: `agy -p /usage` and `/credits` answer without starting a turn, and `--output-format json`
-/// carries the data under `command.data` (the slash command never reaches the model)
+/// carries the data under `command.data` (the slash command never reaches the model).
+/// If print mode rejects the account with an eligibility error while interactive `agy` / ACP still works,
+/// fall back to running `/usage` (and `/credits`) inside an interactive PTY session.
 async fn antigravity_account(settings: &DaemonSettings, penv: &ProbeEnv) -> Result<Value> {
     let ask = |cmd: &'static str| async move {
         let mut data = Value::Null;
@@ -958,14 +963,764 @@ async fn antigravity_account(settings: &DaemonSettings, penv: &ProbeEnv) -> Resu
         anyhow::Ok(data["command"]["data"].clone())
     };
     let (usage, credits) = tokio::join!(ask("/usage"), ask("/credits"));
-    let mut q = antigravity_quota(&usage?, credits.as_ref().unwrap_or(&Value::Null));
-    if let Some(email) = &penv.identity.email {
-        q["account"]["email"] = json!(email);
+    let mut q = match usage {
+        Ok(u) => antigravity_quota(&u, credits.as_ref().unwrap_or(&Value::Null)),
+        Err(e) if is_antigravity_eligibility_error(&e.to_string()) => {
+            antigravity_account_interactive(settings, penv).await?
+        }
+        Err(e) => return Err(e),
+    };
+    if q["account"]["email"].is_null() {
+        if let Some(email) = &penv.identity.email {
+            q["account"]["email"] = json!(email);
+        }
     }
-    if let Some(plan) = &penv.identity.plan {
-        q["account"]["plan"] = json!(plan);
+    if q["account"]["plan"].is_null() {
+        if let Some(plan) = &penv.identity.plan {
+            q["account"]["plan"] = json!(plan);
+        }
     }
     Ok(q)
+}
+
+fn is_antigravity_eligibility_error(msg: &str) -> bool {
+    let low = msg.to_ascii_lowercase();
+    low.contains("eligibility check failed") || low.contains("not eligible for antigravity")
+}
+
+/// Interactive fallback when `agy -p` aborts on an account-region eligibility check while interactive `agy`
+/// treats it as a non-blocking warning and still serves `/usage` and `/credits`.
+async fn antigravity_account_interactive(settings: &DaemonSettings, penv: &ProbeEnv) -> Result<Value> {
+    let program = crate::tools::resolve(ToolKind::Antigravity, settings)
+        .ok_or_else(|| anyhow!("这台机器上没有找到 antigravity"))?;
+    let cwd = probe_dir();
+    let penv = penv.clone();
+    tokio::task::spawn_blocking(move || antigravity_account_interactive_blocking(&program, &cwd, &penv))
+        .await
+        .map_err(|e| anyhow!("查询 antigravity 交互式额度任务失败：{e}"))?
+}
+
+fn antigravity_account_interactive_blocking(
+    program: &Path,
+    cwd: &Path,
+    penv: &ProbeEnv,
+) -> Result<Value> {
+    const ROWS: u16 = 120;
+    const COLS: u16 = 160;
+    let pty = native_pty_system();
+    let pair = pty.openpty(PtySize {
+        rows: ROWS,
+        cols: COLS,
+        pixel_width: 0,
+        pixel_height: 0,
+    })?;
+    let is_script = program
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("cmd") || e.eq_ignore_ascii_case("bat"))
+        .unwrap_or(false);
+    let mut cmd = if cfg!(windows) && is_script {
+        let mut c = CommandBuilder::new("cmd");
+        c.arg("/c");
+        c.arg(program);
+        c
+    } else {
+        CommandBuilder::new(program)
+    };
+    // Trust the dedicated probe dir for this session only so ~/.gemini/antigravity-cli/settings.json is untouched.
+    let settings_arg = json!({ "trustedWorkspaces": [cwd.to_string_lossy()] }).to_string();
+    cmd.arg("--settings");
+    cmd.arg(settings_arg);
+    cmd.cwd(cwd);
+    cmd.env("TERM", "xterm-256color");
+    cmd.env("COLORTERM", "truecolor");
+    for k in &penv.env_unset {
+        cmd.env_remove(k);
+    }
+    for (k, v) in &penv.env {
+        cmd.env(k, v);
+    }
+
+    let mut child = pair.slave.spawn_command(cmd)?;
+    drop(pair.slave);
+    let master = pair.master;
+    let mut reader = master.try_clone_reader()?;
+    let writer: Arc<Mutex<Box<dyn Write + Send>>> = Arc::new(Mutex::new(master.take_writer()?));
+    let mut killer = child.clone_killer();
+
+    let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    let w_q = writer.clone();
+    let reader_handle = std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        let mut tail = Vec::with_capacity(3);
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    let chunk = &buf[..n];
+                    // Windows ConPTY opens with a cursor position query (ESC[6n) and blocks until answered.
+                    let mut scan = Vec::with_capacity(tail.len() + chunk.len());
+                    scan.extend_from_slice(&tail);
+                    scan.extend_from_slice(chunk);
+                    let mut hits = 0usize;
+                    let mut i = 0;
+                    while i + 4 <= scan.len() {
+                        if &scan[i..i + 4] == b"\x1b[6n" {
+                            hits += 1;
+                            i += 4;
+                        } else {
+                            i += 1;
+                        }
+                    }
+                    tail.clear();
+                    let keep = scan.len().min(3);
+                    tail.extend_from_slice(&scan[scan.len() - keep..]);
+                    if hits > 0 {
+                        if let Ok(mut w) = w_q.lock() {
+                            for _ in 0..hits {
+                                let _ = w.write_all(b"\x1b[1;1R");
+                            }
+                            let _ = w.flush();
+                        }
+                    }
+                    if tx.send(chunk.to_vec()).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    let send_bytes = |bytes: &[u8]| -> Result<()> {
+        let mut w = writer.lock().unwrap();
+        w.write_all(bytes)?;
+        w.flush()?;
+        Ok(())
+    };
+
+    enum Stage {
+        WaitReady,
+        WaitUsage,
+        WaitCredits(Instant),
+    }
+
+    let mut screen = TermScreen::new(ROWS as usize, COLS as usize);
+    let mut stage = Stage::WaitReady;
+    let mut trust_acked = false;
+    let mut usage_panel: Option<String> = None;
+    let mut credits_panel: Option<String> = None;
+    let mut settled_usage: Option<(String, Instant)> = None;
+    let mut usage_no_pct_since: Option<Instant> = None;
+    let deadline = Instant::now() + TIMEOUT;
+
+    let result: Result<Value> = (|| {
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                if usage_panel.is_some() {
+                    break;
+                }
+                bail!("查询 antigravity 超时");
+            }
+            let wait = match stage {
+                Stage::WaitCredits(cd) => cd.saturating_duration_since(now).min(Duration::from_millis(80)),
+                _ => deadline.saturating_duration_since(now).min(Duration::from_millis(80)),
+            };
+            match rx.recv_timeout(wait) {
+                Ok(chunk) => {
+                    screen.feed(&chunk);
+                    while let Ok(more) = rx.try_recv() {
+                        screen.feed(&more);
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    if usage_panel.is_some() {
+                        break;
+                    }
+                    bail!("antigravity 意外退出");
+                }
+            }
+
+            let text = screen.text();
+            match stage {
+                Stage::WaitReady => {
+                    if !trust_acked
+                        && text.contains("Do you trust the contents of this project?")
+                        && text.contains("Yes, I trust this folder")
+                    {
+                        send_bytes(b"\r")?;
+                        trust_acked = true;
+                    } else if text.contains("? for shortcuts") {
+                        send_bytes(b"/usage\r")?;
+                        stage = Stage::WaitUsage;
+                    } else if is_antigravity_tui_unauthenticated(&text) {
+                        bail!("antigravity 尚未登录");
+                    }
+                }
+                Stage::WaitUsage => {
+                    if let Some(panel) = extract_antigravity_usage_panel(&text) {
+                        if panel.contains("Loading quota summary") {
+                            settled_usage = None;
+                            usage_no_pct_since = None;
+                            continue;
+                        }
+                        let has_footer = panel.contains("esc Close");
+                        if has_footer && panel.contains('%') {
+                            let panel_s = panel.to_string();
+                            match &settled_usage {
+                                Some((prev, since)) if prev == &panel_s => {
+                                    if since.elapsed() >= Duration::from_millis(200) {
+                                        if antigravity_tui_quota(&panel_s, None, now_ms()).is_ok() {
+                                            usage_panel = Some(panel_s);
+                                            let _ = send_bytes(b"\x1b");
+                                            std::thread::sleep(Duration::from_millis(150));
+                                            if send_bytes(b"/credits\r").is_ok() {
+                                                stage = Stage::WaitCredits(Instant::now() + Duration::from_secs(3));
+                                            } else {
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                                _ => {
+                                    settled_usage = Some((panel_s, Instant::now()));
+                                }
+                            }
+                        } else if has_footer {
+                            let since = *usage_no_pct_since.get_or_insert_with(Instant::now);
+                            if since.elapsed() >= Duration::from_millis(1500) {
+                                bail!("agy 没有返回额度");
+                            }
+                        }
+                    }
+                }
+                Stage::WaitCredits(credits_deadline) => {
+                    if let Some(idx) = text.rfind("Remaining AI Credits:") {
+                        let panel = &text[idx..];
+                        if !panel.contains("Loading")
+                            && (panel.contains("esc Close") || panel.contains("Actions"))
+                        {
+                            credits_panel = Some(panel.to_string());
+                            break;
+                        }
+                    }
+                    if Instant::now() >= credits_deadline {
+                        break;
+                    }
+                }
+            }
+        }
+        let usage = usage_panel.ok_or_else(|| anyhow!("agy 没有返回额度"))?;
+        antigravity_tui_quota(&usage, credits_panel.as_deref(), now_ms())
+    })();
+
+    drop(rx);
+    let _ = killer.kill();
+    let _ = child.wait();
+    drop(writer);
+    drop(master);
+    let _ = reader_handle.join();
+    result
+}
+
+fn is_antigravity_tui_unauthenticated(text: &str) -> bool {
+    if text.contains("? for shortcuts") || text.contains("Signing in...") {
+        return false;
+    }
+    let low = text.to_ascii_lowercase();
+    low.contains("select login method")
+        || low.contains("sign in with google")
+        || low.contains("log in with google")
+        || low.contains("paste authorization code")
+}
+
+fn extract_antigravity_usage_panel(text: &str) -> Option<&str> {
+    let idx = text.rfind("Models & Quota")?;
+    let tail = &text[idx..];
+    if let Some(esc) = tail.find("esc Close") {
+        let end = tail[esc..]
+            .find('\n')
+            .map(|n| esc + n)
+            .unwrap_or(tail.len());
+        Some(&tail[..end])
+    } else {
+        Some(tail)
+    }
+}
+
+/// Parse the `/usage` (and optional `/credits`) screen captured from interactive `agy`.
+fn antigravity_tui_quota(usage_text: &str, credits_text: Option<&str>, now: i64) -> Result<Value> {
+    static BAR_RE: OnceLock<Regex> = OnceLock::new();
+    let bar_re = BAR_RE.get_or_init(|| Regex::new(r"\[[^\]]+\]\s*(\d+(?:\.\d+)?)\s*%").unwrap());
+
+    let lines: Vec<&str> = usage_text.lines().collect();
+    let mut email: Option<String> = None;
+    let mut current_group = String::new();
+    let mut pending_bucket = String::new();
+    let mut windows = Vec::new();
+
+    for (i, raw) in lines.iter().enumerate() {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.starts_with('│') || trimmed.starts_with("↑/↓") || trimmed.contains("esc Close") {
+            break;
+        }
+        if trimmed == "Models & Quota" || trimmed == "└ Models & Quota" {
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("Account:") {
+            let e = rest.trim();
+            if !e.is_empty() {
+                email = Some(e.to_string());
+            }
+            continue;
+        }
+        if let Some(cap) = bar_re.captures(trimmed) {
+            let rem_pct: f64 = cap[1].parse().unwrap_or(0.0);
+            let used = (((100.0 - rem_pct).clamp(0.0, 100.0)) * 10.0).round() / 10.0;
+            let mut resets_at = Value::Null;
+            for next in lines.iter().skip(i + 1).take(3) {
+                let nt = next.trim();
+                if nt.is_empty() {
+                    break;
+                }
+                if nt.starts_with('│') || nt.starts_with("↑/↓") || nt.contains("esc Close") || bar_re.is_match(nt) {
+                    break;
+                }
+                if let Some(dur_ms) = parse_refresh_duration_ms(nt) {
+                    resets_at = json!(now + dur_ms);
+                    break;
+                }
+            }
+            let label = antigravity_tui_window_label(&current_group, &pending_bucket);
+            windows.push(json!({
+                "label": label,
+                "usedPercent": used,
+                "resetsAt": resets_at,
+            }));
+            pending_bucket.clear();
+            continue;
+        }
+        if parse_refresh_duration_ms(trimmed).is_some()
+            || trimmed.eq_ignore_ascii_case("Quota available")
+            || trimmed.eq_ignore_ascii_case("Quota exhausted")
+        {
+            continue;
+        }
+        let next_is_bar = lines
+            .iter()
+            .skip(i + 1)
+            .map(|l| l.trim())
+            .find(|l| !l.is_empty())
+            .map(|l| bar_re.is_match(l))
+            .unwrap_or(false);
+        let unindented = !raw.starts_with([' ', '\t']);
+        let all_upper = trimmed.chars().any(|c| c.is_ascii_alphabetic())
+            && !trimmed.chars().any(|c| c.is_ascii_lowercase());
+        if !next_is_bar && (all_upper || (unindented && !trimmed.contains([':', '.', ',']))) {
+            current_group = normalize_antigravity_tui_group(trimmed);
+            pending_bucket.clear();
+        } else {
+            pending_bucket = trimmed.to_string();
+        }
+    }
+
+    if windows.is_empty() {
+        bail!("agy 交互式界面没有返回额度数据");
+    }
+
+    let note = credits_text
+        .and_then(parse_antigravity_tui_credits)
+        .filter(|&c| c > 0.0)
+        .map(|c| format!("AI 积分剩余 {}", fmt_num(c)));
+
+    let mut account = serde_json::Map::new();
+    if let Some(e) = email {
+        account.insert("email".into(), json!(e));
+    }
+    Ok(json!({ "account": Value::Object(account), "windows": windows, "note": note }))
+}
+
+fn normalize_antigravity_tui_group(raw: &str) -> String {
+    let s = raw.trim();
+    let all_upper =
+        s.chars().any(|c| c.is_ascii_alphabetic()) && !s.chars().any(|c| c.is_ascii_lowercase());
+    let stripped = if s.len() >= 7 && s[s.len() - 7..].eq_ignore_ascii_case(" models") {
+        &s[..s.len() - 7]
+    } else {
+        s
+    };
+    if !all_upper {
+        return stripped.replace(" and ", " / ").replace(" AND ", " / ");
+    }
+    let mut out = Vec::new();
+    for tok in stripped.split_whitespace() {
+        if tok.eq_ignore_ascii_case("AND") {
+            out.push("/".to_string());
+        } else if matches!(tok, "GPT" | "AI" | "API" | "OSS" | "CLI") {
+            out.push(tok.to_string());
+        } else {
+            let mut chars = tok.chars();
+            let mut word = String::with_capacity(tok.len());
+            if let Some(first) = chars.next() {
+                word.push(first.to_ascii_uppercase());
+                for c in chars {
+                    word.push(c.to_ascii_lowercase());
+                }
+            }
+            out.push(word);
+        }
+    }
+    out.join(" ")
+}
+
+fn antigravity_tui_window_label(group: &str, bucket: &str) -> String {
+    let low = bucket.to_ascii_lowercase();
+    let window = if low.contains("five hour")
+        || low.contains("5-hour")
+        || low.contains("5 hour")
+        || low.contains("5h")
+    {
+        "5 小时".to_string()
+    } else if low.contains("weekly") {
+        "每周".to_string()
+    } else {
+        let trimmed = bucket
+            .trim()
+            .trim_end_matches(" Remaining")
+            .trim_end_matches(" remaining")
+            .trim();
+        if !group.is_empty() && trimmed.to_ascii_lowercase().starts_with(&group.to_ascii_lowercase())
+        {
+            return trimmed.to_string();
+        }
+        trimmed.to_string()
+    };
+    if group.is_empty() {
+        window
+    } else if window.is_empty() {
+        group.to_string()
+    } else {
+        format!("{group} {window}")
+    }
+}
+
+fn parse_refresh_duration_ms(line: &str) -> Option<i64> {
+    static HEADER_RE: OnceLock<Regex> = OnceLock::new();
+    static PART_RE: OnceLock<Regex> = OnceLock::new();
+    let header_re =
+        HEADER_RE.get_or_init(|| Regex::new(r"(?i)(?:refreshes|resets)\s+in\s+(.+)").unwrap());
+    let part_re = PART_RE.get_or_init(|| Regex::new(r"(?i)(\d+)\s*([dhms])\b").unwrap());
+    let rest = header_re.captures(line)?.get(1)?.as_str().trim();
+    if rest.starts_with("<1m") || rest.starts_with("< 1m") || rest.to_ascii_lowercase().contains("less than a minute") {
+        return Some(60_000);
+    }
+    let mut total_ms: i64 = 0;
+    let mut matched = false;
+    for cap in part_re.captures_iter(rest) {
+        let n: i64 = cap[1].parse().ok()?;
+        let unit = cap[2].to_ascii_lowercase();
+        let mult: i64 = match unit.as_str() {
+            "d" => 86_400_000,
+            "h" => 3_600_000,
+            "m" => 60_000,
+            "s" => 1_000,
+            _ => continue,
+        };
+        total_ms = total_ms.saturating_add(n.saturating_mul(mult));
+        matched = true;
+    }
+    (matched && total_ms > 0).then_some(total_ms)
+}
+
+fn parse_antigravity_tui_credits(text: &str) -> Option<f64> {
+    for line in text.lines() {
+        let trimmed = line.trim();
+        let Some(rest) = trimmed.strip_prefix("Remaining AI Credits:") else {
+            continue;
+        };
+        let rest = rest.trim();
+        let token: String = rest
+            .chars()
+            .take_while(|c| c.is_ascii_digit() || *c == '.' || *c == ',')
+            .filter(|c| *c != ',')
+            .collect();
+        if !token.is_empty() {
+            return token.parse::<f64>().ok();
+        }
+        return None;
+    }
+    None
+}
+
+/// Minimal VT100/ANSI screen buffer so TUI redraws (Bubble Tea relative cursor moves and Windows ConPTY CUP frames)
+/// flatten into clean visible lines without spinner leftovers or smashed rows.
+struct TermScreen {
+    rows: usize,
+    cols: usize,
+    grid: Vec<Vec<char>>,
+    row: usize,
+    col: usize,
+    saved: (usize, usize),
+    state: TermState,
+    csi: String,
+    osc_esc: bool,
+    utf8_buf: Vec<u8>,
+}
+
+enum TermState {
+    Normal,
+    Esc,
+    Charset,
+    Csi,
+    Osc,
+}
+
+impl TermScreen {
+    fn new(rows: usize, cols: usize) -> Self {
+        Self {
+            rows,
+            cols,
+            grid: vec![vec![' '; cols]; rows],
+            row: 0,
+            col: 0,
+            saved: (0, 0),
+            state: TermState::Normal,
+            csi: String::new(),
+            osc_esc: false,
+            utf8_buf: Vec::new(),
+        }
+    }
+
+    fn feed(&mut self, bytes: &[u8]) {
+        self.utf8_buf.extend_from_slice(bytes);
+        loop {
+            match std::str::from_utf8(&self.utf8_buf) {
+                Ok(s) => {
+                    let owned = s.to_string();
+                    self.utf8_buf.clear();
+                    for ch in owned.chars() {
+                        self.push_char(ch);
+                    }
+                    break;
+                }
+                Err(e) => {
+                    let valid = e.valid_up_to();
+                    if valid > 0 {
+                        let prefix = std::str::from_utf8(&self.utf8_buf[..valid]).unwrap().to_string();
+                        for ch in prefix.chars() {
+                            self.push_char(ch);
+                        }
+                    }
+                    if let Some(bad_len) = e.error_len() {
+                        self.utf8_buf.drain(..valid + bad_len);
+                    } else {
+                        self.utf8_buf.drain(..valid);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    fn clear_all(&mut self) {
+        for r in &mut self.grid {
+            r.fill(' ');
+        }
+    }
+
+    fn linefeed(&mut self) {
+        if self.row + 1 < self.rows {
+            self.row += 1;
+        } else {
+            self.grid.remove(0);
+            self.grid.push(vec![' '; self.cols]);
+        }
+    }
+
+    fn push_char(&mut self, ch: char) {
+        match self.state {
+            TermState::Normal => match ch {
+                '\x1b' => self.state = TermState::Esc,
+                '\r' => self.col = 0,
+                '\n' => self.linefeed(),
+                '\x08' => self.col = self.col.saturating_sub(1),
+                '\t' => self.col = ((self.col / 8 + 1) * 8).min(self.cols.saturating_sub(1)),
+                c if c >= ' ' && c != '\x7f' => {
+                    if self.row < self.rows && self.col < self.cols {
+                        self.grid[self.row][self.col] = c;
+                        self.col += 1;
+                    }
+                }
+                _ => {}
+            },
+            TermState::Esc => match ch {
+                '[' => {
+                    self.state = TermState::Csi;
+                    self.csi.clear();
+                }
+                ']' => {
+                    self.state = TermState::Osc;
+                    self.osc_esc = false;
+                }
+                '(' | ')' | '*' | '+' => self.state = TermState::Charset,
+                '7' => {
+                    self.saved = (self.row, self.col);
+                    self.state = TermState::Normal;
+                }
+                '8' => {
+                    self.row = self.saved.0.min(self.rows - 1);
+                    self.col = self.saved.1.min(self.cols - 1);
+                    self.state = TermState::Normal;
+                }
+                _ => self.state = TermState::Normal,
+            },
+            TermState::Charset => self.state = TermState::Normal,
+            TermState::Osc => {
+                if ch == '\x07' || (self.osc_esc && ch == '\\') {
+                    self.state = TermState::Normal;
+                    self.osc_esc = false;
+                } else {
+                    self.osc_esc = ch == '\x1b';
+                }
+            }
+            TermState::Csi => {
+                let code = ch as u32;
+                if (0x40..=0x7E).contains(&code) {
+                    let params = std::mem::take(&mut self.csi);
+                    self.handle_csi(&params, ch);
+                    self.state = TermState::Normal;
+                } else if self.csi.len() < 64 {
+                    self.csi.push(ch);
+                }
+            }
+        }
+    }
+
+    fn handle_csi(&mut self, params: &str, cmd: char) {
+        if params.starts_with(['?', '>', '=']) {
+            if params == "?1049" && cmd == 'h' {
+                self.clear_all();
+                self.row = 0;
+                self.col = 0;
+            }
+            return;
+        }
+        let nums: Vec<usize> = if params.is_empty() {
+            Vec::new()
+        } else {
+            params.split(';').map(|s| s.parse().unwrap_or(0)).collect()
+        };
+        let p1 = nums.first().copied().unwrap_or(0);
+        let p2 = nums.get(1).copied().unwrap_or(0);
+        let max_r = self.rows.saturating_sub(1);
+        let max_c = self.cols.saturating_sub(1);
+        match cmd {
+            'A' => self.row = self.row.saturating_sub(p1.max(1)),
+            'B' => self.row = self.row.saturating_add(p1.max(1)).min(max_r),
+            'C' => self.col = self.col.saturating_add(p1.max(1)).min(max_c),
+            'D' => self.col = self.col.saturating_sub(p1.max(1)),
+            'E' => {
+                self.row = self.row.saturating_add(p1.max(1)).min(max_r);
+                self.col = 0;
+            }
+            'F' => {
+                self.row = self.row.saturating_sub(p1.max(1));
+                self.col = 0;
+            }
+            'G' => self.col = p1.max(1).saturating_sub(1).min(max_c),
+            'd' => self.row = p1.max(1).saturating_sub(1).min(max_r),
+            'H' | 'f' => {
+                self.row = p1.max(1).saturating_sub(1).min(max_r);
+                self.col = p2.max(1).saturating_sub(1).min(max_c);
+            }
+            'K' => {
+                let r = self.row;
+                match p1 {
+                    0 => {
+                        for x in self.col.min(self.cols)..self.cols {
+                            self.grid[r][x] = ' ';
+                        }
+                    }
+                    1 => {
+                        let end = self.col.saturating_add(1).min(self.cols);
+                        for x in 0..end {
+                            self.grid[r][x] = ' ';
+                        }
+                    }
+                    2 => self.grid[r].fill(' '),
+                    _ => {}
+                }
+            }
+            'J' => {
+                let r = self.row;
+                match p1 {
+                    0 => {
+                        for x in self.col.min(self.cols)..self.cols {
+                            self.grid[r][x] = ' ';
+                        }
+                        for y in (r + 1)..self.rows {
+                            self.grid[y].fill(' ');
+                        }
+                    }
+                    1 => {
+                        for y in 0..r {
+                            self.grid[y].fill(' ');
+                        }
+                        let end = self.col.saturating_add(1).min(self.cols);
+                        for x in 0..end {
+                            self.grid[r][x] = ' ';
+                        }
+                    }
+                    2 | 3 => self.clear_all(),
+                    _ => {}
+                }
+            }
+            'X' => {
+                let n = p1.max(1);
+                let start = self.col.min(self.cols);
+                let end = start.saturating_add(n).min(self.cols);
+                for x in start..end {
+                    self.grid[self.row][x] = ' ';
+                }
+            }
+            'L' => {
+                let n = p1.max(1).min(self.rows - self.row);
+                for _ in 0..n {
+                    self.grid.pop();
+                    self.grid.insert(self.row, vec![' '; self.cols]);
+                }
+            }
+            'M' => {
+                let n = p1.max(1).min(self.rows - self.row);
+                for _ in 0..n {
+                    self.grid.remove(self.row);
+                    self.grid.push(vec![' '; self.cols]);
+                }
+            }
+            's' => self.saved = (self.row, self.col),
+            'u' => {
+                self.row = self.saved.0.min(max_r);
+                self.col = self.saved.1.min(max_c);
+            }
+            _ => {}
+        }
+    }
+
+    fn text(&self) -> String {
+        let mut out = String::new();
+        for (idx, r) in self.grid.iter().enumerate() {
+            if idx > 0 {
+                out.push('\n');
+            }
+            let s: String = r.iter().collect();
+            out.push_str(s.trim_end());
+        }
+        out.trim().to_string()
+    }
 }
 
 /// `/usage` data: groups of models sharing a 5-hour and a weekly bucket, each with remaining_fraction and reset_time
@@ -1610,6 +2365,152 @@ mod tests {
         assert_eq!(q["windows"][2]["resetsAt"], "2026-11-13T03:16:47Z");
         assert!(q["note"].is_null());
         assert_eq!(antigravity_quota(&usage, &json!({"remaining_credits":250}))["note"], "AI 积分剩余 250");
+    }
+
+    #[test]
+    fn antigravity_tui_quota_parses_full_panel_and_credits() {
+        let usage = "\
+Models & Quota
+
+  Account: user@example.com
+
+GEMINI MODELS
+  Models within this group: Gemini 4 Neon, Gemini 4 Hydrogen, Orchestrator (Neon), Gemini 3.8 Flash
+
+  Weekly Limit Remaining
+    [███████████████████████████████████████████████░░░] 93.89%
+    Refreshes in 167h 37m
+
+  Five Hour Limit Remaining
+    [███████████████████████████████████████░░░░░░░░░░░] 78.44%
+    Refreshes in 4h 37m
+
+
+CLAUDE AND GPT MODELS
+  Models within this group: Claude Opus 5.5, Claude Sonnet 5.5, GPT-OSS 120B
+
+  Weekly Limit Remaining
+    [██████████████████████████████████████████████████] 100.00%
+    Quota available
+
+  Five Hour Limit Remaining
+    [██████████████████████████████████████████████████] 100.00%
+    Quota available
+
+
+GEMINI 4 ARGON
+  For paid Pro plans, Argon quota is separate. Higher Argon quota (included as part of the larger Gemini quota bucket) is available on Ultra plans.
+
+  Gemini 4 Argon Weekly Limit
+    [██████████████████████████████████████████████████] 100.00%
+    Quota available
+
+
+  │Within each group, models share a weekly limit and a 5-hour limit.
+  ↑/↓ Scroll · pgup/pgdown Page · ctrl+end Bottom · ctrl+home Top · esc Close";
+
+        let now = 1_700_000_000_000i64;
+        let disabled_credits = "Remaining AI Credits: AI Credits not enabled (enable in /settings)\n";
+        let q = antigravity_tui_quota(usage, Some(disabled_credits), now).unwrap();
+        assert_eq!(q["account"]["email"], "user@example.com");
+        assert!(q["note"].is_null());
+        let wins = q["windows"].as_array().unwrap();
+        assert_eq!(wins.len(), 5);
+        assert_eq!(wins[0]["label"], "Gemini 每周");
+        assert_eq!(wins[0]["usedPercent"], 6.1);
+        assert_eq!(wins[0]["resetsAt"], now + (167 * 3600 + 37 * 60) * 1000);
+        assert_eq!(wins[1]["label"], "Gemini 5 小时");
+        assert_eq!(wins[1]["usedPercent"], 21.6);
+        assert_eq!(wins[1]["resetsAt"], now + (4 * 3600 + 37 * 60) * 1000);
+        assert_eq!(wins[2]["label"], "Claude / GPT 每周");
+        assert_eq!(wins[2]["usedPercent"], 0.0);
+        assert!(wins[2]["resetsAt"].is_null());
+        assert_eq!(wins[3]["label"], "Claude / GPT 5 小时");
+        assert_eq!(wins[3]["usedPercent"], 0.0);
+        assert_eq!(wins[4]["label"], "Gemini 4 Argon 每周");
+        assert_eq!(wins[4]["usedPercent"], 0.0);
+
+        let with_credits = antigravity_tui_quota(usage, Some("Remaining AI Credits: 1,250.5\n"), now).unwrap();
+        assert_eq!(with_credits["note"], "AI 积分剩余 1250.50");
+        let zero_credits = antigravity_tui_quota(usage, Some("Remaining AI Credits: 0\n"), now).unwrap();
+        assert!(zero_credits["note"].is_null());
+    }
+
+    #[test]
+    fn antigravity_tui_quota_handles_exhausted_and_durations() {
+        let usage = "\
+Models & Quota
+
+GEMINI MODELS
+  Weekly Limit Remaining
+    [░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░] 0.00%
+    Quota exhausted
+    Refreshes in 2d 3h 15m
+
+  Five Hour Limit Remaining
+    [░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░] 0.00%
+    Resets in <1m
+  ↑/↓ Scroll · esc Close";
+        let now = 1_000_000_000_000i64;
+        let q = antigravity_tui_quota(usage, None, now).unwrap();
+        let wins = q["windows"].as_array().unwrap();
+        assert_eq!(wins.len(), 2);
+        assert_eq!(wins[0]["usedPercent"], 100.0);
+        assert_eq!(wins[0]["resetsAt"], now + ((2 * 86400 + 3 * 3600 + 15 * 60) * 1000));
+        assert_eq!(wins[1]["usedPercent"], 100.0);
+        assert_eq!(wins[1]["resetsAt"], now + 60_000);
+        assert_eq!(parse_refresh_duration_ms("Resets in 4h 9m 8s"), Some((4 * 3600 + 9 * 60 + 8) * 1000));
+    }
+
+    #[test]
+    fn term_screen_handles_bubble_tea_and_conpty_and_split_utf8() {
+        // 1. Bubble Tea relative cursor moves + spinner overwrite + split UTF-8 bytes
+        let mut scr = TermScreen::new(40, 120);
+        let raw = "\
+└ Models & Quota\r\n\
+\r\n\
+  Account: a@b.com\r\n\
+\r\n\
+  ⡿ Loading quota summary...\r\n\
+\x1b[1A\x1b[2K\rGEMINI MODELS\r\n\
+  Weekly Limit Remaining\n\x1b[20D[████░░░░░░] 40.00%\n\x1b[18DRefreshes in 45m\r\n\
+  ↑/↓ Scroll · esc Close\r\n";
+        for chunk in raw.as_bytes().chunks(5) {
+            scr.feed(chunk);
+        }
+        let text = scr.text();
+        let panel = extract_antigravity_usage_panel(&text).unwrap();
+        let q = antigravity_tui_quota(panel, None, 10_000).unwrap();
+        assert_eq!(q["account"]["email"], "a@b.com");
+        assert_eq!(q["windows"][0]["label"], "Gemini 每周");
+        assert_eq!(q["windows"][0]["usedPercent"], 60.0);
+        assert_eq!(q["windows"][0]["resetsAt"], 10_000 + 45 * 60_000);
+
+        // 2. Windows ConPTY style CUP positioning without '\n'
+        let mut conpty = TermScreen::new(20, 100);
+        conpty.feed(
+            b"\x1b[1;1HModels & Quota\
+              \x1b[3;1HCLAUDE AND GPT MODELS\
+              \x1b[4;3HFive Hour Limit Remaining\
+              \x1b[5;5H[##########] 75.50%\
+              \x1b[6;5HRefreshes in 2h 10m\
+              \x1b[8;3Hesc Close",
+        );
+        let ctext = conpty.text();
+        let cpanel = extract_antigravity_usage_panel(&ctext).unwrap();
+        let cq = antigravity_tui_quota(cpanel, None, 50_000).unwrap();
+        assert_eq!(cq["windows"][0]["label"], "Claude / GPT 5 小时");
+        assert_eq!(cq["windows"][0]["usedPercent"], 24.5);
+        assert_eq!(cq["windows"][0]["resetsAt"], 50_000 + (2 * 3600 + 10 * 60) * 1000);
+    }
+
+    #[test]
+    fn antigravity_eligibility_error_detection() {
+        assert!(is_antigravity_eligibility_error(
+            "Eligibility check failed: Your current account is not eligible for Antigravity, because it is not currently available in your location."
+        ));
+        assert!(is_antigravity_eligibility_error("not eligible for antigravity"));
+        assert!(!is_antigravity_eligibility_error("Authentication required"));
     }
 
     #[test]
