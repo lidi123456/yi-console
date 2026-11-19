@@ -180,6 +180,12 @@ struct State {
     /// Antigravity (`agy acp`): tracks asynchronous subagents and background tasks spawned in the current turn
     is_antigravity: bool,
     agy_pre_turn_steps: usize,
+    /// Active manual `/compact` turn on Antigravity (confirmed via a `CHECKPOINT` step in the transcript)
+    agy_compact: Option<AgyCompact>,
+    /// Last token count reported by ACP `usage_update` on Antigravity
+    agy_context_tokens: Option<u64>,
+    /// Transcript step indices of `CHECKPOINT` steps already turned into `EventBody::Compact`
+    agy_seen_checkpoints: HashSet<usize>,
     /// First possible wakeup step after the prompt or the last finished wakeup
     agy_wake_from: usize,
     /// Parent transcript step count known to be at or past agy's own ACP stream cursor
@@ -637,7 +643,8 @@ fn prompt(st: &mut State, em: &Emitter, p: &Prompt) -> Value {
 fn prompt_with_brain_dir(st: &mut State, em: &Emitter, p: &Prompt, brain_dir: Option<&std::path::Path>) -> Value {
     st.prompting = true;
     st.last_reply.clear();
-    st.compact_manual = p.text.trim().starts_with("/compact");
+    st.compact_manual = is_compact_command(&p.text);
+    st.agy_compact = None;
     st.turn_credits = 0.0;
     st.agy_pending_calls.clear();
     st.agy_send_baselines.clear();
@@ -673,6 +680,17 @@ fn prompt_with_brain_dir(st: &mut State, em: &Emitter, p: &Prompt, brain_dir: Op
         if let Some((prior, extra)) = split_compact(&p.text) {
             return cursor_compact_start(st, em, &prior, extra);
         }
+    }
+    if st.is_antigravity && st.compact_manual && !pre_steps.is_empty() {
+        let pre_tokens = agy_last_step_tokens(&pre_steps).or(st.agy_context_tokens);
+        st.agy_compact = Some(AgyCompact { started: now_ms(), pre_tokens });
+        em.event(EventBody::Compact {
+            phase: "start".into(),
+            trigger: Some("manual".into()),
+            pre_tokens: None,
+            post_tokens: None,
+            duration_ms: None,
+        });
     }
     let mut blocks = vec![];
     if !p.images.is_empty() {
@@ -1282,6 +1300,17 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Result<V
                     flush(st, em);
                     st.agy_replay = None;
                     st.agy_replay_hidden.clear();
+                    if let Some(m) = st.agy_compact.take() {
+                        st.compact_manual = false;
+                        let duration_ms = u64::try_from((now_ms() - m.started).max(0)).ok();
+                        em.event(EventBody::Compact {
+                            phase: "failed".into(),
+                            trigger: Some("manual".into()),
+                            pre_tokens: m.pre_tokens,
+                            post_tokens: None,
+                            duration_ms,
+                        });
+                    }
                     em.event(EventBody::Error { message: msg });
                     em.event(EventBody::TurnEnd {
                         stop_reason: Some("error".into()),
@@ -1534,8 +1563,9 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Result<V
                     st.agy_replay = None;
                     st.agy_replay_hidden.clear();
                     settle_agy_prompt_bg(st, em);
-                    let steps = &st.agy_parent_transcript.steps;
-                    st.agy_wake_from = agy_prompt_boundary(steps, st.agy_pre_turn_steps, &st.last_reply);
+                    let steps = st.agy_parent_transcript.steps.clone();
+                    settle_agy_compactions(st, spec, em, &steps);
+                    st.agy_wake_from = agy_prompt_boundary(&steps, st.agy_pre_turn_steps, &st.last_reply);
                     st.agy_last_streamed_steps = st.agy_wake_from;
                     steps.iter().skip(st.agy_wake_from).any(is_agy_wakeup)
                 } else {
@@ -1573,7 +1603,7 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Result<V
                         watch.detached = true;
                         // One pass right away, so tasks that already finished are picked up without waiting for a tick
                         let step = step_agy_watch(&mut watch, spec, em, &mut st.next_id, &mut st.pending);
-                        mark_watch_settled(st, &mut watch);
+                        mark_watch_settled(st, Some(spec), em, &mut watch);
                         st.prompting = false;
                         st.end_subagents();
                         // A wakeup already seen in this pass reopened the turn: that one ends it
@@ -2236,6 +2266,107 @@ fn new_session(st: &mut State, spec: &StartSpec) -> Value {
     st.req(Pending::Session, "session/new", json!({"cwd":cwd,"mcpServers":spec.mcp_servers}))
 }
 
+/// Antigravity manual `/compact` turn in progress
+struct AgyCompact {
+    started: i64,
+    pre_tokens: Option<u64>,
+}
+
+fn rearm_memory_notice(st: &mut State, spec: Option<&StartSpec>, em: &Emitter) {
+    if st.memory_enabled {
+        // Compaction may have summarized away the initial <yi-memory> block: re-arm a fresh snapshot
+        st.memory_notice = em
+            .memory_prompt_snapshot()
+            .map(|p| format!("<system-reminder>\n{p}\n</system-reminder>"))
+            .or_else(|| spec.and_then(super::acp_memory_reminder));
+    }
+}
+
+fn is_agy_checkpoint(step: &Value) -> bool {
+    step["type"].as_str() == Some("CHECKPOINT") && step["status"].as_str() == Some("DONE")
+}
+
+fn agy_step_input_tokens(step: &Value) -> Option<u64> {
+    let total = step["input_tokens"].as_u64().unwrap_or(0) + step["cache_read_tokens"].as_u64().unwrap_or(0);
+    (total > 0).then_some(total)
+}
+
+fn agy_step_total_tokens(step: &Value) -> Option<u64> {
+    let total = step["input_tokens"].as_u64().unwrap_or(0)
+        + step["cache_read_tokens"].as_u64().unwrap_or(0)
+        + step["output_tokens"].as_u64().unwrap_or(0);
+    (total > 0).then_some(total)
+}
+
+fn agy_last_step_tokens(steps: &[Value]) -> Option<u64> {
+    steps
+        .iter()
+        .rev()
+        .filter(|s| s["type"].as_str() == Some("PLANNER_RESPONSE"))
+        .find_map(agy_step_total_tokens)
+}
+
+fn agy_post_checkpoint_tokens(after: &[Value]) -> Option<u64> {
+    after
+        .iter()
+        .take_while(|s| !is_agy_checkpoint(s))
+        .filter(|s| s["type"].as_str() == Some("PLANNER_RESPONSE"))
+        .find_map(agy_step_input_tokens)
+}
+
+/// Inspect Antigravity transcript steps appended during this prompt for `CHECKPOINT` compaction steps
+/// (both manual `/compact` and automatic compaction) and settle any in-progress manual compaction
+fn settle_agy_compactions(st: &mut State, spec: &StartSpec, em: &Emitter, steps: &[Value]) {
+    let manual_started = st.agy_compact.take();
+    let is_manual_cmd = std::mem::take(&mut st.compact_manual);
+    let checkpoints: Vec<usize> = steps
+        .iter()
+        .enumerate()
+        .skip(st.agy_pre_turn_steps)
+        .filter(|(idx, step)| is_agy_checkpoint(step) && !st.agy_seen_checkpoints.contains(idx))
+        .map(|(idx, _)| idx)
+        .collect();
+    if !checkpoints.is_empty() {
+        let mut last_post = None;
+        for (pos, idx) in checkpoints.into_iter().enumerate() {
+            st.agy_seen_checkpoints.insert(idx);
+            let step = &steps[idx];
+            let manual = pos == 0 && (is_manual_cmd || manual_started.is_some());
+            let pre_tokens = agy_last_step_tokens(&steps[..idx])
+                .or_else(|| (pos == 0).then(|| manual_started.as_ref().and_then(|m| m.pre_tokens)).flatten())
+                .or_else(|| agy_step_input_tokens(step));
+            let post_tokens = agy_post_checkpoint_tokens(&steps[idx + 1..]);
+            last_post = post_tokens;
+            let duration_ms = (pos == 0)
+                .then(|| manual_started.as_ref().and_then(|m| u64::try_from((now_ms() - m.started).max(0)).ok()))
+                .flatten();
+            em.event(EventBody::Compact {
+                phase: "done".into(),
+                trigger: Some(if manual { "manual" } else { "auto" }.into()),
+                pre_tokens,
+                post_tokens,
+                duration_ms,
+            });
+        }
+        rearm_memory_notice(st, Some(spec), em);
+        // Bare `/compact` emits only the summarizer call's pre-compact `usage_update` with no follow-up turn.
+        // Clear the gauge so the UI and Bot auto-compact don't see stale pre-compaction context usage.
+        if last_post.is_none() {
+            st.agy_context_tokens = None;
+            em.context(0.0);
+        }
+    } else if let Some(m) = manual_started {
+        let duration_ms = u64::try_from((now_ms() - m.started).max(0)).ok();
+        em.event(EventBody::Compact {
+            phase: "failed".into(),
+            trigger: Some("manual".into()),
+            pre_tokens: m.pre_tokens,
+            post_tokens: None,
+            duration_ms,
+        });
+    }
+}
+
 /// Cursor's emulated /compact in progress
 #[derive(Default)]
 struct CursorCompact {
@@ -2611,10 +2742,13 @@ fn update(st: &mut State, em: &Emitter, u: &Value) {
                 }
             }
         }
-        // Standard ACP context usage (CodeBuddy sends it, with this turn's credit cost in cost.amount)
+        // Standard ACP context usage (CodeBuddy and Antigravity send it, with this turn's credit cost in cost.amount)
         "usage_update" => {
             if let (Some(used), Some(size)) = (u["used"].as_f64(), u["size"].as_f64().filter(|s| *s > 0.0)) {
                 if used > 0.0 {
+                    if st.is_antigravity {
+                        st.agy_context_tokens = Some(used.round() as u64);
+                    }
                     em.context(used / size * 100.0);
                 }
             }
@@ -3682,6 +3816,7 @@ struct AgyWatch {
     wake: bool,
     wake_failed: bool,
     emitted_wake_text: bool,
+    compacted: bool,
     unresumed_items: VecDeque<AgyWakeReplayItem>,
     out: AgyOut,
     settled_tc_ids: Vec<String>,
@@ -3727,6 +3862,7 @@ impl AgyWatch {
             wake: false,
             wake_failed: false,
             emitted_wake_text: false,
+            compacted: false,
             unresumed_items: VecDeque::new(),
             out: vec![],
             settled_tc_ids: vec![],
@@ -4004,17 +4140,20 @@ fn carry_agy_watch(st: &mut State, em: &Emitter) {
     st.agy_carry.unresumed_items.extend(watch.unresumed_items.drain(..));
     finish_agy_watch(&mut watch);
     watch.flush_out(em);
-    mark_watch_settled(st, &mut watch);
+    mark_watch_settled(st, None, em, &mut watch);
     em.watch_active(false);
     em.background_tasks(current_agy_tasks(st));
 }
 
-fn mark_watch_settled(st: &mut State, watch: &mut AgyWatch) {
+fn mark_watch_settled(st: &mut State, spec: Option<&StartSpec>, em: &Emitter, watch: &mut AgyWatch) {
     for id in watch.settled_tc_ids.drain(..) {
         if let Some(t) = st.tools.get_mut(&id) {
             t.done = true;
         }
         st.agy_open_bg_calls.retain(|(x, _)| x != &id);
+    }
+    if std::mem::take(&mut watch.compacted) {
+        rearm_memory_notice(st, spec, em);
     }
 }
 
@@ -4250,7 +4389,7 @@ fn poll_agy_watch(st: &mut State, spec: &StartSpec, em: &Emitter) -> Option<Valu
         watch.reopened |= watch.detached;
     }
     let step = step_agy_watch(&mut watch, spec, em, &mut st.next_id, &mut st.pending);
-    mark_watch_settled(st, &mut watch);
+    mark_watch_settled(st, Some(spec), em, &mut watch);
     match step {
         AgyStep::Wait => {
             st.agy_watch = Some(watch);
@@ -4599,6 +4738,24 @@ fn step_agy_watch_inner(watch: &mut AgyWatch, spec: &StartSpec, next_id: &mut u6
                         }
                     }
                     true
+                }
+                "CHECKPOINT" => {
+                    if is_agy_checkpoint(step) {
+                        let pre_tokens = agy_last_step_tokens(&parent_steps[..step_idx])
+                            .or_else(|| agy_step_input_tokens(step));
+                        let post_tokens = agy_post_checkpoint_tokens(&parent_steps[step_idx + 1..]);
+                        watch.out.push(EventBody::Compact {
+                            phase: "done".into(),
+                            trigger: Some("auto".into()),
+                            pre_tokens,
+                            post_tokens,
+                            duration_ms: None,
+                        });
+                        watch.compacted = true;
+                        true
+                    } else {
+                        false
+                    }
                 }
                 "SYSTEM_MESSAGE" => false,
                 _ => false,
@@ -6702,5 +6859,209 @@ mod model_config_tests {
         assert!(guard.consume_tool("run_command", &json!({"CommandLine":"git diff"})), "skipped parallel tool must still match once");
         // Each historical tool can only be consumed once
         assert!(!guard.consume_tool("run_command", &json!({"CommandLine":"git diff"})));
+    }
+
+    fn write_agy_transcript(brain_dir: &std::path::Path, sid: &str, steps: &[Value]) {
+        let logs = brain_dir.join(sid).join(".system_generated").join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        let body = steps.iter().map(|s| serde_json::to_string(s).unwrap()).collect::<Vec<_>>().join("\n");
+        std::fs::write(logs.join("transcript_full.jsonl"), format!("{body}\n")).unwrap();
+    }
+
+    #[test]
+    fn antigravity_manual_compact_emits_progress_resets_context_and_rearms_memory() {
+        let root = tempfile::tempdir().unwrap();
+        let sid = "agy-compact-manual-bare";
+        let pre = vec![
+            json!({"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","content":"<USER_REQUEST>\nhi\n</USER_REQUEST>"}),
+            json!({"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","input_tokens":12989,"cache_read_tokens":0,"output_tokens":23,"content":"OK"}),
+        ];
+        write_agy_transcript(root.path(), sid, &pre);
+
+        let (hub, em, _rx) = crate::hub::test_emitter();
+        crate::hub::test_set_tool(&hub, "s", ToolKind::Antigravity);
+        let mut spec = agy_test_spec();
+        spec.memory_prompt = Some("<yi-memory>facts</yi-memory>".into());
+        let mut st = State {
+            is_antigravity: true,
+            memory_enabled: true,
+            session_id: Some(sid.into()),
+            ..Default::default()
+        };
+
+        let req = prompt_with_brain_dir(&mut st, &em, &Prompt { text: "/compact".into(), images: vec![] }, Some(root.path()));
+        assert_eq!(req["params"]["prompt"][0]["text"], "/compact");
+        assert!(st.agy_compact.is_some());
+
+        // During bare /compact, agy emits usage_update for the summarizer LLM call (pre-compact size)
+        update(&mut st, &em, &json!({"sessionUpdate":"usage_update","used":14474,"size":1048576}));
+        assert!(hub.info("s").unwrap().context_percent.unwrap() > 1.0);
+
+        let mut post = pre.clone();
+        post.push(json!({"step_index":2,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","content":"<USER_REQUEST>\n/compact\n</USER_REQUEST>"}));
+        post.push(json!({"step_index":3,"source":"SYSTEM","type":"CHECKPOINT","status":"DONE","input_tokens":2990,"cache_read_tokens":10932,"output_tokens":552,"content":"# Resuming from a compaction"}));
+        st.agy_parent_transcript.steps = std::sync::Arc::new(post);
+
+        handle(&mut st, &spec, &json!({"id":req["id"],"result":{"stopReason":"end_turn"}}), &em).unwrap();
+        assert!(st.agy_compact.is_none());
+        assert_eq!(hub.info("s").unwrap().context_percent, Some(0.0), "bare /compact resets stale summarizer context %");
+        assert!(
+            st.memory_notice.as_deref().is_some_and(|n| n.contains("<system-reminder>") && n.contains("<yi-memory")),
+            "memory notice must re-arm: {:?}",
+            st.memory_notice
+        );
+
+        let compacts: Vec<_> = hub.store.events_since("s", 0, 100).unwrap().into_iter().filter_map(|e| match e.body {
+            EventBody::Compact { phase, trigger, pre_tokens, post_tokens, duration_ms } => Some((phase, trigger, pre_tokens, post_tokens, duration_ms.is_some())),
+            _ => None,
+        }).collect();
+        assert_eq!(compacts, vec![
+            ("start".into(), Some("manual".into()), None, None, false),
+            ("done".into(), Some("manual".into()), Some(13012), None, true),
+        ]);
+    }
+
+    #[test]
+    fn antigravity_manual_compact_with_instructions_keeps_post_tokens_and_context() {
+        let root = tempfile::tempdir().unwrap();
+        let sid = "agy-compact-manual-extra";
+        let pre = vec![
+            json!({"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","content":"<USER_REQUEST>\nRemember BANANA\n</USER_REQUEST>"}),
+            json!({"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","input_tokens":12996,"cache_read_tokens":0,"output_tokens":25,"content":"OK"}),
+        ];
+        write_agy_transcript(root.path(), sid, &pre);
+
+        let (hub, em, _rx) = crate::hub::test_emitter();
+        crate::hub::test_set_tool(&hub, "s", ToolKind::Antigravity);
+        let spec = agy_test_spec();
+        let mut st = State { is_antigravity: true, session_id: Some(sid.into()), ..Default::default() };
+
+        let req = prompt_with_brain_dir(&mut st, &em, &Prompt { text: "/compact keep BANANA".into(), images: vec![] }, Some(root.path()));
+        update(&mut st, &em, &json!({"sessionUpdate":"usage_update","used":14325,"size":1048576}));
+        update(&mut st, &em, &json!({"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Context compacted."}}));
+        update(&mut st, &em, &json!({"sessionUpdate":"usage_update","used":13440,"size":1048576}));
+
+        let mut post = pre.clone();
+        post.push(json!({"step_index":2,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","content":"<USER_REQUEST>\n/compact keep BANANA\n</USER_REQUEST>"}));
+        post.push(json!({"step_index":3,"source":"SYSTEM","type":"CHECKPOINT","status":"DONE","input_tokens":2998,"cache_read_tokens":10939,"output_tokens":388,"content":"# Resuming from a compaction"}));
+        post.push(json!({"step_index":4,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","input_tokens":13371,"cache_read_tokens":0,"output_tokens":69,"content":"Context compacted."}));
+        st.agy_parent_transcript.steps = std::sync::Arc::new(post);
+
+        handle(&mut st, &spec, &json!({"id":req["id"],"result":{"stopReason":"end_turn"}}), &em).unwrap();
+        let pct = hub.info("s").unwrap().context_percent.unwrap();
+        assert_eq!(pct, 1.3, "post-checkpoint usage_update must be preserved (13440 / 1048576 -> 1.3%)");
+
+        let compacts: Vec<_> = hub.store.events_since("s", 0, 100).unwrap().into_iter().filter_map(|e| match e.body {
+            EventBody::Compact { phase, trigger, pre_tokens, post_tokens, .. } => Some((phase, trigger, pre_tokens, post_tokens)),
+            _ => None,
+        }).collect();
+        assert_eq!(compacts, vec![
+            ("start".into(), Some("manual".into()), None, None),
+            ("done".into(), Some("manual".into()), Some(13021), Some(13371)),
+        ]);
+    }
+
+    #[test]
+    fn antigravity_compact_empty_session_and_failure_paths() {
+        let root = tempfile::tempdir().unwrap();
+        let spec = agy_test_spec();
+
+        // 1. Empty session: no pre-turn history, agy replies normally without writing a CHECKPOINT
+        let (hub, em, _rx) = crate::hub::test_emitter();
+        crate::hub::test_set_tool(&hub, "s", ToolKind::Antigravity);
+        let mut st = State { is_antigravity: true, session_id: Some("agy-empty".into()), ..Default::default() };
+        let req = prompt_with_brain_dir(&mut st, &em, &Prompt { text: "/compact".into(), images: vec![] }, Some(root.path()));
+        assert!(st.agy_compact.is_none(), "empty session must not emit a fake compact start");
+        st.agy_parent_transcript.steps = std::sync::Arc::new(vec![
+            json!({"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","content":"/compact"}),
+            json!({"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","content":"Nothing to compact yet."}),
+        ]);
+        handle(&mut st, &spec, &json!({"id":req["id"],"result":{"stopReason":"end_turn"}}), &em).unwrap();
+        assert!(hub.store.events_since("s", 0, 100).unwrap().iter().all(|e| !matches!(e.body, EventBody::Compact { .. })));
+
+        // 2. Non-empty session where /compact fails (error, cancelled, or end_turn with no CHECKPOINT)
+        let sid = "agy-fail";
+        let pre = vec![
+            json!({"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","content":"hi"}),
+            json!({"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","input_tokens":5000,"cache_read_tokens":0,"output_tokens":50,"content":"OK"}),
+        ];
+        write_agy_transcript(root.path(), sid, &pre);
+        for resp in [
+            json!({"error":{"code":-32603,"message":"Internal error"}}),
+            json!({"result":{"stopReason":"cancelled"}}),
+            json!({"result":{"stopReason":"end_turn"}}),
+        ] {
+            let (hub, em, _rx) = crate::hub::test_emitter();
+            crate::hub::test_set_tool(&hub, "s", ToolKind::Antigravity);
+            let mut st = State { is_antigravity: true, session_id: Some(sid.into()), ..Default::default() };
+            let req = prompt_with_brain_dir(&mut st, &em, &Prompt { text: "/compact".into(), images: vec![] }, Some(root.path()));
+            st.agy_parent_transcript.steps = std::sync::Arc::new(pre.clone());
+            let mut msg = resp.clone();
+            msg["id"] = req["id"].clone();
+            handle(&mut st, &spec, &msg, &em).unwrap();
+            assert!(st.agy_compact.is_none());
+            let compacts: Vec<_> = hub.store.events_since("s", 0, 100).unwrap().into_iter().filter_map(|e| match e.body {
+                EventBody::Compact { phase, trigger, pre_tokens, .. } => Some((phase, trigger, pre_tokens)),
+                _ => None,
+            }).collect();
+            assert_eq!(compacts, vec![
+                ("start".into(), Some("manual".into()), None),
+                ("failed".into(), Some("manual".into()), Some(5050)),
+            ], "failed response: {resp}");
+        }
+    }
+
+    #[test]
+    fn antigravity_auto_compaction_in_prompt_and_wakeup() {
+        let root = tempfile::tempdir().unwrap();
+        let mut spec = agy_test_spec();
+        spec.memory_prompt = Some("<yi-memory>memo</yi-memory>".into());
+
+        // 1. Auto-compaction during a normal prompt turn
+        let sid = "agy-auto-prompt";
+        let pre = vec![
+            json!({"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","content":"start"}),
+            json!({"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","input_tokens":180000,"cache_read_tokens":20000,"output_tokens":500,"content":"working"}),
+        ];
+        write_agy_transcript(root.path(), sid, &pre);
+        let (hub, em, _rx) = crate::hub::test_emitter();
+        crate::hub::test_set_tool(&hub, "s", ToolKind::Antigravity);
+        let mut st = State { is_antigravity: true, memory_enabled: true, session_id: Some(sid.into()), ..Default::default() };
+        let req = prompt_with_brain_dir(&mut st, &em, &Prompt { text: "continue".into(), images: vec![] }, Some(root.path()));
+        let mut post = pre.clone();
+        post.push(json!({"step_index":2,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","content":"continue"}));
+        post.push(json!({"step_index":3,"source":"SYSTEM","type":"CHECKPOINT","status":"DONE","input_tokens":5000,"cache_read_tokens":190000,"output_tokens":1200,"content":"# Resuming from a compaction"}));
+        post.push(json!({"step_index":4,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","input_tokens":15000,"cache_read_tokens":9000,"output_tokens":200,"content":"done"}));
+        st.agy_parent_transcript.steps = std::sync::Arc::new(post);
+        handle(&mut st, &spec, &json!({"id":req["id"],"result":{"stopReason":"end_turn"}}), &em).unwrap();
+        assert!(st.memory_notice.as_deref().is_some_and(|n| n.contains("<system-reminder>") && n.contains("<yi-memory")));
+        let compacts: Vec<_> = hub.store.events_since("s", 0, 100).unwrap().into_iter().filter_map(|e| match e.body {
+            EventBody::Compact { phase, trigger, pre_tokens, post_tokens, .. } => Some((phase, trigger, pre_tokens, post_tokens)),
+            _ => None,
+        }).collect();
+        assert_eq!(compacts, vec![("done".into(), Some("auto".into()), Some(200500), Some(24000))]);
+
+        // 2. Auto-compaction during an AgyWatch parent wakeup turn
+        let wsid = "agy-auto-wakeup";
+        let wake_steps = vec![
+            json!({"step_index":0,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","input_tokens":150000,"cache_read_tokens":0,"output_tokens":100,"content":"waiting"}),
+            json!({"step_index":1,"source":"SYSTEM","type":"SYSTEM_MESSAGE","status":"DONE","content":"<SYSTEM_MESSAGE>\n[Message] sender=sub-1 content=finished\n</SYSTEM_MESSAGE>"}),
+            json!({"step_index":2,"source":"SYSTEM","type":"CHECKPOINT","status":"DONE","input_tokens":4000,"cache_read_tokens":145000,"output_tokens":800,"content":"# Resuming from a compaction"}),
+            json!({"step_index":3,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","input_tokens":22000,"cache_read_tokens":0,"output_tokens":50,"content":"All done."}),
+        ];
+        write_agy_transcript(root.path(), wsid, &wake_steps);
+        let (hub, em, _rx) = crate::hub::test_emitter();
+        crate::hub::test_set_tool(&hub, "s", ToolKind::Antigravity);
+        let mut st = State { is_antigravity: true, memory_enabled: true, session_id: Some(wsid.into()), ..Default::default() };
+        let mut watch = AgyWatch::new(wsid.into(), root.path().to_path_buf(), 0, 1, Some("end_turn".into()), HashMap::new(), HashMap::new(), true);
+        watch.detached = true;
+        st.agy_watch = Some(watch);
+        let _ = poll_agy_watch(&mut st, &spec, &em);
+        assert!(st.memory_notice.as_deref().is_some_and(|n| n.contains("<system-reminder>") && n.contains("<yi-memory")));
+        let compacts: Vec<_> = hub.store.events_since("s", 0, 100).unwrap().into_iter().filter_map(|e| match e.body {
+            EventBody::Compact { phase, trigger, pre_tokens, post_tokens, .. } => Some((phase, trigger, pre_tokens, post_tokens)),
+            _ => None,
+        }).collect();
+        assert_eq!(compacts, vec![("done".into(), Some("auto".into()), Some(150100), Some(22000))]);
     }
 }

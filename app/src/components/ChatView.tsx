@@ -134,7 +134,7 @@ function desktopStatus(ev?: GatewayEvent) {
   return null;
 }
 
-/** hideCompactCmd: when the tool reports compaction progress (Claude, Codex, Cursor's emulated one), don't show the user's "/compact" bubble */
+/** hideCompactCmd: when the tool reports compaction progress (Claude, Codex, Cursor's emulated one, Antigravity), don't show the user's "/compact" bubble */
 function buildItems(events: HubEvent[], hideCompactCmd = false): Item[] {
   const items: Item[] = [];
   const tools = new Map<string, Item & { k: 'tool' }>();
@@ -1932,7 +1932,7 @@ export function ChatView({
   /** Async questions (by id) the user skipped */
   skippedAsks?: string[];
 }) {
-  const hideCompactCmd = info?.tool === 'claude' || info?.tool === 'codex' || info?.tool === 'cursor';
+  const hideCompactCmd = info?.tool === 'claude' || info?.tool === 'codex' || info?.tool === 'cursor' || info?.tool === 'antigravity';
   const [, lang] = useLang();
   const items = useMemo(() => buildItems(events, hideCompactCmd), [events, events.length, hideCompactCmd, lang]);
   const [limit, setLimit] = useState(PAGE);
