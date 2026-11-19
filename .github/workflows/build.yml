@@ -124,7 +124,7 @@ jobs:
         with:
           workspaces: |
             app/src-tauri
-            plugins
+            connectors
           key: ${{ matrix.target }}
       - uses: actions/setup-node@v5
         with:
@@ -153,12 +153,12 @@ jobs:
       - name: prepare macOS Computer Use driver
         if: runner.os == 'macOS'
         run: python3 scripts/prepare-computer-use.py --macos app/src-tauri/resources/yi-agentd/computer-use-macos.tgz
-      # Feishu / GitHub plugins ship with the desktop app (loaded from resources/plugins)
-      - name: bundle plugins
+      # Feishu / GitHub connectors ship with the desktop app (loaded from resources/connectors)
+      - name: bundle connectors
         shell: bash
         run: |
           if [ "$RUNNER_OS" = Windows ]; then py=python; else py=python3; fi
-          "$py" scripts/bundle-plugins.py
+          "$py" scripts/bundle-connectors.py
       - run: npm ci
         working-directory: app
       # Updater bundles (NSIS setup / .app.tar.gz / AppImage plus .sig) need the updater signing key; releases must have it,

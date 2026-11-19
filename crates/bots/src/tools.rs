@@ -31,7 +31,7 @@ pub fn bot_tools() -> Vec<Value> {
                 "event_ids": {"type": "array", "items": {"type": "string"}, "description": "Events this task handles; may be empty when the owner asked in this session directly"},
                 "title": {"type": "string", "description": "Short title shown in the sidebar"},
                 "request": {"type": "string", "description": "Only when the owner asked in this session directly: their request as they wrote it when it stands on its own; when it came out of your conversation (answers, a confirmed plan), written out with every fact and decision so a task that never saw the conversation can act on it"},
-                "kind": {"type": "string", "enum": ["work", "plugin"], "description": "plugin: build a Yi Console plugin with the plugin SDK (always runs in scratch; workspace, cwd and mode are ignored). Default: work"},
+                "kind": {"type": "string", "enum": ["work", "connector"], "description": "connector: build a Yi Console connector with the connector SDK (always runs in scratch; workspace, cwd and mode are ignored). Default: work"},
                 "note": {"type": "string", "description": "At most 30 words of routing information; never an implementation plan"},
                 "ack": {"type": "string", "description": "With event_ids: one sentence for the requester, sent to the event's conversation as the task is created; names the object and the expected result"},
                 "mode": {"type": "string", "enum": ["worktree", "repo", "scratch"], "description": "Isolation mode: worktree (own git worktree and branch, for changing files in a repo), repo (read-only in the project directory), or scratch (dedicated empty directory, no repo). Default: worktree when a workspace/cwd is used, scratch otherwise"},
@@ -92,7 +92,7 @@ pub fn bot_tools() -> Vec<Value> {
         ),
         tool(
             "reply",
-            "Answer in an event's conversation, through the plugin it came from.",
+            "Answer in an event's conversation, through the connector it came from.",
             json!({"event_id": {"type": "string"}, "text": {"type": "string"}}),
             &["event_id", "text"],
         ),
@@ -109,10 +109,10 @@ pub fn bot_tools() -> Vec<Value> {
             json!({"event_id": {"type": "string"}, "cursor": {"type": "string"}}),
             &["event_id"],
         ),
-        tool("plugin_tools", "Tools offered by the plugin instances this Bot uses.", json!({}), &[]),
+        tool("connector_tools", "Tools offered by the connector instances this Bot uses.", json!({}), &[]),
         tool(
-            "plugin_call",
-            "Run a plugin tool listed by plugin_tools.",
+            "connector_call",
+            "Run a connector tool listed by connector_tools.",
             json!({
                 "instance": {"type": "string"},
                 "name": {"type": "string"},
@@ -179,11 +179,11 @@ pub fn bot_tools() -> Vec<Value> {
             json!({"host": {"type": "string"}, "tool": {"type": "string"}}),
             &["host", "tool"],
         ),
-        tool("list_plugins", "Installed plugins: capabilities, permissions and the JSON schema of their configuration.", json!({}), &[]),
-        tool("list_instances", "Configured plugin instances. Secret values show as ********.", json!({}), &[]),
+        tool("list_connectors", "Installed plugins: capabilities, permissions and the JSON schema of their configuration.", json!({}), &[]),
+        tool("list_instances", "Configured connector instances. Secret values show as ********.", json!({}), &[]),
         tool(
             "request_secret",
-            "Ask the owner to enter or replace secrets (tokens, keys) of a plugin instance you use, e.g. when its token \
+            "Ask the owner to enter or replace secrets (tokens, keys) of a connector instance you use, e.g. when its token \
              was refused. They get a card in this session; the value goes straight into the configuration and you never see it.",
             json!({
                 "instance_id": {"type": "string"},
@@ -193,9 +193,9 @@ pub fn bot_tools() -> Vec<Value> {
             &["instance_id", "reason"],
         ),
         tool(
-            "propose_plugin",
-            "Submit a plugin a task built, after you checked it, for the owner to review and install: a .yiplugin file or a \
-             folder with plugin.json and the component, on the task's host (relative paths start at the task's directory). \
+            "propose_connector",
+            "Submit a connector a task built, after you checked it, for the owner to review and install: a .yiconnector file or a \
+             folder with connector.json and the component, on the task's host (relative paths start at the task's directory). \
              Nothing is installed until the owner confirms its permissions.",
             json!({"task_id": {"type": "string"}, "path": {"type": "string"}}),
             &["task_id", "path"],
@@ -204,7 +204,7 @@ pub fn bot_tools() -> Vec<Value> {
 }
 
 /// Bot tools that only look things up for a configuration change
-pub const SETUP_TOOLS: [&str; 5] = ["list_hosts", "list_tools", "list_models", "list_plugins", "list_instances"];
+pub const SETUP_TOOLS: [&str; 5] = ["list_hosts", "list_tools", "list_models", "list_connectors", "list_instances"];
 
 pub fn task_tools() -> Vec<Value> {
     vec![
@@ -242,10 +242,10 @@ pub fn task_tools() -> Vec<Value> {
             &["event_id"],
         ),
         tool(
-            "plugin_kit",
-            "Build a Yi Console plugin (a task spawned with kind plugin): write the plugin SDK, the WIT interface, an \
-             example plugin and the author guide into a folder, as a cargo workspace to build the plugin in.",
-            json!({"dir": {"type": "string", "description": "Target folder, absolute or relative to this task's directory (default: yi-plugin-kit)"}}),
+            "connector_kit",
+            "Build a Yi Console connector (a task spawned with kind connector): write the connector SDK, the WIT interface, an \
+             example connector and the author guide into a folder, as a cargo workspace to build the connector in.",
+            json!({"dir": {"type": "string", "description": "Target folder, absolute or relative to this task's directory (default: yi-connector-kit)"}}),
             &[],
         ),
     ]
@@ -259,7 +259,7 @@ pub fn draft() -> Value {
     let tool = json!({"type": "string", "enum": crate::config::AI_TOOLS});
     json!({
         "type": "object",
-        "description": "A Bot configuration (get_bot returns the same shape). Leave id empty for a new Bot. Plugin \
+        "description": "A Bot configuration (get_bot returns the same shape). Leave id empty for a new Bot. Connector \
                         instances to create are referenced by their ref (\"new:...\") in triggers, notify and allow. \
                         Only the fields below exist; validate rejects any other.",
         "additionalProperties": false,
@@ -315,7 +315,7 @@ pub fn draft() -> Value {
                     "keepDays": {"type": "integer", "description": "Days an ended task keeps its session before it is cleaned up; 0 means forever (default 7)"},
                 },
             },
-            "triggers": strings("Plugin instance ids or new: refs whose events the Bot handles"),
+            "triggers": strings("Connector instance ids or new: refs whose events the Bot handles"),
             "notify": strings("Where reminders go: \"app\" (desktop notification) and/or instance ids / new: refs with the notify capability"),
             "mcp": {
                 "type": "object",
@@ -323,7 +323,7 @@ pub fn draft() -> Value {
                 "properties": {"bot": strings("MCP server names for the Bot session"), "task": strings("MCP server names for tasks")},
             },
             "accept": {"type": "string", "enum": ["off", "observe", "auto"], "description": "off: events are only recorded; observe (default for new Bots): the Bot decides but only records what it would do; auto: carried out"},
-            "ambient": {"type": "string", "enum": ["record", "deliver"], "description": "Plugin events neither addressed to the Bot nor from an allowed sender (group chatter): record (default) keeps them out of your conversation, you can still read them with read_thread; deliver brings them to you like other events"},
+            "ambient": {"type": "string", "enum": ["record", "deliver"], "description": "Connector events neither addressed to the Bot nor from an allowed sender (group chatter): record (default) keeps them out of your conversation, you can still read them with read_thread; deliver brings them to you like other events"},
             "allow": {
                 "type": "array",
                 "description": "Senders whose explicit requests run in auto mode, per instance",
@@ -365,12 +365,12 @@ pub fn draft() -> Value {
                 "additionalProperties": false,
                 "properties": {
                     "reply": {"type": "boolean", "description": "Replies into conversations"},
-                    "write": {"type": "boolean", "description": "Plugin tool calls that change something"},
+                    "write": {"type": "boolean", "description": "Connector tool calls that change something"},
                 },
             },
             "activeHours": {
                 "type": ["object", "null"],
-                "description": "Plugin events outside these hours wait until they start (routines, task reports and the owner are not affected); null: always active",
+                "description": "Connector events outside these hours wait until they start (routines, task reports and the owner are not affected); null: always active",
                 "additionalProperties": false,
                 "required": ["start", "end"],
                 "properties": {
@@ -435,49 +435,49 @@ pub fn unknown_keys(schema: &Value, v: &Value, path: &str, out: &mut Vec<String>
 fn new_instances() -> Value {
     json!({
         "type": "array",
-        "description": "Plugin instances to create along with the change. Secret fields stay empty: the owner fills them in.",
+        "description": "Connector instances to create along with the change. Secret fields stay empty: the owner fills them in.",
         "items": {
             "type": "object",
             "properties": {
                 "ref": {"type": "string", "description": "\"new:\" plus a short name, used in triggers / notify / allow in place of the id"},
-                "pluginId": {"type": "string"},
+                "connectorId": {"type": "string"},
                 "name": {"type": "string"},
-                "config": {"type": "object", "description": "Values for the plugin's config schema, secrets left out"},
+                "config": {"type": "object", "description": "Values for the connector's config schema, secrets left out"},
             },
-            "required": ["ref", "pluginId", "config"],
+            "required": ["ref", "connectorId", "config"],
         },
     })
 }
 
-/// Files of the plugin kit (the task tool `plugin_kit`): a cargo workspace with the SDK and an example, relative path → content
-pub fn plugin_kit() -> Vec<(&'static str, String)> {
-    let example = include_str!("../../../plugins/testkit/Cargo.toml")
-        .replace("name = \"yi-plugin-testkit\"", "name = \"yi-plugin-example\"")
+/// Files of the connector kit (the task tool `connector_kit`): a cargo workspace with the SDK and an example, relative path → content
+pub fn connector_kit() -> Vec<(&'static str, String)> {
+    let example = include_str!("../../../connectors/testkit/Cargo.toml")
+        .replace("name = \"yi-connector-testkit\"", "name = \"yi-connector-example\"")
         .replace(
-            "Yi Console plugin used by the end-to-end tests: talks to a local mock server and exercises the sandbox",
-            "Example plugin: polls a chat server, replies, offers tools",
+            "Yi Console connector used by the end-to-end tests: talks to a local mock server and exercises the sandbox",
+            "Example connector: polls a chat server, replies, offers tools",
         );
     vec![
         (
             "Cargo.toml",
-            "# Yi Console plugin kit. Build a plugin: cargo build --release --target wasm32-wasip2 -p <crate>\n\
-             # (once: rustup target add wasm32-wasip2). Add new plugins to `members`.\n\
+            "# Yi Console connector kit. Build a connector: cargo build --release --target wasm32-wasip2 -p <crate>\n\
+             # (once: rustup target add wasm32-wasip2). Add new connectors to `members`.\n\
              [workspace]\nresolver = \"2\"\nmembers = [\"sdk\", \"example\"]\n\n\
              [workspace.package]\nversion = \"0.1.0\"\nedition = \"2021\"\nlicense = \"MIT\"\n\n\
-             [workspace.dependencies]\nyi-plugin = { path = \"sdk\" }\n\
+             [workspace.dependencies]\nyi-connector = { path = \"sdk\" }\n\
              wit-bindgen = { version = \"0.63\", default-features = false, features = [\"macros\", \"realloc\", \"std\", \"bitflags\"] }\n\
              serde = { version = \"1\", features = [\"derive\"] }\nserde_json = \"1\"\n\n\
              [profile.release]\nopt-level = \"s\"\nlto = true\nstrip = true\ncodegen-units = 1\n"
                 .to_string(),
         ),
-        ("GUIDE.md", include_str!("../../../docs/plugins.en.md").to_string()),
-        ("wit/yi-plugin.wit", include_str!("../../../plugins/wit/yi-plugin.wit").to_string()),
-        ("sdk/Cargo.toml", include_str!("../../../plugins/sdk/Cargo.toml").to_string()),
-        ("sdk/src/lib.rs", include_str!("../../../plugins/sdk/src/lib.rs").to_string()),
+        ("GUIDE.md", include_str!("../../../docs/connectors.en.md").to_string()),
+        ("wit/yi-connector.wit", include_str!("../../../connectors/wit/yi-connector.wit").to_string()),
+        ("sdk/Cargo.toml", include_str!("../../../connectors/sdk/Cargo.toml").to_string()),
+        ("sdk/src/lib.rs", include_str!("../../../connectors/sdk/src/lib.rs").to_string()),
         ("example/Cargo.toml", example),
-        ("example/plugin.json", include_str!("../../../plugins/testkit/plugin.json").replace("\"testkit\"", "\"example\"")),
-        ("example/prompt.md", include_str!("../../../plugins/testkit/prompt.md").to_string()),
-        ("example/src/lib.rs", include_str!("../../../plugins/testkit/src/lib.rs").to_string()),
+        ("example/connector.json", include_str!("../../../connectors/testkit/connector.json").replace("\"testkit\"", "\"example\"")),
+        ("example/prompt.md", include_str!("../../../connectors/testkit/prompt.md").to_string()),
+        ("example/src/lib.rs", include_str!("../../../connectors/testkit/src/lib.rs").to_string()),
     ]
 }
 
@@ -534,19 +534,19 @@ mod tests {
     }
 
     #[test]
-    fn bots_change_their_config_but_only_propose_plugins() {
+    fn bots_change_their_config_but_only_propose_connectors() {
         let names = |v: Vec<Value>| v.iter().map(|t| t["name"].as_str().unwrap().to_string()).collect::<Vec<_>>();
         let bot = names(bot_tools());
-        assert!(["get_config", "update_config", "propose_plugin", "accept_ready", "memory_list", "memory_save", "memory_delete"]
+        assert!(["get_config", "update_config", "propose_connector", "accept_ready", "memory_list", "memory_save", "memory_delete"]
             .iter()
             .all(|n| bot.iter().any(|b| b == n)));
         assert!(SETUP_TOOLS.iter().all(|n| bot.iter().any(|b| b == n)));
-        assert!(!bot.iter().any(|n| n.contains("install") || n == "plugin_kit" || (n.contains("delete") && n != "memory_delete")));
+        assert!(!bot.iter().any(|n| n.contains("install") || n == "connector_kit" || (n.contains("delete") && n != "memory_delete")));
         // memory_save must never accept `source` from the model (engine derives it)
         let mem_save = bot_tools().into_iter().find(|t| t["name"] == "memory_save").unwrap();
         assert!(mem_save["inputSchema"]["properties"].get("source").is_none());
-        // Building a plugin is a task's work
-        assert!(names(task_tools()).iter().any(|n| n == "plugin_kit"));
+        // Building a connector is a task's work
+        assert!(names(task_tools()).iter().any(|n| n == "connector_kit"));
     }
 
     #[test]
@@ -577,14 +577,14 @@ mod tests {
     }
 
     #[test]
-    fn plugin_kit_is_a_workspace_of_its_own() {
-        let kit = plugin_kit();
+    fn connector_kit_is_a_workspace_of_its_own() {
+        let kit = connector_kit();
         let get = |p: &str| kit.iter().find(|(k, _)| *k == p).map(|(_, v)| v.clone()).unwrap();
         assert!(get("Cargo.toml").contains("members = [\"sdk\", \"example\"]"));
-        assert!(get("example/Cargo.toml").contains("name = \"yi-plugin-example\""));
-        assert!(get("example/plugin.json").contains("\"id\": \"example\""));
+        assert!(get("example/Cargo.toml").contains("name = \"yi-connector-example\""));
+        assert!(get("example/connector.json").contains("\"id\": \"example\""));
         // The SDK finds the WIT next to it, as in the repository
         assert!(get("sdk/src/lib.rs").contains("path: \"../wit\""));
-        assert!(get("wit/yi-plugin.wit").contains("package yi:plugin"));
+        assert!(get("wit/yi-connector.wit").contains("package yi:connector"));
     }
 }

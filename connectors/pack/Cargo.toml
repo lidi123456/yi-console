@@ -1,0 +1,11 @@
+[package]
+name = "yi-connector-pack"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "Packs built Yi Console connectors into dist/<id>/ and <id>-<version>.yiconnector"
+
+[dependencies]
+serde_json.workspace = true
+zip = { version = "2", default-features = false, features = ["deflate"] }

@@ -1,0 +1,14 @@
+[package]
+name = "yi-connector-feishu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Yi Console connector: Feishu / Lark bot messages over the long connection, replies in the chat"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+yi-connector.workspace = true
+serde.workspace = true
+serde_json.workspace = true

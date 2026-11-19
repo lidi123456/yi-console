@@ -1,0 +1,41 @@
+{
+  "id": "github",
+  "version": "0.1.0",
+  "api": "0.1",
+  "runtime": "wasm",
+  "main": "connector.wasm",
+  "name": { "zh": "GitHub", "en": "GitHub" },
+  "description": {
+    "zh": "轮询 GitHub 通知（@ 提及、指派、评审请求、CI 结果），Bot 可以在原 issue / PR 里回复",
+    "en": "Polls GitHub notifications (mentions, assignments, review requests, CI results); the Bot can reply in the issue or PR"
+  },
+  "capabilities": ["trigger", "reply", "context", "tools"],
+  "permissions": { "net": ["api.github.com"], "exec": [] },
+  "config": {
+    "type": "object",
+    "required": ["token"],
+    "properties": {
+      "token": {
+        "type": "string",
+        "title": "访问令牌",
+        "description": "Personal access token（classic 需要 notifications 和 repo 权限）",
+        "x-secret": true,
+        "x-en": { "title": "Access token", "description": "Personal access token (classic: notifications and repo scopes)" }
+      },
+      "repos": {
+        "type": "array",
+        "items": { "type": "string" },
+        "title": "只看这些仓库",
+        "description": "owner/repo，每行一个；留空表示全部",
+        "x-ui": "rows",
+        "x-en": { "title": "Only these repositories", "description": "owner/repo, one per line; empty means all" }
+      },
+      "pollSeconds": {
+        "type": "integer",
+        "title": "轮询间隔（秒）",
+        "default": 60,
+        "x-en": { "title": "Poll interval (seconds)" }
+      }
+    }
+  }
+}

@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
 members = ["crates/proto", "crates/browser", "crates/link", "crates/yi-agentd", "crates/relay", "crates/client", "crates/web", "crates/bots"]
-exclude = ["app/src-tauri", "plugins"]
+exclude = ["app/src-tauri", "connectors"]
 
 [workspace.package]
 version = "0.4.0"

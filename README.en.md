@@ -89,7 +89,7 @@ Each machine runs a background service, `yi-agentd`, which starts and hosts the 
 - [Remote access and relay](docs/remote.en.md): SSH hosts, connecting through a relay, deploying a relay server, network proxies
 - [Computer use](docs/computer-use.en.md): what is supported, permissions, how to use it
 - [External MCP servers](docs/mcp.en.md)
-- [Writing Bot plugins](docs/plugins.en.md)
+- [Writing Bot plugins](docs/connectors.en.md)
 - [Development guide](docs/development.en.md): building from source, project layout, packaging and releases
 - [Relay security design](docs/relay-security.en.md)
 - [Adding a new AI tool](docs/adding-a-tool.en.md)

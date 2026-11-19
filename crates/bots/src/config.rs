@@ -21,20 +21,20 @@ pub struct BotConfig {
     pub bot: SessionSpec,
     #[serde(default)]
     pub task: TaskDefaults,
-    /// Plugin instance ids whose events this Bot handles
+    /// Connector instance ids whose events this Bot handles
     #[serde(default)]
     pub triggers: Vec<String>,
-    /// Where reminders go: "app" plus plugin instance ids with the notify capability
+    /// Where reminders go: "app" plus connector instance ids with the notify capability
     #[serde(default = "default_notify")]
     pub notify: Vec<String>,
     #[serde(default)]
     pub mcp: McpChoice,
     #[serde(default)]
     pub accept: Accept,
-    /// Plugin events neither addressed to the Bot nor from an allow-listed sender
+    /// Connector events neither addressed to the Bot nor from an allow-listed sender
     #[serde(default)]
     pub ambient: Ambient,
-    /// Who may make explicit requests, per plugin instance
+    /// Who may make explicit requests, per connector instance
     #[serde(default)]
     pub allow: Vec<Allow>,
     #[serde(default)]
@@ -45,7 +45,7 @@ pub struct BotConfig {
     /// Outgoing actions that wait for the owner (auto mode, turns the owner didn't start)
     #[serde(default)]
     pub approval: Approval,
-    /// Plugin events outside these hours wait until they start; None: always
+    /// Connector events outside these hours wait until they start; None: always
     #[serde(default)]
     pub active_hours: Option<ActiveHours>,
     /// User layer of the prompt
@@ -186,8 +186,8 @@ pub enum Accept {
     Auto,
 }
 
-/// What happens to plugin events nobody addressed to the Bot, from senders not on the allow list (chatter in a
-/// group the plugin listens to in full). Follow-ups in a task's conversation go to the task either way.
+/// What happens to connector events nobody addressed to the Bot, from senders not on the allow list (chatter in a
+/// group the connector listens to in full). Follow-ups in a task's conversation go to the task either way.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum Ambient {
@@ -263,7 +263,7 @@ pub struct Approval {
     /// Replies into conversations are drafted for approval
     #[serde(default)]
     pub reply: bool,
-    /// Plugin tool calls that change something are drafted for approval
+    /// Connector tool calls that change something are drafted for approval
     #[serde(default)]
     pub write: bool,
 }
@@ -426,7 +426,7 @@ impl BotConfig {
             if r.name.is_empty() || r.prompt.trim().is_empty() {
                 bail!("例行任务需要名称和要做的事");
             }
-            if let Err(e) = crate::plugins::cron::Cron::parse(&r.schedule) {
+            if let Err(e) = crate::connectors::cron::Cron::parse(&r.schedule) {
                 bail!("例行任务「{}」的时间表无效: {e}", r.name);
             }
             if let Some(sid) = r.sop_id.as_deref() {

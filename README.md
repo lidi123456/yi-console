@@ -89,7 +89,7 @@ Yi Console 把它们统一管起来：
 - [远程连接与中继](docs/remote.md)：SSH 主机、经中继连接、部署中继服务器、网络代理
 - [操作电脑](docs/computer-use.md)：支持范围、权限、使用步骤
 - [外接 MCP 服务器](docs/mcp.md)
-- [编写 Bot 插件](docs/plugins.md)
+- [编写 Bot 插件](docs/connectors.md)
 - [开发指南](docs/development.md)：从源码构建、项目结构、打包发布
 - [中继安全设计](docs/relay-security.md)
 - [接入新的 AI 工具](docs/adding-a-tool.md)

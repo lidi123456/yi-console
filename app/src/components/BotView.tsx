@@ -17,7 +17,7 @@ import {
   type EventRow,
   type MemoryItem,
   type OutboxRow,
-  type PluginInstance,
+  type ConnectorInstance,
   type RoutineRun,
   type Sop,
 } from '../bots';
@@ -126,12 +126,12 @@ function EventsCard({ botId }: { botId: string }) {
   );
 }
 
-/** Outbox rows filtered to this Bot (`plugins.outbox { botId }`), loaded lazily when opened */
+/** Outbox rows filtered to this Bot (`connectors.outbox { botId }`), loaded lazily when opened */
 function BotOutboxPanel({ botId, instName }: { botId: string; instName: (id: string) => string }) {
   const botCall = useBotCall();
   const [open, setOpen] = useState(false);
   const [rows, setRows] = useState<OutboxRow[] | null>(null);
-  const load = () => botCall<OutboxRow[]>('plugins.outbox', { botId, limit: 30 }).then(setRows).catch(errorToast);
+  const load = () => botCall<OutboxRow[]>('connectors.outbox', { botId, limit: 30 }).then(setRows).catch(errorToast);
   useEffect(() => {
     if (open) load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -515,7 +515,7 @@ export function BotView({ botId }: { botId: string }) {
   const [showBasePrompt, setShowBasePrompt] = useState(false);
   /** revision whose diff against the one it was based on is open */
   const [diffOf, setDiffOf] = useState<number | null>(null);
-  const [instances, setInstances] = useState<PluginInstance[]>([]);
+  const [instances, setInstances] = useState<ConnectorInstance[]>([]);
   const [preview, setPreview] = useState<{ bot: string; task: string } | null>(null);
   const [defaults, setDefaults] = useState<Record<string, string>>({});
   // The list changes whenever the Bot saves; reload the full row then
@@ -535,7 +535,7 @@ export function BotView({ botId }: { botId: string }) {
         else loadMemories();
       })
       .catch(errorToast);
-    botCall<PluginInstance[]>('plugins.instances').then(setInstances).catch(() => {});
+    botCall<ConnectorInstance[]>('connectors.instances').then(setInstances).catch(() => {});
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [botId, available, src, stamp]);
   useEffect(() => {
@@ -886,7 +886,7 @@ export function BotView({ botId }: { botId: string }) {
             <button className="link-btn small" onClick={() => navigate({ kind: 'botEvents', botId, src: src || undefined })}>
               {t('viewInboxLog')}
             </button>
-            <button className="link-btn small" onClick={() => navigate({ kind: 'plugins', src: src || undefined })}>
+            <button className="link-btn small" onClick={() => navigate({ kind: 'connectors', src: src || undefined })}>
               {t('managePlugins')}
             </button>
           </span>

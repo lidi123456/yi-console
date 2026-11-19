@@ -1,12 +1,12 @@
 //! Yi Console Bots, run by the desktop app: always-on orchestrating sessions ("Bots") that take events from trigger
-//! plugins and spawn task sessions on any connected host. See docs/internals/bots.md.
+//! connectors and spawn task sessions on any connected host. See docs/internals/bots.md.
 //!
-//! Plugged into `ClientHub` as an `Extension`: frontend commands `bots.*` / `tasks.*` / `plugins.*`, the Bot tools
+//! Plugged into `ClientHub` as an `Extension`: frontend commands `bots.*` / `tasks.*` / `connectors.*`, the Bot tools
 //! relayed by hosts (`clientMcp.call`), and host notifications to follow the Bot and task sessions.
 
 pub mod config;
 pub mod engine;
-pub mod plugins;
+pub mod connectors;
 pub mod prompt;
 pub mod store;
 pub mod tools;
@@ -36,12 +36,12 @@ fn client_id(data_dir: &Path) -> String {
     id
 }
 
-/// Open the Bots database, plug the engine into the hub and start the enabled Bots. `bundled_plugins`: the WASM
-/// plugins shipped with the app (one folder per plugin), if any. Call inside the tokio runtime
-pub fn start(hub: &Arc<ClientHub>, data_dir: &Path, device_name: &str, bundled_plugins: Option<&Path>) -> Result<Arc<Bots>> {
+/// Open the Bots database, plug the engine into the hub and start the enabled Bots. `bundled_connectors`: the WASM
+/// connectors shipped with the app (one folder per connector), if any. Call inside the tokio runtime
+pub fn start(hub: &Arc<ClientHub>, data_dir: &Path, device_name: &str, bundled_connectors: Option<&Path>) -> Result<Arc<Bots>> {
     let store = store::Store::open(&data_dir.join("bots.db"))?;
     let identity = Identity { client_id: client_id(data_dir), kind: "desktop".into(), name: device_name.into() };
-    let engine = engine::Engine::new(hub, store, identity, Some(&data_dir.join("plugins")), bundled_plugins);
+    let engine = engine::Engine::new(hub, store, identity, Some(&data_dir.join("connectors")), bundled_connectors);
     let bots = Arc::new(Bots { engine: engine.clone() });
     hub.set_extension(bots.clone());
     engine.start();
@@ -61,7 +61,7 @@ impl Extension for Bots {
     }
 
     fn handles(&self, cmd: &str) -> bool {
-        cmd.starts_with("bots.") || cmd.starts_with("tasks.") || cmd.starts_with("plugins.")
+        cmd.starts_with("bots.") || cmd.starts_with("tasks.") || cmd.starts_with("connectors.")
     }
 
     fn call<'a>(&'a self, cmd: &'a str, args: Value) -> BoxFut<'a, Result<Value>> {

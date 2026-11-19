@@ -1,0 +1,113 @@
+// The interface between Yi Console and a WASM connector (a WASI 0.2 component). The desktop app is the host.
+//
+// Versioned: an app keeps supporting older `api` versions so installed connectors keep working after upgrades.
+// JSON strings carry the parts that are connector specific (config, http requests, meta, tool input).
+package yi:connector@0.1.0;
+
+interface types {
+  record sender {
+    id: string,
+    name: option<string>,
+    // A bot account: never starts a task by itself
+    bot: bool,
+  }
+
+  record trigger-event {
+    // Source-side id, used to drop duplicates
+    key: string,
+    // The conversation it belongs to, e.g. "github:owner/repo#12"; follow-ups go to the same task
+    thread: string,
+    sender: sender,
+    // Explicitly addressed to the Bot: @, assignment, command
+    addressed: bool,
+    text: string,
+    url: option<string>,
+    // ms since the epoch; 0 means now
+    at: u64,
+    // JSON, connector specific
+    meta: string,
+  }
+
+  record context-message {
+    id: string,
+    sender: sender,
+    at: u64,
+    text: string,
+    url: option<string>,
+  }
+
+  record context-page {
+    messages: list<context-message>,
+    next: option<string>,
+  }
+
+  record tool-def {
+    name: string,
+    description: string,
+    // JSON Schema of the input
+    input-schema: string,
+    // Changes nothing outside: may run while the Bot only observes
+    read-only: bool,
+  }
+
+  enum send-result {
+    sent,
+    // The conversation no longer accepts replies
+    gone,
+  }
+}
+
+// What the app gives a connector
+interface host {
+  use types.{trigger-event};
+
+  // The instance configuration as JSON, secrets included
+  config: func() -> string;
+  emit: func(event: trigger-event);
+  kv-get: func(key: string) -> option<string>;
+  kv-set: func(key: string, value: option<string>);
+  // level: debug / info / warn / error
+  log: func(level: string, message: string);
+  // state: ok / starting / error
+  health: func(state: string, detail: string);
+  // ms since the epoch
+  now: func() -> u64;
+
+  // Request JSON: {method, url, headers?: {name: value}, body?: string, timeoutMs?}
+  // Response JSON: {status, headers: {name: value}, body: string}. Only hosts in permissions.net are reachable
+  http-fetch: func(request: string) -> result<string, string>;
+
+  // headers: JSON object. The connection reports through `on-ws`: open / text / binary / close / error
+  ws-open: func(url: string, headers: string) -> result<u32, string>;
+  ws-send: func(id: u32, data: list<u8>, binary: bool) -> result<_, string>;
+  ws-close: func(id: u32);
+
+  // Runs a command on the desktop machine; only commands in permissions.exec. Returns stdout
+  exec: func(cmd: string, args: list<string>, stdin: option<string>) -> result<string, string>;
+
+  // Fires `on-timer` after ms (again every ms when repeat)
+  set-timer: func(ms: u64, repeat: bool) -> u32;
+  clear-timer: func(id: u32);
+}
+
+// What a connector implements. Every capability is optional and declared in connector.json; unsupported ones return an error
+interface connector {
+  use types.{send-result, context-page, tool-def};
+
+  start: func() -> result<_, string>;
+  stop: func();
+  on-timer: func(id: u32);
+  on-ws: func(id: u32, kind: string, data: list<u8>);
+  // key is an idempotency key: a retry with the same key must not send twice
+  reply: func(thread: string, reply-to: option<string>, key: string, text: string) -> result<send-result, string>;
+  notify: func(text: string, key: string) -> result<send-result, string>;
+  read-context: func(thread: string, cursor: option<string>) -> result<context-page, string>;
+  tools: func() -> list<tool-def>;
+  // input: JSON
+  call-tool: func(name: string, input: string) -> result<string, string>;
+}
+
+world yi-connector {
+  import host;
+  export connector;
+}

@@ -14,7 +14,7 @@ import uuid
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-LOCAL = ("frontend", "yi-agentd", "yi-relay", "yi-web", "plugins")
+LOCAL = ("frontend", "yi-agentd", "yi-relay", "yi-web", "connectors")
 DAEMONS = [
     dict(os="ubuntu-latest", target="x86_64-unknown-linux-musl", name="linux-x86_64", cross=True),
     dict(os="ubuntu-latest", target="aarch64-unknown-linux-musl", name="linux-aarch64", cross=True),
@@ -185,9 +185,9 @@ def local_build(args, packages):
         if "android" not in packages:
             run(["npm", "run", "build"], cwd=ROOT / "app", dry_run=args.dry_run)
             print(f"Frontend output: {ROOT / 'app/dist'}")
-    if "plugins" in packages:
-        run([sys.executable, "scripts/bundle-plugins.py"], dry_run=args.dry_run)
-        print(f"Plugin output (always release): {ROOT / 'plugins/dist'}")
+    if "connectors" in packages:
+        run([sys.executable, "scripts/bundle-connectors.py"], dry_run=args.dry_run)
+        print(f"Connector output (always release): {ROOT / 'connectors/dist'}")
     if "android" in packages:
         android_build(args)
 

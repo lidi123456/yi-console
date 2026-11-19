@@ -1330,7 +1330,7 @@ pub mod methods {
     /// -> [{clientId, name}]: desktop apps registered on this machine (`client.hello` over local IPC), whose Bots a
     /// phone or yi-web can control through `client.call`
     pub const CLIENTS_LIST: &str = "clients.list";
-    /// {clientId, cmd, args} -> the command's result: run a `bots.*` / `tasks.*` / `plugins.*` command in that
+    /// {clientId, cmd, args} -> the command's result: run a `bots.*` / `tasks.*` / `connectors.*` command in that
     /// desktop app (remote control). Not accepted from processes started by this daemon (the AI tools)
     pub const CLIENT_CALL: &str = "client.call";
     /// {callId, result?, error?}: a desktop app answers a `client.call` notification

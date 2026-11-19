@@ -403,7 +403,7 @@ function PrefRow({ title, desc, children }: { title: string; desc?: string; chil
   );
 }
 
-/** Bots (desktop app only): keep running in the tray, plugins */
+/** Bots (desktop app only): keep running in the tray, connectors */
 function BotsCard() {
   const available = useBots((b) => b.list !== null);
   const client = useStore((s) => s.client);
@@ -418,7 +418,7 @@ function BotsCard() {
           {tx('closeToTray')}
         </label>
         <p className="muted small">{tx('closeToTrayHint')}</p>
-        <button className="btn small" onClick={() => navigate({ kind: 'plugins' })}>
+        <button className="btn small" onClick={() => navigate({ kind: 'connectors' })}>
           <Icon name="plug" size={13} /> {tx('managePlugins')}
         </button>
       </div>

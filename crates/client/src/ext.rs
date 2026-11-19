@@ -1,6 +1,6 @@
 //! Local services plugged into `ClientHub` by the desktop app (the Bot engine in `crates/bots`).
 //!
-//! An extension answers its own frontend commands (`bots.*`, `tasks.*`, `plugins.*`), receives the client MCP calls
+//! An extension answers its own frontend commands (`bots.*`, `tasks.*`, `connectors.*`), receives the client MCP calls
 //! hosts relay to this client (`clientMcp.call`), and sees every host notification and status change. ClientHub
 //! introduces itself to every host with the extension's identity (`client.hello`), so hosts know where to send calls.
 

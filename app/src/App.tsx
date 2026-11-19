@@ -12,7 +12,7 @@ import { StatsView } from './components/StatsView';
 import { PortsView } from './components/PortsView';
 import { PrefsView } from './components/PrefsView';
 import { BotView } from './components/BotView';
-import { PluginsView } from './components/PluginsView';
+import { ConnectorsView } from './components/ConnectorsView';
 import { BotEventsView } from './components/BotActivity';
 import { BotSource } from './bots';
 import { Palette, useShortcuts } from './components/Palette';
@@ -85,10 +85,10 @@ function Main() {
           <BotEventsView key={`${view.src ?? ''}/${view.botId}`} botId={view.botId} />
         </BotSource.Provider>
       );
-    case 'plugins':
+    case 'connectors':
       return (
         <BotSource.Provider value={view.src ?? ''}>
-          <PluginsView key={`${view.src ?? ''}/${view.review ?? ''}`} review={view.review} />
+          <ConnectorsView key={`${view.src ?? ''}/${view.review ?? ''}`} review={view.review} />
         </BotSource.Provider>
       );
     case 'new': {

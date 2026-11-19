@@ -1,14 +1,14 @@
-//! The Bot engine: keeps each enabled Bot's session alive, admits plugin events, delivers them to the Bot in merged
+//! The Bot engine: keeps each enabled Bot's session alive, admits connector events, delivers them to the Bot in merged
 //! messages, runs the Bot's tools (spawning and steering tasks), relays task reports, and asks people for help.
 //!
 //! Everything here runs in the desktop app. Hosts only see ordinary sessions with a `BotLink`, an appended system
 //! prompt and a client MCP server (`yi_bot` / `yi_task`) whose calls come back here through `clientMcp.call`.
 
 use crate::config::{Accept, Ambient, BotConfig, Routine, AI_TOOLS};
-use crate::plugins::cron::Cron;
-use crate::plugins::builtin::{self, Builtin, APP_INSTANCE};
-use crate::plugins::wasm::Wasm;
-use crate::plugins::{self, package, Manifest, PluginHost, PluginInstance, PluginRuntime, SendResult, TriggerEvent};
+use crate::connectors::cron::Cron;
+use crate::connectors::builtin::{self, Builtin, APP_INSTANCE};
+use crate::connectors::wasm::Wasm;
+use crate::connectors::{self, package, Manifest, ConnectorHost, ConnectorInstance, ConnectorRuntime, SendResult, TriggerEvent};
 use crate::prompt;
 use crate::store::{ApprovalRow, Attention, BotRow, EventRow, Instance, OutboxRow, RoutineRun, SessionRef, Store, TaskRow};
 use crate::tools::{self, BOT_SERVER, OFFLINE_MARK, TASK_SERVER};
@@ -19,7 +19,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex, Weak};
 use yi_client::{ClientHub, Identity};
 
-/// kv namespace of the app's own plugin settings
+/// kv namespace of the app's own connector settings
 const APP_KV: &str = "_app";
 /// Attempts before an outgoing message is given up
 const OUTBOX_ATTEMPTS: u32 = 8;
@@ -30,9 +30,9 @@ const RUN_HOURS: i64 = 6;
 /// Maximum silent SOP pre-review rejections before letting a task reach `ready` for the owner
 const MAX_SOP_REVIEWS: u32 = 2;
 
-/// Run a plugin call off the async threads: WASM instances answer through a channel and may do HTTP meanwhile
+/// Run a connector call off the async threads: WASM instances answer through a channel and may do HTTP meanwhile
 async fn blocking<R: Send + 'static>(f: impl FnOnce() -> R + Send + 'static) -> Result<R> {
-    tokio::task::spawn_blocking(f).await.map_err(|e| anyhow!("插件调用失败: {e}"))
+    tokio::task::spawn_blocking(f).await.map_err(|e| anyhow!("连接器调用失败: {e}"))
 }
 
 pub fn now_ms() -> i64 {
@@ -161,7 +161,7 @@ struct PendingChange {
     items: Vec<String>,
 }
 
-/// The Bot asked the owner to enter (or replace) secrets of a plugin instance it uses
+/// The Bot asked the owner to enter (or replace) secrets of a connector instance it uses
 #[derive(Clone)]
 struct SecretRequest {
     id: String,
@@ -210,14 +210,14 @@ pub struct Engine {
     hub: Weak<ClientHub>,
     pub store: Store,
     identity: Identity,
-    /// The tokio runtime the engine was created in (plugin threads hop onto it)
+    /// The tokio runtime the engine was created in (connector threads hop onto it)
     rt: tokio::runtime::Handle,
-    runtimes: Vec<Arc<dyn PluginRuntime>>,
+    runtimes: Vec<Arc<dyn ConnectorRuntime>>,
     /// Installed WASM plugins; None when the runtime could not start
     wasm: Option<Arc<Wasm>>,
-    /// Packages read by `plugins.inspect`, waiting for the person to confirm
+    /// Packages read by `connectors.inspect`, waiting for the person to confirm
     staged: Mutex<HashMap<String, package::Staged>>,
-    instances: Mutex<HashMap<String, Arc<dyn PluginInstance>>>,
+    instances: Mutex<HashMap<String, Arc<dyn ConnectorInstance>>>,
     health: Mutex<HashMap<String, Value>>,
     bots: Mutex<HashMap<String, BotRt>>,
     /// Tasks whose host connection came back: offline calls are being caught up
@@ -227,7 +227,7 @@ pub struct Engine {
     task_busy: Mutex<HashMap<String, bool>>,
 }
 
-/// A plugin instance's view of the engine. WASM instances call it from their own threads, outside the tokio
+/// A connector instance's view of the engine. WASM instances call it from their own threads, outside the tokio
 /// runtime: anything async goes through `rt`
 struct InstanceHost {
     engine: Weak<Engine>,
@@ -236,7 +236,7 @@ struct InstanceHost {
     rt: tokio::runtime::Handle,
 }
 
-impl PluginHost for InstanceHost {
+impl ConnectorHost for InstanceHost {
     fn instance_id(&self) -> &str {
         &self.id
     }
@@ -258,14 +258,14 @@ impl PluginHost for InstanceHost {
         }
     }
     fn log(&self, level: &str, message: &str) {
-        eprintln!("[plugin {}] {level}: {message}", self.id);
+        eprintln!("[connector {}] {level}: {message}", self.id);
     }
     fn health(&self, state: &str, detail: &str) {
         if let Some(e) = self.engine.upgrade() {
             let v = json!({"state": state, "detail": detail, "at": now_ms()});
             let same = e.health.lock().unwrap().get(&self.id).is_some_and(|o| o["state"] == v["state"] && o["detail"] == v["detail"]);
             e.health.lock().unwrap().insert(self.id.clone(), v);
-            // Polling plugins report ok on every round: only announce real changes
+            // Polling connectors report ok on every round: only announce real changes
             if !same {
                 self.rt.spawn(async move { e.changed() });
             }
@@ -274,13 +274,13 @@ impl PluginHost for InstanceHost {
 }
 
 impl Engine {
-    /// `plugins_dir`: where WASM plugins are installed (None: built-in plugins only); `bundled`: WASM plugins shipped
+    /// `connectors_dir`: where WASM connectors are installed (None: built-in connectors only); `bundled`: WASM connectors shipped
     /// with the app
-    pub fn new(hub: &Arc<ClientHub>, store: Store, identity: Identity, plugins_dir: Option<&Path>, bundled: Option<&Path>) -> Arc<Engine> {
-        let wasm = plugins_dir.and_then(|d| match Wasm::new(d, bundled) {
+    pub fn new(hub: &Arc<ClientHub>, store: Store, identity: Identity, connectors_dir: Option<&Path>, bundled: Option<&Path>) -> Arc<Engine> {
+        let wasm = connectors_dir.and_then(|d| match Wasm::new(d, bundled) {
             Ok(w) => Some(w),
             Err(e) => {
-                eprintln!("WASM plugin runtime: {e:#}");
+                eprintln!("WASM connector runtime: {e:#}");
                 None
             }
         });
@@ -298,7 +298,7 @@ impl Engine {
                 identity,
                 rt: tokio::runtime::Handle::current(),
                 runtimes: {
-                    let mut r: Vec<Arc<dyn PluginRuntime>> = vec![Arc::new(Builtin { app_notify })];
+                    let mut r: Vec<Arc<dyn ConnectorRuntime>> = vec![Arc::new(Builtin { app_notify })];
                     if let Some(w) = &wasm {
                         r.push(w.clone());
                     }
@@ -370,13 +370,13 @@ impl Engine {
         self.runtimes.iter().flat_map(|r| r.manifests()).collect()
     }
 
-    fn manifest(&self, plugin_id: &str) -> Option<Manifest> {
-        self.manifests().into_iter().find(|m| m.id == plugin_id)
+    fn manifest(&self, connector_id: &str) -> Option<Manifest> {
+        self.manifests().into_iter().find(|m| m.id == connector_id)
     }
 
     // ---------- startup ----------
 
-    /// Start plugin instances and the enabled Bots
+    /// Start connector instances and the enabled Bots
     pub fn start(&self) {
         for i in self.store.instances().unwrap_or_default() {
             if i.enabled {
@@ -386,7 +386,7 @@ impl Engine {
         // The app notification always exists
         let app = Instance {
             id: APP_INSTANCE.into(),
-            plugin_id: builtin::APP_NOTIFY.into(),
+            connector_id: builtin::APP_NOTIFY.into(),
             name: "App".into(),
             config: json!({}),
             enabled: true,
@@ -441,16 +441,16 @@ impl Engine {
 
     fn start_instance(&self, i: &Instance) {
         self.stop_instance(&i.id);
-        if self.disabled_plugins().contains(&i.plugin_id) {
+        if self.disabled_plugins().contains(&i.connector_id) {
             return;
         }
-        let Some(m) = self.manifest(&i.plugin_id) else {
-            self.health.lock().unwrap().insert(i.id.clone(), json!({"state": "error", "detail": "插件不存在"}));
+        let Some(m) = self.manifest(&i.connector_id) else {
+            self.health.lock().unwrap().insert(i.id.clone(), json!({"state": "error", "detail": "连接器不存在"}));
             return;
         };
         let Some(rt) = self.runtimes.iter().find(|r| r.kind() == m.runtime).cloned() else { return };
         let host = Arc::new(InstanceHost { engine: self.me.clone(), id: i.id.clone(), config: i.config.clone(), rt: self.rt.clone() });
-        match rt.start(&i.plugin_id, host) {
+        match rt.start(&i.connector_id, host) {
             Ok(inst) => {
                 self.instances.lock().unwrap().insert(i.id.clone(), inst);
             }
@@ -467,7 +467,7 @@ impl Engine {
         self.health.lock().unwrap().remove(id);
     }
 
-    fn instance(&self, id: &str) -> Option<Arc<dyn PluginInstance>> {
+    fn instance(&self, id: &str) -> Option<Arc<dyn ConnectorInstance>> {
         self.instances.lock().unwrap().get(id).cloned()
     }
 
@@ -480,11 +480,11 @@ impl Engine {
     fn bot_prompt(&self, c: &BotConfig) -> String {
         let instances = self.store.instances().unwrap_or_default();
         let manifests = self.manifests();
-        let notes = |plugin: &str| {
-            let m = manifests.iter().find(|m| m.id == plugin)?;
+        let notes = |connector: &str| {
+            let m = manifests.iter().find(|m| m.id == connector)?;
             let mut n = m.prompt.clone().unwrap_or_default();
             if m.has("tools") {
-                n.push_str("\nThis source has tools: list them with plugin_tools, run them with plugin_call.");
+                n.push_str("\nThis source has tools: list them with connector_tools, run them with connector_call.");
             }
             if m.has("reply") {
                 n.push_str("\nYou can answer in its conversations with reply.");
@@ -976,8 +976,8 @@ impl Engine {
     // ---------- events ----------
 
     pub async fn ingest(&self, instance_id: &str, ev: TriggerEvent) {
-        let plugin = self.store.instances().unwrap_or_default().into_iter().find(|i| i.id == instance_id).map(|i| i.plugin_id);
-        let system_source = matches!(plugin.as_deref(), Some(builtin::CRON | builtin::SESSION_EVENTS));
+        let connector = self.store.instances().unwrap_or_default().into_iter().find(|i| i.id == instance_id).map(|i| i.connector_id);
+        let system_source = matches!(connector.as_deref(), Some(builtin::CRON | builtin::SESSION_EVENTS));
         for b in self.store.bots().unwrap_or_default() {
             let c = &b.config;
             if !c.enabled || !c.triggers.iter().any(|t| t == instance_id) {
@@ -1063,8 +1063,8 @@ impl Engine {
     /// Whether an event is an explicit request: addressed to the Bot by a person who is on the allow list, or from a
     /// built-in source (the owner's own schedule, the owner's sessions)
     fn explicit(&self, c: &BotConfig, e: &EventRow) -> bool {
-        let plugin = self.store.instances().unwrap_or_default().into_iter().find(|i| i.id == e.instance_id).map(|i| i.plugin_id);
-        let system_source = matches!(plugin.as_deref(), Some(builtin::CRON | builtin::SESSION_EVENTS));
+        let connector = self.store.instances().unwrap_or_default().into_iter().find(|i| i.id == e.instance_id).map(|i| i.connector_id);
+        let system_source = matches!(connector.as_deref(), Some(builtin::CRON | builtin::SESSION_EVENTS));
         e.addressed && !e.sender_bot && (system_source || c.allowed(&e.instance_id, &e.sender))
     }
 
@@ -1074,7 +1074,7 @@ impl Engine {
             .unwrap_or_default()
             .into_iter()
             .find(|i| i.id == id)
-            .map(|i| format!("{} ({})", i.id, i.plugin_id))
+            .map(|i| format!("{} ({})", i.id, i.connector_id))
             .unwrap_or_else(|| id.to_string())
     }
 
@@ -1343,7 +1343,7 @@ impl Engine {
             }
         } else {
             match self.instance(&ap.instance_id) {
-                None => "not run: the plugin instance is not running".to_string(),
+                None => "not run: the connector instance is not running".to_string(),
                 Some(inst) => {
                     let (name, input) = (ap.tool.clone().unwrap_or_default(), ap.input.clone());
                     match blocking(move || inst.call_tool(&name, &input)).await {
@@ -1477,10 +1477,10 @@ impl Engine {
                 let restricted = self.engine_turn(&c.id) || !event_ids.is_empty();
                 let kind = match a["kind"].as_str().map(str::trim).filter(|k| !k.is_empty()) {
                     None | Some("work") => "work",
-                    Some("plugin") => "plugin",
-                    Some(other) => bail!("Unknown kind \"{other}\"; use work or plugin."),
+                    Some("connector") => "plugin",
+                    Some(other) => bail!("Unknown kind \"{other}\"; use work or connector."),
                 };
-                // A plugin is built in a scratch directory, never inside one of the owner's repositories
+                // A connector is built in a scratch directory, never inside one of the owner's repositories
                 let location = if kind == "plugin" {
                     json!({"mode": "scratch", "host": a["host"]})
                 } else {
@@ -1731,7 +1731,7 @@ impl Engine {
             }
             "read_event" => Ok(serde_json::to_value(self.bot_event(&c.id, &s("event_id"))?)?),
             "read_thread" => self.read_thread(&c.id, &s("event_id"), a["cursor"].as_str()).await,
-            "plugin_tools" => {
+            "connector_tools" => {
                 let mut out = vec![];
                 for id in self.tool_instances(c) {
                     if let Some(inst) = self.instance(&id) {
@@ -1741,12 +1741,12 @@ impl Engine {
                 }
                 Ok(json!(out))
             }
-            "plugin_call" => {
+            "connector_call" => {
                 let id = s("instance");
                 if !self.tool_instances(c).contains(&id) {
-                    bail!("This Bot has no plugin instance {id} with tools.");
+                    bail!("This Bot has no connector instance {id} with tools.");
                 }
-                let inst = self.instance(&id).ok_or_else(|| anyhow!("The plugin instance is not running."))?;
+                let inst = self.instance(&id).ok_or_else(|| anyhow!("The connector instance is not running."))?;
                 let name = s("name");
                 // Observe and off modes don't act on the outside world: only read-only tools run. In auto mode a
                 // changing call from a turn the owner didn't start waits for approval when the Bot is set up so
@@ -1795,13 +1795,13 @@ impl Engine {
                 }
                 let iid = s("instance_id");
                 if !bot_instances(c).contains(&iid) {
-                    bail!("{iid} is not one of your plugin instances (triggers, notify or allow).");
+                    bail!("{iid} is not one of your connector instances (triggers, notify or allow).");
                 }
                 let inst = self.store.instances()?.into_iter().find(|i| i.id == iid).ok_or_else(|| anyhow!("No instance {iid}"))?;
-                let m = self.manifest(&inst.plugin_id).ok_or_else(|| anyhow!("Plugin {} is not installed", inst.plugin_id))?;
+                let m = self.manifest(&inst.connector_id).ok_or_else(|| anyhow!("Connector {} is not installed", inst.connector_id))?;
                 let secret = secret_keys(&m.config);
                 if secret.is_empty() {
-                    bail!("This plugin has no secret settings.");
+                    bail!("This connector has no secret settings.");
                 }
                 let mut fields: Vec<String> = a["fields"].as_array().into_iter().flatten().filter_map(|v| v.as_str()).map(str::to_string).collect();
                 if fields.is_empty() {
@@ -1821,7 +1821,7 @@ impl Engine {
                     h.emit_event(json!({"type": "bots.secretsNeeded", "botId": c.id, "name": c.name, "pending": [{"id": iid, "name": inst.name}]}));
                 }
                 self.changed();
-                Ok(json!("The owner now has a card in this session to enter it; the value goes straight into the plugin configuration and you never see it. You get a message once it is saved. Do not ask for it in the chat."))
+                Ok(json!("The owner now has a card in this session to enter it; the value goes straight into the connector configuration and you never see it. You get a message once it is saved. Do not ask for it in the chat."))
             }
             "update_config" => {
                 // Only on the owner's word: a turn started by events or reports could carry someone else's text
@@ -1877,7 +1877,7 @@ impl Engine {
                 out += &secrets_note(&pending);
                 Ok(json!(out))
             }
-            "propose_plugin" => {
+            "propose_connector" => {
                 // A task built it; the Bot checked it and submits it from the task's host
                 let t = self.bot_task(&c.id, &s("task_id"))?;
                 let path = s("path");
@@ -1888,11 +1888,11 @@ impl Engine {
                 };
                 let staged = self.package_from_host(&t.host, &path).await?;
                 if builtin::RESERVED.contains(&staged.manifest.id.as_str()) {
-                    bail!("Plugin id {} is reserved; have the task choose another", staged.manifest.id);
+                    bail!("Connector id {} is reserved; have the task choose another", staged.manifest.id);
                 }
                 let v = self.stage(staged)?;
                 if let (Ok(h), Some(sr)) = (self.hub(), bot.session.as_ref()) {
-                    h.emit_event(json!({"type": "bots.pluginProposal", "token": v["token"], "id": v["manifest"]["id"], "name": v["manifest"]["name"], "host": sr.host, "sessionId": sr.session_id}));
+                    h.emit_event(json!({"type": "bots.connectorProposal", "token": v["token"], "id": v["manifest"]["id"], "name": v["manifest"]["name"], "host": sr.host, "sessionId": sr.session_id}));
                 }
                 let list = |k: &str| {
                     v["manifest"]["permissions"][k].as_array().map(|x| x.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(", ")).filter(|x| !x.is_empty()).unwrap_or_else(|| "none".into())
@@ -1982,10 +1982,10 @@ impl Engine {
         if id == APP_INSTANCE {
             return Some(builtin::APP_NOTIFY.into());
         }
-        self.store.instances().ok()?.into_iter().find(|i| i.id == id).map(|i| i.plugin_id)
+        self.store.instances().ok()?.into_iter().find(|i| i.id == id).map(|i| i.connector_id)
     }
 
-    /// Instances a Bot may use tools of: the ones it picked, whose plugin has the tools capability
+    /// Instances a Bot may use tools of: the ones it picked, whose connector has the tools capability
     fn tool_instances(&self, c: &BotConfig) -> Vec<String> {
         c.triggers
             .iter()
@@ -1999,7 +1999,7 @@ impl Engine {
 
     // ---------- outbox ----------
 
-    /// Queue a message for a plugin and try it right away; returns the row after that attempt. A key that is already
+    /// Queue a message for a connector and try it right away; returns the row after that attempt. A key that is already
     /// queued or sent is not sent again
     async fn send_out(&self, mut o: OutboxRow) -> OutboxRow {
         let now = now_ms();
@@ -2014,7 +2014,7 @@ impl Engine {
 
     async fn attempt(&self, mut o: OutboxRow) -> OutboxRow {
         let r = match self.instance(&o.instance_id) {
-            None => Err(anyhow!("这份插件配置没有在运行")),
+            None => Err(anyhow!("这份连接器配置没有在运行")),
             Some(inst) => {
                 let m = o.clone();
                 blocking(move || {
@@ -2055,7 +2055,7 @@ impl Engine {
         o
     }
 
-    /// A task's acknowledgement as a reply in `e`'s conversation; None when its plugin can't reply
+    /// A task's acknowledgement as a reply in `e`'s conversation; None when its connector can't reply
     fn ack_row(&self, t: &TaskRow, e: &EventRow, text: &str) -> Option<OutboxRow> {
         let can_reply = self.instance_plugin(&e.instance_id).and_then(|p| self.manifest(&p)).is_some_and(|m| m.has("reply"));
         let now = now_ms();
@@ -2166,7 +2166,7 @@ impl Engine {
             cwd: &wt_path,
             workspace: &t.workspace,
             branch: branch.as_deref(),
-            plugin: t.is_plugin(),
+            connector: t.is_connector(),
             sop,
             memories: &memories,
         };
@@ -2509,10 +2509,10 @@ impl Engine {
                 Ok(serde_json::to_value(e)?)
             }
             "read_thread" => self.read_thread(&t.bot_id, &s("event_id"), a["cursor"].as_str()).await,
-            "plugin_kit" => {
+            "connector_kit" => {
                 let dir = kit_dir(&t.cwd, a["dir"].as_str());
                 let mut written = vec![];
-                for (rel, content) in tools::plugin_kit() {
+                for (rel, content) in tools::connector_kit() {
                     let path = format!("{dir}/{rel}");
                     if let Some((parent, _)) = path.rsplit_once('/') {
                         // "already exists" is fine
@@ -2522,11 +2522,11 @@ impl Engine {
                     written.push(rel);
                 }
                 Ok(json!(format!(
-                    "Wrote {dir}: {}. Read GUIDE.md first. Add the plugin as a new workspace member next to example/, build it with \
+                    "Wrote {dir}: {}. Read GUIDE.md first. Add the connector as a new workspace member next to example/, build it with \
                      `cargo build --release --target wasm32-wasip2 -p <crate>` (check `cargo --version` and `rustup target list \
                      --installed` first; if Rust or the wasm32-wasip2 target is missing, report blocked with the install commands \
                      and install them only after the person's yes), copy target/wasm32-wasip2/release/<crate_name>.wasm into a \
-                     folder with its plugin.json (named as `main`) and prompt.md, then report ready with that folder's path \
+                     folder with its connector.json (named as `main`) and prompt.md, then report ready with that folder's path \
                      relative to your directory: the Bot checks it and submits it to the owner. Do not install it yourself.",
                     written.join(", ")
                 )))
@@ -2604,7 +2604,7 @@ impl Engine {
             cwd: &cwd,
             workspace: &t.workspace,
             branch: branch.as_deref(),
-            plugin: t.is_plugin(),
+            connector: t.is_connector(),
             sop,
             memories: &memories,
         };
@@ -2672,7 +2672,7 @@ impl Engine {
             cwd: &cwd,
             workspace: &t.workspace,
             branch: branch.as_deref(),
-            plugin: t.is_plugin(),
+            connector: t.is_connector(),
             sop,
             memories: &memories,
         };
@@ -3174,10 +3174,10 @@ impl Engine {
                 }
                 Value::Null
             }
-            "plugins.staged" => {
+            "connectors.staged" => {
                 let token = s("token")?;
                 let staged = self.staged.lock().unwrap();
-                let st = staged.get(&token).ok_or_else(|| anyhow!("安装已过期，请重新选择插件包"))?;
+                let st = staged.get(&token).ok_or_else(|| anyhow!("安装已过期，请重新选择连接器包"))?;
                 self.describe_staged(&token, st)
             }
             "bots.runRoutine" => {
@@ -3198,14 +3198,14 @@ impl Engine {
                 let iid = s("instanceId")?;
                 let b = self.store.bot(&bot_id)?;
                 let cards = self.secret_cards(&b.config);
-                let card = cards.iter().find(|c| c["instanceId"] == iid.as_str()).ok_or_else(|| anyhow!("这份插件配置不需要填写密钥了"))?;
+                let card = cards.iter().find(|c| c["instanceId"] == iid.as_str()).ok_or_else(|| anyhow!("这份连接器配置不需要填写密钥了"))?;
                 let allowed: Vec<&str> = card["fields"].as_array().into_iter().flatten().filter_map(|f| f["key"].as_str()).collect();
-                let mut inst = self.store.instances()?.into_iter().find(|i| i.id == iid).ok_or_else(|| anyhow!("插件配置不存在"))?;
-                let m = self.manifest(&inst.plugin_id).ok_or_else(|| anyhow!("插件不存在: {}", inst.plugin_id))?;
+                let mut inst = self.store.instances()?.into_iter().find(|i| i.id == iid).ok_or_else(|| anyhow!("连接器配置不存在"))?;
+                let m = self.manifest(&inst.connector_id).ok_or_else(|| anyhow!("连接器不存在: {}", inst.connector_id))?;
                 let mut filled = vec![];
                 for (k, v) in a["values"].as_object().into_iter().flatten() {
                     let v = v.as_str().unwrap_or("").trim();
-                    if v.is_empty() || v == plugins::MASK {
+                    if v.is_empty() || v == connectors::MASK {
                         continue;
                     }
                     if !allowed.contains(&k.as_str()) {
@@ -3218,7 +3218,7 @@ impl Engine {
                     bail!("请填写密钥");
                 }
                 // Filled in from the card: the configuration is meant to run once it is complete
-                let complete = plugins::validate_config(&m.config, &inst.config, true).is_ok();
+                let complete = connectors::validate_config(&m.config, &inst.config, true).is_ok();
                 if complete {
                     inst.enabled = true;
                 }
@@ -3226,7 +3226,7 @@ impl Engine {
                 self.save_instance(inst).await?;
                 self.bots.lock().unwrap().entry(bot_id.clone()).or_default().secret_requests.retain(|r| r.instance_id != iid);
                 let state = if complete { "it is enabled now" } else { "it still misses other settings and stays disabled" };
-                let text = format!("<owner event=\"secret-filled\" name=\"{}\">The owner entered {} for the plugin configuration \"{name}\" ({iid}); {state}. You never see the values.</owner>", attr(&name), filled.join(", "));
+                let text = format!("<owner event=\"secret-filled\" name=\"{}\">The owner entered {} for the connector configuration \"{name}\" ({iid}); {state}. You never see the values.</owner>", attr(&name), filled.join(", "));
                 self.push_item(&bot_id, Inbox::note(text, true, TurnTrust::Owner));
                 self.changed();
                 json!({"enabled": complete})
@@ -3485,26 +3485,26 @@ impl Engine {
                 self.store.save_task(&t)?;
                 Value::Null
             }
-            "plugins.list" => {
+            "connectors.list" => {
                 let health = self.health.lock().unwrap().clone();
-                json!({"plugins": self.manifests(), "health": health, "disabled": self.disabled_plugins(), "wasm": self.wasm.is_some()})
+                json!({"connectors": self.manifests(), "health": health, "disabled": self.disabled_plugins(), "wasm": self.wasm.is_some()})
             }
-            "plugins.inspect" => self.inspect(&a).await?,
-            "plugins.install" => {
+            "connectors.inspect" => self.inspect(&a).await?,
+            "connectors.install" => {
                 let token = s("token")?;
-                let staged = self.staged.lock().unwrap().remove(&token).ok_or_else(|| anyhow!("安装已过期，请重新选择插件包"))?;
+                let staged = self.staged.lock().unwrap().remove(&token).ok_or_else(|| anyhow!("安装已过期，请重新选择连接器包"))?;
                 json!(self.install(staged).await?)
             }
-            "plugins.uninstall" => {
+            "connectors.uninstall" => {
                 let id = s("id")?;
-                let wasm = self.wasm.clone().ok_or_else(|| anyhow!("插件运行时没有启动"))?;
+                let wasm = self.wasm.clone().ok_or_else(|| anyhow!("连接器运行时没有启动"))?;
                 if wasm.installed(&id).is_none() {
-                    bail!("只能卸载安装的插件");
+                    bail!("只能卸载安装的连接器");
                 }
                 if wasm.is_bundled(&id) {
-                    bail!("这是 App 自带的插件，不能卸载；不用时可以停用");
+                    bail!("这是 App 自带的连接器，不能卸载；不用时可以停用");
                 }
-                let instances: Vec<Instance> = self.store.instances()?.into_iter().filter(|i| i.plugin_id == id).collect();
+                let instances: Vec<Instance> = self.store.instances()?.into_iter().filter(|i| i.connector_id == id).collect();
                 for i in &instances {
                     self.stop_instance(&i.id);
                 }
@@ -3519,7 +3519,7 @@ impl Engine {
                 self.refresh_prompts().await;
                 Value::Null
             }
-            "plugins.setEnabled" => {
+            "connectors.setEnabled" => {
                 let id = s("id")?;
                 let enabled = a["enabled"].as_bool().unwrap_or(true);
                 let mut off = self.disabled_plugins();
@@ -3528,7 +3528,7 @@ impl Engine {
                     off.push(id.clone());
                 }
                 self.store.kv_set(APP_KV, "disabledPlugins", Some(&serde_json::to_string(&off)?))?;
-                for i in self.store.instances()?.into_iter().filter(|i| i.plugin_id == id) {
+                for i in self.store.instances()?.into_iter().filter(|i| i.connector_id == id) {
                     if enabled && i.enabled {
                         self.start_instance(&i);
                     } else {
@@ -3538,9 +3538,9 @@ impl Engine {
                 self.refresh_prompts().await;
                 Value::Null
             }
-            "plugins.tools" | "plugins.callTool" => {
-                let inst = self.instance(&s("instanceId")?).ok_or_else(|| anyhow!("这份插件配置没有在运行"))?;
-                if cmd == "plugins.tools" {
+            "connectors.tools" | "connectors.callTool" => {
+                let inst = self.instance(&s("instanceId")?).ok_or_else(|| anyhow!("这份连接器配置没有在运行"))?;
+                if cmd == "connectors.tools" {
                     json!(blocking(move || inst.tools()).await?)
                 } else {
                     // The owner trying a tool by hand: runs whatever the Bot's mode is
@@ -3548,17 +3548,17 @@ impl Engine {
                     json!(blocking(move || inst.call_tool(&name, &input)).await??)
                 }
             }
-            "plugins.outbox" => json!(self.store.outbox(
+            "connectors.outbox" => json!(self.store.outbox(
                 a["instanceId"].as_str(),
                 a["botId"].as_str(),
                 a["limit"].as_u64().unwrap_or(50).min(500) as usize
             )?),
-            "plugins.instances" => self.instances_view()?,
-            "plugins.saveInstance" => {
-                let i: Instance = serde_json::from_value(a["instance"].clone()).map_err(|e| anyhow!("插件配置无效: {e}"))?;
+            "connectors.instances" => self.instances_view()?,
+            "connectors.saveInstance" => {
+                let i: Instance = serde_json::from_value(a["instance"].clone()).map_err(|e| anyhow!("连接器配置无效: {e}"))?;
                 json!(self.save_instance(i).await?)
             }
-            "plugins.deleteInstance" => {
+            "connectors.deleteInstance" => {
                 let id = s("id")?;
                 self.stop_instance(&id);
                 self.store.delete_instance(&id)?;
@@ -3570,8 +3570,8 @@ impl Engine {
         };
         // Reads must not announce a change: the frontend refetches `bots.list` on `bots.changed`
         const READS: &[&str] = &[
-            "bots.list", "bots.hosts", "bots.get", "bots.defaults", "bots.preview", "bots.events", "bots.stats", "bots.prompts", "bots.memories", "bots.routineRuns", "bots.approvals", "plugins.staged", "tasks.list", "tasks.events", "plugins.list",
-            "plugins.instances", "plugins.inspect", "plugins.outbox", "plugins.tools", "plugins.callTool",
+            "bots.list", "bots.hosts", "bots.get", "bots.defaults", "bots.preview", "bots.events", "bots.stats", "bots.prompts", "bots.memories", "bots.routineRuns", "bots.approvals", "connectors.staged", "tasks.list", "tasks.events", "connectors.list",
+            "connectors.instances", "connectors.inspect", "connectors.outbox", "connectors.tools", "connectors.callTool",
         ];
         if !READS.contains(&cmd) {
             self.changed();
@@ -3647,24 +3647,24 @@ impl Engine {
         Ok(json!({"bots": out, "clientId": self.identity.client_id}))
     }
 
-    /// Save a plugin configuration and start or stop it; returns its id. A disabled one may still miss required
+    /// Save a connector configuration and start or stop it; returns its id. A disabled one may still miss required
     /// settings (one a Bot created, waiting for the owner's secrets)
     async fn save_instance(&self, mut i: Instance) -> Result<String> {
-        let m = self.manifest(&i.plugin_id).ok_or_else(|| anyhow!("插件不存在: {}", i.plugin_id))?;
+        let m = self.manifest(&i.connector_id).ok_or_else(|| anyhow!("连接器不存在: {}", i.connector_id))?;
         if m.singleton {
-            bail!("这个插件只能有一份配置");
+            bail!("这个连接器只能有一份配置");
         }
         if i.id.is_empty() {
-            i.id = short_id(&i.plugin_id.replace('-', ""));
+            i.id = short_id(&i.connector_id.replace('-', ""));
         }
         if i.id == APP_INSTANCE {
             bail!("配置 id 已被占用");
         }
         let old = self.store.instances()?.into_iter().find(|x| x.id == i.id).map(|x| x.config).unwrap_or(json!({}));
-        plugins::keep_secrets(&m.config, &mut i.config, &old)?;
-        plugins::validate_config(&m.config, &i.config, i.enabled)?;
-        if i.plugin_id == builtin::CRON {
-            plugins::cron::Cron::parse(i.config["schedule"].as_str().unwrap_or(""))?;
+        connectors::keep_secrets(&m.config, &mut i.config, &old)?;
+        connectors::validate_config(&m.config, &i.config, i.enabled)?;
+        if i.connector_id == builtin::CRON {
+            connectors::cron::Cron::parse(i.config["schedule"].as_str().unwrap_or(""))?;
         }
         i.name = i.name.trim().to_string();
         if i.name.is_empty() {
@@ -3742,7 +3742,7 @@ impl Engine {
 
     /// Read a package (`path` on this machine, `url`, or base64 `data`), check it, and keep it until confirmed
     async fn inspect(&self, a: &Value) -> Result<Value> {
-        let wasm = self.wasm.clone().ok_or_else(|| anyhow!("插件运行时没有启动"))?;
+        let wasm = self.wasm.clone().ok_or_else(|| anyhow!("连接器运行时没有启动"))?;
         let path = a["path"].as_str().map(str::to_string);
         let url = a["url"].as_str().map(str::to_string);
         let data = a["data"].as_str().map(str::to_string);
@@ -3753,7 +3753,7 @@ impl Engine {
                 package::from_zip(&package::download(&u)?)?
             } else if let Some(d) = data {
                 use base64::Engine as _;
-                let bytes = base64::engine::general_purpose::STANDARD.decode(d.trim()).map_err(|_| anyhow!("插件包数据不对"))?;
+                let bytes = base64::engine::general_purpose::STANDARD.decode(d.trim()).map_err(|_| anyhow!("连接器包数据不对"))?;
                 package::from_zip(&bytes)?
             } else {
                 bail!("缺少参数 path / url / data");
@@ -3768,7 +3768,7 @@ impl Engine {
     /// Keep a checked package until the owner confirms it; what the review shows
     fn stage(&self, staged: package::Staged) -> Result<Value> {
         if self.wasm.as_ref().is_some_and(|w| w.is_bundled(&staged.manifest.id)) {
-            bail!("「{}」是 App 自带的插件，随 App 一起更新，不能另外安装", staged.manifest.id);
+            bail!("「{}」是 App 自带的连接器，随 App 一起更新，不能另外安装", staged.manifest.id);
         }
         let token = short_id("pkg");
         let v = self.describe_staged(&token, &staged);
@@ -3782,14 +3782,14 @@ impl Engine {
         json!({"token": token, "manifest": staged.manifest, "installed": installed, "added": added})
     }
 
-    /// Install a confirmed package; running instances of the plugin restart on the new version
+    /// Install a confirmed package; running instances of the connector restart on the new version
     async fn install(&self, staged: package::Staged) -> Result<String> {
-        let wasm = self.wasm.clone().ok_or_else(|| anyhow!("插件运行时没有启动"))?;
+        let wasm = self.wasm.clone().ok_or_else(|| anyhow!("连接器运行时没有启动"))?;
         let id = staged.manifest.id.clone();
         if wasm.is_bundled(&id) {
-            bail!("「{id}」是 App 自带的插件，随 App 一起更新，不能另外安装");
+            bail!("「{id}」是 App 自带的连接器，随 App 一起更新，不能另外安装");
         }
-        let instances: Vec<Instance> = self.store.instances()?.into_iter().filter(|i| i.plugin_id == id).collect();
+        let instances: Vec<Instance> = self.store.instances()?.into_iter().filter(|i| i.connector_id == id).collect();
         for i in &instances {
             self.stop_instance(&i.id);
         }
@@ -3805,7 +3805,7 @@ impl Engine {
         Ok(id)
     }
 
-    /// Plugin instances changed: the Bots' generated prompt layer mentions them
+    /// Connector instances changed: the Bots' generated prompt layer mentions them
     async fn refresh_prompts(&self) {
         for b in self.store.bots().unwrap_or_default() {
             if let (true, Some(s)) = (b.config.enabled, &b.session) {
@@ -3862,8 +3862,8 @@ fn brief(t: &TaskRow, events: &[EventRow], label: &dyn Fn(&str) -> String) -> St
     if let Some(r) = t.spec["request"].as_str().filter(|r| !r.is_empty()) {
         s.push_str(&format!("\n## Request from the owner\n\n{r}\n"));
     }
-    if t.is_plugin() {
-        s.push_str("\nThis task builds a Yi Console plugin: follow \"Building a plugin\" in your instructions, starting with plugin_kit.\n");
+    if t.is_connector() {
+        s.push_str("\nThis task builds a Yi Console connector: follow \"Building a connector\" in your instructions, starting with connector_kit.\n");
     }
     if !events.is_empty() {
         s.push_str("\n## Events\n\n");
@@ -3964,7 +3964,7 @@ fn phase1_handoff_text(t: &TaskRow) -> String {
     }
 }
 
-/// Where plugin_kit writes: `dir` as given when absolute, else relative to the task's directory
+/// Where connector_kit writes: `dir` as given when absolute, else relative to the task's directory
 fn kit_dir(cwd: &str, dir: Option<&str>) -> String {
     let cwd = cwd.trim_end_matches(['/', '\\']);
     let dir = dir.map(str::trim).filter(|d| !d.is_empty()).unwrap_or("yi-plugin-kit");
@@ -4100,15 +4100,15 @@ fn resolve_spawn_location(c: &BotConfig, a: &Value, restricted: bool) -> Result<
 // ---------- configuration changes a Bot asks for ----------
 
 impl Engine {
-    /// Plugin instances as the UI and the Bots see them: secrets masked, the app notification first
+    /// Connector instances as the UI and the Bots see them: secrets masked, the app notification first
     fn instances_view(&self) -> Result<Value> {
         let manifests = self.manifests();
-        let app = Instance { id: APP_INSTANCE.into(), plugin_id: builtin::APP_NOTIFY.into(), name: "App".into(), config: json!({}), enabled: true };
+        let app = Instance { id: APP_INSTANCE.into(), connector_id: builtin::APP_NOTIFY.into(), name: "App".into(), config: json!({}), enabled: true };
         let list: Vec<Value> = std::iter::once(app)
             .chain(self.store.instances()?)
             .map(|mut i| {
-                if let Some(m) = manifests.iter().find(|m| m.id == i.plugin_id) {
-                    i.config = plugins::redact(&m.config, &i.config);
+                if let Some(m) = manifests.iter().find(|m| m.id == i.connector_id) {
+                    i.config = connectors::redact(&m.config, &i.config);
                 }
                 serde_json::to_value(i).unwrap_or_default()
             })
@@ -4121,7 +4121,7 @@ impl Engine {
         Ok(r["hosts"].as_array().cloned().unwrap_or_default())
     }
 
-    /// Check a configuration a Bot wants: the save rules, plus the hosts, plugins and instances it names. Returns the
+    /// Check a configuration a Bot wants: the save rules, plus the hosts, connectors and instances it names. Returns the
     /// normalized configuration, the new instances with secrets taken out, errors and warnings
     async fn check_draft(&self, a: &Value) -> Result<(Option<BotConfig>, Vec<Value>, Vec<String>, Vec<String>)> {
         let (mut errors, mut warnings) = (vec![], vec![]);
@@ -4130,17 +4130,17 @@ impl Engine {
         let mut instances = vec![];
         for i in a["instances"].as_array().into_iter().flatten() {
             let r = i["ref"].as_str().unwrap_or("").to_string();
-            let pid = i["pluginId"].as_str().unwrap_or("").to_string();
+            let pid = i["connectorId"].as_str().unwrap_or("").to_string();
             if !r.starts_with("new:") {
                 errors.push(format!("Instance ref must start with \"new:\": {r:?}"));
                 continue;
             }
             let Some(m) = manifests.iter().find(|m| m.id == pid) else {
-                errors.push(format!("{r}: no plugin {pid:?} is installed (list_plugins)"));
+                errors.push(format!("{r}: no connector {pid:?} is installed (list_connectors)"));
                 continue;
             };
             if m.singleton {
-                errors.push(format!("{r}: plugin {pid} has a single built-in instance ({APP_INSTANCE}); use that id"));
+                errors.push(format!("{r}: connector {pid} has a single built-in instance ({APP_INSTANCE}); use that id"));
                 continue;
             }
             let mut config = if i["config"].is_object() { i["config"].clone() } else { json!({}) };
@@ -4164,12 +4164,12 @@ impl Engine {
                 }
             }
             if pid == builtin::CRON {
-                if let Err(e) = plugins::cron::Cron::parse(config["schedule"].as_str().unwrap_or("")) {
+                if let Err(e) = connectors::cron::Cron::parse(config["schedule"].as_str().unwrap_or("")) {
                     errors.push(format!("{r}: {e:#}"));
                 }
             }
             new_refs.insert(r.clone(), pid.clone());
-            instances.push(json!({"ref": r, "pluginId": pid, "name": i["name"].as_str().unwrap_or(""), "config": config}));
+            instances.push(json!({"ref": r, "connectorId": pid, "name": i["name"].as_str().unwrap_or(""), "config": config}));
         }
 
         // Serde ignores unknown keys: name them, or a misplaced field passes silently
@@ -4205,7 +4205,7 @@ impl Engine {
             if id == APP_INSTANCE {
                 return Some(builtin::APP_NOTIFY.into());
             }
-            new_refs.get(id).cloned().or_else(|| existing.iter().find(|i| i.id == id).map(|i| i.plugin_id.clone()))
+            new_refs.get(id).cloned().or_else(|| existing.iter().find(|i| i.id == id).map(|i| i.connector_id.clone()))
         };
         let mut need = |id: &str, cap: &str, what: &str| match plugin_of(id) {
             None => errors.push(format!("{what}: no instance {id} (list_instances, or a \"new:\" ref in instances)")),
@@ -4246,7 +4246,7 @@ impl Engine {
         Ok((Some(c), instances, errors, warnings))
     }
 
-    /// Read a plugin package from a host: a .yiplugin file, or a folder with plugin.json, the component and extras
+    /// Read a connector package from a host: a .yiconnector file, or a folder with connector.json, the component and extras
     async fn package_from_host(&self, host: &str, path: &str) -> Result<package::Staged> {
         use base64::Engine as _;
         let read = |p: String| async move {
@@ -4254,7 +4254,7 @@ impl Engine {
             base64::engine::general_purpose::STANDARD.decode(r["base64"].as_str().unwrap_or("")).map_err(|e| anyhow!("{e}"))
         };
         let is_dir = self.rpc(host, "fs.list", json!({"path": path})).await.is_ok();
-        let wasm = self.wasm.clone().ok_or_else(|| anyhow!("插件运行时没有启动"))?;
+        let wasm = self.wasm.clone().ok_or_else(|| anyhow!("连接器运行时没有启动"))?;
         if !is_dir {
             let zip = read(path.to_string()).await?;
             return blocking(move || -> Result<package::Staged> {
@@ -4265,9 +4265,9 @@ impl Engine {
             .await?;
         }
         let join = |f: &str| format!("{}/{f}", path.trim_end_matches(['/', '\\']));
-        let manifest = read(join("plugin.json")).await?;
-        let main = serde_json::from_slice::<Value>(&manifest).ok().and_then(|m| m["main"].as_str().map(str::to_string)).unwrap_or_else(|| "plugin.wasm".into());
-        let mut files = vec![("plugin.json".to_string(), manifest)];
+        let manifest = read(join("connector.json")).await?;
+        let main = serde_json::from_slice::<Value>(&manifest).ok().and_then(|m| m["main"].as_str().map(str::to_string)).unwrap_or_else(|| "connector.wasm".into());
+        let mut files = vec![("connector.json".to_string(), manifest)];
         files.push((main.clone(), read(join(&main)).await.map_err(|e| anyhow!("读取 {main} 失败: {e:#}"))?));
         for extra in ["prompt.md", "README.md", "LICENSE"] {
             if let Ok(b) = read(join(extra)).await {
@@ -4320,7 +4320,7 @@ impl Engine {
                     .collect::<Vec<_>>()))
             }
             "list_models" => self.rpc(&s("host")?, "tools.models", json!({"tool": s("tool")?})).await,
-            "list_plugins" => {
+            "list_connectors" => {
                 let off = self.disabled_plugins();
                 Ok(json!(self
                     .manifests()
@@ -4344,7 +4344,7 @@ impl Engine {
     }
 
     /// Secret cards for a Bot: the instances it uses that miss a required secret, and the ones it asked for with
-    /// request_secret. Each lists its secret fields with labels from the plugin's schema
+    /// request_secret. Each lists its secret fields with labels from the connector's schema
     fn secret_cards(&self, c: &BotConfig) -> Vec<Value> {
         let requests = self.bots.lock().unwrap().get(&c.id).map(|r| r.secret_requests.clone()).unwrap_or_default();
         let used = bot_instances(c);
@@ -4353,7 +4353,7 @@ impl Engine {
             if !used.contains(&inst.id) {
                 continue;
             }
-            let Some(m) = self.manifest(&inst.plugin_id) else { continue };
+            let Some(m) = self.manifest(&inst.connector_id) else { continue };
             let empty = |k: &str| inst.config.get(k).map_or(true, |v| v.is_null() || v.as_str() == Some(""));
             let required: Vec<&str> = m.config["required"].as_array().into_iter().flatten().filter_map(|v| v.as_str()).collect();
             let req = requests.iter().find(|r| r.instance_id == inst.id);
@@ -4375,7 +4375,7 @@ impl Engine {
                 })
                 .collect();
             out.push(json!({
-                "instanceId": inst.id, "name": inst.name, "pluginId": inst.plugin_id, "enabled": inst.enabled,
+                "instanceId": inst.id, "name": inst.name, "connectorId": inst.connector_id, "enabled": inst.enabled,
                 "requestId": req.map(|r| r.id.clone()), "reason": req.map(|r| r.reason.clone()), "fields": fields,
             }));
         }
@@ -4390,8 +4390,8 @@ impl Engine {
             if !before.contains(&inst.id) || used.contains(&inst.id) || inst.enabled {
                 continue;
             }
-            let Some(m) = self.manifest(&inst.plugin_id) else { continue };
-            if plugins::validate_config(&m.config, &inst.config, true).is_ok() {
+            let Some(m) = self.manifest(&inst.connector_id) else { continue };
+            if connectors::validate_config(&m.config, &inst.config, true).is_ok() {
                 continue;
             }
             self.stop_instance(&inst.id);
@@ -4400,15 +4400,15 @@ impl Engine {
         }
     }
 
-    /// Save a checked configuration: its new plugin instances first (one still missing a secret is created disabled,
+    /// Save a checked configuration: its new connector instances first (one still missing a secret is created disabled,
     /// for the owner to fill in), then the Bot with the "new:" refs swapped for their ids. Returns the saved
     /// configuration and the instances waiting for secrets
     async fn apply_config(&self, mut c: BotConfig, instances: &[Value], origin: &str) -> Result<(BotConfig, Vec<Value>)> {
         let mut ids: HashMap<String, String> = HashMap::new();
         let mut pending = vec![];
         for i in instances {
-            let pid = i["pluginId"].as_str().unwrap_or("").to_string();
-            let m = self.manifest(&pid).ok_or_else(|| anyhow!("插件不存在: {pid}"))?;
+            let pid = i["connectorId"].as_str().unwrap_or("").to_string();
+            let m = self.manifest(&pid).ok_or_else(|| anyhow!("连接器不存在: {pid}"))?;
             let config = i["config"].clone();
             let missing: Vec<String> = m.config["required"]
                 .as_array()
@@ -4419,7 +4419,7 @@ impl Engine {
                 .map(str::to_string)
                 .collect();
             let name = i["name"].as_str().unwrap_or("").to_string();
-            let inst = Instance { id: String::new(), plugin_id: pid, name, config, enabled: missing.is_empty() };
+            let inst = Instance { id: String::new(), connector_id: pid, name, config, enabled: missing.is_empty() };
             let id = self.save_instance(inst).await?;
             if !missing.is_empty() {
                 let name = self.store.instances()?.into_iter().find(|x| x.id == id).map(|x| x.name).unwrap_or_default();
@@ -4505,7 +4505,7 @@ fn sensitive_changes(old: &BotConfig, new: &BotConfig) -> Vec<String> {
     items
 }
 
-/// Whether the Bot takes plugin events now
+/// Whether the Bot takes connector events now
 fn in_active_hours(c: &BotConfig) -> bool {
     c.active_hours.as_ref().map_or(true, |h| h.contains(chrono::Local::now().naive_local()))
 }
@@ -4524,7 +4524,7 @@ fn fmt_tokens(n: u64) -> String {
     }
 }
 
-/// Plugin instances a Bot uses: its triggers, notify targets and allow list
+/// Connector instances a Bot uses: its triggers, notify targets and allow list
 fn bot_instances(c: &BotConfig) -> Vec<String> {
     let mut v: Vec<String> = c.triggers.iter().chain(c.notify.iter()).cloned().chain(c.allow.iter().map(|a| a.instance.clone())).collect();
     v.sort();
@@ -4532,12 +4532,12 @@ fn bot_instances(c: &BotConfig) -> Vec<String> {
     v
 }
 
-/// Settings marked x-secret in a plugin's configuration schema
+/// Settings marked x-secret in a connector's configuration schema
 fn secret_keys(schema: &Value) -> Vec<String> {
     schema["properties"].as_object().into_iter().flatten().filter(|(_, p)| p["x-secret"] == true).map(|(k, _)| k.clone()).collect()
 }
 
-/// For the Bot: new plugin configurations that wait for the owner's secrets
+/// For the Bot: new connector configurations that wait for the owner's secrets
 fn secrets_note(pending: &[Value]) -> String {
     if pending.is_empty() {
         return String::new();
@@ -4550,7 +4550,7 @@ fn secrets_note(pending: &[Value]) -> String {
         })
         .collect();
     format!(
-        "\nThese new plugin configurations stay disabled until the owner enters their secrets in the card the app shows \
+        "\nThese new connector configurations stay disabled until the owner enters their secrets in the card the app shows \
          in this session (you never see the values; you get a message when they are saved): {}. Tell the owner in one \
          sentence to fill in the card; never ask for the secret in the chat.",
         names.join("; ")
@@ -4663,14 +4663,14 @@ mod tests {
         };
         let b = brief(&t, &[], &|i| i.to_string());
         assert!(b.contains("please fix the typo") && b.contains("yi/task-1") && b.contains("see #3"));
-        assert!(!b.contains("Building a plugin"));
+        assert!(!b.contains("Building a connector"));
         let p = TaskRow { spec: json!({"mode": "scratch", "kind": "plugin", "request": "Jira Server events"}), ..Default::default() };
-        assert!(p.is_plugin() && p.mode() == "scratch");
-        assert!(brief(&p, &[], &|i| i.to_string()).contains("follow \"Building a plugin\""));
+        assert!(p.is_connector() && p.mode() == "scratch");
+        assert!(brief(&p, &[], &|i| i.to_string()).contains("follow \"Building a connector\""));
     }
 
     #[test]
-    fn plugin_kit_dirs_are_relative_to_the_task() {
+    fn connector_kit_dirs_are_relative_to_the_task() {
         assert_eq!(kit_dir("C:\\w\\t1", None), "C:\\w\\t1/yi-plugin-kit");
         assert_eq!(kit_dir("C:\\w\\t1\\", Some("connectors/jira/kit")), "C:\\w\\t1/connectors/jira/kit");
         assert_eq!(kit_dir("/w/t1", Some("./kit/")), "/w/t1/kit");

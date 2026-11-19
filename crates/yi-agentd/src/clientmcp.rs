@@ -161,7 +161,7 @@ impl Clients {
     pub async fn remote_call(&self, p: &Value) -> Result<Value> {
         let client = p["clientId"].as_str().ok_or_else(|| anyhow!("缺少参数 clientId"))?;
         let cmd = p["cmd"].as_str().ok_or_else(|| anyhow!("缺少参数 cmd"))?;
-        if !["bots.", "tasks.", "plugins."].iter().any(|x| cmd.starts_with(x)) {
+        if !["bots.", "tasks.", "connectors."].iter().any(|x| cmd.starts_with(x)) {
             bail!("不能遥控这个命令：{cmd}");
         }
         let target = {

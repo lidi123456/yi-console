@@ -27,8 +27,8 @@ export type View =
   | { kind: 'prefs' }
   /** A Bot's details. src: the Bots source (bots.ts), '' or absent for this app */
   | { kind: 'bot'; botId: string; src?: string }
-  /** Bot plugins and their instances */
-  | { kind: 'plugins'; src?: string; review?: string }
+  /** Bot connectors and their instances */
+  | { kind: 'connectors'; src?: string; review?: string }
   /** Every event a Bot received */
   | { kind: 'botEvents'; botId: string; src?: string }
   /** New session page (`NewSession.tsx`) */
@@ -740,8 +740,8 @@ export function startEventLoop() {
       case 'bots.confirm':
         confirmNeeded(ev, '');
         break;
-      case 'bots.pluginProposal':
-        pluginProposal(ev, '');
+      case 'bots.connectorProposal':
+        connectorProposal(ev, '');
         break;
       case 'bots.taskUpgraded':
         taskUpgraded(ev, '');
@@ -766,17 +766,17 @@ export function setToolJob(hostId: string, tool: string, job: ToolJob, line?: st
   });
 }
 
-/** A Bot proposed a plugin a task built: open it for review when the Bot's session is on screen, otherwise offer it
+/** A Bot proposed a connector a task built: open it for review when the Bot's session is on screen, otherwise offer it
  * in a toast */
-function pluginProposal(ev: any, src: string) {
-  const go = () => navigate({ kind: 'plugins', review: ev.token, src: src || undefined });
+function connectorProposal(ev: any, src: string) {
+  const go = () => navigate({ kind: 'connectors', review: ev.token, src: src || undefined });
   const hostId = mapHost(src, ev.host, (id) => state.hosts.some((h) => h.config.id === id));
   const v = state.view;
   if (v.kind === 'session' && v.hostId === hostId && v.sessionId === ev.sessionId) go();
   else toast(t('pluginProposed', { name: ev.id }), 'info', { label: t('view'), run: go });
 }
 
-/** Plugin configurations of a Bot wait for the owner's secrets: a card in the Bot's session takes them */
+/** Connector configurations of a Bot wait for the owner's secrets: a card in the Bot's session takes them */
 function secretsNeeded(ev: any, src: string) {
   const pending: { name: string }[] = ev.pending ?? [];
   if (pending.length === 0) return;
@@ -839,7 +839,7 @@ function onNotification(hostId: string, method: string, p: any) {
       if (ev.type === 'bots.notify' || ev.type === 'bots.attention') botToast(ev, key);
       if (ev.type === 'bots.secretsNeeded') secretsNeeded(ev, key);
       if (ev.type === 'bots.confirm') confirmNeeded(ev, key);
-      if (ev.type === 'bots.pluginProposal') pluginProposal(ev, key);
+      if (ev.type === 'bots.connectorProposal') connectorProposal(ev, key);
       if (ev.type === 'bots.taskUpgraded') taskUpgraded(ev, key);
       break;
     }

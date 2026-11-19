@@ -118,7 +118,7 @@ export interface Approval {
   originalText?: string | null;
   tool?: string | null;
   input?: unknown;
-  /** Plugin instance name, and the message a reply answers */
+  /** Connector instance name, and the message a reply answers */
   source?: string;
   quoteFrom?: string;
   quote?: string;
@@ -191,12 +191,12 @@ export interface PendingChange {
   items: string[];
 }
 
-/** Secrets of one plugin instance for the owner to enter: required ones that are missing, or ones the Bot asked
+/** Secrets of one connector instance for the owner to enter: required ones that are missing, or ones the Bot asked
  *  for with request_secret (then with `requestId` and `reason`). The values never reach the Bot */
 export interface SecretCard {
   instanceId: string;
   name: string;
-  pluginId: string;
+  connectorId: string;
   enabled: boolean;
   requestId?: string | null;
   reason?: string | null;
@@ -216,7 +216,7 @@ export interface BotEntry {
   attention: Attention[];
   /** Drafts waiting for the owner */
   approvals?: Approval[];
-  /** Plugin instances the Bot uses that wait for the owner's secrets */
+  /** Connector instances the Bot uses that wait for the owner's secrets */
   secrets?: SecretCard[];
   /** Latest run per routine id */
   lastRuns?: Record<string, RoutineRun>;
@@ -242,7 +242,7 @@ export interface EventRow {
   note: string;
 }
 
-/** A message on its way out through a plugin (crates/bots store.rs OutboxRow) */
+/** A message on its way out through a connector (crates/bots store.rs OutboxRow) */
 export interface OutboxRow {
   key: string;
   instanceId: string;
@@ -260,7 +260,7 @@ export interface OutboxRow {
   createdAt: number;
 }
 
-export interface PluginManifest {
+export interface ConnectorManifest {
   id: string;
   version: string;
   /** builtin / wasm */
@@ -288,9 +288,9 @@ export interface SchemaProp {
   'x-ui'?: string;
 }
 
-export interface PluginInstance {
+export interface ConnectorInstance {
   id: string;
-  pluginId: string;
+  connectorId: string;
   name: string;
   config: Record<string, unknown>;
   enabled: boolean;
@@ -388,7 +388,7 @@ export function botCall<T = unknown>(cmd: string, args: Record<string, unknown> 
   return rpc<T>(hostId, 'client.call', { clientId, cmd, args });
 }
 
-/** The Bots source the components below work on (BotsSection, BotView, PluginsView) */
+/** The Bots source the components below work on (BotsSection, BotView, ConnectorsView) */
 export const BotSource = createContext('');
 
 export function useBotSource() {

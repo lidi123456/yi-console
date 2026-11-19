@@ -75,7 +75,8 @@ pub const MEMORY_MAX_CHARS: usize = 300;
 #[serde(rename_all = "camelCase")]
 pub struct Instance {
     pub id: String,
-    pub plugin_id: String,
+    #[serde(alias = "pluginId")]
+    pub connector_id: String,
     pub name: String,
     /// Secrets in plain text, like the hosts' MCP env; redacted before it leaves the engine
     pub config: Value,
@@ -162,9 +163,9 @@ impl TaskRow {
         matches!(self.state.as_str(), "queued" | "working" | "needsYou" | "reviewing")
     }
 
-    /// A `kind: plugin` task (`spawn_task`): builds a Yi Console plugin in a scratch directory
-    pub fn is_plugin(&self) -> bool {
-        self.spec["kind"].as_str() == Some("plugin")
+    /// A `kind: connector` task (`spawn_task`): builds a Yi Console connector in a scratch directory
+    pub fn is_connector(&self) -> bool {
+        matches!(self.spec["kind"].as_str(), Some("connector" | "plugin"))
     }
 
     pub fn mode(&self) -> &str {
@@ -190,8 +191,8 @@ pub struct Attention {
     pub at: i64,
 }
 
-/// A message on its way out through a plugin (a reply into a conversation, or a notification). The key is the
-/// idempotency key the plugin gets, so retries never send twice
+/// A message on its way out through a connector (a reply into a conversation, or a notification). The key is the
+/// idempotency key the connector gets, so retries never send twice
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OutboxRow {
@@ -266,7 +267,7 @@ pub struct ApprovalRow {
     pub tool: Option<String>,
     #[serde(default)]
     pub input: Value,
-    /// For the card: the plugin instance's name, and the message a reply answers (who, what)
+    /// For the card: the connector instance's name, and the message a reply answers (who, what)
     #[serde(default)]
     pub source: String,
     #[serde(default)]
@@ -448,7 +449,7 @@ impl Store {
         let rows = st.query_map([], |r| {
             Ok(Instance {
                 id: r.get(0)?,
-                plugin_id: r.get(1)?,
+                connector_id: r.get(1)?,
                 name: r.get(2)?,
                 config: serde_json::from_str(&r.get::<_, String>(3)?).unwrap_or(Value::Null),
                 enabled: r.get::<_, i64>(4)? != 0,
@@ -461,7 +462,7 @@ impl Store {
         self.db.lock().unwrap().execute(
             "INSERT INTO plugin_instances (id, plugin_id, name, config, enabled, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(id) DO UPDATE SET name = excluded.name, config = excluded.config, enabled = excluded.enabled",
-            params![i.id, i.plugin_id, i.name, serde_json::to_string(&i.config)?, i.enabled as i64, now],
+            params![i.id, i.connector_id, i.name, serde_json::to_string(&i.config)?, i.enabled as i64, now],
         )?;
         Ok(())
     }

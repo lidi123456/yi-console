@@ -699,7 +699,7 @@ export function ApprovalCards({ bot, src, inline }: { bot: BotEntry; src: string
   );
 }
 
-/** Secrets of one plugin instance: password fields that go straight to the desktop app's plugin configuration */
+/** Secrets of one connector instance: password fields that go straight to the desktop app's connector configuration */
 function SecretForm({ bot, card, src }: { bot: BotEntry; card: SecretCard; src: string }) {
   const [values, setValues] = useState<Record<string, string>>({});
   const [shown, setShown] = useState(false);
@@ -788,7 +788,7 @@ function SecretForm({ bot, card, src }: { bot: BotEntry; card: SecretCard; src: 
   );
 }
 
-/** Plugin instances of a Bot waiting for the owner's secrets */
+/** Connector instances of a Bot waiting for the owner's secrets */
 export function SecretCards({ bot, src, inline }: { bot: BotEntry; src: string; inline?: boolean }) {
   const list = bot.secrets ?? [];
   if (list.length === 0) return null;
@@ -1050,7 +1050,7 @@ function BotsSection({ src, filter }: { src: string; filter: string }) {
     setCollapsed(!collapsed);
   };
   const attn = (list ?? []).reduce((n, b) => n + needsYouCount(b), 0);
-  const here = (view.kind === 'plugins' || view.kind === 'bot' || view.kind === 'botEvents') && (view.src ?? '') === src;
+  const here = (view.kind === 'connectors' || view.kind === 'bot' || view.kind === 'botEvents') && (view.src ?? '') === src;
   return (
     <div className="host-block bots-block">
       <div className="host-head">
@@ -1066,7 +1066,7 @@ function BotsSection({ src, filter }: { src: string; filter: string }) {
         </button>
         {list && (
           <>
-            <button className={`host-act ${here && view.kind === 'plugins' ? 'active' : ''}`} title={t('plugins')} onClick={() => navigate({ kind: 'plugins', src })}>
+            <button className={`host-act ${here && view.kind === 'connectors' ? 'active' : ''}`} title={t('plugins')} onClick={() => navigate({ kind: 'connectors', src })}>
               <Icon name="plug" size={14} />
             </button>
             <button className="host-act" title={t('newBot')} onClick={() => newBot(src)}>

@@ -87,6 +87,6 @@
   "catNetwork": "Network",
   "bots": "Bots",
   "closeToTray": "Keep running in the tray when the window is closed",
-  "closeToTrayHint": "While a Bot is enabled, closing the main window only hides it to the tray and Bots and plugins keep working; quit from the tray menu to exit. With no Bot enabled the app quits as usual.",
-  "managePlugins": "Manage plugins"
+  "closeToTrayHint": "While a Bot is enabled, closing the main window only hides it to the tray and Bots and connectors keep working; quit from the tray menu to exit. With no Bot enabled the app quits as usual.",
+  "managePlugins": "Manage connectors"
 }

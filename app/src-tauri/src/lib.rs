@@ -181,8 +181,8 @@ pub fn run() {
             {
                 // Bots run only in the desktop app; phones and yi-web will reach them through the desktop
                 let h = hub.clone();
-                // Feishu / GitHub ship with the app (scripts/bundle-plugins.py fills resources/plugins)
-                let bundled = app.path().resource_dir().ok().map(|d| d.join("plugins"));
+                // Feishu / GitHub ship with the app (scripts/bundle-connectors.py fills resources/connectors)
+                let bundled = app.path().resource_dir().ok().map(|d| d.join("connectors"));
                 let bots = tauri::async_runtime::block_on(async move {
                     yi_bots::start(&h, &data_dir, &yi_client::api::device_name(), bundled.as_deref())
                 });
