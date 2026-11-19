@@ -41,6 +41,38 @@ struct ToolState {
     done: bool,
 }
 
+#[derive(Debug, Clone)]
+struct PendingElicit {
+    rpc_id: Value,
+    fields: Vec<ElicitField>,
+}
+
+#[derive(Debug, Clone)]
+enum ElicitField {
+    /// Antigravity's `ask_question` form (`qN` for options, `qN_other` for free-text)
+    AskQuestion {
+        question_id: String,
+        select_key: Option<String>,
+        other_key: Option<String>,
+        multi: bool,
+    },
+    /// Generic ACP/MCP `elicitation/create` form property
+    Property {
+        question_id: String,
+        key: String,
+        kind: ElicitPropKind,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ElicitPropKind {
+    String,
+    MultiArray,
+    Bool,
+    Integer,
+    Number,
+}
+
 #[derive(Default)]
 struct State {
     qoder_config_dir: Option<PathBuf>,
@@ -116,6 +148,9 @@ struct State {
     last_reply: String,
     /// Cursor's cursor/ask_question requests: request id -> (JSON-RPC id)
     asks: HashMap<String, Value>,
+    /// ACP `elicitation/create` form requests (Antigravity's `ask_question` and MCP form elicitations)
+    elicits: HashMap<String, PendingElicit>,
+    elicit_seq: u64,
     /// Auth methods returned by initialize. We don't call authenticate up front (cursor_login opens a browser,
     /// and with CURSOR_API_KEY set it isn't needed at all). Cursor authentication failures must be
     /// surfaced instead of starting a browser login on a headless host; other tools retry once.
@@ -377,11 +412,19 @@ pub async fn run(spec: StartSpec, em: Emitter, mut rx: mpsc::UnboundedReceiver<A
                                 "result":{"outcome":{"outcome":"cancelled"}}})).await;
                             em.event(EventBody::PermissionResolved { request_id: rid, option_id: "cancelled".into(), answers: vec![] });
                         }
+                        for (rid, el) in st.elicits.drain() {
+                            let _ = p.send(&elicit_response(&el, "cancelled", &[])).await;
+                            em.event(EventBody::PermissionResolved { request_id: rid, option_id: "cancelled".into(), answers: vec![] });
+                        }
                         let _ = p.send(&json!({"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":sid}})).await;
                     }
                 }
                 Some(AdapterCmd::Permission { request_id, option_id, answers }) => {
-                    if let Some(rpc_id) = st.asks.remove(&request_id) {
+                    if let Some(el) = st.elicits.remove(&request_id) {
+                        let _ = p.send(&elicit_response(&el, &option_id, &answers)).await;
+                        let resolved_answers = if option_id == "cancelled" { vec![] } else { answers };
+                        em.event(EventBody::PermissionResolved { request_id, option_id, answers: resolved_answers });
+                    } else if let Some(rpc_id) = st.asks.remove(&request_id) {
                         let outcome = match option_id.as_str() {
                             QUESTION_ANSWER => json!({"outcome":"answered","answers":answers.iter()
                                 .filter(|a| !a.selected.is_empty())
@@ -419,10 +462,12 @@ pub async fn run(spec: StartSpec, em: Emitter, mut rx: mpsc::UnboundedReceiver<A
     em.exited(fatal.or(msg));
 }
 
-/// Cursor only exposes individual model parameters when this extension is declared.
+/// Cursor only exposes individual model parameters when `parameterizedModelPicker` is declared;
+/// Antigravity only sends `elicitation/create` for `ask_question` when `elicitation.form` is declared.
 pub fn client_capabilities(tool: ToolKind) -> Value {
     let mut caps = json!({"fs":{"readTextFile":false,"writeTextFile":false},"terminal":false});
     if tool == ToolKind::Cursor { caps["_meta"] = json!({"parameterizedModelPicker":true}); }
+    if tool == ToolKind::Antigravity { caps["elicitation"] = json!({"form":{}}); }
     caps
 }
 
@@ -1237,6 +1282,35 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Result<V
                 options: super::question_options(),
                 questions,
             });
+        } else if method == "elicitation/create" {
+            // ACP form elicitation (Antigravity's `ask_question` and MCP form elicitations):
+            // {sessionId, toolCallId?, mode: "form", message, requestedSchema: {type: "object", properties: {...}}}
+            flush(st, em);
+            let tc_id = params["toolCallId"].as_str().unwrap_or("");
+            let fallback_input = (!tc_id.is_empty()).then(|| st.tools.get(tc_id).map(|t| &t.input)).flatten();
+            if let Some((questions, fields)) = parse_elicitation(params, fallback_input) {
+                st.elicit_seq += 1;
+                let rid = if tc_id.is_empty() {
+                    format!("elicit:{}", st.elicit_seq)
+                } else {
+                    format!("elicit:{tc_id}:{}", st.elicit_seq)
+                };
+                let input = fallback_input
+                    .filter(|inp| !inp.is_null() && *inp != &json!({}))
+                    .cloned()
+                    .unwrap_or_else(|| params.clone());
+                st.elicits.insert(rid.clone(), PendingElicit { rpc_id: v["id"].clone(), fields });
+                em.event(EventBody::PermissionRequest {
+                    request_id: rid,
+                    tool_name: "ask_question".into(),
+                    title: elicit_title(spec.tool, params["message"].as_str()),
+                    input,
+                    options: super::question_options(),
+                    questions,
+                });
+            } else {
+                out.push(json!({"jsonrpc":"2.0","id":v["id"],"result":{"action":"decline"}}));
+            }
         } else {
             out.push(json!({"jsonrpc":"2.0","id":v["id"],
                 "error":{"code":-32601,"message":"not supported by yi-console"}}));
@@ -1261,6 +1335,320 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Result<V
         _ => {}
     }
     Ok(out)
+}
+
+fn elicit_title(tool: ToolKind, msg: Option<&str>) -> String {
+    let m = msg.map(str::trim).unwrap_or("");
+    let generic = m.is_empty()
+        || m == "The agent has a question."
+        || (m.starts_with("The agent has ") && m.ends_with(" questions."));
+    if generic {
+        let name = match tool {
+            ToolKind::Antigravity => "Antigravity",
+            ToolKind::Cursor => "Cursor",
+            ToolKind::Kiro => "Kiro",
+            ToolKind::Qoder => "Qoder",
+            ToolKind::Codebuddy => "CodeBuddy",
+            _ => tool.as_str(),
+        };
+        format!("{name} 有问题想问你")
+    } else {
+        m.to_string()
+    }
+}
+
+fn elicit_options(prop: &Value) -> Vec<QuestionOption> {
+    let src = if prop["type"] == "array" { &prop["items"] } else { prop };
+    if let Some(arr) = src["oneOf"].as_array().or_else(|| src["anyOf"].as_array()) {
+        return arr
+            .iter()
+            .filter_map(|o| {
+                let id = match &o["const"] {
+                    Value::String(s) if !s.is_empty() => s.clone(),
+                    Value::Number(n) => n.to_string(),
+                    Value::Bool(b) => b.to_string(),
+                    _ => return None,
+                };
+                let label = o["title"].as_str().filter(|s| !s.is_empty()).unwrap_or(&id).to_string();
+                let description = o["description"].as_str().unwrap_or("").to_string();
+                Some(QuestionOption { id, label, description })
+            })
+            .collect();
+    }
+    if let Some(arr) = src["enum"].as_array() {
+        let names = src["enumNames"].as_array();
+        return arr
+            .iter()
+            .enumerate()
+            .filter_map(|(i, val)| {
+                let id = match val {
+                    Value::String(s) if !s.is_empty() => s.clone(),
+                    Value::Number(n) => n.to_string(),
+                    Value::Bool(b) => b.to_string(),
+                    _ => return None,
+                };
+                let label = names
+                    .and_then(|n| n.get(i))
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(&id)
+                    .to_string();
+                Some(QuestionOption { id, label, description: String::new() })
+            })
+            .collect();
+    }
+    vec![]
+}
+
+/// Parse ACP `elicitation/create` (`mode: "form"`). Antigravity builds `q1`/`q1_other`, `q2`/`q2_other`, … for
+/// `ask_question`; remaining JSON Schema properties are handled as generic form questions.
+fn parse_elicitation(params: &Value, fallback_input: Option<&Value>) -> Option<(Vec<Question>, Vec<ElicitField>)> {
+    if params["mode"].as_str().is_some_and(|m| m != "form") {
+        return None;
+    }
+    let mut questions = vec![];
+    let mut fields = vec![];
+    if let Some(props) = params["requestedSchema"]["properties"].as_object() {
+        let mut consumed = HashSet::new();
+        // Read q1, q2, …, qN numerically so serde_json's BTreeMap key order ("q10" before "q2") preserves question order
+        for k in 1usize.. {
+            let sk = format!("q{k}");
+            let ok = format!("q{k}_other");
+            let sel = props.get(&sk);
+            let oth = props.get(&ok);
+            if sel.is_none() && oth.is_none() {
+                break;
+            }
+            if let Some(s) = sel {
+                consumed.insert(sk.clone());
+                let has_other = oth.is_some_and(|o| o["type"].as_str().unwrap_or("string") == "string");
+                if has_other {
+                    consumed.insert(ok.clone());
+                }
+                let multi = s["type"] == "array";
+                let options = elicit_options(s);
+                let question = s["title"]
+                    .as_str()
+                    .filter(|t| !t.is_empty())
+                    .or_else(|| s["description"].as_str().filter(|t| !t.is_empty()))
+                    .unwrap_or(&sk)
+                    .to_string();
+                let secret = s["format"] == "password" || s["writeOnly"] == json!(true);
+                let (select_key, other_key, allow_other) = if options.is_empty() && !has_other {
+                    (None, Some(sk.clone()), true)
+                } else {
+                    (Some(sk.clone()), has_other.then(|| ok.clone()), has_other)
+                };
+                questions.push(Question {
+                    id: sk.clone(),
+                    header: String::new(),
+                    question,
+                    options,
+                    multi_select: multi,
+                    allow_other,
+                    secret,
+                });
+                fields.push(ElicitField::AskQuestion { question_id: sk, select_key, other_key, multi });
+            } else if let Some(o) = oth {
+                consumed.insert(ok.clone());
+                let question = o["title"]
+                    .as_str()
+                    .filter(|t| !t.is_empty() && *t != "Other")
+                    .or_else(|| {
+                        o["description"]
+                            .as_str()
+                            .and_then(|d| d.strip_prefix("Optional free-form answer to: "))
+                            .filter(|t| !t.is_empty())
+                    })
+                    .or_else(|| o["description"].as_str().filter(|t| !t.is_empty()))
+                    .unwrap_or(&ok)
+                    .to_string();
+                let secret = o["format"] == "password" || o["writeOnly"] == json!(true);
+                questions.push(Question {
+                    id: sk.clone(),
+                    header: String::new(),
+                    question,
+                    options: vec![],
+                    multi_select: false,
+                    allow_other: true,
+                    secret,
+                });
+                fields.push(ElicitField::AskQuestion { question_id: sk, select_key: None, other_key: Some(ok), multi: false });
+            }
+        }
+        for (key, prop) in props {
+            if consumed.contains(key) {
+                continue;
+            }
+            let ptype = prop["type"].as_str().unwrap_or("string");
+            let title = prop["title"].as_str().map(str::trim).unwrap_or("");
+            let desc = prop["description"].as_str().map(str::trim).unwrap_or("");
+            let (header, question) = if !title.is_empty() && !desc.is_empty() && title != desc && title.chars().count() <= 32 {
+                (title.to_string(), desc.to_string())
+            } else {
+                (
+                    String::new(),
+                    if !title.is_empty() {
+                        title
+                    } else if !desc.is_empty() {
+                        desc
+                    } else {
+                        key.as_str()
+                    }
+                    .to_string(),
+                )
+            };
+            let secret = prop["format"] == "password" || prop["writeOnly"] == json!(true);
+            let opts = elicit_options(prop);
+            let (options, multi_select, allow_other, kind) = if ptype == "boolean" {
+                (
+                    vec![
+                        QuestionOption { id: "true".into(), label: "是".into(), description: String::new() },
+                        QuestionOption { id: "false".into(), label: "否".into(), description: String::new() },
+                    ],
+                    false,
+                    false,
+                    ElicitPropKind::Bool,
+                )
+            } else if !opts.is_empty() {
+                let multi = ptype == "array";
+                (opts, multi, false, if multi { ElicitPropKind::MultiArray } else { ElicitPropKind::String })
+            } else {
+                let kind = match ptype {
+                    "integer" => ElicitPropKind::Integer,
+                    "number" => ElicitPropKind::Number,
+                    _ => ElicitPropKind::String,
+                };
+                (vec![], false, true, kind)
+            };
+            questions.push(Question {
+                id: key.clone(),
+                header,
+                question,
+                options,
+                multi_select,
+                allow_other,
+                secret,
+            });
+            fields.push(ElicitField::Property { question_id: key.clone(), key: key.clone(), kind });
+        }
+    }
+    if questions.is_empty() {
+        if let Some(arr) = fallback_input.and_then(|v| v["questions"].as_array()) {
+            for (idx, q) in arr.iter().enumerate() {
+                let k = idx + 1;
+                let sk = format!("q{k}");
+                let ok = format!("q{k}_other");
+                let question = q["question"].as_str().unwrap_or("").trim().to_string();
+                if question.is_empty() {
+                    continue;
+                }
+                let multi = q["is_multi_select"].as_bool().or_else(|| q["multiSelect"].as_bool()).unwrap_or(false);
+                let options: Vec<QuestionOption> = q["options"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .enumerate()
+                    .filter_map(|(oi, o)| {
+                        if let Some(s) = o.as_str().filter(|s| !s.is_empty()) {
+                            Some(QuestionOption { id: (oi + 1).to_string(), label: s.to_string(), description: String::new() })
+                        } else {
+                            let label = o["label"].as_str().or_else(|| o["text"].as_str())?.to_string();
+                            let id = o["id"].as_str().map(str::to_string).unwrap_or_else(|| (oi + 1).to_string());
+                            let description = o["description"].as_str().unwrap_or("").to_string();
+                            Some(QuestionOption { id, label, description })
+                        }
+                    })
+                    .collect();
+                let select_key = (!options.is_empty()).then(|| sk.clone());
+                questions.push(Question {
+                    id: sk.clone(),
+                    header: q["header"].as_str().unwrap_or("").to_string(),
+                    question,
+                    options,
+                    multi_select: multi,
+                    allow_other: true,
+                    secret: false,
+                });
+                fields.push(ElicitField::AskQuestion { question_id: sk, select_key, other_key: Some(ok), multi });
+            }
+        }
+    }
+    (!questions.is_empty()).then_some((questions, fields))
+}
+
+fn elicit_response(el: &PendingElicit, option_id: &str, answers: &[QuestionAnswer]) -> Value {
+    let result = match option_id {
+        QUESTION_ANSWER => {
+            let mut content = serde_json::Map::new();
+            for field in &el.fields {
+                match field {
+                    ElicitField::AskQuestion { question_id, select_key, other_key, multi } => {
+                        let Some(ans) = answers.iter().find(|a| a.question_id == *question_id) else { continue };
+                        if let Some(sk) = select_key {
+                            if !ans.selected.is_empty() {
+                                let v = if *multi { json!(ans.selected) } else { json!(ans.selected[0]) };
+                                content.insert(sk.clone(), v);
+                            }
+                        }
+                        let text = ans.text.trim();
+                        if !text.is_empty() {
+                            if let Some(ok) = other_key.as_ref().or(select_key.as_ref()) {
+                                content.insert(ok.clone(), json!(text));
+                            }
+                        }
+                    }
+                    ElicitField::Property { question_id, key, kind } => {
+                        let Some(ans) = answers.iter().find(|a| a.question_id == *question_id) else { continue };
+                        match kind {
+                            ElicitPropKind::MultiArray => {
+                                if !ans.selected.is_empty() {
+                                    content.insert(key.clone(), json!(ans.selected));
+                                }
+                            }
+                            ElicitPropKind::Bool => {
+                                let raw = ans.selected.first().map(String::as_str).unwrap_or_else(|| ans.text.trim());
+                                if let Ok(b) = raw.parse::<bool>() {
+                                    content.insert(key.clone(), json!(b));
+                                }
+                            }
+                            ElicitPropKind::Integer => {
+                                let raw = ans.selected.first().map(String::as_str).unwrap_or_else(|| ans.text.trim());
+                                if let Ok(n) = raw.parse::<i64>() {
+                                    content.insert(key.clone(), json!(n));
+                                } else if !raw.is_empty() {
+                                    content.insert(key.clone(), json!(raw));
+                                }
+                            }
+                            ElicitPropKind::Number => {
+                                let raw = ans.selected.first().map(String::as_str).unwrap_or_else(|| ans.text.trim());
+                                if let Ok(n) = raw.parse::<f64>() {
+                                    content.insert(key.clone(), json!(n));
+                                } else if !raw.is_empty() {
+                                    content.insert(key.clone(), json!(raw));
+                                }
+                            }
+                            ElicitPropKind::String => {
+                                let raw = ans
+                                    .selected
+                                    .first()
+                                    .map(String::as_str)
+                                    .filter(|s| !s.is_empty())
+                                    .unwrap_or_else(|| ans.text.trim());
+                                if !raw.is_empty() {
+                                    content.insert(key.clone(), json!(raw));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            json!({"action":"accept","content":content})
+        }
+        "cancelled" => json!({"action":"cancel"}),
+        _ => json!({"action":"decline"}),
+    };
+    json!({"jsonrpc":"2.0","id":el.rpc_id,"result":result})
 }
 
 /// The `mcp__yi_browser__<tool>` name of a permission request for a yi_browser tool. Exact forms only, never a
@@ -3138,6 +3526,9 @@ fn agy_resume_req(watch: &AgyWatch, spec: &StartSpec, next_id: &mut u64, pending
 
 fn poll_agy_watch(st: &mut State, spec: &StartSpec, em: &Emitter) -> Option<Value> {
     let mut watch = st.agy_watch.take()?;
+    if !st.perms.is_empty() || !st.asks.is_empty() || !st.elicits.is_empty() {
+        watch.started_at = tokio::time::Instant::now();
+    }
     let step = step_agy_watch(&mut watch, spec, em, &mut st.next_id, &mut st.pending);
     mark_watch_settled(st, &mut watch);
     match step {
@@ -4957,5 +5348,155 @@ mod model_config_tests {
             .with_open_bg_calls(open.clone());
         assert_eq!(take_agy_open_bg_call(&mut open, Some("run_command")).as_deref(), Some("tc-bg-lag"));
         assert_eq!(take_agy_open_bg_call(&mut watch.open_bg_calls, Some("run_command")).as_deref(), Some("tc-bg-lag"));
+    }
+
+    #[test]
+    fn antigravity_elicitation_ask_question_and_answers() {
+        use super::*;
+        assert_eq!(client_capabilities(ToolKind::Antigravity)["elicitation"]["form"], json!({}));
+        assert!(client_capabilities(ToolKind::Cursor).get("elicitation").is_none());
+        assert!(client_capabilities(ToolKind::Kiro).get("elicitation").is_none());
+
+        let (hub, em, _rx) = crate::hub::test_emitter();
+        let spec = agy_test_spec();
+        let mut st = State { is_antigravity: true, session_id: Some("agy-s1".into()), ..Default::default() };
+
+        // 1. Real 4-question Antigravity ask_question tool_call + elicitation/create (plus multi-select & free-text Other)
+        let raw_input = json!({
+            "questions": [
+                {
+                    "is_multi_select": false,
+                    "options": [
+                        "(Recommended) 基于本地 kong-ref:latest 分别挂载/覆盖 feature-2026.1-release 与当前 feature-2026.3-release 的 kong/ 代码及配置进行 A/B 对比",
+                        "尝试基于本地 gw-builder:latest 或 Dockerfile 重新构建两个版本的完整镜像",
+                        "使用其他指定镜像（请在 Other 中说明镜像名）"
+                    ],
+                    "question": "1. Kong 容器镜像如何准备（用于基线版 2026.1 vs 优化版 2026.3 对比）？"
+                },
+                {
+                    "is_multi_select": true,
+                    "options": ["PG", "Redis", "Kafka"],
+                    "question": "2. 依赖中间件的容器部署范围？"
+                }
+            ]
+        });
+        update(
+            &mut st,
+            &em,
+            &json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "call_kong_1",
+                "name": "ask_question",
+                "kind": "other",
+                "title": "Run ask_question",
+                "status": "pending",
+                "rawInput": raw_input,
+            }),
+        );
+        let elicit_req = json!({
+            "jsonrpc": "2.0",
+            "id": "1",
+            "method": "elicitation/create",
+            "params": {
+                "sessionId": "agy-s1",
+                "toolCallId": "call_kong_1",
+                "mode": "form",
+                "message": "The agent has 2 questions.",
+                "requestedSchema": {
+                    "type": "object",
+                    "properties": {
+                        "q1": {
+                            "type": "string",
+                            "title": "1. Kong 容器镜像如何准备（用于基线版 2026.1 vs 优化版 2026.3 对比）？",
+                            "oneOf": [
+                                {"const": "1", "title": "(Recommended) 基于本地 kong-ref:latest 分别挂载/覆盖 feature-2026.1-release 与当前 feature-2026.3-release 的 kong/ 代码及配置进行 A/B 对比"},
+                                {"const": "2", "title": "尝试基于本地 gw-builder:latest 或 Dockerfile 重新构建两个版本的完整镜像"},
+                                {"const": "3", "title": "使用其他指定镜像（请在 Other 中说明镜像名）"}
+                            ]
+                        },
+                        "q1_other": {
+                            "type": "string",
+                            "title": "Other",
+                            "description": "Optional free-form answer to: 1. Kong 容器镜像如何准备（用于基线版 2026.1 vs 优化版 2026.3 对比）？"
+                        },
+                        "q2": {
+                            "type": "array",
+                            "title": "2. 依赖中间件的容器部署范围？",
+                            "items": {
+                                "anyOf": [
+                                    {"const": "1", "title": "PG"},
+                                    {"const": "2", "title": "Redis"},
+                                    {"const": "3", "title": "Kafka"}
+                                ]
+                            }
+                        },
+                        "q2_other": {
+                            "type": "string",
+                            "title": "Other",
+                            "description": "Optional free-form answer to: 2. 依赖中间件的容器部署范围？"
+                        }
+                    }
+                }
+            }
+        });
+        let outs = handle(&mut st, &spec, &elicit_req, &em).unwrap();
+        assert!(outs.is_empty());
+        assert_eq!(st.elicits.len(), 1);
+
+        let evs = hub.store.events_since("s", 0, 50).unwrap();
+        let (rid, title, qs) = evs
+            .iter()
+            .find_map(|e| match &e.body {
+                EventBody::PermissionRequest { request_id, tool_name, title, questions, .. } if tool_name == "ask_question" => {
+                    Some((request_id.clone(), title.clone(), questions.clone()))
+                }
+                _ => None,
+            })
+            .expect("PermissionRequest emitted for elicitation/create");
+        assert_eq!(title, "Antigravity 有问题想问你");
+        assert_eq!(qs.len(), 2);
+        assert_eq!(qs[0].id, "q1");
+        assert!(!qs[0].multi_select);
+        assert!(qs[0].allow_other);
+        assert_eq!(qs[0].options.len(), 3);
+        assert_eq!(qs[1].id, "q2");
+        assert!(qs[1].multi_select);
+        assert!(qs[1].allow_other);
+        assert_eq!(qs[1].options.len(), 3);
+
+        // Answer q1 with free-text Other, and q2 with multi-select + extra Other note
+        let el = st.elicits.remove(&rid).unwrap();
+        let resp = elicit_response(
+            &el,
+            QUESTION_ANSWER,
+            &[
+                QuestionAnswer { question_id: "q1".into(), selected: vec![], text: "kong:3.6-custom".into() },
+                QuestionAnswer { question_id: "q2".into(), selected: vec!["1".into(), "2".into()], text: "plus mock".into() },
+            ],
+        );
+        assert_eq!(resp["id"], "1");
+        assert_eq!(resp["result"]["action"], "accept");
+        assert_eq!(resp["result"]["content"]["q1_other"], "kong:3.6-custom");
+        assert!(resp["result"]["content"].get("q1").is_none());
+        assert_eq!(resp["result"]["content"]["q2"], json!(["1", "2"]));
+        assert_eq!(resp["result"]["content"]["q2_other"], "plus mock");
+
+        // Skip -> decline; interrupt -> cancel
+        assert_eq!(elicit_response(&el, QUESTION_SKIP, &[])["result"], json!({"action": "decline"}));
+        assert_eq!(elicit_response(&el, "cancelled", &[])["result"], json!({"action": "cancel"}));
+
+        // 2. Numeric ordering with >=10 questions (q1..q10 must not put q10 before q2) + 0-option qN_other
+        let mut props = serde_json::Map::new();
+        for i in 1..=10 {
+            props.insert(format!("q{i}_other"), json!({"type": "string", "title": format!("Q{i}")}));
+        }
+        let (qs10, _) = parse_elicitation(&json!({"mode": "form", "requestedSchema": {"properties": props}}), None).unwrap();
+        let ids10: Vec<&str> = qs10.iter().map(|q| q.question.as_str()).collect();
+        assert_eq!(ids10, ["Q1", "Q2", "Q3", "Q4", "Q5", "Q6", "Q7", "Q8", "Q9", "Q10"]);
+
+        // 3. Non-form mode declines immediately
+        let url_elicit = json!({"jsonrpc": "2.0", "id": "9", "method": "elicitation/create", "params": {"mode": "url", "url": "https://example.com"}});
+        let url_out = handle(&mut st, &spec, &url_elicit, &em).unwrap();
+        assert_eq!(url_out, vec![json!({"jsonrpc": "2.0", "id": "9", "result": {"action": "decline"}})]);
     }
 }

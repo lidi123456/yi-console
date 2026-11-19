@@ -1,4 +1,5 @@
 {
+  "hasAQuestion": "{{name}} has a question for you",
   "questions": "{{length}} questions",
   "expand": "Expand",
   "collapse": "Collapse",

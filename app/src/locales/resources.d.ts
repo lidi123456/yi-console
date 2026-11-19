@@ -1916,6 +1916,7 @@ export default interface Resources {
     "cancelled": "已取消",
     "collapse": "暂时收起",
     "expand": "展开问题",
+    "hasAQuestion": "{{name}} 有问题想问你",
     "multiSelect": "（可多选）",
     "otherTypeYourAnswer": "其他，自己填写…",
     "pleaseAnswerAllQuestions": "每个问题都要回答",

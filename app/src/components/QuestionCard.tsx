@@ -1,12 +1,23 @@
 import { useState } from 'react';
-import { getT, isEn } from '../i18n';
+import { getT, isEn, useLang } from '../i18n';
 import type { Question, QuestionAnswer } from '../types';
 import { Icon } from './Icon';
 
 const t = getT('questionCard');
 
 // Card for questions from the AI: one or more questions, each answered by clicking options (single / multiple choice), with free text if allowed; submit or skip.
-// Used for question requests from Claude, Codex and Cursor, and Codex's async questions
+// Used for question requests from Claude, Codex, Cursor and Antigravity, and Codex's async questions
+
+function displayTitle(title: string) {
+  const m = /^(.+) 有问题想问你$/.exec(title);
+  return m ? t('hasAQuestion', { name: m[1] }) : title;
+}
+
+function stripLeadingIndex(text: string, idx: number, total: number) {
+  if (total <= 1) return text;
+  const re = new RegExp(`^${idx + 1}[.、)]\\s*`);
+  return text.replace(re, '') || text;
+}
 
 type Draft = Record<string, { selected: string[]; text: string }>;
 
@@ -28,11 +39,13 @@ export function QuestionCard({
   compact?: boolean;
   submitLabel?: string;
 }) {
+  useLang();
   const [draft, setDraft] = useState<Draft>({});
   const [busy, setBusy] = useState(false);
   const [folded, setFolded] = useState(false);
+  const shownTitle = displayTitle(title);
 
-  if (resolved) return <Resolved title={title} questions={questions} resolved={resolved} />;
+  if (resolved) return <Resolved title={shownTitle} questions={questions} resolved={resolved} />;
 
   const get = (q: Question) => draft[q.id] ?? { selected: [], text: '' };
   const set = (q: Question, v: { selected: string[]; text: string }) => setDraft((d) => ({ ...d, [q.id]: v }));
@@ -58,10 +71,10 @@ export function QuestionCard({
     run(() => onSubmit?.(questions.map((q) => ({ questionId: q.id, selected: get(q).selected, text: get(q).text.trim() || undefined }))));
 
   return (
-    <div className={`q-card ${compact ? 'compact' : ''} ${folded ? 'folded' : ''}`} role="group" aria-label={title}>
+    <div className={`q-card ${compact ? 'compact' : ''} ${folded ? 'folded' : ''}`} role="group" aria-label={shownTitle}>
       <div className="q-head" onClick={compact ? () => setFolded(!folded) : undefined}>
         <Icon name="chat" size={15} />
-        <span className="q-title">{title}</span>
+        <span className="q-title">{shownTitle}</span>
         {questions.length > 1 && <span className="muted small">{t('questions', { length: questions.length })}</span>}
         {compact && (
           <button
@@ -87,7 +100,7 @@ export function QuestionCard({
               <div className="q-question">
                 {questions.length > 1 && <span className="q-num">{qi + 1}</span>}
                 {q.header && <span className="q-header">{q.header}</span>}
-                <span>{q.question}</span>
+                <span>{stripLeadingIndex(q.question, qi, questions.length)}</span>
                 {q.multiSelect && !/多选|multi/i.test(q.question) && <span className="muted small">{t('multiSelect')}</span>}
               </div>
               {q.options.length > 0 && (

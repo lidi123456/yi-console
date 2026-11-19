@@ -683,6 +683,7 @@ function toolName(name: string, input?: unknown) {
   if (n === 'task' || n === 'agent' || n === 'invoke_subagent' || n === 'dispatch_agent' || n === 'subagent' || n === 'delegate' || n === 'spawn_agent') return 'Task';
   if (n === 'swarm') return 'Task';
   if (n === 'send_message' && input && typeof input === 'object' && ('Recipient' in input || 'recipient' in input)) return 'Task';
+  if (n === 'ask_question' || n === 'run ask_question' || n === 'askuserquestion' || n === 'request_user_input') return 'AskUserQuestion';
   if (n.includes('todo')) return t('todo');
   if (n === 'delete') return 'Delete';
   if (n === 'move') return 'Move';
@@ -762,11 +763,35 @@ function formatTaskPrompt(input: unknown): { summary: string; detail: string } {
   return { summary: fallback, detail: fallback };
 }
 
-/** Tools with no real name show their title as is. Only subagent titles (Antigravity's invoke_subagent / send_message /
- *  swarm when a replay leaves the name out) are mapped, so other tools' titles stay as the tool wrote them */
+/** Extract concise summary & readable detail for question tool calls (Claude/Codex/Cursor/Antigravity) */
+function formatQuestionPrompt(input: unknown): { summary: string; detail: string } {
+  if (!input || typeof input !== 'object') return { summary: '', detail: '' };
+  const qs = (input as { questions?: unknown }).questions;
+  if (!Array.isArray(qs) || !qs.length) return { summary: '', detail: '' };
+  const items = qs.filter((q): q is Record<string, unknown> => !!q && typeof q === 'object');
+  if (!items.length) return { summary: '', detail: '' };
+  const first = String(items[0].header ?? items[0].question ?? items[0].prompt ?? '').trim();
+  const summary = items.length > 1 && first ? `${first} (+${items.length - 1})` : first;
+  const detail = items
+    .map((q, i) => {
+      const qText = String(q.question ?? q.prompt ?? q.header ?? `#${i + 1}`).trim();
+      const opts = Array.isArray(q.options)
+        ? q.options
+            .map((o) => (typeof o === 'string' ? o : o && typeof o === 'object' ? String((o as Record<string, unknown>).label ?? (o as Record<string, unknown>).text ?? '') : ''))
+            .filter(Boolean)
+        : [];
+      return [qText, ...opts.map((o) => `  - ${o}`)].join('\n');
+    })
+    .join('\n\n');
+  return { summary, detail };
+}
+
+/** Tools with no real name show their title as is. Only subagent / question titles (Antigravity's invoke_subagent /
+ *  send_message / swarm / ask_question when a replay leaves the name out) are mapped, so other tools' titles stay as the tool wrote them */
 function isGenericTool(it: Item & { k: 'tool' }) {
   if ((it.name !== 'other' && it.name !== 'think') || !it.title) return false;
-  return toolName(it.title, it.input) !== 'Task';
+  const mapped = toolName(it.title, it.input);
+  return mapped !== 'Task' && mapped !== 'AskUserQuestion';
 }
 
 /** Name shown for a tool call; a generic one maps to Task when its title is a subagent tool */
@@ -787,6 +812,10 @@ function toolArg(it: Item & { k: 'tool' }, shown: string, cwd?: string) {
   if (shown === 'Task') {
     const sub = formatTaskPrompt(it.input).summary;
     if (sub) return sub.replace(/\s+/g, ' ');
+  }
+  if (shown === 'AskUserQuestion') {
+    const sub = formatQuestionPrompt(it.input).summary;
+    return sub.replace(/\s+/g, ' ');
   }
   const input: Record<string, unknown> = it.input && typeof it.input === 'object' ? { ...(it.input as Record<string, unknown>) } : {};
   // File-editing tools check the path first: Kiro's write also puts the operation type (strReplace / create) in command
@@ -968,7 +997,7 @@ const ToolLine = memo(function ToolLine({ it, active, cwd }: { it: Item & { k: '
   const hasInput = kind !== 'edit' && it.input !== undefined && it.input !== null && JSON.stringify(it.input) !== '{}';
   const inputObj = it.input && typeof it.input === 'object' ? (it.input as { command?: string; CommandLine?: string }) : undefined;
   const cmd = kind === 'bash' ? inputObj?.command ?? inputObj?.CommandLine : undefined;
-  const taskDetail = shown === 'Task' ? formatTaskPrompt(it.input).detail : '';
+  const taskDetail = shown === 'Task' ? formatTaskPrompt(it.input).detail : shown === 'AskUserQuestion' ? formatQuestionPrompt(it.input).detail : '';
   return (
     <div className={`tl tl-tool ${state}`}>
       <span className="tl-dot" />
@@ -1453,6 +1482,7 @@ function toolUiLabel(shown: string): string {
     'Web Search': 'Web search',
     Fetch: 'Open page',
     Task: 'Subagent',
+    AskUserQuestion: 'Ask user',
     Delete: 'Delete file',
     Move: 'Move file',
     Think: 'Think',
@@ -1470,6 +1500,7 @@ function toolUiLabel(shown: string): string {
     'Web Search': '搜索网页',
     Fetch: '打开网页',
     Task: '子 Agent',
+    AskUserQuestion: '向你提问',
     Delete: '删除文件',
     Move: '移动文件',
     Think: '思考',
@@ -1543,7 +1574,7 @@ const ModernTool = memo(function ModernTool({ it, active, cwd }: { it: Item & { 
   const out = v.parsed.text;
   const inputObj = it.input && typeof it.input === 'object' ? (it.input as { command?: unknown; CommandLine?: unknown }) : undefined;
   const bashCmd = v.kind === 'bash' ? inputObj?.command ?? inputObj?.CommandLine : undefined;
-  const taskDetail = v.shown === 'Task' ? formatTaskPrompt(it.input).detail : '';
+  const taskDetail = v.shown === 'Task' ? formatTaskPrompt(it.input).detail : v.shown === 'AskUserQuestion' ? formatQuestionPrompt(it.input).detail : '';
   const input =
     typeof bashCmd === 'string'
       ? bashCmd
