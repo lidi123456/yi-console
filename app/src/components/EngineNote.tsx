@@ -32,8 +32,12 @@ export function parseEngine(text: string): Block[] {
 
 const firstLine = (s: string) => s.split('\n').map((l) => l.trim()).find((l) => l) ?? '';
 
-const REPORT_STATES: Record<string, 'noteReportReady' | 'noteReportProgress' | 'noteReportBlocked' | 'noteReportFailed' | 'noteReportDropped' | 'noteReportWaiting'> = {
+const REPORT_STATES: Record<
+  string,
+  'noteReportReady' | 'noteReportReviewing' | 'noteReportProgress' | 'noteReportBlocked' | 'noteReportFailed' | 'noteReportDropped' | 'noteReportWaiting'
+> = {
   ready: 'noteReportReady',
+  reviewing: 'noteReportReviewing',
   progress: 'noteReportProgress',
   blocked: 'noteReportBlocked',
   failed: 'noteReportFailed',
@@ -68,7 +72,19 @@ function describe(b: Block): { icon: string; title: string; detail?: string; ton
     case 'approval': {
       const tool = a.kind === 'tool';
       const key =
-        a.state === 'approved' ? (tool ? 'noteApprovedTool' : 'noteApprovedReply') : a.state === 'rejected' ? (tool ? 'noteRejectedTool' : 'noteRejectedReply') : tool ? 'noteExpiredTool' : 'noteExpiredReply';
+        a.state === 'approved'
+          ? tool
+            ? 'noteApprovedTool'
+            : a.edited === 'true'
+              ? 'noteApprovedReplyEdited'
+              : 'noteApprovedReply'
+          : a.state === 'rejected'
+            ? tool
+              ? 'noteRejectedTool'
+              : 'noteRejectedReply'
+            : tool
+              ? 'noteExpiredTool'
+              : 'noteExpiredReply';
       return { icon: 'shield', title: t(key), detail: a.text, tone: a.state === 'approved' ? 'ok' : undefined };
     }
     case 'owner':
@@ -83,6 +99,10 @@ function describe(b: Block): { icon: string; title: string; detail?: string; ton
           return { icon: 'key', title: t('noteSecretDismissed') };
         case 'task-continued':
           return { icon: 'play', title: t('noteTaskContinued'), detail: a.summary, tone: 'ok' };
+        case 'task-answered':
+          return { icon: 'check', title: t('noteTaskAnswered'), detail: a.summary || firstLine(b.body), tone: 'ok' };
+        case 'memory-updated':
+          return { icon: 'file', title: t('noteMemoryUpdated'), detail: a.summary };
         default:
           return { icon: 'bot', title: t('noteOwner') };
       }
@@ -94,6 +114,10 @@ function describe(b: Block): { icon: string; title: string; detail?: string; ton
       return { icon: 'forward', title: t('noteFollowUp') };
     case 'notes':
       return { icon: 'file', title: t('noteNotes') };
+    case 'memories':
+      return { icon: 'file', title: t('noteMemories') };
+    case 'previous-phase':
+      return { icon: 'play', title: t('notePreviousPhase', { mode: a.mode ?? 'repo' }), detail: firstLine(b.body), tone: 'ok' };
     case 'bot-message':
       return { icon: 'bot', title: t('noteBotMessage'), detail: b.body };
     default:

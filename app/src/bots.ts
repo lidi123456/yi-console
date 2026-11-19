@@ -45,8 +45,38 @@ export interface BotConfig {
   /** ISO weekdays (1 = Monday, empty = every day) and HH:MM times; null = always */
   activeHours?: { days: number[]; start: string; end: string } | null;
   prompt: { role: string; communication: string; delivery: string };
+  sops?: Sop[];
   promptRevision: number;
   compactAt: number;
+}
+
+export interface Sop {
+  id: string;
+  name: string;
+  when: string;
+  how: string;
+  askHuman?: string;
+  delivery?: string;
+  enabled: boolean;
+}
+
+export interface MemoryItem {
+  id: string;
+  botId: string;
+  /** "" = global; non-empty = canonical "<host>:<cwd>" */
+  scope: string;
+  content: string;
+  /** owner / review / task / bot */
+  source: string;
+  updatedAt: number;
+}
+
+export interface PriorSession {
+  sessionId: string;
+  mode: 'repo' | 'worktree' | 'scratch';
+  cwd: string;
+  summary?: string;
+  endedAt: number;
 }
 
 export interface Routine {
@@ -55,6 +85,7 @@ export interface Routine {
   /** Five-field cron, local time */
   schedule: string;
   prompt: string;
+  sopId?: string | null;
   enabled: boolean;
 }
 
@@ -84,6 +115,7 @@ export interface Approval {
   eventId?: string | null;
   thread: string;
   text: string;
+  originalText?: string | null;
   tool?: string | null;
   input?: unknown;
   /** Plugin instance name, and the message a reply answers */
@@ -95,7 +127,7 @@ export interface Approval {
   decidedAt?: number | null;
 }
 
-export type TaskState = 'queued' | 'working' | 'needsYou' | 'ready' | 'failed' | 'done' | 'stopped';
+export type TaskState = 'queued' | 'working' | 'needsYou' | 'reviewing' | 'ready' | 'failed' | 'done' | 'stopped';
 
 export interface TaskRow {
   id: string;
@@ -110,9 +142,30 @@ export interface TaskRow {
   workspace: string;
   /** `dirty`: kept after the task ended because something in it is uncommitted */
   worktree?: { path: string; branch: string; repo: string; dirty?: boolean } | null;
-  spec: { mode?: 'worktree' | 'repo' | 'scratch'; [key: string]: unknown };
+  spec: {
+    mode?: 'worktree' | 'repo' | 'scratch';
+    sop?: string;
+    sopName?: string;
+    priorSessions?: PriorSession[];
+    priorSummary?: string;
+    reviewCount?: number;
+    pendingBrief?: boolean;
+    [key: string]: unknown;
+  };
   /** `auto`: written by the engine from the last message of a turn that ended without a report (state `waiting`) */
-  lastReport?: { state: string; summary: string; question?: string; links?: string[]; auto?: boolean; at: number } | null;
+  lastReport?: {
+    state: string;
+    summary: string;
+    question?: string;
+    options?: string[];
+    details?: string;
+    learned?: string;
+    answered?: string;
+    reviewNote?: string;
+    links?: string[];
+    auto?: boolean;
+    at: number;
+  } | null;
   hold: boolean;
   manual: boolean;
   createdAt: number;
@@ -436,14 +489,15 @@ export function findBot(botId: string, src = ''): BotEntry | undefined {
   return listOf(src).find((b) => b.config.id === botId);
 }
 
-export const ACTIVE_TASK: TaskState[] = ['queued', 'working', 'needsYou'];
+export const ACTIVE_TASK: TaskState[] = ['queued', 'working', 'needsYou', 'reviewing'];
 
-/** The owner typed into a task's session: the task becomes manual (the Bot stops steering it until handed back) */
+/** The owner typed into a task's active session: the task becomes manual (the Bot stops steering it until handed back) */
 export function noteOwnerMessage(s: SessionInfo) {
   const src = sourceOf(s.bot?.clientId);
   if (src === null || s.bot?.role !== 'task' || !s.bot.taskId) return;
   const task = findTask(s.bot.taskId, src);
-  if (!task || task.manual || !ACTIVE_TASK.includes(task.state)) return;
+  // Ignore messages typed in superseded prior-phase sessions after an in-place upgrade
+  if (!task || task.sessionId !== s.id || task.manual || !ACTIVE_TASK.includes(task.state)) return;
   botCall('tasks.manual', { id: task.id }, src).catch(() => {});
 }
 

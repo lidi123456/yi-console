@@ -9,5 +9,6 @@
   "pluginProposed": "配置助手提交了插件 {{name}}，等你确认安装",
   "pluginSecretsNeeded": "Bot 用到的插件配置还缺密钥：{{names}}。在 Bot 会话的卡片里填写。",
   "fillIn": "去填写",
-  "botWantsConfirm": "Bot「{{name}}」有个设置修改等你确认"
+  "botWantsConfirm": "Bot「{{name}}」有个设置修改等你确认",
+  "taskUpgraded": "任务已原地升级为独立 worktree 阶段，已自动切换到新会话"
 }

@@ -4,7 +4,7 @@ import { useEffect, useState } from 'react';
 import { diffLines } from 'diff';
 import { getT, isEn, useLang } from '../i18n';
 import { errorToast, navigate } from '../store';
-import { findTask, useBotCall, useBotList, useBotSource, type BotConfig, type EventRow } from '../bots';
+import { findTask, useBotCall, useBotList, useBotSource, type BotConfig, type EventRow, type Sop } from '../bots';
 import { openOn, taskStateLabel } from './BotsSection';
 import { openUrl } from './PortsView';
 import { Icon } from './Icon';
@@ -212,11 +212,41 @@ export function StatsCard({ botId }: { botId: string }) {
 
 const SECTIONS: (keyof BotConfig['prompt'])[] = ['role', 'communication', 'delivery'];
 
-/** Line diff of the three prompt sections between two revisions */
-export function PromptDiff({ from, to }: { from: BotConfig['prompt'] | null; to: BotConfig['prompt'] }) {
+function formatSops(list?: Sop[] | null): string {
+  if (!list || list.length === 0) return '';
+  return list
+    .map((s) =>
+      [
+        `[${s.id}] ${s.name}${s.enabled ? '' : ' (disabled)'}`,
+        `  when: ${s.when}`,
+        `  how: ${s.how}`,
+        s.askHuman ? `  askHuman: ${s.askHuman}` : null,
+        s.delivery ? `  delivery: ${s.delivery}` : null,
+      ]
+        .filter(Boolean)
+        .join('\n'),
+    )
+    .join('\n\n');
+}
+
+/** Line diff of the three prompt sections and SOPs between two revisions */
+export function PromptDiff({
+  from,
+  to,
+  fromSops,
+  toSops,
+}: {
+  from: BotConfig['prompt'] | null;
+  to: BotConfig['prompt'];
+  fromSops?: Sop[] | null;
+  toSops?: Sop[];
+}) {
   const label = (k: string) => (k === 'role' ? t('promptRole') : k === 'communication' ? t('promptCommunication') : t('promptDelivery'));
   const changed = SECTIONS.filter((k) => (from?.[k] ?? '') !== to[k]);
-  if (changed.length === 0) return <p className="muted small">{t('noPromptChange')}</p>;
+  const sopsFrom = formatSops(fromSops);
+  const sopsTo = formatSops(toSops);
+  const sopsChanged = sopsFrom !== sopsTo;
+  if (changed.length === 0 && !sopsChanged) return <p className="muted small">{t('noPromptChange')}</p>;
   return (
     <div className="bot-diff">
       {changed.map((k) => (
@@ -235,6 +265,22 @@ export function PromptDiff({ from, to }: { from: BotConfig['prompt'] | null; to:
           </pre>
         </div>
       ))}
+      {sopsChanged && (
+        <div>
+          <div className="muted small">{t('sopsTitle')}</div>
+          <pre className="bot-diff-body">
+            {diffLines(sopsFrom, sopsTo).map((p, i) => (
+              <span key={i} className={p.added ? 'dl-add' : p.removed ? 'dl-del' : 'bot-diff-ctx'}>
+                {p.value
+                  .replace(/\n$/, '')
+                  .split('\n')
+                  .map((l) => `${p.added ? '+ ' : p.removed ? '- ' : '  '}${l}`)
+                  .join('\n') + '\n'}
+              </span>
+            ))}
+          </pre>
+        </div>
+      )}
     </div>
   );
 }

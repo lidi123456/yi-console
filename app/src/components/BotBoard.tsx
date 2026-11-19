@@ -3,7 +3,22 @@
 import { getT, useLang } from '../i18n';
 import { errorToast, useStore } from '../store';
 import { ACTIVE_TASK, botCall, useBots, type BotEntry, type TaskRow } from '../bots';
-import { botDot, botMenu, botStateLabel, localHost, openOn, taskDot, taskMenu, taskStateLabel } from './BotsSection';
+import {
+  TaskAnsweredBanner,
+  TaskQuestionCard,
+  answeredWaitingTasks,
+  botDot,
+  botMenu,
+  botStateLabel,
+  localHost,
+  needsYouCount,
+  openOn,
+  questionTasks,
+  taskDot,
+  taskMenu,
+  taskStateLabel,
+  visibleAttention,
+} from './BotsSection';
 import { openMenu } from './Overlay';
 import { Icon, ToolBadge } from './Icon';
 import { timeAgo } from '../util';
@@ -17,9 +32,9 @@ interface Row {
   device?: string;
 }
 
-/** Needs you, then busy, then idle, then disabled */
+/** Needs you (including pending changes, drafts, secrets, decision cards), then error, busy, idle, disabled */
 function rank(b: BotEntry) {
-  if (b.attention.length > 0 || b.tasks.some((x) => x.state === 'needsYou')) return 0;
+  if (needsYouCount(b) > 0 || b.tasks.some((x) => x.state === 'needsYou')) return 0;
   if (b.state === 'error') return 1;
   if (b.tasks.some((x) => ACTIVE_TASK.includes(x.state)) || b.state === 'running') return 2;
   return b.config.enabled ? 3 : 4;
@@ -60,6 +75,9 @@ function BoardTask({ task, src }: { task: TaskRow; src: string }) {
 
 function BotCard({ b, src, device }: Row) {
   const dot = botDot(b);
+  const questions = questionTasks(b);
+  const answered = answeredWaitingTasks(b);
+  const attn = visibleAttention(b);
   const active = b.tasks.filter((x) => ACTIVE_TASK.includes(x.state));
   const ready = b.tasks.filter((x) => x.state === 'ready');
   const today = new Date().setHours(0, 0, 0, 0);
@@ -87,7 +105,13 @@ function BotCard({ b, src, device }: Row) {
         </button>
       </div>
       {b.state === 'error' && b.error && <div className="bot-card-err small">{b.error}</div>}
-      {b.attention.map((a) => (
+      {questions.map((qt) => (
+        <TaskQuestionCard key={qt.id} task={qt} src={src} showTaskLink compact />
+      ))}
+      {answered.map((at) => (
+        <TaskAnsweredBanner key={at.id} task={at} />
+      ))}
+      {attn.map((a) => (
         <div key={a.id} className="bot-card-attn">
           <span className="sdot sdot-attn" />
           <span className="grow">{a.text}</span>
@@ -100,7 +124,7 @@ function BotCard({ b, src, device }: Row) {
       {[...active, ...ready].map((x) => (
         <BoardTask key={x.id} task={x} src={src} />
       ))}
-      {active.length === 0 && ready.length === 0 && b.attention.length === 0 && <div className="muted small">{t('boardIdle')}</div>}
+      {active.length === 0 && ready.length === 0 && attn.length === 0 && questions.length === 0 && <div className="muted small">{t('boardIdle')}</div>}
       <div className="bot-card-foot muted small">
         {b.waiting > 0 && <span>{t('boardWaiting', { n: b.waiting })}</span>}
         {endedToday > 0 && <span>{t('boardEndedToday', { n: endedToday })}</span>}

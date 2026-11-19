@@ -11,14 +11,49 @@ import { ACTIVE_TASK, botCall, mapHost, unmapHost, useBotCall, refreshRemote, so
 import { openUrl } from './PortsView';
 import { fmtTime } from './BotActivity';
 import { askConfirm, openMenu, type MenuItem } from './Overlay';
+import { showChanges } from './SessionActions';
 import { Icon, ToolBadge } from './Icon';
 import type { SessionInfo } from '../types';
 
 const t = getT('bots');
 
-/** Things waiting for the owner: calls for attention, drafts to approve and secrets to enter */
+/** Whether a blocked task should render the interactive decision card (excludes desktop-lock `pendingBrief` and already-answered) */
+export function isQuestionTask(task: TaskRow): boolean {
+  return (
+    task.state === 'needsYou' &&
+    !task.manual &&
+    task.lastReport?.state === 'blocked' &&
+    !task.spec.pendingBrief &&
+    !task.lastReport?.answered &&
+    !!task.lastReport?.question
+  );
+}
+
+/** Tasks of a Bot currently awaiting an owner decision card */
+export function questionTasks(b: BotEntry): TaskRow[] {
+  return b.tasks.filter(isQuestionTask);
+}
+
+/** Tasks whose decision was submitted and are waiting for the Bot to upgrade/resume */
+export function answeredWaitingTasks(b: BotEntry): TaskRow[] {
+  return b.tasks.filter((x) => x.state === 'needsYou' && !x.manual && !!x.lastReport?.answered);
+}
+
+/** Attention items excluding those already represented by an interactive decision card (avoids duplicate banners) */
+export function visibleAttention(b: BotEntry) {
+  const covered = new Set([...questionTasks(b), ...answeredWaitingTasks(b)].map((x) => x.id));
+  return b.attention.filter((a) => !a.taskId || !covered.has(a.taskId));
+}
+
+/** Things waiting for the owner: deduplicated attention, decision cards, drafts, secrets and pending config changes */
 export function needsYouCount(b: BotEntry) {
-  return b.attention.length + (b.approvals?.length ?? 0) + (b.secrets?.length ?? 0);
+  return (
+    visibleAttention(b).length +
+    questionTasks(b).length +
+    (b.approvals?.length ?? 0) +
+    (b.secrets?.length ?? 0) +
+    (b.pendingChange ? 1 : 0)
+  );
 }
 
 /** Sidebar dot class for a Bot state */
@@ -41,6 +76,7 @@ export function taskDot(state: string) {
     case 'needsYou':
       return 'attn';
     case 'working':
+    case 'reviewing':
       return 'busy';
     case 'failed':
       return 'err';
@@ -59,6 +95,8 @@ export function taskStateLabel(state: string) {
       return t('stateWorking');
     case 'needsYou':
       return t('stateNeedsYou');
+    case 'reviewing':
+      return t('stateReviewing');
     case 'ready':
       return t('stateReady');
     case 'failed':
@@ -395,7 +433,7 @@ export function newBot(src: string) {
 }
 
 /** A configuration change the Bot asked for, waiting for the owner: what changes and why, confirm or decline */
-function PendingCard({ bot, src }: { bot: BotEntry; src: string }) {
+export function PendingCard({ bot, src, bare }: { bot: BotEntry; src: string; bare?: boolean }) {
   const p = bot.pendingChange;
   const [busy, setBusy] = useState(false);
   if (!p) return null;
@@ -420,26 +458,136 @@ function PendingCard({ bot, src }: { bot: BotEntry; src: string }) {
             ? t('changeComputerUse')
             : t('changePermission'),
   );
-  return (
-    <div className="bot-approvals">
-      <div className="bot-approval bot-confirm">
-        <div className="bot-approval-head">
-          <span className="bot-approval-icon">
-            <Icon name="settings" size={13} />
-          </span>
-          <span className="bot-approval-title">{t('confirmChangeTitle', { items: items.join(t('listSep')) })}</span>
-        </div>
-        {p.summary && <div className="bot-approval-text">{p.summary}</div>}
-        <div className="bot-approval-actions">
-          <span className="bot-bar-fill" />
-          <button className="btn small" disabled={busy} onClick={() => answer(false)}>
-            {t('decline')}
-          </button>
-          <button className="btn small primary" disabled={busy} onClick={() => answer(true)}>
-            {t('confirmChange')}
-          </button>
-        </div>
+  const card = (
+    <div className="bot-approval bot-confirm">
+      <div className="bot-approval-head">
+        <span className="bot-approval-icon">
+          <Icon name="settings" size={13} />
+        </span>
+        <span className="bot-approval-title">{t('confirmChangeTitle', { items: items.join(t('listSep')) })}</span>
       </div>
+      {p.summary && <div className="bot-approval-text">{p.summary}</div>}
+      <div className="bot-approval-actions">
+        <span className="bot-bar-fill" />
+        <button className="btn small" disabled={busy} onClick={() => answer(false)}>
+          {t('decline')}
+        </button>
+        <button className="btn small primary" disabled={busy} onClick={() => answer(true)}>
+          {t('confirmChange')}
+        </button>
+      </div>
+    </div>
+  );
+  return bare ? card : <div className="bot-approvals">{card}</div>;
+}
+
+/** Interactive decision card for a task waiting on a plan/choice from the owner (`tasks.answer`) */
+export function TaskQuestionCard({
+  task,
+  src,
+  showTaskLink,
+  compact,
+}: {
+  task: TaskRow;
+  src: string;
+  showTaskLink?: boolean;
+  compact?: boolean;
+}) {
+  const report = task.lastReport;
+  const options = report?.options ?? [];
+  const [selected, setSelected] = useState<string>(options[0] ?? '');
+  const [note, setNote] = useState('');
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    setSelected(options[0] ?? '');
+    setNote('');
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [task.id, report?.at]);
+
+  if (!report?.question) return null;
+  const combined = options.length > 0 ? [selected, note.trim()].filter(Boolean).join('\n') : note.trim();
+  const canSubmit = !busy && combined.length > 0;
+  const submit = async () => {
+    if (!canSubmit) return;
+    setBusy(true);
+    try {
+      await botCall('tasks.answer', { id: task.id, answer: combined }, src);
+    } catch (e) {
+      errorToast(e);
+      setBusy(false);
+    }
+  };
+  const sopName = typeof task.spec.sopName === 'string' ? task.spec.sopName : undefined;
+  const showSummary = !!report.summary && report.summary.trim() !== report.question.trim();
+
+  return (
+    <div className={`bot-approval bot-question ${compact ? 'compact' : ''}`}>
+      <div className="bot-approval-head">
+        <span className="bot-approval-icon">
+          <Icon name="bot" size={13} />
+        </span>
+        <span className="bot-approval-title">{t('questionTitle')}</span>
+        {showTaskLink && task.sessionId ? (
+          <button className="link-btn small bot-approval-src truncate" onClick={() => openOn(src, task.host, task.sessionId!)}>
+            {task.title}
+          </button>
+        ) : (
+          <span className="bot-approval-src truncate">{task.title}</span>
+        )}
+        {sopName && <span className="pill bot-sop-pill">{sopName}</span>}
+        <span className="bot-bar-fill" />
+        {taskMode(task) === 'repo' && <span className="pill">{t('modeRepo')}</span>}
+      </div>
+      {showSummary && <div className="bot-question-summary muted small">{report.summary}</div>}
+      {!compact && report.details && (
+        <details className="bot-question-details">
+          <summary>{t('questionDetails')}</summary>
+          <pre>{report.details}</pre>
+        </details>
+      )}
+      <div className="bot-approval-text">{report.question}</div>
+      {options.length > 0 && (
+        <div className="bot-question-options" role="radiogroup">
+          {options.map((opt, idx) => (
+            <label key={idx} className={`bot-question-opt ${selected === opt ? 'selected' : ''}`}>
+              <input type="radio" name={`q-${task.id}`} checked={selected === opt} onChange={() => setSelected(opt)} />
+              <span>{opt}</span>
+            </label>
+          ))}
+        </div>
+      )}
+      <form
+        className="bot-question-foot"
+        onSubmit={(e) => {
+          e.preventDefault();
+          void submit();
+        }}
+      >
+        <input
+          type="text"
+          className="bot-question-input"
+          value={note}
+          placeholder={options.length > 0 ? t('answerExtraPlaceholder') : t('answerPlaceholder')}
+          onChange={(e) => setNote(e.target.value)}
+          disabled={busy}
+        />
+        <button type="submit" className="btn small primary" disabled={!canSubmit}>
+          <Icon name="play" size={12} /> {t('answerSubmit')}
+        </button>
+      </form>
+    </div>
+  );
+}
+
+/** Banner shown after the owner clicked a decision on a `repo` task while waiting for the Bot to act */
+export function TaskAnsweredBanner({ task }: { task: TaskRow }) {
+  const ans = task.lastReport?.answered;
+  if (!ans) return null;
+  return (
+    <div className="bot-answered-banner">
+      <Icon name="check" size={13} />
+      <span className="truncate">{t('answerSubmittedWaiting', { title: task.title, answer: ans })}</span>
     </div>
   );
 }
@@ -653,9 +801,67 @@ export function SecretCards({ bot, src, inline }: { bot: BotEntry; src: string; 
   );
 }
 
+/** Unified priority deck under the Bot session bar: keeps only the most urgent card expanded on narrow/mobile viewports */
+function NeedsYouDeck({ bot, src }: { bot: BotEntry; src: string }) {
+  const [expanded, setExpanded] = useState(false);
+  const questions = questionTasks(bot);
+  const answered = answeredWaitingTasks(bot);
+  const approvals = [...(bot.approvals ?? [])].sort((x, y) => x.createdAt - y.createdAt);
+  const secrets = bot.secrets ?? [];
+
+  const cards: { key: string; label: string; node: React.ReactNode }[] = [];
+  if (bot.pendingChange) {
+    cards.push({
+      key: `pending-${bot.pendingChange.id}`,
+      label: bot.pendingChange.summary || t('confirmChange'),
+      node: <PendingCard bot={bot} src={src} bare />,
+    });
+  }
+  for (const sc of secrets) {
+    cards.push({
+      key: `secret-${sc.instanceId}`,
+      label: sc.name,
+      node: <SecretForm bot={bot} card={sc} src={src} />,
+    });
+  }
+  for (const qt of questions) {
+    cards.push({
+      key: `q-${qt.id}`,
+      label: qt.title,
+      node: <TaskQuestionCard task={qt} src={src} showTaskLink />,
+    });
+  }
+  for (const ap of approvals) {
+    cards.push({
+      key: `ap-${ap.id}`,
+      label: ap.text.slice(0, 40),
+      node: <ApprovalCard a={ap} src={src} />,
+    });
+  }
+
+  if (cards.length === 0 && answered.length === 0) return null;
+  const shown = expanded ? cards : cards.slice(0, 1);
+  return (
+    <div className="bot-approvals">
+      {shown.map((c) => (
+        <div key={c.key}>{c.node}</div>
+      ))}
+      {cards.length > 1 && (
+        <button className="link-btn small bot-approvals-more" onClick={() => setExpanded(!expanded)}>
+          {expanded ? t('deckFold') : t('deckMore', { n: cards.length - 1, next: cards[1].label })}
+        </button>
+      )}
+      {answered.map((x) => (
+        <TaskAnsweredBanner key={x.id} task={x} />
+      ))}
+    </div>
+  );
+}
+
 /** Bar under the session header for a Bot's own session or one of its tasks */
 export function SessionBotBar({ info }: { info: SessionInfo }) {
   useLang();
+  const view = useStore((s) => s.view);
   const link = info.bot;
   // Subscribe to list changes; the source of the session's desktop app may appear later
   const src = useBots(() => sourceOf(link?.clientId));
@@ -672,96 +878,143 @@ export function SessionBotBar({ info }: { info: SessionInfo }) {
   }
   if (link.role === 'task') {
     const task = bot.tasks.find((x) => x.id === link.taskId);
+    const isPrior = !!task && !!task.sessionId && task.sessionId !== info.id;
     const active = task ? ACTIVE_TASK.includes(task.state) : false;
-    const waitingExternal = !!task && task.state === 'needsYou' && !task.manual && !info.pending;
+    const hasQuestion = !!task && !isPrior && !info.pending && isQuestionTask(task);
+    const hasAnswered = !!task && !isPrior && task.state === 'needsYou' && !task.manual && !!task.lastReport?.answered;
+    const waitingExternal = !!task && !isPrior && task.state === 'needsYou' && !task.manual && !info.pending;
+    const sopName = typeof task?.spec.sopName === 'string' ? task.spec.sopName : undefined;
+    const priors = Array.isArray(task?.spec.priorSessions) ? task!.spec.priorSessions : [];
+    const currentHostId = view.kind === 'session' ? view.hostId : (task ? localHost(src, task.host) : null);
+    const canDiff = !!task && !isPrior && !!currentHostId && (!!task.worktree || task.state === 'ready' || task.state === 'reviewing');
+
     return (
-      <div className="bot-bar">
-        <Icon name="bot" size={14} />
-        <button className="link-btn" onClick={() => navigate({ kind: 'bot', botId: bot.config.id, src })}>
-          {bot.config.name}
-        </button>
-        {task && <span className={`pill bot-task-${task.state}`}>{taskStateLabel(task.state)}</span>}
-        {task?.spec.computerUse === true && (
-          <span className="muted small" title={t('computerUseOnDemand')}>
-            <Icon name="laptop" size={13} />
-          </span>
-        )}
-        {task?.manual && <span className="muted small">{t('manualHint')}</span>}
-        {waitingExternal && task?.lastReport?.question && (
-          <span className="muted small truncate" title={task.lastReport.question}>
-            {task.lastReport.question}
-          </span>
-        )}
-        {task && task.eventIds.length > 0 && (
-          <button className="btn small" onClick={(e) => sourceMenu(e.currentTarget, task, src)}>
-            {t('sources', { n: task.eventIds.length })}
+      <>
+        <div className="bot-bar">
+          <Icon name="bot" size={14} />
+          <button className="link-btn" onClick={() => navigate({ kind: 'bot', botId: bot.config.id, src })}>
+            {bot.config.name}
           </button>
+          {task && <span className={`pill bot-task-${task.state}`}>{taskStateLabel(task.state)}</span>}
+          {sopName && (
+            <span className="pill bot-sop-pill" title={t('sopLabel')}>
+              <Icon name="outline" size={11} /> {sopName}
+            </span>
+          )}
+          {task?.spec.computerUse === true && (
+            <span className="muted small" title={t('computerUseOnDemand')}>
+              <Icon name="laptop" size={13} />
+            </span>
+          )}
+          {task?.manual && !isPrior && <span className="muted small">{t('manualHint')}</span>}
+          {waitingExternal && !hasQuestion && task?.lastReport?.question && (
+            <span className="muted small truncate" title={task.lastReport.question}>
+              {task.lastReport.question}
+            </span>
+          )}
+          {!isPrior && priors.length > 0 && task && (
+            <button
+              className="btn small"
+              onClick={() => openOn(src, task.host, priors[priors.length - 1].sessionId)}
+              title={t('openPriorPhaseHint')}
+            >
+              <Icon name="history" size={12} /> {t('priorPhase', { n: priors.length })}
+            </button>
+          )}
+          {task && task.eventIds.length > 0 && (
+            <button className="btn small" onClick={(e) => sourceMenu(e.currentTarget, task, src)}>
+              {t('sources', { n: task.eventIds.length })}
+            </button>
+          )}
+          {task?.worktree && !isPrior ? (
+            <span className="muted small mono truncate" title={task.worktree.path}>
+              {task.worktree.branch}
+            </span>
+          ) : task && taskMode(task) !== 'worktree' ? (
+            <span className="pill" title={task.cwd}>
+              {t(taskMode(task) === 'repo' ? 'modeRepo' : 'modeScratch')}
+            </span>
+          ) : null}
+          <span className="bot-bar-fill" />
+          {canDiff && (
+            <button className="btn small" onClick={() => showChanges(currentHostId, info.id)}>
+              <Icon name="diff" size={12} /> {t('viewDiff')}
+            </button>
+          )}
+          {waitingExternal && !hasQuestion && !hasAnswered && (
+            <button className="btn small primary" onClick={() => run(botCall('tasks.continue', { id: task.id }, src))}>
+              <Icon name="play" size={12} /> {t('continueTask')}
+            </button>
+          )}
+          {task && !isPrior && active && task.manual && (
+            <button className="btn small" onClick={() => run(botCall('tasks.handBack', { id: task.id }, src))}>
+              {t('handBack')}
+            </button>
+          )}
+          {task && !isPrior && task.state !== 'done' && (
+            <button className="btn small" onClick={() => run(botCall('tasks.markDone', { id: task.id }, src))}>
+              <Icon name="check" size={12} /> {t('markDone')}
+            </button>
+          )}
+          {task && (
+            <button
+              className="icon-btn"
+              title={t('more')}
+              onClick={(e) => {
+                const r = e.currentTarget.getBoundingClientRect();
+                openMenu({ clientX: r.left, clientY: r.bottom + 2 }, taskMenu(task, src));
+              }}
+            >
+              <Icon name="more" size={15} />
+            </button>
+          )}
+        </div>
+        {isPrior && task?.sessionId && (
+          <div className="bot-prior-banner">
+            <Icon name="history" size={13} />
+            <span className="truncate">{t('priorPhaseBanner')}</span>
+            <span className="bot-bar-fill" />
+            <button className="btn small primary" onClick={() => openOn(src, task.host, task.sessionId!)}>
+              <Icon name="forward" size={12} /> {t('goToCurrentPhase')}
+            </button>
+          </div>
         )}
-        {task?.worktree ? (
-          <span className="muted small mono truncate" title={task.worktree.path}>
-            {task.worktree.branch}
-          </span>
-        ) : task && taskMode(task) !== 'worktree' ? (
-          <span className="pill" title={task.cwd}>
-            {t(taskMode(task) === 'repo' ? 'modeRepo' : 'modeScratch')}
-          </span>
-        ) : null}
-        <span className="bot-bar-fill" />
-        {waitingExternal && (
-          <button className="btn small primary" onClick={() => run(botCall('tasks.continue', { id: task.id }, src))}>
-            <Icon name="play" size={12} /> {t('continueTask')}
-          </button>
+        {hasQuestion && task && (
+          <div className="bot-approvals">
+            <TaskQuestionCard task={task} src={src} />
+          </div>
         )}
-        {task && active && task.manual && (
-          <button className="btn small" onClick={() => run(botCall('tasks.handBack', { id: task.id }, src))}>
-            {t('handBack')}
-          </button>
+        {hasAnswered && task && (
+          <div className="bot-approvals">
+            <TaskAnsweredBanner task={task} />
+          </div>
         )}
-        {task && task.state !== 'done' && (
-          <button className="btn small" onClick={() => run(botCall('tasks.markDone', { id: task.id }, src))}>
-            {t('markDone')}
-          </button>
-        )}
-        {task && (
-          <button
-            className="icon-btn"
-            title={t('more')}
-            onClick={(e) => {
-              const r = e.currentTarget.getBoundingClientRect();
-              openMenu({ clientX: r.left, clientY: r.bottom + 2 }, taskMenu(task, src));
-            }}
-          >
-            <Icon name="more" size={15} />
-          </button>
-        )}
-      </div>
+      </>
     );
   }
   return (
     <>
-    <div className="bot-bar">
-      <Icon name="bot" size={14} />
-      <span className="truncate">{t('botSessionOf', { name: bot.config.name })}</span>
-      <span className="pill">{botStateLabel(bot.state)}</span>
-      {bot.waiting > 0 && <span className="muted small">{t('waitingItems', { n: bot.waiting })}</span>}
-      <span className="bot-bar-fill" />
-      <button className="btn small" onClick={() => navigate({ kind: 'bot', botId: bot.config.id, src })}>
-        <Icon name="eye" size={13} /> {t('botDetails')}
-      </button>
-      <button
-        className="icon-btn"
-        title={t('more')}
-        onClick={(e) => {
-          const r = e.currentTarget.getBoundingClientRect();
-          openMenu({ clientX: r.left, clientY: r.bottom + 2 }, botMenu(bot, src));
-        }}
-      >
-        <Icon name="more" size={15} />
-      </button>
-    </div>
-    <PendingCard bot={bot} src={src} />
-    <SecretCards bot={bot} src={src} />
-    <ApprovalCards bot={bot} src={src} />
+      <div className="bot-bar">
+        <Icon name="bot" size={14} />
+        <span className="truncate">{t('botSessionOf', { name: bot.config.name })}</span>
+        <span className="pill">{botStateLabel(bot.state)}</span>
+        {bot.waiting > 0 && <span className="muted small">{t('waitingItems', { n: bot.waiting })}</span>}
+        <span className="bot-bar-fill" />
+        <button className="btn small" onClick={() => navigate({ kind: 'bot', botId: bot.config.id, src })}>
+          <Icon name="eye" size={13} /> {t('botDetails')}
+        </button>
+        <button
+          className="icon-btn"
+          title={t('more')}
+          onClick={(e) => {
+            const r = e.currentTarget.getBoundingClientRect();
+            openMenu({ clientX: r.left, clientY: r.bottom + 2 }, botMenu(bot, src));
+          }}
+        >
+          <Icon name="more" size={15} />
+        </button>
+      </div>
+      <NeedsYouDeck bot={bot} src={src} />
     </>
   );
 }

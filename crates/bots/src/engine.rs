@@ -27,6 +27,8 @@ const OUTBOX_ATTEMPTS: u32 = 8;
 const APPROVAL_HOURS: i64 = 2;
 /// A routine run still open after this long is closed as failed
 const RUN_HOURS: i64 = 6;
+/// Maximum silent SOP pre-review rejections before letting a task reach `ready` for the owner
+const MAX_SOP_REVIEWS: u32 = 2;
 
 /// Run a plugin call off the async threads: WASM instances answer through a channel and may do HTTP meanwhile
 async fn blocking<R: Send + 'static>(f: impl FnOnce() -> R + Send + 'static) -> Result<R> {
@@ -88,6 +90,31 @@ fn truncate(s: &str, max: usize) -> String {
     t
 }
 
+/// Code-enforced trust level for the Bot's current turn (guards `update_config` and `memory_save` / `memory_delete`)
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+enum TurnTrust {
+    /// Any external trigger event or scheduled routine in this turn (cannot write memories or config)
+    External = 0,
+    /// Only task reports (may save workspace-scoped memories for the reporting task's workspace only)
+    TaskReport = 1,
+    /// Owner edited/approved a draft or answered a decision card (may save global & workspace memories)
+    Review = 2,
+    /// Owner directly spoke in the Bot session (highest trust: unlocks `update_config` and `request_secret`)
+    #[default]
+    Owner = 3,
+}
+
+impl TurnTrust {
+    fn memory_source(self) -> &'static str {
+        match self {
+            TurnTrust::Owner => "owner",
+            TurnTrust::Review => "review",
+            TurnTrust::TaskReport => "task",
+            TurnTrust::External => "bot",
+        }
+    }
+}
+
 /// Something waiting to be told to a Bot
 #[derive(Clone)]
 struct Inbox {
@@ -98,8 +125,29 @@ struct Inbox {
     wake: bool,
     /// The owner's own words (the first message of a new Bot): the turn counts as the owner's
     owner: bool,
+    /// Code-enforced trust level of this item
+    trust: TurnTrust,
+    /// Canonical workspace keys (`<host>:<cwd>`) touched by task reports in this item
+    workspaces: Vec<String>,
+    /// Tasks entering `reviewing` in this item (auto-promoted to `ready` if the Bot finishes the turn without acting)
+    reviewing: Vec<String>,
     /// The routine run this item starts
     run: Option<String>,
+}
+
+impl Inbox {
+    fn note(text: String, wake: bool, trust: TurnTrust) -> Self {
+        Inbox {
+            text,
+            events: vec![],
+            wake,
+            owner: trust == TurnTrust::Owner,
+            trust,
+            workspaces: vec![],
+            reviewing: vec![],
+            run: None,
+        }
+    }
 }
 
 /// A configuration change the Bot asked for that needs the owner's confirmation in the app
@@ -136,11 +184,17 @@ struct BotRt {
     error: Option<String>,
     /// Attach the notes to the next message (new session or after compaction)
     notes_due: bool,
+    /// Attach durable memories to the next message (new session or after compaction; keeps `bot_prompt` static)
+    memories_due: bool,
     compacting: bool,
     /// Trigger events delivered in the current turn: a spawn_task without event ids during that turn is about them
     turn_events: Vec<String>,
-    /// The engine started the current turn (events, reports), not the owner typing in the Bot session
-    engine_turn: bool,
+    /// Trust level of the current turn (defaults to Owner while idle so direct owner typing runs as Owner)
+    turn_trust: TurnTrust,
+    /// Canonical workspace keys of tasks whose reports started the current turn
+    turn_workspaces: HashSet<String>,
+    /// Tasks delivered in `reviewing` state in the current turn (auto-promoted to `ready` when turn ends untouched)
+    turn_reviewing: Vec<String>,
     pending: Option<PendingChange>,
     /// Secrets the Bot asked the owner for with request_secret (memory only); missing required secrets of the
     /// instances it uses need no request, their cards are worked out from the configuration
@@ -523,6 +577,9 @@ impl Engine {
         if !row.notes.trim().is_empty() {
             self.bots.lock().unwrap().entry(bot_id.into()).or_default().notes_due = true;
         }
+        if !self.store.memories(bot_id, None).unwrap_or_default().is_empty() {
+            self.bots.lock().unwrap().entry(bot_id.into()).or_default().memories_due = true;
+        }
         Ok(s)
     }
 
@@ -536,7 +593,11 @@ impl Engine {
     }
 
     fn push(&self, bot_id: &str, text: String, wake: bool) {
-        self.push_item(bot_id, Inbox { text, events: vec![], wake, owner: false, run: None });
+        self.push_item(bot_id, Inbox::note(text, wake, TurnTrust::External));
+    }
+
+    fn push_trusted(&self, bot_id: &str, text: String, wake: bool, trust: TurnTrust) {
+        self.push_item(bot_id, Inbox::note(text, wake, trust));
     }
 
     fn push_item(&self, bot_id: &str, item: Inbox) {
@@ -557,7 +618,8 @@ impl Engine {
         tokio::spawn(fut);
     }
 
-    /// Send what is waiting to an idle Bot session, merged into one message
+    /// Send what is waiting to an idle Bot session, merged into one message. Items of a higher `TurnTrust` are sent
+    /// ahead of lower-trust external events so an owner review or task report isn't downgraded by coinciding chatter.
     async fn deliver(&self, bot_id: &str) {
         let Ok(row) = self.store.bot(bot_id) else { return };
         if !row.config.enabled {
@@ -569,20 +631,42 @@ impl Engine {
             }
             return;
         };
-        let (items, notes_due) = {
+        let (items, notes_due, memories_due, batch_trust) = {
             let mut bots = self.bots.lock().unwrap();
             let rt = bots.entry(bot_id.into()).or_default();
             let idle = matches!(rt.status.as_deref(), Some("idle" | "exited") | None);
-            if !idle || rt.starting || rt.sending || rt.compacting || !rt.inbox.iter().any(|i| i.wake) {
+            let Some(best_trust) = rt.inbox.iter().filter(|i| i.wake).map(|i| i.trust).max() else {
+                return;
+            };
+            if !idle || rt.starting || rt.sending || rt.compacting {
                 return;
             }
             rt.sending = true;
-            rt.engine_turn = !items_are_owner(&rt.inbox);
-            (std::mem::take(&mut rt.inbox), std::mem::take(&mut rt.notes_due))
+            // Deliver items at or above the highest waking trust level first; lower-trust items wait for the next idle turn
+            let mut send_now = Vec::new();
+            let mut keep = Vec::new();
+            for item in std::mem::take(&mut rt.inbox) {
+                if item.trust >= best_trust {
+                    send_now.push(item);
+                } else {
+                    keep.push(item);
+                }
+            }
+            rt.inbox = keep;
+            let trust = batch_trust_of(&send_now);
+            rt.turn_trust = trust;
+            (send_now, std::mem::take(&mut rt.notes_due), std::mem::take(&mut rt.memories_due), trust)
         };
         let mut text = String::new();
         if notes_due && !row.notes.trim().is_empty() {
             text.push_str(&format!("<notes>\nYour notes from before:\n{}\n</notes>\n\n", row.notes.trim()));
+        }
+        if memories_due {
+            let mems = self.store.memories(bot_id, None).unwrap_or_default();
+            let body = prompt::format_memories_for_bot(&row.config, &mems);
+            if !body.is_empty() {
+                text.push_str(&format!("<memories>\n{body}\n</memories>\n\n"));
+            }
         }
         for i in &items {
             text.push_str(&i.text);
@@ -590,7 +674,7 @@ impl Engine {
         }
         // Only the owner's own words (a new Bot's role) show as theirs; anything the engine adds is a system note
         let theirs = text.is_empty() || items.iter().all(|i| i.owner && !i.text.starts_with('<'));
-        let theirs = theirs && !text.starts_with("<notes>");
+        let theirs = theirs && !text.starts_with("<notes>") && !text.starts_with("<memories>");
         let mut msg = json!({"sessionId": s.session_id, "text": text.trim_end()});
         if !theirs {
             msg["origin"] = json!(ENGINE_ORIGIN);
@@ -603,8 +687,11 @@ impl Engine {
             Ok(_) => {
                 rt.status = Some("running".into());
                 rt.error = None;
+                rt.turn_trust = batch_trust;
                 rt.turn_events = items.iter().flat_map(|i| i.events.iter().cloned()).collect();
                 rt.turn_runs = items.iter().filter_map(|i| i.run.clone()).collect();
+                rt.turn_workspaces = items.iter().flat_map(|i| i.workspaces.iter().cloned()).collect();
+                rt.turn_reviewing = items.iter().flat_map(|i| i.reviewing.iter().cloned()).collect();
                 for id in &rt.turn_runs {
                     if let Ok(mut r) = self.store.run(id) {
                         r.state = "running".into();
@@ -618,6 +705,8 @@ impl Engine {
                 back.append(&mut rt.inbox);
                 rt.inbox = back;
                 rt.notes_due |= notes_due;
+                rt.memories_due |= memories_due;
+                rt.turn_trust = TurnTrust::Owner;
                 let msg = format!("{e:#}");
                 if msg.contains("会话不存在") {
                     drop(bots);
@@ -680,6 +769,7 @@ impl Engine {
         let status = info["status"].as_str().unwrap_or("").to_string();
         let compact_at = self.store.bot(bot_id).map(|b| b.config.compact_at).unwrap_or(70) as f64;
         let mut ended_runs = vec![];
+        let mut ended_reviewing = vec![];
         let compact = {
             let mut bots = self.bots.lock().unwrap();
             let rt = bots.entry(bot_id.into()).or_default();
@@ -689,13 +779,16 @@ impl Engine {
             let idle = status == "idle";
             if idle && !rt.sending {
                 rt.turn_events.clear();
-                rt.engine_turn = false;
+                rt.turn_trust = TurnTrust::Owner;
+                rt.turn_workspaces.clear();
                 ended_runs = std::mem::take(&mut rt.turn_runs);
+                ended_reviewing = std::mem::take(&mut rt.turn_reviewing);
             }
             if was_compacting && idle {
-                // The compaction turn ended: the notes go with the next message
+                // The compaction turn ended: notes and memories go with the next message
                 rt.compacting = false;
                 rt.notes_due = true;
+                rt.memories_due = true;
             }
             let over = rt.context.is_some_and(|c| c >= compact_at);
             if idle && over && !rt.compacting {
@@ -721,6 +814,11 @@ impl Engine {
         let id = bot_id.to_string();
         let session = self.store.bot(bot_id).ok().and_then(|b| b.session);
         tokio::spawn(async move {
+            // Fallback: if the Bot finished its turn without rejecting, closing or calling accept_ready on a
+            // reviewing task, promote it to ready automatically so it can never get stuck
+            for tid in ended_reviewing {
+                let _ = me.promote_reviewing_to_ready(&tid, true, None).await;
+            }
             if compact {
                 if let Some(s) = session {
                     if me.rpc(&s.host, "session.compact", json!({"sessionId": s.session_id})).await.is_err() {
@@ -736,6 +834,11 @@ impl Engine {
     fn task_updated(&self, task_id: &str, info: &Value) {
         let Ok(mut t) = self.store.task(task_id) else { return };
         self.count_tokens(&t.bot_id, info);
+        // Ignore updates from superseded prior-phase sessions after an in-place upgrade
+        let sid = info["id"].as_str().unwrap_or("");
+        if !sid.is_empty() && t.session_id.as_deref() != Some(sid) {
+            return;
+        }
         let pending = &info["pending"];
         let mut changed = false;
         if t.state == "working" && !pending.is_null() {
@@ -943,7 +1046,16 @@ impl Engine {
                 self.changed();
                 continue;
             }
-            self.push_item(&c.id, Inbox { text: card(&row, explicit, &self.instance_label(instance_id)), events: vec![row.id.clone()], wake: true, owner: false, run: None });
+            self.push_item(&c.id, Inbox {
+                text: card(&row, explicit, &self.instance_label(instance_id)),
+                events: vec![row.id.clone()],
+                wake: true,
+                owner: false,
+                trust: TurnTrust::External,
+                workspaces: vec![],
+                reviewing: vec![],
+                run: None,
+            });
             self.changed();
         }
     }
@@ -1111,23 +1223,50 @@ impl Engine {
             return Ok(run);
         }
         self.store.save_run(&run)?;
+        let mut sop_attr = String::new();
+        let mut body = r.prompt.trim().to_string();
+        if let Some(sid) = r.sop_id.as_deref() {
+            if let Some(sop) = c.find_sop(sid) {
+                if sop.enabled {
+                    sop_attr = format!(" sop=\"{}\"", attr(&sop.id));
+                    body.push_str(&format!("\nFollow SOP `{}` (\"{}\") when spawning any task.", sop.id, sop.name));
+                } else {
+                    body.push_str(&format!("\n(Note: linked SOP `{}` \"{}\" is currently disabled.)", sop.id, sop.name));
+                }
+            }
+        }
         let text = format!(
-            "<routine run=\"{}\" name=\"{}\"{}>\n{}\n</routine>",
+            "<routine run=\"{}\" name=\"{}\"{}{}>\n{}\n</routine>",
             run.id,
             attr(&r.name),
+            sop_attr,
             if manual { " manual=\"true\"" } else { "" },
-            r.prompt.trim()
+            body
         );
-        self.push_item(&c.id, Inbox { text, events: vec![], wake: true, owner: false, run: Some(run.id.clone()) });
+        self.push_item(&c.id, Inbox {
+            text,
+            events: vec![],
+            wake: true,
+            owner: false,
+            trust: TurnTrust::External,
+            workspaces: vec![],
+            reviewing: vec![],
+            run: Some(run.id.clone()),
+        });
         self.changed();
         Ok(run)
     }
 
     // ---------- approvals ----------
 
+    /// Code-enforced trust level of the Bot's current turn (defaults to Owner while idle / direct owner typing)
+    fn turn_trust(&self, bot_id: &str) -> TurnTrust {
+        self.bots.lock().unwrap().get(bot_id).map(|r| r.turn_trust).unwrap_or(TurnTrust::Owner)
+    }
+
     /// The engine (not the owner) started the Bot's current turn
     fn engine_turn(&self, bot_id: &str) -> bool {
-        self.bots.lock().unwrap().get(bot_id).is_some_and(|r| r.engine_turn)
+        self.turn_trust(bot_id) != TurnTrust::Owner
     }
 
     /// Keep an outgoing action for the owner; the Bot's tool call returns at once
@@ -1176,7 +1315,9 @@ impl Engine {
             return Ok(json!(ap));
         }
         let edited = ap.kind == "reply" && text.as_deref().map(str::trim).is_some_and(|t| !t.is_empty() && t != ap.text.trim());
+        let original = ap.text.clone();
         if edited {
+            ap.original_text = Some(original.clone());
             ap.text = text.unwrap_or_default().trim().to_string();
         }
         ap.state = "approved".into();
@@ -1214,18 +1355,31 @@ impl Engine {
         };
         ap.result = Some(result.clone());
         self.store.save_approval(&ap)?;
-        self.push(
-            &ap.bot_id,
+        let notice = if edited {
             format!(
-                "<approval id=\"{}\" state=\"approved\" kind=\"{}\" text=\"{}\">The owner approved your drafted {what}{} ({}). Result: {result}</approval>",
+                "<approval id=\"{}\" state=\"approved\" kind=\"{}\" edited=\"true\" text=\"{}\">\n\
+                 The owner edited your drafted {what} before approving it.\n\
+                 Original: {}\n\
+                 Sent: {}\n\
+                 Result: {result}\n\
+                 If the edit reflects a lasting style rule or preference, call memory_list then memory_save(scope: \"\", content: \"...\").\n\
+                 </approval>",
                 ap.id,
                 ap.kind,
                 attr(&truncate(&ap.text, 120)),
-                if edited { " after editing it" } else { "" },
+                truncate(&original, 400),
+                truncate(&ap.text, 400),
+            )
+        } else {
+            format!(
+                "<approval id=\"{}\" state=\"approved\" kind=\"{}\" text=\"{}\">The owner approved your drafted {what} ({}). Result: {result}</approval>",
+                ap.id,
+                ap.kind,
+                attr(&truncate(&ap.text, 120)),
                 truncate(&ap.text, 200)
-            ),
-            true,
-        );
+            )
+        };
+        self.push_trusted(&ap.bot_id, notice, true, TurnTrust::Review);
         Ok(json!(ap))
     }
 
@@ -1284,13 +1438,30 @@ impl Engine {
                     event_ids = self.bots.lock().unwrap().get(&c.id).map(|r| r.turn_events.clone()).unwrap_or_default();
                 }
                 let events: Vec<EventRow> = event_ids.iter().map(|id| self.bot_event(&c.id, id)).collect::<Result<_>>()?;
+                let sop = match a["sop"].as_str().map(str::trim).filter(|x| !x.is_empty()) {
+                    Some(q) => {
+                        let Some(found) = c.find_sop(q) else {
+                            let avail: Vec<String> = c.sops.iter().filter(|x| x.enabled).map(|x| format!("`{}` ({})", x.id, x.name)).collect();
+                            if avail.is_empty() {
+                                bail!("Unknown SOP \"{q}\"; no enabled SOPs are configured.");
+                            }
+                            bail!("Unknown SOP \"{q}\"; enabled SOPs: {}.", avail.join(", "));
+                        };
+                        if !found.enabled {
+                            bail!("SOP `{}` (\"{}\") is disabled; omit `sop` or ask the owner to enable it.", found.id, found.name);
+                        }
+                        Some(found.clone())
+                    }
+                    None => None,
+                };
                 // Admission guards trigger events; the owner asking in the session directly is always carried out.
                 // A task starts only in auto mode and only for explicit requests (addressed, a person, allowed sender)
                 if !events.is_empty() && (c.accept != Accept::Auto || !events.iter().all(|e| self.explicit(c, e))) {
                     let why = if c.accept == Accept::Auto { "not an explicit request from an allowed sender" } else { "observe mode" };
+                    let sop_note = sop.as_ref().map(|x| format!(" with SOP `{}`", x.id)).unwrap_or_default();
                     for mut e in events {
                         e.disposition = "observed".into();
-                        e.note = format!("would spawn task \"{}\" ({why})", s("title"));
+                        e.note = format!("would spawn task \"{}\"{sop_note} ({why})", s("title"));
                         let _ = self.store.update_event(&e);
                     }
                     return Ok(json!(format!(
@@ -1316,6 +1487,7 @@ impl Engine {
                     a.clone()
                 };
                 let (mode, host, ws_path) = resolve_spawn_location(c, &location, restricted)?;
+                let ad_hoc = !ws_path.is_empty() && !c.workspaces.iter().any(|w| w.host == host && w.cwd == ws_path);
                 let allowed = c.task_tools();
                 let tool = match a["tool"].as_str().filter(|t| !t.is_empty()) {
                     Some(t) if allowed.contains(&t) => t.to_string(),
@@ -1334,6 +1506,22 @@ impl Engine {
                 } else {
                     ws_path.clone()
                 };
+                let mut spec = json!({
+                    "mode": mode,
+                    "kind": kind,
+                    "tool": tool,
+                    "model": a["model"].as_str().filter(|m| !m.is_empty()).map(str::to_string).or(if default_tool { c.task.model.clone() } else { None }),
+                    "effort": if default_tool { c.task.effort.clone() } else { None },
+                    "computerUse": computer_use,
+                    "adHoc": ad_hoc,
+                    "reviewCount": 0,
+                    "note": truncate(&s("note"), 400),
+                    "request": s("request"),
+                });
+                if let Some(sop) = &sop {
+                    spec["sop"] = json!(sop.id);
+                    spec["sopName"] = json!(sop.name);
+                }
                 let mut t = TaskRow {
                     id: task_id,
                     bot_id: c.id.clone(),
@@ -1346,16 +1534,7 @@ impl Engine {
                     cwd: initial_cwd,
                     workspace: ws_path,
                     worktree: None,
-                    spec: json!({
-                        "mode": mode,
-                        "kind": kind,
-                        "tool": tool,
-                        "model": a["model"].as_str().filter(|m| !m.is_empty()).map(str::to_string).or(if default_tool { c.task.model.clone() } else { None }),
-                        "effort": if default_tool { c.task.effort.clone() } else { None },
-                        "computerUse": computer_use,
-                        "note": truncate(&s("note"), 400),
-                        "request": s("request"),
-                    }),
+                    spec,
                     created_at: now_ms(),
                     ..Default::default()
                 };
@@ -1434,8 +1613,33 @@ impl Engine {
                 if !(t.active() || t.state == "ready") || t.session_id.is_none() {
                     bail!("The task has ended.");
                 }
+                if let Some(m) = a["mode"].as_str().map(str::trim).filter(|x| !x.is_empty()) {
+                    if m != "worktree" {
+                        bail!("send_task only supports mode=\"worktree\" to upgrade a read-only `repo` task in place.");
+                    }
+                    let res = self.upgrade_task_to_worktree(c, &mut t, &s("text")).await?;
+                    return Ok(res);
+                }
+                if t.state == "reviewing" {
+                    let count = t.spec["reviewCount"].as_u64().unwrap_or(0) + 1;
+                    t.spec["reviewCount"] = json!(count);
+                    self.store.save_task(&t)?;
+                }
                 self.send_to_task(&mut t, format!("<bot-message>\n{}\n</bot-message>", s("text"))).await?;
                 Ok(json!("ok"))
+            }
+            "accept_ready" => {
+                let t = self.bot_task(&c.id, &s("task_id"))?;
+                if t.state == "ready" {
+                    return Ok(json!("Already ready for the owner."));
+                }
+                if t.state != "reviewing" {
+                    bail!("Task is {}; only a `reviewing` task can be approved with accept_ready.", t.state);
+                }
+                let notify = a["notify"].as_bool().unwrap_or(true);
+                let note = a["summary"].as_str().map(str::trim).filter(|x| !x.is_empty());
+                self.promote_reviewing_to_ready(&t.id, notify, note).await?;
+                Ok(json!("Promoted to ready for the owner."))
             }
             "task_status" => Ok(task_view(&self.bot_task(&c.id, &s("task_id"))?)),
             "list_tasks" => {
@@ -1459,8 +1663,8 @@ impl Engine {
                 if !["done", "failed"].contains(&result.as_str()) {
                     bail!("result must be done or failed");
                 }
-                if !matches!(t.state.as_str(), "working" | "needsYou" | "ready") {
-                    bail!("The task is {}; only a working, blocked or ready task can be closed.", t.state);
+                if !matches!(t.state.as_str(), "working" | "needsYou" | "reviewing" | "ready") {
+                    bail!("The task is {}; only a working, blocked, reviewing or ready task can be closed.", t.state);
                 }
                 if t.manual {
                     bail!("The owner has taken over this task; leave it to them.");
@@ -1707,6 +1911,61 @@ impl Engine {
                 self.store.set_notes(&c.id, &truncate(&s("text"), 8000))?;
                 Ok(json!("saved"))
             }
+            "memory_list" => {
+                let scope_filter = if a.get("scope").is_none() || a["scope"].is_null() {
+                    None
+                } else {
+                    Some(resolve_memory_scope(c, &a["scope"])?)
+                };
+                let rows = self.store.memories(&c.id, scope_filter.as_deref())?;
+                Ok(json!(rows))
+            }
+            "memory_save" => {
+                let trust = self.turn_trust(&c.id);
+                if trust == TurnTrust::External {
+                    bail!("Cannot save memories during an external event or routine turn. Only the owner, approval edits, or task reports (for their own workspace) may save memories.");
+                }
+                let scope = resolve_memory_scope(c, &a["scope"])?;
+                if trust == TurnTrust::TaskReport {
+                    if scope.is_empty() {
+                        bail!("Global memories (scope \"\") can only be saved in an owner turn or after an owner draft edit, not from a task report.");
+                    }
+                    let allowed_ws = self.bots.lock().unwrap().get(&c.id).is_some_and(|r| r.turn_workspaces.contains(&scope));
+                    if !allowed_ws {
+                        bail!("Task reports may only save memories for the workspace of the reporting task (got \"{scope}\").");
+                    }
+                }
+                let saved = self.store.save_memory(
+                    &c.id,
+                    a["id"].as_str(),
+                    &scope,
+                    &s("content"),
+                    trust.memory_source(),
+                    now_ms(),
+                )?;
+                // Intentionally do NOT call session.setSystemPrompt here: keeps Bot KV cache intact and avoids restarting the CLI tool
+                Ok(json!(saved))
+            }
+            "memory_delete" => {
+                let trust = self.turn_trust(&c.id);
+                if trust == TurnTrust::External {
+                    bail!("Cannot delete memories during an external event or routine turn.");
+                }
+                let mid = s("id");
+                let existing = self.store.memory(&mid)?;
+                if existing.bot_id != c.id {
+                    bail!("记忆不存在: {mid}");
+                }
+                if trust == TurnTrust::TaskReport {
+                    let allowed_ws = !existing.scope.is_empty()
+                        && self.bots.lock().unwrap().get(&c.id).is_some_and(|r| r.turn_workspaces.contains(&existing.scope));
+                    if !allowed_ws || existing.source == "owner" {
+                        bail!("Task report turns cannot delete global or owner-authored memories.");
+                    }
+                }
+                self.store.delete_memory(&c.id, &mid)?;
+                Ok(json!("deleted"))
+            }
             _ => bail!("Unknown tool: {tool}"),
         }
     }
@@ -1815,9 +2074,9 @@ impl Engine {
         })
     }
 
-    /// A ready or blocked (`needsYou`) task that gets more to do goes back to work; its timeout counts from now.
+    /// A ready, reviewing or blocked (`needsYou`) task that gets more to do goes back to work; its timeout counts from now.
     fn reopen(&self, t: &mut TaskRow) -> Result<()> {
-        if !matches!(t.state.as_str(), "ready" | "needsYou") || t.session_id.is_none() {
+        if !matches!(t.state.as_str(), "ready" | "needsYou" | "reviewing") || t.session_id.is_none() {
             return Ok(());
         }
         t.state = "working".into();
@@ -1829,6 +2088,194 @@ impl Engine {
         self.store.resolve_attention(None, Some(&t.id), now_ms())?;
         self.changed();
         Ok(())
+    }
+
+    /// Promote a `reviewing` task to `ready` for owner review, releasing its active slot and optionally notifying
+    async fn promote_reviewing_to_ready(&self, task_id: &str, notify: bool, review_note: Option<&str>) -> Result<()> {
+        let mut t = self.store.task(task_id)?;
+        if t.state != "reviewing" {
+            return Ok(());
+        }
+        t.state = "ready".into();
+        if let Some(note) = review_note {
+            if let Some(r) = t.last_report.as_mut().and_then(Value::as_object_mut) {
+                r.insert("reviewNote".into(), json!(truncate(note, 500)));
+            }
+        }
+        self.store.save_task(&t)?;
+        if notify {
+            let summary = review_note
+                .map(str::to_string)
+                .or_else(|| t.last_report.as_ref().and_then(|r| r["summary"].as_str()).map(str::to_string))
+                .unwrap_or_default();
+            let text = if summary.is_empty() {
+                format!("{}: 已完成预审，待你验收", t.title)
+            } else {
+                format!("{}（待验收）：{}", t.title, truncate(&summary, 240))
+            };
+            self.attention(&t.bot_id, Some(&t.id), &text, "normal");
+        }
+        self.release_task_desktop(&t).await;
+        self.start_queued_for_host(&t.bot_id, &t.host).await;
+        self.changed();
+        Ok(())
+    }
+
+    /// Atomically upgrade a read-only `repo` task in place to its own git worktree & phase-2 session (`handoffFrom`).
+    /// Creates the worktree and new session first so any error leaves the phase-1 session completely intact.
+    async fn upgrade_task_to_worktree(&self, c: &BotConfig, t: &mut TaskRow, text: &str) -> Result<Value> {
+        if t.mode() != "repo" {
+            bail!("Only a read-only `repo` task can be upgraded to worktree mode (current mode: {}).", t.mode());
+        }
+        if t.workspace.is_empty() {
+            bail!("This task has no repository workspace to create a worktree from.");
+        }
+        let configured = c.workspaces.iter().any(|w| w.host == t.host && w.cwd == t.workspace);
+        let trust = self.turn_trust(&c.id);
+        if !configured && (t.spec["adHoc"].as_bool() != Some(true) || trust < TurnTrust::Review) {
+            bail!("Cannot upgrade to worktree outside configured workspaces.");
+        }
+        let old_sid = t.session_id.clone().ok_or_else(|| anyhow!("任务会话不存在"))?;
+        let old_cwd = t.cwd.clone();
+        let want_cu = task_uses_computer(t);
+        if want_cu {
+            if let Some(other) = self.desktop_holder(&t.host, Some(&t.id))? {
+                bail!("主机上另一个桌面任务「{}」正在运行，请稍后再试", other.title);
+            }
+            let cu = self.rpc(&t.host, "computerUse.status", json!({})).await?;
+            if cu["supported"] == false || cu["status"] == "driverMissing" || cu["status"] == "desktopUnavailable" {
+                bail!("桌面当前不可用，无法升级桌面任务");
+            }
+        }
+
+        // 1. Create the worktree first; if this fails (e.g. non-git dir), the phase-1 session stays untouched
+        let name = t.id.replace('_', "-");
+        let w = self
+            .rpc(&t.host, "git.worktreeAdd", json!({"cwd": t.workspace, "name": name, "branch": format!("yi/{name}")}))
+            .await
+            .map_err(|e| anyhow!("无法创建 worktree（旧会话保持不变）：{e:#}"))?;
+        let wt_path = w["path"].as_str().ok_or_else(|| anyhow!("worktree 路径缺失"))?.to_string();
+        let branch = w["branch"].as_str().map(str::to_string);
+
+        // 2. Build phase-2 system prompt (worktree rules + matched SOP + repo memories)
+        let sop = t.spec["sop"].as_str().and_then(|id| c.find_sop(id)).filter(|s| s.enabled);
+        let memories = self.store.memories_for_task(&c.id, &t.host, &t.workspace).unwrap_or_default();
+        let env = prompt::TaskEnv {
+            mode: "worktree",
+            host: &t.host,
+            cwd: &wt_path,
+            workspace: &t.workspace,
+            branch: branch.as_deref(),
+            plugin: t.is_plugin(),
+            sop,
+            memories: &memories,
+        };
+        let task_prompt = prompt::task_prompt_for(c, Some(&env));
+
+        // 3. Create the phase-2 session without `prompt` (so the handoff message can carry `origin: bot-engine`)
+        //    and link it via `handoffFrom` so both sessions show a clickable handoff card
+        let create = self
+            .rpc(
+                &t.host,
+                "session.create",
+                json!({
+                    "tool": t.spec["tool"],
+                    "cwd": wt_path,
+                    "title": t.title,
+                    "model": t.spec["model"],
+                    "effort": t.spec["effort"],
+                    "permissionMode": c.task.permission_mode,
+                    "accountId": t.spec["accountId"].as_str().or(c.task.account_id.as_deref()),
+                    "appendSystemPrompt": task_prompt,
+                    "clientMcp": [tools::client_mcp(TASK_SERVER, &self.identity.client_id)],
+                    "bot": self.link(c, "task", Some(&t.id)),
+                    "computerUse": want_cu,
+                    "handoffFrom": old_sid,
+                }),
+            )
+            .await;
+        let info = match create {
+            Ok(info) => info,
+            Err(e) => {
+                // Roll back the freshly created worktree on session creation failure
+                let _ = self.rpc(&t.host, "git.worktreeRemove", json!({"path": wt_path, "force": true})).await;
+                return Err(anyhow!("创建 worktree 阶段会话失败（已回滚）：{e:#}"));
+            }
+        };
+        let new_sid = info["id"].as_str().ok_or_else(|| anyhow!("创建 worktree 阶段会话失败"))?.to_string();
+        let final_cwd = info["cwd"].as_str().map(str::to_string).unwrap_or(wt_path);
+
+        // 4. Preserve full phase-1 findings & decision for phase-2 handoff
+        let prior_summary = t.last_report.as_ref().and_then(|r| r["summary"].as_str()).unwrap_or("").to_string();
+        let prior_context = phase1_handoff_text(t);
+        let events: Vec<EventRow> = t.event_ids.iter().filter_map(|id| self.store.event(id).ok()).collect();
+        let mut next_t = t.clone();
+        next_t.cwd = final_cwd.clone();
+        next_t.worktree = Some(w.clone());
+        next_t.spec["mode"] = json!("worktree");
+        let base_brief = brief(&next_t, &events, &|id| self.instance_label(id));
+        let handoff_msg = format!(
+            "{base_brief}\n\n<previous-phase mode=\"repo\" session=\"{old_sid}\">\n{prior_context}\n</previous-phase>\n\n<bot-message>\n{text}\n</bot-message>"
+        );
+        if let Err(e) = self
+            .rpc(&t.host, "session.send", json!({"sessionId": new_sid, "text": handoff_msg, "queue": true, "origin": ENGINE_ORIGIN}))
+            .await
+        {
+            let _ = self.rpc(&t.host, "session.delete", json!({"sessionId": new_sid})).await;
+            let _ = self.rpc(&t.host, "git.worktreeRemove", json!({"path": final_cwd, "force": true})).await;
+            return Err(anyhow!("发送 worktree 阶段指令失败（已回滚）：{e:#}"));
+        }
+
+        // 5. Commit the atomic switch on the same TaskRow BEFORE touching the old session
+        let mut priors = t.spec["priorSessions"].as_array().cloned().unwrap_or_default();
+        priors.push(json!({
+            "sessionId": old_sid,
+            "mode": "repo",
+            "cwd": old_cwd,
+            "summary": truncate(&prior_summary, 400),
+            "endedAt": now_ms(),
+        }));
+        t.spec["priorSessions"] = json!(priors);
+        t.spec["priorSummary"] = json!(truncate(&prior_summary, 1000));
+        t.spec["mode"] = json!("worktree");
+        t.spec["pendingBrief"] = json!(false);
+        t.session_id = Some(new_sid.clone());
+        t.cwd = final_cwd;
+        t.worktree = Some(w);
+        t.state = "working".into();
+        t.started_at = Some(now_ms());
+        t.last_report = None;
+        // Critical: new session's event seq starts at 1, so reset seen_seq for offline catch_up
+        t.seen_seq = 0;
+        self.store.save_task(t)?;
+        self.store.resolve_attention(None, Some(&t.id), now_ms())?;
+        self.task_busy.lock().unwrap().remove(&t.id);
+
+        // 6. Quietly retire the old session: strip client MCP so stale calls can't fire, interrupt without deleting
+        //    (keeps phase-1 history inspectable; cleaned up with the task in clean_task / delete_bot)
+        let _ = self.rpc(&t.host, "session.setClientMcp", json!({"sessionId": old_sid, "clientMcp": []})).await;
+        let _ = self.rpc(&t.host, "session.interrupt", json!({"sessionId": old_sid})).await;
+
+        // 7. Notify UI to follow the upgraded session if the user is viewing phase 1
+        if let Ok(h) = self.hub() {
+            h.emit_event(json!({
+                "type": "bots.taskUpgraded",
+                "botId": c.id,
+                "taskId": t.id,
+                "host": t.host,
+                "oldSessionId": old_sid,
+                "sessionId": new_sid,
+            }));
+        }
+        self.changed();
+        Ok(json!({
+            "upgraded": true,
+            "taskId": t.id,
+            "mode": "worktree",
+            "sessionId": new_sid,
+            "branch": branch,
+            "cwd": t.cwd,
+        }))
     }
 
     /// Another computer-use task currently holding `host`'s desktop (`working` or `needsYou`).
@@ -1918,9 +2365,48 @@ impl Engine {
                 if t.hold {
                     return Ok(json!("This task was stopped by the owner; nothing more is needed."));
                 }
-                t.last_report = Some(json!({"state": state, "summary": s("summary"), "question": a["question"], "links": a["links"], "at": now_ms()}));
+                let options: Vec<String> = a["options"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|x| !x.is_empty())
+                    .take(6)
+                    .map(|x| truncate(x, 120))
+                    .collect();
+                let details = a["details"].as_str().map(str::trim).filter(|x| !x.is_empty()).map(|x| truncate(x, 4000));
+                let learned = a["learned"].as_str().map(str::trim).filter(|x| !x.is_empty()).map(|x| truncate(x, 300));
+                let mut report = json!({
+                    "state": state,
+                    "summary": s("summary"),
+                    "question": a["question"],
+                    "links": a["links"],
+                    "at": now_ms(),
+                });
+                if !options.is_empty() {
+                    report["options"] = json!(options);
+                }
+                if let Some(d) = &details {
+                    report["details"] = json!(d);
+                }
+                if let Some(l) = &learned {
+                    report["learned"] = json!(l);
+                }
+                t.last_report = Some(report);
+
+                let bot_cfg = self.store.bot(&t.bot_id).ok().map(|b| b.config);
+                let sop_id = t.spec["sop"].as_str().map(str::to_string);
+                let sop_has_delivery = sop_id
+                    .as_deref()
+                    .and_then(|id| bot_cfg.as_ref()?.find_sop(id))
+                    .is_some_and(|sop| sop.enabled && !sop.delivery.trim().is_empty());
+                let review_count = t.spec["reviewCount"].as_u64().unwrap_or(0) as u32;
+                let entering_review = state == "ready" && sop_has_delivery && review_count < MAX_SOP_REVIEWS;
+                let hit_review_cap = state == "ready" && sop_has_delivery && review_count >= MAX_SOP_REVIEWS;
+
                 match state.as_str() {
-                    "ready" => t.state = "ready".into(),
+                    "ready" => t.state = if entering_review { "reviewing".into() } else { "ready".into() },
                     "blocked" => t.state = "needsYou".into(),
                     "failed" => t.state = "failed".into(),
                     "dropped" => t.state = "done".into(),
@@ -1935,22 +2421,52 @@ impl Engine {
                     self.attention(&t.bot_id, Some(&t.id), &format!("{}: {q}", t.title), "normal");
                 } else if state == "failed" {
                     self.attention(&t.bot_id, Some(&t.id), &format!("{}: {}", t.title, s("summary")), "normal");
+                } else if hit_review_cap {
+                    self.attention(
+                        &t.bot_id,
+                        Some(&t.id),
+                        &format!("{}（已达自动预审上限，待你验收）：{}", t.title, truncate(&s("summary"), 200)),
+                        "normal",
+                    );
                 }
                 let links = a["links"].as_array().map(|l| l.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(" ")).unwrap_or_default();
-                let mut card = format!("<report task=\"{}\" title=\"{}\" state=\"{state}\">\n{}", t.id, attr(&t.title), clip(&s("summary")));
+                let card_state = if entering_review { "reviewing" } else { state.as_str() };
+                let sop_attr = sop_id.as_deref().map(|id| format!(" sop=\"{}\"", attr(id))).unwrap_or_default();
+                let mut card = format!("<report task=\"{}\" title=\"{}\"{sop_attr} state=\"{card_state}\">\n{}", t.id, attr(&t.title), clip(&s("summary")));
                 if let Some(q) = a["question"].as_str().filter(|q| !q.is_empty()) {
                     card.push_str(&format!("\nQuestion: {q}"));
+                }
+                if !options.is_empty() {
+                    card.push_str(&format!("\nOptions: {}", options.join(" | ")));
                 }
                 if !links.is_empty() {
                     card.push_str(&format!("\nLinks: {links}"));
                 }
+                if let Some(l) = &learned {
+                    card.push_str(&format!("\nLearned: {l}"));
+                }
+                if hit_review_cap {
+                    card.push_str(&format!("\nNote: already returned for SOP fixes {MAX_SOP_REVIEWS} times; escalated directly to ready for the owner."));
+                }
                 card.push_str("\n</report>");
-                self.push(&t.bot_id, card, state != "progress");
+                let ws_key = BotConfig::workspace_key(&t.host, &t.workspace);
+                let workspaces = if ws_key.is_empty() { vec![] } else { vec![ws_key] };
+                let reviewing = if entering_review { vec![t.id.clone()] } else { vec![] };
+                self.push_item(&t.bot_id, Inbox {
+                    text: card,
+                    events: vec![],
+                    wake: state != "progress",
+                    owner: false,
+                    trust: TurnTrust::TaskReport,
+                    workspaces,
+                    reviewing,
+                    run: None,
+                });
                 if !t.active() {
                     self.release_task_desktop(&t).await;
                     self.start_queued_for_host(&t.bot_id, &t.host).await;
                 }
-                Ok(json!("Reported to the Bot."))
+                Ok(json!(if entering_review { "Reported to the Bot for SOP pre-review." } else { "Reported to the Bot." }))
             }
             "ack" => {
                 if let Some(sent) = t.spec["ack"].as_str().filter(|a| !a.is_empty()) {
@@ -2080,6 +2596,8 @@ impl Engine {
             }
         }
         let branch = t.worktree.as_ref().and_then(|w| w["branch"].as_str()).map(str::to_string);
+        let sop = t.spec["sop"].as_str().and_then(|id| c.find_sop(id)).filter(|s| s.enabled);
+        let memories = self.store.memories_for_task(&c.id, &t.host, &t.workspace).unwrap_or_default();
         let env = prompt::TaskEnv {
             mode: &mode,
             host: &t.host,
@@ -2087,6 +2605,8 @@ impl Engine {
             workspace: &t.workspace,
             branch: branch.as_deref(),
             plugin: t.is_plugin(),
+            sop,
+            memories: &memories,
         };
         let task_prompt = prompt::task_prompt_for(c, Some(&env));
         let want_cu = task_uses_computer(&t);
@@ -2144,6 +2664,8 @@ impl Engine {
     async fn park_desktop_unavailable(&self, c: &BotConfig, mut t: TaskRow, cwd: String) -> Result<String> {
         let mode = t.mode().to_string();
         let branch = t.worktree.as_ref().and_then(|w| w["branch"].as_str()).map(str::to_string);
+        let sop = t.spec["sop"].as_str().and_then(|id| c.find_sop(id)).filter(|s| s.enabled);
+        let memories = self.store.memories_for_task(&c.id, &t.host, &t.workspace).unwrap_or_default();
         let env = prompt::TaskEnv {
             mode: &mode,
             host: &t.host,
@@ -2151,6 +2673,8 @@ impl Engine {
             workspace: &t.workspace,
             branch: branch.as_deref(),
             plugin: t.is_plugin(),
+            sop,
+            memories: &memories,
         };
         let info = self
             .rpc(
@@ -2355,10 +2879,17 @@ impl Engine {
         gone
     }
 
-    /// Deletes an ended task's session; the task row stays with its title, result and events
+    /// Deletes an ended task's session (and any superseded prior-phase sessions); the task row stays with its title, result and events
     async fn clean_task(&self, t: &mut TaskRow) {
         if let Some(sid) = t.session_id.take() {
             let _ = self.rpc(&t.host, "session.delete", json!({"sessionId": sid})).await;
+        }
+        if let Some(priors) = t.spec["priorSessions"].as_array() {
+            for p in priors {
+                if let Some(psid) = p["sessionId"].as_str().filter(|s| !s.is_empty()) {
+                    let _ = self.rpc(&t.host, "session.delete", json!({"sessionId": psid})).await;
+                }
+            }
         }
         t.cleaned_at = Some(now_ms());
         let _ = self.store.save_task(t);
@@ -2411,6 +2942,15 @@ impl Engine {
                     if let Some(sid) = &t.session_id {
                         if deleted.insert((t.host.clone(), sid.clone())) {
                             let _ = hub.host_rpc(&t.host, "session.delete", json!({"sessionId": sid})).await;
+                        }
+                    }
+                    if let Some(priors) = t.spec["priorSessions"].as_array() {
+                        for p in priors {
+                            if let Some(psid) = p["sessionId"].as_str().filter(|s| !s.is_empty()) {
+                                if deleted.insert((t.host.clone(), psid.to_string())) {
+                                    let _ = hub.host_rpc(&t.host, "session.delete", json!({"sessionId": psid})).await;
+                                }
+                            }
                         }
                     }
                 }
@@ -2515,7 +3055,16 @@ impl Engine {
                 continue;
             }
             let text = card(&e, self.explicit(c, &e), &self.instance_label(&e.instance_id));
-            self.push_item(&c.id, Inbox { text, events: vec![e.id.clone()], wake: true, owner: false, run: None });
+            self.push_item(&c.id, Inbox {
+                text,
+                events: vec![e.id.clone()],
+                wake: true,
+                owner: false,
+                trust: TurnTrust::External,
+                workspaces: vec![],
+                reviewing: vec![],
+                run: None,
+            });
         }
         self.changed();
     }
@@ -2530,7 +3079,12 @@ impl Engine {
             "bots.hosts" => self.hub()?.call("hosts.list", json!({})).await?,
             "bots.get" => {
                 let b = self.store.bot(&s("id")?)?;
-                json!({"bot": b, "prompts": self.store.prompts(&b.config.id)?, "preview": self.bot_prompt(&b.config)})
+                json!({
+                    "bot": b,
+                    "prompts": self.store.prompts(&b.config.id)?,
+                    "memories": self.store.memories(&b.config.id, None)?,
+                    "preview": self.bot_prompt(&b.config),
+                })
             }
             "bots.defaults" => json!({
                 "shared": prompt::SHARED, "bot": prompt::BOT, "task": prompt::TASK, "dispatch": prompt::DISPATCH,
@@ -2567,6 +3121,15 @@ impl Engine {
                 let r = self.store.prompts(&id)?.into_iter().find(|p| p.revision == rev).ok_or_else(|| anyhow!("没有第 {rev} 版提示词"))?;
                 let mut c = self.store.bot(&id)?.config;
                 c.prompt = r.sections;
+                c.sops = r.sops;
+                // Clear dangling routine -> SOP links when restoring an older revision without that SOP
+                for rt in &mut c.routines {
+                    if let Some(sid) = rt.sop_id.as_deref() {
+                        if !c.sops.iter().any(|s| s.id == sid) {
+                            rt.sop_id = None;
+                        }
+                    }
+                }
                 serde_json::to_value(self.save(c, "restore").await?)?
             }
             "bots.create" => {
@@ -2589,7 +3152,7 @@ impl Engine {
                 }))?;
                 let saved = self.save_with(c, "create", false).await?;
                 let sr = self.ensure_session(&saved.id).await?;
-                self.push_item(&saved.id, Inbox { text: role, events: vec![], wake: true, owner: true, run: None });
+                self.push_item(&saved.id, Inbox::note(role, true, TurnTrust::Owner));
                 json!({"botId": saved.id, "host": sr.host, "sessionId": sr.session_id})
             }
             "bots.confirmChange" => {
@@ -2664,7 +3227,7 @@ impl Engine {
                 self.bots.lock().unwrap().entry(bot_id.clone()).or_default().secret_requests.retain(|r| r.instance_id != iid);
                 let state = if complete { "it is enabled now" } else { "it still misses other settings and stays disabled" };
                 let text = format!("<owner event=\"secret-filled\" name=\"{}\">The owner entered {} for the plugin configuration \"{name}\" ({iid}); {state}. You never see the values.</owner>", attr(&name), filled.join(", "));
-                self.push_item(&bot_id, Inbox { text, events: vec![], wake: true, owner: true, run: None });
+                self.push_item(&bot_id, Inbox::note(text, true, TurnTrust::Owner));
                 self.changed();
                 json!({"enabled": complete})
             }
@@ -2702,6 +3265,50 @@ impl Engine {
                 v
             }
             "bots.prompts" => json!(self.store.prompts(&s("id")?)?),
+            "bots.memories" => {
+                let id = s("id")?;
+                let scope = a["scope"].as_str();
+                json!(self.store.memories(&id, scope)?)
+            }
+            "bots.saveMemory" => {
+                let bot_id = s("botId")?;
+                let b = self.store.bot(&bot_id)?;
+                let scope = resolve_memory_scope(&b.config, &a["scope"])?;
+                let saved = self.store.save_memory(&bot_id, a["id"].as_str(), &scope, &s("content")?, "owner", now_ms())?;
+                self.push_trusted(
+                    &bot_id,
+                    format!(
+                        "<owner event=\"memory-updated\" summary=\"{}\">The owner saved a memory [{}] ({}): {}</owner>",
+                        attr(&truncate(&saved.content, 120)),
+                        saved.id,
+                        if saved.scope.is_empty() { "global" } else { &saved.scope },
+                        saved.content
+                    ),
+                    false,
+                    TurnTrust::Owner,
+                );
+                json!(saved)
+            }
+            "bots.deleteMemory" => {
+                let bot_id = s("botId")?;
+                let mid = s("id")?;
+                let old = self.store.memory(&mid).ok().filter(|m| m.bot_id == bot_id);
+                if self.store.delete_memory(&bot_id, &mid)? {
+                    let detail = old.map(|m| m.content).unwrap_or_else(|| mid.clone());
+                    self.push_trusted(
+                        &bot_id,
+                        format!(
+                            "<owner event=\"memory-updated\" summary=\"{}\">The owner deleted memory [{}]: {}</owner>",
+                            attr(&truncate(&detail, 120)),
+                            mid,
+                            detail
+                        ),
+                        false,
+                        TurnTrust::Owner,
+                    );
+                }
+                Value::Null
+            }
             "bots.saveNotes" => {
                 self.store.set_notes(&s("id")?, &s("notes")?)?;
                 Value::Null
@@ -2750,6 +3357,78 @@ impl Engine {
                     format!("<owner event=\"task-continued\" summary=\"{}\">The owner handled what task \"{}\" ({}) was waiting for and resumed it.</owner>", attr(&t.title), t.title, t.id),
                     false,
                 );
+                Value::Null
+            }
+            "tasks.answer" => {
+                let mut t = self.store.task(&s("id")?)?;
+                if t.state != "needsYou" {
+                    bail!("只有等待你拍板的任务才能提交回答");
+                }
+                if t.manual {
+                    bail!("你已手动接管这个任务，直接在任务会话里回复即可");
+                }
+                let pending_brief = t.spec["pendingBrief"].as_bool().unwrap_or(false);
+                if pending_brief {
+                    // Desktop-locked tasks wait for unlock + initial brief rather than a text decision
+                    self.send_to_task(&mut t, String::new()).await?;
+                    self.push(
+                        &t.bot_id,
+                        format!("<owner event=\"task-continued\" summary=\"{}\">The owner unlocked the host desktop and resumed task \"{}\" ({}).</owner>", attr(&t.title), t.title, t.id),
+                        false,
+                    );
+                    return Ok(Value::Null);
+                }
+                let answer = a["answer"].as_str().map(str::trim).unwrap_or("").to_string();
+                if answer.is_empty() {
+                    bail!("请先选择方案或输入回答");
+                }
+                if t.last_report.as_ref().and_then(|r| r["answered"].as_str()).is_some_and(|x| !x.is_empty()) {
+                    bail!("这条提问已经提交过回答，正在处理中");
+                }
+                let summary_attr = attr(&truncate(&answer, 120));
+                if t.mode() == "repo" {
+                    // Case B: a read-only repo task may need the Bot to upgrade it in place to worktree,
+                    // continue read-only inspection, or close the task
+                    let bot = self.store.bot(&t.bot_id)?;
+                    if !bot.config.enabled {
+                        bail!("Bot 已暂停，请先启用 Bot 再提交拍板决策");
+                    }
+                    // Mark answered immediately so the UI hides the decision card and rejects duplicate clicks
+                    if let Some(r) = t.last_report.as_mut().and_then(Value::as_object_mut) {
+                        r.insert("answered".into(), json!(answer));
+                    } else {
+                        t.last_report = Some(json!({"state": "blocked", "answered": answer, "at": now_ms()}));
+                    }
+                    self.store.save_task(&t)?;
+                    self.store.resolve_attention(None, Some(&t.id), now_ms())?;
+                    self.push_trusted(
+                        &t.bot_id,
+                        format!(
+                            "<owner event=\"task-answered\" task=\"{}\" summary=\"{summary_attr}\">The owner answered task \"{}\" ({}, mode: repo): {answer}\n\
+                             If code edits are now confirmed, call send_task(task_id: \"{}\", mode: \"worktree\", text: \"...\") to upgrade this same task in place; \
+                             if only read-only follow-up is needed, call send_task without mode; if nothing more is needed, call close_task.</owner>",
+                            t.id, t.title, t.id, t.id
+                        ),
+                        true,
+                        TurnTrust::Review,
+                    );
+                } else {
+                    // Case A: worktree or scratch task resumes directly with the owner's answer
+                    self.send_to_task(
+                        &mut t,
+                        format!("<owner event=\"task-answered\" summary=\"{summary_attr}\">The owner answered your question: {answer}</owner>"),
+                    )
+                    .await?;
+                    self.push_trusted(
+                        &t.bot_id,
+                        format!(
+                            "<owner event=\"task-answered\" task=\"{}\" summary=\"{summary_attr}\">The owner answered task \"{}\" ({}): {answer}</owner>",
+                            t.id, t.title, t.id
+                        ),
+                        false,
+                        TurnTrust::Review,
+                    );
+                }
                 Value::Null
             }
             "tasks.manual" | "tasks.handBack" => {
@@ -2869,7 +3548,11 @@ impl Engine {
                     json!(blocking(move || inst.call_tool(&name, &input)).await??)
                 }
             }
-            "plugins.outbox" => json!(self.store.outbox(a["instanceId"].as_str(), a["limit"].as_u64().unwrap_or(50).min(500) as usize)?),
+            "plugins.outbox" => json!(self.store.outbox(
+                a["instanceId"].as_str(),
+                a["botId"].as_str(),
+                a["limit"].as_u64().unwrap_or(50).min(500) as usize
+            )?),
             "plugins.instances" => self.instances_view()?,
             "plugins.saveInstance" => {
                 let i: Instance = serde_json::from_value(a["instance"].clone()).map_err(|e| anyhow!("插件配置无效: {e}"))?;
@@ -2887,7 +3570,7 @@ impl Engine {
         };
         // Reads must not announce a change: the frontend refetches `bots.list` on `bots.changed`
         const READS: &[&str] = &[
-            "bots.list", "bots.hosts", "bots.get", "bots.defaults", "bots.preview", "bots.events", "bots.stats", "bots.prompts", "bots.routineRuns", "bots.approvals", "plugins.staged", "tasks.list", "tasks.events", "plugins.list",
+            "bots.list", "bots.hosts", "bots.get", "bots.defaults", "bots.preview", "bots.events", "bots.stats", "bots.prompts", "bots.memories", "bots.routineRuns", "bots.approvals", "plugins.staged", "tasks.list", "tasks.events", "plugins.list",
             "plugins.instances", "plugins.inspect", "plugins.outbox", "plugins.tools", "plugins.callTool",
         ];
         if !READS.contains(&cmd) {
@@ -3012,10 +3695,10 @@ impl Engine {
         } else {
             Some(self.store.bot(&c.id)?)
         };
-        let prompt_changed = old.as_ref().map_or(true, |o| o.config.prompt != c.prompt);
+        let prompt_changed = old.as_ref().map_or(true, |o| o.config.prompt != c.prompt || o.config.sops != c.sops);
         if prompt_changed {
             let base = old.as_ref().map(|o| o.config.prompt_revision).unwrap_or(0);
-            c.prompt_revision = self.store.add_prompt(&c.id, base, &c.prompt, origin, now_ms())?;
+            c.prompt_revision = self.store.add_prompt(&c.id, base, &c.prompt, &c.sops, origin, now_ms())?;
         }
         let now = now_ms();
         self.store.save_bot(&c, now)?;
@@ -3212,8 +3895,73 @@ fn host_supports_computer_use(os: Option<&str>, arch: Option<&str>) -> Option<bo
 fn task_view(t: &TaskRow) -> Value {
     json!({
         "taskId": t.id, "title": t.title, "mode": t.mode(), "state": t.state, "host": t.host, "sessionId": t.session_id,
-        "cwd": t.cwd, "computerUse": task_uses_computer(t), "lastReport": t.last_report, "manual": t.manual, "createdAt": t.created_at,
+        "cwd": t.cwd, "computerUse": task_uses_computer(t), "sop": t.spec.get("sop"), "sopName": t.spec.get("sopName"),
+        "reviewCount": t.spec["reviewCount"].as_u64().unwrap_or(0),
+        "priorSessions": t.spec.get("priorSessions"),
+        "lastReport": t.last_report, "manual": t.manual, "createdAt": t.created_at,
     })
+}
+
+/// Normalize a memory `scope` argument: empty/null -> `""` (global), otherwise resolve against configured workspaces
+/// to canonical `"<host>:<cwd>"` so typos and cross-host basename collisions never silently misfile memories.
+fn resolve_memory_scope(c: &BotConfig, v: &Value) -> Result<String> {
+    if v.is_null() {
+        return Ok(String::new());
+    }
+    if let Some(s) = v.as_str() {
+        if s.trim().is_empty() {
+            return Ok(String::new());
+        }
+    }
+    if let Some(w) = c.find_workspace(v) {
+        return Ok(BotConfig::workspace_key(&w.host, &w.cwd));
+    }
+    if c.workspaces.is_empty() {
+        bail!("No workspaces are configured; omit `scope` or pass \"\" for a global memory.");
+    }
+    let avail: Vec<String> = c
+        .workspaces
+        .iter()
+        .enumerate()
+        .map(|(i, w)| {
+            if w.name.is_empty() {
+                format!("[{i}] {}:{}", w.host, w.cwd)
+            } else {
+                format!("[{i}] {} ({}:{})", w.name, w.host, w.cwd)
+            }
+        })
+        .collect();
+    bail!("Unknown memory scope {v}; pass \"\" for global, or one of the configured workspaces: {}.", avail.join(", "));
+}
+
+/// Rich phase-1 summary & owner decision context injected into phase-2 worktree sessions during an in-place upgrade
+fn phase1_handoff_text(t: &TaskRow) -> String {
+    let mut parts = vec![];
+    if let Some(r) = &t.last_report {
+        if let Some(sum) = r["summary"].as_str().map(str::trim).filter(|s| !s.is_empty()) {
+            parts.push(format!("Summary:\n{sum}"));
+        }
+        if let Some(det) = r["details"].as_str().map(str::trim).filter(|s| !s.is_empty()) {
+            parts.push(format!("Findings & details:\n{det}"));
+        }
+        if let Some(q) = r["question"].as_str().map(str::trim).filter(|s| !s.is_empty()) {
+            parts.push(format!("Question asked:\n{q}"));
+        }
+        if let Some(opts) = r["options"].as_array().filter(|o| !o.is_empty()) {
+            let lines: Vec<String> = opts.iter().filter_map(|v| v.as_str()).map(|o| format!("- {o}")).collect();
+            if !lines.is_empty() {
+                parts.push(format!("Options presented:\n{}", lines.join("\n")));
+            }
+        }
+        if let Some(ans) = r["answered"].as_str().map(str::trim).filter(|s| !s.is_empty()) {
+            parts.push(format!("Owner's decision:\n{ans}"));
+        }
+    }
+    if parts.is_empty() {
+        "Phase 1 (read-only repo inspection) completed.".into()
+    } else {
+        parts.join("\n\n")
+    }
 }
 
 /// Where plugin_kit writes: `dir` as given when absolute, else relative to the task's directory
@@ -3700,7 +4448,13 @@ impl Engine {
     }
 }
 
+/// Minimum trust level among waking items in a delivered batch (or External if empty)
+fn batch_trust_of(items: &[Inbox]) -> TurnTrust {
+    items.iter().filter(|i| i.wake).map(|i| i.trust).min().unwrap_or(TurnTrust::External)
+}
+
 /// Whether the items waiting in an inbox are all the owner's own words
+#[cfg(test)]
 fn items_are_owner(items: &[Inbox]) -> bool {
     !items.is_empty() && items.iter().filter(|i| i.wake).all(|i| i.owner)
 }
@@ -3953,10 +4707,12 @@ mod tests {
         assert_eq!(default_name("修 bug。\n其余不管"), "修 bug");
         assert_eq!(default_name("Triage issues"), "Triage issues");
         assert_eq!(default_name("\n  "), "Bot");
-        let item = |wake, owner| Inbox { text: String::new(), events: vec![], wake, owner, run: None };
+        let item = |wake, owner| Inbox::note(String::new(), wake, if owner { TurnTrust::Owner } else { TurnTrust::External });
         assert!(items_are_owner(&[item(true, true), item(false, false)]));
         assert!(!items_are_owner(&[item(true, true), item(true, false)]));
         assert!(!items_are_owner(&[]));
+        assert_eq!(batch_trust_of(&[item(true, true), item(true, false)]), TurnTrust::External);
+        assert_eq!(batch_trust_of(&[Inbox::note(String::new(), true, TurnTrust::Review)]), TurnTrust::Review);
     }
 
     #[test]
@@ -4123,6 +4879,206 @@ mod tests {
         assert!(engine.store.bots().unwrap().is_empty());
         assert!(engine.store.bot_tasks("b1").unwrap().is_empty());
         assert!(!engine.task_busy.lock().unwrap().contains_key("t1"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn memory_tools_enforce_turn_trust_and_derive_source() {
+        let dir = std::env::temp_dir().join(format!("yi-bots-mem-{}", short_id("t")));
+        let _ = std::fs::create_dir_all(&dir);
+        let store = Store::open(&dir.join("bots.db")).unwrap();
+        let engine = Engine::for_tests(store);
+        let mut c: BotConfig = serde_json::from_value(json!({
+            "id": "b1",
+            "name": "Helper",
+            "enabled": true,
+            "bot": {"host": "local", "tool": "claude"},
+            "workspaces": [
+                {"host": "local", "cwd": "/git/app", "name": "app"},
+                {"host": "mac", "cwd": "/Users/me/ios", "name": "ios"}
+            ]
+        }))
+        .unwrap();
+        c.normalize();
+        engine.store.save_bot(&c, 1).unwrap();
+        let row = engine.store.bot("b1").unwrap();
+
+        // Owner turn: can save global and workspace memories, source is engine-derived "owner"
+        let g = engine.bot_tool(&row, "memory_save", json!({"content": "Keep replies brief"})).await.unwrap();
+        assert_eq!(g["source"], "owner");
+        assert_eq!(g["scope"], "");
+        let w = engine.bot_tool(&row, "memory_save", json!({"scope": "app", "content": "Build via ssh win"})).await.unwrap();
+        assert_eq!(w["scope"], "local:/git/app");
+        assert_eq!(w["source"], "owner");
+        // Unknown workspace scope is rejected
+        assert!(engine.bot_tool(&row, "memory_save", json!({"scope": "typo-repo", "content": "x"})).await.is_err());
+
+        // External event turn: memory_save & memory_delete are blocked by code
+        {
+            let mut bots = engine.bots.lock().unwrap();
+            bots.entry("b1".into()).or_default().turn_trust = TurnTrust::External;
+        }
+        assert!(engine.bot_tool(&row, "memory_save", json!({"content": "evil global rule"})).await.is_err());
+        assert!(engine.bot_tool(&row, "memory_delete", json!({"id": g["id"]})).await.is_err());
+
+        // TaskReport turn: can only write for turn_workspaces, never global, never delete owner memories
+        {
+            let mut bots = engine.bots.lock().unwrap();
+            let rt = bots.entry("b1".into()).or_default();
+            rt.turn_trust = TurnTrust::TaskReport;
+            rt.turn_workspaces = HashSet::from(["local:/git/app".to_string()]);
+        }
+        assert!(engine.bot_tool(&row, "memory_save", json!({"scope": "", "content": "sneaky global"})).await.is_err());
+        assert!(engine.bot_tool(&row, "memory_save", json!({"scope": "ios", "content": "wrong repo"})).await.is_err());
+        let t_mem = engine.bot_tool(&row, "memory_save", json!({"scope": "app", "content": "Mock clock in login test"})).await.unwrap();
+        assert_eq!(t_mem["source"], "task");
+        assert!(engine.bot_tool(&row, "memory_delete", json!({"id": w["id"]})).await.is_err()); // owner-authored
+        assert!(engine.bot_tool(&row, "memory_delete", json!({"id": t_mem["id"]})).await.is_ok());
+
+        // Review turn (owner approval edit): can save global memory with source = "review"
+        {
+            let mut bots = engine.bots.lock().unwrap();
+            bots.entry("b1".into()).or_default().turn_trust = TurnTrust::Review;
+        }
+        let r_mem = engine.bot_tool(&row, "memory_save", json!({"content": "No filler greetings"})).await.unwrap();
+        assert_eq!(r_mem["source"], "review");
+        assert_eq!(engine.command("bots.memories", json!({"id": "b1"})).await.unwrap().as_array().unwrap().len(), 3);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn sop_pre_review_buffers_ready_caps_rejections_and_promotes() {
+        let dir = std::env::temp_dir().join(format!("yi-bots-rev-{}", short_id("t")));
+        let _ = std::fs::create_dir_all(&dir);
+        let store = Store::open(&dir.join("bots.db")).unwrap();
+        let engine = Engine::for_tests(store);
+        let mut c: BotConfig = serde_json::from_value(json!({
+            "id": "b1",
+            "name": "Helper",
+            "enabled": true,
+            "bot": {"host": "local", "tool": "claude"},
+            "workspaces": [{"host": "local", "cwd": "/git/app", "name": "app"}],
+            "sops": [{
+                "id": "s1",
+                "name": "Fix Bug",
+                "when": "bug",
+                "how": "repo then worktree",
+                "askHuman": "after root cause",
+                "delivery": "must run unit tests and i18n:check"
+            }]
+        }))
+        .unwrap();
+        c.normalize();
+        engine.store.save_bot(&c, 1).unwrap();
+        engine
+            .store
+            .save_task(&TaskRow {
+                id: "t1".into(),
+                bot_id: "b1".into(),
+                host: "local".into(),
+                session_id: Some("s-t1".into()),
+                state: "working".into(),
+                title: "Fix login".into(),
+                workspace: "/git/app".into(),
+                cwd: "/wt/t1".into(),
+                spec: json!({"mode": "worktree", "sop": "s1", "sopName": "Fix Bug", "reviewCount": 0}),
+                created_at: 1,
+                ..Default::default()
+            })
+            .unwrap();
+
+        // First ready report enters `reviewing` silently (zero attention items!)
+        engine.task_tool("t1", "report", json!({"state": "ready", "summary": "Fixed code", "learned": "Mock clock"})).await.unwrap();
+        let t = engine.store.task("t1").unwrap();
+        assert_eq!(t.state, "reviewing");
+        assert!(engine.store.attention(Some("b1")).unwrap().is_empty());
+        assert_eq!(t.last_report.as_ref().unwrap()["learned"], "Mock clock");
+
+        // Bot calls accept_ready -> promotes to ready and creates attention item
+        let row = engine.store.bot("b1").unwrap();
+        engine.bot_tool(&row, "accept_ready", json!({"task_id": "t1", "notify": true, "summary": "Checks green"})).await.unwrap();
+        assert_eq!(engine.store.task("t1").unwrap().state, "ready");
+        assert_eq!(engine.store.attention(Some("b1")).unwrap().len(), 1);
+
+        // Once reviewCount reaches MAX_SOP_REVIEWS, next ready escalates directly to ready
+        let mut t = engine.store.task("t1").unwrap();
+        t.state = "working".into();
+        t.spec["reviewCount"] = json!(MAX_SOP_REVIEWS);
+        engine.store.save_task(&t).unwrap();
+        engine.task_tool("t1", "report", json!({"state": "ready", "summary": "Still trying"})).await.unwrap();
+        assert_eq!(engine.store.task("t1").unwrap().state, "ready");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn prompt_restore_clears_dangling_routine_sop_and_tasks_answer_guards_duplicates() {
+        let dir = std::env::temp_dir().join(format!("yi-bots-ans-{}", short_id("t")));
+        let _ = std::fs::create_dir_all(&dir);
+        let store = Store::open(&dir.join("bots.db")).unwrap();
+        let engine = Engine::for_tests(store);
+        let mut c: BotConfig = serde_json::from_value(json!({
+            "id": "",
+            "name": "Helper",
+            "enabled": true,
+            "bot": {"host": "local", "tool": "claude"},
+            "prompt": {"role": "v1"},
+            "sops": []
+        }))
+        .unwrap();
+        c.normalize();
+        // Save v1 (no SOPs), then v2 (adds s1 + routine linked to s1)
+        let saved1 = engine.save_with(c, "create", false).await.unwrap();
+        let bid = saved1.id.clone();
+        assert_eq!(saved1.prompt_revision, 1);
+        let mut c2 = saved1.clone();
+        c2.sops = vec![crate::config::Sop { id: "s1".into(), name: "Daily".into(), when: "9am".into(), how: "check".into(), ask_human: String::new(), delivery: String::new(), enabled: true }];
+        c2.routines = vec![Routine { id: "r1".into(), name: "Morning".into(), schedule: "0 9 * * *".into(), prompt: "run".into(), sop_id: Some("s1".into()), enabled: true }];
+        let saved2 = engine.save_with(c2, "bot", false).await.unwrap();
+        assert_eq!(saved2.prompt_revision, 2);
+
+        // Restoring v1 succeeds by clearing the dangling routine.sop_id instead of failing validate()
+        let restored: BotConfig = serde_json::from_value(
+            engine.command("bots.promptRestore", json!({"id": bid, "revision": 1})).await.unwrap(),
+        )
+        .unwrap();
+        assert!(restored.sops.is_empty());
+        assert!(restored.routines[0].sop_id.is_none());
+
+        // tasks.answer Case B (repo mode): marks answered immediately & rejects duplicate clicks
+        engine
+            .store
+            .save_task(&TaskRow {
+                id: "t-repo".into(),
+                bot_id: bid.clone(),
+                host: "local".into(),
+                session_id: Some("s-repo".into()),
+                state: "needsYou".into(),
+                title: "Investigate".into(),
+                workspace: "/repo".into(),
+                cwd: "/repo".into(),
+                spec: json!({"mode": "repo"}),
+                last_report: Some(json!({
+                    "state": "blocked",
+                    "summary": "Found token race",
+                    "details": "app/src/transport.ts:42 lacks single-flight lock",
+                    "question": "Pick approach?",
+                    "options": ["Plan A (recommended)", "Plan B"]
+                })),
+                created_at: 1,
+                ..Default::default()
+            })
+            .unwrap();
+        engine.command("tasks.answer", json!({"id": "t-repo", "answer": "Plan A (recommended)"})).await.unwrap();
+        let t = engine.store.task("t-repo").unwrap();
+        assert_eq!(t.last_report.as_ref().unwrap()["answered"], "Plan A (recommended)");
+        // Phase-1 handoff text includes summary, details, options and owner's decision
+        let handoff = phase1_handoff_text(&t);
+        assert!(handoff.contains("Found token race") && handoff.contains("transport.ts:42") && handoff.contains("Plan A (recommended)"));
+        // Duplicate click is rejected immediately
+        assert!(engine.command("tasks.answer", json!({"id": "t-repo", "answer": "Plan B"})).await.is_err());
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

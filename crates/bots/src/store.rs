@@ -1,7 +1,7 @@
 //! Local database of the desktop app's Bots (`<app data>/bots.db`).
 
-use crate::config::{BotConfig, PromptSections};
-use anyhow::{anyhow, Result};
+use crate::config::{BotConfig, PromptSections, Sop};
+use anyhow::{anyhow, bail, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -36,10 +36,40 @@ pub struct PromptRevision {
     pub revision: u32,
     pub base_revision: u32,
     pub sections: PromptSections,
-    /// form / ai / bot
+    #[serde(default)]
+    pub sops: Vec<Sop>,
+    /// form / ai / bot / create / restore
     pub origin: String,
     pub at: i64,
 }
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PromptSnapshot {
+    #[serde(flatten)]
+    sections: PromptSections,
+    #[serde(default)]
+    sops: Vec<Sop>,
+}
+
+/// Durable memory entry scoped either globally (`scope == ""`) or to a canonical workspace (`"<host>:<cwd>"`)
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryRow {
+    pub id: String,
+    pub bot_id: String,
+    #[serde(default)]
+    pub scope: String,
+    pub content: String,
+    /// Derived by the engine only: owner / review / task / bot
+    #[serde(default)]
+    pub source: String,
+    pub updated_at: i64,
+}
+
+pub const MEMORY_MAX_TOTAL: usize = 80;
+pub const MEMORY_MAX_SCOPE: usize = 40;
+pub const MEMORY_MAX_CHARS: usize = 300;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -129,7 +159,7 @@ pub struct TaskRow {
 
 impl TaskRow {
     pub fn active(&self) -> bool {
-        matches!(self.state.as_str(), "queued" | "working" | "needsYou")
+        matches!(self.state.as_str(), "queued" | "working" | "needsYou" | "reviewing")
     }
 
     /// A `kind: plugin` task (`spawn_task`): builds a Yi Console plugin in a scratch directory
@@ -229,6 +259,9 @@ pub struct ApprovalRow {
     /// reply: the text to send; tool: what the call does, in the Bot's words
     #[serde(default)]
     pub text: String,
+    /// Original drafted text before the owner edited it (set only when edited on approval)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_text: Option<String>,
     #[serde(default)]
     pub tool: Option<String>,
     #[serde(default)]
@@ -292,7 +325,11 @@ impl Store {
              CREATE TABLE IF NOT EXISTS approvals (
                  id TEXT PRIMARY KEY, bot_id TEXT NOT NULL, state TEXT NOT NULL, created_at INTEGER NOT NULL,
                  data TEXT NOT NULL);
-             CREATE INDEX IF NOT EXISTS approvals_state ON approvals (state, created_at);",
+             CREATE INDEX IF NOT EXISTS approvals_state ON approvals (state, created_at);
+             CREATE TABLE IF NOT EXISTS bot_memories (
+                 id TEXT PRIMARY KEY, bot_id TEXT NOT NULL, scope TEXT NOT NULL DEFAULT '',
+                 content TEXT NOT NULL, source TEXT NOT NULL DEFAULT 'bot', updated_at INTEGER NOT NULL);
+             CREATE INDEX IF NOT EXISTS bot_memories_bot ON bot_memories (bot_id, scope);",
         )?;
         Ok(Store { db: Mutex::new(db) })
     }
@@ -349,6 +386,7 @@ impl Store {
         for sql in [
             "DELETE FROM bots WHERE id = ?1",
             "DELETE FROM bot_prompts WHERE bot_id = ?1",
+            "DELETE FROM bot_memories WHERE bot_id = ?1",
             "DELETE FROM trigger_events WHERE bot_id = ?1",
             "DELETE FROM tasks WHERE bot_id = ?1",
             "DELETE FROM attention WHERE bot_id = ?1",
@@ -365,14 +403,15 @@ impl Store {
 
     // ---------- prompts ----------
 
-    /// Store a new prompt revision; returns its number
-    pub fn add_prompt(&self, bot_id: &str, base: u32, sections: &PromptSections, origin: &str, now: i64) -> Result<u32> {
+    /// Store a new prompt (and SOP) revision; returns its number
+    pub fn add_prompt(&self, bot_id: &str, base: u32, sections: &PromptSections, sops: &[Sop], origin: &str, now: i64) -> Result<u32> {
         let db = self.db.lock().unwrap();
         let last: u32 = db
             .query_row("SELECT COALESCE(MAX(revision), 0) FROM bot_prompts WHERE bot_id = ?1", params![bot_id], |r| r.get(0))?;
+        let snap = PromptSnapshot { sections: sections.clone(), sops: sops.to_vec() };
         db.execute(
             "INSERT INTO bot_prompts (bot_id, revision, base_revision, sections, origin, at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![bot_id, last + 1, base, serde_json::to_string(sections)?, origin, now],
+            params![bot_id, last + 1, base, serde_json::to_string(&snap)?, origin, now],
         )?;
         Ok(last + 1)
     }
@@ -387,11 +426,13 @@ impl Store {
         })?;
         let mut out = vec![];
         for row in rows {
-            let (revision, base_revision, sections, origin, at) = row?;
+            let (revision, base_revision, raw, origin, at) = row?;
+            let snap: PromptSnapshot = serde_json::from_str(&raw).unwrap_or_default();
             out.push(PromptRevision {
                 revision,
                 base_revision,
-                sections: serde_json::from_str(&sections).unwrap_or_default(),
+                sections: snap.sections,
+                sops: snap.sops,
                 origin,
                 at,
             });
@@ -568,7 +609,7 @@ impl Store {
     pub fn active_tasks(&self) -> Result<Vec<TaskRow>> {
         let db = self.db.lock().unwrap();
         let mut st = db.prepare(
-            "SELECT data FROM tasks WHERE state IN ('queued', 'working', 'needsYou') ORDER BY created_at",
+            "SELECT data FROM tasks WHERE state IN ('queued', 'working', 'needsYou', 'reviewing') ORDER BY created_at",
         )?;
         let rows = st.query_map([], |r| r.get::<_, String>(0))?;
         let mut out = vec![];
@@ -645,11 +686,16 @@ impl Store {
         Ok(rows.filter_map(|r| r.ok()).filter_map(|d| serde_json::from_str(&d).ok()).collect())
     }
 
-    /// Newest first, for the plugins page
-    pub fn outbox(&self, instance_id: Option<&str>, limit: usize) -> Result<Vec<OutboxRow>> {
+    /// Newest first, for the plugins page and Bot details outbox panel
+    pub fn outbox(&self, instance_id: Option<&str>, bot_id: Option<&str>, limit: usize) -> Result<Vec<OutboxRow>> {
         let db = self.db.lock().unwrap();
-        let mut st = db.prepare("SELECT data FROM outbox WHERE ?1 IS NULL OR instance_id = ?1 ORDER BY created_at DESC LIMIT ?2")?;
-        let rows = st.query_map(params![instance_id, limit as i64], |r| r.get::<_, String>(0))?;
+        let mut st = db.prepare(
+            "SELECT data FROM outbox
+             WHERE (?1 IS NULL OR instance_id = ?1)
+               AND (?2 IS NULL OR json_extract(data, '$.botId') = ?2)
+             ORDER BY created_at DESC LIMIT ?3",
+        )?;
+        let rows = st.query_map(params![instance_id, bot_id, limit as i64], |r| r.get::<_, String>(0))?;
         Ok(rows.filter_map(|r| r.ok()).filter_map(|d| serde_json::from_str(&d).ok()).collect())
     }
 
@@ -783,6 +829,171 @@ impl Store {
         let rows = st.query_map(params![bot_id, state, limit as i64], |r| r.get::<_, String>(0))?;
         Ok(rows.filter_map(|r| r.ok().and_then(|d| serde_json::from_str(&d).ok())).collect())
     }
+
+    // ---------- memories ----------
+
+    /// All memories of a Bot (optionally filtered to one exact scope: "" for global or "<host>:<cwd>"), newest first
+    pub fn memories(&self, bot_id: &str, scope: Option<&str>) -> Result<Vec<MemoryRow>> {
+        let db = self.db.lock().unwrap();
+        let mut st = db.prepare(
+            "SELECT id, bot_id, scope, content, source, updated_at FROM bot_memories
+             WHERE bot_id = ?1 AND (?2 IS NULL OR scope = ?2)
+             ORDER BY updated_at DESC, id ASC",
+        )?;
+        let rows = st.query_map(params![bot_id, scope], |r| {
+            Ok(MemoryRow {
+                id: r.get(0)?,
+                bot_id: r.get(1)?,
+                scope: r.get(2)?,
+                content: r.get(3)?,
+                source: r.get(4)?,
+                updated_at: r.get(5)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn memory(&self, id: &str) -> Result<MemoryRow> {
+        self.db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT id, bot_id, scope, content, source, updated_at FROM bot_memories WHERE id = ?1",
+                params![id],
+                |r| {
+                    Ok(MemoryRow {
+                        id: r.get(0)?,
+                        bot_id: r.get(1)?,
+                        scope: r.get(2)?,
+                        content: r.get(3)?,
+                        source: r.get(4)?,
+                        updated_at: r.get(5)?,
+                    })
+                },
+            )
+            .optional()?
+            .ok_or_else(|| anyhow!("记忆不存在: {id}"))
+    }
+
+    /// Global memories (`scope == ""`) plus memories matching this task's exact canonical workspace (`"<host>:<cwd>"`),
+    /// global first then workspace, newest first within each group
+    pub fn memories_for_task(&self, bot_id: &str, host: &str, workspace_cwd: &str) -> Result<Vec<MemoryRow>> {
+        let ws_key = BotConfig::workspace_key(host, workspace_cwd);
+        let db = self.db.lock().unwrap();
+        let mut st = db.prepare(
+            "SELECT id, bot_id, scope, content, source, updated_at FROM bot_memories
+             WHERE bot_id = ?1 AND (scope = '' OR (?2 != '' AND scope = ?2))
+             ORDER BY CASE WHEN scope = '' THEN 0 ELSE 1 END, updated_at DESC, id ASC",
+        )?;
+        let rows = st.query_map(params![bot_id, ws_key], |r| {
+            Ok(MemoryRow {
+                id: r.get(0)?,
+                bot_id: r.get(1)?,
+                scope: r.get(2)?,
+                content: r.get(3)?,
+                source: r.get(4)?,
+                updated_at: r.get(5)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Insert or update a Bot memory with exact-content deduplication and strict capacity guards (no silent eviction)
+    pub fn save_memory(&self, bot_id: &str, id: Option<&str>, scope: &str, content: &str, source: &str, now: i64) -> Result<MemoryRow> {
+        let content = content.trim();
+        if content.is_empty() {
+            bail!("记忆内容不能为空");
+        }
+        let content: String = if content.chars().count() > MEMORY_MAX_CHARS {
+            let mut s: String = content.chars().take(MEMORY_MAX_CHARS).collect();
+            s.push('…');
+            s
+        } else {
+            content.to_string()
+        };
+        let scope = scope.trim().to_string();
+        let db = self.db.lock().unwrap();
+
+        if let Some(id) = id.map(str::trim).filter(|s| !s.is_empty()) {
+            let existing: Option<(String, String)> = db
+                .query_row("SELECT bot_id, scope FROM bot_memories WHERE id = ?1", params![id], |r| Ok((r.get(0)?, r.get(1)?)))
+                .optional()?;
+            let Some((owner_bot, old_scope)) = existing else {
+                bail!("记忆不存在: {id}");
+            };
+            if owner_bot != bot_id {
+                bail!("记忆不存在: {id}");
+            }
+            if old_scope != scope {
+                let scope_count: i64 = db.query_row(
+                    "SELECT COUNT(*) FROM bot_memories WHERE bot_id = ?1 AND scope = ?2",
+                    params![bot_id, scope],
+                    |r| r.get(0),
+                )?;
+                if scope_count as usize >= MEMORY_MAX_SCOPE {
+                    bail!("该作用域的记忆已达上限（{MEMORY_MAX_SCOPE} 条），请先调用 memory_list 并用 memory_delete 合并清理旧记忆。");
+                }
+            }
+            db.execute(
+                "UPDATE bot_memories SET scope = ?2, content = ?3, source = ?4, updated_at = ?5 WHERE id = ?1",
+                params![id, scope, content, source, now],
+            )?;
+            return Ok(MemoryRow { id: id.to_string(), bot_id: bot_id.to_string(), scope, content, source: source.to_string(), updated_at: now });
+        }
+
+        // Exact deduplication within the same scope: keep the existing id and bump updated_at
+        let dup: Option<(String, String)> = db
+            .query_row(
+                "SELECT id, source FROM bot_memories WHERE bot_id = ?1 AND scope = ?2 AND content = ?3 LIMIT 1",
+                params![bot_id, scope, content],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        if let Some((dup_id, old_source)) = dup {
+            // Preserve higher-trust source label (owner > review > task > bot)
+            let rank = |s: &str| match s {
+                "owner" => 3,
+                "review" => 2,
+                "task" => 1,
+                _ => 0,
+            };
+            let kept_source = if rank(source) >= rank(&old_source) { source.to_string() } else { old_source };
+            db.execute(
+                "UPDATE bot_memories SET source = ?2, updated_at = ?3 WHERE id = ?1",
+                params![dup_id, kept_source, now],
+            )?;
+            return Ok(MemoryRow { id: dup_id, bot_id: bot_id.to_string(), scope, content, source: kept_source, updated_at: now });
+        }
+
+        let total: i64 = db.query_row("SELECT COUNT(*) FROM bot_memories WHERE bot_id = ?1", params![bot_id], |r| r.get(0))?;
+        if total as usize >= MEMORY_MAX_TOTAL {
+            bail!("记忆库已达上限（{MEMORY_MAX_TOTAL} 条），请先调用 memory_list 并用 memory_delete 合并或清理过时记忆后再保存。");
+        }
+        let scope_count: i64 = db.query_row(
+            "SELECT COUNT(*) FROM bot_memories WHERE bot_id = ?1 AND scope = ?2",
+            params![bot_id, scope],
+            |r| r.get(0),
+        )?;
+        if scope_count as usize >= MEMORY_MAX_SCOPE {
+            bail!("该作用域的记忆已达上限（{MEMORY_MAX_SCOPE} 条），请先调用 memory_list 并用 memory_delete 合并或清理过时记忆后再保存。");
+        }
+
+        let new_id = format!("mem_{}", &uuid::Uuid::new_v4().simple().to_string()[..10]);
+        db.execute(
+            "INSERT INTO bot_memories (id, bot_id, scope, content, source, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![new_id, bot_id, scope, content, source, now],
+        )?;
+        Ok(MemoryRow { id: new_id, bot_id: bot_id.to_string(), scope, content, source: source.to_string(), updated_at: now })
+    }
+
+    pub fn delete_memory(&self, bot_id: &str, id: &str) -> Result<bool> {
+        let n = self
+            .db
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM bot_memories WHERE id = ?1 AND bot_id = ?2", params![id, bot_id])?;
+        Ok(n > 0)
+    }
 }
 
 fn put_task(db: &Connection, t: &TaskRow) -> Result<()> {
@@ -829,8 +1040,8 @@ mod tests {
         s.save_bot(&bot("b1"), 1).unwrap();
         s.set_bot_session("b1", Some(&SessionRef { host: "local".into(), session_id: "s".into() })).unwrap();
         assert_eq!(s.bot("b1").unwrap().session.unwrap().session_id, "s");
-        assert_eq!(s.add_prompt("b1", 0, &Default::default(), "form", 1).unwrap(), 1);
-        assert_eq!(s.add_prompt("b1", 1, &Default::default(), "ai", 2).unwrap(), 2);
+        assert_eq!(s.add_prompt("b1", 0, &Default::default(), &[], "form", 1).unwrap(), 1);
+        assert_eq!(s.add_prompt("b1", 1, &Default::default(), &[], "ai", 2).unwrap(), 2);
         assert_eq!(s.prompts("b1").unwrap()[0].origin, "ai");
 
         let e = EventRow { id: "e1".into(), instance_id: "i".into(), bot_id: "b1".into(), key: "k".into(), at: 5, disposition: "queued".into(), ..Default::default() };
@@ -864,18 +1075,75 @@ mod tests {
         assert!(s.outbox_due(10).unwrap().is_empty());
         assert_eq!(s.outbox_get("k1").unwrap().state, "sent");
         s.purge_instance("i").unwrap();
-        assert!(s.outbox(None, 10).unwrap().is_empty());
+        assert!(s.outbox(None, None, 10).unwrap().is_empty());
 
         let o2 = OutboxRow { key: "k2".into(), instance_id: "i2".into(), kind: "notify".into(), bot_id: Some("b1".into()), text: "bye".into(), state: "pending".into(), next_at: 5, created_at: 2, ..Default::default() };
         assert!(s.outbox_add(&o2).unwrap());
+        assert_eq!(s.outbox(None, Some("b1"), 10).unwrap().len(), 1);
+        assert!(s.outbox(None, Some("other"), 10).unwrap().is_empty());
         assert_eq!(s.bot_tasks("b1").unwrap().len(), 1);
+
+        s.save_memory("b1", None, "", "Keep replies brief", "owner", 10).unwrap();
+        s.save_memory("b1", None, "local:/repo", "Build on Windows", "task", 11).unwrap();
+        assert_eq!(s.memories("b1", None).unwrap().len(), 2);
 
         s.delete_bot("b1").unwrap();
         assert!(s.bots().unwrap().is_empty());
         assert!(s.tasks(None, 10).unwrap().is_empty());
         assert!(s.bot_tasks("b1").unwrap().is_empty());
         assert!(s.outbox_due(10).unwrap().is_empty());
+        assert!(s.memories("b1", None).unwrap().is_empty());
+    }
 
+    #[test]
+    fn memories_scope_isolation_dedupe_and_capacity_limits() {
+        let d = tempfile::tempdir().unwrap();
+        let s = Store::open(&d.path().join("bots.db")).unwrap();
+        s.save_bot(&bot("b1"), 1).unwrap();
+
+        let m1 = s.save_memory("b1", None, "", "Short Chinese replies", "review", 10).unwrap();
+        // Exact dedupe keeps id and upgrades source rank (owner > review)
+        let m1_dup = s.save_memory("b1", None, "", "Short Chinese replies", "owner", 20).unwrap();
+        assert_eq!(m1.id, m1_dup.id);
+        assert_eq!(m1_dup.source, "owner");
+        assert_eq!(m1_dup.updated_at, 20);
+
+        // Two hosts with the same folder basename never collide
+        s.save_memory("b1", None, "local:/git/app", "Linux pitfall", "task", 30).unwrap();
+        s.save_memory("b1", None, "mac:/Users/me/app", "macOS pitfall", "task", 31).unwrap();
+
+        let local_mems = s.memories_for_task("b1", "local", "/git/app").unwrap();
+        assert_eq!(local_mems.len(), 2);
+        assert_eq!(local_mems[0].scope, "");
+        assert_eq!(local_mems[1].content, "Linux pitfall");
+
+        let scratch_mems = s.memories_for_task("b1", "local", "").unwrap();
+        assert_eq!(scratch_mems.len(), 1);
+        assert_eq!(scratch_mems[0].scope, "");
+
+        // Scope capacity guard refuses silent eviction at MEMORY_MAX_SCOPE
+        for i in 1..MEMORY_MAX_SCOPE {
+            s.save_memory("b1", None, "", &format!("Rule {i}"), "owner", 100 + i as i64).unwrap();
+        }
+        assert!(s.save_memory("b1", None, "", "Overflow rule", "owner", 999).is_err());
+
+        // Delete frees a slot
+        assert!(s.delete_memory("b1", &m1.id).unwrap());
+        assert!(s.save_memory("b1", None, "", "Fits now", "owner", 1000).is_ok());
+
+        // PromptRevision stores sops and preserves backward compatibility with legacy JSON without sops
+        let sop = Sop { id: "s1".into(), name: "Bug".into(), when: "bug".into(), how: "fix".into(), ask_human: "plan".into(), delivery: "test".into(), enabled: true };
+        let rev = s.add_prompt("b1", 0, &PromptSections { role: "helper".into(), ..Default::default() }, &[sop.clone()], "bot", 50).unwrap();
+        assert_eq!(rev, 1);
+        let list = s.prompts("b1").unwrap();
+        assert_eq!(list[0].sops, vec![sop]);
+        assert_eq!(list[0].sections.role, "helper");
+
+        // Active tasks include `reviewing`
+        let rt = TaskRow { id: "tr1".into(), bot_id: "b1".into(), state: "reviewing".into(), created_at: 1, ..Default::default() };
+        assert!(rt.active());
+        s.save_task(&rt).unwrap();
+        assert_eq!(s.active_tasks().unwrap().len(), 1);
     }
 
     #[test]

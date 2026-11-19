@@ -51,6 +51,9 @@ pub struct BotConfig {
     /// User layer of the prompt
     #[serde(default)]
     pub prompt: PromptSections,
+    /// Structured per-scenario operating procedures (injected on demand per task)
+    #[serde(default)]
+    pub sops: Vec<Sop>,
     #[serde(default)]
     pub prompt_revision: u32,
     /// Compact the Bot session when its context use passes this percentage
@@ -224,6 +227,32 @@ pub struct Routine {
     pub schedule: String,
     /// What to do on each run
     pub prompt: String,
+    /// Optional SOP id to follow on each run
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sop_id: Option<String>,
+    #[serde(default = "yes")]
+    pub enabled: bool,
+}
+
+/// A named per-scenario operating procedure: matched by `when`, injected into the spawned task on demand
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct Sop {
+    /// Stable id: kept if given, else numbered "s1", "s2", ...
+    #[serde(default)]
+    pub id: String,
+    /// Short display name (1..=40 chars), e.g. "修线上 Bug" / "PR review"
+    pub name: String,
+    /// When this SOP applies (event pattern, request kind, or routine)
+    pub when: String,
+    /// How the task should execute (phases, repo vs worktree mode, tool preference)
+    pub how: String,
+    /// When the task MUST pause (`report(blocked)` with `options` & `details`) and ask the person
+    #[serde(default)]
+    pub ask_human: String,
+    /// Verification & deliverable criteria checked by the Bot before letting the task reach `ready`
+    #[serde(default)]
+    pub delivery: String,
     #[serde(default = "yes")]
     pub enabled: bool,
 }
@@ -323,6 +352,7 @@ impl BotConfig {
             r.name = r.name.trim().to_string();
             r.schedule = r.schedule.split_whitespace().collect::<Vec<_>>().join(" ");
             r.id = r.id.trim().to_string();
+            r.sop_id = r.sop_id.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
             if !r.id.is_empty() && !used.insert(r.id.clone()) {
                 r.id.clear();
             }
@@ -331,6 +361,24 @@ impl BotConfig {
             if r.id.is_empty() {
                 r.id = (1..).map(|n| format!("r{n}")).find(|i| !used.contains(i)).unwrap();
                 used.insert(r.id.clone());
+            }
+        }
+        let mut used_sops = std::collections::HashSet::new();
+        for s in &mut self.sops {
+            s.id = s.id.trim().to_string();
+            s.name = s.name.trim().to_string();
+            s.when = s.when.trim().to_string();
+            s.how = s.how.trim().to_string();
+            s.ask_human = s.ask_human.trim().to_string();
+            s.delivery = s.delivery.trim().to_string();
+            if !s.id.is_empty() && !used_sops.insert(s.id.clone()) {
+                s.id.clear();
+            }
+        }
+        for s in &mut self.sops {
+            if s.id.is_empty() {
+                s.id = (1..).map(|n| format!("s{n}")).find(|i| !used_sops.contains(i)).unwrap();
+                used_sops.insert(s.id.clone());
             }
         }
         let mut seen = vec![self.task.tool.clone()];
@@ -366,12 +414,25 @@ impl BotConfig {
                 bail!("工作区需要主机和目录");
             }
         }
+        for s in &self.sops {
+            if s.name.is_empty() || s.name.chars().count() > 40 {
+                bail!("SOP 名称不能为空，最多 40 个字");
+            }
+            if s.when.is_empty() || s.how.is_empty() {
+                bail!("SOP「{}」需要填写适用场景（when）和执行方式（how）", s.name);
+            }
+        }
         for r in &self.routines {
             if r.name.is_empty() || r.prompt.trim().is_empty() {
                 bail!("例行任务需要名称和要做的事");
             }
             if let Err(e) = crate::plugins::cron::Cron::parse(&r.schedule) {
                 bail!("例行任务「{}」的时间表无效: {e}", r.name);
+            }
+            if let Some(sid) = r.sop_id.as_deref() {
+                if !self.sops.iter().any(|s| s.id == sid) {
+                    bail!("例行任务「{}」关联的 SOP 不存在: {sid}", r.name);
+                }
             }
         }
         if let Some(h) = &self.active_hours {
@@ -380,7 +441,29 @@ impl BotConfig {
         Ok(())
     }
 
-    /// Find a workspace by index, name, exact path, or folder basename
+    /// Canonical memory scope key for a workspace: `<host>:<cwd>`
+    pub fn workspace_key(host: &str, cwd: &str) -> String {
+        if cwd.trim().is_empty() {
+            String::new()
+        } else {
+            format!("{}:{}", host.trim(), cwd.trim())
+        }
+    }
+
+    /// Find an SOP by exact id, or unique case-insensitive name
+    pub fn find_sop(&self, query: &str) -> Option<&Sop> {
+        let q = query.trim();
+        if q.is_empty() {
+            return None;
+        }
+        if let Some(s) = self.sops.iter().find(|s| s.id == q) {
+            return Some(s);
+        }
+        let matches: Vec<&Sop> = self.sops.iter().filter(|s| s.name.eq_ignore_ascii_case(q)).collect();
+        (matches.len() == 1).then(|| matches[0])
+    }
+
+    /// Find a workspace by index, canonical `<host>:<cwd>`, name, exact path, or unique folder basename
     pub fn find_workspace(&self, v: &serde_json::Value) -> Option<&Workspace> {
         if let Some(i) = v.as_u64() {
             return self.workspaces.get(i as usize);
@@ -391,12 +474,16 @@ impl BotConfig {
         }
         self.workspaces
             .iter()
-            .find(|w| !w.name.is_empty() && w.name.eq_ignore_ascii_case(s))
+            .find(|w| Self::workspace_key(&w.host, &w.cwd) == s)
+            .or_else(|| self.workspaces.iter().find(|w| !w.name.is_empty() && w.name.eq_ignore_ascii_case(s)))
             .or_else(|| self.workspaces.iter().find(|w| w.cwd == s))
             .or_else(|| {
-                self.workspaces.iter().find(|w| {
-                    w.cwd.trim_end_matches(['/', '\\']).rsplit(['/', '\\']).next() == Some(s)
-                })
+                let matches: Vec<&Workspace> = self
+                    .workspaces
+                    .iter()
+                    .filter(|w| w.cwd.trim_end_matches(['/', '\\']).rsplit(['/', '\\']).next() == Some(s))
+                    .collect();
+                (matches.len() == 1).then(|| matches[0])
             })
             .or_else(|| s.parse::<usize>().ok().and_then(|i| self.workspaces.get(i)))
     }
@@ -514,7 +601,40 @@ mod tests {
         assert_eq!(c.find_workspace(&json!("/Users/me/docs")).unwrap().host, "mac");
         assert_eq!(c.find_workspace(&json!("yi-console")).unwrap().name, "console");
         assert_eq!(c.find_workspace(&json!("0")).unwrap().name, "console");
+        assert_eq!(c.find_workspace(&json!("mac:/Users/me/docs")).unwrap().host, "mac");
         assert!(c.find_workspace(&json!("missing")).is_none());
         assert!(c.find_workspace(&json!("")).is_none());
+    }
+
+    #[test]
+    fn sops_get_unique_ids_and_validate_routine_links() {
+        let mut c: BotConfig = serde_json::from_value(json!({
+            "name": "x",
+            "bot": {"host": "local", "tool": "claude"},
+            "sops": [
+                {"name": " Fix Bug ", "when": " bug issue ", "how": " repo then worktree ", "askHuman": " after root cause ", "delivery": " run tests "},
+                {"id": "s1", "name": "Daily Check", "when": "09:00", "how": "check CI", "enabled": false}
+            ],
+            "routines": [
+                {"name": "Morning", "schedule": "0 9 * * *", "prompt": "check", "sopId": " s1 "}
+            ]
+        }))
+        .unwrap();
+        c.normalize();
+        c.validate().unwrap();
+        // s1 was claimed by the second SOP; the first gets s2
+        assert_eq!(c.sops[0].id, "s2");
+        assert_eq!(c.sops[0].name, "Fix Bug");
+        assert_eq!(c.sops[1].id, "s1");
+        assert!(!c.sops[1].enabled);
+        assert_eq!(c.routines[0].sop_id.as_deref(), Some("s1"));
+        assert_eq!(c.find_sop("s2").unwrap().name, "Fix Bug");
+        assert_eq!(c.find_sop("fix bug").unwrap().id, "s2");
+        // Missing SOP id fails validation
+        c.routines[0].sop_id = Some("s99".into());
+        assert!(c.validate().is_err());
+        c.routines[0].sop_id = None;
+        c.sops[0].how.clear();
+        assert!(c.validate().is_err());
     }
 }

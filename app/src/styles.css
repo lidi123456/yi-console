@@ -12593,6 +12593,298 @@ button.wp-commit-title .chev {
   flex: 1;
   min-width: 0;
 }
+/* SOPs, decision cards, tiered memories, reviewing state & phase handoff */
+.bot-task-reviewing {
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+}
+.bot-task-ready {
+  color: var(--ok, #2e9d5b);
+  background: color-mix(in srgb, var(--ok, #2e9d5b) 13%, transparent);
+}
+.bot-task-needsYou {
+  color: var(--warn, #c98a1a);
+  background: color-mix(in srgb, var(--warn, #c98a1a) 14%, transparent);
+}
+.bot-sop-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+}
+.bot-needs-card {
+  border-color: color-mix(in srgb, var(--warn, #c98a1a) 36%, var(--border));
+}
+.bot-question-summary {
+  line-height: 1.5;
+  white-space: pre-wrap;
+}
+.bot-question-options {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.bot-question-opt {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg);
+  cursor: pointer;
+  font-size: var(--fs-chat, 13px);
+  line-height: 1.45;
+  transition: border-color 0.12s, background 0.12s;
+}
+.bot-question-opt:hover {
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
+}
+.bot-question-opt.selected {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 8%, var(--bg));
+}
+.bot-question-opt input[type='radio'] {
+  width: 15px;
+  height: 15px;
+  padding: 0;
+  margin: 2px 0 0;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  box-shadow: none;
+  flex: none;
+  accent-color: var(--accent);
+}
+.bot-question-opt > span {
+  flex: 1;
+  min-width: 0;
+  word-break: break-word;
+}
+.bot-question-details {
+  font-size: 12.5px;
+  color: var(--text-2);
+}
+.bot-question-details summary {
+  cursor: pointer;
+  color: var(--text-3);
+  user-select: none;
+}
+.bot-question-details summary:hover {
+  color: var(--text);
+}
+.bot-question-details pre {
+  margin: 6px 0 0;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: var(--bg-soft, var(--side-hover));
+  border: 1px solid var(--border);
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.5;
+  max-height: 160px;
+  overflow-y: auto;
+}
+.bot-question-foot {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.bot-question-input {
+  flex: 1;
+  min-width: 0;
+}
+.bot-question.compact {
+  padding: 10px 12px;
+  gap: 8px;
+}
+.bot-answered-banner,
+.bot-prior-banner {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 14px;
+  font-size: 12.5px;
+  color: var(--text-2);
+  background: color-mix(in srgb, var(--accent) 8%, var(--panel));
+  border-bottom: 1px solid var(--border);
+}
+.bot-approvals .bot-answered-banner,
+.bot-needs-card .bot-answered-banner,
+.bot-card .bot-answered-banner {
+  border: 1px solid color-mix(in srgb, var(--accent) 25%, var(--border));
+  border-radius: 10px;
+}
+.bot-ready-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  border: 1px solid color-mix(in srgb, var(--ok, #2e9d5b) 30%, var(--border));
+  border-radius: 12px;
+  background: var(--bg);
+  flex-wrap: wrap;
+}
+.bot-ready-main {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+  flex: 1;
+}
+.bot-sop-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 12px;
+}
+.bot-sop-card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--bg);
+}
+.bot-sop-card.off {
+  opacity: 0.65;
+}
+.bot-sop-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.bot-sop-on {
+  color: var(--ok, #2e9d5b);
+  background: color-mix(in srgb, var(--ok, #2e9d5b) 12%, transparent);
+}
+.bot-sop-dl {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 6px 12px;
+  margin: 0;
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+.bot-sop-dl dt {
+  color: var(--text-2);
+  font-weight: 500;
+}
+.bot-sop-dl dd {
+  margin: 0;
+  color: var(--text);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.bot-subtoggle {
+  align-self: flex-start;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.bot-mem-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px;
+  border: 1px solid color-mix(in srgb, var(--accent) 30%, var(--border));
+  border-radius: 10px;
+  background: var(--bg);
+}
+.bot-mem-groups {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.bot-mem-group {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.bot-mem-group-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-2);
+}
+.bot-mem-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: var(--bg);
+  font-size: var(--fs-chat, 13px);
+}
+.bot-mem-text {
+  flex: 1;
+  min-width: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  line-height: 1.45;
+}
+.bot-mem-src-owner {
+  color: var(--accent);
+}
+.bot-mem-src-review {
+  color: var(--ok, #2e9d5b);
+}
+.bot-mem-src-task {
+  color: var(--warn, #c98a1a);
+}
+.bot-notes-box {
+  margin-top: 6px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.bot-notes-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.bot-subpanel {
+  margin-top: 6px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.bot-outbox-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.bot-outbox-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12.5px;
+  min-width: 0;
+}
+.bot-outbox-text {
+  flex: 1;
+  min-width: 0;
+  color: var(--text);
+}
+.bot-outbox-sent {
+  color: var(--ok, #2e9d5b);
+}
+.bot-outbox-failed {
+  color: var(--err);
+}
 .bot-preview {
   max-height: 360px;
   overflow: auto;

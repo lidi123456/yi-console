@@ -40,6 +40,7 @@ pub fn bot_tools() -> Vec<Value> {
                 "host": {"type": "string", "description": "Host id for ad-hoc cwd or scratch mode (optional; defaults to the workspace's host or your own host)"},
                 "tool": {"type": "string", "description": "Task tool, one of those listed under Environment; omit for the default"},
                 "model": {"type": "string"},
+                "sop": {"type": "string", "description": "SOP id (or exact name) from your Standard Operating Procedures section when the request matches one"},
                 "computer_use": {"type": "boolean", "description": "true to let this task operate the host's desktop GUI (only when task.computerUse is enabled under Environment and the request genuinely needs GUI apps)"},
             }),
             &["title"],
@@ -53,21 +54,35 @@ pub fn bot_tools() -> Vec<Value> {
         tool("ignore", "Drop events that need no action.", json!({"event_ids": ids(), "reason": {"type": "string"}}), &["event_ids", "reason"]),
         tool(
             "send_task",
-            "Pass extra information to a running task, or changes asked for to a ready one (it goes back to work). Grants no new permissions.",
-            json!({"task_id": {"type": "string"}, "text": {"type": "string"}}),
+            "Pass extra information to a running task, send review feedback to a `reviewing` or `ready` task, or pass mode=\"worktree\" to upgrade a read-only `repo` task in place to its own git worktree and branch after the owner confirms the plan. Grants no new permissions.",
+            json!({
+                "task_id": {"type": "string"},
+                "text": {"type": "string"},
+                "mode": {"type": "string", "enum": ["worktree"], "description": "Pass \"worktree\" to upgrade a read-only `repo` task in place to its own git worktree and branch, keeping the same task"},
+            }),
             &["task_id", "text"],
+        ),
+        tool(
+            "accept_ready",
+            "Approve a task in `reviewing` state after verifying its report against its SOP delivery criteria: promotes it to `ready` for the owner to inspect and optionally notifies them.",
+            json!({
+                "task_id": {"type": "string"},
+                "notify": {"type": "boolean", "description": "Default true: notify the owner that the result is ready for review"},
+                "summary": {"type": "string", "description": "Optional one-sentence review note shown to the owner"},
+            }),
+            &["task_id"],
         ),
         tool("task_status", "State, last report and session of one task.", json!({"task_id": {"type": "string"}}), &["task_id"]),
         tool(
             "list_tasks",
             "This Bot's tasks, newest first.",
-            json!({"active_only": {"type": "boolean", "description": "Only open tasks: queued / working / needsYou / ready (default true)"}}),
+            json!({"active_only": {"type": "boolean", "description": "Only open tasks: queued / working / needsYou / reviewing / ready (default true)"}}),
             &[],
         ),
         tool("stop_task", "Stop a task.", json!({"task_id": {"type": "string"}, "reason": {"type": "string"}}), &["task_id"]),
         tool(
             "close_task",
-            "Close a task whose turn has ended (working, blocked or ready; not running) when its outcome is settled: after relaying a ready result that needs no review by the owner, or after a waiting report that already holds the result.",
+            "Close a task whose turn has ended (working, blocked, reviewing or ready; not running) when its outcome is settled: after relaying a ready/reviewing result that needs no review by the owner, or after a waiting report that already holds the result.",
             json!({
                 "task_id": {"type": "string"},
                 "result": {"type": "string", "enum": ["done", "failed"]},
@@ -118,7 +133,31 @@ pub fn bot_tools() -> Vec<Value> {
         ),
         tool("notes_read", "Your durable notes.", json!({}), &[]),
         tool("notes_write", "Replace your durable notes (keep them short).", json!({"text": {"type": "string"}}), &["text"]),
-        tool("get_config", "Your current configuration: name, workspaces, tools, triggers, notify, accept, allow list, budget, prompt.", json!({}), &[]),
+        tool(
+            "memory_list",
+            "List your durable memories (global preferences/facts and repository-specific pitfalls). Call before memory_save to avoid duplicates.",
+            json!({
+                "scope": {"type": ["string", "integer"], "description": "Omit to list all; pass \"\" for global only, or a workspace name/path/index for one repository"},
+            }),
+            &[],
+        ),
+        tool(
+            "memory_save",
+            "Save or update one concise durable memory (max 300 chars). Global memories require an owner or approval-review turn; task reports may only save repository-scoped pitfalls for that task's workspace; external event turns cannot write memories.",
+            json!({
+                "id": {"type": "string", "description": "Existing memory id to update; omit to add a new one"},
+                "scope": {"type": ["string", "integer"], "description": "Omit or \"\" for global; pass a configured workspace name, path, index or host:cwd for a repository-specific pitfall"},
+                "content": {"type": "string", "description": "One concise, reusable fact, preference or pitfall (max 300 chars)"},
+            }),
+            &["content"],
+        ),
+        tool(
+            "memory_delete",
+            "Delete an outdated or wrong memory by id.",
+            json!({"id": {"type": "string"}}),
+            &["id"],
+        ),
+        tool("get_config", "Your current configuration: name, workspaces, tools, triggers, notify, accept, allow list, budget, routines, sops, prompt.", json!({}), &[]),
         tool(
             "update_config",
             "Change your configuration when the owner asks for it in this session. `changes` is a JSON merge patch over \
@@ -176,6 +215,9 @@ pub fn task_tools() -> Vec<Value> {
                 "state": {"type": "string", "enum": ["progress", "ready", "blocked", "failed", "dropped"]},
                 "summary": {"type": "string", "description": "One or two sentences"},
                 "question": {"type": "string", "description": "blocked: the one concrete question for the person"},
+                "options": {"type": "array", "items": {"type": "string"}, "description": "blocked: 2 to 4 short choices for the person to click (put the recommended one first)"},
+                "details": {"type": "string", "description": "blocked / ready: structured findings, file:line references or option trade-offs (up to 4000 chars) preserved for the next phase or review"},
+                "learned": {"type": "string", "description": "ready / blocked / failed: one reusable pitfall or convention of this repository discovered during the work (max 300 chars; omit when nothing new was learned)"},
                 "links": {"type": "array", "items": {"type": "string"}},
             }),
             &["state", "summary"],
@@ -312,6 +354,7 @@ pub fn draft() -> Value {
                         "name": s("Short name"),
                         "schedule": s("Five-field cron in local time, e.g. \"0 9 * * 1-5\" for 09:00 on weekdays"),
                         "prompt": s("What to do on each run, in the owner's words"),
+                        "sopId": {"type": ["string", "null"], "description": "Optional SOP id from `sops` to follow on each run"},
                         "enabled": {"type": "boolean", "description": "Default true"},
                     },
                 },
@@ -344,6 +387,24 @@ pub fn draft() -> Value {
                     "role": s("What the Bot looks after, how it decides, where it stops and asks"),
                     "communication": s("When and how it speaks to people"),
                     "delivery": s("What a finished task result must include (also given to every task)"),
+                },
+            },
+            "sops": {
+                "type": "array",
+                "description": "Named per-scenario Standard Operating Procedures. The whole list is replaced on change; keep the ids of existing ones",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["name", "when", "how"],
+                    "properties": {
+                        "id": s("Keep for existing SOPs; leave empty for new ones (numbered s1, s2, ...)"),
+                        "name": s("Short display name, at most 40 characters"),
+                        "when": s("When this SOP applies (event pattern, request kind, or routine)"),
+                        "how": s("How the task should execute (phases, repo vs worktree, tool preference)"),
+                        "askHuman": s("When the task MUST stop with report(blocked) + options & details to ask the owner"),
+                        "delivery": s("Verification & deliverable criteria checked by the Bot before letting the task reach ready"),
+                        "enabled": {"type": "boolean", "description": "Default true"},
+                    },
                 },
             },
             "promptRevision": {"type": "integer", "description": "Keep what get_bot returned; 0 for a new Bot"},
@@ -476,9 +537,14 @@ mod tests {
     fn bots_change_their_config_but_only_propose_plugins() {
         let names = |v: Vec<Value>| v.iter().map(|t| t["name"].as_str().unwrap().to_string()).collect::<Vec<_>>();
         let bot = names(bot_tools());
-        assert!(["get_config", "update_config", "propose_plugin"].iter().all(|n| bot.iter().any(|b| b == n)));
+        assert!(["get_config", "update_config", "propose_plugin", "accept_ready", "memory_list", "memory_save", "memory_delete"]
+            .iter()
+            .all(|n| bot.iter().any(|b| b == n)));
         assert!(SETUP_TOOLS.iter().all(|n| bot.iter().any(|b| b == n)));
-        assert!(!bot.iter().any(|n| n.contains("install") || n.contains("delete") || n == "plugin_kit"));
+        assert!(!bot.iter().any(|n| n.contains("install") || n == "plugin_kit" || (n.contains("delete") && n != "memory_delete")));
+        // memory_save must never accept `source` from the model (engine derives it)
+        let mem_save = bot_tools().into_iter().find(|t| t["name"] == "memory_save").unwrap();
+        assert!(mem_save["inputSchema"]["properties"].get("source").is_none());
         // Building a plugin is a task's work
         assert!(names(task_tools()).iter().any(|n| n == "plugin_kit"));
     }
@@ -493,7 +559,8 @@ mod tests {
             "task": {"tools": ["codex"], "accountId": "acc2", "model": "m", "effort": "high", "computerUse": true},
             "allow": [{"instance": "i", "ids": ["a"]}],
             "mcp": {"bot": ["a"], "task": ["b"]},
-            "routines": [{"name": "r", "schedule": "0 9 * * *", "prompt": "p"}],
+            "sops": [{"id": "s1", "name": "Fix bug", "when": "bug", "how": "repo then worktree", "askHuman": "plan", "delivery": "tests"}],
+            "routines": [{"name": "r", "schedule": "0 9 * * *", "prompt": "p", "sopId": "s1"}],
             "activeHours": {"days": [1], "start": "09:00", "end": "18:00"},
         }))
         .unwrap();

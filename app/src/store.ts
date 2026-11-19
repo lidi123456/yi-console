@@ -743,6 +743,9 @@ export function startEventLoop() {
       case 'bots.pluginProposal':
         pluginProposal(ev, '');
         break;
+      case 'bots.taskUpgraded':
+        taskUpgraded(ev, '');
+        break;
       case 'bots.notify':
       case 'bots.attention': {
         botToast(ev, '');
@@ -799,6 +802,16 @@ function confirmNeeded(ev: any, src: string) {
   });
 }
 
+/** A task upgraded in place from read-only `repo` to a new `worktree` session: follow it if currently open */
+function taskUpgraded(ev: any, src: string) {
+  const hostId = mapHost(src, ev.host, (id) => state.hosts.some((h) => h.config.id === id));
+  const v = state.view;
+  if (hostId && ev.sessionId && v.kind === 'session' && v.hostId === hostId && v.sessionId === ev.oldSessionId) {
+    navigate({ kind: 'session', hostId, sessionId: ev.sessionId });
+    toast(t('taskUpgraded'), 'info');
+  }
+}
+
 /** A Bot notification or a call for attention, from this app's engine (src '') or a remote desktop's */
 function botToast(ev: any, src: string) {
   const title: string = ev.type === 'bots.notify' ? ev.title : t('botNeedsYou');
@@ -827,6 +840,7 @@ function onNotification(hostId: string, method: string, p: any) {
       if (ev.type === 'bots.secretsNeeded') secretsNeeded(ev, key);
       if (ev.type === 'bots.confirm') confirmNeeded(ev, key);
       if (ev.type === 'bots.pluginProposal') pluginProposal(ev, key);
+      if (ev.type === 'bots.taskUpgraded') taskUpgraded(ev, key);
       break;
     }
     case 'tools.updating':
