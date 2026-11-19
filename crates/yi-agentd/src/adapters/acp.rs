@@ -3262,7 +3262,7 @@ fn flush_ready_pending_calls(watch: &mut AgyWatch, force_all: bool) {
     }
 }
 
-fn finish_agy_watch(watch: &mut AgyWatch, em: &Emitter) {
+fn finish_agy_watch(watch: &mut AgyWatch) {
     flush_ready_pending_calls(watch, true);
     for sid in watch.subagent_order.clone() {
         if let Some(t) = watch.subagents.get_mut(&sid) {
@@ -3280,13 +3280,15 @@ fn finish_agy_watch(watch: &mut AgyWatch, em: &Emitter) {
     for (tc_id, _) in watch.open_bg_calls.drain(..) {
         watch.out.push(EventBody::ToolResult { id: tc_id, output: String::new(), is_error: false });
     }
-    watch.flush_out(em);
 }
 
 /// Stop following the subagents and background tasks (the adapter exits)
 fn drop_agy_watch(st: &mut State, em: &Emitter) {
     if let Some(mut watch) = st.agy_watch.take() {
-        finish_agy_watch(&mut watch, em);
+        finish_agy_watch(&mut watch);
+        for body in watch.out {
+            em.exit_cleanup_event(body);
+        }
         em.background_tasks(vec![]);
     }
 }
@@ -3327,7 +3329,8 @@ fn carry_agy_watch(st: &mut State, em: &Emitter) {
         }
     }
     st.agy_carry.unresumed_items.extend(watch.unresumed_items.drain(..));
-    finish_agy_watch(&mut watch, em);
+    finish_agy_watch(&mut watch);
+    watch.flush_out(em);
     mark_watch_settled(st, &mut watch);
     em.background_tasks(current_agy_tasks(st));
 }
@@ -3575,10 +3578,9 @@ fn step_agy_watch(
     let step = step_agy_watch_inner(watch, spec, next_id, pending);
     if matches!(step, AgyStep::Done(_)) {
         // Close whatever is still open (Task calls without a report, subagent tool calls without a result)
-        finish_agy_watch(watch, em);
-    } else {
-        watch.flush_out(em);
+        finish_agy_watch(watch);
     }
+    watch.flush_out(em);
     em.background_tasks(if matches!(step, AgyStep::Done(_)) { vec![] } else { watch.tasks() });
     step
 }
@@ -4755,6 +4757,26 @@ mod model_config_tests {
         assert!(done < reply);
 
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn antigravity_exit_closes_background_calls_without_updating_session_time() {
+        use super::*;
+
+        let (hub, em, _rx) = crate::hub::test_emitter();
+        let root = tempfile::tempdir().unwrap();
+        let watch = AgyWatch::new(
+            "p".into(), root.path().into(), 0, 0, None, HashMap::new(), HashMap::new(), true,
+        )
+        .with_open_bg_calls(VecDeque::from([("tc-bg".into(), "run_command".into())]));
+        let mut st = State { agy_watch: Some(watch), ..Default::default() };
+
+        drop_agy_watch(&mut st, &em);
+        em.exited(None);
+
+        assert_eq!(hub.info("s").unwrap().updated_at, 0);
+        let events = hub.backlog("s", 0).unwrap();
+        assert!(matches!(&events[0].body, EventBody::ToolResult { id, .. } if id == "tc-bg"));
     }
 
     pub(super) fn agy_test_spec() -> StartSpec {

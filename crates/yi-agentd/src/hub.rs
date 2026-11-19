@@ -460,7 +460,7 @@ impl Hub {
         }
         drop(map);
         for id in interrupted {
-            self.emit(&id, 0, EventBody::Interrupted { reason: "restart".into() });
+            self.emit_inner(&id, 0, EventBody::Interrupted { reason: "restart".into() }, false);
         }
     }
 
@@ -808,6 +808,7 @@ impl Hub {
             external_id: if tool.has_process() { p.resume_id.clone() } else { None },
             created_at: now,
             updated_at: now,
+            last_process_error_at: None,
             last_seq: 0,
             pending_permissions: 0,
             usage: Usage::default(),
@@ -2899,7 +2900,11 @@ impl Hub {
     }
 
     /// Number, update session state, persist, broadcast. gen=0 means emitted by the hub itself (generation not checked)
-    pub fn emit(&self, sid: &str, gen: u64, mut body: EventBody) {
+    pub fn emit(&self, sid: &str, gen: u64, body: EventBody) {
+        self.emit_inner(sid, gen, body, true);
+    }
+
+    fn emit_inner(&self, sid: &str, gen: u64, mut body: EventBody, mut update_activity_time: bool) {
         let Some(rt) = self.alive(sid, gen) else {
             return;
         };
@@ -2933,6 +2938,11 @@ impl Hub {
                     }
                     // The process is gone: so is the turn it was running (the next message starts a new one)
                     if matches!(status, SessionStatus::Exited | SessionStatus::Error) {
+                        update_activity_time = false;
+                        if *status == SessionStatus::Error {
+                            info.last_process_error_at = Some(ts);
+                            changed = true;
+                        }
                         if let Some(t) = info.turn.as_mut().filter(|t| t.activity.is_some() || t.ended_at.is_none()) {
                             t.activity = None;
                             t.ended_at.get_or_insert(ts);
@@ -3055,7 +3065,9 @@ impl Hub {
                 _ => {}
             }
             info.last_seq += 1;
-            info.updated_at = ts;
+            if update_activity_time {
+                info.updated_at = ts;
+            }
             let ev = Event {
                 seq: info.last_seq,
                 ts,
@@ -3156,7 +3168,7 @@ impl Hub {
         };
         let pending: Vec<String> = rt.pending.lock().unwrap().drain().collect();
         for request_id in pending {
-            self.emit(
+            self.emit_inner(
                 sid,
                 gen,
                 EventBody::PermissionResolved {
@@ -3164,6 +3176,7 @@ impl Hub {
                     option_id: "cancelled".into(),
                     answers: vec![],
                 },
+                false,
             );
         }
         // The process is gone, and so are its background tasks
@@ -3177,7 +3190,7 @@ impl Hub {
         if let Some(m) = &message {
             let tool = rt.info.lock().unwrap().tool;
             crate::warn!("{} 会话 {sid} 出错退出: {m}", tool.as_str());
-            self.emit(sid, gen, EventBody::Error { message: m.clone() });
+            self.emit_inner(sid, gen, EventBody::Error { message: m.clone() }, false);
         }
         self.emit(
             sid,
@@ -4194,6 +4207,11 @@ impl Emitter {
         self.hub.exited(&self.sid, self.gen, message);
     }
 
+    /// Record the events produced while cleaning up a process that is exiting.
+    pub(crate) fn exit_cleanup_event(&self, body: EventBody) {
+        self.hub.emit_inner(&self.sid, self.gen, body, false);
+    }
+
     /// Pids in the process tree of a terminal-mode run (for matching Kiro's .lock files)
     pub fn tool_pids(&self, pids: Vec<u32>) {
         self.hub.note_pids(&self.sid, self.gen, pids);
@@ -4444,6 +4462,43 @@ mod tests {
     }
 
     #[test]
+    fn process_exit_does_not_update_session_time() {
+        for (message, expected_status) in [
+            (None, SessionStatus::Exited),
+            (Some("进程退出".into()), SessionStatus::Error),
+        ] {
+            let (hub, em, _rx) = test_emitter();
+            em.event(EventBody::PermissionRequest {
+                request_id: "request".into(),
+                tool_name: "Bash".into(),
+                title: "cargo test".into(),
+                input: Value::Null,
+                options: vec![],
+                questions: vec![],
+            });
+            let before_exit = 1;
+            hub.get("s").unwrap().info.lock().unwrap().updated_at = before_exit;
+            let mut bus = hub.bus.subscribe();
+
+            em.exited(message);
+
+            let info = hub.info("s").unwrap();
+            assert_eq!(info.updated_at, before_exit);
+            assert_eq!(info.status, expected_status);
+            assert_eq!(info.pending_permissions, 0);
+            let published = updates(&mut bus);
+            assert_eq!(published.last().unwrap().status, expected_status);
+            assert!(published.iter().all(|info| info.updated_at == before_exit));
+            assert_eq!(hub.store.load_sessions().unwrap()[0].updated_at, before_exit);
+
+            let events = hub.backlog("s", 0).unwrap();
+            let exit = events.last().unwrap();
+            assert!(matches!(exit.body, EventBody::Status { status, .. } if status == expected_status));
+            assert_eq!(info.last_process_error_at, (expected_status == SessionStatus::Error).then_some(exit.ts));
+        }
+    }
+
+    #[test]
     fn qoder_plan_tracks_disk_changes_after_a_turn_ends() {
         let (hub, em, _rx) = test_emitter();
         test_set_tool(&hub, "s", ToolKind::Qoder);
@@ -4615,6 +4670,7 @@ mod tests {
             external_id: Some(format!("ext-{id}")),
             created_at: 0,
             updated_at,
+            last_process_error_at: None,
             last_seq: 0,
             pending_permissions: 0,
             usage: Default::default(),
@@ -4697,6 +4753,7 @@ mod tests {
         assert_eq!(info.status, SessionStatus::Exited);
         // It was mid-turn: flagged, with a line in the timeline
         assert!(info.restart_interrupted);
+        assert_eq!(info.updated_at, 0);
         let last = hub.store.events_since("s", 0, 1000).unwrap().pop().unwrap().body;
         assert!(matches!(last, EventBody::Interrupted { reason } if reason == "restart"));
         // Resume first asks the tool to finish the cut-off turn; the queue follows that turn

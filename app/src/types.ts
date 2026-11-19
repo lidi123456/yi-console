@@ -24,6 +24,7 @@ export interface SessionInfo {
   externalId: string | null;
   createdAt: number;
   updatedAt: number;
+  lastProcessErrorAt?: number;
   lastSeq: number;
   pendingPermissions: number;
   usage: Usage;

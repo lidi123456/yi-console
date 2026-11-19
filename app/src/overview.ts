@@ -75,7 +75,7 @@ const ERROR_FRESH_MS = 24 * 3600 * 1000;
 export function needsAttention(s: SessionInfo, now = Date.now()): boolean {
   if (s.tool === 'files') return false;
   if (s.pendingPermissions > 0 || s.status === 'waiting-permission' || s.restartInterrupted) return true;
-  return s.status === 'error' && now - s.updatedAt < ERROR_FRESH_MS;
+  return s.status === 'error' && now - (s.lastProcessErrorAt ?? s.updatedAt) < ERROR_FRESH_MS;
 }
 
 // localStorage is shared between windows: pick up what another window marked

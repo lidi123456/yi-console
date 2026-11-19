@@ -181,6 +181,9 @@ pub struct SessionInfo {
     pub external_id: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
+    /// When the tool process last exited with an error.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_process_error_at: Option<i64>,
     pub last_seq: i64,
     pub pending_permissions: u32,
     pub usage: Usage,

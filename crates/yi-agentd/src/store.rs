@@ -343,6 +343,7 @@ mod tests {
             external_id: None,
             created_at: 1,
             updated_at: 1,
+            last_process_error_at: None,
             last_seq: 0,
             pending_permissions: 0,
             usage: Usage::default(),

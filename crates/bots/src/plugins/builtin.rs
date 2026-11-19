@@ -222,7 +222,14 @@ impl PluginInstance for SessionEvents {
             "pending" => "is waiting for approval or an answer",
             _ => "finished a turn",
         };
-        let at = params["updatedAt"].as_i64().unwrap_or_else(|| chrono::Local::now().timestamp_millis());
+        let error_at = if kind == "error" {
+            params["lastProcessErrorAt"].as_i64()
+        } else {
+            None
+        };
+        let at = error_at
+            .or_else(|| params["updatedAt"].as_i64())
+            .unwrap_or_else(|| chrono::Local::now().timestamp_millis());
         self.host.emit(TriggerEvent {
             key: format!("{host}/{sid}/{kind}/{at}"),
             thread: format!("session:{host}/{sid}"),
@@ -290,5 +297,21 @@ mod tests {
         let kinds: Vec<String> = host.events.lock().unwrap().iter().map(|e| e.meta["kind"].as_str().unwrap().to_string()).collect();
         // error is not in "on"; the Bot's own session is never reported
         assert_eq!(kinds, ["pending", "turnEnd"]);
+    }
+
+    #[test]
+    fn session_error_events_use_the_process_exit_time() {
+        let host = Arc::new(Host { config: json!({"on": ["error"]}), ..Default::default() });
+        let p = SessionEvents { host: host.clone(), last: Mutex::new(HashMap::new()) };
+        let mut update = json!({"id": "s1", "status": "running", "updatedAt": 1});
+        p.on_host_event("local", "session.updated", &update);
+        update["status"] = json!("error");
+        update["lastProcessErrorAt"] = json!(2);
+        p.on_host_event("local", "session.updated", &update);
+
+        let events = host.events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].at, 2);
+        assert_eq!(events[0].key, "local/s1/error/2");
     }
 }
