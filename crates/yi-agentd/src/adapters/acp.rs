@@ -22,6 +22,7 @@ enum Pending {
     SetConfig,
     /// Antigravity's `thought_level` option
     SetEffort,
+    AgyResume,
     Other,
 }
 
@@ -39,6 +40,8 @@ struct ToolState {
     input: Value,
     diffs: Vec<FileDiff>,
     done: bool,
+    /// Outside an Antigravity prompt, the transcript watch publishes this call
+    agy_detached: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -169,6 +172,8 @@ struct State {
     /// Antigravity (`agy acp`): tracks asynchronous subagents and background tasks spawned in the current turn
     is_antigravity: bool,
     agy_pre_turn_steps: usize,
+    /// First possible wakeup step after the prompt or the last finished wakeup
+    agy_wake_from: usize,
     agy_pending_calls: HashMap<String, AgyPendingCall>,
     agy_send_baselines: HashMap<String, usize>,
     agy_open_bg_calls: VecDeque<(String, String)>,
@@ -208,6 +213,11 @@ impl State {
     /// When replaying history that doesn't need recording, drop content events
     fn muted(&self) -> bool {
         self.loading && (!self.record_replay || (self.replay_skip > 0 && self.replay_users <= self.replay_skip))
+    }
+
+    fn ready_to_prompt(&self) -> bool {
+        self.session_id.is_some() && !config_pending(self) && !self.prompting && !self.loading
+            && self.compacting.is_none() && self.agy_watch.as_ref().is_none_or(|watch| !watch.reopened)
     }
 }
 
@@ -307,7 +317,7 @@ pub async fn run(spec: StartSpec, em: Emitter, mut rx: mpsc::UnboundedReceiver<A
                 }
                 if let Some(m) = next_config(&mut st) { let _ = p.send(&m).await; }
                 if let Some(m) = next_effort(&mut st) { let _ = p.send(&m).await; }
-                if st.session_id.is_some() && !config_pending(&st) && !st.prompting && !st.loading && st.compacting.is_none() && !st.queue.is_empty() {
+                if st.ready_to_prompt() && !st.queue.is_empty() {
                     let next = st.queue.remove(0);
                     let m = prompt(&mut st, &em, &next);
                     let _ = p.send(&m).await;
@@ -321,7 +331,7 @@ pub async fn run(spec: StartSpec, em: Emitter, mut rx: mpsc::UnboundedReceiver<A
                 } else {
                     poll_agy_prompt_bg(&mut st, &em);
                 }
-                if !st.prompting && st.session_id.is_some() && !config_pending(&st) && !st.loading && st.compacting.is_none() && !st.queue.is_empty() {
+                if st.ready_to_prompt() && !st.queue.is_empty() {
                     let next = st.queue.remove(0);
                     let m = prompt(&mut st, &em, &next);
                     let _ = p.send(&m).await;
@@ -339,7 +349,7 @@ pub async fn run(spec: StartSpec, em: Emitter, mut rx: mpsc::UnboundedReceiver<A
                     if retry_failed_model(&mut st) {
                         if let Some(m) = next_config(&mut st) { let _ = p.send(&m).await; }
                     }
-                    if st.session_id.is_some() && !config_pending(&st) && !st.prompting && !st.loading && st.compacting.is_none() {
+                    if st.ready_to_prompt() {
                         let m = prompt(&mut st, &em, &next);
                         let _ = p.send(&m).await;
                     } else {
@@ -393,12 +403,15 @@ pub async fn run(spec: StartSpec, em: Emitter, mut rx: mpsc::UnboundedReceiver<A
                     // subagents still running stay background tasks (stopped one by one from the list)
                     if st.agy_watch.as_ref().is_some_and(|w| w.reopened) {
                         carry_agy_watch(&mut st, &em);
+                        if let Some(sid) = st.session_id.as_deref() {
+                            st.agy_wake_from = count_agy_transcript_steps(&agy_brain_dir(), sid);
+                        }
                         st.prompting = false;
                         st.end_subagents();
                         em.event(EventBody::TurnEnd { stop_reason: Some("cancelled".into()), model: None });
                         if !st.agy_carry.is_empty() {
                             if let Some(sid) = st.session_id.clone() {
-                                let steps = count_agy_transcript_steps(&agy_brain_dir(), &sid);
+                                let steps = st.agy_wake_from;
                                 let mut w = AgyWatch::new(sid, agy_brain_dir(), steps, steps, None, HashMap::new(), HashMap::new(), st.perm != "bypass");
                                 w.adopt(std::mem::take(&mut st.agy_carry));
                                 w.detached = true;
@@ -566,12 +579,16 @@ fn prompt(st: &mut State, em: &Emitter, p: &Prompt) -> Value {
     // The watch can't run during a prompt (the parent's own steps would look like a wakeup): its running subagents
     // wait in agy_carry for this prompt's watch. A report arriving meanwhile is handed to this turn by agy itself
     carry_agy_watch(st, em);
+    if st.is_antigravity {
+        st.tools.retain(|_, tool| !tool.agy_detached);
+    }
     st.agy_replay_hidden.clear();
     st.agy_replay_prefix = std::mem::take(&mut st.agy_carry.unresumed_items);
     st.agy_pre_turn_steps = match st.session_id.as_deref() {
         Some(sid) if st.is_antigravity => count_agy_transcript_steps(&agy_brain_dir(), sid),
         _ => 0,
     };
+    st.agy_wake_from = st.agy_pre_turn_steps;
     let sid = st.session_id.clone().unwrap_or_default();
     if st.is_cursor {
         if let Some((prior, extra)) = split_compact(&p.text) {
@@ -869,7 +886,7 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Result<V
                     }
                     Ok(out)
                 }
-                Pending::Other => Ok(out),
+                Pending::AgyResume | Pending::Other => Ok(out),
             };
         }
         let r = &v["result"];
@@ -918,6 +935,11 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Result<V
                 }
                 flush(st, em);
                 st.loading = false;
+                if st.is_antigravity {
+                    if let Some(sid) = st.session_id.as_deref() {
+                        st.agy_wake_from = count_agy_transcript_steps(&agy_brain_dir(), sid);
+                    }
+                }
                 if st.resumed {
                     let ctx = match spec.tool {
                         ToolKind::Cursor => st.session_id.as_deref().and_then(cursor_context),
@@ -1062,11 +1084,16 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Result<V
                     em.event(super::limit_hit(Some(crate::util::now_ms() + left), Some(limit.into())));
                 }
                 let stop_reason = r["stopReason"].as_str().map(str::to_string);
-                if st.is_antigravity {
+                let wake_already_in_log = if st.is_antigravity {
                     st.agy_replay_prefix.clear();
                     st.agy_replay_hidden.clear();
                     settle_agy_prompt_bg(st, em);
-                }
+                    let steps = &st.agy_parent_transcript.steps;
+                    st.agy_wake_from = agy_prompt_boundary(steps, st.agy_pre_turn_steps, &st.last_reply);
+                    steps.iter().skip(st.agy_wake_from).any(is_agy_wakeup)
+                } else {
+                    false
+                };
                 let has_pending_bg = st.agy_bg_tasks.iter().any(|t| !t.done && !t.is_daemon);
                 let should_watch = st.is_antigravity
                     && (!st.agy_carry.is_empty()
@@ -1076,17 +1103,17 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Result<V
                             && (!st.agy_pending_calls.is_empty()
                                 || !st.agy_open_bg_calls.is_empty()
                                 || has_pending_bg
+                                || wake_already_in_log
                                 || st.session_id.as_deref().is_some_and(|sid| {
                                     has_pending_agy_async_turn(&agy_brain_dir(), sid, st.agy_pre_turn_steps)
                                 }))));
                 if should_watch {
                     if let Some(sid) = st.session_id.clone() {
-                        let wake_from = count_agy_transcript_steps(&agy_brain_dir(), &sid);
                         let mut watch = AgyWatch::new(
                             sid,
                             agy_brain_dir(),
                             st.agy_pre_turn_steps,
-                            wake_from,
+                            st.agy_wake_from,
                             stop_reason,
                             std::mem::take(&mut st.agy_pending_calls),
                             std::mem::take(&mut st.agy_send_baselines),
@@ -1109,21 +1136,21 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Result<V
                         }
                         match step {
                             AgyStep::Done(req) => {
-                                if req.is_some() {
-                                    st.agy_carry.unresumed_items.clear();
-                                    st.agy_replay_prefix.clear();
-                                }
+                                remember_agy_wake_progress(st, &watch);
+                                st.agy_carry.unresumed_items.append(&mut watch.unresumed_items);
                                 out.extend(req);
                                 if reopened {
-                                    em.event(EventBody::TurnEnd { stop_reason: watch.stop_reason, model: None });
+                                    em.event(agy_wake_end(&watch));
                                 }
                             }
                             AgyStep::CycleEnd => {
+                                remember_agy_wake_progress(st, &watch);
                                 if reopened {
                                     watch.reopened = false;
-                                    em.event(EventBody::TurnEnd { stop_reason: watch.stop_reason.clone(), model: None });
+                                    em.event(agy_wake_end(&watch));
                                 }
                                 watch.wake = false;
+                                watch.wake_failed = false;
                                 st.agy_watch = Some(watch);
                             }
                             AgyStep::Wait => st.agy_watch = Some(watch),
@@ -1176,6 +1203,7 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Result<V
                 publish_config(st, em);
             }
             Pending::SetEffort => read_thought_level(st, r),
+            Pending::AgyResume => st.agy_carry.unresumed_items.clear(),
             Pending::Other => {}
         }
         return Ok(out);
@@ -1233,6 +1261,7 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Result<V
                 }
             }
             st.perms.insert(rid.clone(), v["id"].clone());
+            agy_detached_permission(st, params);
             em.event(EventBody::PermissionRequest {
                 request_id: rid,
                 tool_name: if known.name.is_empty() {
@@ -1300,6 +1329,7 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Result<V
                     .cloned()
                     .unwrap_or_else(|| params.clone());
                 st.elicits.insert(rid.clone(), PendingElicit { rpc_id: v["id"].clone(), fields });
+                agy_detached_permission(st, params);
                 em.event(EventBody::PermissionRequest {
                     request_id: rid,
                     tool_name: "ask_question".into(),
@@ -1320,7 +1350,11 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Result<V
 
     // Notifications
     match method {
-        "session/update" => update(st, em, &params["update"]),
+        "session/update" => {
+            if !agy_detached_update(st, params, agy_brain_dir) {
+                update(st, em, &params["update"]);
+            }
+        }
         "_kiro.dev/compaction/status" => compaction_status(st, em, &params["status"]["type"]),
         "_kiro.dev/metadata" => {
             if let Some(p) = params["contextUsagePercentage"].as_f64() {
@@ -2482,6 +2516,97 @@ fn is_agy_final_reply(step: &Value) -> bool {
         && step["tool_calls"].as_array().is_none_or(|a| a.is_empty())
 }
 
+fn agy_prompt_boundary(steps: &[Value], pre_prompt: usize, reply: &str) -> usize {
+    // A wakeup can already be on disk when the prompt RPC returns. Anchor to the reply actually
+    // streamed by the prompt whenever it is present, rather than skipping that wakeup.
+    let reply = reply.trim();
+    if !reply.is_empty() {
+        if let Some((index, _)) = steps.iter().enumerate().skip(pre_prompt).find(|(_, step)| {
+            is_agy_final_reply(step) && step["content"].as_str().is_some_and(|text| text.trim() == reply)
+        }) {
+            return index + 1;
+        }
+    }
+    steps.len().max(pre_prompt)
+}
+
+/// Newer agy sends parent updates outside session/prompt too. Use them to start or keep
+/// the transcript watch alive. The watch owns these steps, including the final reply.
+fn agy_detached_update(st: &mut State, params: &Value, brain_dir: impl FnOnce() -> PathBuf) -> bool {
+    if !st.is_antigravity || st.prompting || st.loading {
+        return false;
+    }
+    let Some(sid) = st.session_id.as_deref() else { return false };
+    if params["sessionId"].as_str().is_some_and(|id| id != sid) {
+        return true;
+    }
+    let update = &params["update"];
+    match update["sessionUpdate"].as_str() {
+        Some("agent_message_chunk" | "agent_thought_chunk") => {
+            if content_text(&update["content"]).is_empty() {
+                return true;
+            }
+        }
+        Some("tool_call" | "tool_call_update") => {
+            let Some(id) = update["toolCallId"].as_str() else { return true };
+            if st.tools.get(id).is_some_and(|tool| !tool.agy_detached) {
+                // The watch will publish the real result for asynchronous calls it took over.
+                return st.agy_watch.as_ref().is_some_and(|watch| {
+                    watch.pending_calls.contains_key(id)
+                        || watch.open_bg_calls.iter().any(|(call, _)| call == id)
+                        || watch.bg_tasks.iter().any(|task| task.tc_id.as_deref() == Some(id))
+                });
+            }
+            let tool = st.tools.entry(id.to_string()).or_default();
+            tool.agy_detached = true;
+            // Keep the metadata for permission and elicitation requests that refer to this id.
+            if let Some(title) = update["title"].as_str() {
+                tool.title = title.to_string();
+            }
+            if tool.name.is_empty() {
+                tool.name = meta_tool_name(update)
+                    .or(update["name"].as_str())
+                    .unwrap_or(&tool.title)
+                    .to_string();
+            }
+            if !update["rawInput"].is_null() {
+                tool.input = update["rawInput"].clone();
+            }
+        }
+        _ => return false,
+    }
+    note_agy_detached_activity(st, brain_dir);
+    true
+}
+
+fn agy_detached_permission(st: &mut State, params: &Value) {
+    if st.is_antigravity && !st.prompting && !st.loading
+        && params["sessionId"].as_str().is_none_or(|sid| st.session_id.as_deref() == Some(sid))
+    {
+        if let Some(watch) = note_agy_detached_activity(st, agy_brain_dir) {
+            // The permission event itself puts the session in WaitingPermission.
+            watch.reopened = true;
+        }
+    }
+}
+
+fn note_agy_detached_activity(st: &mut State, brain_dir: impl FnOnce() -> PathBuf) -> Option<&mut AgyWatch> {
+    let sid = st.session_id.as_deref()?;
+    let watch = st.agy_watch.get_or_insert_with(|| {
+        let mut watch = AgyWatch::new(
+            sid.to_string(), brain_dir(), st.agy_wake_from, st.agy_wake_from, None,
+            std::mem::take(&mut st.agy_pending_calls), std::mem::take(&mut st.agy_send_baselines),
+            st.perm != "bypass",
+        ).with_open_bg_calls(std::mem::take(&mut st.agy_open_bg_calls));
+        watch.adopt(std::mem::take(&mut st.agy_carry));
+        watch.adopt_bg(std::mem::take(&mut st.agy_bg_tasks), std::mem::take(&mut st.agy_seen_system_steps));
+        watch.detached = true;
+        watch
+    });
+    watch.last_acp_activity = Some(tokio::time::Instant::now());
+    Some(watch)
+}
+
 /// A step that won't change any more. A background command stays a RUNNING GENERIC step for good (its output comes
 /// later as a SYSTEM_MESSAGE), so it counts as settled too
 fn agy_step_settled(step: &Value) -> bool {
@@ -2997,8 +3122,8 @@ enum AgyStep {
 
 /// Antigravity subagents (`invoke_subagent`, `send_message` to one, `swarm`) and background tasks (`run_command`,
 /// `run_workflow`, `schedule`) run asynchronously: agy ends the prompt turn after launching them, and when they report
-/// back it wakes the parent by itself, outside any ACP prompt, so none of that is streamed. This follows their
-/// transcripts on disk instead. Like Claude's background tasks, the turn ends with the prompt; running subagents and
+/// back it wakes the parent by itself, outside any ACP prompt. Some versions stream ACP updates during a wakeup,
+/// but there is no prompt response to finalize them. This follows the transcripts on disk. Running subagents and
 /// background tasks are listed in `background_tasks`, and the parent's wakeup reopens the session (Running, then TurnEnd)
 #[derive(Debug)]
 struct AgyWatch {
@@ -3023,6 +3148,9 @@ struct AgyWatch {
     parent: AgyTranscript,
     wakeup_stable_ticks: usize,
     started_at: tokio::time::Instant,
+    last_acp_activity: Option<tokio::time::Instant>,
+    /// Text already previewed from the current in-progress planner step
+    preview: Option<(usize, String)>,
     all_subagents_done_at: Option<tokio::time::Instant>,
     /// Allow-all launches agy with --dangerously-skip-permissions, so subagents never wait for approval there
     stall_check: bool,
@@ -3031,6 +3159,7 @@ struct AgyWatch {
     reopened: bool,
     /// This pass produced the parent's own events (its wakeup), which reopen a detached turn
     wake: bool,
+    wake_failed: bool,
     emitted_wake_text: bool,
     unresumed_items: VecDeque<AgyWakeReplayItem>,
     out: AgyOut,
@@ -3068,11 +3197,14 @@ impl AgyWatch {
             parent: AgyTranscript::default(),
             wakeup_stable_ticks: 0,
             started_at: tokio::time::Instant::now(),
+            last_acp_activity: None,
+            preview: None,
             all_subagents_done_at: None,
             stall_check,
             detached: false,
             reopened: false,
             wake: false,
+            wake_failed: false,
             emitted_wake_text: false,
             unresumed_items: VecDeque::new(),
             out: vec![],
@@ -3203,12 +3335,26 @@ impl AgyWatch {
         self.subagent_order.iter().filter(|id| self.subagents.get(*id).is_some_and(|t| !t.done)).cloned().collect()
     }
 
+    fn reply_id(&self, step: &Value, index: usize) -> String {
+        let step_id = step["step_index"].as_u64().unwrap_or(index as u64);
+        format!("agy-wake-{}-a-{step_id}", self.parent_sid)
+    }
+
+    fn preview_reply(&mut self, step: &Value, index: usize) {
+        if step["type"] != "PLANNER_RESPONSE" {
+            return;
+        }
+        let Some(text) = step["content"].as_str().filter(|text| !text.trim().is_empty()) else { return };
+        let previous = self.preview.as_ref().filter(|(i, _)| *i == index).map_or("", |(_, text)| text.as_str());
+        if let Some(delta) = text.strip_prefix(previous).filter(|delta| !delta.is_empty()) {
+            self.out.push(EventBody::AssistantDelta { id: self.reply_id(step, index), delta: delta.to_string() });
+            self.preview = Some((index, text.to_string()));
+        }
+    }
+
     /// Send what this pass produced. A detached turn is reopened (status Running) before the parent's wakeup;
     /// the subagents' own events go out while the session is idle, like a background task's
     fn flush_out(&mut self, em: &Emitter) {
-        if self.out.is_empty() {
-            return;
-        }
         if self.detached && !self.reopened && self.wake {
             self.reopened = true;
             em.status(SessionStatus::Running, None);
@@ -3518,7 +3664,7 @@ fn agy_resume_req(watch: &AgyWatch, spec: &StartSpec, next_id: &mut u64, pending
     // agy only marks steps it streamed as seen; resuming moves that mark past the wakeup turn, so the
     // next prompt doesn't replay it (session/resume sends no history)
     *next_id += 1;
-    pending.insert(*next_id, Pending::Other);
+    pending.insert(*next_id, Pending::AgyResume);
     json!({
         "jsonrpc": "2.0",
         "id": *next_id,
@@ -3527,10 +3673,24 @@ fn agy_resume_req(watch: &AgyWatch, spec: &StartSpec, next_id: &mut u64, pending
     })
 }
 
+fn remember_agy_wake_progress(st: &mut State, watch: &AgyWatch) {
+    st.agy_wake_from = st.agy_wake_from.max(watch.wake_from);
+    if watch.wake && watch.wakeup_msg_idx.is_some_and(|idx| watch.next_parent_emit_step > idx + 1) {
+        st.agy_wake_from = st.agy_wake_from.max(watch.next_parent_emit_step);
+    }
+}
+
+fn agy_wake_end(watch: &AgyWatch) -> EventBody {
+    let reason = if watch.wake_failed { "error" } else { "end_turn" };
+    EventBody::TurnEnd { stop_reason: Some(reason.into()), model: None }
+}
+
 fn poll_agy_watch(st: &mut State, spec: &StartSpec, em: &Emitter) -> Option<Value> {
     let mut watch = st.agy_watch.take()?;
     if !st.perms.is_empty() || !st.asks.is_empty() || !st.elicits.is_empty() {
         watch.started_at = tokio::time::Instant::now();
+        watch.all_subagents_done_at = None;
+        watch.reopened |= watch.detached;
     }
     let step = step_agy_watch(&mut watch, spec, em, &mut st.next_id, &mut st.pending);
     mark_watch_settled(st, &mut watch);
@@ -3540,27 +3700,28 @@ fn poll_agy_watch(st: &mut State, spec: &StartSpec, em: &Emitter) -> Option<Valu
             None
         }
         AgyStep::CycleEnd => {
+            remember_agy_wake_progress(st, &watch);
             if watch.reopened {
                 watch.reopened = false;
                 st.end_subagents();
-                em.event(EventBody::TurnEnd { stop_reason: Some("end_turn".into()), model: None });
+                em.event(agy_wake_end(&watch));
             }
             watch.wake = false;
+            watch.wake_failed = false;
             st.agy_watch = Some(watch);
             None
         }
         AgyStep::Done(req) => {
-            if req.is_some() {
-                st.agy_carry.unresumed_items.clear();
-                st.agy_replay_prefix.clear();
-            }
+            remember_agy_wake_progress(st, &watch);
+            // A queued prompt can start before the resume RPC is acknowledged or after it fails.
+            st.agy_carry.unresumed_items.append(&mut watch.unresumed_items);
             if !watch.detached {
                 st.prompting = false;
                 st.end_subagents();
                 em.event(EventBody::TurnEnd { stop_reason: watch.stop_reason, model: None });
             } else if watch.reopened {
                 st.end_subagents();
-                em.event(EventBody::TurnEnd { stop_reason: Some("end_turn".into()), model: None });
+                em.event(agy_wake_end(&watch));
             }
             req
         }
@@ -3602,6 +3763,7 @@ fn step_agy_watch_inner(watch: &mut AgyWatch, spec: &StartSpec, next_id: &mut u6
             .values()
             .filter_map(|t| t.transcript.changed_at)
             .chain(watch.parent.changed_at)
+            .chain(watch.last_acp_activity)
             .chain(std::iter::once(watch.started_at))
             .max()
             .map(|t| t.elapsed())
@@ -3669,13 +3831,6 @@ fn step_agy_watch_inner(watch: &mut AgyWatch, spec: &StartSpec, next_id: &mut u6
             _ => {}
         }
         watch.next_parent_discover_step += 1;
-    }
-
-    if watch.subagents.is_empty() && !watch.bg_tasks.iter().any(|b| !b.is_daemon) {
-        if watch.started_at.elapsed() >= DISCOVER_GRACE {
-            return AgyStep::Done(None);
-        }
-        return AgyStep::Wait;
     }
 
     // 2. Poll each subagent's own transcript for live tool calls, results, and final reply
@@ -3783,13 +3938,16 @@ fn step_agy_watch_inner(watch: &mut AgyWatch, spec: &StartSpec, next_id: &mut u6
     flush_ready_pending_calls(watch, false);
 
     // 4. Stream & capture parent's reactive wakeup turn once SYSTEM_MESSAGE arrives (even while other tasks still run)
-    let mut has_planner_after_wakeup = false;
-    let mut has_unsettled_after_wakeup = false;
-    if let Some(wakeup_idx) = watch.wakeup_msg_idx {
+    if let Some(after_wakeup) = watch.wakeup_msg_idx.and_then(|idx| parent_steps.get(idx + 1..)) {
+        let has_planner_after_wakeup = after_wakeup.iter().any(|s| s["type"] == "PLANNER_RESPONSE");
+        // Only reopen for a new parent wakeup. Delayed ACP chunks from a completed step can
+        // re-arm the watch, but cannot reopen that step or create an unmatched live buffer.
+        watch.wake |= has_planner_after_wakeup || watch.last_acp_activity.is_some();
         while watch.next_parent_emit_step < parent_steps.len() {
             let step_idx = watch.next_parent_emit_step;
             let step = &parent_steps[step_idx];
             if !agy_step_settled(step) {
+                watch.preview_reply(step, step_idx);
                 watch.wakeup_stable_ticks = 0;
                 break;
             }
@@ -3820,7 +3978,7 @@ fn step_agy_watch_inner(watch: &mut AgyWatch, spec: &StartSpec, next_id: &mut u6
                     if let Some(text) = step["content"].as_str().filter(|s| !s.trim().is_empty()) {
                         watch.emitted_wake_text = true;
                         watch.unresumed_items.push_back(AgyWakeReplayItem::Assistant(text.trim().to_string()));
-                        watch.out.push(EventBody::AssistantText { id: format!("agy-wake-{}-a-{}", watch.parent_sid, step_idx), text: text.to_string() });
+                        watch.out.push(EventBody::AssistantText { id: watch.reply_id(step, step_idx), text: text.to_string() });
                     }
                     true
                 }
@@ -3889,17 +4047,17 @@ fn step_agy_watch_inner(watch: &mut AgyWatch, spec: &StartSpec, next_id: &mut u6
         }
 
         let all_done = watch.subagents.values().all(|t| t.done) && watch.bg_tasks.iter().all(|b| b.done);
-        has_planner_after_wakeup = parent_steps[wakeup_idx + 1..].iter().any(|s| s["type"].as_str() == Some("PLANNER_RESPONSE"));
-        has_unsettled_after_wakeup = parent_steps[wakeup_idx + 1..].iter().any(|s| !agy_step_settled(s));
-        let last_is_final_planner = parent_steps.last().is_some_and(|s| {
-            is_agy_final_reply(s)
-                || (s["type"].as_str() == Some("PLANNER_RESPONSE")
-                    && matches!(s["status"].as_str(), Some("ERROR" | "INVALID"))
-                    && s["tool_calls"].as_array().is_none_or(|a| a.is_empty()))
+        let last = after_wakeup.iter().rev().find(|step| !is_agy_system(step));
+        let failed = last.is_some_and(|s| {
+            s["type"] == "PLANNER_RESPONSE"
+                && matches!(s["status"].as_str(), Some("ERROR" | "INVALID"))
+                && s["tool_calls"].as_array().is_none_or(|a| a.is_empty())
         });
+        let last_is_final_planner = failed || last.is_some_and(is_agy_final_reply);
         if has_planner_after_wakeup && last_is_final_planner && !watch.parent_lane.busy() && watch.next_parent_emit_step == parent_steps.len() {
             watch.wakeup_stable_ticks += 1;
             if watch.wakeup_stable_ticks >= 2 {
+                watch.wake_failed = failed;
                 if all_done {
                     flush_ready_pending_calls(watch, true);
                     return AgyStep::Done(Some(agy_resume_req(watch, spec, next_id, pending)));
@@ -3910,16 +4068,27 @@ fn step_agy_watch_inner(watch: &mut AgyWatch, spec: &StartSpec, next_id: &mut u6
                 watch.next_parent_emit_step = parent_steps.len();
                 watch.wakeup_stable_ticks = 0;
                 watch.all_subagents_done_at = None;
+                watch.last_acp_activity = None;
+                watch.preview = None;
                 return AgyStep::CycleEnd;
             }
             return AgyStep::Wait;
         }
     }
 
+    if watch.subagents.is_empty() && watch.bg_tasks.is_empty() && watch.wakeup_msg_idx.is_none() && !watch.reopened {
+        let expired = match watch.last_acp_activity {
+            Some(activity) => activity.elapsed() >= WAKEUP_GRACE,
+            None => watch.started_at.elapsed() >= DISCOVER_GRACE,
+        };
+        return if expired { AgyStep::Done(None) } else { AgyStep::Wait };
+    }
+
     // 5. Wait until all tracked subagents and background tasks are finished
     if !watch.subagents.values().all(|t| t.done) || !watch.bg_tasks.iter().all(|b| b.done) {
         return if timed_out {
-            AgyStep::Done(watch.wake.then(|| agy_resume_req(watch, spec, next_id, pending)))
+            watch.wake_failed = true;
+            AgyStep::Done(None)
         } else {
             AgyStep::Wait
         };
@@ -3927,17 +4096,11 @@ fn step_agy_watch_inner(watch: &mut AgyWatch, spec: &StartSpec, next_id: &mut u6
 
     let done_at = *watch.all_subagents_done_at.get_or_insert_with(tokio::time::Instant::now);
 
-    // 6. Never abort an active wakeup turn with WAKEUP_GRACE; only time out if no wakeup started (or SYSTEM_MESSAGE stayed unanswered)
-    let wakeup_active = watch.wakeup_msg_idx.is_some()
-        && (has_planner_after_wakeup || has_unsettled_after_wakeup || watch.parent_lane.busy());
-    let waiting_start = if watch.wakeup_msg_idx.is_some() {
-        watch.parent.changed_at.map_or(done_at, |t| t.max(done_at))
-    } else {
-        done_at
-    };
-    let grace_exceeded = !wakeup_active
+    // A real wakeup message can precede the first model step by more than WAKEUP_GRACE.
+    // Wait for that step, even on versions that only write the transcript.
+    let grace_exceeded = watch.wakeup_msg_idx.is_none()
         && !parent_steps.get(watch.wake_from..).is_some_and(|tail| tail.iter().any(|s| !agy_step_settled(s)))
-        && waiting_start.elapsed() >= WAKEUP_GRACE;
+        && done_at.elapsed() >= WAKEUP_GRACE;
 
     if grace_exceeded || timed_out {
         let emitted_wakeup_text = watch.emitted_wake_text
@@ -3954,6 +4117,10 @@ fn step_agy_watch_inner(watch: &mut AgyWatch, spec: &StartSpec, next_id: &mut u6
             }
         }
         flush_ready_pending_calls(watch, true);
+        if timed_out && (watch.wake || watch.reopened) {
+            watch.wake_failed = true;
+            return AgyStep::Done(None);
+        }
         return AgyStep::Done(watch.wake.then(|| agy_resume_req(watch, spec, next_id, pending)));
     }
 
@@ -5270,6 +5437,77 @@ mod model_config_tests {
         assert!(evs.iter().any(|e| matches!(&e.body, EventBody::ToolResult { id, output, is_error } if id == "agy-wake:p-wake-grace:7:0" && output == "ALL PASSED" && !*is_error)));
         assert!(evs.iter().any(|e| matches!(&e.body, EventBody::AssistantText { text, .. } if text == "Final result: all passed.")));
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn antigravity_late_acp_reply_rearms_watch_and_is_saved_once() {
+        use super::*;
+        let root = tempfile::tempdir().unwrap();
+        let parent_id = "p-late-reply";
+        let (hub, em, _rx) = crate::hub::test_emitter();
+        let mut steps = vec![
+            json!({"type":"USER_INPUT","status":"DONE","content":"build"}),
+            json!({"type":"PLANNER_RESPONSE","status":"DONE","content":"Waiting for the build."}),
+            json!({"type":"SYSTEM_MESSAGE","status":"DONE","content":"<SYSTEM_MESSAGE>\n[Message] timestamp=x sender=p-late-reply/task-1 priority=MESSAGE_PRIORITY_HIGH content=Build finished\n</SYSTEM_MESSAGE>"}),
+        ];
+        write_agy_steps(root.path(), parent_id, &steps);
+        let mut st = State {
+            is_antigravity: true,
+            session_id: Some(parent_id.into()),
+            agy_wake_from: agy_prompt_boundary(&steps, 0, "Waiting for the build."),
+            ..Default::default()
+        };
+        assert_eq!(st.agy_wake_from, 2, "the wakeup already on disk must be watched");
+        em.event(EventBody::TurnEnd { stop_reason: Some("end_turn".into()), model: None });
+
+        let mut watch = AgyWatch::new(
+            parent_id.into(), root.path().to_path_buf(), 2, 2, None, HashMap::new(), HashMap::new(), true,
+        );
+        watch.detached = true;
+        st.agy_watch = Some(watch);
+        let spec = agy_test_spec();
+        assert!(poll_agy_watch(&mut st, &spec, &em).is_none());
+        st.agy_watch.as_mut().unwrap().all_subagents_done_at =
+            Some(tokio::time::Instant::now() - std::time::Duration::from_secs(25));
+        assert!(poll_agy_watch(&mut st, &spec, &em).is_none());
+        assert!(st.agy_watch.is_some(), "a known wakeup may take longer than 20s to respond");
+        assert_eq!(hub.info("s").unwrap().status, SessionStatus::Idle);
+
+        // The ACP update also has to recover if no watch is available. Child updates must not do it.
+        st.agy_watch = None;
+        let mut chunk = json!({
+            "sessionId":"a-child",
+            "update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Build passed"}}
+        });
+        assert!(agy_detached_update(&mut st, &chunk, || root.path().to_path_buf()));
+        assert!(st.agy_watch.is_none());
+        chunk["sessionId"] = json!(parent_id);
+        assert!(agy_detached_update(&mut st, &chunk, || root.path().to_path_buf()));
+        assert!(poll_agy_watch(&mut st, &spec, &em).is_none());
+        assert_eq!(hub.info("s").unwrap().status, SessionStatus::Running);
+
+        steps.push(json!({"step_index":3,"type":"PLANNER_RESPONSE","status":"RUNNING","content":"Build passed"}));
+        write_agy_steps(root.path(), parent_id, &steps);
+        assert!(poll_agy_watch(&mut st, &spec, &em).is_none());
+        assert_eq!(st.agy_watch.as_ref().unwrap().preview, Some((3, "Build passed".into())));
+        steps[3]["status"] = json!("DONE");
+        steps[3]["content"] = json!("Build passed, all checks green.");
+        write_agy_steps(root.path(), parent_id, &steps);
+        assert!(poll_agy_watch(&mut st, &spec, &em).is_none());
+        assert_eq!(poll_agy_watch(&mut st, &spec, &em).unwrap()["method"], "session/resume");
+        assert_eq!(hub.info("s").unwrap().status, SessionStatus::Idle);
+        assert_eq!(st.agy_wake_from, 4);
+
+        assert!(agy_detached_update(&mut st, &chunk, || root.path().to_path_buf()));
+        assert!(poll_agy_watch(&mut st, &spec, &em).is_none());
+        assert_eq!(hub.info("s").unwrap().status, SessionStatus::Idle);
+        let events = hub.store.events_since("s", 0, 100).unwrap();
+        let replies: Vec<_> = events.iter().filter_map(|event| match &event.body {
+            EventBody::AssistantText { id, text } => Some((id.as_str(), text.as_str())),
+            _ => None,
+        }).collect();
+        assert_eq!(replies, [("agy-wake-p-late-reply-a-3", "Build passed, all checks green.")]);
+        assert_eq!(events.iter().filter(|event| matches!(event.body, EventBody::TurnEnd { .. })).count(), 2);
     }
 
     #[test]
