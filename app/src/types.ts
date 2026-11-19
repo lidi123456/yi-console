@@ -146,6 +146,14 @@ export interface QueuedMessage {
   images: number;
 }
 
+export interface UserMessageSummary {
+  seq: number;
+  ts: number;
+  text: string;
+  images?: number;
+  origin?: string;
+}
+
 export interface SlashCommand {
   name: string;
   description?: string;

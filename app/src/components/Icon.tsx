@@ -81,6 +81,9 @@ const paths: Record<string, string> = {
   external: 'M14 4h6v6M20 4l-9 9M18 14v6H4V6h6',
   upload: 'M12 16V5M7 10l5-5 5 5M5 20h14',
   clock: 'M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18zM12 7v5l3 2',
+  list: 'M8 6h12M8 12h12M8 18h12M4 6h.01M4 12h.01M4 18h.01',
+  locate: 'M12 3v3M12 18v3M3 12h3M18 12h3M12 12m-5 0a5 5 0 1 0 10 0a5 5 0 1 0-10 0',
+  reply: 'M9 14L4 9l5-5M4 9h10.5a5.5 5.5 0 0 1 5.5 5.5v0a5.5 5.5 0 0 1-5.5 5.5H11',
 };
 
 export function Icon({ name, size = 18 }: { name: keyof typeof paths | string; size?: number }) {

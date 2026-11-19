@@ -31,6 +31,12 @@ import { noteOwnerMessage } from '../bots';
 
 const t = getT('composer');
 
+/** Refill a past user prompt (text + <yi-context> pills) into this session's input box */
+export const RESTORE_COMPOSER = 'yi-console:restore-composer';
+export function restoreToComposer(sessionId: string, text: string) {
+  window.dispatchEvent(new CustomEvent(RESTORE_COMPOSER, { detail: { sessionId, text } }));
+}
+
 /** Matching for / commands: name prefix > word start in name > name contains > description contains > name subsequence; descriptions aren't fuzzy-matched, or everything would match */
 function cmdScore(label: string, desc: string, q: string) {
   const name = label.toLowerCase();
@@ -350,6 +356,24 @@ export function Composer({
     return () => window.removeEventListener(ADD_CONTEXT_REF, onAddRef);
   }, [info.id]);
 
+  // Refill a past prompt from the prompt outline or sticky current-prompt bar
+  useEffect(() => {
+    const onRestore = (e: Event) => {
+      const d = (e as CustomEvent<{ sessionId: string; text: string }>).detail;
+      if (d.sessionId !== info.id) return;
+      restoreMessageToComposer(d.text);
+      requestAnimationFrame(() => {
+        const el = ta.current;
+        if (!el) return;
+        el.focus();
+        el.setSelectionRange(el.value.length, el.value.length);
+        setCaret(el.value.length);
+      });
+    };
+    window.addEventListener(RESTORE_COMPOSER, onRestore);
+    return () => window.removeEventListener(RESTORE_COMPOSER, onRestore);
+  }, [info.id]);
+
   // ---------- / and @ popup menus ----------
   const before = text.slice(0, caret);
   const slash = /^\/(\S*)$/.exec(before);
@@ -586,7 +610,8 @@ export function Composer({
   const restoreMessageToComposer = (rawText: string) => {
     const parsed = parseContextMessage(rawText);
     if (parsed.refs.length) {
-      setRefs((cur) => [...cur, ...parsed.refs.filter((r) => !cur.some((x) => sameContextRef(x, r)))]);
+      const fresh = parsed.refs.map((r) => ({ ...r, id: nextContextRefId() }));
+      setRefs((cur) => [...cur, ...fresh.filter((r) => !cur.some((x) => sameContextRef(x, r)))]);
     }
     if (parsed.text) setText((cur) => (cur.trim() ? `${cur}\n${parsed.text}` : parsed.text));
     ta.current?.focus();

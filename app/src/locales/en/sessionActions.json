@@ -57,5 +57,6 @@
   "noReadableLogForThisTerminalSession": "Couldn't find the tool's log for this terminal session. Nothing may have been said yet, or several sessions of this tool are open in the same folder and it can't tell which one is this.",
   "newWithSameSettings": "New Session with Same Settings",
   "switchOrManageAccount": "Switch / Manage Account…",
-  "memory": "Personal Memory…"
+  "memory": "Personal Memory…",
+  "promptOutline": "Prompt Outline"
 }

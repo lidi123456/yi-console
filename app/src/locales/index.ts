@@ -42,6 +42,7 @@ import zhPalette from './zh/palette.json';
 import zhPlanDock from './zh/planDock.json';
 import zhPortsView from './zh/portsView.json';
 import zhPrefsView from './zh/prefsView.json';
+import zhPromptNav from './zh/promptNav.json';
 import zhQrScanner from './zh/qrScanner.json';
 import zhQuestionCard from './zh/questionCard.json';
 import zhQuickOpen from './zh/quickOpen.json';
@@ -99,6 +100,7 @@ import enPalette from './en/palette.json';
 import enPlanDock from './en/planDock.json';
 import enPortsView from './en/portsView.json';
 import enPrefsView from './en/prefsView.json';
+import enPromptNav from './en/promptNav.json';
 import enQrScanner from './en/qrScanner.json';
 import enQuestionCard from './en/questionCard.json';
 import enQuickOpen from './en/quickOpen.json';
@@ -159,6 +161,7 @@ export const resources = {
     planDock: zhPlanDock,
     portsView: zhPortsView,
     prefsView: zhPrefsView,
+    promptNav: zhPromptNav,
     qrScanner: zhQrScanner,
     questionCard: zhQuestionCard,
     quickOpen: zhQuickOpen,
@@ -218,6 +221,7 @@ export const resources = {
     planDock: enPlanDock,
     portsView: enPortsView,
     prefsView: enPrefsView,
+    promptNav: enPromptNav,
     qrScanner: enQrScanner,
     questionCard: enQuestionCard,
     quickOpen: enQuickOpen,

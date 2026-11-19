@@ -4,8 +4,8 @@ import { canUseComputer } from '../computerUse';
 import { canUseBrowser } from '../browserUse';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useBack } from '../back';
-import { getT, isEn } from '../i18n';
-import { errorToast, hostStatus, loadOlder, loadSession, navigate, setState, skey, toast, useSessionData, useStore } from '../store';
+import { getT, isEn, useLang } from '../i18n';
+import { errorToast, getState, hostStatus, loadOlder, loadSession, loadUserMessages, navigate, setState, skey, toast, useSessionData, useStore } from '../store';
 import { rpc } from '../transport';
 import { TOOL_LABEL, supportsAccountsTool, type QuestionAnswer, type ToolAccountsSummary } from '../types';
 import { fmtUsage, isMobile, lsGet, lsSet, shortPath, STATUS_LABEL } from '../util';
@@ -18,8 +18,9 @@ import { TermPanel } from './TermPanel';
 import { AsyncAskCard, ChatView, openAsyncAsk, PermissionCard, setChatStyle, useChatStyle } from './ChatView';
 import { PlanDock } from './PlanDock';
 import { LimitDock } from './LimitDock';
-import { Composer } from './Composer';
+import { Composer, restoreToComposer } from './Composer';
 import { Icon, ToolBadge } from './Icon';
+import { PromptOutlinePanel, PromptOutlineSheet, PromptStickyBar, PromptTickRail, buildPromptEntries } from './PromptNav';
 import { TermTools, TerminalView } from './TerminalView';
 import { StatusLine } from './StatusLine';
 import { BgTasks } from './BgTasks';
@@ -28,8 +29,26 @@ import { SessionMemoryDrawer } from './MemoryView';
 import { SessionBotBar } from './BotsSection';
 
 const t = getT('sessionView');
+const tp = getT('promptNav');
 /** Sessions whose AI browser view was opened automatically in this window */
 const autoOpened = new Set<string>();
+
+function useNarrowViewport() {
+  const [narrow, setNarrow] = useState(() =>
+    typeof window !== 'undefined' && typeof window.matchMedia === 'function'
+      ? window.matchMedia('(max-width: 760px)').matches
+      : isMobile(),
+  );
+  useEffect(() => {
+    if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return;
+    const mq = window.matchMedia('(max-width: 760px)');
+    const sync = () => setNarrow(mq.matches);
+    sync();
+    mq.addEventListener('change', sync);
+    return () => mq.removeEventListener('change', sync);
+  }, []);
+  return narrow;
+}
 
 export function SessionView({ hostId, sessionId, seq }: { hostId: string; sessionId: string; seq?: number }) {
   const key = skey(hostId, sessionId);
@@ -173,6 +192,219 @@ export function SessionView({ hostId, sessionId, seq }: { hostId: string; sessio
     lsSet(skipKey, next);
   };
   const openAsk = ask && !skippedAsks.includes(ask.id) ? ask : null;
+
+  const [, lang] = useLang();
+  const mobileViewport = useNarrowViewport();
+  const isChatMode = !!info && info.tool !== 'files' && info.tool !== 'shell' && info.mode === 'structured';
+  const pinKey = `prompt-outline-pin-${key}`;
+  const [outlinePinned, setOutlinePinned] = useState(() => lsGet(pinKey, false));
+  useEffect(() => {
+    setOutlinePinned(lsGet(pinKey, false));
+  }, [pinKey]);
+  const [outlineMode, setOutlineMode] = useState<'none' | 'hover' | 'click'>('none');
+  const [promptScroll, setPromptScroll] = useState<{ activeSeq: number | null; stickyVisible: boolean }>({
+    activeSeq: null,
+    stickyVisible: false,
+  });
+  const [jumpReq, setJumpReq] = useState<{ seq: number; nonce: number } | null>(null);
+  const [jumpingSeq, setJumpingSeq] = useState<number | null>(null);
+  const jumpNonce = useRef(0);
+  const stepAnchorRef = useRef<{ seq: number; until: number } | null>(null);
+  const popoverRef = useRef<HTMLDivElement>(null);
+  const hoverTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const searchFocused = useRef(false);
+
+  const clearHoverTimer = () => {
+    if (hoverTimer.current) {
+      clearTimeout(hoverTimer.current);
+      hoverTimer.current = null;
+    }
+  };
+
+  useEffect(() => {
+    clearHoverTimer();
+    searchFocused.current = false;
+    stepAnchorRef.current = null;
+    setOutlineMode('none');
+    setJumpReq(null);
+    setJumpingSeq(null);
+    setPromptScroll({ activeSeq: null, stickyVisible: false });
+  }, [key]);
+
+  useEffect(() => () => clearHoverTimer(), []);
+
+  const docked = isChatMode && outlinePinned && !mobileViewport && !files;
+
+  const loadedUserSeqs = useMemo(() => {
+    const s = new Set<number>();
+    for (const e of data.events) {
+      if (e.kind === 'user_message' && e.seq > 0) s.add(e.seq);
+    }
+    return s;
+  }, [data.events, data.events.length]);
+
+  const hideCompactCmd = info?.tool === 'claude' || info?.tool === 'codex' || info?.tool === 'cursor' || info?.tool === 'antigravity';
+  const prompts = useMemo(
+    () =>
+      buildPromptEntries(data.userMessages, loadedUserSeqs, hideCompactCmd, {
+        images: (n) => tp('imagesSummary', { count: n }),
+        refs: (n) => tp('refsSummary', { count: n }),
+        empty: tp('emptyPromptFallback'),
+      }),
+    [data.userMessages, loadedUserSeqs, hideCompactCmd, lang],
+  );
+  const promptSeqs = useMemo(() => prompts.map((p) => p.seq), [prompts]);
+
+  useEffect(() => {
+    if (
+      connected &&
+      isChatMode &&
+      data.loaded &&
+      data.hasMore &&
+      !data.userMessagesLoaded &&
+      !data.userMessagesLoading &&
+      !data.userMessagesUnsupported
+    ) {
+      loadUserMessages(hostId, sessionId).catch(() => {});
+    }
+  }, [
+    connected,
+    isChatMode,
+    hostId,
+    sessionId,
+    data.loaded,
+    data.hasMore,
+    data.userMessagesLoaded,
+    data.userMessagesLoading,
+    data.userMessagesUnsupported,
+  ]);
+
+  const jumpToPrompt = (targetSeq: number) => {
+    stepAnchorRef.current = { seq: targetSeq, until: Date.now() + 900 };
+    setJumpingSeq(targetSeq);
+    setJumpReq({ seq: targetSeq, nonce: ++jumpNonce.current });
+  };
+
+  const stepPrompt = (delta: -1 | 1) => {
+    if (!prompts.length) return;
+    const anchorSeq =
+      stepAnchorRef.current && Date.now() < stepAnchorRef.current.until
+        ? stepAnchorRef.current.seq
+        : promptScroll.activeSeq;
+    let curIdx = anchorSeq != null ? prompts.findIndex((p) => p.seq === anchorSeq) : prompts.length - 1;
+    if (curIdx < 0) curIdx = prompts.length - 1;
+    const nextIdx = Math.max(0, Math.min(prompts.length - 1, curIdx + delta));
+    const target = prompts[nextIdx];
+    if (target && (nextIdx !== curIdx || target.seq !== anchorSeq)) {
+      jumpToPrompt(target.seq);
+    }
+  };
+
+  const stepPromptRef = useRef(stepPrompt);
+  stepPromptRef.current = stepPrompt;
+  useEffect(() => {
+    if (!isChatMode || prompts.length === 0) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.isComposing || e.keyCode === 229) return;
+      if (getState().palette) return;
+      const mod = /Mac|iPhone|iPad/.test(navigator.platform) ? e.metaKey : e.ctrlKey;
+      if (!e.altKey || !e.shiftKey || mod) return;
+      if (e.key === 'ArrowUp' || e.key === 'ArrowDown') {
+        e.preventDefault();
+        stepPromptRef.current(e.key === 'ArrowUp' ? -1 : 1);
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [isChatMode, prompts.length]);
+
+  const scheduleHoverClose = () => {
+    clearHoverTimer();
+    hoverTimer.current = setTimeout(() => {
+      if (!searchFocused.current) setOutlineMode((m) => (m === 'hover' ? 'none' : m));
+    }, 220);
+  };
+
+  const openHoverOutline = () => {
+    clearHoverTimer();
+    hoverTimer.current = setTimeout(() => {
+      hoverTimer.current = null;
+      setOutlineMode((m) => (m === 'none' ? 'hover' : m));
+    }, 180);
+  };
+
+  const closeOutline = () => {
+    clearHoverTimer();
+    searchFocused.current = false;
+    if (docked) {
+      setOutlinePinned(false);
+      lsSet(pinKey, false);
+    }
+    setOutlineMode('none');
+  };
+
+  const togglePinOutline = () => {
+    const next = !outlinePinned;
+    setOutlinePinned(next);
+    lsSet(pinKey, next);
+    clearHoverTimer();
+    if (next && files && !mobileViewport) {
+      lsSet(filesKey, false);
+      setFiles(false);
+      setFileOpen(false);
+      setFull(false);
+    }
+    setOutlineMode(next ? 'none' : 'click');
+  };
+
+  const toggleOutlineBtn = () => {
+    clearHoverTimer();
+    if (docked) {
+      setOutlinePinned(false);
+      lsSet(pinKey, false);
+      setOutlineMode('none');
+      return;
+    }
+    setOutlineMode((m) => (m === 'click' ? 'none' : 'click'));
+  };
+
+  useBack(!mobileViewport && !docked && outlineMode === 'click', () => setOutlineMode('none'));
+
+  useEffect(() => {
+    if (mobileViewport || docked || outlineMode === 'none') return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.isComposing || e.keyCode === 229) return;
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        e.stopPropagation();
+        clearHoverTimer();
+        searchFocused.current = false;
+        setOutlineMode('none');
+      }
+    };
+    const onDown = (e: PointerEvent) => {
+      const target = e.target as HTMLElement | null;
+      if (target?.closest('[data-outline-trigger]')) return;
+      if (popoverRef.current && target && !popoverRef.current.contains(target)) {
+        clearHoverTimer();
+        searchFocused.current = false;
+        setOutlineMode('none');
+      }
+    };
+    window.addEventListener('keydown', onKey, true);
+    document.addEventListener('pointerdown', onDown);
+    return () => {
+      window.removeEventListener('keydown', onKey, true);
+      document.removeEventListener('pointerdown', onDown);
+    };
+  }, [mobileViewport, docked, outlineMode]);
+
+  const showRail = isChatMode && !mobileViewport && !docked && !files && prompts.length >= 2;
+  const outlineActive = docked || outlineMode !== 'none';
+  const refillPrompt = (rawText: string) => {
+    restoreToComposer(sessionId, rawText);
+    toast(tp('refilled'));
+  };
 
   if (!info) {
     return (
@@ -357,6 +589,19 @@ export function SessionView({ hostId, sessionId, seq }: { hostId: string; sessio
             <Icon name="book" size={16} />
           </button>
         )}
+        {isChatMode && (
+          <button
+            type="button"
+            data-outline-trigger="1"
+            className={`icon-btn ${outlineActive ? 'active' : ''}`}
+            title={prompts.length > 0 ? t('promptOutlineCount', { count: prompts.length }) : t('promptOutline')}
+            aria-label={t('promptOutline')}
+            aria-expanded={outlineActive}
+            onClick={toggleOutlineBtn}
+          >
+            <Icon name="list" size={17} />
+          </button>
+        )}
         <button className="icon-btn" title={t('viewChanges')} aria-label={t('viewChanges')} onClick={() => showChanges(hostId, sessionId)}>
           <Icon name="diff" size={17} />
         </button>
@@ -393,6 +638,7 @@ export function SessionView({ hostId, sessionId, seq }: { hostId: string; sessio
                 inSession: true,
                 onUsage: () => setUsage(true),
                 onMemory: () => setMemoryOpen(true),
+                onPromptOutline: isChatMode ? toggleOutlineBtn : undefined,
                 term,
                 onToggleTerm: toggleTerm,
                 style,
@@ -439,67 +685,162 @@ export function SessionView({ hostId, sessionId, seq }: { hostId: string; sessio
           )}
         </>
       ) : (
-        <>
-          <ChatView
-            events={data.events}
-            live={data.live}
-            liveThinking={data.liveThinking}
-            info={info}
-            hostId={hostId}
-            onAnswer={answer}
-            hasMore={data.hasMore}
-            loadingOlder={data.loadingOlder}
-            loading={data.loading}
-            onLoadOlder={() => loadOlder(hostId, sessionId).catch(errorToast)}
-            focusSeq={seq}
-            pendingOutside
-            skippedAsks={skippedAsks}
-          />
-          <div className="composer-wrap">
-            <BgTasks hostId={hostId} info={info} />
-            <PlanDock events={data.events} busy={info.status === 'running' || info.status === 'starting'} alive={connected && alive} />
-            <LimitDock hostId={hostId} info={info} connected={connected} />
-            {info.status === 'error' && (
-              <div className="session-recover" role="status">
-                <span className="session-recover-text">
-                  {t('theToolProcessExitedUnexpectedly')}
-                </span>
-                <button className="btn primary small" disabled={!connected || recovering} onClick={recover}>
-                  {recovering && <span className="spinner" />}
-                  {recovering ? t('resuming') : t('resumeSession')}
-                </button>
-              </div>
-            )}
-            {(pending.length > 0 || openAsk) && (
-              <div className="pending-perms">
-                {pending.map((p) => (
-                  <PermissionCard key={p.requestId} it={p} onAnswer={answer} compact />
-                ))}
-                {openAsk && (
-                  <AsyncAskCard key={openAsk.id} ask={openAsk} tool={info.tool} compact onSend={sendText} onSkip={() => skipAsk(openAsk.id)} />
-                )}
-              </div>
-            )}
-            <Composer
-              hostId={hostId}
-              info={info}
-              connected={connected}
-              desktopControls={
-                canUseComputer(hostStatus(hostId).hello, info) || canUseBrowser(hostStatus(hostId).hello, info) ? (
-                  <>
-                    {canUseComputer(hostStatus(hostId).hello, info) && <ComputerUsePanel hostId={hostId} info={info} connected={connected} revision={desktopRevision} />}
-                    {canUseBrowser(hostStatus(hostId).hello, info) && <BrowserUsePanel hostId={hostId} info={info} connected={connected} revision={browserRevision} />}
-                  </>
-                ) : undefined
-              }
-              onPrewarm={prewarm}
-              onInterrupt={() => act('session.interrupt')}
-              onExport={() => exportSession(hostId, info, 'download')}
-              onRename={rename}
-            />
-            <StatusLine hostId={hostId} info={info} events={data.events} />
+        <div className="session-body-split">
+          <div className="session-chat-col">
+            <div className="chat-stage">
+              <PromptStickyBar
+                prompts={prompts}
+                activeSeq={promptScroll.activeSeq}
+                visible={promptScroll.stickyVisible && prompts.length > 0}
+                mobile={mobileViewport}
+                outlineOpen={outlineActive}
+                hasRail={showRail}
+                hostId={hostId}
+                sessionId={sessionId}
+                cwd={info.cwd}
+                onJump={jumpToPrompt}
+                onStep={stepPrompt}
+                onToggleOutline={toggleOutlineBtn}
+                onRefill={refillPrompt}
+              />
+              {showRail && (
+                <PromptTickRail
+                  prompts={prompts}
+                  activeSeq={promptScroll.activeSeq}
+                  lit={outlineMode !== 'none'}
+                  onHoverEnter={openHoverOutline}
+                  onHoverLeave={scheduleHoverClose}
+                  onJump={jumpToPrompt}
+                />
+              )}
+              {!mobileViewport && !docked && outlineMode !== 'none' && (
+                <div
+                  ref={popoverRef}
+                  className={`outline-card outline-popover ${showRail ? '' : 'no-rail'}`}
+                  onMouseEnter={clearHoverTimer}
+                  onMouseLeave={() => {
+                    if (outlineMode === 'hover') scheduleHoverClose();
+                  }}
+                >
+                  <PromptOutlinePanel
+                    mode="popover"
+                    prompts={prompts}
+                    activeSeq={promptScroll.activeSeq}
+                    jumpingSeq={jumpingSeq}
+                    fullIndexed={data.userMessagesLoaded && !data.userMessagesUnsupported}
+                    hasMore={data.hasMore}
+                    loadingIndex={data.userMessagesLoading}
+                    loadingOlder={data.loadingOlder}
+                    pinned={outlinePinned}
+                    onJump={jumpToPrompt}
+                    onStep={stepPrompt}
+                    onRefill={refillPrompt}
+                    onTogglePin={togglePinOutline}
+                    onClose={() => {
+                      clearHoverTimer();
+                      searchFocused.current = false;
+                      setOutlineMode('none');
+                    }}
+                    onLoadOlder={() => loadOlder(hostId, sessionId).catch(errorToast)}
+                    onSearchFocusChange={(focused) => {
+                      searchFocused.current = focused;
+                      if (focused) clearHoverTimer();
+                    }}
+                  />
+                </div>
+              )}
+              <ChatView
+                events={data.events}
+                live={data.live}
+                liveThinking={data.liveThinking}
+                info={info}
+                hostId={hostId}
+                onAnswer={answer}
+                hasMore={data.hasMore}
+                loadingOlder={data.loadingOlder}
+                loading={data.loading}
+                onLoadOlder={(targetSeq) => loadOlder(hostId, sessionId, targetSeq).catch(errorToast)}
+                focusSeq={seq}
+                jumpReq={jumpReq}
+                onJumpDone={() => setJumpingSeq(null)}
+                promptSeqs={promptSeqs}
+                onPromptScrollState={(st) => {
+                  if (stepAnchorRef.current && st.activeSeq === stepAnchorRef.current.seq) {
+                    stepAnchorRef.current = null;
+                  }
+                  setPromptScroll(st);
+                }}
+                pendingOutside
+                skippedAsks={skippedAsks}
+              />
+            </div>
+            <div className="composer-wrap">
+              <BgTasks hostId={hostId} info={info} />
+              <PlanDock events={data.events} busy={info.status === 'running' || info.status === 'starting'} alive={connected && alive} />
+              <LimitDock hostId={hostId} info={info} connected={connected} />
+              {info.status === 'error' && (
+                <div className="session-recover" role="status">
+                  <span className="session-recover-text">
+                    {t('theToolProcessExitedUnexpectedly')}
+                  </span>
+                  <button className="btn primary small" disabled={!connected || recovering} onClick={recover}>
+                    {recovering && <span className="spinner" />}
+                    {recovering ? t('resuming') : t('resumeSession')}
+                  </button>
+                </div>
+              )}
+              {(pending.length > 0 || openAsk) && (
+                <div className="pending-perms">
+                  {pending.map((p) => (
+                    <PermissionCard key={p.requestId} it={p} onAnswer={answer} compact />
+                  ))}
+                  {openAsk && (
+                    <AsyncAskCard key={openAsk.id} ask={openAsk} tool={info.tool} compact onSend={sendText} onSkip={() => skipAsk(openAsk.id)} />
+                  )}
+                </div>
+              )}
+              <Composer
+                hostId={hostId}
+                info={info}
+                connected={connected}
+                desktopControls={
+                  canUseComputer(hostStatus(hostId).hello, info) || canUseBrowser(hostStatus(hostId).hello, info) ? (
+                    <>
+                      {canUseComputer(hostStatus(hostId).hello, info) && <ComputerUsePanel hostId={hostId} info={info} connected={connected} revision={desktopRevision} />}
+                      {canUseBrowser(hostStatus(hostId).hello, info) && <BrowserUsePanel hostId={hostId} info={info} connected={connected} revision={browserRevision} />}
+                    </>
+                  ) : undefined
+                }
+                onPrewarm={prewarm}
+                onInterrupt={() => act('session.interrupt')}
+                onExport={() => exportSession(hostId, info, 'download')}
+                onRename={rename}
+              />
+              <StatusLine hostId={hostId} info={info} events={data.events} />
+            </div>
           </div>
-        </>
+          {docked && (
+            <aside className="outline-dock">
+              <PromptOutlinePanel
+                mode="dock"
+                prompts={prompts}
+                activeSeq={promptScroll.activeSeq}
+                jumpingSeq={jumpingSeq}
+                fullIndexed={data.userMessagesLoaded && !data.userMessagesUnsupported}
+                hasMore={data.hasMore}
+                loadingIndex={data.userMessagesLoading}
+                loadingOlder={data.loadingOlder}
+                pinned={outlinePinned}
+                onJump={jumpToPrompt}
+                onStep={stepPrompt}
+                onRefill={refillPrompt}
+                onTogglePin={togglePinOutline}
+                onClose={closeOutline}
+                onLoadOlder={() => loadOlder(hostId, sessionId).catch(errorToast)}
+              />
+            </aside>
+          )}
+        </div>
       )}
       {term && connected && info.tool !== 'shell' && <TermPanel key={key} hostId={hostId} info={info} onClose={toggleTerm} />}
     </div>
@@ -520,6 +861,24 @@ export function SessionView({ hostId, sessionId, seq }: { hostId: string; sessio
       )}
       {usage && <UsageDialog hostId={hostId} info={info} onClose={() => setUsage(false)} />}
       {memoryOpen && connected && <SessionMemoryDrawer hostId={hostId} cwd={info.cwd} onClose={() => setMemoryOpen(false)} />}
+      {isChatMode && mobileViewport && (
+        <PromptOutlineSheet
+          open={outlineMode !== 'none'}
+          prompts={prompts}
+          activeSeq={promptScroll.activeSeq}
+          jumpingSeq={jumpingSeq}
+          fullIndexed={data.userMessagesLoaded && !data.userMessagesUnsupported}
+          hasMore={data.hasMore}
+          loadingIndex={data.userMessagesLoading}
+          loadingOlder={data.loadingOlder}
+          pinned={false}
+          onJump={jumpToPrompt}
+          onStep={stepPrompt}
+          onRefill={refillPrompt}
+          onClose={() => setOutlineMode('none')}
+          onLoadOlder={() => loadOlder(hostId, sessionId).catch(errorToast)}
+        />
+      )}
     </div>
   );
 }

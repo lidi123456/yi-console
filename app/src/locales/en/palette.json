@@ -5,6 +5,7 @@
     "palette": "Command Palette: jump to session or run action",
     "newSession": "New Session (Alt+N in browser)",
     "switchSession": "Previous / Next session",
+    "switchPrompt": "Previous / Next prompt (in session)",
     "backForward": "Back / Forward",
     "sidebar": "Toggle Sidebar",
     "rename": "Rename current session",

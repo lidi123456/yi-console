@@ -28,6 +28,7 @@ export function getShortcuts(): [string, string][] {
     [`${MOD}+Shift+F`, t('search.all')],
     [`${MOD}+N`, t('shortcuts.newSession')],
     ['Alt+↑ / Alt+↓', t('shortcuts.switchSession')],
+    ['Alt+Shift+↑ / ↓', t('shortcuts.switchPrompt')],
     ['Alt+← / Alt+→', t('shortcuts.backForward')],
     [`${MOD}+B`, t('shortcuts.sidebar')],
     ['F2', t('shortcuts.rename')],
@@ -73,7 +74,7 @@ export function useShortcuts() {
       } else if ((mod && !e.shiftKey && k === 'n') || (e.altKey && !mod && k === 'n')) {
         e.preventDefault();
         newSession();
-      } else if (e.altKey && !mod && (e.key === 'ArrowUp' || e.key === 'ArrowDown')) {
+      } else if (e.altKey && !mod && !e.shiftKey && (e.key === 'ArrowUp' || e.key === 'ArrowDown')) {
         e.preventDefault();
         stepSession(e.key === 'ArrowUp' ? -1 : 1);
       } else if (e.altKey && !mod && (e.key === 'ArrowLeft' || e.key === 'ArrowRight')) {

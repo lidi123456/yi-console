@@ -30,5 +30,7 @@
   "defaultAccount": "Default Account",
   "manageAccounts": "Manage Accounts…",
   "switchedAccount": "Switched this session to \"{{label}}\"",
-  "memory": "View or edit personal long-term memories for this session"
+  "memory": "View or edit personal long-term memories for this session",
+  "promptOutline": "Prompt Outline",
+  "promptOutlineCount": "Prompt Outline ({{count}})"
 }

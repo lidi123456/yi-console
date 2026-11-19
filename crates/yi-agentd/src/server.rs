@@ -596,6 +596,11 @@ pub async fn dispatch(
             let (events, more) = hub.backlog_tail(sid, before, limit)?;
             json!({ "events": events, "hasMore": more })
         }
+        SESSION_USER_MESSAGES => {
+            let sid = s(&p, "sessionId")?;
+            let items = hub.user_messages(sid)?;
+            json!({ "items": items })
+        }
         SESSION_UNSUBSCRIBE => {
             subs.lock().unwrap().remove(s(&p, "sessionId")?);
             Value::Null

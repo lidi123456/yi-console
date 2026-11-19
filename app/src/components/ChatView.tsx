@@ -26,7 +26,7 @@ const t = getT('chatView');
 
 type Item =
   | { k: 'desktop'; key: string; ev: GatewayEvent }
-  | { k: 'user'; key: string; text: string; ts: number; images: ImageRef[]; origin?: string }
+  | { k: 'user'; key: string; seq: number; text: string; ts: number; images: ImageRef[]; origin?: string }
   | { k: 'text'; key: string; ts: number; text: string; id?: string; ask?: AsyncAsk }
   | { k: 'thinking'; key: string; ts: number; text: string }
   | {
@@ -204,7 +204,7 @@ function buildItems(events: HubEvent[], hideCompactCmd = false): Item[] {
           openAsk = null;
         }
         if (!(hideCompactCmd && e.text.trim() === '/compact')) {
-          items.push({ k: 'user', key, text: e.text, ts: e.ts, images: e.images ?? [], origin: e.origin });
+          items.push({ k: 'user', key, seq: e.seq, text: e.text, ts: e.ts, images: e.images ?? [], origin: e.origin });
         }
         turnStart ??= e.ts;
         break;
@@ -1909,6 +1909,10 @@ export function ChatView({
   loading,
   onLoadOlder,
   focusSeq,
+  jumpReq,
+  onJumpDone,
+  promptSeqs,
+  onPromptScrollState,
   pendingOutside,
   skippedAsks,
 }: {
@@ -1924,9 +1928,16 @@ export function ChatView({
   loadingOlder?: boolean;
   /** Fetching the session log from the host (first open, reload) */
   loading?: boolean;
-  onLoadOlder?: () => void;
+  onLoadOlder?: (targetSeq?: number) => void;
   /** Scroll to this message and highlight it (jumped here from global search) */
   focusSeq?: number;
+  /** Trigger an explicit jump/flash to any message seq (supports repeated jumps to the same seq) */
+  jumpReq?: { seq: number; nonce: number } | null;
+  onJumpDone?: () => void;
+  /** Ordered seqs of all user prompts in the session (for tracking active prompt when scrolled above loaded bubbles) */
+  promptSeqs?: readonly number[];
+  /** Called when the visible current prompt or sticky bar visibility changes */
+  onPromptScrollState?: (state: { activeSeq: number | null; stickyVisible: boolean }) => void;
   /** Pending permission requests are already shown elsewhere (above the input box) */
   pendingOutside?: boolean;
   /** Async questions (by id) the user skipped */
@@ -1979,11 +1990,94 @@ export function ChatView({
 
   const [away, setAway] = useState(false);
   const [selectingText, setSelectingText] = useState<string | null>(null);
+  const stickyShownRef = useRef(false);
+  const lastPromptReport = useRef<{ activeSeq: number | null; stickyVisible: boolean }>({
+    activeSeq: null,
+    stickyVisible: false,
+  });
+  const promptStateCb = useRef(onPromptScrollState);
+  promptStateCb.current = onPromptScrollState;
+  const promptSeqsRef = useRef(promptSeqs);
+  promptSeqsRef.current = promptSeqs;
+  const shownLenRef = useRef(0);
+  shownLenRef.current = shown.length;
+  const promptRaf = useRef<number | null>(null);
+
+  const computePromptScroll = () => {
+    const cb = promptStateCb.current;
+    const box = ref.current;
+    if (!cb || !box) return;
+    const containerTop = box.getBoundingClientRect().top;
+    const nodes = box.querySelectorAll<HTMLElement>('[data-prompt-seq]');
+    const allSeqs = promptSeqsRef.current ?? [];
+    let activeSeq: number | null = null;
+    let activeNode: HTMLElement | null = null;
+
+    if (nodes.length > 0) {
+      let chosen: HTMLElement | null = null;
+      for (const n of nodes) {
+        if (n.getBoundingClientRect().top <= containerTop + 80) chosen = n;
+        else break;
+      }
+      if (chosen) {
+        activeNode = chosen;
+        activeSeq = Number(chosen.dataset.promptSeq);
+      } else {
+        const firstSeq = Number(nodes[0].dataset.promptSeq);
+        let earlierSeq: number | null = null;
+        for (const s of allSeqs) {
+          if (s < firstSeq) earlierSeq = s;
+          else break;
+        }
+        if (earlierSeq != null) {
+          activeSeq = earlierSeq;
+        } else {
+          activeNode = nodes[0];
+          activeSeq = firstSeq;
+        }
+      }
+    } else if (allSeqs.length > 0 && shownLenRef.current > 0) {
+      activeSeq = allSeqs[allSeqs.length - 1];
+    }
+
+    let stickyVisible = false;
+    if (activeSeq != null) {
+      if (!activeNode) {
+        stickyVisible = shownLenRef.current > 0;
+      } else {
+        const bottom = activeNode.getBoundingClientRect().bottom;
+        stickyVisible = stickyShownRef.current ? bottom < containerTop + 44 : bottom < containerTop + 16;
+      }
+    }
+    stickyShownRef.current = stickyVisible;
+    const prev = lastPromptReport.current;
+    if (prev.activeSeq !== activeSeq || prev.stickyVisible !== stickyVisible) {
+      lastPromptReport.current = { activeSeq, stickyVisible };
+      cb({ activeSeq, stickyVisible });
+    }
+  };
+
+  const schedulePromptScroll = () => {
+    if (!promptStateCb.current || promptRaf.current != null) return;
+    promptRaf.current = requestAnimationFrame(() => {
+      promptRaf.current = null;
+      computePromptScroll();
+    });
+  };
+
+  useEffect(
+    () => () => {
+      if (promptRaf.current != null) cancelAnimationFrame(promptRaf.current);
+    },
+    [],
+  );
+
   const toBottom = (smooth = false) => {
     const el = ref.current;
     if (!el) return;
     stick.current = true;
     el.scrollTo({ top: el.scrollHeight, behavior: smooth ? 'smooth' : 'auto' });
+    schedulePromptScroll();
   };
   const onScroll = () => {
     const el = ref.current;
@@ -1993,6 +2087,7 @@ export function ChatView({
     const far = gap > el.clientHeight * 0.6;
     if (far !== away) setAway(far);
     if (el.scrollTop < 40 && canOlder && !loadingOlder && keepFrom.current == null) older();
+    schedulePromptScroll();
   };
 
   useLayoutEffect(() => {
@@ -2010,10 +2105,12 @@ export function ChatView({
     if (!el) return;
     const ro = new ResizeObserver(() => {
       if (stick.current && keepFrom.current == null && !selectingIn(el, false)) el.scrollTop = el.scrollHeight;
+      schedulePromptScroll();
     });
     ro.observe(el);
     const diagramResize = () => {
       if (stick.current && keepFrom.current == null && !selectingIn(el, false)) el.scrollTop = el.scrollHeight;
+      schedulePromptScroll();
     };
     el.addEventListener('yi-diagram-resize', diagramResize);
     return () => { ro.disconnect(); el.removeEventListener('yi-diagram-resize', diagramResize); };
@@ -2030,11 +2127,25 @@ export function ChatView({
     seenUser.current = lastUser;
   }, [lastUser]);
 
+  const seenJumpNonce = useRef(0);
+  const handledJumpNonce = useRef(0);
+  const jumpStartedLoaded = useRef(true);
+
   useEffect(() => {
     stick.current = true;
     setLimit(PAGE);
     setSelectingText(null);
+    seenJumpNonce.current = 0;
+    handledJumpNonce.current = 0;
+    jumpStartedLoaded.current = true;
+    stickyShownRef.current = false;
+    lastPromptReport.current = { activeSeq: null, stickyVisible: false };
+    onPromptScrollState?.({ activeSeq: null, stickyVisible: false });
   }, [info?.id]);
+
+  useEffect(() => {
+    schedulePromptScroll();
+  }, [blocks, promptSeqs, info?.id]);
 
   // Jump to a given message: if it isn't loaded yet, keep fetching older ones until we find it or reach the start
   const focused = useRef<number | null>(null);
@@ -2052,8 +2163,50 @@ export function ChatView({
     const first = events.find((e) => e.seq > 0)?.seq ?? Infinity;
     if (first > focusSeq && hasMore && !loadingOlder && onLoadOlder) {
       setLimit(Infinity);
-      onLoadOlder();
+      onLoadOlder(focusSeq);
     } else if (items.length > shown.length) setLimit(Infinity);
+  });
+
+  // Explicit prompt jump (from outline, tick rail, sticky bar, or Alt+Shift+Up/Down)
+  useEffect(() => {
+    if (!jumpReq) return;
+    if (seenJumpNonce.current !== jumpReq.nonce) {
+      seenJumpNonce.current = jumpReq.nonce;
+      jumpStartedLoaded.current = !!ref.current?.querySelector(`[data-key="e${jumpReq.seq}"]`);
+    }
+    if (handledJumpNonce.current === jumpReq.nonce) return;
+    stick.current = false;
+    keepFrom.current = null;
+    const box = ref.current;
+    const el = box?.querySelector(`[data-key="e${jumpReq.seq}"]`) as HTMLElement | null;
+    if (el && box) {
+      handledJumpNonce.current = jumpReq.nonce;
+      const top = el.getBoundingClientRect().top - box.getBoundingClientRect().top + box.scrollTop - 18;
+      box.scrollTo({ top: Math.max(0, top), behavior: jumpStartedLoaded.current ? 'smooth' : 'auto' });
+      el.classList.remove('flash');
+      void el.offsetWidth;
+      el.classList.add('flash');
+      setTimeout(() => el.classList.remove('flash'), 2400);
+      jumpStartedLoaded.current = true;
+      onJumpDone?.();
+      schedulePromptScroll();
+      return;
+    }
+    if (items.some((x) => x.key === `e${jumpReq.seq}`)) {
+      jumpStartedLoaded.current = false;
+      setLimit(Infinity);
+      return;
+    }
+    const first = events.find((e) => e.seq > 0)?.seq ?? Infinity;
+    if (first > jumpReq.seq && hasMore && !loadingOlder && onLoadOlder) {
+      jumpStartedLoaded.current = false;
+      setLimit(Infinity);
+      onLoadOlder(jumpReq.seq);
+    } else if (!hasMore && !loadingOlder) {
+      handledJumpNonce.current = jumpReq.nonce;
+      jumpStartedLoaded.current = true;
+      onJumpDone?.();
+    }
   });
 
   // Compact style: the last group counts as running (expanded, timed) while it's in this turn and the reply body hasn't started
@@ -2135,7 +2288,7 @@ export function ChatView({
               const parsed = parseContextMessage(it.text);
               const shownText = parsed.text;
               return (
-                <div key={it.key} data-key={it.key} className="msg-user">
+                <div key={it.key} data-key={it.key} data-prompt-seq={it.seq} className="msg-user">
                   {it.images.length > 0 && hostId && info && (
                     <div className="msg-imgs">
                       {it.images.map((img) => (

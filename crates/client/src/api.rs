@@ -55,6 +55,7 @@ struct Bulk {
 /// Read-only methods whose replies can be large; they go over `Bulk` when there is one
 const BULK_METHODS: &[&str] = &[
     "session.history",
+    "session.userMessages",
     "history.read",
     "history.list",
     "fs.read",

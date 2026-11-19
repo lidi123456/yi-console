@@ -8,7 +8,7 @@ import { fmtAt } from './limit';
 import { hubCall, onHubEvent, rpc, isTauri } from './transport';
 import { markSeen, recordChange } from './overview';
 import { dropRemoteHost, findBot, mapHost, refreshBots, refreshRemote, refreshRemoteHost, remoteKey, sourceOf } from './bots';
-import { isHostSession, type AccountLoginUpdate, type ClientSettings, type HostConfig, type HostStatus, type HubEvent, type NotifyPrefs, type SessionInfo, type Snippet, type ToolInfo, type ToolJob, type ToolKind } from './types';
+import { isHostSession, type AccountLoginUpdate, type ClientSettings, type HostConfig, type HostStatus, type HubEvent, type NotifyPrefs, type SessionInfo, type Snippet, type ToolInfo, type ToolJob, type ToolKind, type UserMessageSummary } from './types';
 
 const t = getT('store');
 
@@ -146,6 +146,14 @@ export function useStore<T>(sel: (s: State) => T): T {
 export interface SessionData {
   events: HubEvent[];
   seqs: Set<number>;
+  /** Lightweight index of all user messages in the session (for prompt outline navigation) */
+  userMessages: UserMessageSummary[];
+  userMessagesLoaded: boolean;
+  userMessagesLoading: boolean;
+  /** Older remote yi-agentd lacks session.userMessages; fall back to loaded events */
+  userMessagesUnsupported: boolean;
+  /** Latest cleared event seq so in-flight RPCs don't reintroduce pre-clear prompts */
+  clearSeq: number;
   /** Streaming assistant text: id -> text received so far */
   live: Map<string, string>;
   /** Streaming thinking */
@@ -172,6 +180,11 @@ export function getSession(key: string): SessionData {
     d = {
       events: [],
       seqs: new Set(),
+      userMessages: [],
+      userMessagesLoaded: false,
+      userMessagesLoading: false,
+      userMessagesUnsupported: false,
+      clearSeq: 0,
       live: new Map(),
       liveThinking: new Map(),
       loaded: false,
@@ -184,6 +197,17 @@ export function getSession(key: string): SessionData {
     sessionData.set(key, d);
   }
   return d;
+}
+
+function mergeUserMessages(cur: UserMessageSummary[], incoming: UserMessageSummary[], clearSeq: number): UserMessageSummary[] {
+  const bySeq = new Map<number, UserMessageSummary>();
+  for (const m of cur) {
+    if (m.seq > clearSeq) bySeq.set(m.seq, m);
+  }
+  for (const m of incoming) {
+    if (m.seq > clearSeq) bySeq.set(m.seq, m);
+  }
+  return [...bySeq.values()].sort((a, b) => a.seq - b.seq);
 }
 
 function bump(key: string) {
@@ -208,6 +232,7 @@ export function useSessionData(key: string): SessionData {
 function addEvents(key: string, evs: HubEvent[]) {
   const d = getSession(key);
   let changed = false;
+  const addedUsers: UserMessageSummary[] = [];
   for (const e of evs) {
     if (e.kind === 'assistant_delta') {
       d.live.set(e.id, (d.live.get(e.id) ?? '') + e.delta);
@@ -236,6 +261,15 @@ function addEvents(key: string, evs: HubEvent[]) {
       d.live.clear();
       d.liveThinking.clear();
     }
+    if (e.kind === 'user_message' && e.seq > 0 && e.seq > d.clearSeq) {
+      addedUsers.push({
+        seq: e.seq,
+        ts: e.ts,
+        text: e.text,
+        images: e.images?.length || 0,
+        origin: e.origin,
+      });
+    }
     d.events.push(e);
     changed = true;
   }
@@ -246,12 +280,19 @@ function addEvents(key: string, evs: HubEvent[]) {
     let cut = -1;
     for (let i = d.events.length - 1; i >= 0; i--) if (d.events[i].kind === 'cleared') { cut = i; break; }
     if (cut >= 0) {
+      const clearedAt = d.events[cut].seq;
+      d.clearSeq = Math.max(d.clearSeq, clearedAt);
       for (const e of d.events.slice(0, cut + 1)) d.seqs.delete(e.seq);
-      d.seqs.add(d.events[cut].seq);
+      d.seqs.add(clearedAt);
       d.events = d.events.slice(cut + 1);
       d.hasMore = false;
+      d.userMessages = d.userMessages.filter((m) => m.seq > d.clearSeq);
+      d.userMessagesLoaded = true;
       d.live.clear();
       d.liveThinking.clear();
+    }
+    if (addedUsers.length > 0) {
+      d.userMessages = mergeUserMessages(d.userMessages, addedUsers, d.clearSeq);
     }
     bump(key);
   }
@@ -284,8 +325,50 @@ export function setHistoryTail(n: number) {
   lsSet('history-tail', n);
 }
 
-/** Page back: fetch historyTail() events before the current earliest one */
-export async function loadOlder(hostId: string, sid: string) {
+/** Fetch the lightweight index of all user messages for prompt outline navigation (silently degrades on older daemons) */
+export async function loadUserMessages(hostId: string, sid: string, force = false): Promise<void> {
+  const key = skey(hostId, sid);
+  const d = getSession(key);
+  if (d.userMessagesUnsupported && !force) return;
+  if ((d.userMessagesLoaded || d.userMessagesLoading) && !force) return;
+  if (d.loaded && !d.hasMore && !force) {
+    const fromEvents: UserMessageSummary[] = [];
+    for (const e of d.events) {
+      if (e.kind === 'user_message' && e.seq > 0 && e.seq > d.clearSeq) {
+        fromEvents.push({
+          seq: e.seq,
+          ts: e.ts,
+          text: e.text,
+          images: e.images?.length || 0,
+          origin: e.origin,
+        });
+      }
+    }
+    d.userMessages = mergeUserMessages(d.userMessages, fromEvents, d.clearSeq);
+    d.userMessagesLoaded = true;
+    bump(key);
+    return;
+  }
+  d.userMessagesLoading = true;
+  bump(key);
+  try {
+    const r = await rpc<{ items?: UserMessageSummary[] }>(hostId, 'session.userMessages', { sessionId: sid });
+    d.userMessages = mergeUserMessages(d.userMessages, r.items ?? [], d.clearSeq);
+    d.userMessagesLoaded = true;
+    d.userMessagesUnsupported = false;
+  } catch (e) {
+    const msg = errText(e).toLowerCase();
+    if (msg.includes('未知方法') || msg.includes('unknown method') || msg.includes('method not found')) {
+      d.userMessagesUnsupported = true;
+    }
+  } finally {
+    d.userMessagesLoading = false;
+    bump(key);
+  }
+}
+
+/** Page back: fetch historyTail() events (or enough to reach targetSeq in one call) before the current earliest one */
+export async function loadOlder(hostId: string, sid: string, targetSeq?: number) {
   const key = skey(hostId, sid);
   const d = getSession(key);
   if (!d.hasMore || d.loadingOlder) return;
@@ -293,7 +376,11 @@ export async function loadOlder(hostId: string, sid: string) {
   bump(key);
   try {
     const first = d.events.find((e) => e.seq > 0)?.seq;
-    const r = await rpc(hostId, 'session.history', { sessionId: sid, beforeSeq: first, limit: historyTail() });
+    const limit =
+      targetSeq != null && first != null && first > targetSeq
+        ? Math.min(20000, Math.max(historyTail(), first - targetSeq + 80))
+        : historyTail();
+    const r = await rpc(hostId, 'session.history', { sessionId: sid, beforeSeq: first, limit });
     d.hasMore = !!r.hasMore;
     addEvents(key, r.events);
   } finally {
@@ -317,6 +404,10 @@ export async function loadSession(hostId: string, sid: string, force = false) {
     if (force) {
       d.events = [];
       d.seqs.clear();
+      d.userMessages = [];
+      d.userMessagesLoaded = false;
+      d.userMessagesUnsupported = false;
+      d.clearSeq = 0;
       d.live.clear();
       d.liveThinking.clear();
     }
@@ -324,6 +415,11 @@ export async function loadSession(hostId: string, sid: string, force = false) {
     if (r.terminal !== undefined) writeTerm(key, b64(r.terminal), true);
     upsertSession(hostId, r.info);
     d.loaded = true;
+    if (!d.hasMore) {
+      d.userMessagesLoaded = true;
+    } else {
+      loadUserMessages(hostId, sid).catch(() => {});
+    }
   } finally {
     d.loading = false;
     bump(key);

@@ -30,5 +30,7 @@
   "defaultAccount": "默认账号",
   "manageAccounts": "管理账号…",
   "switchedAccount": "已将当前会话切换至「{{label}}」",
-  "memory": "查看或编辑本会话的个人长期记忆"
+  "memory": "查看或编辑本会话的个人长期记忆",
+  "promptOutline": "提问目录",
+  "promptOutlineCount": "提问目录 ({{count}})"
 }

@@ -402,6 +402,19 @@ pub struct QueuedMessage {
     pub images: u32,
 }
 
+/// Lightweight summary of a user message in a session, for prompt outline navigation
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct UserMessageSummary {
+    pub seq: i64,
+    pub ts: i64,
+    pub text: String,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub images: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+}
+
 /// A slash command provided by the tool
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -1427,6 +1440,9 @@ pub mod methods {
     pub const SESSION_STATUS_LINE: &str = "session.statusLine";
     /// Page back to older events: {sessionId, beforeSeq, limit} → {events, hasMore}
     pub const SESSION_HISTORY: &str = "session.history";
+    /// All user messages in a session (lightweight outline for long-session prompt navigation):
+    /// {sessionId} -> {items: [UserMessageSummary]}
+    pub const SESSION_USER_MESSAGES: &str = "session.userMessages";
     /// Fetch an image from a user message {sessionId, imageId} -> {mimeType, data(base64)}
     pub const SESSION_IMAGE: &str = "session.image";
     /// Files pasted / dropped into the input box are saved to the session's upload directory; returns the absolute path on the host, and the frontend inserts an @path reference

@@ -2634,6 +2634,11 @@ impl Hub {
         self.store.events_tail(id, before, limit.clamp(1, 20_000))
     }
 
+    pub fn user_messages(&self, id: &str) -> Result<Vec<UserMessageSummary>> {
+        self.get(id)?;
+        self.store.user_messages(id)
+    }
+
     pub fn term_snapshot(&self, id: &str) -> Result<Vec<u8>> {
         let rt = self.get(id)?;
         let t = rt.term.lock().unwrap();

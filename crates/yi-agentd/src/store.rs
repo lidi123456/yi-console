@@ -1,7 +1,7 @@
 //! SQLite persistence: session metadata, event log, usage records, queued messages.
 
 use anyhow::Result;
-use yi_proto::{Event, EventBody, ModelConfigOption, SessionInfo, Usage};
+use yi_proto::{Event, EventBody, ModelConfigOption, SessionInfo, Usage, UserMessageSummary};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 use std::sync::Mutex;
@@ -255,6 +255,33 @@ impl Store {
         Ok(n as u32)
     }
 
+    /// Lightweight summaries of all user messages in a session, in ascending seq order
+    pub fn user_messages(&self, session_id: &str) -> Result<Vec<UserMessageSummary>> {
+        let c = self.conn.lock().unwrap();
+        let mut st = c.prepare(
+            "SELECT seq, ts, body FROM events
+             WHERE session_id = ?1 AND json_extract(body, '$.kind') = 'user_message'
+             ORDER BY seq ASC",
+        )?;
+        let rows = st.query_map(params![session_id], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?))
+        })?;
+        let mut out = vec![];
+        for r in rows {
+            let (seq, ts, raw) = r?;
+            if let Ok(EventBody::UserMessage { text, images, origin }) = serde_json::from_str::<EventBody>(&raw) {
+                out.push(UserMessageSummary {
+                    seq,
+                    ts,
+                    text,
+                    images: images.len() as u32,
+                    origin,
+                });
+            }
+        }
+        Ok(out)
+    }
+
     pub fn max_seq(&self, session_id: &str) -> Result<i64> {
         let c = self.conn.lock().unwrap();
         let v: Option<i64> = c
@@ -437,5 +464,125 @@ mod tests {
         assert_eq!(s.search("kind", 10).unwrap().len(), 0);
         s.delete_session("a").unwrap();
         assert_eq!(s.max_seq("a").unwrap(), 0);
+    }
+
+    #[test]
+    fn user_messages_returns_ordered_summaries_and_respects_clear() {
+        let s = Store::open_memory().unwrap();
+        s.save_session(&info("a")).unwrap();
+        s.save_session(&info("b")).unwrap();
+        s.append_event(
+            "a",
+            &Event {
+                seq: 1,
+                ts: 100,
+                body: EventBody::UserMessage {
+                    text: "first prompt".into(),
+                    images: vec![ImageRef { id: "img-1".into(), mime_type: "image/png".into() }],
+                    origin: None,
+                },
+            },
+        )
+        .unwrap();
+        s.append_event(
+            "a",
+            &Event {
+                seq: 2,
+                ts: 110,
+                body: EventBody::AssistantText { id: "r1".into(), text: "reply".into() },
+            },
+        )
+        .unwrap();
+        s.append_event(
+            "a",
+            &Event {
+                seq: 3,
+                ts: 120,
+                body: EventBody::ToolCall {
+                    id: "t1".into(),
+                    name: "Bash".into(),
+                    title: "ls".into(),
+                    input: serde_json::Value::Null,
+                    diffs: vec![],
+                },
+            },
+        )
+        .unwrap();
+        s.append_event(
+            "a",
+            &Event {
+                seq: 4,
+                ts: 130,
+                body: EventBody::TurnEnd { stop_reason: Some("end_turn".into()), model: None },
+            },
+        )
+        .unwrap();
+        s.append_event(
+            "a",
+            &Event {
+                seq: 5,
+                ts: 140,
+                body: EventBody::UserMessage {
+                    text: "<notice>bot</notice>".into(),
+                    images: vec![],
+                    origin: Some("bot-engine".into()),
+                },
+            },
+        )
+        .unwrap();
+        s.append_event(
+            "b",
+            &Event {
+                seq: 1,
+                ts: 150,
+                body: EventBody::UserMessage { text: "other".into(), images: vec![], origin: None },
+            },
+        )
+        .unwrap();
+
+        let list = s.user_messages("a").unwrap();
+        assert_eq!(
+            list,
+            vec![
+                UserMessageSummary {
+                    seq: 1,
+                    ts: 100,
+                    text: "first prompt".into(),
+                    images: 1,
+                    origin: None,
+                },
+                UserMessageSummary {
+                    seq: 5,
+                    ts: 140,
+                    text: "<notice>bot</notice>".into(),
+                    images: 0,
+                    origin: Some("bot-engine".into()),
+                },
+            ]
+        );
+
+        s.delete_events("a").unwrap();
+        s.append_event("a", &Event { seq: 6, ts: 200, body: EventBody::Cleared {} }).unwrap();
+        s.append_event(
+            "a",
+            &Event {
+                seq: 7,
+                ts: 210,
+                body: EventBody::UserMessage { text: "after clear".into(), images: vec![], origin: None },
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            s.user_messages("a").unwrap(),
+            vec![UserMessageSummary {
+                seq: 7,
+                ts: 210,
+                text: "after clear".into(),
+                images: 0,
+                origin: None,
+            }]
+        );
+        assert_eq!(s.user_messages("b").unwrap().len(), 1);
     }
 }
