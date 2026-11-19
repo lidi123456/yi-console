@@ -2079,11 +2079,12 @@ fn is_agy_system(step: &Value) -> bool {
 }
 
 /// A SYSTEM_MESSAGE that wakes the parent: a report from a subagent or a background task. agy's own notices
-/// (`sender=system`, e.g. after a settings change) arrive inside a prompt turn and wake nobody
+/// have no sender, or use `sender=system`, and arrive inside a prompt turn without waking the parent.
 fn is_agy_wakeup(step: &Value) -> bool {
     is_agy_system(step) && {
         let content = step["content"].as_str().unwrap_or("");
-        content.contains("<SYSTEM_MESSAGE>") && !content.contains("sender=system ")
+        content.contains("<SYSTEM_MESSAGE>")
+            && extract_system_sender(content).is_some_and(|sender| sender != "system")
     }
 }
 
@@ -4420,6 +4421,14 @@ mod model_config_tests {
         assert_eq!(agy_task_finished(msg), Some(("s1/task-2", "SUB-DONE-42".to_string())));
         assert!(!is_agy_wakeup(&json!({"type":"SYSTEM_MESSAGE","content":"<SYSTEM_MESSAGE>\n[Message] timestamp=x sender=system priority=MESSAGE_PRIORITY_HIGH content=settings changed\n</SYSTEM_MESSAGE>"})));
         assert!(is_agy_wakeup(&json!({"type":"SYSTEM_MESSAGE","content":msg})));
+        assert!(!is_agy_wakeup(&json!({
+            "type":"SYSTEM_MESSAGE",
+            "content":"The following is a <SYSTEM_MESSAGE> not actually sent by the user.\n\n<SYSTEM_MESSAGE>\n[plan review due] Call `enter_plan_mode` now.\n</SYSTEM_MESSAGE>"
+        })));
+        assert!(!is_agy_wakeup(&json!({
+            "type":"SYSTEM_MESSAGE",
+            "content":"The following is a <SYSTEM_MESSAGE> not actually sent by the user.\n\n<SYSTEM_MESSAGE>\nPlan mode is on.\n</SYSTEM_MESSAGE>"
+        })));
         assert_eq!(agy_background_task("Created At: x\nTool is running as a background task with task id: s1/task-2\nTask Description: sleep"), Some("s1/task-2"));
 
         let root = std::env::temp_dir().join(format!("yi-agy-bg-{}", uuid::Uuid::new_v4()));
