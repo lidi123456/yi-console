@@ -1452,7 +1452,8 @@ mod tests {
         sp.account_handoff = Some("<yi-account-handoff>summary</yi-account-handoff>".into());
         let mut st = State::default();
 
-        let init_resp = json!({"id": 1, "result": {}});
+        let init = st.req(Pending::Init, "initialize", json!({}));
+        let init_resp = json!({"id": init["id"], "result": {}});
         let init_out = handle(&mut st, &sp, &init_resp, &em);
         assert_eq!(init_out.len(), 3);
         let resume_id = init_out[2]["id"].as_u64().unwrap();
