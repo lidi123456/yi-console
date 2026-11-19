@@ -129,6 +129,8 @@ struct SessionRt {
     prompt_dirty: Mutex<bool>,
     /// Permission mode changed but needs a process restart to apply (Claude switching to allow-all); restart once this turn ends
     restart_pending: Mutex<bool>,
+    /// An adapter watch (Antigravity's `AgyWatch`) is still waiting for background task discovery or a reactive wakeup turn
+    watch_active: std::sync::atomic::AtomicBool,
     /// Bumped whenever the pending automatic continue changes; a timer only fires while its token is still current
     resume_token: Mutex<u64>,
     /// This turn ended on the usage limit: hold queued messages and send a usage-limit notification instead of "turn finished"
@@ -1090,32 +1092,67 @@ impl Hub {
         })
     }
 
-    fn launch(self: &Arc<Self>, rt: &Arc<SessionRt>, mut spec: StartSpec) -> Result<()> {
+    fn launch(self: &Arc<Self>, rt: &Arc<SessionRt>, spec: StartSpec) -> Result<()> {
+        self.launch_inner(rt, spec, false).map(|_| ())
+    }
+
+    /// Launch only if no process is currently running; otherwise return the existing command channel.
+    /// Prevents concurrent `session.resume` (prewarm) and `session.send` (`deliver`) from racing past `spec_for`
+    /// and overwriting a newly launched process (which would silently drop the delivered prompt).
+    fn launch_if_stopped(
+        self: &Arc<Self>,
+        rt: &Arc<SessionRt>,
+        spec: StartSpec,
+    ) -> Result<mpsc::UnboundedSender<AdapterCmd>> {
+        self.launch_inner(rt, spec, true)
+    }
+
+    fn launch_inner(
+        self: &Arc<Self>,
+        rt: &Arc<SessionRt>,
+        mut spec: StartSpec,
+        only_if_stopped: bool,
+    ) -> Result<mpsc::UnboundedSender<AdapterCmd>> {
         if !spec.tool.has_process() {
             bail!("文件会话没有进程");
+        }
+        if only_if_stopped {
+            if let Some(existing) = self.running_tx(rt) {
+                return Ok(existing);
+            }
         }
         let sid = rt.info.lock().unwrap().id.clone();
         if spec.mode == SessionMode::Structured && spec.tool != ToolKind::Shell {
             self.make_room(&sid);
         }
+        let (tx, rx, gen) = {
+            let mut cmd_slot = rt.cmd.lock().unwrap();
+            if only_if_stopped {
+                if let Some(existing) = cmd_slot.as_ref().filter(|t| !t.is_closed()) {
+                    return Ok(existing.clone());
+                }
+            }
+            if std::mem::take(&mut *rt.prompt_dirty.lock().unwrap()) {
+                spec.system_notice = spec.system_prompt.is_some();
+            }
+            let gen = {
+                let mut g = rt.generation.lock().unwrap();
+                *g += 1;
+                *g
+            };
+            let (tx, rx) = mpsc::unbounded_channel();
+            *cmd_slot = Some(tx.clone());
+            *rt.launched_mode.lock().unwrap() = spec.permission_mode.clone();
+            *rt.mcp_fingerprint.lock().unwrap() = spec.mcp_fingerprint.clone();
+            *rt.restart_pending.lock().unwrap() = false;
+            rt.watch_active.store(false, std::sync::atomic::Ordering::Relaxed);
+            (tx, rx, gen)
+        };
         // The new tool process starts its own desktop, browser, memory and client MCP proxies
         self.desktop.release_proxy(&sid);
         self.browsers.release_proxy(&sid);
         self.memories.release_proxy(&sid);
         self.clients.release_proxies(&sid);
-        if std::mem::take(&mut *rt.prompt_dirty.lock().unwrap()) {
-            spec.system_notice = spec.system_prompt.is_some();
-        }
-        let gen = {
-            let mut g = rt.generation.lock().unwrap();
-            *g += 1;
-            *g
-        };
-        let (tx, rx) = mpsc::unbounded_channel();
-        *rt.cmd.lock().unwrap() = Some(tx);
-        *rt.launched_mode.lock().unwrap() = spec.permission_mode.clone();
-        *rt.mcp_fingerprint.lock().unwrap() = spec.mcp_fingerprint.clone();
-        *rt.restart_pending.lock().unwrap() = false;
         if spec.mode == SessionMode::Terminal && matches!(spec.tool, ToolKind::Codex | ToolKind::Kiro) {
             let mut runs = rt.runs.lock().unwrap();
             let now = now_ms();
@@ -1145,7 +1182,7 @@ impl Hub {
         } else {
             adapters::start(spec, em, rx);
         }
-        Ok(())
+        Ok(tx)
     }
 
     fn running_tx(&self, rt: &SessionRt) -> Option<mpsc::UnboundedSender<AdapterCmd>> {
@@ -1230,8 +1267,7 @@ impl Hub {
             Some(tx) => tx,
             None => {
                 let spec = self.spec_for(info, false, 120, 32)?;
-                self.launch(rt, spec)?;
-                self.running_tx(rt).ok_or_else(|| anyhow!("启动失败"))?
+                self.launch_if_stopped(rt, spec)?
             }
         };
         if info.mode == SessionMode::Structured {
@@ -1570,6 +1606,7 @@ impl Hub {
         rt.last_text.lock().unwrap().clear();
         *rt.interrupted.lock().unwrap() = false;
         *rt.restart_pending.lock().unwrap() = false;
+        rt.watch_active.store(false, std::sync::atomic::Ordering::Relaxed);
         *rt.qoder_plan.lock().unwrap() = None;
         self.store.delete_events(id)?;
         self.store.save_session(&info)?;
@@ -1699,7 +1736,7 @@ impl Hub {
         }
         let replay = info.last_seq == 0 || self.history_missing(&info);
         let spec = self.spec_for(&info, replay, cols, rows)?;
-        self.launch(&rt, spec)
+        self.launch_if_stopped(&rt, spec).map(|_| ())
     }
 
     /// When an ACP session taken over from tool history (Cursor, Kiro…) failed its first session/load (e.g. the session was held by another Kiro),
@@ -1820,6 +1857,7 @@ impl Hub {
         rt.term.lock().unwrap().clear();
         rt.commands.lock().unwrap().clear();
         *rt.interrupted.lock().unwrap() = false;
+        rt.watch_active.store(false, std::sync::atomic::Ordering::Relaxed);
         *rt.info.lock().unwrap() = info.clone();
         self.store.save_session(&info)?;
 
@@ -1974,13 +2012,19 @@ impl Hub {
         Ok(json!({ "text": text }))
     }
 
-    /// The last background task ended: a restart held back for it (permission mode change) runs now if the
-    /// session is idle; a running turn does it at its end (`after_turn`)
+    /// The last background task (or adapter wakeup watch) ended: a restart held back for it (permission mode or
+    /// account switch) runs now if the session is idle; a running turn does it at its end (`after_turn`)
     fn restart_when_settled(self: &Arc<Self>, sid: &str, gen: u64) {
         let Some(rt) = self.alive(sid, gen) else {
             return;
         };
-        if rt.info.lock().unwrap().status != SessionStatus::Idle || !std::mem::take(&mut *rt.restart_pending.lock().unwrap()) {
+        let settled = {
+            let i = rt.info.lock().unwrap();
+            i.status == SessionStatus::Idle
+                && i.background_tasks.is_empty()
+                && !rt.watch_active.load(std::sync::atomic::Ordering::Relaxed)
+        };
+        if !settled || !std::mem::take(&mut *rt.restart_pending.lock().unwrap()) {
             return;
         }
         let (hub, sid) = (self.clone(), sid.to_string());
@@ -2033,8 +2077,9 @@ impl Hub {
         } else {
             *rt.pending_failover.lock().unwrap() = None;
         }
-        // A restart would also end the background tasks (Claude's shells, subagents); it waits until they finish
-        let tasks_left = !rt.info.lock().unwrap().background_tasks.is_empty();
+        // A restart would also end the background tasks (Claude's shells, subagents) or an active wakeup watch; it waits until they finish
+        let tasks_left = !rt.info.lock().unwrap().background_tasks.is_empty()
+            || rt.watch_active.load(std::sync::atomic::Ordering::Relaxed);
         if !tasks_left && std::mem::take(&mut *rt.restart_pending.lock().unwrap()) {
             if let Err(e) = self.relaunch(&rt) {
                 self.emit(sid, 0, EventBody::Error { message: format!("重启会话失败: {e}") });
@@ -2069,7 +2114,22 @@ impl Hub {
     /// End the current process and start it again with the session's current settings (continuing the same tool session)
     fn relaunch(self: &Arc<Self>, rt: &Arc<SessionRt>) -> Result<()> {
         let info = rt.info.lock().unwrap().clone();
+        // Refresh a deferred Level-2 account handoff digest right before relaunch so events produced after the switch aren't missed
+        if info.external_id.is_none() && info.mode == SessionMode::Structured {
+            let needs_refresh = rt
+                .pending_handoff
+                .lock()
+                .unwrap()
+                .as_deref()
+                .is_some_and(|h| h.starts_with("<yi-account-handoff>"));
+            if needs_refresh {
+                if let Some(fresh) = self.handoff_digest(&info.id) {
+                    *rt.pending_handoff.lock().unwrap() = Some(fresh);
+                }
+            }
+        }
         let spec = self.spec_for(&info, false, 120, 32)?;
+        rt.watch_active.store(false, std::sync::atomic::Ordering::Relaxed);
         if let Some(tx) = self.running_tx(rt) {
             // Retire the old generation first: its exit would otherwise show "process ended" before the new process starts
             *rt.generation.lock().unwrap() += 1;
@@ -2116,7 +2176,8 @@ impl Hub {
         };
         if restart {
             let busy = matches!(info.status, SessionStatus::Running | SessionStatus::WaitingPermission)
-                || !info.background_tasks.is_empty();
+                || !info.background_tasks.is_empty()
+                || rt.watch_active.load(std::sync::atomic::Ordering::Relaxed);
             if busy {
                 *rt.restart_pending.lock().unwrap() = true;
             } else {
@@ -2232,7 +2293,10 @@ impl Hub {
     /// Idle ones need a tool session id (to reconnect later); errored ones lose nothing by ending;
     /// with `waiting`, those awaiting approval count too (the approval is voided and redone on the next message)
     fn releasable(rt: &SessionRt, info: &SessionInfo, waiting: bool) -> bool {
-        if !rt.queue.lock().unwrap().is_empty() || !info.background_tasks.is_empty() {
+        if !rt.queue.lock().unwrap().is_empty()
+            || !info.background_tasks.is_empty()
+            || rt.watch_active.load(std::sync::atomic::Ordering::Relaxed)
+        {
             return false;
         }
         match info.status {
@@ -3217,7 +3281,8 @@ impl Hub {
                 false,
             );
         }
-        // The process is gone, and so are its background tasks
+        // The process is gone, and so are its background tasks and watches
+        rt.watch_active.store(false, std::sync::atomic::Ordering::Relaxed);
         self.set_info(sid, gen, |i| {
             let changed = i.model_config_pending || !i.background_tasks.is_empty();
             i.model_config_pending = false;
@@ -3259,6 +3324,7 @@ impl Hub {
             if info.mode == SessionMode::Terminal
                 || matches!(info.status, SessionStatus::Running | SessionStatus::WaitingPermission | SessionStatus::Starting)
                 || !info.background_tasks.is_empty()
+                || rt.watch_active.load(std::sync::atomic::Ordering::Relaxed)
             {
                 return true;
             }
@@ -3279,6 +3345,7 @@ impl Hub {
             if info.mode == SessionMode::Terminal
                 || matches!(info.status, SessionStatus::Running | SessionStatus::WaitingPermission | SessionStatus::Starting)
                 || !info.background_tasks.is_empty()
+                || rt.watch_active.load(std::sync::atomic::Ordering::Relaxed)
             {
                 return true;
             }
@@ -3350,7 +3417,9 @@ impl Hub {
                         i.id.clone(),
                         i.mode == SessionMode::Terminal,
                         i.mode == SessionMode::Structured
-                            && matches!(i.status, SessionStatus::Running | SessionStatus::WaitingPermission),
+                            && (matches!(i.status, SessionStatus::Running | SessionStatus::WaitingPermission)
+                                || !i.background_tasks.is_empty()
+                                || rt.watch_active.load(std::sync::atomic::Ordering::Relaxed)),
                     )
                 };
                 if !busy {
@@ -3401,7 +3470,10 @@ impl Hub {
                 let resolved = self.accounts.resolve(info.tool, info.account_id.as_deref());
                 let expected = self.session_launch_fingerprint(&self.settings.read().unwrap(), &info, desktop, resolved.as_ref());
                 if *rt.mcp_fingerprint.lock().unwrap() != expected {
-                    if matches!(info.status, SessionStatus::Running | SessionStatus::WaitingPermission) {
+                    if matches!(info.status, SessionStatus::Running | SessionStatus::WaitingPermission)
+                        || !info.background_tasks.is_empty()
+                        || rt.watch_active.load(std::sync::atomic::Ordering::Relaxed)
+                    {
                         *rt.restart_pending.lock().unwrap() = true;
                     } else if let Some(tx) = rt.cmd.lock().unwrap().take() {
                         *rt.generation.lock().unwrap() += 1;
@@ -3620,7 +3692,9 @@ impl Hub {
     ) -> SessionInfo {
         let is_terminal = cur.mode == SessionMode::Terminal;
         let busy = cur.mode == SessionMode::Structured
-            && matches!(cur.status, SessionStatus::Running | SessionStatus::WaitingPermission);
+            && (matches!(cur.status, SessionStatus::Running | SessionStatus::WaitingPermission)
+                || !cur.background_tasks.is_empty()
+                || rt.watch_active.load(std::sync::atomic::Ordering::Relaxed));
         if retire_running && !busy {
             if let Some(tx) = rt.cmd.lock().unwrap().take() {
                 *rt.generation.lock().unwrap() += 1;
@@ -3925,6 +3999,7 @@ fn new_rt(info: SessionInfo) -> SessionRt {
         mcp_fingerprint: Mutex::new(mcp_fingerprint(&[], false)),
         prompt_dirty: Mutex::new(false),
         restart_pending: Mutex::new(false),
+        watch_active: std::sync::atomic::AtomicBool::new(false),
         resume_token: Mutex::new(0),
         limited: Mutex::new(false),
         limit_probing: Mutex::new(false),
@@ -4043,6 +4118,21 @@ pub(crate) fn test_set_permission_mode(hub: &Hub, id: &str, mode: &str) {
 #[cfg(test)]
 pub(crate) fn test_pending_handoff(hub: &Hub, id: &str) -> Option<String> {
     hub.get(id).unwrap().pending_handoff.lock().unwrap().clone()
+}
+
+#[cfg(test)]
+pub(crate) fn test_set_restart_pending(hub: &Hub, id: &str, pending: bool) {
+    *hub.get(id).unwrap().restart_pending.lock().unwrap() = pending;
+}
+
+#[cfg(test)]
+pub(crate) fn test_restart_pending(hub: &Hub, id: &str) -> bool {
+    *hub.get(id).unwrap().restart_pending.lock().unwrap()
+}
+
+#[cfg(test)]
+pub(crate) fn test_watch_active(hub: &Hub, id: &str) -> bool {
+    hub.get(id).unwrap().watch_active.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 #[cfg(test)]
@@ -4246,6 +4336,19 @@ impl Emitter {
             true
         });
         if ended {
+            self.hub.restart_when_settled(&self.sid, self.gen);
+        }
+    }
+
+    /// Track whether an adapter watch (Antigravity's `AgyWatch`) is still active waiting for background task
+    /// discovery or a reactive parent wakeup turn. Deferred restarts, idle release, and host-account switches wait
+    /// until both `background_tasks` is empty and `watch_active` is false.
+    pub fn watch_active(&self, active: bool) {
+        let Some(rt) = self.hub.alive(&self.sid, self.gen) else {
+            return;
+        };
+        let prev = rt.watch_active.swap(active, std::sync::atomic::Ordering::Relaxed);
+        if prev && !active {
             self.hub.restart_when_settled(&self.sid, self.gen);
         }
     }
@@ -5330,6 +5433,157 @@ mod tests {
         assert!(rt.failover_tried.lock().unwrap().is_empty());
         let summary2 = accounts.list(Some(ToolKind::Claude), &HashMap::new(), &|_, _| None, false);
         assert_eq!(summary2[0].accounts.iter().find(|a| a.id == oauth_b.id).unwrap().state, AccountState::Ready);
+    }
+
+    #[tokio::test]
+    async fn watch_active_holds_deferred_restart_and_release_until_wakeup_settles() {
+        let (hub, em, mut rx) = test_emitter();
+        let rt = hub.get("s").unwrap();
+        {
+            let mut i = rt.info.lock().unwrap();
+            i.tool = ToolKind::Antigravity;
+            i.external_id = Some("ext-1".into());
+        }
+        *rt.restart_pending.lock().unwrap() = true;
+        *rt.pending_handoff.lock().unwrap() = Some(
+            "<yi-account-handoff>\nold digest\n</yi-account-handoff>".into(),
+        );
+
+        let task = BackgroundTask {
+            id: "ext-1/task-1".into(),
+            kind: "local_bash".into(),
+            description: "Run E2E".into(),
+            started_at: 1,
+            output_file: None,
+            unstoppable: true,
+        };
+        em.background_tasks(vec![task]);
+        em.watch_active(true);
+        em.event(EventBody::TurnEnd { stop_reason: Some("end_turn".into()), model: None });
+
+        assert_eq!(hub.info("s").unwrap().status, SessionStatus::Idle);
+        assert!(*rt.restart_pending.lock().unwrap(), "after_turn must hold restart while task/watch active");
+        assert!(rx.try_recv().is_err(), "adapter must not be killed yet");
+
+        // Task ends -> background_tasks becomes empty, but watch_active is still true waiting for parent wakeup!
+        em.background_tasks(vec![]);
+        tokio::task::yield_now().await;
+        assert!(*rt.restart_pending.lock().unwrap(), "empty background_tasks must NOT restart while watch_active is true");
+        assert!(rx.try_recv().is_err(), "adapter must survive to run its reactive wakeup turn");
+        assert!(!Hub::releasable(&rt, &hub.info("s").unwrap(), false), "watch_active session must not be releasable");
+        assert!(hub.has_running_host_session(ToolKind::Antigravity), "watch_active session must block host account probes");
+
+        // Wakeup turn runs and emits fresh reply, then watch finishes and TurnEnd settles
+        em.status(SessionStatus::Running, None);
+        em.event(EventBody::AssistantText { id: "wake-1".into(), text: "Wakeup handled failure".into() });
+        em.watch_active(false);
+        assert!(*rt.restart_pending.lock().unwrap(), "watch_active(false) while Running waits for TurnEnd");
+        // Clear external_id as a Level-2 account switch does so relaunch refreshes the account handoff digest
+        rt.info.lock().unwrap().external_id = None;
+        em.event(EventBody::TurnEnd { stop_reason: Some("end_turn".into()), model: None });
+        assert!(!*rt.restart_pending.lock().unwrap(), "after_turn must consume restart_pending once wakeup finishes");
+        let handoff = test_pending_handoff(&hub, "s").unwrap();
+        assert!(handoff.contains("Wakeup handled failure"), "deferred relaunch must refresh account handoff digest: {handoff}");
+    }
+
+    #[test]
+    fn account_switch_defers_while_idle_with_background_tasks_or_watch() {
+        let dir = tempfile::tempdir().unwrap();
+        let accounts = Arc::new(crate::accounts::AccountManager::with_dirs(
+            dir.path().to_path_buf(),
+            dir.path().to_path_buf(),
+        ));
+        let hub = Hub::with_accounts(Store::open_memory().unwrap(), DaemonSettings::default(), accounts.clone());
+        let acc_b = accounts
+            .save(crate::accounts::SaveAccountRequest {
+                tool: ToolKind::Antigravity,
+                id: None,
+                label: Some("Backup".into()),
+                auth_kind: Some(AccountAuthKind::ApiKey),
+                allow_auto_failover: Some(true),
+                priority: Some(1),
+                api_config: Some(ApiKeyConfig { api_key: "k".into(), ..Default::default() }),
+                verified_identity: None,
+                activate: false,
+            })
+            .unwrap();
+        let stored_b = accounts.get_stored(ToolKind::Antigravity, &acc_b.id).unwrap();
+
+        let mut rx = live(&hub, "s-bg", SessionMode::Structured, SessionStatus::Idle, 0);
+        let rt = hub.get("s-bg").unwrap();
+        {
+            let mut i = rt.info.lock().unwrap();
+            i.tool = ToolKind::Antigravity;
+            i.external_id = Some("ext-bg".into());
+            i.background_tasks = vec![BackgroundTask {
+                id: "ext-bg/task-1".into(),
+                kind: "local_bash".into(),
+                description: "Build".into(),
+                started_at: 1,
+                output_file: None,
+                unstoppable: true,
+            }];
+        }
+        hub.apply_account_switch(&rt, &stored_b, "host_switched", true);
+        assert!(rx.try_recv().is_err(), "idle session with running background task must NOT be killed");
+        assert!(*rt.restart_pending.lock().unwrap(), "account switch must defer via restart_pending");
+        assert_eq!(hub.info("s-bg").unwrap().background_tasks.len(), 1, "background_tasks must stay intact");
+
+        // Same when background_tasks just emptied but watch_active is still true waiting for wakeup
+        let mut rx2 = live(&hub, "s-watch", SessionMode::Structured, SessionStatus::Idle, 0);
+        let rt2 = hub.get("s-watch").unwrap();
+        {
+            let mut i = rt2.info.lock().unwrap();
+            i.tool = ToolKind::Antigravity;
+            i.external_id = Some("ext-watch".into());
+        }
+        rt2.watch_active.store(true, std::sync::atomic::Ordering::Relaxed);
+        hub.apply_account_switch(&rt2, &stored_b, "host_switched", true);
+        assert!(rx2.try_recv().is_err(), "idle session with active wakeup watch must NOT be killed");
+        assert!(*rt2.restart_pending.lock().unwrap(), "account switch must defer while watch_active");
+    }
+
+    #[test]
+    fn launch_if_stopped_preserves_existing_process_when_resume_races_deliver() {
+        let hub = Hub::new(Store::open_memory().unwrap(), DaemonSettings::default());
+        let mut rx = live(&hub, "s-race", SessionMode::Structured, SessionStatus::Starting, 1);
+        let rt = hub.get("s-race").unwrap();
+        let spec = StartSpec {
+            tool: ToolKind::Antigravity,
+            mode: SessionMode::Structured,
+            cwd: std::env::temp_dir(),
+            resume: Some("ext-race".into()),
+            replay: false,
+            replay_skip: 0,
+            permission_mode: "default".into(),
+            model: None,
+            model_config_options: vec![],
+            effort: None,
+            program: PathBuf::from("agy"),
+            command: None,
+            extra_args: vec![],
+            cols: 120,
+            rows: 32,
+            tmux: None,
+            session_id: None,
+            mcp_servers: vec![],
+            mcp_fingerprint: String::new(),
+            allow_mcp: vec![],
+            system_prompt: None,
+            system_notice: false,
+            memory_prompt: None,
+            memory_notice: false,
+            env: Default::default(),
+            env_unset: vec![],
+            data_dir: None,
+            auth_method: None,
+            account_handoff: None,
+        };
+        let before_gen = *rt.generation.lock().unwrap();
+        let returned_tx = hub.launch_if_stopped(&rt, spec).unwrap();
+        assert_eq!(*rt.generation.lock().unwrap(), before_gen, "must not bump generation when a process is already running");
+        returned_tx.send(AdapterCmd::Send(Prompt { text: "继续".into(), images: vec![] })).unwrap();
+        assert!(matches!(rx.try_recv(), Ok(AdapterCmd::Send(p)) if p.text == "继续"));
     }
 }
 

@@ -15,6 +15,8 @@ enum Pending {
     Init,
     Auth,
     Session,
+    /// session/resume: attach to an existing Antigravity session without replaying history; falls back to session/load
+    Resume,
     /// session/load: switch to session/new when the tool can't find this session
     Load,
     Prompt,
@@ -98,6 +100,8 @@ struct State {
     queue: Vec<Prompt>,
     /// initialize declared support for image input
     image_ok: bool,
+    /// initialize declared support for session/resume (attach without history replay)
+    can_resume: bool,
     /// Model switch requested before the session was created
     want_model: Option<String>,
     /// Model being switched to; recorded on the session once it succeeds
@@ -178,6 +182,8 @@ struct State {
     agy_pre_turn_steps: usize,
     /// First possible wakeup step after the prompt or the last finished wakeup
     agy_wake_from: usize,
+    /// Parent transcript step count known to be at or past agy's own ACP stream cursor
+    agy_last_streamed_steps: usize,
     agy_pending_calls: HashMap<String, AgyPendingCall>,
     agy_send_baselines: HashMap<String, usize>,
     agy_open_bg_calls: VecDeque<(String, String)>,
@@ -189,8 +195,8 @@ struct State {
     agy_carry: AgyCarry,
     /// Tool call ids suppressed during muted `session/load` replay (never re-emit if flushed afterwards)
     muted_tools: HashSet<String>,
-    /// Wakeup steps already streamed by `AgyWatch` before `session/resume` ran; suppressed if replayed on the next prompt
-    agy_replay_prefix: VecDeque<AgyWakeReplayItem>,
+    /// Active pre-turn replay guard during an Antigravity `session/prompt`
+    agy_replay: Option<AgyReplayGuard>,
     agy_replay_hidden: HashSet<String>,
 }
 
@@ -199,6 +205,44 @@ enum AgyWakeReplayItem {
     Thinking(String),
     Assistant(String),
     Tool { name: String, input: Value },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum AgyHistoryItem {
+    User(String),
+    Thinking(String),
+    Assistant(String),
+    Tool { name: String, input: Value },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum AgyReplayAction {
+    Drop,
+    StripPrefix(String),
+    Pass,
+}
+
+#[derive(Debug, Clone, Default)]
+struct AgyReplayGuard {
+    /// Trimmed user prompt text for the active turn; used to detect agy's live `user_message_chunk` echo
+    prompt_text: String,
+    /// Wakeup steps already streamed by `AgyWatch` before `session/resume` ran
+    unresumed: VecDeque<AgyWakeReplayItem>,
+    /// Pre-turn transcript items (`steps[from..pre_turn_steps]`) that agy could replay before answering
+    history: Vec<AgyHistoryItem>,
+    /// Independent monotonic cursors per kind so concatenated thoughts/replies don't skip interleaved tool calls
+    thought_cursor: usize,
+    tool_cursor: usize,
+    /// Consumed historical tool indices; lets out-of-order parallel tool calls match once even behind `tool_cursor`
+    used_tools: HashSet<usize>,
+    assistant_cursor: usize,
+    user_cursor: usize,
+    /// Highest history index (+1) matched by any non-user item so far (anchors historical USER_INPUT lookup)
+    max_consumed: usize,
+    /// True once at least one pre-turn item has been matched and suppressed in this prompt
+    replaying: bool,
+    /// Accumulated `user_message_chunk` buffer for the current echoed user message
+    user_buf: String,
 }
 
 impl State {
@@ -220,8 +264,13 @@ impl State {
     }
 
     fn ready_to_prompt(&self) -> bool {
-        self.session_id.is_some() && !config_pending(self) && !self.prompting && !self.loading
-            && self.compacting.is_none() && self.agy_watch.as_ref().is_none_or(|watch| !watch.reopened)
+        self.session_id.is_some()
+            && !config_pending(self)
+            && !self.prompting
+            && !self.loading
+            && self.compacting.is_none()
+            && !self.pending.values().any(|p| matches!(p, Pending::AgyResume))
+            && self.agy_watch.as_ref().is_none_or(|watch| !watch.reopened)
     }
 }
 
@@ -329,6 +378,7 @@ pub async fn run(spec: StartSpec, em: Emitter, mut rx: mpsc::UnboundedReceiver<A
                 if let Some(m) = next_effort(&mut st) { let _ = p.send(&m).await; }
                 if st.ready_to_prompt() && !st.queue.is_empty() {
                     let next = st.queue.remove(0);
+                    em.status(SessionStatus::Running, None);
                     let m = prompt(&mut st, &em, &next);
                     let _ = p.send(&m).await;
                 }
@@ -343,6 +393,7 @@ pub async fn run(spec: StartSpec, em: Emitter, mut rx: mpsc::UnboundedReceiver<A
                 }
                 if st.ready_to_prompt() && !st.queue.is_empty() {
                     let next = st.queue.remove(0);
+                    em.status(SessionStatus::Running, None);
                     let m = prompt(&mut st, &em, &next);
                     let _ = p.send(&m).await;
                 }
@@ -418,8 +469,8 @@ pub async fn run(spec: StartSpec, em: Emitter, mut rx: mpsc::UnboundedReceiver<A
                         }
                         st.prompting = false;
                         st.end_subagents();
-                        em.event(EventBody::TurnEnd { stop_reason: Some("cancelled".into()), model: None });
-                        if !st.agy_carry.is_empty() {
+                        let keep_watch = !st.agy_carry.is_empty() && st.session_id.is_some();
+                        if keep_watch {
                             if let Some(sid) = st.session_id.clone() {
                                 let steps = st.agy_wake_from;
                                 let mut w = AgyWatch::new(sid, agy_brain_dir(), steps, steps, None, HashMap::new(), HashMap::new(), st.perm != "bypass");
@@ -428,6 +479,8 @@ pub async fn run(spec: StartSpec, em: Emitter, mut rx: mpsc::UnboundedReceiver<A
                                 st.agy_watch = Some(w);
                             }
                         }
+                        em.watch_active(keep_watch);
+                        em.event(EventBody::TurnEnd { stop_reason: Some("cancelled".into()), model: None });
                     }
                     if let Some(sid) = st.session_id.clone() {
                         for (rid, rpc_id) in st.perms.drain().chain(st.asks.drain()) {
@@ -577,6 +630,11 @@ fn publish_config(st: &State, em: &Emitter) {
 }
 
 fn prompt(st: &mut State, em: &Emitter, p: &Prompt) -> Value {
+    let brain_dir = st.is_antigravity.then(agy_brain_dir);
+    prompt_with_brain_dir(st, em, p, brain_dir.as_deref())
+}
+
+fn prompt_with_brain_dir(st: &mut State, em: &Emitter, p: &Prompt, brain_dir: Option<&std::path::Path>) -> Value {
     st.prompting = true;
     st.last_reply.clear();
     st.compact_manual = p.text.trim().starts_with("/compact");
@@ -593,12 +651,23 @@ fn prompt(st: &mut State, em: &Emitter, p: &Prompt) -> Value {
         st.tools.retain(|_, tool| !tool.agy_detached);
     }
     st.agy_replay_hidden.clear();
-    st.agy_replay_prefix = std::mem::take(&mut st.agy_carry.unresumed_items);
-    st.agy_pre_turn_steps = match st.session_id.as_deref() {
-        Some(sid) if st.is_antigravity => count_agy_transcript_steps(&agy_brain_dir(), sid),
-        _ => 0,
+    let unresumed = std::mem::take(&mut st.agy_carry.unresumed_items);
+    let pre_steps = match (st.session_id.as_deref(), brain_dir) {
+        (Some(sid), Some(dir)) if st.is_antigravity => read_agy_transcript_steps(dir, sid),
+        _ => vec![],
     };
+    st.agy_pre_turn_steps = pre_steps.len();
     st.agy_wake_from = st.agy_pre_turn_steps;
+    st.agy_replay = if st.is_antigravity {
+        let history = if st.agy_last_streamed_steps < pre_steps.len() {
+            extract_agy_history(&pre_steps[st.agy_last_streamed_steps..])
+        } else {
+            vec![]
+        };
+        AgyReplayGuard::new(&p.text, unresumed, history)
+    } else {
+        None
+    };
     let sid = st.session_id.clone().unwrap_or_default();
     if st.is_cursor {
         if let Some((prior, extra)) = split_compact(&p.text) {
@@ -688,7 +757,75 @@ fn set_model(st: &mut State, model: &str) -> Value {
     )
 }
 
-fn consume_agy_replay(prefix: &mut VecDeque<AgyWakeReplayItem>, matches: impl Fn(&AgyWakeReplayItem) -> bool) -> bool {
+fn extract_agy_user_text(raw: &str) -> String {
+    if let Some((_, rest)) = raw.split_once("<USER_REQUEST>") {
+        if let Some((inner, _)) = rest.split_once("</USER_REQUEST>") {
+            return inner.trim().to_string();
+        }
+    }
+    raw.trim().to_string()
+}
+
+fn extract_agy_history(steps: &[Value]) -> Vec<AgyHistoryItem> {
+    let mut items = vec![];
+    for step in steps {
+        match step["type"].as_str().unwrap_or("") {
+            "USER_INPUT" => {
+                let text = extract_agy_user_text(step["content"].as_str().unwrap_or(""));
+                if !text.is_empty() {
+                    items.push(AgyHistoryItem::User(text));
+                }
+            }
+            "PLANNER_RESPONSE" => {
+                if let Some(thinking) = step["thinking"].as_str().map(str::trim).filter(|s| !s.is_empty()) {
+                    items.push(AgyHistoryItem::Thinking(thinking.to_string()));
+                }
+                for tc in step["tool_calls"].as_array().into_iter().flatten() {
+                    let name = tc["name"].as_str().unwrap_or("").to_string();
+                    if !name.is_empty() {
+                        items.push(AgyHistoryItem::Tool { name, input: tc["args"].clone() });
+                    }
+                }
+                if let Some(content) = step["content"].as_str().map(str::trim).filter(|s| !s.is_empty()) {
+                    items.push(AgyHistoryItem::Assistant(content.to_string()));
+                }
+            }
+            "ERROR_MESSAGE" => {
+                if let Some(raw) = step["content"].as_str().map(str::trim).filter(|s| !s.is_empty()) {
+                    let clean = raw.strip_prefix("Error:").map(str::trim).unwrap_or(raw);
+                    if !clean.is_empty() {
+                        items.push(AgyHistoryItem::Assistant(clean.to_string()));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    items
+}
+
+fn strip_agy_warning_banner(rem: &str) -> Option<&str> {
+    let after_mark = rem.strip_prefix('⚠')?;
+    // A warning banner runs until a newline, the next '⚠', or the end of the segment.
+    let end = after_mark
+        .find(['\n', '⚠'])
+        .map(|i| '⚠'.len_utf8() + i)
+        .unwrap_or(rem.len());
+    Some(rem[end..].trim_start())
+}
+
+fn user_echo_matches(echoed: &str, prompt_text: &str) -> bool {
+    let echoed = extract_agy_user_text(echoed);
+    if echoed.is_empty() {
+        return false;
+    }
+    if prompt_text.is_empty() {
+        return true;
+    }
+    echoed == prompt_text || echoed.ends_with(prompt_text)
+}
+
+fn consume_agy_unresumed(prefix: &mut VecDeque<AgyWakeReplayItem>, matches: impl Fn(&AgyWakeReplayItem) -> bool) -> bool {
     if prefix.is_empty() {
         return false;
     }
@@ -702,12 +839,259 @@ fn consume_agy_replay(prefix: &mut VecDeque<AgyWakeReplayItem>, matches: impl Fn
         prefix.drain(..=skip_thinking);
         return true;
     }
-    prefix.clear();
     false
 }
 
+impl AgyReplayGuard {
+    fn new(prompt_text: &str, unresumed: VecDeque<AgyWakeReplayItem>, history: Vec<AgyHistoryItem>) -> Option<Self> {
+        if unresumed.is_empty() && history.is_empty() {
+            return None;
+        }
+        Some(Self {
+            prompt_text: prompt_text.trim().to_string(),
+            unresumed,
+            history,
+            thought_cursor: 0,
+            tool_cursor: 0,
+            used_tools: HashSet::new(),
+            assistant_cursor: 0,
+            user_cursor: 0,
+            max_consumed: 0,
+            replaying: false,
+            user_buf: String::new(),
+        })
+    }
+
+    fn text_cursor(&self, seg: Seg) -> usize {
+        match seg {
+            Seg::Thought => self.thought_cursor,
+            Seg::Agent => self.assistant_cursor,
+            Seg::User => self.user_cursor,
+        }
+    }
+
+    fn set_text_cursor(&mut self, seg: Seg, pos: usize) {
+        match seg {
+            Seg::Thought => self.thought_cursor = pos,
+            Seg::Agent => self.assistant_cursor = pos,
+            Seg::User => self.user_cursor = pos,
+        }
+        if seg != Seg::User {
+            self.max_consumed = self.max_consumed.max(pos);
+        }
+    }
+
+    /// Handle a `user_message_chunk` during an Antigravity live prompt. Returns `true` when this echo
+    /// belongs to the current prompt and the replay guard should be disarmed.
+    fn on_user_chunk(&mut self, text: &str) -> bool {
+        self.user_buf.push_str(text);
+        let echoed = extract_agy_user_text(&self.user_buf);
+        if echoed.is_empty() {
+            return false;
+        }
+        if !self.replaying {
+            if user_echo_matches(&echoed, &self.prompt_text) {
+                return true;
+            }
+            if let Some(off) = self.history[self.user_cursor..].iter().position(|it| matches!(it, AgyHistoryItem::User(u) if u == &echoed)) {
+                let idx = self.user_cursor + off;
+                if idx + 1 < self.history.len() {
+                    self.user_cursor = idx + 1;
+                    self.replaying = true;
+                    self.user_buf.clear();
+                }
+            }
+            return false;
+        }
+        // Inside an active multi-turn replay: only advance past an old USER_INPUT if non-user history still follows it.
+        let start = self.user_cursor.max(self.max_consumed);
+        if let Some(off) = self.history[start..].iter().position(|it| matches!(it, AgyHistoryItem::User(u) if u == &echoed)) {
+            let idx = start + off;
+            let has_following = self.history[idx + 1..].iter().any(|it| !matches!(it, AgyHistoryItem::User(_)));
+            if has_following {
+                self.user_cursor = idx + 1;
+                self.user_buf.clear();
+                return false;
+            }
+        }
+        user_echo_matches(&echoed, &self.prompt_text)
+    }
+
+    fn clear_user_buf(&mut self) {
+        self.user_buf.clear();
+    }
+
+    /// True if `buf` could still be a prefix of a pre-turn replay item (hold transient deltas until flush).
+    fn might_match_prefix(&self, seg: Seg, buf: &str) -> bool {
+        let trimmed = buf.trim();
+        if trimmed.is_empty() {
+            return true;
+        }
+        if seg == Seg::Agent && self.replaying && trimmed.starts_with('⚠') {
+            return true;
+        }
+        let check = |h: &str| -> bool {
+            if h.is_empty() {
+                return false;
+            }
+            if h.starts_with(trimmed) || trimmed.starts_with(h) {
+                return true;
+            }
+            if seg == Seg::Agent {
+                if let Some(after) = trimmed.strip_prefix('⚠').map(str::trim_start) {
+                    return after.is_empty() || h.starts_with(after) || after.starts_with(h);
+                }
+            }
+            false
+        };
+        if self.unresumed.iter().any(|it| match (seg, it) {
+            (Seg::Thought, AgyWakeReplayItem::Thinking(h)) => check(h),
+            (Seg::Agent, AgyWakeReplayItem::Assistant(h)) => check(h),
+            _ => false,
+        }) {
+            return true;
+        }
+        let cursor = self.text_cursor(seg);
+        self.history[cursor..].iter().any(|it| match (seg, it) {
+            (Seg::Thought, AgyHistoryItem::Thinking(h)) => check(h),
+            (Seg::Agent, AgyHistoryItem::Assistant(h)) => check(h),
+            _ => false,
+        })
+    }
+
+    fn consume_text(&mut self, seg: Seg, raw_text: &str) -> AgyReplayAction {
+        self.user_buf.clear();
+        let trimmed = raw_text.trim();
+        if trimmed.is_empty() {
+            return AgyReplayAction::Drop;
+        }
+        let matched_unresumed = match seg {
+            Seg::Thought => consume_agy_unresumed(&mut self.unresumed, |it| matches!(it, AgyWakeReplayItem::Thinking(t) if t == trimmed)),
+            Seg::Agent => consume_agy_unresumed(&mut self.unresumed, |it| matches!(it, AgyWakeReplayItem::Assistant(t) if t == trimmed)),
+            Seg::User => false,
+        };
+        if matched_unresumed {
+            self.replaying = true;
+            let cursor = self.text_cursor(seg);
+            if let Some(off) = self.history[cursor..].iter().position(|it| match (seg, it) {
+                (Seg::Thought, AgyHistoryItem::Thinking(h)) => h == trimmed,
+                (Seg::Agent, AgyHistoryItem::Assistant(h)) => h == trimmed,
+                _ => false,
+            }) {
+                self.set_text_cursor(seg, cursor + off + 1);
+            }
+            return AgyReplayAction::Drop;
+        }
+        let mut rem = trimmed;
+        let mut scan = self.text_cursor(seg);
+        let mut matched_any = false;
+        let mut clean_boundary = false;
+        while !rem.is_empty() {
+            let exact = self.history[scan..].iter().position(|it| match (seg, it) {
+                (Seg::Thought, AgyHistoryItem::Thinking(h)) => rem == h,
+                (Seg::Agent, AgyHistoryItem::Assistant(h)) => {
+                    rem == h || rem.strip_prefix('⚠').is_some_and(|r| r.trim() == h)
+                }
+                _ => false,
+            });
+            if let Some(off) = exact {
+                scan += off + 1;
+                rem = "";
+                matched_any = true;
+                break;
+            }
+            let mut best: Option<(usize, usize)> = None;
+            for (off, it) in self.history[scan..].iter().enumerate() {
+                let h = match (seg, it) {
+                    (Seg::Thought, AgyHistoryItem::Thinking(h)) => h.as_str(),
+                    (Seg::Agent, AgyHistoryItem::Assistant(h)) => h.as_str(),
+                    _ => continue,
+                };
+                if h.is_empty() {
+                    continue;
+                }
+                let consumed = if rem.starts_with(h) {
+                    Some(h.len())
+                } else if seg == Seg::Agent {
+                    rem.strip_prefix('⚠').and_then(|after| {
+                        let t = after.trim_start();
+                        t.starts_with(h).then(|| (rem.len() - t.len()) + h.len())
+                    })
+                } else {
+                    None
+                };
+                if let Some(len) = consumed {
+                    if best.is_none_or(|(_, best_len)| len > best_len) {
+                        best = Some((scan + off, len));
+                    }
+                }
+            }
+            if let Some((idx, len)) = best {
+                let after = &rem[len..];
+                clean_boundary = after.is_empty() || after.starts_with('\n');
+                scan = idx + 1;
+                rem = after.trim_start();
+                matched_any = true;
+                continue;
+            }
+            if seg == Seg::Agent && (self.replaying || matched_any) {
+                // Quota/error banners are stored in agy's SQLite DB but omitted from transcript_full.jsonl.
+                if let Some(rest) = strip_agy_warning_banner(rem) {
+                    clean_boundary = true;
+                    rem = rest;
+                    matched_any = true;
+                    continue;
+                }
+            }
+            break;
+        }
+        if matched_any {
+            if rem.is_empty() {
+                self.set_text_cursor(seg, scan);
+                self.replaying = true;
+                return AgyReplayAction::Drop;
+            }
+            if self.replaying && clean_boundary {
+                self.set_text_cursor(seg, scan);
+                return AgyReplayAction::StripPrefix(rem.to_string());
+            }
+        }
+        AgyReplayAction::Pass
+    }
+
+    fn consume_tool(&mut self, name: &str, input: &Value) -> bool {
+        self.user_buf.clear();
+        let find_tool = |guard: &Self| {
+            let matches = |i: usize| {
+                !guard.used_tools.contains(&i)
+                    && matches!(&guard.history[i], AgyHistoryItem::Tool { name: n, input: inp } if n == name && inp == input)
+            };
+            (guard.tool_cursor..guard.history.len())
+                .find(|&i| matches(i))
+                .or_else(|| (0..guard.tool_cursor).find(|&i| matches(i)))
+        };
+        if consume_agy_unresumed(&mut self.unresumed, |it| matches!(it, AgyWakeReplayItem::Tool { name: n, input: i } if n == name && i == input)) {
+            self.replaying = true;
+            if let Some(idx) = find_tool(self) {
+                self.used_tools.insert(idx);
+                self.tool_cursor = self.tool_cursor.max(idx + 1);
+                self.max_consumed = self.max_consumed.max(idx + 1);
+            }
+            return true;
+        }
+        if let Some(idx) = find_tool(self) {
+            self.used_tools.insert(idx);
+            self.tool_cursor = self.tool_cursor.max(idx + 1);
+            self.max_consumed = self.max_consumed.max(idx + 1);
+            self.replaying = true;
+            return true;
+        }
+        false
+    }
+}
+
 fn flush(st: &mut State, em: &Emitter) {
-    let Some((seg, id, text)) = st.seg.take() else {
+    let Some((seg, id, mut text)) = st.seg.take() else {
         return;
     };
     if st.loading && seg == Seg::User && !text.trim().is_empty() {
@@ -716,15 +1100,18 @@ fn flush(st: &mut State, em: &Emitter) {
     if text.trim().is_empty() || st.muted() {
         return;
     }
-    if st.is_antigravity && !st.loading && !st.agy_replay_prefix.is_empty() {
-        let trimmed = text.trim();
-        let matched = match seg {
-            Seg::Thought => consume_agy_replay(&mut st.agy_replay_prefix, |it| matches!(it, AgyWakeReplayItem::Thinking(t) if t == trimmed)),
-            Seg::Agent => consume_agy_replay(&mut st.agy_replay_prefix, |it| matches!(it, AgyWakeReplayItem::Assistant(t) if t == trimmed)),
-            Seg::User => false,
-        };
-        if matched {
-            return;
+    if st.is_antigravity && !st.loading && seg != Seg::User {
+        if let Some(guard) = st.agy_replay.as_mut() {
+            match guard.consume_text(seg, &text) {
+                AgyReplayAction::Drop => return,
+                AgyReplayAction::StripPrefix(rest) => {
+                    st.agy_replay = None;
+                    text = rest;
+                }
+                AgyReplayAction::Pass => {
+                    st.agy_replay = None;
+                }
+            }
         }
     }
     if seg == Seg::Agent && !st.loading {
@@ -742,6 +1129,13 @@ fn chunk(st: &mut State, em: &Emitter, seg: Seg, text: &str) {
     // Flush any preceding segment first so a replayed reply before the prompt echo can't concatenate with the new turn.
     if seg == Seg::User && !st.loading {
         flush(st, em);
+        if st.is_antigravity {
+            if let Some(guard) = st.agy_replay.as_mut() {
+                if guard.on_user_chunk(text) {
+                    st.agy_replay = None;
+                }
+            }
+        }
         return;
     }
     if seg != Seg::User && !st.loading && !st.subagents.is_empty() {
@@ -764,7 +1158,23 @@ fn chunk(st: &mut State, em: &Emitter, seg: Seg, text: &str) {
     }
     if let Some((_, id, buf)) = st.seg.as_mut() {
         buf.push_str(text);
-        if !st.loading && !(st.is_antigravity && !st.agy_replay_prefix.is_empty()) {
+        if !st.loading {
+            if st.is_antigravity {
+                if let Some(guard) = st.agy_replay.as_mut() {
+                    guard.clear_user_buf();
+                    if guard.might_match_prefix(seg, buf) {
+                        return;
+                    }
+                    // Diverged from pre-turn history: disarm guard and emit the buffered text as the first delta.
+                    st.agy_replay = None;
+                    match seg {
+                        Seg::Agent => em.event(EventBody::AssistantDelta { id: id.clone(), delta: buf.clone() }),
+                        Seg::Thought => em.event(EventBody::ThinkingDelta { id: id.clone(), delta: buf.clone() }),
+                        Seg::User => {}
+                    }
+                    return;
+                }
+            }
             match seg {
                 Seg::Agent => em.event(EventBody::AssistantDelta {
                     id: id.clone(),
@@ -831,6 +1241,15 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Result<V
                 return Ok(out);
             }
             return match kind {
+                // Antigravity's session/resume can fail when the session needs session/load (or on older agy builds).
+                Pending::Resume if !is_auth_error(&msg) => {
+                    if let Some(sid) = spec.resume.as_deref() {
+                        out.push(load_session(st, spec, sid));
+                        Ok(out)
+                    } else {
+                        Err(login_hint(spec, &msg))
+                    }
+                }
                 // If the process went away after the session was created but before anything was said, some tools (Cursor) never saved the session and load reports not found.
                 // Also if resuming across switched accounts fails for a non-auth reason (e.g. team/model mismatch), start a fresh session with the handoff digest.
                 Pending::Load if is_missing_session(&msg) || (spec.account_handoff.is_some() && !is_auth_error(&msg)) => {
@@ -850,17 +1269,19 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Result<V
                     out.push(new_session(st, spec));
                     Ok(out)
                 }
-                Pending::Session | Pending::Load if spec.tool != ToolKind::Cursor && !st.auth_tried && st.auth_method.is_some() => {
+                Pending::Session | Pending::Load | Pending::Resume if spec.tool != ToolKind::Cursor && !st.auth_tried && st.auth_method.is_some() => {
                     st.auth_tried = true;
                     let mid = st.auth_method.clone().unwrap_or_default();
                     out.push(st.req(Pending::Auth, "authenticate", json!({"methodId": mid})));
                     Ok(out)
                 }
-                Pending::Auth | Pending::Session | Pending::Load | Pending::Init => Err(login_hint(spec, &msg)),
+                Pending::Auth | Pending::Session | Pending::Load | Pending::Resume | Pending::Init => Err(login_hint(spec, &msg)),
                 Pending::Prompt => {
                     st.prompting = false;
                     st.end_subagents();
                     flush(st, em);
+                    st.agy_replay = None;
+                    st.agy_replay_hidden.clear();
                     em.event(EventBody::Error { message: msg });
                     em.event(EventBody::TurnEnd {
                         stop_reason: Some("error".into()),
@@ -918,6 +1339,7 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Result<V
                 st.image_ok = r["agentCapabilities"]["promptCapabilities"]["image"]
                     .as_bool()
                     .unwrap_or(false);
+                st.can_resume = r["agentCapabilities"]["sessionCapabilities"]["resume"].is_object();
                 // If an explicit auth_method (e.g. "gemini-api-key") is selected for the session,
                 // authenticate upfront before session/new so it wins over host cached OAuth.
                 if let Some(explicit) = &spec.auth_method {
@@ -936,7 +1358,7 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Result<V
                 }
             }
             Pending::Auth => out.push(new_or_load(st, spec)),
-            Pending::Session | Pending::Load => {
+            Pending::Session | Pending::Load | Pending::Resume => {
                 // The fresh session that replaces the compacted one
                 let compacted = match &st.cursor_compact {
                     Some(c) if c.replacing && kind == Pending::Session => st.cursor_compact.take(),
@@ -958,6 +1380,10 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Result<V
                 if st.is_antigravity {
                     if let Some(sid) = st.session_id.as_deref() {
                         st.agy_wake_from = count_agy_transcript_steps(&agy_brain_dir(), sid);
+                    }
+                    if matches!(kind, Pending::Load | Pending::Resume) {
+                        // Guard the first prompt after resume against any pre-turn history agy may still replay.
+                        st.agy_last_streamed_steps = 0;
                     }
                 }
                 if st.resumed {
@@ -1105,11 +1531,12 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Result<V
                 }
                 let stop_reason = r["stopReason"].as_str().map(str::to_string);
                 let wake_already_in_log = if st.is_antigravity {
-                    st.agy_replay_prefix.clear();
+                    st.agy_replay = None;
                     st.agy_replay_hidden.clear();
                     settle_agy_prompt_bg(st, em);
                     let steps = &st.agy_parent_transcript.steps;
                     st.agy_wake_from = agy_prompt_boundary(steps, st.agy_pre_turn_steps, &st.last_reply);
+                    st.agy_last_streamed_steps = st.agy_wake_from;
                     steps.iter().skip(st.agy_wake_from).any(is_agy_wakeup)
                 } else {
                     false
@@ -1223,7 +1650,10 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Result<V
                 publish_config(st, em);
             }
             Pending::SetEffort => read_thought_level(st, r),
-            Pending::AgyResume => st.agy_carry.unresumed_items.clear(),
+            Pending::AgyResume => {
+                st.agy_carry.unresumed_items.clear();
+                st.agy_last_streamed_steps = st.agy_last_streamed_steps.max(st.agy_wake_from);
+            }
             Pending::Other => {}
         }
         return Ok(out);
@@ -1281,6 +1711,9 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Result<V
             }
             st.perms.insert(rid.clone(), v["id"].clone());
             agy_detached_permission(st, params);
+            if st.agy_watch.is_some() {
+                em.watch_active(true);
+            }
             em.event(EventBody::PermissionRequest {
                 request_id: rid,
                 tool_name: if known.name.is_empty() {
@@ -1349,6 +1782,9 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Result<V
                     .unwrap_or_else(|| params.clone());
                 st.elicits.insert(rid.clone(), PendingElicit { rpc_id: v["id"].clone(), fields });
                 agy_detached_permission(st, params);
+                if st.agy_watch.is_some() {
+                    em.watch_active(true);
+                }
                 em.event(EventBody::PermissionRequest {
                     request_id: rid,
                     tool_name: "ask_question".into(),
@@ -1370,7 +1806,11 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Result<V
     // Notifications
     match method {
         "session/update" => {
-            if !agy_detached_update(st, params, agy_brain_dir) {
+            if agy_detached_update(st, params, agy_brain_dir) {
+                if st.agy_watch.is_some() {
+                    em.watch_active(true);
+                }
+            } else {
                 update(st, em, &params["update"]);
             }
         }
@@ -1756,22 +2196,39 @@ fn compaction_status(st: &mut State, em: &Emitter, kind: &Value) {
 }
 
 fn new_or_load(st: &mut State, spec: &StartSpec) -> Value {
-    let cwd = spec.cwd.display().to_string();
     match &spec.resume {
-        Some(sid) => {
-            st.loading = true;
-            st.record_replay = spec.replay;
-            st.replay_skip = spec.replay_skip;
-            st.replay_users = 0;
-            st.resumed = true;
-            st.req(
-                Pending::Load,
-                "session/load",
-                json!({"sessionId":sid,"cwd":cwd,"mcpServers":spec.mcp_servers}),
-            )
-        }
+        Some(sid) if st.is_antigravity && !spec.replay && st.can_resume => resume_session(st, spec, sid),
+        Some(sid) => load_session(st, spec, sid),
         None => new_session(st, spec),
     }
+}
+
+fn resume_session(st: &mut State, spec: &StartSpec, sid: &str) -> Value {
+    let cwd = spec.cwd.display().to_string();
+    st.loading = true;
+    st.record_replay = false;
+    st.replay_skip = 0;
+    st.replay_users = 0;
+    st.resumed = true;
+    st.req(
+        Pending::Resume,
+        "session/resume",
+        json!({"sessionId":sid,"cwd":cwd,"mcpServers":spec.mcp_servers}),
+    )
+}
+
+fn load_session(st: &mut State, spec: &StartSpec, sid: &str) -> Value {
+    let cwd = spec.cwd.display().to_string();
+    st.loading = true;
+    st.record_replay = spec.replay;
+    st.replay_skip = spec.replay_skip;
+    st.replay_users = 0;
+    st.resumed = true;
+    st.req(
+        Pending::Load,
+        "session/load",
+        json!({"sessionId":sid,"cwd":cwd,"mcpServers":spec.mcp_servers}),
+    )
 }
 
 fn new_session(st: &mut State, spec: &StartSpec) -> Value {
@@ -2204,13 +2661,17 @@ fn update(st: &mut State, em: &Emitter, u: &Value) {
             if !u["rawInput"].is_null() {
                 t.input = u["rawInput"].clone();
             }
-            if !known && st.is_antigravity && !st.loading && !st.agy_replay_prefix.is_empty() && u["sessionUpdate"] == "tool_call" {
-                let agy_name = if t.name == "other" || t.name.is_empty() { t.title.as_str() } else { t.name.as_str() };
-                if consume_agy_replay(&mut st.agy_replay_prefix, |it| matches!(it, AgyWakeReplayItem::Tool { name, input } if name == agy_name && *input == t.input)) {
-                    if !id.is_empty() {
-                        st.agy_replay_hidden.insert(id);
+            if !known && st.is_antigravity && !st.loading && u["sessionUpdate"] == "tool_call" {
+                if let Some(guard) = st.agy_replay.as_mut() {
+                    let agy_name = if t.name == "other" || t.name.is_empty() { t.title.as_str() } else { t.name.as_str() };
+                    if guard.consume_tool(agy_name, &t.input) {
+                        if !id.is_empty() {
+                            st.agy_replay_hidden.insert(id);
+                        }
+                        return;
                     }
-                    return;
+                    // An unmatched new tool call means the live turn has started.
+                    st.agy_replay = None;
                 }
             }
             let is_agent = matches!(t.name.as_str(), "Agent" | "Task");
@@ -2288,7 +2749,6 @@ fn update(st: &mut State, em: &Emitter, u: &Value) {
             if (status == "completed" || status == "failed") && !t.done {
                 t.done = true;
                 st.subagents.remove(&id);
-                st.agy_open_bg_calls.retain(|(x, _)| x != &id);
                 let mut output = texts.join("\n");
                 if output.is_empty() && !command_text && u["rawOutput"]["output"].is_string() {
                     let raw = u["rawOutput"]["output"].as_str().unwrap_or("");
@@ -2310,11 +2770,25 @@ fn update(st: &mut State, em: &Emitter, u: &Value) {
                 let bg_parsed = (st.is_antigravity && !st.loading && status == "completed" && !command_text)
                     .then(|| parse_agy_bg_task(&output))
                     .flatten();
-                let mut defer_agy = st.is_antigravity
+                let mut already_settled = false;
+                if st.is_antigravity
                     && !st.loading
-                    && status == "completed"
-                    && output.is_empty()
-                    && st.agy_pending_calls.contains_key(&id);
+                    && bg_parsed.is_none()
+                    && !command_text
+                    && (output.is_empty() || output == "{}")
+                    && matches!(agy_tool.to_ascii_lowercase().as_str(), "run_command" | "run_workflow" | "schedule")
+                    && !st.agy_open_bg_calls.is_empty()
+                {
+                    poll_agy_prompt_bg(st, em);
+                    already_settled = st.tools.get(&id).is_some_and(|existing| existing.done);
+                }
+                st.agy_open_bg_calls.retain(|(x, _)| x != &id);
+                let mut defer_agy = already_settled
+                    || (st.is_antigravity
+                        && !st.loading
+                        && status == "completed"
+                        && output.is_empty()
+                        && st.agy_pending_calls.contains_key(&id));
                 if let Some(parsed) = bg_parsed {
                     let (kind, is_daemon, timer_cond, meta_desc) = agy_bg_meta(agy_tool, &t.input, &parsed.description);
                     if !is_daemon {
@@ -2561,6 +3035,18 @@ fn agy_prompt_boundary(steps: &[Value], pre_prompt: usize, reply: &str) -> usize
         }) {
             return index + 1;
         }
+    }
+    // For tool-only turns (empty reply), preserve any trailing wakeup SYSTEM_MESSAGE(s) already on disk.
+    if let Some(first_trailing_wake) = steps
+        .iter()
+        .enumerate()
+        .skip(pre_prompt)
+        .rev()
+        .take_while(|(_, step)| is_agy_wakeup(step))
+        .last()
+        .map(|(idx, _)| idx)
+    {
+        return first_trailing_wake;
     }
     steps.len().max(pre_prompt)
 }
@@ -3375,6 +3861,11 @@ impl AgyWatch {
         format!("agy-wake-{}-a-{step_id}", self.parent_sid)
     }
 
+    fn thinking_id(&self, step: &Value, index: usize) -> String {
+        let step_id = step["step_index"].as_u64().unwrap_or(index as u64);
+        format!("agy-wake-{}-t-{step_id}", self.parent_sid)
+    }
+
     fn preview_reply(&mut self, step: &Value, index: usize) {
         if step["type"] != "PLANNER_RESPONSE" {
             return;
@@ -3470,6 +3961,7 @@ fn drop_agy_watch(st: &mut State, em: &Emitter) {
         for body in watch.out {
             em.exit_cleanup_event(body);
         }
+        em.watch_active(false);
         em.background_tasks(vec![]);
     }
 }
@@ -3513,6 +4005,7 @@ fn carry_agy_watch(st: &mut State, em: &Emitter) {
     finish_agy_watch(&mut watch);
     watch.flush_out(em);
     mark_watch_settled(st, &mut watch);
+    em.watch_active(false);
     em.background_tasks(current_agy_tasks(st));
 }
 
@@ -3614,8 +4107,27 @@ fn settle_agy_bg_from_steps(st: &mut State, steps: &[Value], em: &Emitter) {
     }
 }
 
-fn take_agy_open_bg_call(open: &mut VecDeque<(String, String)>, call_name: Option<&str>) -> Option<String> {
+fn take_agy_open_bg_call(
+    open: &mut VecDeque<(String, String)>,
+    tools: Option<&HashMap<String, ToolState>>,
+    call_name: Option<&str>,
+    call_args: Option<&Value>,
+) -> Option<String> {
     let cn = call_name?;
+    if let (Some(tools), Some(args)) = (tools, call_args) {
+        let want_cmd = arg_str(&args["CommandLine"]);
+        let want_sum = arg_str(&args["toolSummary"]);
+        if let Some(pos) = open.iter().position(|(id, n)| {
+            n.eq_ignore_ascii_case(cn)
+                && tools.get(id).is_some_and(|t| {
+                    t.input == *args
+                        || (want_cmd.is_some() && arg_str(&t.input["CommandLine"]) == want_cmd)
+                        || (want_sum.is_some() && arg_str(&t.input["toolSummary"]) == want_sum)
+                })
+        }) {
+            return open.remove(pos).map(|(id, _)| id);
+        }
+    }
     open.iter()
         .position(|(_, n)| n.eq_ignore_ascii_case(cn))
         .and_then(|pos| open.remove(pos))
@@ -3627,6 +4139,10 @@ fn discover_agy_bg_from_steps(st: &mut State, steps: &[Value]) -> bool {
     let mut open_calls: VecDeque<(String, Value)> = VecDeque::new();
     for step in steps.iter().skip(st.agy_pre_turn_steps) {
         if !agy_step_settled(step) {
+            if step["type"].as_str() == Some("GENERIC") {
+                let _ = open_calls.pop_front();
+                continue;
+            }
             break;
         }
         match step["type"].as_str().unwrap_or("") {
@@ -3642,11 +4158,17 @@ fn discover_agy_bg_from_steps(st: &mut State, steps: &[Value]) -> bool {
                     if let Some(parsed) = parse_agy_bg_task(step["content"].as_str().unwrap_or("")) {
                         if !st.agy_bg_tasks.iter().any(|b| b.id == parsed.id) {
                             let call_name = call.as_ref().map(|(n, _)| n.clone());
+                            let call_args = call.as_ref().map(|(_, a)| a.clone());
                             let (kind, is_daemon, timer_cond, desc) = match call {
                                 Some((name, args)) => agy_bg_meta(&name, &args, &parsed.description),
                                 None => agy_bg_meta("", &Value::Null, &parsed.description),
                             };
-                            let tc_id = take_agy_open_bg_call(&mut st.agy_open_bg_calls, call_name.as_deref());
+                            let tc_id = take_agy_open_bg_call(
+                                &mut st.agy_open_bg_calls,
+                                Some(&st.tools),
+                                call_name.as_deref(),
+                                call_args.as_ref(),
+                            );
                             if !is_daemon {
                                 st.agy_bg_tasks.push(AgyBgTask {
                                     id: parsed.id,
@@ -3772,12 +4294,16 @@ fn step_agy_watch(
     pending: &mut HashMap<u64, Pending>,
 ) -> AgyStep {
     let step = step_agy_watch_inner(watch, spec, next_id, pending);
-    if matches!(step, AgyStep::Done(_)) {
+    let done = matches!(step, AgyStep::Done(_));
+    if done {
         // Close whatever is still open (Task calls without a report, subagent tool calls without a result)
         finish_agy_watch(watch);
     }
     watch.flush_out(em);
-    em.background_tasks(if matches!(step, AgyStep::Done(_)) { vec![] } else { watch.tasks() });
+    // Keep watch_active true across the gap between the last task finishing and the parent's wakeup turn so
+    // deferred restarts / idle release / host account switches don't kill agy before it can wake up.
+    em.watch_active(!done);
+    em.background_tasks(if done { vec![] } else { watch.tasks() });
     step
 }
 
@@ -3787,6 +4313,8 @@ fn step_agy_watch_inner(watch: &mut AgyWatch, spec: &StartSpec, next_id: &mut u6
     const IDLE_TIMEOUT: Duration = Duration::from_secs(1800);
     const DISCOVER_GRACE: Duration = Duration::from_secs(3);
     const WAKEUP_GRACE: Duration = Duration::from_secs(20);
+    /// Upper bound for waiting on the first PLANNER_RESPONSE after a wakeup SYSTEM_MESSAGE arrives
+    const WAKEUP_START_TIMEOUT: Duration = Duration::from_secs(300);
     /// A subagent whose transcript ends in a tool call without a result, and that doesn't move for this long, is
     /// waiting for an approval: agy never sends subagent approvals over ACP
     const STALL: Duration = Duration::from_secs(30);
@@ -3843,7 +4371,7 @@ fn step_agy_watch_inner(watch: &mut AgyWatch, spec: &StartSpec, next_id: &mut u6
                                 Some((name, args)) => agy_bg_meta(&name, &args, &parsed.description),
                                 None => agy_bg_meta("", &Value::Null, &parsed.description),
                             };
-                            let tc_id = take_agy_open_bg_call(&mut watch.open_bg_calls, call_name.as_deref());
+                            let tc_id = take_agy_open_bg_call(&mut watch.open_bg_calls, None, call_name.as_deref(), None);
                             if !is_daemon {
                                 watch.add_bg_task(AgyBgTask {
                                     id: parsed.id,
@@ -3973,8 +4501,9 @@ fn step_agy_watch_inner(watch: &mut AgyWatch, spec: &StartSpec, next_id: &mut u6
     flush_ready_pending_calls(watch, false);
 
     // 4. Stream & capture parent's reactive wakeup turn once SYSTEM_MESSAGE arrives (even while other tasks still run)
+    let mut has_planner_after_wakeup = false;
     if let Some(after_wakeup) = watch.wakeup_msg_idx.and_then(|idx| parent_steps.get(idx + 1..)) {
-        let has_planner_after_wakeup = after_wakeup.iter().any(|s| s["type"] == "PLANNER_RESPONSE");
+        has_planner_after_wakeup = after_wakeup.iter().any(|s| s["type"] == "PLANNER_RESPONSE");
         // Only reopen for a new parent wakeup. Delayed ACP chunks from a completed step can
         // re-arm the watch, but cannot reopen that step or create an unmatched live buffer.
         watch.wake |= has_planner_after_wakeup || watch.last_acp_activity.is_some();
@@ -3990,7 +4519,7 @@ fn step_agy_watch_inner(watch: &mut AgyWatch, spec: &StartSpec, next_id: &mut u6
                 "PLANNER_RESPONSE" => {
                     if let Some(thinking) = step["thinking"].as_str().map(str::trim).filter(|s| !s.is_empty()) {
                         watch.unresumed_items.push_back(AgyWakeReplayItem::Thinking(thinking.to_string()));
-                        watch.out.push(EventBody::Thinking { id: format!("agy-wake-{}-t-{}", watch.parent_sid, step_idx), text: thinking.to_string() });
+                        watch.out.push(EventBody::Thinking { id: watch.thinking_id(step, step_idx), text: thinking.to_string() });
                     }
                     for (tc_idx, tc) in step["tool_calls"].as_array().into_iter().flatten().enumerate() {
                         let tc_name = tc["name"].as_str().unwrap_or("tool");
@@ -4116,7 +4645,12 @@ fn step_agy_watch_inner(watch: &mut AgyWatch, spec: &StartSpec, next_id: &mut u6
             Some(activity) => activity.elapsed() >= WAKEUP_GRACE,
             None => watch.started_at.elapsed() >= DISCOVER_GRACE,
         };
-        return if expired { AgyStep::Done(None) } else { AgyStep::Wait };
+        return if expired {
+            let need_resume = !watch.unresumed_items.is_empty();
+            AgyStep::Done(need_resume.then(|| agy_resume_req(watch, spec, next_id, pending)))
+        } else {
+            AgyStep::Wait
+        };
     }
 
     // 5. Wait until all tracked subagents and background tasks are finished
@@ -4131,11 +4665,16 @@ fn step_agy_watch_inner(watch: &mut AgyWatch, spec: &StartSpec, next_id: &mut u6
 
     let done_at = *watch.all_subagents_done_at.get_or_insert_with(tokio::time::Instant::now);
 
-    // A real wakeup message can precede the first model step by more than WAKEUP_GRACE.
-    // Wait for that step, even on versions that only write the transcript.
-    let grace_exceeded = watch.wakeup_msg_idx.is_none()
-        && !parent_steps.get(watch.wake_from..).is_some_and(|tail| tail.iter().any(|s| !agy_step_settled(s)))
-        && done_at.elapsed() >= WAKEUP_GRACE;
+    // A real wakeup message can precede the first model step by more than WAKEUP_GRACE (e.g. a slow model call).
+    // Wait up to WAKEUP_START_TIMEOUT before concluding no reply will arrive, instead of stalling for IDLE_TIMEOUT.
+    let no_unsettled = !parent_steps.get(watch.wake_from..).is_some_and(|tail| tail.iter().any(|s| !agy_step_settled(s)));
+    let acp_quiet = watch.last_acp_activity.is_none_or(|t| t.elapsed() >= WAKEUP_GRACE);
+    let grace_exceeded = no_unsettled
+        && ((watch.wakeup_msg_idx.is_none() && done_at.elapsed() >= WAKEUP_GRACE)
+            || (watch.wakeup_msg_idx.is_some()
+                && !has_planner_after_wakeup
+                && acp_quiet
+                && done_at.elapsed() >= WAKEUP_START_TIMEOUT));
 
     if grace_exceeded || timed_out {
         let emitted_wakeup_text = watch.emitted_wake_text
@@ -4156,7 +4695,8 @@ fn step_agy_watch_inner(watch: &mut AgyWatch, spec: &StartSpec, next_id: &mut u6
             watch.wake_failed = true;
             return AgyStep::Done(None);
         }
-        return AgyStep::Done(watch.wake.then(|| agy_resume_req(watch, spec, next_id, pending)));
+        let need_resume = watch.wake || !watch.unresumed_items.is_empty();
+        return AgyStep::Done(need_resume.then(|| agy_resume_req(watch, spec, next_id, pending)));
     }
 
     AgyStep::Wait
@@ -5650,8 +6190,8 @@ mod model_config_tests {
         let mut open = VecDeque::from([("tc-bg-lag".to_string(), "run_command".to_string())]);
         let mut watch = AgyWatch::new("p".into(), std::env::temp_dir(), 0, 0, None, HashMap::new(), HashMap::new(), true)
             .with_open_bg_calls(open.clone());
-        assert_eq!(take_agy_open_bg_call(&mut open, Some("run_command")).as_deref(), Some("tc-bg-lag"));
-        assert_eq!(take_agy_open_bg_call(&mut watch.open_bg_calls, Some("run_command")).as_deref(), Some("tc-bg-lag"));
+        assert_eq!(take_agy_open_bg_call(&mut open, None, Some("run_command"), None).as_deref(), Some("tc-bg-lag"));
+        assert_eq!(take_agy_open_bg_call(&mut watch.open_bg_calls, None, Some("run_command"), None).as_deref(), Some("tc-bg-lag"));
     }
 
     #[test]
@@ -5802,5 +6342,365 @@ mod model_config_tests {
         let url_elicit = json!({"jsonrpc": "2.0", "id": "9", "method": "elicitation/create", "params": {"mode": "url", "url": "https://example.com"}});
         let url_out = handle(&mut st, &spec, &url_elicit, &em).unwrap();
         assert_eq!(url_out, vec![json!({"jsonrpc": "2.0", "id": "9", "result": {"action": "decline"}})]);
+    }
+
+    #[test]
+    fn antigravity_prefers_session_resume_and_falls_back_to_load() {
+        use super::*;
+        let (hub, em, _rx) = crate::hub::test_emitter();
+        let mut spec = agy_test_spec();
+        spec.resume = Some("agy-existing-1".into());
+        spec.replay = false;
+
+        // 1. When initialize advertises sessionCapabilities.resume and replay=false, use session/resume
+        let mut st = State { is_antigravity: true, native_modes: true, ..Default::default() };
+        let init_id = st.req(Pending::Init, "initialize", json!({}))["id"].as_u64().unwrap();
+        let outs = handle(
+            &mut st,
+            &spec,
+            &json!({"jsonrpc":"2.0","id":init_id,"result":{"agentCapabilities":{"sessionCapabilities":{"resume":{},"load":{}}}}}),
+            &em,
+        )
+        .unwrap();
+        assert_eq!(outs.len(), 1);
+        assert_eq!(outs[0]["method"], "session/resume");
+        assert_eq!(outs[0]["params"]["sessionId"], "agy-existing-1");
+        assert!(st.loading);
+        assert!(st.resumed);
+
+        // 2. Non-auth error on session/resume falls back cleanly to session/load
+        let resume_id = outs[0]["id"].as_u64().unwrap();
+        let fallback = handle(
+            &mut st,
+            &spec,
+            &json!({"jsonrpc":"2.0","id":resume_id,"error":{"code":-32603,"message":"Failed to read session agy-existing-1; retry, or load it with session/load"}}),
+            &em,
+        )
+        .unwrap();
+        assert_eq!(fallback.len(), 1);
+        assert_eq!(fallback[0]["method"], "session/load");
+        let load_id = fallback[0]["id"].as_u64().unwrap();
+        let _ = handle(
+            &mut st,
+            &spec,
+            &json!({"jsonrpc":"2.0","id":load_id,"result":{"sessionId":"agy-existing-1"}}),
+            &em,
+        )
+        .unwrap();
+        assert!(!st.loading);
+        assert_eq!(st.session_id.as_deref(), Some("agy-existing-1"));
+        assert_eq!(st.agy_last_streamed_steps, 0);
+        assert_eq!(hub.info("s").unwrap().status, SessionStatus::Idle);
+
+        // 3. Explicit history import (replay=true) still uses session/load even when session/resume is advertised
+        let mut import_spec = spec.clone();
+        import_spec.replay = true;
+        let mut st_imp = State { is_antigravity: true, native_modes: true, ..Default::default() };
+        let imp_init = st_imp.req(Pending::Init, "initialize", json!({}))["id"].as_u64().unwrap();
+        let imp_outs = handle(
+            &mut st_imp,
+            &import_spec,
+            &json!({"jsonrpc":"2.0","id":imp_init,"result":{"agentCapabilities":{"sessionCapabilities":{"resume":{},"load":{}}}}}),
+            &em,
+        )
+        .unwrap();
+        assert_eq!(imp_outs[0]["method"], "session/load");
+
+        // 4. Auth error on session/resume is surfaced instead of falling back
+        let mut st_auth = State { is_antigravity: true, can_resume: true, ..Default::default() };
+        let req = new_or_load(&mut st_auth, &spec);
+        assert_eq!(req["method"], "session/resume");
+        let rid = req["id"].as_u64().unwrap();
+        let err = handle(
+            &mut st_auth,
+            &spec,
+            &json!({"jsonrpc":"2.0","id":rid,"error":{"code":-32000,"message":"Authentication required"}}),
+            &em,
+        )
+        .unwrap_err();
+        assert!(err.contains("agy acp --login"), "{err}");
+    }
+
+    #[test]
+    fn antigravity_reopen_replay_guard_filters_history_concat_quota_and_preserves_new_reply() {
+        use super::*;
+        let root = tempfile::tempdir().unwrap();
+        let sid = "agy-reopen-replay";
+        let steps = vec![
+            json!({"step_index":0,"type":"USER_INPUT","status":"DONE","content":"<USER_REQUEST>\n继续\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nt=1\n</ADDITIONAL_METADATA>"}),
+            json!({"step_index":1,"type":"PLANNER_RESPONSE","status":"DONE","thinking":"Thought A from earlier.","tool_calls":[{"name":"read_file","args":{"Path":"a.lua"}}]}),
+            json!({"step_index":2,"type":"GENERIC","status":"DONE","content":"ok"}),
+            json!({"step_index":3,"type":"PLANNER_RESPONSE","status":"DONE","thinking":"Thought B from earlier.","content":"12:35 测试总结已完成。"}),
+            json!({"step_index":4,"type":"USER_INPUT","status":"DONE","content":"<USER_REQUEST>\n你的后端是怎么mock的\n</USER_REQUEST>"}),
+            json!({"step_index":5,"type":"PLANNER_RESPONSE","status":"DONE","content":"14:02 Mock 后端使用 OpenResty。"}),
+            json!({"step_index":6,"type":"ERROR_MESSAGE","status":"DONE","content":"Error: The stream was interrupted. Please continue the task you were working on."}),
+            json!({"step_index":7,"type":"USER_INPUT","status":"DONE","content":"<USER_REQUEST>\n继续\n</USER_REQUEST>"}),
+            json!({"step_index":8,"type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"write_file","args":{"Path":"b.lua"}}]}),
+        ];
+        write_agy_steps(root.path(), sid, &steps);
+
+        let (hub, em, _rx) = crate::hub::test_emitter();
+        let spec = agy_test_spec();
+        let mut st = State {
+            is_antigravity: true,
+            session_id: Some(sid.into()),
+            agy_last_streamed_steps: 0,
+            ..Default::default()
+        };
+
+        // Start a new "继续" turn after resume; agy replays historical steps before echoing this prompt
+        let prompt_req = prompt_with_brain_dir(&mut st, &em, &Prompt { text: "继续".into(), images: vec![] }, Some(root.path()));
+        let prompt_id = prompt_req["id"].as_u64().unwrap();
+
+        // Concatenated historical thoughts + historical tool call + concatenated replies + mid-replay "继续" + error + quota banner
+        update(&mut st, &em, &json!({"sessionUpdate":"agent_thought_chunk","content":{"text":"Thought A from earlier.\nThought B from earlier."}}));
+        update(&mut st, &em, &json!({"sessionUpdate":"tool_call","toolCallId":"call-old-1","name":"read_file","status":"in_progress","rawInput":{"Path":"a.lua"}}));
+        update(&mut st, &em, &json!({"sessionUpdate":"tool_call_update","toolCallId":"call-old-1","status":"completed","rawOutput":{"output":"old"}}));
+        update(&mut st, &em, &json!({"sessionUpdate":"agent_message_chunk","content":{"text":"12:35 测试总结已完成。14:02 Mock 后端使用 OpenResty。"}}));
+        // Mid-replay USER_INPUT("继续") must NOT disarm the guard while steps[8] still follows
+        update(&mut st, &em, &json!({"sessionUpdate":"user_message_chunk","content":{"text":"继续"}}));
+        assert!(st.agy_replay.is_some(), "mid-replay historical user echo must not disarm the guard");
+        update(&mut st, &em, &json!({"sessionUpdate":"agent_message_chunk","content":{"text":"⚠ The stream was interrupted. Please continue the task you were working on."}}));
+        update(&mut st, &em, &json!({"sessionUpdate":"tool_call","toolCallId":"call-old-2","name":"write_file","status":"completed","rawInput":{"Path":"b.lua"}}));
+        update(&mut st, &em, &json!({"sessionUpdate":"agent_message_chunk","content":{"text":"⚠ Individual quota reached. Please upgrade your subscription. Resets in 135h57m45s. ⚠ Individual quota reached. Please upgrade your subscription. Resets in 135h57m45s."}}));
+
+        // Now current prompt echo arrives (after all historical USER_INPUTs) -> disarms guard
+        update(&mut st, &em, &json!({"sessionUpdate":"user_message_chunk","content":{"text":"继续"}}));
+        assert!(st.agy_replay.is_none(), "current prompt echo should disarm the guard");
+
+        // Fresh reply arrives — even if its text matches an earlier reply, it must NOT be dropped
+        update(&mut st, &em, &json!({"sessionUpdate":"agent_message_chunk","content":{"text":"14:02 Mock 后端使用 OpenResty。"}}));
+        let _ = handle(&mut st, &spec, &json!({"jsonrpc":"2.0","id":prompt_id,"result":{"stopReason":"end_turn"}}), &em).unwrap();
+
+        let evs = hub.store.events_since("s", 0, 100).unwrap();
+        assert!(!evs.iter().any(|e| matches!(e.body, EventBody::Thinking { .. })), "replayed thinking leaked");
+        assert!(!evs.iter().any(|e| matches!(e.body, EventBody::ToolCall { .. } | EventBody::ToolResult { .. })), "replayed tool leaked");
+        assert!(!evs.iter().any(|e| matches!(e.body, EventBody::RateLimit { .. })), "replayed quota triggered fake rate_limit");
+        let replies: Vec<&str> = evs.iter().filter_map(|e| match &e.body {
+            EventBody::AssistantText { text, .. } => Some(text.as_str()),
+            _ => None,
+        }).collect();
+        assert_eq!(replies, ["14:02 Mock 后端使用 OpenResty。"]);
+
+        // Scenario 2: If session/prompt returns end_turn right after a replayed quota banner with no fresh reply, no fake rate_limit fires
+        let (hub2, em2, _rx2) = crate::hub::test_emitter();
+        let mut st2 = State {
+            is_antigravity: true,
+            session_id: Some(sid.into()),
+            agy_last_streamed_steps: 0,
+            ..Default::default()
+        };
+        let pid2 = prompt_with_brain_dir(&mut st2, &em2, &Prompt { text: "继续".into(), images: vec![] }, Some(root.path()))["id"].as_u64().unwrap();
+        update(&mut st2, &em2, &json!({"sessionUpdate":"tool_call","toolCallId":"call-old-2","name":"write_file","status":"completed","rawInput":{"Path":"b.lua"}}));
+        update(&mut st2, &em2, &json!({"sessionUpdate":"agent_message_chunk","content":{"text":"\n⚠ Individual quota reached. Resets in 135h57m45s."}}));
+        let _ = handle(&mut st2, &spec, &json!({"jsonrpc":"2.0","id":pid2,"result":{"stopReason":"end_turn"}}), &em2).unwrap();
+        let evs2 = hub2.store.events_since("s", 0, 100).unwrap();
+        assert!(!evs2.iter().any(|e| matches!(e.body, EventBody::RateLimit { .. })), "replayed quota banner must not trigger rate_limit");
+        assert!(!evs2.iter().any(|e| matches!(e.body, EventBody::AssistantText { .. })), "replayed quota banner must not be saved");
+    }
+
+    #[test]
+    fn antigravity_cycle_end_then_grace_exit_still_resumes_and_ready_to_prompt_waits() {
+        use super::*;
+        let root = tempfile::tempdir().unwrap();
+        let parent_id = "p-cycle-grace";
+        let (hub, em, _rx) = crate::hub::test_emitter();
+        let steps = vec![
+            json!({"step_index":0,"type":"USER_INPUT","status":"DONE","content":"run two"}),
+            json!({"step_index":1,"type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"run_command","args":{"CommandLine":"a"}},{"name":"run_command","args":{"CommandLine":"b"}}]}),
+            json!({"step_index":2,"type":"GENERIC","status":"RUNNING","content":"Created At: x\nTool is running as a background task with task id: p-cycle-grace/task-a"}),
+            json!({"step_index":3,"type":"GENERIC","status":"RUNNING","content":"Created At: x\nTool is running as a background task with task id: p-cycle-grace/task-b"}),
+            json!({"step_index":4,"type":"SYSTEM_MESSAGE","status":"DONE","content":"<SYSTEM_MESSAGE>\n[Message] timestamp=x sender=p-cycle-grace/task-a priority=MESSAGE_PRIORITY_HIGH content=Task id \"p-cycle-grace/task-a\" finished with result:\nCommand exited with code 0.\n\nCommand output:\nA-OK\n</SYSTEM_MESSAGE>"}),
+            json!({"step_index":5,"type":"PLANNER_RESPONSE","status":"DONE","content":"Task A finished while B runs."}),
+        ];
+        write_agy_steps(root.path(), parent_id, &steps);
+
+        // Tool-only boundary check: trailing wakeup SYSTEM_MESSAGE must not be skipped when last_reply is empty
+        assert_eq!(agy_prompt_boundary(&steps[..5], 0, ""), 4);
+
+        let mut st = State { is_antigravity: true, session_id: Some(parent_id.into()), ..Default::default() };
+        let mut watch = AgyWatch::new(parent_id.into(), root.path().to_path_buf(), 0, 4, Some("end_turn".into()), HashMap::new(), HashMap::new(), true);
+        watch.detached = true;
+        watch.add_bg_task(AgyBgTask { id: "p-cycle-grace/task-a".into(), kind: "local_bash".into(), description: "Task A".into(), started_at: 1, output_file: None, tc_id: Some("tc-a".into()), is_daemon: false, timer_cond: None, done: false, announced: false, result: None });
+        watch.add_bg_task(AgyBgTask { id: "p-cycle-grace/task-b".into(), kind: "local_bash".into(), description: "Task B".into(), started_at: 2, output_file: None, tc_id: Some("tc-b".into()), is_daemon: false, timer_cond: None, done: false, announced: false, result: None });
+        st.agy_watch = Some(watch);
+
+        // Cycle 1 settles via CycleEnd (task-b still running, so watch.wake becomes false)
+        assert!(poll_agy_watch(&mut st, &agy_test_spec(), &em).is_none());
+        assert!(poll_agy_watch(&mut st, &agy_test_spec(), &em).is_none());
+        assert!(!st.agy_watch.as_ref().unwrap().wake);
+        assert!(!st.agy_watch.as_ref().unwrap().unresumed_items.is_empty());
+
+        // Task B finishes silently (no second wakeup message) and WAKEUP_GRACE expires
+        st.agy_watch.as_mut().unwrap().bg_tasks.iter_mut().for_each(|b| b.done = true);
+        st.agy_watch.as_mut().unwrap().all_subagents_done_at =
+            Some(tokio::time::Instant::now() - std::time::Duration::from_secs(25));
+        let sync = poll_agy_watch(&mut st, &agy_test_spec(), &em)
+            .expect("grace exit after CycleEnd must still send session/resume for cycle 1");
+        assert_eq!(sync["method"], "session/resume");
+
+        // While Pending::AgyResume is inflight, ready_to_prompt() must wait so session/prompt doesn't race it
+        assert!(!st.ready_to_prompt(), "queued prompts must wait for Pending::AgyResume");
+        let sync_id = sync["id"].as_u64().unwrap();
+        let _ = handle(&mut st, &agy_test_spec(), &json!({"jsonrpc":"2.0","id":sync_id,"result":{}}), &em).unwrap();
+        assert!(st.ready_to_prompt());
+        assert!(st.agy_carry.unresumed_items.is_empty());
+        assert_eq!(st.agy_last_streamed_steps, 6);
+        let _ = hub;
+    }
+
+    #[tokio::test]
+    async fn antigravity_deferred_restart_survives_task_end_until_wakeup_finishes() {
+        use super::*;
+        let root = tempfile::tempdir().unwrap();
+        let parent_id = "p-bg-restart";
+        let (hub, em, mut rx) = crate::hub::test_emitter();
+        crate::hub::test_set_tool(&hub, "s", ToolKind::Antigravity);
+        crate::hub::test_set_restart_pending(&hub, "s", true);
+
+        let bg_notice = "Created At: x\nTool is running as a background task with task id: p-bg-restart/task-188\nTask Description: run e2e\nTask logs are available at: file:///tmp/task-188.log";
+        let mut steps = vec![
+            json!({"step_index":0,"type":"USER_INPUT","status":"DONE","content":"run e2e"}),
+            json!({"step_index":1,"type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"run_command","args":{"CommandLine":"run e2e","toolSummary":"Run isolated E2E"}}]}),
+            json!({"step_index":2,"type":"GENERIC","status":"RUNNING","content":bg_notice}),
+            json!({"step_index":3,"type":"PLANNER_RESPONSE","status":"DONE","content":"Running E2E in background."}),
+        ];
+        write_agy_steps(root.path(), parent_id, &steps);
+
+        let mut st = State { is_antigravity: true, session_id: Some(parent_id.into()), ..Default::default() };
+        let mut watch = AgyWatch::new(parent_id.into(), root.path().to_path_buf(), 0, 4, Some("end_turn".into()), HashMap::new(), HashMap::new(), true);
+        watch.detached = true;
+        watch.add_bg_task(AgyBgTask {
+            id: "p-bg-restart/task-188".into(),
+            kind: "local_bash".into(),
+            description: "Run isolated E2E".into(),
+            started_at: 1,
+            output_file: Some("/tmp/task-188.log".into()),
+            tc_id: Some("tc-188".into()),
+            is_daemon: false,
+            timer_cond: None,
+            done: false,
+            announced: false,
+            result: None,
+        });
+        st.agy_watch = Some(watch);
+        let spec = agy_test_spec();
+
+        // Turn ends while task-188 is still running -> watch_active stays true, restart_pending held
+        assert!(poll_agy_watch(&mut st, &spec, &em).is_none());
+        em.event(EventBody::TurnEnd { stop_reason: Some("end_turn".into()), model: None });
+        assert_eq!(hub.info("s").unwrap().status, SessionStatus::Idle);
+        assert_eq!(hub.info("s").unwrap().background_tasks.len(), 1);
+        assert!(crate::hub::test_watch_active(&hub, "s"));
+        assert!(crate::hub::test_restart_pending(&hub, "s"));
+
+        // Task-188 fails and writes SYSTEM_MESSAGE, BEFORE parent writes wakeup PLANNER_RESPONSE
+        steps.push(json!({
+            "step_index": 4,
+            "type": "SYSTEM_MESSAGE",
+            "status": "DONE",
+            "content": "<SYSTEM_MESSAGE>\n[Message] timestamp=x sender=p-bg-restart/task-188 priority=MESSAGE_PRIORITY_HIGH content=Task id \"p-bg-restart/task-188\" finished with result:\nCommand exited with code 1.\n\nCommand output:\nTimeout 15000ms exceeded\nLog: file:///tmp/task-188.log\n</SYSTEM_MESSAGE>"
+        }));
+        write_agy_steps(root.path(), parent_id, &steps);
+
+        assert!(poll_agy_watch(&mut st, &spec, &em).is_none());
+        tokio::task::yield_now().await;
+        // background_tasks cleared in UI, but watch_active keeps restart_pending from killing agy mid-wakeup!
+        assert!(hub.info("s").unwrap().background_tasks.is_empty());
+        assert!(crate::hub::test_watch_active(&hub, "s"));
+        assert!(crate::hub::test_restart_pending(&hub, "s"), "deferred restart must wait for agy wakeup reply");
+        assert!(rx.try_recv().is_err(), "agy process must not be killed before waking up");
+
+        // Parent wakes up and reports the failure
+        steps.push(json!({
+            "step_index": 5,
+            "type": "PLANNER_RESPONSE",
+            "status": "DONE",
+            "content": "E2E timed out; fixing and retrying."
+        }));
+        write_agy_steps(root.path(), parent_id, &steps);
+
+        assert!(poll_agy_watch(&mut st, &spec, &em).is_none());
+        assert_eq!(hub.info("s").unwrap().status, SessionStatus::Running);
+        let sync = poll_agy_watch(&mut st, &spec, &em).expect("wakeup finished with session/resume");
+        assert_eq!(sync["method"], "session/resume");
+        assert!(!crate::hub::test_watch_active(&hub, "s"));
+        assert!(!crate::hub::test_restart_pending(&hub, "s"), "after_turn should run deferred restart once wakeup finishes");
+
+        let evs = hub.store.events_since("s", 0, 100).unwrap();
+        assert!(evs.iter().any(|e| matches!(&e.body, EventBody::System { text } if text == "后台任务失败：Run isolated E2E")));
+        assert!(evs.iter().any(|e| matches!(&e.body, EventBody::AssistantText { text, .. } if text == "E2E timed out; fixing and retrying.")));
+    }
+
+    #[test]
+    fn antigravity_parallel_background_command_discovered_behind_unsettled_step() {
+        use super::*;
+        let (hub, em, _rx) = crate::hub::test_emitter();
+        let mut st = State {
+            is_antigravity: true,
+            session_id: Some("p-par".into()),
+            ..Default::default()
+        };
+        update(
+            &mut st,
+            &em,
+            &json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "tc-sync-1",
+                "name": "run_command",
+                "title": "slow sync",
+                "status": "in_progress",
+                "rawInput": {"CommandLine": "sleep 8", "toolSummary": "Slow sync cmd"}
+            }),
+        );
+        update(
+            &mut st,
+            &em,
+            &json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "tc-bg-2",
+                "name": "run_command",
+                "title": "fast bg",
+                "status": "in_progress",
+                "rawInput": {"CommandLine": "npm run build", "toolSummary": "Parallel bg build"}
+            }),
+        );
+        let steps = vec![
+            json!({"step_index":0,"type":"USER_INPUT","status":"DONE","content":"go"}),
+            json!({"step_index":1,"type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[
+                {"name":"run_command","args":{"CommandLine":"sleep 8","toolSummary":"Slow sync cmd"}},
+                {"name":"run_command","args":{"CommandLine":"npm run build","toolSummary":"Parallel bg build"}}
+            ]}),
+            // First command still inside WaitMsBeforeAsync (unsettled GENERIC/RUNNING without background notice)
+            json!({"step_index":2,"type":"GENERIC","status":"RUNNING","content":"Created At: x\nRunning..."}),
+            // Second command already moved to background
+            json!({"step_index":3,"type":"GENERIC","status":"RUNNING","content":"Created At: x\nTool is running as a background task with task id: p-par/task-3\nTask Description: npm run build\nTask logs are available at: file:///tmp/t3.log"}),
+        ];
+
+        assert!(discover_agy_bg_from_steps(&mut st, &steps));
+        assert_eq!(st.agy_bg_tasks.len(), 1);
+        assert_eq!(st.agy_bg_tasks[0].id, "p-par/task-3");
+        assert_eq!(st.agy_bg_tasks[0].description, "Parallel bg build");
+        assert_eq!(st.agy_bg_tasks[0].tc_id.as_deref(), Some("tc-bg-2"), "must bind the matching parallel toolCallId, not tc-sync-1");
+        assert_eq!(st.agy_open_bg_calls.len(), 1);
+        assert_eq!(st.agy_open_bg_calls[0].0, "tc-sync-1");
+        let _ = hub;
+    }
+
+    #[test]
+    fn antigravity_replay_guard_handles_out_of_order_parallel_tools() {
+        use super::*;
+        let history = vec![
+            AgyHistoryItem::Tool { name: "manage_task".into(), input: json!({"Action":"status","TaskId":"t1"}) },
+            AgyHistoryItem::Tool { name: "run_command".into(), input: json!({"CommandLine":"git diff"}) },
+            AgyHistoryItem::Tool { name: "manage_task".into(), input: json!({"Action":"status","TaskId":"t2"}) },
+        ];
+        let mut guard = AgyReplayGuard::new("继续", VecDeque::new(), history).unwrap();
+        // agy replays parallel tool calls [0, 2, 1] out of declaration order
+        assert!(guard.consume_tool("manage_task", &json!({"Action":"status","TaskId":"t1"})));
+        assert!(guard.consume_tool("manage_task", &json!({"Action":"status","TaskId":"t2"})));
+        assert!(guard.consume_tool("run_command", &json!({"CommandLine":"git diff"})), "skipped parallel tool must still match once");
+        // Each historical tool can only be consumed once
+        assert!(!guard.consume_tool("run_command", &json!({"CommandLine":"git diff"})));
     }
 }
