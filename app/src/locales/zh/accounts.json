@@ -10,7 +10,7 @@
   "autoFailover": "额度用完自动切换",
   "autoFailoverTip": "会话遇到用量上限时，按列表顺序换到下一个可用账号",
   "refreshQuotas": "刷新额度",
-  "probeAllQuotas": "逐个切换探测全部账号的额度",
+  "probeAllQuotas": "逐个检查所有账号额度",
   "addAccount": "添加账号",
   "addShort": "添加",
   "importBundle": "导入凭据包",

@@ -20,7 +20,7 @@
   "cache": "Cache",
   "billedInCreditsNoTokens": "Billed in credits (no tokens reported)",
   "dailyUsage": "Daily usage",
-  "probeAll": "Probe All",
+  "probeAll": "Check all account quotas",
   "manageAccounts": "Manage",
   "activeAccount": "Default"
 }

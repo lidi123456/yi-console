@@ -20,7 +20,7 @@
   "cache": "缓存",
   "billedInCreditsNoTokens": "按积分计费（未上报 token）",
   "dailyUsage": "每日用量",
-  "probeAll": "切换探测全部",
+  "probeAll": "检查全部账号额度",
   "manageAccounts": "管理",
   "activeAccount": "默认"
 }

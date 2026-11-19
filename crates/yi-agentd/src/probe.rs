@@ -1346,7 +1346,7 @@ pub async fn quota(
                 "account": { "email": res.identity.email, "plan": res.identity.plan },
                 "windows": [],
                 "needsActivationToProbe": true,
-                "note": "系统级单活账号：切换为当前账号后自动探测，或点击「探测全部」",
+                "note": "系统级单活账号：切换为当前账号后自动检查，或点击「检查全部账号额度」",
                 "fetchedAt": Value::Null,
             }));
         }
@@ -1464,7 +1464,7 @@ pub async fn quotas(
                             "account": { "email": acc.identity.email, "plan": acc.identity.plan },
                             "windows": [],
                             "needsActivationToProbe": true,
-                            "note": "系统级单活账号：切换为当前账号后自动探测，或点击「切换探测全部」",
+                            "note": "系统级单活账号：切换为当前账号后自动检查，或点击「检查全部账号额度」",
                             "fetchedAt": Value::Null,
                         })
                     });

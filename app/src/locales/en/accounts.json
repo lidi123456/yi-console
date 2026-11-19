@@ -10,7 +10,7 @@
   "autoFailover": "Switch when quota runs out",
   "autoFailoverTip": "When a session hits a usage limit, move to the next usable account in list order",
   "refreshQuotas": "Refresh quotas",
-  "probeAllQuotas": "Switch through every account to check its quota",
+  "probeAllQuotas": "Check every account's quota",
   "addAccount": "Add account",
   "addShort": "Add",
   "importBundle": "Import bundle",

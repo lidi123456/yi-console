@@ -17,7 +17,7 @@
   "manageAccounts": "Accounts",
   "allAccountsQuota": "Quotas across all configured accounts",
   "otherAccountsQuota": "Quotas across other configured accounts",
-  "probeAll": "Probe All",
+  "probeAll": "Check all account quotas",
   "switchToThisAccount": "Use Here",
   "switchedAccount": "Switched this session to \"{{label}}\""
 }
