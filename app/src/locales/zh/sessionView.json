@@ -29,5 +29,6 @@
   "switchAccountTitle": "在当前会话原地切换账号或管理账号",
   "defaultAccount": "默认账号",
   "manageAccounts": "管理账号…",
-  "switchedAccount": "已将当前会话切换至「{{label}}」"
+  "switchedAccount": "已将当前会话切换至「{{label}}」",
+  "memory": "查看或编辑本会话的个人长期记忆"
 }

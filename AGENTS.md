@@ -26,6 +26,7 @@ See [README.md](README.md) for an overview and usage. This file has the project 
 | Frontend UI: chat timeline, theme, fonts, scrollbars, sidebar, links, overlays, i18n | [docs/internals/frontend-ui.md](docs/internals/frontend-ui.md) |
 | Computer Use: bundled Windows driver, macOS CuaDriver.app, session MCP, control leases, screenshots | [docs/internals/computer-use.md](docs/internals/computer-use.md) |
 | AI browser (`yi_browser`): per-session Chrome over CDP, snapshots and refs, gateway rules | [docs/internals/browser.md](docs/internals/browser.md) |
+| Personal long-term memory (`yi_memory`): host/project Markdown store, progressive disclosure, gateway rules | [docs/internals/memory.md](docs/internals/memory.md) |
 | Remote: SSH bridge, relay, forwarding, port forwarding | [docs/internals/remote.md](docs/internals/remote.md) |
 | Daemon lifecycle, versions, auto-upgrade | [docs/internals/daemon.md](docs/internals/daemon.md) |
 | App self-update, Android | [docs/internals/release.md](docs/internals/release.md) |

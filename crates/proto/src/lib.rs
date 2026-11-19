@@ -591,6 +591,28 @@ pub enum EventBody {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         images: Vec<ImageRef>,
     },
+    /// Personal memory change made or proposed by the AI via `yi_memory`
+    Memory {
+        /// "saved" | "deleted" | "pending_save" | "pending_delete"
+        action: String,
+        scope: MemoryScope,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        project_key: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        project_name: Option<String>,
+        id: String,
+        title: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        description: String,
+        #[serde(default)]
+        mode: MemoryMode,
+        /// Revision id in `.history/` for 1-click undo (present on direct save/delete)
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        undo_id: Option<String>,
+        /// Pending proposal id (present when host write policy is `confirm`)
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pending_id: Option<String>,
+    },
     ToolCall {
         id: String,
         name: String,
@@ -1013,6 +1035,164 @@ pub struct DaemonSettings {
     /// The AI browser (`yi_browser`)
     #[serde(default, skip_serializing_if = "BrowserSettings::is_default")]
     pub browser: BrowserSettings,
+    /// Host personal long-term memory (`yi_memory`)
+    #[serde(default, skip_serializing_if = "MemorySettings::is_default")]
+    pub memory: MemorySettings,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "lowercase")]
+pub enum MemoryScope {
+    #[default]
+    Global,
+    Project,
+}
+
+impl MemoryScope {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            MemoryScope::Global => "global",
+            MemoryScope::Project => "project",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "kebab-case")]
+pub enum MemoryMode {
+    #[default]
+    OnDemand,
+    Always,
+}
+
+impl MemoryMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            MemoryMode::OnDemand => "on-demand",
+            MemoryMode::Always => "always",
+        }
+    }
+}
+
+fn default_memory_write_policy() -> String {
+    "direct".into()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct MemorySettings {
+    /// Master switch for host personal long-term memory (`yi_memory`); enabled by default
+    #[serde(default = "yes")]
+    pub enabled: bool,
+    /// AI write policy: "direct" (save + undo snapshot) | "confirm" (pending review) | "readonly"
+    #[serde(default = "default_memory_write_policy")]
+    pub write_policy: String,
+}
+
+impl Default for MemorySettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            write_policy: default_memory_write_policy(),
+        }
+    }
+}
+
+impl MemorySettings {
+    pub fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+
+    pub fn normalized_policy(&self) -> &'static str {
+        match self.write_policy.trim() {
+            "confirm" => "confirm",
+            "readonly" => "readonly",
+            _ => "direct",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryMeta {
+    pub id: String,
+    pub scope: MemoryScope,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_key: Option<String>,
+    pub title: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub mode: MemoryMode,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub updated_at: i64,
+    #[serde(default)]
+    pub size: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryEntry {
+    #[serde(flatten)]
+    pub meta: MemoryMeta,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryProjectInfo {
+    pub key: String,
+    pub display_name: String,
+    pub root_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_common_dir: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aliases: Vec<String>,
+    #[serde(default)]
+    pub count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingMemory {
+    pub pending_id: String,
+    /// "save" | "delete"
+    pub action: String,
+    pub scope: MemoryScope,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_name: Option<String>,
+    pub id: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub mode: MemoryMode,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryImportCandidate {
+    pub source: String,
+    pub path: String,
+    pub suggested_scope: MemoryScope,
+    pub suggested_id: String,
+    pub title: String,
+    pub description: String,
+    pub suggested_mode: MemoryMode,
+    pub content: String,
+    pub already_exists: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -1338,6 +1518,32 @@ pub mod methods {
     /// {event}: a registered desktop app pushes a state change (`bots.changed`, ...) to every connected client
     pub const CLIENT_EVENT: &str = "client.event";
 
+    /// Host personal long-term memory (`yi_memory`)
+    /// {cwd?, projectKey?} -> {resolvedProject?, projects, global, project, byProject, pending, settings}
+    pub const MEMORY_LIST: &str = "memory.list";
+    /// {scope, projectKey?, cwd?, id} -> MemoryEntry
+    pub const MEMORY_GET: &str = "memory.get";
+    /// {scope, projectKey?, cwd?, id, title?, description?, mode?, tags?, content, prevId?} -> {entry, undoId}
+    pub const MEMORY_SAVE: &str = "memory.save";
+    /// {scope, projectKey?, cwd?, id} -> {undoId}
+    pub const MEMORY_DELETE: &str = "memory.delete";
+    /// {fromScope, fromProjectKey?, id, toScope, toProjectKey?, cwd?, newId?} -> {entry, undoId}
+    pub const MEMORY_MOVE: &str = "memory.move";
+    /// {undoId} -> {ok, action, scope, id}
+    pub const MEMORY_UNDO: &str = "memory.undo";
+    /// {pendingId, approve, scope?, projectKey?, id?, title?, description?, mode?, tags?, content?} -> {ok, entry?}
+    pub const MEMORY_RESOLVE_PENDING: &str = "memory.resolvePending";
+    /// {cwd?, projectKey?} -> {prompt, project?, alwaysCount, indexCount, omittedCount, bytes}
+    pub const MEMORY_PREVIEW: &str = "memory.preview";
+    /// {cwd?} -> {candidates, project?}
+    pub const MEMORY_SCAN_IMPORT: &str = "memory.scanImport";
+    /// {items: [...]} -> {imported, skipped}
+    pub const MEMORY_IMPORT: &str = "memory.import";
+    /// {projectKey, cwd} -> MemoryProjectInfo
+    pub const MEMORY_REBIND_PROJECT: &str = "memory.rebindProject";
+    /// Private, locally authenticated `yi_memory` MCP proxy traffic; remote peers cannot invoke it
+    pub const MEMORY_MCP: &str = "memory.mcp";
+
     // Notifications
     pub const EV_SESSION_EVENT: &str = "session.event";
     pub const EV_SESSION_UPDATED: &str = "session.updated";
@@ -1363,6 +1569,8 @@ pub mod methods {
     pub const EV_BROWSER_FRAME: &str = "browser.frame";
     /// Address, tabs, dialog, busy and paused state of a watched AI browser
     pub const EV_BROWSER_STATUS: &str = "browser.status";
+    /// {}: host personal memories or pending proposals changed
+    pub const EV_MEMORY_CHANGED: &str = "memory.changed";
 }
 
 #[cfg(test)]

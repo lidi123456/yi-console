@@ -334,6 +334,7 @@ export function sessionMenu(
   opts: {
     inSession?: boolean;
     onUsage?: () => void;
+    onMemory?: () => void;
     style?: 'modern' | 'claude';
     onToggleStyle?: () => void;
     /** On mobile the bottom terminal panel toggle lives in the menu (its top-bar spot is taken by usage) */
@@ -406,6 +407,7 @@ export function sessionMenu(
     ...(opts.inSession ? [] : [{ label: tx('viewChanges'), icon: 'diff', run: () => showChanges(hostId, sid) }]),
     // The mobile top bar already has a usage button, so don't repeat it in the menu; the terminal panel is the reverse and only appears in the mobile menu
     ...(opts.onUsage && info.tool !== 'shell' && !mobile ? [{ label: tx('viewUsage'), icon: 'chart', run: opts.onUsage }] : []),
+    ...(opts.onMemory && info.tool !== 'shell' && info.mode === 'structured' ? [{ label: tx('memory'), icon: 'book', run: opts.onMemory }] : []),
     ...(opts.onToggleTerm && info.tool !== 'shell' && mobile
       ? [{ label: opts.term ? tx('hideTerminalPanel') : tx('openTerminalPanel'), icon: 'terminal', run: opts.onToggleTerm }]
       : []),

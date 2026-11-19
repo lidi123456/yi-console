@@ -25,6 +25,7 @@
     "files": "{{name}}: Files",
     "stats": "{{name}}: Usage Stats",
     "ports": "{{name}}: Port Forwarding",
+    "memory": "{{name}}: Personal Memory",
     "settings": "{{name}}: Host Settings",
     "settingsSub": "Snippets, status line, push notifications"
   },

@@ -34,6 +34,7 @@
   "openTerminal": "Open Terminal",
   "usageStats": "Usage Stats",
   "portForwarding": "Port Forwarding",
+  "memory": "Personal Memory",
   "hostSettings": "Host Settings",
   "editConnection": "Edit Connection",
   "disconnect": "Disconnect",

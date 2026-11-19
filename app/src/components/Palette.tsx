@@ -150,6 +150,7 @@ export function Palette() {
         { key: `h-files-${id}`, label: t('host.files', { name: n }), icon: 'folder', run: () => navigate({ kind: 'files', hostId: id }) },
         { key: `h-stats-${id}`, label: t('host.stats', { name: n }), icon: 'chart', run: () => navigate({ kind: 'stats', hostId: id }) },
         { key: `h-ports-${id}`, label: t('host.ports', { name: n }), icon: 'external', run: () => navigate({ kind: 'ports', hostId: id }) },
+        { key: `h-mem-${id}`, label: t('host.memory', { name: n }), icon: 'book', run: () => navigate({ kind: 'memory', hostId: id }) },
         { key: `h-set-${id}`, label: t('host.settings', { name: n }), icon: 'settings', sub: t('host.settingsSub'), run: () => navigate({ kind: 'settings', hostId: id }) },
       );
     }

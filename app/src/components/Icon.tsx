@@ -73,6 +73,7 @@ const paths: Record<string, string> = {
   wrap: 'M4 6h16M4 12h13a3 3 0 0 1 0 6h-4M15 16l-2 2 2 2M4 18h5',
   eye: 'M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12zM12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6z',
   outline: 'M4 6h2M9 6h11M7 12h2M12 12h8M7 18h2M12 18h8',
+  book: 'M4 5.5A2.5 2.5 0 0 1 6.5 3H20v17H6.5A2.5 2.5 0 0 0 4 22zM4 19.5A2.5 2.5 0 0 1 6.5 17H20',
   columns: 'M4 5h16v14H4zM12 5v14',
   rows: 'M4 5h16v14H4zM4 12h16',
   compare: 'M7 4v13M4 14l3 3 3-3M17 20V7M14 10l3-3 3 3',

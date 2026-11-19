@@ -6,6 +6,7 @@ use yi_proto::{DaemonSettings, McpServerConfig, McpTransport, ToolKind};
 
 pub const DESKTOP_SERVER: &str = "yi_computer_use";
 pub const BROWSER_SERVER: &str = crate::browser::SERVER;
+pub const MEMORY_SERVER: &str = crate::memory::SERVER;
 const MASK: &str = "********";
 
 pub fn supported(tool: ToolKind) -> bool {
@@ -38,6 +39,9 @@ pub fn validate(settings: &DaemonSettings) -> Result<()> {
         }
         if server.name == BROWSER_SERVER {
             bail!("MCP 名称 yi_browser 为内置浏览器保留");
+        }
+        if server.name == MEMORY_SERVER {
+            bail!("MCP 名称 yi_memory 为内置长期记忆保留");
         }
         if !names.insert(&server.name) {
             bail!("MCP 名称重复：{}", server.name);
@@ -129,6 +133,10 @@ pub fn desktop(config: Value) -> Result<McpServerConfig> {
 
 pub fn browser(config: Value) -> Result<McpServerConfig> {
     Ok(serde_json::from_value(json!({"name":BROWSER_SERVER,"command":config["command"],"args":config["args"]}))?)
+}
+
+pub fn memory(config: Value) -> Result<McpServerConfig> {
+    Ok(serde_json::from_value(json!({"name":MEMORY_SERVER,"command":config["command"],"args":config["args"]}))?)
 }
 
 /// Cache identity only; the digest is not used as an authorization credential.
@@ -231,6 +239,8 @@ mod tests {
         assert!(validate(&settings).is_err());
         settings.mcp_servers = vec![fixture()];
         settings.mcp_servers[0].name = DESKTOP_SERVER.into();
+        assert!(validate(&settings).is_err());
+        settings.mcp_servers[0].name = MEMORY_SERVER.into();
         assert!(validate(&settings).is_err());
         settings.mcp_servers[0] = fixture();
         let mut hidden = redact(settings.clone());

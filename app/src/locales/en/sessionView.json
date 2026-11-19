@@ -29,5 +29,6 @@
   "switchAccountTitle": "Switch or manage account in this session",
   "defaultAccount": "Default Account",
   "manageAccounts": "Manage Accounts…",
-  "switchedAccount": "Switched this session to \"{{label}}\""
+  "switchedAccount": "Switched this session to \"{{label}}\"",
+  "memory": "View or edit personal long-term memories for this session"
 }

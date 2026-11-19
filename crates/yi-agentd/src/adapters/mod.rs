@@ -30,6 +30,10 @@ and omit configuration directives, HTML, external resources, click actions and c
 /// Everything we add to the system prompt of Claude (`--append-system-prompt`) and Codex (`developerInstructions`)
 pub fn system_text(spec: &StartSpec) -> String {
     let mut s = format!("{}{}{}", IMAGE_HINT, crate::computer_use::model_hint(&spec.extra_args), crate::browser::model_hint(&spec.extra_args));
+    if let Some(m) = &spec.memory_prompt {
+        s.push_str("\n\n");
+        s.push_str(m);
+    }
     if let Some(p) = &spec.system_prompt {
         s.push_str("\n\n");
         s.push_str(p);
@@ -45,6 +49,18 @@ pub fn acp_system_notice(spec: &StartSpec) -> Option<String> {
 /// The session's appended system prompt as sent in a prompt, whether or not this tool session has seen it
 pub fn acp_system_reminder(spec: &StartSpec) -> Option<String> {
     spec.system_prompt
+        .as_ref()
+        .map(|p| format!("<system-reminder>\n{p}\n</system-reminder>"))
+}
+
+/// ACP tools: host personal memory L0 snapshot, sent on a fresh tool session and re-armed after compaction
+pub fn acp_memory_notice(spec: &StartSpec) -> Option<String> {
+    acp_memory_reminder(spec).filter(|_| spec.memory_notice)
+}
+
+/// The session's personal memory L0 snapshot wrapped as a system reminder for ACP prompts
+pub fn acp_memory_reminder(spec: &StartSpec) -> Option<String> {
+    spec.memory_prompt
         .as_ref()
         .map(|p| format!("<system-reminder>\n{p}\n</system-reminder>"))
 }
@@ -127,6 +143,10 @@ pub struct StartSpec {
     pub system_prompt: Option<String>,
     /// ACP tools: send `system_prompt` with the first prompt of this launch
     pub system_notice: bool,
+    /// Host personal long-term memory L0 snapshot (launch-time only; excluded from launch fingerprint)
+    pub memory_prompt: Option<String>,
+    /// ACP tools: send `memory_prompt` with the first prompt of a new tool session
+    pub memory_notice: bool,
     pub cols: u16,
     pub rows: u16,
     /// Run terminal mode inside this tmux session (so it survives daemon restarts)

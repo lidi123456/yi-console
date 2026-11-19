@@ -56,5 +56,6 @@
   "reload": "重新加载",
   "noReadableLogForThisTerminalSession": "找不到这个终端会话对应的工具日志，可能还没说过话，或者同一目录里同时开着多个同类会话、无法确定是哪一个",
   "newWithSameSettings": "以相同配置新建会话",
-  "switchOrManageAccount": "切换 / 管理账号…"
+  "switchOrManageAccount": "切换 / 管理账号…",
+  "memory": "个人长期记忆…"
 }

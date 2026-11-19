@@ -33,6 +33,7 @@ import zhLightbox from './zh/lightbox.json';
 import zhLimit from './zh/limit.json';
 import zhLimitDock from './zh/limitDock.json';
 import zhMain from './zh/main.json';
+import zhMemory from './zh/memory.json';
 import zhMermaidBlock from './zh/mermaidBlock.json';
 import zhModelPicker from './zh/modelPicker.json';
 import zhNewSession from './zh/newSession.json';
@@ -89,6 +90,7 @@ import enLightbox from './en/lightbox.json';
 import enLimit from './en/limit.json';
 import enLimitDock from './en/limitDock.json';
 import enMain from './en/main.json';
+import enMemory from './en/memory.json';
 import enMermaidBlock from './en/mermaidBlock.json';
 import enModelPicker from './en/modelPicker.json';
 import enNewSession from './en/newSession.json';
@@ -148,6 +150,7 @@ export const resources = {
     limit: zhLimit,
     limitDock: zhLimitDock,
     main: zhMain,
+    memory: zhMemory,
     mermaidBlock: zhMermaidBlock,
     modelPicker: zhModelPicker,
     newSession: zhNewSession,
@@ -206,6 +209,7 @@ export const resources = {
     limit: enLimit,
     limitDock: enLimitDock,
     main: enMain,
+    memory: enMemory,
     mermaidBlock: enMermaidBlock,
     modelPicker: enModelPicker,
     newSession: enNewSession,

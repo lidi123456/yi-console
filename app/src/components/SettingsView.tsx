@@ -3,9 +3,9 @@ import { openAccountManager } from './AccountManagerModal';
 import { useEffect, useState } from 'react';
 import { getT, isEn } from '../i18n';
 import { Icon } from './Icon';
-import { errorToast, invalidateSnippets, redetectTools, toast, useStore } from '../store';
+import { errorToast, invalidateSnippets, navigate, redetectTools, toast, useStore } from '../store';
 import { rpc } from '../transport';
-import { TOOL_LABEL, type BrowserSettings, type DaemonSettings, type Snippet, type StatusLineSettings, type ToolKind } from '../types';
+import { TOOL_LABEL, type BrowserSettings, type DaemonSettings, type MemorySettings, type Snippet, type StatusLineSettings, type ToolKind } from '../types';
 import { DEFAULT_STATUS_LINE, getStatusFields, invalidateStatusLine, TEMPLATE_VARS } from './StatusLine';
 
 const t = getT('settingsView');
@@ -153,6 +153,7 @@ export function SettingsView({ hostId }: { hostId: string }) {
         </div>
       </div>
       <BrowserCard v={s.browser ?? {}} local={hostId === 'local'} onChange={(browser) => setS({ ...s, browser })} />
+      <MemoryCard hostId={hostId} v={s.memory ?? { enabled: true, writePolicy: 'direct' }} onChange={(memory) => setS({ ...s, memory })} />
       <McpSettingsCard servers={s.mcpServers ?? []} onChange={(mcpServers) => setS({ ...s, mcpServers })} />
       <SnippetsCard list={s.snippets} onChange={(snippets) => setS({ ...s, snippets })} />
       <StatusLineCard v={s.statusLine} onChange={(statusLine) => setS({ ...s, statusLine })} />
@@ -195,6 +196,44 @@ const DOMAINS_SAMPLE = ['example.com', '*.example.com', 'localhost'].join('\n');
 
 /** Categories the host can always refuse (`deniedActions`), the risky ones first */
 const DENIABLE = ['eval', 'upload', 'download', 'network', 'storage', 'fill', 'click', 'interact'] as const;
+
+/** Host settings of personal long-term memory (`yi_memory`) */
+function MemoryCard({ hostId, v, onChange }: { hostId: string; v: MemorySettings; onChange: (v: MemorySettings) => void }) {
+  const m = getT('memory');
+  return (
+    <div className="card">
+      <div className="row" style={{ justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 }}>
+        <div className="card-title" style={{ marginBottom: 0 }}>{m('settingsTitle')}</div>
+        <button type="button" className="btn small" onClick={() => navigate({ kind: 'memory', hostId })}>
+          <Icon name="book" size={14} /> {m('manageMemories')}
+        </button>
+      </div>
+      <p className="muted small">{m('settingsDesc')}</p>
+      <div className="form">
+        <label className="check">
+          <input
+            type="checkbox"
+            checked={v.enabled ?? true}
+            onChange={(e) => onChange({ ...v, enabled: e.target.checked })}
+          />
+          {m('settingsEnabled')}
+        </label>
+        <label>
+          {m('settingsPolicy')}
+          <select
+            value={v.writePolicy || 'direct'}
+            disabled={!(v.enabled ?? true)}
+            onChange={(e) => onChange({ ...v, writePolicy: e.target.value })}
+          >
+            <option value="direct">{m('policyDirect')}</option>
+            <option value="confirm">{m('policyConfirm')}</option>
+            <option value="readonly">{m('policyReadonly')}</option>
+          </select>
+        </label>
+      </div>
+    </div>
+  );
+}
 
 /** Host settings of the AI browser (`yi_browser`) */
 function BrowserCard({ v, local, onChange }: { v: BrowserSettings; local: boolean; onChange: (v: BrowserSettings) => void }) {

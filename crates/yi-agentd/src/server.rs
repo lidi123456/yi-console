@@ -173,6 +173,29 @@ where
                     (Ok(sid), Ok(ticket)) => hub.browsers.proxy_call(&hub, sid, ticket, p["packet"].clone(), peer_pid).await,
                     (Err(e), _) | (_, Err(e)) => Err(e),
                 }
+            } else if req.method == methods::MEMORY_MCP && !local {
+                Err(anyhow!("记忆代理只接受本机连接"))
+            } else if req.method == methods::MEMORY_MCP {
+                let p = &req.params;
+                match (s(p, "sessionId"), s(p, "ticket")) {
+                    (Ok(sid), Ok(ticket)) => hub.memories.proxy_call(&hub, sid, ticket, p["packet"].clone(), peer_pid).await,
+                    (Err(e), _) | (_, Err(e)) => Err(e),
+                }
+            } else if local
+                && matches!(
+                    req.method.as_str(),
+                    methods::MEMORY_SAVE
+                        | methods::MEMORY_DELETE
+                        | methods::MEMORY_MOVE
+                        | methods::MEMORY_UNDO
+                        | methods::MEMORY_RESOLVE_PENDING
+                        | methods::MEMORY_IMPORT
+                        | methods::MEMORY_REBIND_PROJECT
+                )
+                && from_tool(peer_pid)
+            {
+                // AI tools and their subprocesses must go through the `yi_memory` MCP gateway, never direct admin RPCs
+                Err(anyhow!("AI 工具启动的进程不能直接调用 {}", req.method))
             } else if req.method == methods::BROWSER_VIEW_ATTACH {
                 // Frames go only to this connection, never through the hub's broadcast
                 match s(&req.params, "sessionId") {
@@ -316,6 +339,224 @@ pub async fn dispatch(
             Value::Null
         }
         BROWSER_USE_MCP => anyhow::bail!("浏览器代理只接受本机连接"),
+        MEMORY_MCP => anyhow::bail!("记忆代理只接受本机连接"),
+        MEMORY_LIST => {
+            let h = hub.clone();
+            let cwd = p["cwd"].as_str().filter(|x| !x.trim().is_empty()).map(std::path::PathBuf::from);
+            let pkey = p["projectKey"].as_str().filter(|x| !x.trim().is_empty()).map(str::to_string);
+            let settings = hub.settings.read().unwrap().memory.clone();
+            let snap = tokio::task::spawn_blocking(move || h.memories.store.list(cwd.as_deref(), pkey.as_deref())).await?;
+            let mut val = serde_json::to_value(snap)?;
+            val["settings"] = serde_json::to_value(settings)?;
+            val
+        }
+        MEMORY_GET => {
+            let h = hub.clone();
+            let scope: MemoryScope = serde_json::from_value(p["scope"].clone()).map_err(|_| anyhow!("scope 无效（应为 global 或 project）"))?;
+            let pkey = p["projectKey"].as_str().map(str::to_string);
+            let cwd = p["cwd"].as_str().filter(|x| !x.trim().is_empty()).map(std::path::PathBuf::from);
+            let id = s(&p, "id")?.to_string();
+            let entry = tokio::task::spawn_blocking(move || h.memories.store.get(scope, pkey.as_deref(), cwd.as_deref(), &id)).await??;
+            serde_json::to_value(entry)?
+        }
+        MEMORY_SAVE => {
+            let h = hub.clone();
+            let scope: MemoryScope = serde_json::from_value(p["scope"].clone()).map_err(|_| anyhow!("scope 无效（应为 global 或 project）"))?;
+            let project_key = p["projectKey"].as_str().filter(|x| !x.trim().is_empty()).map(str::to_string);
+            let cwd = p["cwd"].as_str().filter(|x| !x.trim().is_empty()).map(std::path::PathBuf::from);
+            let id = s(&p, "id")?.trim().to_string();
+            let prev_id = p["prevId"].as_str().filter(|x| !x.trim().is_empty()).map(str::to_string);
+            let title = p["title"].as_str().map(str::to_string);
+            let description = p["description"].as_str().map(str::to_string);
+            let mode: Option<MemoryMode> = if p["mode"].is_null() {
+                None
+            } else {
+                Some(serde_json::from_value(p["mode"].clone()).map_err(|_| anyhow!("mode 无效（应为 on-demand 或 always）"))?)
+            };
+            let tags: Option<Vec<String>> = p["tags"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect());
+            let content = p["content"].as_str().ok_or_else(|| anyhow!("缺少参数 content"))?.to_string();
+            let out = tokio::task::spawn_blocking(move || {
+                h.memories.store.save(crate::memory::store::SaveInput {
+                    scope,
+                    project_key,
+                    cwd,
+                    id,
+                    prev_id,
+                    title,
+                    description,
+                    mode,
+                    tags,
+                    content,
+                })
+            })
+            .await??;
+            hub.memory_changed();
+            json!({ "entry": out.entry, "undoId": out.undo_id })
+        }
+        MEMORY_DELETE => {
+            let h = hub.clone();
+            let scope: MemoryScope = serde_json::from_value(p["scope"].clone()).map_err(|_| anyhow!("scope 无效（应为 global 或 project）"))?;
+            let pkey = p["projectKey"].as_str().filter(|x| !x.trim().is_empty()).map(str::to_string);
+            let cwd = p["cwd"].as_str().filter(|x| !x.trim().is_empty()).map(std::path::PathBuf::from);
+            let id = s(&p, "id")?.trim().to_string();
+            let out = tokio::task::spawn_blocking(move || h.memories.store.delete(scope, pkey.as_deref(), cwd.as_deref(), &id)).await??;
+            hub.memory_changed();
+            json!({ "undoId": out.undo_id })
+        }
+        MEMORY_MOVE => {
+            let h = hub.clone();
+            let from_scope: MemoryScope = serde_json::from_value(p["fromScope"].clone()).map_err(|_| anyhow!("fromScope 无效"))?;
+            let from_key = p["fromProjectKey"].as_str().filter(|x| !x.trim().is_empty()).map(str::to_string);
+            let id = s(&p, "id")?.trim().to_string();
+            let to_scope: MemoryScope = serde_json::from_value(p["toScope"].clone()).map_err(|_| anyhow!("toScope 无效"))?;
+            let to_key = p["toProjectKey"].as_str().filter(|x| !x.trim().is_empty()).map(str::to_string);
+            let cwd = p["cwd"].as_str().filter(|x| !x.trim().is_empty()).map(std::path::PathBuf::from);
+            let new_id = p["newId"].as_str().filter(|x| !x.trim().is_empty()).map(str::to_string);
+            let out = tokio::task::spawn_blocking(move || {
+                h.memories.store.move_entry(
+                    from_scope,
+                    from_key.as_deref(),
+                    &id,
+                    to_scope,
+                    to_key.as_deref(),
+                    cwd.as_deref(),
+                    new_id.as_deref(),
+                )
+            })
+            .await??;
+            hub.memory_changed();
+            json!({ "entry": out.entry, "undoId": out.undo_id })
+        }
+        MEMORY_UNDO => {
+            let h = hub.clone();
+            let undo_id = s(&p, "undoId")?.trim().to_string();
+            let out = tokio::task::spawn_blocking(move || h.memories.store.undo(&undo_id)).await??;
+            hub.memory_changed();
+            json!({ "ok": true, "action": out.action, "scope": out.scope, "projectKey": out.project_key, "id": out.id })
+        }
+        MEMORY_RESOLVE_PENDING => {
+            let h = hub.clone();
+            let pending_id = s(&p, "pendingId")?.trim().to_string();
+            let approve = p["approve"].as_bool().unwrap_or(false);
+            let scope_override: Option<MemoryScope> = if p["scope"].is_null() {
+                None
+            } else {
+                Some(serde_json::from_value(p["scope"].clone()).map_err(|_| anyhow!("scope 无效"))?)
+            };
+            let project_key_override = p["projectKey"].as_str().filter(|x| !x.trim().is_empty()).map(str::to_string);
+            let id_override = p["id"].as_str().filter(|x| !x.trim().is_empty()).map(str::to_string);
+            let title_override = p["title"].as_str().map(str::to_string);
+            let description_override = p["description"].as_str().map(str::to_string);
+            let mode_override: Option<MemoryMode> = if p["mode"].is_null() {
+                None
+            } else {
+                Some(serde_json::from_value(p["mode"].clone()).map_err(|_| anyhow!("mode 无效"))?)
+            };
+            let tags_override: Option<Vec<String>> = p["tags"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect());
+            let content_override = p["content"].as_str().map(str::to_string);
+            let entry = tokio::task::spawn_blocking(move || {
+                h.memories.store.resolve_pending(
+                    &pending_id,
+                    approve,
+                    scope_override,
+                    project_key_override,
+                    id_override,
+                    title_override,
+                    description_override,
+                    mode_override,
+                    tags_override,
+                    content_override,
+                )
+            })
+            .await??;
+            hub.memory_changed();
+            json!({ "ok": true, "entry": entry })
+        }
+        MEMORY_PREVIEW => {
+            let h = hub.clone();
+            let cwd = p["cwd"].as_str().filter(|x| !x.trim().is_empty()).map(std::path::PathBuf::from);
+            let pkey = p["projectKey"].as_str().filter(|x| !x.trim().is_empty()).map(str::to_string);
+            let settings = hub.settings.read().unwrap().memory.clone();
+            let preview = tokio::task::spawn_blocking(move || {
+                h.memories
+                    .store
+                    .build_l0_preview(cwd.as_deref(), pkey.as_deref(), &settings, false)
+            })
+            .await?;
+            serde_json::to_value(preview)?
+        }
+        MEMORY_SCAN_IMPORT => {
+            let h = hub.clone();
+            let cwd = p["cwd"].as_str().filter(|x| !x.trim().is_empty()).map(std::path::PathBuf::from);
+            let (candidates, project) = tokio::task::spawn_blocking(move || h.memories.store.scan_import(cwd.as_deref())).await?;
+            json!({ "candidates": candidates, "project": project })
+        }
+        MEMORY_IMPORT => {
+            let h = hub.clone();
+            let items = p["items"]
+                .as_array()
+                .cloned()
+                .ok_or_else(|| anyhow!("缺少参数 items"))?;
+            let (imported, skipped) = tokio::task::spawn_blocking(move || -> Result<(usize, usize)> {
+                let mut imported = 0usize;
+                let mut skipped = 0usize;
+                for it in items {
+                    let scope: MemoryScope = serde_json::from_value(it["scope"].clone()).unwrap_or(MemoryScope::Project);
+                    let project_key = it["projectKey"].as_str().filter(|x| !x.trim().is_empty()).map(str::to_string);
+                    let cwd = it["cwd"].as_str().filter(|x| !x.trim().is_empty()).map(std::path::PathBuf::from);
+                    let id = it["id"].as_str().unwrap_or("").trim().to_string();
+                    let overwrite = it["overwrite"].as_bool().unwrap_or(false);
+                    if id.is_empty() {
+                        skipped += 1;
+                        continue;
+                    }
+                    if !overwrite && h.memories.store.get(scope, project_key.as_deref(), cwd.as_deref(), &id).is_ok() {
+                        skipped += 1;
+                        continue;
+                    }
+                    let title = it["title"].as_str().map(str::to_string);
+                    let description = it["description"].as_str().map(str::to_string);
+                    let mode: Option<MemoryMode> = if it["mode"].is_null() {
+                        None
+                    } else {
+                        serde_json::from_value(it["mode"].clone()).ok()
+                    };
+                    let tags: Option<Vec<String>> = it["tags"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect());
+                    let content = it["content"].as_str().unwrap_or("").to_string();
+                    if content.trim().is_empty() {
+                        skipped += 1;
+                        continue;
+                    }
+                    h.memories.store.save(crate::memory::store::SaveInput {
+                        scope,
+                        project_key,
+                        cwd,
+                        id,
+                        prev_id: None,
+                        title,
+                        description,
+                        mode,
+                        tags,
+                        content,
+                    })?;
+                    imported += 1;
+                }
+                Ok((imported, skipped))
+            })
+            .await??;
+            if imported > 0 {
+                hub.memory_changed();
+            }
+            json!({ "imported": imported, "skipped": skipped })
+        }
+        MEMORY_REBIND_PROJECT => {
+            let h = hub.clone();
+            let project_key = s(&p, "projectKey")?.trim().to_string();
+            let cwd = std::path::PathBuf::from(s(&p, "cwd")?);
+            let info = tokio::task::spawn_blocking(move || h.memories.store.rebind_project(&project_key, &cwd)).await??;
+            hub.memory_changed();
+            serde_json::to_value(info)?
+        }
         SESSION_LIST => serde_json::to_value(hub.list())?,
         SESSION_CREATE => {
             let params: CreateParams = serde_json::from_value(p)?;
@@ -1042,12 +1283,17 @@ pub async fn dispatch(
             let old = hub.settings.read().unwrap().clone();
             let mut new: DaemonSettings = serde_json::from_value(p.clone())?;
             if p.get("mcpServers").is_none() { new.mcp_servers = old.mcp_servers.clone(); }
+            if p.get("memory").is_none() { new.memory = old.memory.clone(); }
+            new.memory.write_policy = new.memory.normalized_policy().into();
             crate::mcp::keep_secrets(&mut new, &old)?;
             crate::mcp::validate(&new)?;
             crate::settings::save(&new)?;
             *hub.settings.write().unwrap() = new.clone();
             hub.mcp_settings_changed(&old, &new);
             hub.browsers.settings_changed(&old, &new);
+            if old.memory != new.memory {
+                hub.memory_changed();
+            }
             *TOOLS.lock().unwrap() = None;
             serde_json::to_value(crate::mcp::redact(new))?
         }
@@ -1100,6 +1346,9 @@ mod tests {
             (methods::BROWSER_USE_MCP, "浏览器代理只接受本机连接", "ssh", ""),
             (methods::BROWSER_USE_MCP, "浏览器代理只接受本机连接", "relay", ""),
             (methods::BROWSER_USE_MCP, "浏览器代理只接受本机连接", "local", yi_proto::BRIDGE_REMOTE_MARK),
+            (methods::MEMORY_MCP, "记忆代理只接受本机连接", "ssh", ""),
+            (methods::MEMORY_MCP, "记忆代理只接受本机连接", "relay", ""),
+            (methods::MEMORY_MCP, "记忆代理只接受本机连接", "local", yi_proto::BRIDGE_REMOTE_MARK),
         ] {
             let hub = Hub::new(crate::store::Store::open_memory().unwrap(), DaemonSettings::default());
             let (mut client, server) = tokio::io::duplex(4096);

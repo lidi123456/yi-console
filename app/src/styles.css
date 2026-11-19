@@ -13224,3 +13224,348 @@ button.wp-commit-title .chev {
 .prefs-toc button.active {
   background: var(--side-active);
 }
+
+/* ---- Host personal long-term memory (`yi_memory`) ---- */
+
+.mem-page {
+  max-width: 1080px;
+}
+
+.mem-disabled-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  background: var(--warn-soft);
+  border-color: var(--warn);
+}
+
+.mem-layout {
+  display: grid;
+  grid-template-columns: 240px minmax(0, 1fr);
+  gap: 14px;
+  align-items: start;
+}
+
+.mem-scopes {
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.mem-scope-sep {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-3);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 10px 10px 4px;
+}
+
+.mem-scope-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 7px 10px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.mem-scope-row:hover {
+  background: var(--bg-2);
+}
+
+.mem-scope-row.active {
+  background: var(--accent-soft);
+  font-weight: 600;
+}
+
+.mem-main {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+}
+
+.mem-toolbar {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.mem-toolbar-head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  min-width: 0;
+}
+
+.mem-search {
+  width: 100%;
+}
+
+.mem-cards {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.mem-card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 12px 14px;
+}
+
+.mem-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.mem-card-desc {
+  color: var(--text-2);
+  line-height: 1.45;
+}
+
+.mem-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 2px;
+}
+
+.mem-tag {
+  font-size: 11px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: var(--bg-3);
+  color: var(--text-2);
+}
+
+.mem-modal {
+  width: min(680px, 94vw);
+  max-height: 86vh;
+  display: flex;
+  flex-direction: column;
+  padding: 0;
+  overflow: hidden;
+}
+
+.mem-modal .modal-head {
+  padding: 14px 18px;
+  border-bottom: 1px solid var(--border);
+  margin: 0;
+}
+
+.mem-modal-body {
+  padding: 14px 18px;
+  overflow-y: auto;
+  flex: 1 1 auto;
+}
+
+.mem-modal-foot {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 12px 18px;
+  border-top: 1px solid var(--border);
+}
+
+.mem-form-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+  gap: 10px;
+}
+
+.mem-editor-ta {
+  font-family: var(--font-editor);
+  font-size: var(--fs-editor, 13px);
+  line-height: 1.5;
+  resize: vertical;
+}
+
+.mem-warn {
+  color: var(--warn);
+  margin: 0;
+}
+
+.mem-preview-pre {
+  margin: 0;
+  padding: 12px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--code-bg);
+  font-family: var(--font-editor);
+  font-size: var(--fs-editor, 12.5px);
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 55vh;
+  overflow: auto;
+}
+
+.mem-import-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.mem-import-item {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.mem-import-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.mem-import-controls {
+  display: grid;
+  grid-template-columns: 110px 110px minmax(0, 1fr);
+  gap: 8px;
+}
+
+.mem-import-id {
+  min-width: 0;
+}
+
+.mem-pending-card {
+  border-color: var(--warn);
+}
+
+.mem-pending-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.mem-pending-item {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  background: var(--bg-2);
+}
+
+.mem-pending-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.mem-pending-snippet {
+  margin: 0;
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: var(--code-bg);
+  border: 1px solid var(--border);
+  font-family: var(--font-editor);
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 120px;
+  overflow: auto;
+}
+
+.mem-item-actions {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.mem-drawer-sec {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 14px;
+}
+
+.mem-drawer-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 13px;
+}
+
+.mem-drawer-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-2);
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.mem-drawer-row:hover {
+  border-color: var(--border-2);
+  background: var(--bg-3);
+}
+
+.mem-timeline-card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 9px 12px;
+  margin: 6px 0;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg-2);
+  font-size: var(--fs-chat, 13.5px);
+}
+
+.mem-timeline-card.pending {
+  border-color: var(--warn);
+}
+
+.mem-timeline-head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex-wrap: wrap;
+}
+
+.mem-timeline-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+@media (max-width: 760px) {
+  .mem-layout {
+    grid-template-columns: 1fr;
+  }
+  .mem-import-controls {
+    grid-template-columns: 1fr 1fr;
+  }
+  .mem-import-id {
+    grid-column: 1 / -1;
+  }
+}

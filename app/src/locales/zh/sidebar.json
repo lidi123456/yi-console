@@ -34,6 +34,7 @@
   "openTerminal": "打开终端",
   "usageStats": "用量统计",
   "portForwarding": "端口转发",
+  "memory": "长期记忆",
   "hostSettings": "主机设置",
   "editConnection": "编辑连接",
   "disconnect": "断开连接",

@@ -7,6 +7,7 @@ import { Icon } from './components/Icon';
 import { NewSessionPage } from './components/NewSession';
 import { SessionView } from './components/SessionView';
 import { SettingsView } from './components/SettingsView';
+import { MemoryView } from './components/MemoryView';
 import { Sidebar } from './components/Sidebar';
 import { StatsView } from './components/StatsView';
 import { PortsView } from './components/PortsView';
@@ -66,6 +67,8 @@ function Main() {
       return <FilesView key={view.hostId} hostId={view.hostId} path={view.path} />;
     case 'ports':
       return <PortsView key={view.hostId} hostId={view.hostId} />;
+    case 'memory':
+      return <MemoryView key={view.hostId + (view.cwd ?? '')} hostId={view.hostId} cwd={view.cwd} />;
     case 'stats':
       return <StatsView key={view.hostId} hostId={view.hostId} />;
     case 'settings':

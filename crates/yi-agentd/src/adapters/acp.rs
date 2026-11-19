@@ -85,6 +85,10 @@ struct State {
     browser_notice: bool,
     /// The session's appended system prompt still has to go out with the next prompt (new tool session or changed)
     system_notice: Option<String>,
+    /// Host personal memory L0 snapshot still to go out with the next prompt (new tool session or after compaction)
+    memory_notice: Option<String>,
+    /// True when this launch carries `yi_memory` (so compaction / load fallback should re-arm `memory_notice`)
+    memory_enabled: bool,
     /// Compact cross-account handoff summary injected if `session/load` fell back to a fresh ACP session
     account_handoff: Option<String>,
     next_id: u64,
@@ -255,6 +259,9 @@ pub fn build_args(spec: &StartSpec) -> Vec<String> {
         if has(crate::mcp::BROWSER_SERVER) {
             rules.extend(yi_browser::tool_names().map(|name| format!("@{}/{name}", crate::mcp::BROWSER_SERVER)));
         }
+        if has(crate::mcp::MEMORY_SERVER) {
+            rules.extend(crate::memory::tool_names().map(|name| format!("@{}/{name}", crate::mcp::MEMORY_SERVER)));
+        }
         if !rules.is_empty() {
             let rules = rules.join(",");
             if let Some(index) = a.iter().rposition(|arg| arg == "--trust-tools" || arg.starts_with("--trust-tools=")) {
@@ -282,6 +289,9 @@ pub async fn run(spec: StartSpec, em: Emitter, mut rx: mpsc::UnboundedReceiver<A
         desktop_notice: spec.mcp_servers.iter().any(|server| server["name"] == crate::mcp::DESKTOP_SERVER),
         browser_notice: spec.mcp_servers.iter().any(|server| server["name"] == crate::mcp::BROWSER_SERVER),
         system_notice: super::acp_system_notice(&spec),
+        memory_notice: super::acp_memory_notice(&spec),
+        memory_enabled: spec.memory_prompt.is_some()
+            || spec.mcp_servers.iter().any(|server| server["name"] == crate::mcp::MEMORY_SERVER),
         ..Default::default()
     };
     let init = st.req(
@@ -609,6 +619,9 @@ fn prompt(st: &mut State, em: &Emitter, p: &Prompt) -> Value {
     }
     // Slash commands must stay the first block for the tool to recognize them; the notice waits for a real prompt
     if !p.text.trim_start().starts_with('/') {
+        if let Some(mem) = st.memory_notice.take() {
+            blocks.push(json!({"type":"text","text":mem}));
+        }
         if let Some(notice) = st.system_notice.take() {
             blocks.push(json!({"type":"text","text":notice}));
         }
@@ -823,6 +836,13 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Result<V
                 Pending::Load if is_missing_session(&msg) || (spec.account_handoff.is_some() && !is_auth_error(&msg)) => {
                     st.loading = false;
                     st.resumed = false;
+                    // Fresh ACP session has not seen the memory snapshot yet
+                    if st.memory_enabled {
+                        st.memory_notice = em
+                            .memory_prompt_snapshot()
+                            .map(|p| format!("<system-reminder>\n{p}\n</system-reminder>"))
+                            .or_else(|| super::acp_memory_reminder(spec));
+                    }
                     if spec.account_handoff.is_some() {
                         st.account_handoff = spec.account_handoff.clone();
                         em.resume_fallback();
@@ -1247,11 +1267,10 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Result<V
                     return Ok(out);
                 }
             }
-            // A yi_browser call while the browser is on: turning it on was the user's approval (as Claude's
-            // allowedTools / Kiro's trust list). The gateway still enforces plan mode and the live grant
+            // A yi_browser or yi_memory call: the gateway enforces plan mode, write policy, bot read-only and secret checks
             if !question {
                 if let Some(name) = gateway_tool(&known.name, &title, &tc["rawInput"]) {
-                    if em.browser_tool_allowed(&name) {
+                    if em.browser_tool_allowed(&name) || em.memory_tool_allowed(&name) {
                         if let Some(o) = options.iter().find(|o| o.kind == "allow_once").or_else(|| options.iter().find(|o| o.kind.starts_with("allow"))) {
                             out.push(json!({"jsonrpc":"2.0","id":v["id"],
                                 "result":{"outcome":{"outcome":"selected","optionId":o.id}}}));
@@ -1685,23 +1704,27 @@ fn elicit_response(el: &PendingElicit, option_id: &str, answers: &[QuestionAnswe
     json!({"jsonrpc":"2.0","id":el.rpc_id,"result":result})
 }
 
-/// The `mcp__yi_browser__<tool>` name of a permission request for a yi_browser tool. Exact forms only, never a
-/// substring of free input (a shell command mentioning the name must not be approved): Qoder names the call
-/// `mcp__yi_browser__<tool>` and titles it `<tool> (yi_browser)`; CodeBuddy wraps it in `DeferExecuteTool` with
-/// `toolName` in the input
+/// The `mcp__<server>__<tool>` name of a permission request for a built-in gateway tool (`yi_browser` or `yi_memory`).
+/// Exact forms only, never a substring of free input (a shell command mentioning the name must not be approved):
+/// Qoder names the call `mcp__<server>__<tool>` and titles it `<tool> (<server>)`; CodeBuddy wraps it in
+/// `DeferExecuteTool` with `toolName` in the input
 fn gateway_tool(name: &str, title: &str, input: &Value) -> Option<String> {
-    let prefix = format!("mcp__{}__", crate::mcp::BROWSER_SERVER);
-    let known = |n: &str| n.strip_prefix(&prefix).filter(|t| yi_browser::tool_names().any(|x| x == *t)).map(|_| n.to_string());
-    if let Some(n) = known(name) {
-        return Some(n);
-    }
-    if name == "DeferExecuteTool" {
-        if let Some(n) = input["toolName"].as_str().and_then(known) {
+    let check_server = |server: &str, is_known: &dyn Fn(&str) -> bool| -> Option<String> {
+        let prefix = format!("mcp__{server}__");
+        let known = |n: &str| n.strip_prefix(&prefix).filter(|t| is_known(t)).map(|_| n.to_string());
+        if let Some(n) = known(name) {
             return Some(n);
         }
-    }
-    let suffix = format!(" ({})", crate::mcp::BROWSER_SERVER);
-    title.strip_suffix(&suffix).filter(|t| yi_browser::tool_names().any(|x| x == *t)).map(|t| format!("{prefix}{t}"))
+        if name == "DeferExecuteTool" {
+            if let Some(n) = input["toolName"].as_str().and_then(known) {
+                return Some(n);
+            }
+        }
+        let suffix = format!(" ({server})");
+        title.strip_suffix(&suffix).filter(|t| is_known(t)).map(|t| format!("{prefix}{t}"))
+    };
+    check_server(crate::mcp::BROWSER_SERVER, &|t| yi_browser::tool_names().any(|x| x == t))
+        .or_else(|| check_server(crate::mcp::MEMORY_SERVER, &|t| crate::memory::tool_names().any(|x| x == t)))
 }
 
 /// Kiro's `_kiro.dev/compaction/status`: status.type is started, then completed (or failed)
@@ -1717,6 +1740,12 @@ fn compaction_status(st: &mut State, em: &Emitter, kind: &Value) {
     // Any other status ends the compaction, so held messages are never stuck
     let Some(t0) = st.compacting.take() else { return };
     let ok = kind == "completed";
+    if ok && st.memory_enabled {
+        // Compaction may have summarized away the initial <yi-memory> block: re-arm a fresh snapshot
+        if let Some(p) = em.memory_prompt_snapshot() {
+            st.memory_notice = Some(format!("<system-reminder>\n{p}\n</system-reminder>"));
+        }
+    }
     em.event(EventBody::Compact {
         phase: if ok { "done" } else { "failed" }.into(),
         trigger: ok.then(|| if std::mem::take(&mut st.compact_manual) { "manual" } else { "auto" }.into()),
@@ -1850,8 +1879,14 @@ fn cursor_compact_done(st: &mut State, spec: &StartSpec, em: &Emitter, c: Cursor
     st.compacting = None;
     st.prompting = false;
     st.end_subagents();
-    // A new tool session hasn't seen the appended system prompt or the computer use notice
+    // A new tool session hasn't seen the appended system prompt, memory index, or the computer use notice
     st.system_notice = super::acp_system_reminder(spec);
+    if st.memory_enabled {
+        st.memory_notice = em
+            .memory_prompt_snapshot()
+            .map(|p| format!("<system-reminder>\n{p}\n</system-reminder>"))
+            .or_else(|| super::acp_memory_reminder(spec));
+    }
     st.desktop_notice = spec.mcp_servers.iter().any(|server| server["name"] == crate::mcp::DESKTOP_SERVER);
     st.browser_notice = spec.mcp_servers.iter().any(|server| server["name"] == crate::mcp::BROWSER_SERVER);
     em.pending_context(format!("<yi-compact-summary>\n{CURSOR_COMPACT_INTRO}\n\n{}\n</yi-compact-summary>", c.summary));
@@ -4199,6 +4234,13 @@ mod tests {
         assert_eq!(gateway_tool("mcp__yi_computer_use__click", "", &none), None);
         assert_eq!(gateway_tool("Bash", "echo browser_click (yi_browser) && rm -rf x", &json!({"command": "mcp__yi_browser__browser_click"})), None);
         assert_eq!(gateway_tool("Bash", "Bash", &json!({"toolName": "mcp__yi_browser__browser_click"})), None);
+        // yi_memory exact forms
+        assert_eq!(gateway_tool("mcp__yi_memory__memory_read", "", &none).as_deref(), Some("mcp__yi_memory__memory_read"));
+        assert_eq!(gateway_tool("tool", "memory_search (yi_memory)", &none).as_deref(), Some("mcp__yi_memory__memory_search"));
+        let mem_wrapped = json!({"toolName": "mcp__yi_memory__memory_save", "params": {"id": "x"}});
+        assert_eq!(gateway_tool("DeferExecuteTool", "DeferExecuteTool", &mem_wrapped).as_deref(), Some("mcp__yi_memory__memory_save"));
+        assert_eq!(gateway_tool("mcp__yi_memory__memory_nope", "", &none), None);
+        assert_eq!(gateway_tool("Bash", "echo memory_read (yi_memory)", &json!({"command": "mcp__yi_memory__memory_read"})), None);
     }
 
     #[test]
@@ -4500,7 +4542,7 @@ mod model_config_tests {
             tool: ToolKind::Cursor, mode: SessionMode::Structured, cwd: "/tmp".into(), resume: None, replay: false,
             replay_skip: 0, model: Some(model.into()), effort: None, model_config_options: vec![],
             permission_mode: "default".into(), command: None, program: "cursor-agent".into(), extra_args: vec![],
-            mcp_servers: vec![], mcp_fingerprint: String::new(), allow_mcp: vec![], system_prompt: None, system_notice: false, cols: 80, rows: 24, tmux: None, session_id: None,
+            mcp_servers: vec![], mcp_fingerprint: String::new(), allow_mcp: vec![], system_prompt: None, system_notice: false, memory_prompt: None, memory_notice: false, cols: 80, rows: 24, tmux: None, session_id: None,
             env: Default::default(), env_unset: vec![], data_dir: None, auth_method: None, account_handoff: None,
         }
     }
@@ -4966,6 +5008,8 @@ mod model_config_tests {
             allow_mcp: vec![],
             system_prompt: None,
             system_notice: false,
+            memory_prompt: None,
+            memory_notice: false,
             cols: 80,
             rows: 24,
             tmux: None,

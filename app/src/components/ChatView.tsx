@@ -8,11 +8,12 @@ import { parseContextMessage } from '../contextRefs';
 import { type ImgCtx } from '../chatImages';
 import { getT, isEn, trErr, useLang } from '../i18n';
 import { rpc } from '../transport';
-import { TOOL_LABEL, type FileDiff, type HubEvent, type ImageRef, type PermissionOption, type PlanEntry, type Question, type QuestionAnswer, type SessionInfo, type Usage } from '../types';
+import { TOOL_LABEL, type FileDiff, type HubEvent, type ImageRef, type MemoryEntry, type MemoryEvent, type MemoryListResponse, type PermissionOption, type PlanEntry, type Question, type QuestionAnswer, type SessionInfo, type Usage } from '../types';
 import { clock, fmtTokens, isMobile, lsGet, lsSet } from '../util';
 import { writeClipboard } from '../clipboard';
-import { navigate, toast, useStore } from '../store';
+import { errorToast, navigate, toast, useStore } from '../store';
 import { handoffSession } from './SessionActions';
+import { MemoryEditorModal, type MemoryEditorInit } from './MemoryView';
 import { DiffView, diffLines } from './DiffView';
 import { openImage } from './Lightbox';
 import { imageMenu } from './ImageMenu';
@@ -62,6 +63,7 @@ type Item =
   | { k: 'limit'; key: string; hit?: LimitEvent; last: LimitEvent }
   | { k: 'handoff'; key: string; ev: HubEvent & { kind: 'handoff' } }
   | { k: 'account_switched'; key: string; ev: HubEvent & { kind: 'account_switched' } }
+  | { k: 'memory'; key: string; ev: HubEvent & { kind: 'memory' } }
   | {
       k: 'turn';
       key: string;
@@ -321,6 +323,9 @@ function buildItems(events: HubEvent[], hideCompactCmd = false): Item[] {
         break;
       case 'account_switched':
         items.push({ k: 'account_switched', key, ev: e });
+        break;
+      case 'memory':
+        items.push({ k: 'memory', key, ev: e });
         break;
       case 'interrupted':
         items.push({ k: 'note', key, text: t('turnCutOffByRestart'), tone: 'muted' });
@@ -1528,7 +1533,54 @@ function toolView(it: Item & { k: 'tool' }, cwd?: string) {
   // A yi_browser call before its gateway event arrives (Codex shows the row first): label it the same way
   const browserTool = browserToolName(it);
   if (browserTool) return { shown, kind, arg, parsed, err, label: getT('browserUse')('action', { tool: browserTool }) };
+  const memTool = memoryToolName(it);
+  if (memTool) return { shown, kind, arg: memoryToolArg(it), parsed, err, label: memoryToolLabel(memTool) };
   return { shown, kind, arg, parsed, err, label: generic ? it.title : toolUiLabel(shown) };
+}
+
+/** The yi_memory tool a row calls across Claude / Codex / ACP providers (including Kiro bare names) */
+function memoryToolName(it: Item & { k: 'tool' }): string | null {
+  const wrapped = (it.input as { toolName?: unknown } | null)?.toolName;
+  for (const s of [it.name, typeof wrapped === 'string' ? wrapped : '', it.title]) {
+    const m =
+      /^(?:mcp__yi_memory__|yi_memory\.|mcp_yi_memory_|@yi_memory\/)?(memory_(?:list|read|search|save|delete))$/.exec(s ?? '') ??
+      /^(memory_(?:list|read|search|save|delete)) \(yi_memory\)$/.exec(s ?? '');
+    if (m) return m[1];
+  }
+  return null;
+}
+
+function memoryToolLabel(tool: string): string {
+  const m = getT('memory');
+  switch (tool) {
+    case 'memory_list':
+      return m('toolList');
+    case 'memory_read':
+      return m('toolRead');
+    case 'memory_search':
+      return m('toolSearch');
+    case 'memory_save':
+      return m('toolSave');
+    case 'memory_delete':
+      return m('toolDelete');
+    default:
+      return tool;
+  }
+}
+
+function memoryToolArg(it: Item & { k: 'tool' }): string {
+  const inp = (it.input as Record<string, unknown> | null) ?? {};
+  const inner = (inp.params as Record<string, unknown> | undefined) ?? inp;
+  if (typeof inner.id === 'string' && inner.id) return inner.id;
+  if (Array.isArray(inner.items)) {
+    const ids = inner.items
+      .map((x) => (x && typeof (x as { id?: unknown }).id === 'string' ? (x as { id: string }).id : ''))
+      .filter(Boolean);
+    if (ids.length) return ids.join(', ');
+  }
+  if (typeof inner.query === 'string' && inner.query) return inner.query;
+  if (typeof inner.scope === 'string' && inner.scope) return inner.scope;
+  return '';
 }
 
 /** The yi_browser tool a row calls, from the forms the AI tools use: mcp__yi_browser__x (Claude), yi_browser.x
@@ -2175,6 +2227,8 @@ export function ChatView({
               return <HandoffNote key={it.key} ev={it.ev} hostId={hostId} />;
             case 'account_switched':
               return <AccountSwitchedNote key={it.key} ev={it.ev} />;
+            case 'memory':
+              return <MemoryEventCard key={it.key} ev={it.ev} hostId={hostId} cwd={info?.cwd} />;
           }
         })}
         {liveThought && !liveText && !modern && <Thinking text={liveThought} live />}
@@ -2227,4 +2281,173 @@ function DesktopAction({ ev, hostId, sessionId }: { ev: GatewayEvent; hostId?: s
     {!!ev.durationMs && <div className="muted small">{x.elapsed}</div>}
     {!!ev.images?.length && hostId && sessionId && <div className="computer-use-images">{ev.images.map((img) => <MsgImage key={img.id} hostId={hostId} sessionId={sessionId} img={img} />)}</div>}
   </div>;
+}
+
+function MemoryEventCard({ ev, hostId, cwd }: { ev: MemoryEvent; hostId?: string; cwd?: string }) {
+  useLang();
+  const m = getT('memory');
+  const [state, setState] = useState<'idle' | 'reverted' | 'approved' | 'rejected'>('idle');
+  const [busy, setBusy] = useState(false);
+  const [editor, setEditor] = useState<{ kind: 'edit' | 'review'; initial: MemoryEditorInit } | null>(null);
+
+  const scopeLabel =
+    ev.scope === 'global'
+      ? m('scopeGlobalShort')
+      : ev.projectName
+        ? m('scopeProjectNamed', { name: ev.projectName })
+        : m('scopeProjectShort');
+  const isPending = ev.action === 'pending_save' || ev.action === 'pending_delete';
+  const heading =
+    ev.action === 'deleted'
+      ? m('timelineDeleted', { scope: scopeLabel, title: ev.title || ev.id })
+      : ev.action === 'pending_save'
+        ? m('timelinePendingSave', { scope: scopeLabel, title: ev.title || ev.id })
+        : ev.action === 'pending_delete'
+          ? m('timelinePendingDelete', { scope: scopeLabel, title: ev.title || ev.id })
+          : m('timelineSaved', { scope: scopeLabel, title: ev.title || ev.id });
+
+  const undo = async () => {
+    if (!hostId || !ev.undoId) return;
+    setBusy(true);
+    try {
+      await rpc(hostId, 'memory.undo', { undoId: ev.undoId });
+      setState('reverted');
+      toast(m('undone'));
+    } catch (e) {
+      errorToast(e);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const resolvePending = async (approve: boolean) => {
+    if (!hostId || !ev.pendingId) return;
+    setBusy(true);
+    try {
+      await rpc(hostId, 'memory.resolvePending', { pendingId: ev.pendingId, approve });
+      setState(approve ? 'approved' : 'rejected');
+      toast(approve ? m('approved') : m('rejected'));
+    } catch (e) {
+      errorToast(e);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const openEdit = async () => {
+    if (!hostId) return;
+    setBusy(true);
+    try {
+      if (isPending && ev.pendingId) {
+        const list = await rpc<MemoryListResponse>(hostId, 'memory.list', { cwd });
+        const found = list.pending.find((x) => x.pendingId === ev.pendingId);
+        if (!found) {
+          toast(m('timelineRejected'));
+          return;
+        }
+        setEditor({
+          kind: 'review',
+          initial: {
+            scope: found.scope,
+            projectKey: found.projectKey,
+            cwd,
+            id: found.id,
+            title: found.title,
+            description: found.description,
+            mode: found.mode,
+            tags: found.tags,
+            content: found.content,
+            pendingId: found.pendingId,
+          },
+        });
+      } else {
+        const entry = await rpc<MemoryEntry>(hostId, 'memory.get', {
+          scope: ev.scope,
+          projectKey: ev.projectKey ?? undefined,
+          cwd,
+          id: ev.id,
+        });
+        setEditor({
+          kind: 'edit',
+          initial: {
+            scope: entry.scope,
+            projectKey: entry.projectKey,
+            cwd,
+            id: entry.id,
+            prevId: entry.id,
+            title: entry.title,
+            description: entry.description,
+            mode: entry.mode,
+            tags: entry.tags ?? [],
+            content: entry.content,
+          },
+        });
+      }
+    } catch (e) {
+      errorToast(e);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className={`mem-timeline-card ${isPending && state === 'idle' ? 'pending' : ''}`}>
+      <div className="mem-timeline-head">
+        <Icon name="book" size={14} />
+        <strong className="small">{heading}</strong>
+        <code className="muted small">{ev.id}</code>
+        {state === 'reverted' && <span className="acc-badge acc-badge-muted">{m('timelineReverted')}</span>}
+        {state === 'approved' && <span className="acc-badge acc-badge-ok">{m('timelineApproved')}</span>}
+        {state === 'rejected' && <span className="acc-badge acc-badge-muted">{m('timelineRejected')}</span>}
+      </div>
+      {ev.description && <div className="muted small">{ev.description}</div>}
+      {state === 'idle' && hostId && (
+        <div className="mem-timeline-actions">
+          {isPending ? (
+            <>
+              <button className="btn small primary" disabled={busy} onClick={() => resolvePending(true)}>
+                {m('approve')}
+              </button>
+              {ev.action === 'pending_save' && (
+                <button className="btn small" disabled={busy} onClick={openEdit}>
+                  {m('editAndApprove')}
+                </button>
+              )}
+              <button className="btn small" disabled={busy} onClick={() => resolvePending(false)}>
+                {m('reject')}
+              </button>
+            </>
+          ) : (
+            <>
+              {ev.action === 'saved' && (
+                <button className="btn small" disabled={busy} onClick={openEdit}>
+                  {m('edit')}
+                </button>
+              )}
+              {ev.undoId && (
+                <button className="btn small" disabled={busy} onClick={undo}>
+                  {m('undo')}
+                </button>
+              )}
+            </>
+          )}
+        </div>
+      )}
+      {editor && hostId &&
+        createPortal(
+          <MemoryEditorModal
+            hostId={hostId}
+            kind={editor.kind}
+            initial={editor.initial}
+            projects={[]}
+            cwd={cwd}
+            onSaved={() => {
+              if (editor.kind === 'review') setState('approved');
+            }}
+            onClose={() => setEditor(null)}
+          />,
+          document.body,
+        )}
+    </div>
+  );
 }

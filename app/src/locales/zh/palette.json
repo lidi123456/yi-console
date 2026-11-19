@@ -25,6 +25,7 @@
     "files": "{{name}}：文件",
     "stats": "{{name}}：用量",
     "ports": "{{name}}：端口转发",
+    "memory": "{{name}}：长期记忆",
     "settings": "{{name}}：主机设置",
     "settingsSub": "提示词片段、状态栏、推送"
   },

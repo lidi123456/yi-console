@@ -24,6 +24,7 @@ import { TermTools, TerminalView } from './TerminalView';
 import { StatusLine } from './StatusLine';
 import { BgTasks } from './BgTasks';
 import { UsageDialog } from './UsageDialog';
+import { SessionMemoryDrawer } from './MemoryView';
 import { SessionBotBar } from './BotsSection';
 
 const t = getT('sessionView');
@@ -110,6 +111,7 @@ export function SessionView({ hostId, sessionId, seq }: { hostId: string; sessio
   const [fileOpen, setFileOpen] = useState(false);
   const [switching, setSwitching] = useState(false);
   const [usage, setUsage] = useState(false);
+  const [memoryOpen, setMemoryOpen] = useState(false);
   const [recovering, setRecovering] = useState(false);
   const split = useRef<HTMLDivElement>(null);
   const dragPanel = (e: React.PointerEvent) => {
@@ -345,6 +347,16 @@ export function SessionView({ hostId, sessionId, seq }: { hostId: string; sessio
             <Icon name={style === 'modern' ? 'rows' : 'outline'} size={16} />
           </button>
         )}
+        {info.mode === 'structured' && info.tool !== 'shell' && !filesOnly && (
+          <button
+            className="icon-btn hide-mobile"
+            title={t('memory')}
+            aria-label={t('memory')}
+            onClick={() => setMemoryOpen(true)}
+          >
+            <Icon name="book" size={16} />
+          </button>
+        )}
         <button className="icon-btn" title={t('viewChanges')} aria-label={t('viewChanges')} onClick={() => showChanges(hostId, sessionId)}>
           <Icon name="diff" size={17} />
         </button>
@@ -380,6 +392,7 @@ export function SessionView({ hostId, sessionId, seq }: { hostId: string; sessio
               sessionMenu(hostId, info, {
                 inSession: true,
                 onUsage: () => setUsage(true),
+                onMemory: () => setMemoryOpen(true),
                 term,
                 onToggleTerm: toggleTerm,
                 style,
@@ -506,6 +519,7 @@ export function SessionView({ hostId, sessionId, seq }: { hostId: string; sessio
         />
       )}
       {usage && <UsageDialog hostId={hostId} info={info} onClose={() => setUsage(false)} />}
+      {memoryOpen && connected && <SessionMemoryDrawer hostId={hostId} cwd={info.cwd} onClose={() => setMemoryOpen(false)} />}
     </div>
   );
 }

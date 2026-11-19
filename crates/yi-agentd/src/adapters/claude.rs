@@ -61,6 +61,9 @@ pub fn build_args(spec: &StartSpec) -> Vec<String> {
     if !crate::browser::model_hint(&spec.extra_args).is_empty() {
         allow_tools(&mut a, "mcp__yi_browser__*");
     }
+    if crate::memory::has_in_args(&spec.extra_args) {
+        allow_tools(&mut a, "mcp__yi_memory__*");
+    }
     // Client MCP tools (a Bot's own tools) are answered by the desktop app, which does its own checks
     for name in &spec.allow_mcp {
         allow_tools(&mut a, &format!("mcp__{name}__*"));
@@ -950,6 +953,8 @@ mod tests {
             allow_mcp: vec![],
             system_notice: false,
             system_prompt: None,
+            memory_prompt: None,
+            memory_notice: false,
             cols: 80,
             rows: 24,
             tmux: None,

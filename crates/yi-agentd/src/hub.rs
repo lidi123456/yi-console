@@ -256,6 +256,8 @@ pub struct Hub {
     pub desktop: crate::computer_use::Desktop,
     /// The AI browser (`yi_browser`), one Chrome per session that turned it on
     pub browsers: crate::browser::Browsers,
+    /// Host personal long-term memory (`yi_memory`), shared across all AI tools
+    pub memories: crate::memory::Memories,
     /// Clients that said who they are (`client.hello`), and the client MCP bridge
     pub clients: crate::clientmcp::Clients,
     /// Each tool's most recently reported model list (persisted, used for new sessions)
@@ -343,6 +345,7 @@ impl Hub {
             shutdown: tokio::sync::Notify::new(),
             desktop: crate::computer_use::Desktop::new(),
             browsers: crate::browser::Browsers::new(),
+            memories: crate::memory::Memories::default(),
             clients: Default::default(),
             tool_models: Mutex::new(
                 std::fs::read(models_path())
@@ -375,6 +378,7 @@ impl Hub {
             shutdown: tokio::sync::Notify::new(),
             desktop: crate::computer_use::Desktop::new(),
             browsers: crate::browser::Browsers::new(),
+            memories: crate::memory::Memories::default(),
             clients: Default::default(),
             tool_models: Mutex::new(HashMap::new()),
             tool_commands: Mutex::new(HashMap::new()),
@@ -607,13 +611,26 @@ impl Hub {
 
     /// Refresh after the current turn, or lazily before the next message of an idle session.
     pub fn mcp_settings_changed(&self, old: &DaemonSettings, new: &DaemonSettings) {
+        let mem_toggled = old.memory.enabled != new.memory.enabled;
         for rt in self.sessions.lock().unwrap().values() {
             let info = rt.info.lock().unwrap();
-            if info.mode == SessionMode::Structured && matches!(info.status, SessionStatus::Running | SessionStatus::WaitingPermission)
-                && crate::mcp::selected(old, info.tool) != crate::mcp::selected(new, info.tool) {
+            if info.mode == SessionMode::Structured
+                && matches!(info.status, SessionStatus::Running | SessionStatus::WaitingPermission)
+                && (crate::mcp::selected(old, info.tool) != crate::mcp::selected(new, info.tool)
+                    || (mem_toggled && crate::mcp::supported(info.tool)))
+            {
                 *rt.restart_pending.lock().unwrap() = true;
             }
         }
+    }
+
+    /// Broadcast that host personal memories or pending proposals changed.
+    pub fn memory_changed(&self) {
+        let _ = self.bus.send(Arc::new(Outbound {
+            session_id: None,
+            method: methods::EV_MEMORY_CHANGED,
+            params: json!({}),
+        }));
     }
 
     /// Change what a session was launched with (client MCP servers, appended system prompt, Bot link). A running turn
@@ -998,6 +1015,22 @@ impl Hub {
             mcp_fingerprint(&[], false)
         };
         let structured_ai = info.mode == SessionMode::Structured && crate::mcp::supported(info.tool);
+        let mut memory_prompt = None;
+        if structured_ai && settings.memory.enabled {
+            let readonly_session = info.bot.is_some();
+            if self
+                .memories
+                .ensure_session(&info.id, Path::new(&info.cwd), readonly_session)
+                .is_ok()
+            {
+                if let Some(config) = self.memories.mcp_config(&info.id) {
+                    servers.push(crate::mcp::memory(config)?);
+                }
+            }
+            memory_prompt = self
+                .memories
+                .build_l0_prompt(Path::new(&info.cwd), &settings, readonly_session);
+        }
         let mut allow_mcp = vec![];
         if structured_ai {
             for m in &info.client_mcp {
@@ -1009,6 +1042,7 @@ impl Hub {
         let system_prompt = info.append_system_prompt.clone().filter(|_| structured_ai);
         // A new tool session has not seen the prompt yet; `launch` also sets this after the prompt changed
         let system_notice = system_prompt.is_some() && resume.is_none();
+        let memory_notice = memory_prompt.is_some() && resume.is_none();
         let account_handoff = if info.mode == SessionMode::Structured
             && matches!(info.tool, ToolKind::Codex | ToolKind::Cursor)
             && resume.is_some()
@@ -1038,6 +1072,8 @@ impl Hub {
             allow_mcp,
             system_notice,
             system_prompt,
+            memory_prompt,
+            memory_notice,
             cols,
             rows,
             // tmux keeps AI terminal sessions and standalone shells alive across daemon restarts. Bottom-panel shells
@@ -1062,9 +1098,10 @@ impl Hub {
         if spec.mode == SessionMode::Structured && spec.tool != ToolKind::Shell {
             self.make_room(&sid);
         }
-        // The new tool process starts its own desktop and client MCP proxies
+        // The new tool process starts its own desktop, browser, memory and client MCP proxies
         self.desktop.release_proxy(&sid);
         self.browsers.release_proxy(&sid);
+        self.memories.release_proxy(&sid);
         self.clients.release_proxies(&sid);
         if std::mem::take(&mut *rt.prompt_dirty.lock().unwrap()) {
             spec.system_notice = spec.system_prompt.is_some();
@@ -2296,6 +2333,7 @@ impl Hub {
 
     pub fn delete(&self, id: &str) -> Result<()> {
         self.revoke_desktop(id);
+        self.memories.remove_session(id);
         // The id comes from the client and is later used in a path for remove_dir_all: only handle sessions that really exist
         let rt = self.get(id)?;
         let (bot_link, session_cwd) = {
@@ -3736,6 +3774,11 @@ impl Hub {
         if info.mode == SessionMode::Structured && info.browser_use && self.browsers.enabled(&info.id) {
             base.push_str("+browser");
         }
+        // Only the master memory switch enters the fingerprint, never memory contents (preserves KV cache).
+        // Enabled is the default, so mark only the non-default disabled state to keep the default fingerprint invariant.
+        if info.mode == SessionMode::Structured && crate::mcp::supported(info.tool) && !settings.memory.enabled {
+            base.push_str("-memory");
+        }
         if let Some(acc) = resolved {
             base.push('+');
             base.push_str(&acc.fingerprint);
@@ -4028,8 +4071,27 @@ impl Emitter {
         self.hub.browsers.authorizes(&self.sid, name)
     }
 
+    /// A yi_memory tool may run without CLI prompts; the gateway enforces plan mode, write policy and bot read-only
+    pub fn memory_tool_allowed(&self, name: &str) -> bool {
+        self.hub.memories.authorizes(&self.sid, name)
+    }
+
+    /// Build a fresh L0 memory snapshot for this session (used after ACP compaction or load fallback)
+    pub fn memory_prompt_snapshot(&self) -> Option<String> {
+        let info = self.hub.info(&self.sid).ok()?;
+        let settings = self.hub.settings.read().unwrap().clone();
+        if info.mode != SessionMode::Structured || !crate::mcp::supported(info.tool) || !settings.memory.enabled {
+            return None;
+        }
+        self.hub
+            .memories
+            .build_l0_prompt(Path::new(&info.cwd), &settings, info.bot.is_some())
+    }
+
     pub fn desktop_tool_allowed(&self, name: &str) -> bool {
-        self.hub.desktop.authorizes(&self.sid, name) || self.hub.browsers.authorizes(&self.sid, name)
+        self.hub.desktop.authorizes(&self.sid, name)
+            || self.hub.browsers.authorizes(&self.sid, name)
+            || self.hub.memories.authorizes(&self.sid, name)
     }
 
     pub fn event(&self, body: EventBody) {

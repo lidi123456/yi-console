@@ -1341,6 +1341,8 @@ mod tests {
             allow_mcp: vec![],
             system_prompt: None,
             system_notice: false,
+            memory_prompt: None,
+            memory_notice: false,
             cols: 80,
             rows: 24,
             tmux: None,

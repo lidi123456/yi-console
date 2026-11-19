@@ -23,6 +23,7 @@ export type View =
   | { kind: 'files'; hostId: string; path?: string }
   | { kind: 'stats'; hostId: string }
   | { kind: 'ports'; hostId: string }
+  | { kind: 'memory'; hostId: string; cwd?: string }
   | { kind: 'settings'; hostId: string }
   | { kind: 'prefs' }
   /** A Bot's details. src: the Bots source (bots.ts), '' or absent for this app */
@@ -453,6 +454,13 @@ export function onBrowserView(fn: (hostId: string, method: string, p: any) => vo
   return () => browserViewListeners.delete(fn);
 }
 
+/** Host personal memories or pending proposals changed (`memory.changed`) */
+const memoryListeners = new Set<(hostId: string) => void>();
+export function onMemoryChanged(fn: (hostId: string) => void): () => void {
+  memoryListeners.add(fn);
+  return () => memoryListeners.delete(fn);
+}
+
 export function sessionInfo(hostId: string, sid: string): SessionInfo | undefined {
   return state.sessions[hostId]?.find((s) => s.id === sid);
 }
@@ -854,6 +862,9 @@ function onNotification(hostId: string, method: string, p: any) {
     case 'browser.frame':
     case 'browser.status':
       for (const fn of browserViewListeners) fn(hostId, method, p);
+      break;
+    case 'memory.changed':
+      for (const fn of memoryListeners) fn(hostId);
       break;
     case 'tools.accountLogin':
       if (p) for (const fn of loginListeners) fn(hostId, p as AccountLoginUpdate);

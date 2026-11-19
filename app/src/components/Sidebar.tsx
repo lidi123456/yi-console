@@ -213,6 +213,7 @@ function hostMenu(h: HostEntry, connect: () => void): (MenuItem | '-')[] {
     { label: tx('openTerminal'), icon: 'terminal', run: () => openTerminal(id) },
     { label: tx('usageStats'), icon: 'chart', run: () => navigate({ kind: 'stats', hostId: id }) },
     { label: tx('portForwarding'), icon: 'external', run: () => navigate({ kind: 'ports', hostId: id }) },
+    { label: tx('memory'), icon: 'book', run: () => navigate({ kind: 'memory', hostId: id }) },
     '-',
     { label: tx('hostSettings'), icon: 'settings', run: () => navigate({ kind: 'settings', hostId: id }) },
     { label: tx('editConnection'), icon: 'edit', run: () => navigate({ kind: 'hosts', editId: id }) },

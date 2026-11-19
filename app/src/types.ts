@@ -382,10 +382,25 @@ export interface PlanEntry {
 export type ComputerUseEvent = { kind: 'computer_use'; actionId: string; tool: string; status: string; message: string; durationMs: number; images: ImageRef[] };
 /** An AI browser (`yi_browser`) action; `url` is the page it ended on */
 export type BrowserUseEvent = { kind: 'browser_use'; actionId: string; tool: string; status: string; message: string; durationMs: number; url?: string; images: ImageRef[] };
+/** Personal long-term memory change made or proposed by the AI via `yi_memory` */
+export type MemoryEvent = {
+  kind: 'memory';
+  action: 'saved' | 'deleted' | 'pending_save' | 'pending_delete' | string;
+  scope: MemoryScope;
+  projectKey?: string | null;
+  projectName?: string | null;
+  id: string;
+  title: string;
+  description?: string;
+  mode?: MemoryMode;
+  undoId?: string | null;
+  pendingId?: string | null;
+};
 
 export type EventBody =
   | ComputerUseEvent
   | BrowserUseEvent
+  | MemoryEvent
   /** `origin`: who sent it when not the person (`bot-engine`: the desktop app's Bot engine) */
   | { kind: 'user_message'; text: string; images?: ImageRef[]; origin?: string }
   | { kind: 'assistant_text'; id: string; text: string }
@@ -608,6 +623,89 @@ export interface DaemonSettings {
   worktreeRoot?: string;
   /** The AI browser (`yi_browser`) */
   browser?: BrowserSettings;
+  /** Host personal long-term memory (`yi_memory`) */
+  memory?: MemorySettings;
+}
+
+export type MemoryScope = 'global' | 'project';
+export type MemoryMode = 'on-demand' | 'always';
+export type MemoryWritePolicy = 'direct' | 'confirm' | 'readonly';
+
+export interface MemorySettings {
+  enabled: boolean;
+  writePolicy: MemoryWritePolicy | string;
+}
+
+export interface MemoryMeta {
+  id: string;
+  scope: MemoryScope;
+  projectKey?: string | null;
+  title: string;
+  description: string;
+  mode: MemoryMode;
+  tags?: string[];
+  updatedAt: number;
+  size: number;
+}
+
+export interface MemoryEntry extends MemoryMeta {
+  content: string;
+}
+
+export interface MemoryProjectInfo {
+  key: string;
+  displayName: string;
+  rootPath: string;
+  gitCommonDir?: string | null;
+  aliases?: string[];
+  count: number;
+}
+
+export interface PendingMemory {
+  pendingId: string;
+  action: 'save' | 'delete' | string;
+  scope: MemoryScope;
+  projectKey?: string | null;
+  projectName?: string | null;
+  id: string;
+  title: string;
+  description: string;
+  mode: MemoryMode;
+  tags?: string[];
+  content: string;
+  sessionId?: string | null;
+  createdAt: number;
+}
+
+export interface MemoryImportCandidate {
+  source: string;
+  path: string;
+  suggestedScope: MemoryScope;
+  suggestedId: string;
+  title: string;
+  description: string;
+  suggestedMode: MemoryMode;
+  content: string;
+  alreadyExists: boolean;
+}
+
+export interface MemoryListResponse {
+  resolvedProject?: MemoryProjectInfo | null;
+  projects: MemoryProjectInfo[];
+  global: MemoryMeta[];
+  project: MemoryMeta[];
+  byProject: Record<string, MemoryMeta[]>;
+  pending: PendingMemory[];
+  settings: MemorySettings;
+}
+
+export interface MemoryPreviewResponse {
+  prompt: string;
+  project?: MemoryProjectInfo | null;
+  alwaysCount: number;
+  indexCount: number;
+  omittedCount: number;
+  bytes: number;
 }
 
 export interface BrowserSettings {
