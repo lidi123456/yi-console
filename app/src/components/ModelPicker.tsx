@@ -278,7 +278,12 @@ export function ModelMenu({
   const activeId = cur ? findModel(cur, models ?? [])?.id : undefined;
   const curModel = currentModel(cur, models ?? []);
   const efforts = curModel?.efforts ?? [];
-  const effort = reasoningOption?.currentValue ?? effortValue;
+  const supportedEffort = !effortValue
+    ? ''
+    : models === null || !curModel || efforts.includes(effortValue)
+      ? effortValue
+      : '';
+  const effort = reasoningOption?.currentValue ?? supportedEffort;
   const hasEffort = !!reasoningOption || efforts.length > 0;
   // Cursor always uses the settings menu, also before a model or its parameters are known, so it never falls back to the bare list
   const hasControls = tool === 'cursor' || configPending || !!fastOption || !!contextOption || hasEffort;

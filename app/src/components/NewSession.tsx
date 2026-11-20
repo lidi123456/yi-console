@@ -853,7 +853,7 @@ export function NewSessionPage({ params }: { params: NewSessionParams }) {
                     setModel(id);
                     // A level the new model doesn't have is dropped when sending; clear it so the button doesn't show it
                     const m = modelList?.find((x) => x.id === id);
-                    if (effort && m?.efforts && !m.efforts.includes(effort)) setEffort('');
+                    if (effort && m && !(m.efforts ?? []).includes(effort)) setEffort('');
                   }}
                   onEffort={setEffort}
                   configOptions={shownConfig}

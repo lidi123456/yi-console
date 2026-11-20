@@ -90,6 +90,8 @@ const ERR_PATTERNS: [RegExp, string | ((...m: string[]) => string)][] = [
   [/该后台任务不支持从外部停止/, 'This background task cannot be stopped from outside'],
   [/当前模型不支持这个参数/, 'The current model does not support this parameter'],
   [/模型参数值无效/, 'Invalid model parameter value'],
+  [/当前模型不支持调整思考等级/, 'The current model does not support thinking levels'],
+  [/当前模型不支持这个思考等级/, 'The current model does not support this thinking level'],
   [/^切换模型失败，发下一条消息时会再试[:：]\s*(.+)$/s, (_, m) => `Could not switch models; it will be tried again with the next message: ${m}`],
   [/^Cursor 没有模型 (.+)，改用 (.+)$/, (_, a, b) => `Cursor has no model ${a}; using ${b}`],
   [/^切换模型参数失败[:：]\s*(.+)$/, (_, m) => `Could not change model parameter: ${m}`],

@@ -37,6 +37,8 @@ struct State {
     model: Option<String>,
     /// Thinking level, sent with every turn/start
     effort: Option<String>,
+    /// Models reported by model/list, used to omit unsupported thinking levels
+    models: Vec<ModelOption>,
     /// Permission mode switched during the session; every turn/start afterwards carries the matching approval policy and sandbox
     perm: Option<String>,
     approvals: HashMap<String, PendingApproval>,
@@ -184,6 +186,7 @@ pub async fn run(spec: StartSpec, em: Emitter, mut rx: mpsc::UnboundedReceiver<A
                     // app-server sets the model per turn; it takes effect from the next turn/start
                     em.model(&model);
                     st.model = Some(model).filter(|m| !m.is_empty());
+                    drop_unsupported_effort(&mut st, None);
                 }
                 Some(AdapterCmd::SetPermissionMode(mode)) => {
                     st.perm = Some(mode);
@@ -286,6 +289,16 @@ fn start_turn(st: &mut State, prompt: &Prompt) -> Value {
         _ => {}
     }
     start_turn_with(st, tid, prompt)
+}
+
+fn drop_unsupported_effort(st: &mut State, fallback_model: Option<&str>) {
+    let Some(effort) = st.effort.as_deref() else { return };
+    let Some(model) = st.model.as_deref().or(fallback_model).filter(|m| !m.is_empty()) else { return };
+    if let Some(opt) = st.models.iter().find(|m| m.id == model) {
+        if !opt.efforts.iter().any(|e| e == effort) {
+            st.effort = None;
+        }
+    }
 }
 
 fn start_turn_with(st: &mut State, tid: String, prompt: &Prompt) -> Value {
@@ -560,7 +573,12 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Vec<Valu
                     st.turn_id = Some(t.to_string());
                 }
             }
-            Pending::Models => em.models(parse_models(&v["result"])),
+            Pending::Models => {
+                let models = parse_models(&v["result"]);
+                st.models = models.clone();
+                drop_unsupported_effort(st, spec.model.as_deref());
+                em.models(models);
+            }
             Pending::Other => {}
         }
         return out;
@@ -1444,6 +1462,30 @@ mod tests {
         assert_eq!(review_target("commit abc123"), json!({"type":"commit","sha":"abc123"}));
         assert_eq!(review_target("重点看并发安全"), json!({"type":"custom","instructions":"重点看并发安全"}));
         assert_eq!(review_target("branch"), json!({"type":"custom","instructions":"branch"}));
+    }
+
+    #[test]
+    fn codex_omits_effort_for_model_without_efforts() {
+        let (hub, em, _rx) = crate::hub::test_emitter();
+        let mut sp = spec();
+        sp.model = Some("plain-model".into());
+        sp.effort = Some("high".into());
+        let mut st = State { effort: Some("high".into()), ..Default::default() };
+        let req = st.req(Pending::Models, "model/list", json!({}));
+        let list = json!({
+            "id": req["id"],
+            "result": {
+                "data": [
+                    { "id": "reasoning-model", "supportedReasoningEfforts": [{"reasoningEffort": "low"}, {"reasoningEffort": "high"}] },
+                    { "id": "plain-model", "supportedReasoningEfforts": [] }
+                ]
+            }
+        });
+        handle(&mut st, &sp, &list, &em);
+        assert_eq!(st.effort, None);
+        let turn = start_turn_with(&mut st, "t1".into(), &Prompt { text: "hi".into(), images: vec![] });
+        assert!(turn["params"].get("effort").is_none());
+        let _ = hub;
     }
 
     #[test]

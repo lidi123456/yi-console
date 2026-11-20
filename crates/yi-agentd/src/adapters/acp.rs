@@ -152,6 +152,9 @@ struct State {
     /// Antigravity: the thinking level chosen in Yi Console, kept on the tool's `thought_level` option. agy resets the
     /// option to its default on every model switch, so it is set again whenever the tool reports a different value
     effort: Option<String>,
+    /// Antigravity: models reported by the session (with each model's supported thinking levels) and the active model id
+    agy_models: Vec<ModelOption>,
+    agy_model: Option<String>,
     /// Levels the tool offers for the current model, and the one it is on
     thought_levels: Vec<String>,
     thought_current: Option<String>,
@@ -429,6 +432,13 @@ pub async fn run(spec: StartSpec, em: Emitter, mut rx: mpsc::UnboundedReceiver<A
                     st.config_queue.clear();
                     st.model_failed = None;
                     st.model_retried = false;
+                    if st.is_antigravity {
+                        if let Some(opt) = st.agy_models.iter().find(|m| m.id == model) {
+                            if st.effort.as_deref().is_some_and(|e| !opt.efforts.iter().any(|l| l == e)) {
+                                st.effort = None;
+                            }
+                        }
+                    }
                     if st.session_id.is_some() {
                         if st.parameterized {
                             st.config_queue.push(("model".into(), base_model(&model).into()));
@@ -449,9 +459,14 @@ pub async fn run(spec: StartSpec, em: Emitter, mut rx: mpsc::UnboundedReceiver<A
                     if let Some(m) = next_config(&mut st) { let _ = p.send(&m).await; }
                 }
                 Some(AdapterCmd::SetEffort(effort)) if spec.tool == ToolKind::Antigravity => {
-                    // Back to "default" is agy's own default level
-                    st.effort = Some(if effort.is_empty() { "medium".into() } else { effort });
-                    if let Some(m) = next_effort(&mut st) { let _ = p.send(&m).await; }
+                    if effort.is_empty() {
+                        // Back to "default": clear the override and reset the current model once if it offers a default level
+                        st.effort = None;
+                        if let Some(m) = reset_effort_to_default(&mut st) { let _ = p.send(&m).await; }
+                    } else {
+                        st.effort = Some(effort);
+                        if let Some(m) = next_effort(&mut st) { let _ = p.send(&m).await; }
+                    }
                 }
                 Some(AdapterCmd::SetPermissionMode(mode)) => {
                     let was_plan = st.perm == "plan";
@@ -560,17 +575,53 @@ fn config_pending(st: &State) -> bool {
 /// Antigravity: record the `thought_level` option from a configOptions list (absent: the model has no levels)
 fn read_thought_level(st: &mut State, v: &Value) {
     let Some(options) = v["configOptions"].as_array() else { return };
+    if let Some(model) = options.iter().find(|o| o["id"] == "model").and_then(|o| o["currentValue"].as_str()) {
+        st.agy_model = Some(model.to_string());
+    }
     let option = options.iter().find(|o| o["category"] == "thought_level");
     st.thought_levels = option.and_then(|o| o["options"].as_array()).into_iter().flatten()
         .filter_map(|o| o["value"].as_str().map(str::to_string)).collect();
     st.thought_current = option.and_then(|o| o["currentValue"].as_str()).map(str::to_string);
 }
 
+/// Antigravity: true unless the active model is known in `agy_models` and does not offer `effort`
+fn agy_model_supports_effort(st: &State, effort: &str) -> bool {
+    let Some(model) = st.agy_model.as_deref() else { return true };
+    let Some(opt) = st.agy_models.iter().find(|m| m.id == model) else { return true };
+    opt.efforts.iter().any(|e| e == effort)
+}
+
+/// Antigravity: one-shot reset back to the active model's default level when the user clears thinking level
+fn reset_effort_to_default(st: &mut State) -> Option<Value> {
+    if st.loading || st.session_id.is_none() || st.pending.values().any(|p| matches!(p, Pending::SetModel | Pending::SetEffort)) {
+        return None;
+    }
+    let default = st
+        .agy_model
+        .as_deref()
+        .and_then(|id| st.agy_models.iter().find(|m| m.id == id))
+        .map(|m| m.default_effort.as_str())
+        .filter(|d| !d.is_empty())
+        .unwrap_or("medium")
+        .to_string();
+    if st.thought_current.as_deref() == Some(default.as_str())
+        || !st.thought_levels.contains(&default)
+        || !agy_model_supports_effort(st, &default)
+    {
+        return None;
+    }
+    st.thought_current = Some(default.clone());
+    Some(st.req(Pending::SetEffort, "session/set_config_option",
+        json!({"sessionId":st.session_id,"configId":"thought_level","value":default})))
+}
+
 /// Antigravity: set the chosen thinking level when the tool is on another one and the current model offers it
 fn next_effort(st: &mut State) -> Option<Value> {
     let want = st.effort.clone()?;
     if st.loading || st.session_id.is_none() || st.pending.values().any(|p| matches!(p, Pending::SetModel | Pending::SetEffort))
-        || st.thought_current.as_deref() == Some(want.as_str()) || !st.thought_levels.contains(&want) {
+        || st.thought_current.as_deref() == Some(want.as_str())
+        || !st.thought_levels.contains(&want)
+        || !agy_model_supports_effort(st, &want) {
         return None;
     }
     st.thought_current = Some(want.clone());
@@ -768,6 +819,9 @@ fn antigravity_mode(perm: &str) -> &'static str {
 fn set_model(st: &mut State, model: &str) -> Value {
     let sid = st.session_id.clone().unwrap_or_default();
     st.switching = Some(model.to_string());
+    // Clear the previous model's thinking levels so next_effort waits for the new model's configOptions
+    st.thought_levels.clear();
+    st.thought_current = None;
     st.req(
         Pending::SetModel,
         "session/set_model",
@@ -1329,6 +1383,7 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Result<V
                 Pending::SetEffort => {
                     // Don't try again on every option update
                     st.effort = None;
+                    st.thought_current = None;
                     em.event(EventBody::Error { message: format!("设置思考等级失败: {msg}") });
                     Ok(out)
                 }
@@ -1481,6 +1536,16 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Result<V
                         st.config_queue.extend(wanted);
                     }
                 } else {
+                    if agy {
+                        st.agy_models = models.clone();
+                        st.agy_model = current.clone();
+                        let active = want.as_deref().filter(|w| listed(w)).or(current.as_deref());
+                        if let Some(m) = active.and_then(|id| st.agy_models.iter().find(|o| o.id == id)) {
+                            if st.effort.as_deref().is_some_and(|e| !m.efforts.iter().any(|l| l == e)) {
+                                st.effort = None;
+                            }
+                        }
+                    }
                     match (want.filter(|w| listed(w)), &current) {
                         (Some(w), c) if c.as_deref() != Some(w.as_str()) => out.push(set_model(st, &w)),
                         (_, Some(c)) => em.model(c),
@@ -1670,6 +1735,13 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Result<V
             }
             Pending::SetModel => {
                 if let Some(m) = st.switching.take() {
+                    if st.is_antigravity {
+                        st.agy_model = Some(m.clone());
+                        read_thought_level(st, r);
+                        if st.effort.as_deref().is_some_and(|e| !agy_model_supports_effort(st, e)) {
+                            st.effort = None;
+                        }
+                    }
                     em.model(&m);
                 }
                 if spec.tool == ToolKind::Cursor { em.model_config_settled(); }
@@ -5507,6 +5579,91 @@ mod model_config_tests {
         st.pending.clear();
         st.effort = Some("xhigh".into());
         assert!(next_effort(&mut st).is_none(), "not offered by this model");
+
+        // Switching to a model without thinking levels clears stale thought_levels and never sends thought_level
+        let mut st2 = State {
+            is_antigravity: true,
+            session_id: Some("s".into()),
+            effort: Some("medium".into()),
+            agy_models: models.clone(),
+            ..Default::default()
+        };
+        read_thought_level(&mut st2, &r);
+        assert_eq!(st2.agy_model.as_deref(), Some("gemini-4-argon"));
+        let _ = set_model(&mut st2, "gpt-oss-120b-medium");
+        assert!(st2.thought_levels.is_empty(), "stale levels from previous model cleared on set_model");
+        st2.pending.clear();
+        st2.agy_model = Some("gpt-oss-120b-medium".into());
+        assert!(next_effort(&mut st2).is_none(), "never send effort after set_model before new configOptions");
+        // Even if configOptions still advertises thought_level while on a model whose availableModels has no levels
+        st2.thought_levels = vec!["low".into(), "medium".into(), "high".into()];
+        st2.thought_current = Some("low".into());
+        assert!(next_effort(&mut st2).is_none(), "model in agy_models has no efforts");
+
+        // Clearing effort to default resets once without sticking st.effort across later model switches
+        let mut st3 = State {
+            is_antigravity: true,
+            session_id: Some("s".into()),
+            effort: Some("high".into()),
+            agy_models: models.clone(),
+            ..Default::default()
+        };
+        read_thought_level(&mut st3, &r);
+        st3.thought_current = Some("high".into());
+        st3.effort = None;
+        let reset = reset_effort_to_default(&mut st3).unwrap();
+        assert_eq!((reset["params"]["configId"].as_str(), reset["params"]["value"].as_str()), (Some("thought_level"), Some("medium")));
+        st3.pending.clear();
+        assert!(next_effort(&mut st3).is_none(), "default choice is not persisted as an override");
+
+        // Resuming a session with a stale effort when targeting a model without levels drops st.effort
+        let (hub, em, _rx) = crate::hub::test_emitter();
+        crate::hub::test_set_tool(&hub, "s", ToolKind::Antigravity);
+        let mut st4 = State {
+            is_antigravity: true,
+            effort: Some("medium".into()),
+            ..Default::default()
+        };
+        let mut sp = StartSpec {
+            tool: ToolKind::Antigravity,
+            mode: SessionMode::Structured,
+            cwd: std::path::PathBuf::from("."),
+            resume: Some("agy-1".into()),
+            session_id: None,
+            replay: false,
+            replay_skip: 0,
+            model: Some("gpt-oss-120b-medium".into()),
+            effort: Some("medium".into()),
+            model_config_options: vec![],
+            permission_mode: "default".into(),
+            command: None,
+            program: std::path::PathBuf::new(),
+            extra_args: vec![],
+            mcp_servers: vec![],
+            mcp_fingerprint: String::new(),
+            allow_mcp: vec![],
+            system_notice: false,
+            system_prompt: None,
+            memory_prompt: None,
+            memory_notice: false,
+            cols: 120,
+            rows: 32,
+            tmux: None,
+            env: std::collections::BTreeMap::new(),
+            env_unset: vec![],
+            data_dir: None,
+            auth_method: None,
+            account_handoff: None,
+        };
+        let req = resume_session(&mut st4, &sp, "agy-1");
+        let outs = handle(&mut st4, &sp, &json!({"id": req["id"], "result": r}), &em).unwrap();
+        assert_eq!(st4.effort, None, "effort cleared when target model offers no levels");
+        assert!(outs.iter().any(|m| m["method"] == "session/set_model" && m["params"]["modelId"] == "gpt-oss-120b-medium"));
+        let set_id = outs.iter().find(|m| m["method"] == "session/set_model").unwrap()["id"].clone();
+        let _ = handle(&mut st4, &sp, &json!({"id": set_id, "result": {}}), &em).unwrap();
+        assert!(next_effort(&mut st4).is_none());
+        sp.model = None;
+        let _ = sp;
 
         let text = "\n⚠ Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 4h9m8s.\n";
         assert_eq!(antigravity_limit(text), Some(((4 * 60 + 9) * 60 + 8) * 1000));

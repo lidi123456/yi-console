@@ -417,6 +417,11 @@ impl Hub {
                     info.model = info.model.as_deref().map(|m| base_model(m).to_string());
                 }
             }
+            let clean_effort = sanitize_effort(info.tool, info.model.as_deref(), info.effort.clone(), &self.cached_models(info.tool));
+            if info.effort != clean_effort {
+                info.effort = clean_effort;
+                let _ = self.store.save_session(&info);
+            }
             let queue = queues
                 .remove(&info.id)
                 .filter(|_| info.tool.has_process() && info.mode == SessionMode::Structured)
@@ -817,6 +822,7 @@ impl Hub {
             }
         }
         let model = p.model.as_deref().map(|m| if cursor { base_model(m) } else { m }).filter(|m| !m.is_empty()).map(str::to_string);
+        let effort = sanitize_effort(tool, model.as_deref(), p.effort.clone(), &self.cached_models(tool));
         let info = SessionInfo {
             id,
             tool,
@@ -840,7 +846,7 @@ impl Hub {
                 .permission_mode
                 .clone()
                 .filter(|m| permission_modes(tool, mode).contains(&m.as_str())),
-            effort: p.effort.clone().filter(|e| !e.is_empty()),
+            effort,
             pinned: false,
             queued: vec![],
             queue_paused: None,
@@ -1054,6 +1060,15 @@ impl Hub {
         } else {
             None
         };
+        let models = self
+            .sessions
+            .lock()
+            .unwrap()
+            .get(&info.id)
+            .cloned()
+            .map(|rt| self.models_for(&rt, info.tool))
+            .unwrap_or_else(|| self.cached_models(info.tool));
+        let effort = sanitize_effort(info.tool, info.model.as_deref(), info.effort.clone(), &models);
         Ok(StartSpec {
             tool: info.tool,
             mode: info.mode,
@@ -1063,7 +1078,7 @@ impl Hub {
             replay,
             replay_skip: 0,
             model: info.model.clone(),
-            effort: info.effort.clone(),
+            effort,
             model_config_options: info.model_config_options.clone(),
             permission_mode: info.permission_mode.clone().unwrap_or_else(|| "default".into()),
             command: info.command.clone(),
@@ -1404,7 +1419,9 @@ impl Hub {
     pub fn set_model(self: &Arc<Self>, id: &str, model: &str) -> Result<()> {
         let rt = self.get(id)?;
         let running = self.running_tx(&rt);
-        let (info, discover, carried) = {
+        let tool = rt.info.lock().unwrap().tool;
+        let models = self.models_for(&rt, tool);
+        let (info, discover, carried, effort_cleared) = {
             let mut i = rt.info.lock().unwrap();
             if i.mode == SessionMode::Terminal {
                 bail!("终端模式不支持切换模型");
@@ -1415,6 +1432,9 @@ impl Hub {
                 return Ok(());
             }
             i.model = Some(model.to_string()).filter(|m| !m.is_empty());
+            let next_effort = sanitize_effort(i.tool, i.model.as_deref(), i.effort.clone(), &models);
+            let effort_cleared = i.effort.is_some() && next_effort.is_none();
+            i.effort = next_effort;
             let mut discover = false;
             let mut carried = vec![];
             if cursor {
@@ -1432,12 +1452,15 @@ impl Hub {
                 // A running process reads the parameters when it switches; otherwise a short probe does
                 discover = i.model_config_pending && running.is_none();
             }
-            (i.clone(), discover, carried)
+            (i.clone(), discover, carried, effort_cleared)
         };
         self.store.save_session(&info)?;
         self.broadcast_updated(&info);
         if let Some(tx) = running {
             let _ = tx.send(AdapterCmd::SetModel(model.to_string()));
+            if effort_cleared {
+                let _ = tx.send(AdapterCmd::SetEffort(String::new()));
+            }
             for (id, value) in carried {
                 let _ = tx.send(AdapterCmd::SetModelConfig { id, value });
             }
@@ -1639,6 +1662,8 @@ impl Hub {
 
     pub fn set_effort(&self, id: &str, effort: &str) -> Result<()> {
         let rt = self.get(id)?;
+        let tool = rt.info.lock().unwrap().tool;
+        let models = self.models_for(&rt, tool);
         let info = {
             let mut i = rt.info.lock().unwrap();
             if i.mode == SessionMode::Terminal {
@@ -1646,6 +1671,16 @@ impl Hub {
             }
             if !matches!(i.tool, ToolKind::Claude | ToolKind::Codex | ToolKind::Antigravity) {
                 bail!("{} 不支持调整思考等级", i.tool.as_str());
+            }
+            if !effort.is_empty() {
+                if let Some(opt) = find_model_option(i.model.as_deref(), &models) {
+                    if opt.efforts.is_empty() {
+                        bail!("当前模型不支持调整思考等级");
+                    }
+                    if !opt.efforts.iter().any(|e| e == effort) {
+                        bail!("当前模型不支持这个思考等级");
+                    }
+                }
             }
             i.effort = Some(effort.to_string()).filter(|m| !m.is_empty());
             i.clone()
@@ -1695,11 +1730,17 @@ impl Hub {
                 self.discover_model_config(&model, &info.cwd, info.account_id.clone());
             }
         }
-        let mut models = rt.models.lock().unwrap().clone();
-        if models.is_empty() {
-            models = self.cached_models(info.tool);
-        }
+        let models = self.models_for(&rt, info.tool);
         Ok(json!({ "current": info.model, "models": models }))
+    }
+
+    fn models_for(&self, rt: &SessionRt, tool: ToolKind) -> Vec<ModelOption> {
+        let models = rt.models.lock().unwrap().clone();
+        if models.is_empty() {
+            self.cached_models(tool)
+        } else {
+            models
+        }
     }
 
     pub fn cached_models(&self, tool: ToolKind) -> Vec<ModelOption> {
@@ -4114,6 +4155,36 @@ fn is_effort_alias(id: &str) -> bool {
     matches!(id, "reasoning" | "reasoning_effort" | "effort")
 }
 
+/// Look up a model option the same way the picker does: exact id, else resolved model id (preferring non-"default")
+fn find_model_option<'a>(model: Option<&str>, models: &'a [ModelOption]) -> Option<&'a ModelOption> {
+    let Some(cur) = model.filter(|m| !m.is_empty()) else {
+        return models.iter().find(|o| o.id == "default");
+    };
+    models
+        .iter()
+        .find(|o| o.id == cur)
+        .or_else(|| models.iter().find(|o| o.resolved == cur && o.id != "default"))
+        .or_else(|| models.iter().find(|o| o.resolved == cur))
+}
+
+/// Drop a remembered thinking level when the selected model is in `models` and does not support it
+/// (including models that offer no thinking levels). Unknown models / empty lists keep the level untouched.
+fn sanitize_effort(
+    tool: ToolKind,
+    model: Option<&str>,
+    effort: Option<String>,
+    models: &[ModelOption],
+) -> Option<String> {
+    let effort = effort.filter(|e| !e.is_empty())?;
+    if !matches!(tool, ToolKind::Claude | ToolKind::Codex | ToolKind::Antigravity) {
+        return None;
+    }
+    let Some(opt) = find_model_option(model, models) else {
+        return Some(effort);
+    };
+    opt.efforts.iter().any(|e| e == &effort).then_some(effort)
+}
+
 #[cfg(test)]
 pub(crate) fn test_set_tool(hub: &Hub, id: &str, tool: ToolKind) {
     hub.get(id).unwrap().info.lock().unwrap().tool = tool;
@@ -4259,12 +4330,19 @@ impl Emitter {
     }
 
     pub fn model(&self, model: &str) {
+        let Some(rt) = self.hub.alive(&self.sid, self.gen) else {
+            return;
+        };
+        let tool = rt.info.lock().unwrap().tool;
+        let models = self.hub.models_for(&rt, tool);
         let m = model.to_string();
         self.hub.set_info(&self.sid, self.gen, |i| {
-            if i.model.as_deref() == Some(m.as_str()) {
+            let next_effort = sanitize_effort(i.tool, Some(m.as_str()), i.effort.clone(), &models);
+            if i.model.as_deref() == Some(m.as_str()) && i.effort == next_effort {
                 return false;
             }
             i.model = Some(m);
+            i.effort = next_effort;
             true
         });
     }
@@ -4277,7 +4355,16 @@ impl Emitter {
         let tool = rt.info.lock().unwrap().tool;
         self.hub.remember_models(tool, &models);
         let saved = self.hub.cached_models(tool);
-        *rt.models.lock().unwrap() = if short_cursor_list(tool, &models, &saved) { saved } else { models };
+        let effective = if short_cursor_list(tool, &models, &saved) { saved } else { models };
+        *rt.models.lock().unwrap() = effective.clone();
+        self.hub.set_info(&self.sid, self.gen, |i| {
+            let next_effort = sanitize_effort(i.tool, i.model.as_deref(), i.effort.clone(), &effective);
+            if i.effort == next_effort {
+                return false;
+            }
+            i.effort = next_effort;
+            true
+        });
     }
 
     /// Cursor answered a `session/set_config_option`: its model and that model's full parameter list. This is the
@@ -4822,6 +4909,63 @@ mod tests {
         let i = hub.info("s").unwrap();
         assert_eq!(i.model.as_deref(), Some("cold"));
         assert!(!i.model_config_pending);
+    }
+
+    #[test]
+    fn switching_to_model_without_effort_clears_previous_effort() {
+        let (hub, em, mut rx) = test_emitter();
+        hub.get("s").unwrap().info.lock().unwrap().tool = ToolKind::Antigravity;
+        let model = |id: &str, efforts: &[&str]| ModelOption {
+            id: id.into(),
+            name: id.into(),
+            description: String::new(),
+            resolved: String::new(),
+            efforts: efforts.iter().map(|s| (*s).into()).collect(),
+            default_effort: if efforts.contains(&"medium") { "medium".into() } else { String::new() },
+        };
+        em.models(vec![
+            model("gemini-4-neon", &["low", "medium", "high", "xhigh"]),
+            model("gemini-4-argon", &["low", "medium", "high"]),
+            model("gemini-pro-orchestrator-neon", &[]),
+        ]);
+
+        // Select a model and thinking level, then switch to another model that supports the same level -> preserved
+        hub.set_model("s", "gemini-4-neon").unwrap();
+        hub.set_effort("s", "high").unwrap();
+        assert_eq!(hub.info("s").unwrap().effort.as_deref(), Some("high"));
+        hub.set_model("s", "gemini-4-argon").unwrap();
+        assert_eq!(hub.info("s").unwrap().effort.as_deref(), Some("high"));
+
+        // Drain earlier commands before checking commands for clearing
+        while rx.try_recv().is_ok() {}
+
+        // Switch to a model with no thinking levels -> effort is cleared and adapter is told to clear it
+        hub.set_model("s", "gemini-pro-orchestrator-neon").unwrap();
+        assert_eq!(hub.info("s").unwrap().effort, None);
+        assert!(matches!(rx.try_recv().unwrap(), AdapterCmd::SetModel(m) if m == "gemini-pro-orchestrator-neon"));
+        assert!(matches!(rx.try_recv().unwrap(), AdapterCmd::SetEffort(e) if e.is_empty()));
+
+        // Explicitly setting an effort on a model without thinking levels is rejected; clearing is allowed
+        assert!(hub.set_effort("s", "medium").is_err());
+        hub.set_effort("s", "").unwrap();
+
+        // Switching from xhigh -> model that only offers low/medium/high also clears effort
+        hub.set_model("s", "gemini-4-neon").unwrap();
+        hub.set_effort("s", "xhigh").unwrap();
+        assert_eq!(hub.info("s").unwrap().effort.as_deref(), Some("xhigh"));
+        hub.set_model("s", "gemini-4-argon").unwrap();
+        assert_eq!(hub.info("s").unwrap().effort, None);
+
+        // Stale saved effort on a model without thinking levels is sanitized when models arrive
+        hub.get("s").unwrap().info.lock().unwrap().model = Some("gemini-pro-orchestrator-neon".into());
+        hub.get("s").unwrap().info.lock().unwrap().effort = Some("medium".into());
+        let spec = hub.spec_for(&hub.info("s").unwrap(), false, 120, 32).unwrap();
+        assert_eq!(spec.effort, None);
+        em.models(vec![
+            model("gemini-4-neon", &["low", "medium", "high", "xhigh"]),
+            model("gemini-pro-orchestrator-neon", &[]),
+        ]);
+        assert_eq!(hub.info("s").unwrap().effort, None);
     }
 
     #[test]
