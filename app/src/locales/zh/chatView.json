@@ -104,7 +104,5 @@
   "selectTextHint": "长按文字自由拖选",
   "copySelection": "复制选中",
   "copyAll": "复制全文",
-  "close": "关闭",
-  "turnChangedFiles_other": "{{count}} 个文件变更",
-  "viewTurnChanges": "查看工作区变更"
+  "close": "关闭"
 }

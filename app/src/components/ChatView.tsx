@@ -12,7 +12,7 @@ import { TOOL_LABEL, type FileDiff, type HubEvent, type ImageRef, type MemoryEnt
 import { clock, fmtTokens, isMobile, lsGet, lsSet } from '../util';
 import { writeClipboard } from '../clipboard';
 import { errorToast, navigate, toast, useStore } from '../store';
-import { handoffSession, showChanges } from './SessionActions';
+import { handoffSession } from './SessionActions';
 import { MemoryEditorModal, type MemoryEditorInit } from './MemoryView';
 import { DiffView, diffLines } from './DiffView';
 import { openImage } from './Lightbox';
@@ -71,7 +71,6 @@ type Item =
       ts: number;
       usage: Usage | null;
       tools: number;
-      diffStat?: { files: number; add: number; del: number };
       model?: string | null;
       reason?: string;
       text: string;
@@ -149,7 +148,6 @@ function buildItems(events: HubEvent[], hideCompactCmd = false): Item[] {
   let turnStart: number | null = null;
   let turnUsage: Usage | null = null;
   let turnTools = 0;
-  let turnToolItems: (Item & { k: 'tool' })[] = [];
   let turnTexts: string[] = [];
   let exitNote: Extract<Item, { k: 'note' }> | null = null;
   let openAsk: AsyncAsk | null = null;
@@ -250,7 +248,6 @@ function buildItems(events: HubEvent[], hideCompactCmd = false): Item[] {
           tools.set(e.id, it);
           items.push(it);
           turnTools++;
-          turnToolItems.push(it);
           const early = earlyRuns.findIndex((r) => desktopTools.get(r.actionId) === undefined && isDesktopTool(it, r));
           if (early >= 0) {
             it.desktop = earlyRuns[early];
@@ -370,20 +367,7 @@ function buildItems(events: HubEvent[], hideCompactCmd = false): Item[] {
         t.credits += u.credits;
         break;
       }
-      case 'turn_end': {
-        const diffFiles = new Set<string>();
-        let diffAdd = 0;
-        let diffDel = 0;
-        for (const ti of turnToolItems) {
-          for (const d of ti.diffs) {
-            if (d.path) diffFiles.add(d.path);
-            const ls = diffLines(d);
-            for (const l of ls) {
-              if (l.t === 'add') diffAdd++;
-              else if (l.t === 'del') diffDel++;
-            }
-          }
-        }
+      case 'turn_end':
         items.push({
           k: 'turn',
           key,
@@ -391,7 +375,6 @@ function buildItems(events: HubEvent[], hideCompactCmd = false): Item[] {
           ts: e.ts,
           usage: turnUsage,
           tools: turnTools,
-          diffStat: diffFiles.size > 0 ? { files: diffFiles.size, add: diffAdd, del: diffDel } : undefined,
           model: e.model,
           reason: e.stopReason && !NORMAL_END.includes(e.stopReason) ? reasonText(e.stopReason) : undefined,
           text: turnTexts.join('\n\n'),
@@ -399,10 +382,8 @@ function buildItems(events: HubEvent[], hideCompactCmd = false): Item[] {
         turnStart = null;
         turnUsage = null;
         turnTools = 0;
-        turnToolItems = [];
         turnTexts = [];
         break;
-      }
     }
   }
   return items;
@@ -1858,18 +1839,14 @@ function fullTime(ms: number) {
   return `${t.getFullYear()}-${p(t.getMonth() + 1)}-${p(t.getDate())} ${p(t.getHours())}:${p(t.getMinutes())}`;
 }
 
-/** Compact-style action row under each reply: turn diff summary pill on the left, quiet duration/cost/copy on the right; detailed tokens live in the tooltip */
+/** Compact-style action row under each reply: quiet duration/cost/copy on the right; detailed tokens live in the tooltip */
 function ModernTurnFooter({
   it,
   latest,
-  hostId,
-  sessionId,
   onSelectText,
 }: {
   it: Item & { k: 'turn' };
   latest: boolean;
-  hostId?: string;
-  sessionId?: string;
   onSelectText?: (text: string) => void;
 }) {
   useLang();
@@ -1894,24 +1871,8 @@ function ModernTurnFooter({
   if (it.model) tipLines.push(it.model);
   tipLines.push(fullTime(it.ts));
   const tip = tipLines.join('\n');
-  const ds = it.diffStat;
   return (
-    <div className={`m-actions ${latest ? 'latest' : ''} ${ds ? 'has-diff' : ''}`}>
-      {ds && (
-        <button
-          type="button"
-          className="m-diff-pill"
-          title={t('viewTurnChanges')}
-          onClick={() => {
-            if (hostId && sessionId) showChanges(hostId, sessionId);
-          }}
-        >
-          <Icon name="diff" size={12} />
-          <span>{t('turnChangedFiles', { count: ds.files })}</span>
-          {ds.add > 0 && <span className="add mono">+{ds.add}</span>}
-          {ds.del > 0 && <span className="del mono">-{ds.del}</span>}
-        </button>
-      )}
+    <div className={`m-actions ${latest ? 'latest' : ''}`}>
       {it.reason && <span className="attn-text">{it.reason}</span>}
       <div className="m-act-right">
         <span className="m-act-time">{fullTime(it.ts)}</span>
@@ -2410,7 +2371,7 @@ export function ChatView({
               return <Plan key={it.key} plan={it.plan} busy={!!busy} />;
             case 'turn':
               return modern ? (
-                <ModernTurnFooter key={it.key} it={it} latest={it.key === lastTurnKey} hostId={hostId} sessionId={info?.id} onSelectText={setSelectingText} />
+                <ModernTurnFooter key={it.key} it={it} latest={it.key === lastTurnKey} onSelectText={setSelectingText} />
               ) : (
                 <TurnFooter key={it.key} it={it} onSelectText={setSelectingText} />
               );

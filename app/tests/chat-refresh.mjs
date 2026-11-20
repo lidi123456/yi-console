@@ -59,14 +59,10 @@ try {
     assert.match(copiedCode, /export function summarizeSteps/);
     assert.ok(!copiedCode.includes('typescript\n'), 'language label is not copied into clipboard');
 
-    // Turn diff pill displays file count + add/del and triggers OPEN_CHANGES
-    const diffPill = page.locator('.m-diff-pill');
-    const diffText = await diffPill.innerText();
-    assert.match(diffText, /1 个文件变更/);
-    assert.match(diffText, /\+5/);
-    assert.match(diffText, /-1/);
-    await diffPill.click();
-    await page.waitForFunction(() => window.getChangesClicks() === 1);
+    // Turn diff pill is removed; balanced line-height (1.78 => ~24.92px at 14px) applies
+    assert.equal(await page.locator('.m-diff-pill').count(), 0);
+    const proseLh = await page.locator('.msg-assistant .md p').first().evaluate((el) => parseFloat(getComputedStyle(el).lineHeight));
+    assert.ok(proseLh >= 24.5 && proseLh <= 25.3, `expected ~24.92px line-height, got ${proseLh}`);
 
     // Compact metadata: duration + cost shown, verbose token breakdown stays in tooltip
     const metaText = await page.locator('.m-act-meta').innerText();
@@ -110,7 +106,7 @@ try {
     assert.deepEqual(errors, []);
     await ctx.close();
 
-    console.log('PASS: chat-refresh E2E (original tool group + diff pill + code lang header + composer + dark theme).');
+    console.log('PASS: chat-refresh E2E (original tool group + balanced typography + code lang header + composer + dark theme).');
   } finally {
     await browser.close();
   }

@@ -104,8 +104,5 @@
   "selectTextHint": "Long-press and drag to select",
   "copySelection": "Copy selection",
   "copyAll": "Copy all",
-  "close": "Close",
-  "turnChangedFiles_one": "{{count}} file changed",
-  "turnChangedFiles_other": "{{count}} files changed",
-  "viewTurnChanges": "View workspace changes"
+  "close": "Close"
 }

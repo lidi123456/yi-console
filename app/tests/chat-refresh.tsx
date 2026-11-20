@@ -7,7 +7,6 @@ import { ChatView, PermissionCard, setChatStyle } from '../src/components/ChatVi
 import { Composer } from '../src/components/Composer';
 import { Icon, ToolBadge } from '../src/components/Icon';
 import { Overlays, useContextMenu } from '../src/components/Overlay';
-import { OPEN_CHANGES } from '../src/components/SessionActions';
 import { setLangPref } from '../src/i18n';
 import { setTheme } from '../src/theme';
 import type { HubEvent, SessionInfo } from '../src/types';
@@ -563,13 +562,6 @@ const SCENARIOS: Record<
   },
 };
 
-let changesClicks = 0;
-if (typeof window !== 'undefined') {
-  window.addEventListener(OPEN_CHANGES, () => {
-    changesClicks += 1;
-  });
-}
-
 function Fixture() {
   useContextMenu();
   const [sceneName, setSceneName] = useState<string>('default');
@@ -597,7 +589,6 @@ function Fixture() {
     setTheme,
     setLangPref,
     loadScenario,
-    getChangesClicks: () => changesClicks,
   });
 
   const pendingPermEv = showPendingPerm

@@ -14749,14 +14749,14 @@ button.wp-commit-title .chev {
 
 .chat.modern .msg-assistant {
   --m-fs: var(--fs-chat, 14px);
-  --m-lh: calc(var(--m-fs) * 1.62);
-  --m-gap: 10px;
+  --m-lh: calc(var(--m-fs) * 1.78);
+  --m-gap: 13px;
   color: var(--chat-prose);
 }
 
 /* Headings: generous space above, tight space below so each heading clearly binds to its section */
 .chat.modern .msg-assistant .md > :is(ul, ol) + * {
-  margin-top: calc(var(--m-gap) + 2px);
+  margin-top: calc(var(--m-gap) + 3px);
 }
 
 .chat.modern .msg-assistant .md > :is(h1, h2) + * {
@@ -14812,7 +14812,7 @@ button.wp-commit-title .chev {
 
 .chat.modern .msg-assistant .md li + li,
 .chat.modern .msg-assistant .md li > :is(ul, ol) {
-  margin-top: 4px;
+  margin-top: 6px;
 }
 
 .chat.modern .msg-assistant .md li::marker {
@@ -14912,7 +14912,7 @@ button.wp-commit-title .chev {
   padding-top: 10px;
 }
 
-/* ---- Turn footer: diff summary pill + quiet right-aligned metadata ---- */
+/* ---- Turn footer: quiet right-aligned metadata ---- */
 
 .m-actions {
   justify-content: space-between;
@@ -14923,39 +14923,10 @@ button.wp-commit-title .chev {
   transition: opacity 0.15s;
 }
 
-.m-actions.has-diff,
 .m-actions.latest,
 .m-actions:hover,
 .m-actions:focus-within {
   opacity: 1;
-}
-
-.m-diff-pill {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  height: 24px;
-  padding: 0 9px;
-  border-radius: 7px;
-  border: 1px solid var(--border);
-  background: var(--chat-act-bg);
-  color: var(--text-2);
-  font-size: 11.5px;
-  transition: border-color 0.15s, background 0.15s, color 0.15s;
-}
-
-.m-diff-pill:hover {
-  border-color: var(--border-2);
-  background: var(--bg-2);
-  color: var(--text);
-}
-
-.m-diff-pill .add {
-  color: var(--add-fg);
-}
-
-.m-diff-pill .del {
-  color: var(--del-fg);
 }
 
 .m-act-right {
