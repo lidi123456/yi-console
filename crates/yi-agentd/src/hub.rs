@@ -1598,6 +1598,7 @@ impl Hub {
         let _ = self.store.save_queue(id, "[]");
         *rt.resume_token.lock().unwrap() += 1;
         *rt.limited.lock().unwrap() = false;
+        *rt.limit_probing.lock().unwrap() = false;
         rt.pending.lock().unwrap().clear();
         rt.pending_briefs.lock().unwrap().clear();
         rt.turn_files.lock().unwrap().clear();
@@ -1608,6 +1609,9 @@ impl Hub {
         *rt.restart_pending.lock().unwrap() = false;
         rt.watch_active.store(false, std::sync::atomic::Ordering::Relaxed);
         *rt.qoder_plan.lock().unwrap() = None;
+        *rt.pending_handoff.lock().unwrap() = None;
+        *rt.pending_failover.lock().unwrap() = None;
+        rt.failover_tried.lock().unwrap().clear();
         self.store.delete_events(id)?;
         self.store.save_session(&info)?;
         // Images and attachments in the chat are only referenced by the deleted records, so delete them too
@@ -5589,6 +5593,31 @@ mod tests {
         assert_eq!(*rt.generation.lock().unwrap(), before_gen, "must not bump generation when a process is already running");
         returned_tx.send(AdapterCmd::Send(Prompt { text: "继续".into(), images: vec![] })).unwrap();
         assert!(matches!(rx.try_recv(), Ok(AdapterCmd::Send(p)) if p.text == "继续"));
+    }
+
+    #[tokio::test]
+    async fn clear_resets_pending_handoff_and_failover_state() {
+        let hub = Hub::new(Store::open_memory().unwrap(), DaemonSettings::default());
+        let rx = live(&hub, "s-clear", SessionMode::Structured, SessionStatus::Idle, 1);
+        let rt = hub.get("s-clear").unwrap();
+        *rt.pending_handoff.lock().unwrap() = Some("<yi-account-handoff>\nstale summary\n</yi-account-handoff>".into());
+        *rt.pending_failover.lock().unwrap() = Some(("acc-2".into(), None, None));
+        rt.failover_tried.lock().unwrap().push("acc-1".into());
+        *rt.limit_probing.lock().unwrap() = true;
+
+        drop(rx);
+        hub.clear("s-clear").await.unwrap();
+
+        assert!(rt.pending_handoff.lock().unwrap().is_none());
+        assert!(rt.pending_failover.lock().unwrap().is_none());
+        assert!(rt.failover_tried.lock().unwrap().is_empty());
+        assert!(!*rt.limit_probing.lock().unwrap());
+
+        let (tx2, mut rx2) = mpsc::unbounded_channel();
+        *rt.cmd.lock().unwrap() = Some(tx2);
+        rt.info.lock().unwrap().status = SessionStatus::Idle;
+        hub.send("s-clear", "fresh prompt", vec![], false, None).unwrap();
+        assert!(matches!(rx2.try_recv(), Ok(AdapterCmd::Send(p)) if p.text == "fresh prompt"));
     }
 }
 
