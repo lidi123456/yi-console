@@ -11,7 +11,7 @@ The session page's "workspace files" (`FilePanel.tsx`), also used standalone by 
 
 ## Tree
 
-- The tree marks changes (M / U / D) from `git.changes` (with `diff: false`, statuses only, because running git diff per file is too slow in big repos).
+- The tree marks changes (M / U / D) from `git.changes` (with `diff: false`, statuses only, because running git diff per file is too slow in big repos), and dims git-ignored files, ignored directories (plus `.git`), their descendants, and open tabs (`.g-ign`) using the `ignored` list returned by `git status --ignored=matching`.
 - The filter box uses `fs.search`.
 - When a turn ends the tree refreshes, and open files without local edits are reread.
 - Expanded folders are stored in localStorage `wp-exp-<host>/<cwd>` (missing ones are dropped quietly).

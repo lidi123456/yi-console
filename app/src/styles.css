@@ -8092,6 +8092,20 @@ body.resizing .side-resizer::after {
 .wp-row.g-ren .wp-git {
   color: var(--link);
 }
+/* git-ignored files and directories: dimmed text and icons, matching VS Code / Cursor */
+.wp-row.g-ign .wp-name {
+  color: var(--text-3);
+  opacity: 0.9;
+}
+.wp-row.g-ign .wp-ficon,
+.wp-row.g-ign .wp-twist,
+.wp-ftab.g-ign .wp-ficon {
+  opacity: 0.45;
+}
+.wp-ftab.g-ign > .truncate {
+  color: var(--text-3);
+  opacity: 0.85;
+}
 /* Changes view: "+12 −3" on the right of file rows and the totals at the top */
 .wp-stat {
   flex: none;

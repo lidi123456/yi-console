@@ -5,6 +5,7 @@
   "renamed": "Renamed",
   "modified": "Modified",
   "conflict": "Conflict",
+  "ignored": "Ignored by Git",
   "saving": "Saving",
   "changedOnDisk": "Changed on disk",
   "saveFailed": "Save failed",

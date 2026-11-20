@@ -10,6 +10,8 @@ const DIFF_MAX: usize = 200 * 1024;
 /// At most this many changed files are returned (VS Code's git.statusLimit default): a repo without a .gitignore for
 /// node_modules and the like can list hundreds of thousands, and the panel polls every 10 s
 const STATUS_MAX: usize = 10_000;
+/// Separate cap for ignored paths (`git status --ignored=matching`) so ignored entries never crowd out changed files
+const IGNORED_MAX: usize = 10_000;
 /// New files beyond this many don't get their lines counted (that reads each file)
 const COUNT_MAX: usize = 2_000;
 
@@ -64,23 +66,37 @@ pub fn changes(cwd: &str) -> Result<Value> {
 pub fn changes_with(cwd: &str, with_diff: bool, only: Option<&[String]>) -> Result<Value> {
     let dir = crate::paths::expand(cwd);
     let Some(root) = repo_root(&dir) else {
-        return Ok(json!({ "repo": null, "files": [] }));
+        return Ok(json!({ "repo": null, "files": [], "ignored": [] }));
     };
     let branch = git_ok(&root, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap_or_default();
     // Current commit: the frontend refreshes the commit history when it changes (null in a repo with no commits yet)
     let head = git_ok(&root, &["rev-parse", "--verify", "-q", "HEAD"]).ok().map(|s| s.trim().to_string());
-    let status = git_ok(&root, &["status", "--porcelain=v1", "-z", "-uall"])?;
+    // Include ignored entries only for full listings; --ignored=matching stops at ignored directory boundaries
+    // (avoiding a walk into node_modules/target), falling back for very old git (< 2.16) that lacks it
+    let status = if only.is_none() {
+        git_ok(&root, &["status", "--porcelain=v1", "-z", "-uall", "--ignored=matching"])
+            .or_else(|_| git_ok(&root, &["status", "--porcelain=v1", "-z", "-uall"]))?
+    } else {
+        git_ok(&root, &["status", "--porcelain=v1", "-z", "-uall"])?
+    };
     let stats = numstat(&root);
     let mut files = vec![];
+    let mut ignored = vec![];
     let (mut total, mut counted) = (0usize, 0usize);
     let mut it = status.split('\0').filter(|s| !s.is_empty());
     while let Some(entry) = it.next() {
         if entry.len() < 4 {
             continue;
         }
-        total += 1;
         let (code, path) = entry.split_at(3);
         let code = code.trim().to_string();
+        if code == "!!" {
+            if ignored.len() < IGNORED_MAX {
+                ignored.push(path.to_string());
+            }
+            continue;
+        }
+        total += 1;
         // Rename entries are followed by the original path
         if code.starts_with('R') || code.starts_with('C') {
             it.next();
@@ -139,6 +155,8 @@ pub fn changes_with(cwd: &str, with_diff: bool, only: Option<&[String]>) -> Resu
         // Total number of changed files, set only when more than STATUS_MAX were left out
         "total": if only.is_none() && total > files.len() { Some(total) } else { None },
         "files": files,
+        // Ignored paths relative to the repo root (directories end with '/')
+        "ignored": ignored,
     }))
 }
 
@@ -577,5 +595,55 @@ mod tests {
 
         assert!(show(&cwd, "HEAD; rm", None).is_err());
         assert!(show(&cwd, head, Some(&["../x".to_string()])).is_err());
+    }
+
+    #[test]
+    fn changes_reports_ignored_paths() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path();
+        let run = |a: &[&str]| assert!(git(p, a).unwrap().status.success(), "{a:?}");
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "t@t"]);
+        run(&["config", "user.name", "t"]);
+        std::fs::write(p.join(".gitignore"), "dist/\nfoo/\nbar/*\n!bar/keep.txt\n*.log\n").unwrap();
+        std::fs::create_dir_all(p.join("dist/sub")).unwrap();
+        std::fs::write(p.join("dist/sub/out.js"), "console.log(1);\n").unwrap();
+        std::fs::create_dir_all(p.join("foo")).unwrap();
+        std::fs::write(p.join("foo/tracked.txt"), "ok\n").unwrap();
+        std::fs::write(p.join("foo/ignored.txt"), "skip\n").unwrap();
+        std::fs::create_dir_all(p.join("bar")).unwrap();
+        std::fs::write(p.join("bar/keep.txt"), "keep\n").unwrap();
+        std::fs::write(p.join("bar/drop.o"), "drop\n").unwrap();
+        std::fs::write(p.join("app.log"), "log\n").unwrap();
+        std::fs::write(p.join("tracked.log"), "tracked\n").unwrap();
+        run(&["add", ".gitignore"]);
+        run(&["add", "-f", "foo/tracked.txt", "tracked.log"]);
+        run(&["commit", "-qm", "init"]);
+
+        let cwd = p.display().to_string();
+        let res = changes_with(&cwd, false, None).unwrap();
+        let files = res["files"].as_array().unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0]["path"], "bar/keep.txt");
+        assert!(res["total"].is_null());
+
+        let ignored: Vec<&str> = res["ignored"].as_array().unwrap().iter().filter_map(|v| v.as_str()).collect();
+        // Whole ignored dir is reported with trailing '/', without descending into it
+        assert!(ignored.contains(&"dist/"), "{ignored:?}");
+        assert!(!ignored.iter().any(|x| x.starts_with("dist/sub")), "{ignored:?}");
+        // Ignored file matching pattern
+        assert!(ignored.contains(&"app.log"), "{ignored:?}");
+        // Force-tracked file matching .gitignore is not reported as ignored
+        assert!(!ignored.contains(&"tracked.log"), "{ignored:?}");
+        // Ignored dir containing a tracked file only marks untracked ignored siblings, not the dir itself
+        assert!(!ignored.contains(&"foo/"), "{ignored:?}");
+        assert!(ignored.contains(&"foo/ignored.txt"), "{ignored:?}");
+        // Negated file is in `files`, while non-negated sibling is in `ignored`
+        assert!(ignored.contains(&"bar/drop.o"), "{ignored:?}");
+        assert!(!ignored.contains(&"bar/keep.txt"), "{ignored:?}");
+
+        // Single-file diff fetch skips ignored collection
+        let one = changes_with(&cwd, true, Some(&["bar/keep.txt".to_string()])).unwrap();
+        assert!(one["ignored"].as_array().unwrap().is_empty());
     }
 }

@@ -128,8 +128,27 @@ interface GitInfo {
   files: Map<string, GitFile>;
   /** Directories containing changes */
   dirs: Set<string>;
+  /** Ignored file paths (norm(absolute path)) from git status --ignored=matching */
+  ignoredFiles: Set<string>;
+  /** Ignored directory paths (norm(absolute path)), plus `<repo>/.git` */
+  ignoredDirs: Set<string>;
   /** Total changed files when yi-agentd returned only the first 10000 */
   total?: number | null;
+}
+
+/** Whether `absPath` (file or directory) is ignored by git or sits inside an ignored directory */
+function isGitIgnored(git: GitInfo | null | undefined, absPath: string): boolean {
+  if (!git || !absPath) return false;
+  const k = norm(absPath);
+  if (git.files.has(k)) return false;
+  if (git.ignoredFiles.has(k) || git.ignoredDirs.has(k)) return true;
+  let i = k.lastIndexOf('/');
+  while (i > 0) {
+    const d = k.slice(0, i);
+    if (git.ignoredDirs.has(d)) return true;
+    i = d.lastIndexOf('/');
+  }
+  return false;
 }
 
 /** Older yi-agentd on Windows returned child paths with a \\?\ prefix (and they got stored in tab records); strip it everywhere */
@@ -370,6 +389,7 @@ function Rows({
         const g = git && !r.isDir ? git.files.get(norm(r.path)) : undefined;
         const mark = g ? gitMark(g.status) : null;
         const dirChanged = !!git && r.isDir && !r.expanded && git.dirs.has(norm(r.path));
+        const ignored = !r.loading && !mark && !dirChanged && isGitIgnored(git, r.path);
         return (
         <div
           key={r.key}
@@ -379,7 +399,7 @@ function Rows({
           data-path={r.path}
           data-key={r.key}
           data-dir={r.isDir ? '1' : undefined}
-          className={`wp-row ${selected === r.path ? 'sel' : ''} ${focused === r.key ? 'kfocus' : ''} ${mark ? mark[1] : ''} ${dirChanged ? 'g-dir' : ''} ${
+          className={`wp-row ${selected === r.path ? 'sel' : ''} ${focused === r.key ? 'kfocus' : ''} ${mark ? mark[1] : ignored ? 'g-ign' : ''} ${dirChanged ? 'g-dir' : ''} ${
             dropDir && r.isDir && r.path === dropDir ? 'drop' : ''
           }`}
           draggable={!r.loading && !!onDragRow}
@@ -395,7 +415,7 @@ function Rows({
               : undefined
           }
           style={{ paddingLeft: 8 + r.depth * 14 }}
-          title={mark ? `${r.path}\n${gitText(mark[0])}` : r.path}
+          title={mark ? `${r.path}\n${gitText(mark[0])}` : ignored ? `${r.path}\n${tx('ignored')}` : r.path}
           onClick={() => (r.isDir ? onToggle(r) : onOpen(r))}
           onContextMenu={onMenu ? (e) => (e.stopPropagation(), onMenu(e, r)) : undefined}
         >
@@ -493,7 +513,7 @@ const SEARCH_LIMIT = 200;
 /** Last git status per host + directory (like VS Code's Source Control view): reopening the panel or switching back to a
  *  session shows it at once and refreshes in the background instead of starting from "Loading changes…".
  *  git: null = not a repo. In memory only */
-const gitCache = new Map<string, { git: GitInfo | null; sig: string }>();
+const gitCache = new Map<string, { git: GitInfo | null; sig: string; ignSig: string }>();
 const gitKey = (hostId: string, cwd: string) => `${hostId}\n${cwd}`;
 /** Root path and top-level listing per host + directory + hidden-files setting. The Changes list and the tree are
  *  both laid out against the root, so without it a remounted panel stays blank until fs.list returns. In memory only */
@@ -665,23 +685,38 @@ export function FilePanel({
   const staleBlobs = useRef<{ key: string; blobs: Record<string, GitBlob | null> }>({ key: '', blobs: {} });
   // Summary of the last git status: periodic refreshes leave the UI alone if nothing changed, so an open diff doesn't flicker
   const gitSig = useRef(gitCache.get(gitKey(hostId, cwd))?.sig ?? '');
+  const gitIgnSig = useRef(gitCache.get(gitKey(hostId, cwd))?.ignSig ?? '');
   /** quiet: background refresh (timer / window refocus); if the status didn't change, just quietly refetch the current file's diff */
   const loadGit = useCallback((quiet = false) => {
     // Without diffs: in a big repo with many changed files, running git diff for each takes ages, so fetch only the file that gets opened
-    rpc<{ repo: string | null; branch?: string; head?: string | null; total?: number | null; files: { path: string; status: string; diff: string; added?: number | null; deleted?: number | null }[] }>(hostId, 'git.changes', { cwd, diff: false })
+    rpc<{
+      repo: string | null;
+      branch?: string;
+      head?: string | null;
+      total?: number | null;
+      files: { path: string; status: string; diff: string; added?: number | null; deleted?: number | null }[];
+      ignored?: string[];
+    }>(hostId, 'git.changes', { cwd, diff: false })
       .then((r) => {
         setGitReady(true);
+        const rawIgnored = r.ignored ?? [];
         const sig = `${r.repo}|${r.branch}|${r.head}|${r.files.map((f) => `${f.status} ${f.path} ${f.added ?? ''}/${f.deleted ?? ''}`).join('|')}`;
-        if (quiet && sig === gitSig.current) return refreshCurDiff.current();
+        const ignSig = rawIgnored.join('\0');
+        const filesChanged = !quiet || sig !== gitSig.current;
+        const ignChanged = !quiet || ignSig !== gitIgnSig.current;
+        if (!filesChanged && !ignChanged) return refreshCurDiff.current();
         gitSig.current = sig;
-        setFileDiffs({});
-        setBlobs((m) => {
-          const key = gitKey(hostId, cwd);
-          staleBlobs.current = { key, blobs: staleBlobs.current.key === key ? { ...staleBlobs.current.blobs, ...m } : m };
-          return {};
-        });
+        gitIgnSig.current = ignSig;
+        if (filesChanged) {
+          setFileDiffs({});
+          setBlobs((m) => {
+            const key = gitKey(hostId, cwd);
+            staleBlobs.current = { key, blobs: staleBlobs.current.key === key ? { ...staleBlobs.current.blobs, ...m } : m };
+            return {};
+          });
+        }
         if (!r.repo) {
-          gitCache.set(gitKey(hostId, cwd), { git: null, sig });
+          gitCache.set(gitKey(hostId, cwd), { git: null, sig, ignSig });
           return setGit(null);
         }
         const files = new Map<string, GitFile>();
@@ -695,9 +730,20 @@ export function FilePanel({
             dirs.add(d);
           }
         }
-        const info = { repo: r.repo, branch: r.branch ?? '', head: r.head, total: r.total, files, dirs };
-        gitCache.set(gitKey(hostId, cwd), { git: info, sig });
+        const ignoredFiles = new Set<string>();
+        const ignoredDirs = new Set<string>([norm(join(r.repo, '.git'))]);
+        const sep = sepOf(r.repo);
+        for (const p of rawIgnored) {
+          const isDir = p.endsWith('/');
+          const relPath = isDir ? p.slice(0, -1) : p;
+          const k = norm(join(r.repo, relPath.split('/').join(sep)));
+          if (isDir) ignoredDirs.add(k);
+          else ignoredFiles.add(k);
+        }
+        const info: GitInfo = { repo: r.repo, branch: r.branch ?? '', head: r.head, total: r.total, files, dirs, ignoredFiles, ignoredDirs };
+        gitCache.set(gitKey(hostId, cwd), { git: info, sig, ignSig });
         setGit(info);
+        if (!filesChanged) refreshCurDiff.current();
       })
       .catch(() => (setGitReady(true), quiet || setGit(null)));
   }, [hostId, cwd]);
@@ -1214,6 +1260,7 @@ export function FilePanel({
       });
       setFile((cur) => (cur && cur.path === f.path ? { ...cur, content: f.draft, modified: r.modified, size: r.size } : cur));
       setSaveState(null);
+      loadGit(true);
       toast(tx('saved', { v: baseName(f.path) }));
     } catch (e) {
       const msg = String((e as Error)?.message ?? e);
@@ -2431,13 +2478,14 @@ export function FilePanel({
                 );
               const g = gitOf(t);
               const mark = g ? gitMark(g.status) : null;
+              const ignored = !mark && isGitIgnored(git, t);
               return (
                 <div
                   key={t}
                   role="tab"
                   aria-selected={cur}
-                  className={`wp-ftab ${cur ? 'active' : ''} ${mark ? mark[1] : ''}`}
-                  title={t}
+                  className={`wp-ftab ${cur ? 'active' : ''} ${mark ? mark[1] : ignored ? 'g-ign' : ''}`}
+                  title={ignored ? `${t}\n${tx('ignored')}` : t}
                   draggable
                   onDragStart={(e) => {
                     e.dataTransfer.setData(DRAG_REF, `@${rel(t)} `);
@@ -2550,7 +2598,7 @@ export function FilePanel({
             file.untitled ? (
               <span className="wp-untitled-title truncate">{nameOf(file.path)}</span>
             ) : (
-              <Breadcrumbs hostId={hostId} root={root ?? cwd} path={file.path} hidden={hidden} onOpen={openFile} dirty={dirty} />
+              <Breadcrumbs hostId={hostId} root={root ?? cwd} path={file.path} hidden={hidden} git={git} onOpen={openFile} dirty={dirty} />
             )
           )}
           <div className="wp-actions">
@@ -2701,6 +2749,7 @@ function Breadcrumbs({
   root,
   path,
   hidden,
+  git,
   dirty,
   onOpen,
 }: {
@@ -2708,6 +2757,7 @@ function Breadcrumbs({
   root: string;
   path: string;
   hidden: boolean;
+  git: GitInfo | null;
   dirty: boolean;
   onOpen: (p: string) => void;
 }) {
@@ -2762,6 +2812,7 @@ function Breadcrumbs({
           hostId={hostId}
           dir={pop.dir}
           hidden={hidden}
+          git={git}
           selected={path}
           x={pop.x}
           y={pop.y}
@@ -2780,6 +2831,7 @@ function DirPopover({
   hostId,
   dir,
   hidden,
+  git,
   selected,
   x,
   y,
@@ -2789,6 +2841,7 @@ function DirPopover({
   hostId: string;
   dir: string;
   hidden: boolean;
+  git: GitInfo | null;
   selected: string;
   x: number;
   y: number;
@@ -2828,6 +2881,7 @@ function DirPopover({
       ) : (
         <Rows
           rows={rows}
+          git={git}
           selected={selected}
           onToggle={(r) => {
             const n = new Set(expanded);

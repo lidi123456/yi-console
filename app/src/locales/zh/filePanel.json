@@ -5,6 +5,7 @@
   "renamed": "改名",
   "modified": "已修改",
   "conflict": "有冲突",
+  "ignored": "Git 已忽略",
   "saving": "正在保存",
   "changedOnDisk": "磁盘内容已变化",
   "saveFailed": "保存失败",
