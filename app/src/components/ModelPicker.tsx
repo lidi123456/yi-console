@@ -398,7 +398,7 @@ export function ModelMenu({
     }
   };
   return (
-    <div className="menu-wrap" ref={wrapRef} onKeyDown={onKeyDown}>
+    <div className="menu-wrap model-menu-wrap" ref={wrapRef} onKeyDown={onKeyDown}>
       <button ref={buttonRef} className="model-btn" title={t('switchModel')} aria-haspopup="dialog" aria-expanded={open}
         onClick={() => { if (open) close(); else { onOpen?.(); setOpen(true); } }}>
         <span className="truncate">{modelLabel(cur, models ?? [])}</span>

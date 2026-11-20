@@ -4301,17 +4301,31 @@ textarea {
   min-width: 0;
 }
 
+.composer-tools > * {
+  flex-shrink: 0;
+}
+
+.composer-tools > .model-menu-wrap {
+  flex: 0 1 auto;
+  min-width: 0;
+}
+
 .composer-tools .send-btn {
   margin-left: 8px;
 }
 
-/* Model picker sits on the right of the input box toolbar */
+/* Model picker sits on the right of the input box toolbar and shrinks first when space is tight */
 .composer-tools .model-btn {
   border: none;
   height: 26px;
   padding: 0 8px;
   border-radius: 7px;
-  max-width: 220px;
+  max-width: min(220px, 100%);
+  min-width: 0;
+}
+
+.composer-tools .model-btn > svg {
+  flex: none;
 }
 
 .menu.menu-up-right {
@@ -4319,17 +4333,9 @@ textarea {
   right: 0;
 }
 
-@media (max-width: 760px) {
-  .composer-tools > div.menu-wrap:last-of-type {
-    margin-left: auto;
-  }
-  .composer-tools .model-btn {
-    max-width: 130px;
-  }
-}
-
 .composer-spacer {
-  margin-left: auto;
+  flex: 1 1 0;
+  min-width: 0;
 }
 
 .tool-chip {
@@ -8132,6 +8138,26 @@ body.resizing .side-resizer::after {
     display: none;
   }
 }
+@container (max-width: 480px) {
+  .composer-tools .add-btn {
+    margin-right: 0;
+  }
+  .composer-tools .perm-btn {
+    padding: 0 5px;
+    gap: 2px;
+  }
+  .composer-tools .model-btn {
+    padding: 0 6px;
+  }
+  .composer-tools .send-btn {
+    margin-left: 4px;
+  }
+}
+@container (max-width: 390px) {
+  .composer-tools .model-effort {
+    display: none;
+  }
+}
 /* With a file open, the tree takes at most 38% of the panel so the editor isn't squeezed too narrow */
 @media (min-width: 761px) {
   .file-panel:not(.browse) .wp-side {
@@ -9138,6 +9164,12 @@ body.resizing .wp-merge-sash {
     padding-right: 28px;
     max-width: calc(768px + 56px);
   }
+  @container (max-width: 480px) {
+    .composer-wrap {
+      padding-left: 14px;
+      padding-right: 14px;
+    }
+  }
 }
 @media (max-width: 760px) {
   .chat {
@@ -10102,6 +10134,7 @@ button.wp-commit-title .chev {
 }
 
 .ns-center {
+  container-type: inline-size;
   width: 100%;
   max-width: 760px;
   /* auto margins center it and still let it scroll from the top when taller than the page */
@@ -10888,7 +10921,6 @@ button.wp-commit-title .chev {
 .mcp-tool-scopes { display: flex; gap: 12px; flex-wrap: wrap; }
 
 @media (max-width: 760px) {
-  .composer-tools:has(.computer-use-bar) .model-btn { max-width: 100px; min-width: 0; }
   /* Full-screen like every other .modal on phones: the desktop width and padding above would leave a strip of the page showing */
   /* The daemon upgrade dialog only shows progress: a centred card, not a blank full-screen page */
   .modal-bg.upgrade-bg {
