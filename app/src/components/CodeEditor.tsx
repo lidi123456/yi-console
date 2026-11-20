@@ -15,12 +15,13 @@ import {
 import { closeBrackets, closeBracketsKeymap } from '@codemirror/autocomplete';
 import { defaultKeymap, history, historyKeymap, indentWithTab } from '@codemirror/commands';
 import { bracketMatching, foldAll, foldGutter, foldKeymap, HighlightStyle, indentOnInput, indentUnit, LanguageDescription, syntaxHighlighting, unfoldAll } from '@codemirror/language';
-import { highlightSelectionMatches, openSearchPanel, searchKeymap } from '@codemirror/search';
+import { highlightSelectionMatches, openSearchPanel, searchPanelOpen } from '@codemirror/search';
 import { languages } from '@codemirror/language-data';
 import { tags as t } from '@lezer/highlight';
 import { detectEol, detectIndent } from '../textFormat';
 import { openMenu, type MenuItem } from './Overlay';
 import { readClipboard, writeClipboard } from '../clipboard';
+import { editorSearchExtension, editorSearchKeymap } from './EditorSearchPanel';
 import { Icon } from './Icon';
 
 const tx = getT('filePanel');
@@ -185,9 +186,9 @@ export function foldMarker(open: boolean) {
 
 export const theme = EditorView.theme({
   // Editor font size and line height are per-device preferences (fontPrefs.ts)
-  '&': { height: '100%', fontSize: 'var(--fs-editor)', backgroundColor: 'var(--bg)', color: 'var(--text)' },
+  '&': { height: '100%', fontSize: 'var(--fs-editor)', backgroundColor: 'var(--bg)', color: 'var(--text)', overflow: 'hidden' },
   '&.cm-focused': { outline: 'none' },
-  '.cm-scroller': { fontFamily: 'var(--font-editor)', lineHeight: 'var(--lh-editor)' },
+  '.cm-scroller': { fontFamily: 'var(--font-editor)', lineHeight: 'var(--lh-editor)', flex: '1 1 0%', minHeight: 0, height: 'auto' },
   '.cm-content': { padding: '4px 0', caretColor: 'var(--text)' },
   '.cm-gutters': { backgroundColor: 'var(--bg)', color: 'var(--text-3)', border: 'none' },
   '.cm-lineNumbers .cm-gutterElement': { padding: '0 4px 0 16px', minWidth: '36px' },
@@ -202,13 +203,14 @@ export const theme = EditorView.theme({
   '&.cm-focused .cm-selectionBackground, .cm-selectionBackground, ::selection': { backgroundColor: 'var(--cm-sel) !important' },
   '.cm-selectionMatch': { backgroundColor: 'var(--cm-match)' },
   '&.cm-focused .cm-matchingBracket': { backgroundColor: 'var(--cm-match)', outline: '1px solid var(--border-2)' },
-  '.cm-searchMatch': { backgroundColor: 'var(--cm-find)' },
-  '.cm-searchMatch.cm-searchMatch-selected': { backgroundColor: 'var(--cm-find-cur)' },
-  '.cm-panels': { backgroundColor: 'var(--bg-2)', color: 'var(--text)', borderColor: 'var(--border)' },
+  '.cm-searchMatch': { backgroundColor: 'var(--cm-find)', borderRadius: '2px' },
+  '.cm-searchMatch.cm-searchMatch-selected': { backgroundColor: 'var(--cm-find-cur)', boxShadow: '0 0 0 1px var(--cm-find-ring)' },
+  // Keep CodeMirror panels/tooltips inside the editor's stacking context (baseTheme sets z-index 300/500, which otherwise escapes above .modal-bg at 50)
+  '.cm-panels': { backgroundColor: 'var(--bg-2)', color: 'var(--text)', borderColor: 'var(--border)', zIndex: 10, flexShrink: 0 },
   '.cm-panels.cm-panels-top': { borderBottom: '1px solid var(--border)' },
-  // The global input { width: 100% } stretches the search box and checkboxes to a full row (pushing checkboxes away from their labels); size them to content here
-  '.cm-panel.cm-search': { padding: '6px 30px 6px 10px', fontSize: '12px', lineHeight: '28px' },
-  '.cm-panel.cm-search input, .cm-panel.cm-search button': { fontSize: '12px' },
+  '.cm-panels.cm-panels-bottom': { borderTop: '1px solid var(--border)' },
+  '.cm-tooltip': { zIndex: 20 },
+  // Compact inputs/buttons for CodeMirror built-in dialogs such as Go to line (Mod-Alt-g)
   '.cm-textfield': {
     width: 'min(220px, 100%)',
     height: '26px',
@@ -230,19 +232,6 @@ export const theme = EditorView.theme({
     lineHeight: '24px',
   },
   '.cm-button:hover': { backgroundColor: 'var(--bg-3)' },
-  '.cm-panel.cm-search label': {
-    display: 'inline-flex',
-    alignItems: 'center',
-    gap: '4px',
-    margin: '2px 10px 2px 0',
-    fontSize: '12px',
-    color: 'var(--text-2)',
-    whiteSpace: 'nowrap',
-    verticalAlign: 'middle',
-    cursor: 'pointer',
-  },
-  '.cm-panel.cm-search input[type=checkbox]': { width: 'auto', height: 'auto', margin: 0, padding: 0, boxShadow: 'none' },
-  '.cm-panel.cm-search [name=close]': { top: '6px', right: '8px', fontSize: '16px', color: 'var(--text-3)', cursor: 'pointer' },
 });
 
 export function searchPhrases() {
@@ -320,6 +309,11 @@ export function CodeEditor({
       setSelChip(null);
       return;
     }
+    // Keep the floating "+ Add to chat" chip out of the way while stepping through search matches
+    if (searchPanelOpen(v.state) && document.activeElement?.closest('.ed-find')) {
+      setSelChip(null);
+      return;
+    }
     setSelChip(measureSelectionChip(v, box));
   };
 
@@ -367,10 +361,11 @@ export function CodeEditor({
             ...closeBracketsKeymap,
             ...defaultKeymap,
             ...historyKeymap,
-            ...searchKeymap,
+            ...editorSearchKeymap,
             ...foldKeymap,
             indentWithTab,
           ]),
+          editorSearchExtension(),
           EditorState.tabSize.of(ind.tabSize),
           indentUnit.of(ind.unit),
           c.phrases.of(searchPhrases()),
@@ -380,6 +375,10 @@ export function CodeEditor({
           c.wrap.of(wrap ? EditorView.lineWrapping : []),
           EditorView.updateListener.of((u) => {
             if (u.docChanged) cb.current.onChange(u.state.doc.sliceString(0, u.state.doc.length, eol));
+            if (u.transactions.some((tr) => tr.isUserEvent('select.search'))) {
+              setSelChip(null);
+              return;
+            }
             if (u.selectionSet || u.docChanged || u.geometryChanged) requestAnimationFrame(syncChip);
           }),
         ],
@@ -454,12 +453,14 @@ export function CodeEditor({
       className="wp-code-wrap"
       ref={wrapRef}
       onPointerDown={(e) => {
-        if (e.button === 0 && !(e.target as Element | null)?.closest('.cm-sel-act')) {
+        if (e.button === 0 && !(e.target as Element | null)?.closest('.cm-sel-act, .ed-find')) {
           dragging.current = true;
           setSelChip(null);
         }
       }}
-      onContextMenu={(e) => view.current && menu && openEditorContextMenu(e, view.current, menu)}
+      onContextMenu={(e) =>
+        view.current && menu && !(e.target as Element | null)?.closest('.cm-panels') && openEditorContextMenu(e, view.current, menu)
+      }
     >
       <div className="wp-code" ref={host} />
       {selChip && onAddSelection && (

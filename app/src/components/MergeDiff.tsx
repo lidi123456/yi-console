@@ -20,7 +20,7 @@ import {
 import { closeBrackets, closeBracketsKeymap } from '@codemirror/autocomplete';
 import { defaultKeymap, history, historyKeymap, indentWithTab } from '@codemirror/commands';
 import { bracketMatching, foldGutter, foldKeymap, indentOnInput, indentUnit, LanguageDescription, syntaxHighlighting } from '@codemirror/language';
-import { highlightSelectionMatches, searchKeymap } from '@codemirror/search';
+import { highlightSelectionMatches, searchPanelOpen } from '@codemirror/search';
 import { languages } from '@codemirror/language-data';
 import { Chunk, getChunks, getOriginalDoc, goToNextChunk, goToPreviousChunk, MergeView, originalDocChangeEffect, unifiedMergeView } from '@codemirror/merge';
 import { getT, isEn, useLang } from '../i18n';
@@ -36,6 +36,7 @@ import {
   type EditorMenuCtx,
   type GotoTarget,
 } from './CodeEditor';
+import { editorSearchExtension, editorSearchKeymap } from './EditorSearchPanel';
 import { Icon } from './Icon';
 import type { MenuItem } from './Overlay';
 
@@ -520,6 +521,10 @@ export const MergeDiff = forwardRef<
       setSelChip(null);
       return;
     }
+    if (searchPanelOpen(cur.view.state) && document.activeElement?.closest('.ed-find')) {
+      setSelChip(null);
+      return;
+    }
     const pos = measureSelectionChip(cur.view, el);
     setSelChip(pos ? { ...pos, side: cur.side } : null);
   };
@@ -657,8 +662,9 @@ export const MergeDiff = forwardRef<
       keymap.of([
         ...commonKeys,
         ...(editableSide ? [...closeBracketsKeymap, ...defaultKeymap, ...historyKeymap, ...foldKeymap, indentWithTab] : defaultKeymap),
-        ...searchKeymap,
+        ...editorSearchKeymap,
       ]),
+      editorSearchExtension(),
       EditorState.tabSize.of(ind.tabSize),
       indentUnit.of(ind.unit),
       editableSide ? roComp.current.of([EditorState.readOnly.of(readOnly), EditorView.editable.of(!readOnly)]) : EditorState.readOnly.of(true),
@@ -671,6 +677,10 @@ export const MergeDiff = forwardRef<
       EditorView.updateListener.of((u) => {
         if (editableSide && u.docChanged && cb.current.onChange) {
           cb.current.onChange(u.state.doc.sliceString(0, u.state.doc.length, eol));
+        }
+        if (u.transactions.some((tr) => tr.isUserEvent('select.search'))) {
+          setSelChip(null);
+          return;
         }
         if (u.selectionSet && !u.state.selection.main.empty) activeSelSide.current = selSide;
         if (u.selectionSet || u.docChanged || u.geometryChanged) requestAnimationFrame(syncSelChip);
@@ -783,7 +793,7 @@ export const MergeDiff = forwardRef<
   /** Locate the diff chunk under the pointer and place the hunk action bar at its top-right */
   const onPointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
     if (!onAddContext && !onCopyHunk) return;
-    if ((e.target as Element | null)?.closest('.wp-hunk-bar, .cm-sel-act, .wp-merge-sash')) return;
+    if ((e.target as Element | null)?.closest('.wp-hunk-bar, .cm-sel-act, .wp-merge-sash, .ed-find')) return;
     const el = box.current;
     const l = live.current;
     if (!el || !l) return;
@@ -889,6 +899,7 @@ export const MergeDiff = forwardRef<
   const onContextMenu = (e: React.MouseEvent) => {
     const l = live.current;
     if (!l || !menu) return;
+    if ((e.target as Element | null)?.closest('.cm-panels')) return;
     const v =
       l.kind === 'split'
         ? e.clientX < l.a.scrollDOM.getBoundingClientRect().right
@@ -917,7 +928,7 @@ export const MergeDiff = forwardRef<
       onPointerMove={onPointerMove}
       onPointerLeave={() => setHoveredHunk(null)}
       onPointerDown={(e) => {
-        if (e.button === 0 && !(e.target as Element | null)?.closest('.cm-sel-act, .wp-hunk-bar, .wp-merge-sash')) {
+        if (e.button === 0 && !(e.target as Element | null)?.closest('.cm-sel-act, .wp-hunk-bar, .wp-merge-sash, .ed-find')) {
           dragging.current = true;
           setSelChip(null);
         }

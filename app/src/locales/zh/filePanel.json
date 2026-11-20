@@ -170,5 +170,19 @@
   "addDiffHunkToChat": "将这一处改动添加到对话",
   "copyDiffHunk": "复制这一处 diff",
   "diffCopied": "已复制 diff 片段",
-  "folderIsOutsideTheWorkspace": "这个文件夹不在当前工作目录里：{{v}}"
+  "folderIsOutsideTheWorkspace": "这个文件夹不在当前工作目录里：{{v}}",
+  "replaceWith": "替换为…",
+  "replace": "替换",
+  "replaceAll": "全部替换",
+  "toggleReplace": "展开替换",
+  "hideReplace": "收起替换",
+  "matchCase": "区分大小写",
+  "matchWholeWord": "全词匹配",
+  "useRegularExpression": "使用正则表达式",
+  "previousMatch": "上一个匹配",
+  "nextMatch": "下一个匹配",
+  "noResults": "无结果",
+  "invalidRegex": "正则无效",
+  "matchCount": "{{current}} / {{total}}",
+  "matchTotalOnly": "{{total}} 项"
 }

@@ -5754,6 +5754,14 @@ button.md-rimg-ph:hover {
   --cm-match: rgba(84, 145, 255, 0.12);
   --cm-find: rgba(255, 200, 0, 0.3);
   --cm-find-cur: rgba(255, 150, 0, 0.45);
+  --cm-find-ring: rgba(217, 119, 6, 0.55);
+  --ed-find-bg: rgba(255, 255, 255, 0.96);
+  --ed-find-field: #f6f8fa;
+  --ed-find-field-focus: #ffffff;
+  --ed-find-opt-bg: #e5eefb;
+  --ed-find-opt-fg: #0969da;
+  --ed-find-opt-ring: rgba(9, 105, 218, 0.32);
+  --ed-find-shadow: 0 8px 24px rgba(31, 35, 40, 0.13), 0 1px 3px rgba(31, 35, 40, 0.06);
   width: var(--panel-w, 640px);
   max-width: calc(100% - 360px);
   flex: none;
@@ -5781,6 +5789,14 @@ button.md-rimg-ph:hover {
     --cm-match: rgba(173, 214, 255, 0.15);
     --cm-find: rgba(234, 92, 0, 0.33);
     --cm-find-cur: #9e6a03;
+    --cm-find-ring: rgba(245, 158, 11, 0.65);
+    --ed-find-bg: rgba(34, 34, 36, 0.95);
+    --ed-find-field: #161618;
+    --ed-find-field-focus: #141416;
+    --ed-find-opt-bg: rgba(68, 147, 248, 0.18);
+    --ed-find-opt-fg: #79c0ff;
+    --ed-find-opt-ring: rgba(68, 147, 248, 0.4);
+    --ed-find-shadow: 0 10px 28px rgba(0, 0, 0, 0.52), 0 0 0 1px rgba(255, 255, 255, 0.05);
   }
 }
 
@@ -5799,6 +5815,14 @@ button.md-rimg-ph:hover {
   --cm-match: rgba(173, 214, 255, 0.15);
   --cm-find: rgba(234, 92, 0, 0.33);
   --cm-find-cur: #9e6a03;
+  --cm-find-ring: rgba(245, 158, 11, 0.65);
+  --ed-find-bg: rgba(34, 34, 36, 0.95);
+  --ed-find-field: #161618;
+  --ed-find-field-focus: #141416;
+  --ed-find-opt-bg: rgba(68, 147, 248, 0.18);
+  --ed-find-opt-fg: #79c0ff;
+  --ed-find-opt-ring: rgba(68, 147, 248, 0.4);
+  --ed-find-shadow: 0 10px 28px rgba(0, 0, 0, 0.52), 0 0 0 1px rgba(255, 255, 255, 0.05);
 }
 
 /* Full screen: covers the chat area */
@@ -5996,11 +6020,14 @@ button.wp-crumb:hover {
   position: relative;
   display: flex;
   flex-direction: column;
+  /* Isolate CodeMirror's internal z-index layers (.cm-panels, .cm-tooltip) from page modals and overlays */
+  isolation: isolate;
 }
 
 .wp-code {
   flex: 1;
   min-height: 0;
+  overflow: hidden;
 }
 
 .wp-code .cm-editor {
@@ -8418,6 +8445,7 @@ body.resizing .side-resizer::after {
 }
 .wp-merge {
   position: relative;
+  isolation: isolate;
 }
 .wp-merge-host {
   height: 100%;
@@ -8450,11 +8478,13 @@ body.resizing .wp-merge-sash {
 .wp-merge.wp-merge-split .cm-mergeViewEditor {
   min-width: 0;
 }
-.wp-merge.wp-merge-split .cm-mergeView .cm-editor,
-.wp-merge.wp-merge-split .cm-mergeView .cm-scroller {
+.wp-merge.wp-merge-split .cm-mergeView .cm-editor {
   height: 100% !important;
 }
 .wp-merge.wp-merge-split .cm-mergeView .cm-scroller {
+  flex: 1 1 0% !important;
+  min-height: 0 !important;
+  height: auto !important;
   overflow: auto !important;
 }
 .wp-merge-split .cm-mergeViewEditor + .cm-mergeViewEditor {
@@ -8531,6 +8561,250 @@ body.resizing .wp-merge-sash {
   font-size: 10.5px;
   font-weight: 400;
   color: var(--text-3);
+}
+
+/* Floating top-right Find & Replace panel inside CodeMirror editors (EditorSearchPanel.ts) */
+.cm-editor .cm-panels.cm-panels-top:has(> .cm-search-host) {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  background: transparent;
+  border-bottom: none;
+  pointer-events: none;
+}
+.cm-panel.cm-search-host {
+  display: flex;
+  justify-content: flex-end;
+  padding: 8px 12px 0;
+  background: transparent;
+  pointer-events: none;
+}
+.ed-find {
+  pointer-events: auto;
+  display: flex;
+  align-items: stretch;
+  gap: 4px;
+  padding: 6px 6px 6px 4px;
+  border-radius: 10px;
+  background: var(--ed-find-bg, var(--panel));
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  border: 1px solid var(--border-2);
+  box-shadow: var(--ed-find-shadow, var(--shadow));
+  font-family: var(--font);
+  font-size: 12.5px;
+  color: var(--text);
+  max-width: 100%;
+}
+.ed-find.readonly {
+  padding-left: 6px;
+}
+.ed-find-toggle {
+  flex: none;
+  width: 20px;
+  padding: 0;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-2);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+}
+.ed-find-toggle[hidden] {
+  display: none;
+}
+.ed-find-toggle:hover {
+  background: var(--bg-3);
+  color: var(--text);
+}
+.ed-find-chev {
+  display: inline-flex;
+  transition: transform 0.14s ease;
+}
+.ed-find-chev.open {
+  transform: rotate(90deg);
+}
+.ed-find-grid {
+  flex: 1;
+  display: grid;
+  grid-template-columns: minmax(112px, 268px) auto;
+  gap: 5px 4px;
+  align-items: center;
+  min-width: 0;
+}
+.ed-find-field {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  height: 28px;
+  padding: 0 4px 0 9px;
+  border-radius: 7px;
+  background: var(--ed-find-field, var(--bg-2));
+  border: 1px solid var(--border-2);
+  min-width: 0;
+  transition: border-color 0.12s ease, box-shadow 0.12s ease, background-color 0.12s ease;
+}
+.ed-find-field:focus-within {
+  background: var(--ed-find-field-focus, var(--bg));
+  border-color: var(--text-2);
+  box-shadow: 0 0 0 2.5px var(--focus);
+}
+.ed-find-field.error,
+.ed-find-field.error:focus-within {
+  border-color: var(--err);
+  box-shadow: 0 0 0 2.5px rgba(207, 34, 46, 0.14);
+}
+.ed-find .ed-find-input {
+  flex: 1;
+  min-width: 0;
+  width: auto;
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  border: none;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+  outline: none;
+  font-family: var(--font);
+  font-size: 12.5px;
+  line-height: 26px;
+  color: var(--text);
+}
+.ed-find .ed-find-input::placeholder {
+  color: var(--text-3);
+}
+.ed-opt {
+  flex: none;
+  height: 20px;
+  min-width: 22px;
+  padding: 0 4px;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 20px;
+  color: var(--text-3);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+}
+.ed-opt:hover {
+  background: var(--bg-3);
+  color: var(--text);
+}
+.ed-opt.on {
+  background: var(--ed-find-opt-bg, var(--accent-soft));
+  color: var(--ed-find-opt-fg, var(--link));
+  box-shadow: inset 0 0 0 1px var(--ed-find-opt-ring, var(--border-2));
+  font-weight: 600;
+}
+.ed-find-acts {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  flex: none;
+}
+.ed-rep-acts {
+  gap: 4px;
+  justify-content: flex-end;
+}
+.ed-rep-cell[hidden] {
+  display: none;
+}
+.ed-count {
+  min-width: 42px;
+  padding: 0 4px;
+  text-align: center;
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-2);
+  white-space: nowrap;
+}
+.ed-count:empty {
+  min-width: 4px;
+  padding: 0;
+}
+.ed-count.empty {
+  color: var(--err);
+  font-weight: 500;
+}
+.ed-sep {
+  width: 1px;
+  height: 16px;
+  background: var(--border);
+  margin: 0 2px;
+  flex: none;
+}
+.ed-ibtn {
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-2);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  cursor: pointer;
+}
+.ed-ibtn:hover:not(:disabled) {
+  background: var(--bg-3);
+  color: var(--text);
+}
+.ed-ibtn:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+.ed-rbtn {
+  height: 26px;
+  padding: 0 8px;
+  border-radius: 6px;
+  font-family: var(--font);
+  font-size: 11.5px;
+  font-weight: 500;
+  color: var(--text);
+  background: var(--bg-2);
+  border: 1px solid var(--border-2);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.ed-rbtn:hover:not(:disabled) {
+  background: var(--bg-3);
+}
+.ed-rbtn.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--bg);
+}
+.ed-rbtn.primary:hover:not(:disabled) {
+  opacity: 0.9;
+}
+.ed-rbtn:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+@media (hover: none) {
+  .ed-find-field {
+    height: 32px;
+  }
+  .ed-ibtn {
+    width: 28px;
+    height: 28px;
+  }
+  .ed-rbtn {
+    height: 30px;
+  }
 }
 .pd-hunk {
   align-items: center;

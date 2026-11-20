@@ -170,5 +170,19 @@
   "addDiffHunkToChat": "Add this diff hunk to chat",
   "copyDiffHunk": "Copy this diff hunk",
   "diffCopied": "Diff hunk copied",
-  "folderIsOutsideTheWorkspace": "This folder is outside the workspace: {{v}}"
+  "folderIsOutsideTheWorkspace": "This folder is outside the workspace: {{v}}",
+  "replaceWith": "Replace…",
+  "replace": "Replace",
+  "replaceAll": "Replace all",
+  "toggleReplace": "Toggle replace",
+  "hideReplace": "Hide replace",
+  "matchCase": "Match case",
+  "matchWholeWord": "Match whole word",
+  "useRegularExpression": "Use regular expression",
+  "previousMatch": "Previous match",
+  "nextMatch": "Next match",
+  "noResults": "No results",
+  "invalidRegex": "Invalid regex",
+  "matchCount": "{{current}} / {{total}}",
+  "matchTotalOnly": "{{total}} found"
 }
