@@ -338,6 +338,8 @@ export function sessionMenu(
     style?: 'modern' | 'claude';
     onToggleStyle?: () => void;
     onPromptOutline?: () => void;
+    outlineActive?: boolean;
+    promptCount?: number;
     /** On mobile the bottom terminal panel toggle lives in the menu (its top-bar spot is taken by usage) */
     term?: boolean;
     onToggleTerm?: () => void;
@@ -409,7 +411,17 @@ export function sessionMenu(
     // The mobile top bar already has a usage button, so don't repeat it in the menu; the terminal panel is the reverse and only appears in the mobile menu
     ...(opts.onUsage && info.tool !== 'shell' && !mobile ? [{ label: tx('viewUsage'), icon: 'chart', run: opts.onUsage }] : []),
     ...(opts.onMemory && info.tool !== 'shell' && info.mode === 'structured' ? [{ label: tx('memory'), icon: 'book', run: opts.onMemory }] : []),
-    ...(opts.onPromptOutline && info.tool !== 'shell' && info.mode === 'structured' ? [{ label: tx('promptOutline'), icon: 'list', run: opts.onPromptOutline }] : []),
+    ...(opts.onPromptOutline && info.tool !== 'shell' && info.mode === 'structured'
+      ? [
+          {
+            label: tx('promptOutline'),
+            icon: 'list',
+            active: opts.outlineActive,
+            hint: opts.promptCount ? String(opts.promptCount) : undefined,
+            run: opts.onPromptOutline,
+          },
+        ]
+      : []),
     ...(opts.onToggleTerm && info.tool !== 'shell' && mobile
       ? [{ label: opts.term ? tx('hideTerminalPanel') : tx('openTerminalPanel'), icon: 'terminal', run: opts.onToggleTerm }]
       : []),

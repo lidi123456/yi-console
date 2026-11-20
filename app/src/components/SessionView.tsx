@@ -566,42 +566,6 @@ export function SessionView({ hostId, sessionId, seq }: { hostId: string; sessio
             </span>
           </button>
         )}
-        {info.mode === 'structured' && info.tool !== 'shell' && !filesOnly && (
-          <button
-            className="icon-btn hide-mobile"
-            title={
-              style === 'modern'
-                ? t('replyStyleMinimalGroupedThinking')
-                : t('replyStyleClaudeCodeTimeline')
-            }
-            onClick={() => setChatStyle(style === 'modern' ? 'claude' : 'modern')}
-          >
-            <Icon name={style === 'modern' ? 'rows' : 'outline'} size={16} />
-          </button>
-        )}
-        {info.mode === 'structured' && info.tool !== 'shell' && !filesOnly && (
-          <button
-            className="icon-btn hide-mobile"
-            title={t('memory')}
-            aria-label={t('memory')}
-            onClick={() => setMemoryOpen(true)}
-          >
-            <Icon name="book" size={16} />
-          </button>
-        )}
-        {isChatMode && (
-          <button
-            type="button"
-            data-outline-trigger="1"
-            className={`icon-btn ${outlineActive ? 'active' : ''}`}
-            title={prompts.length > 0 ? t('promptOutlineCount', { count: prompts.length }) : t('promptOutline')}
-            aria-label={t('promptOutline')}
-            aria-expanded={outlineActive}
-            onClick={toggleOutlineBtn}
-          >
-            <Icon name="list" size={17} />
-          </button>
-        )}
         <button className="icon-btn" title={t('viewChanges')} aria-label={t('viewChanges')} onClick={() => showChanges(hostId, sessionId)}>
           <Icon name="diff" size={17} />
         </button>
@@ -639,6 +603,8 @@ export function SessionView({ hostId, sessionId, seq }: { hostId: string; sessio
                 onUsage: () => setUsage(true),
                 onMemory: () => setMemoryOpen(true),
                 onPromptOutline: isChatMode ? toggleOutlineBtn : undefined,
+                outlineActive,
+                promptCount: prompts.length,
                 term,
                 onToggleTerm: toggleTerm,
                 style,

@@ -12,8 +12,6 @@
   "switching": "切换中…",
   "chatMode": "对话模式",
   "terminalMode": "终端模式",
-  "replyStyleMinimalGroupedThinking": "回复显示风格：简约（思考和工具调用收成一组）。点击切换到 Claude Code 时间线",
-  "replyStyleClaudeCodeTimeline": "回复显示风格：Claude Code 时间线。点击切换到简约",
   "viewChanges": "查看改动",
   "workspaceFiles": "工作目录文件",
   "hideTerminal": "收起终端",
@@ -29,8 +27,5 @@
   "switchAccountTitle": "在当前会话原地切换账号或管理账号",
   "defaultAccount": "默认账号",
   "manageAccounts": "管理账号…",
-  "switchedAccount": "已将当前会话切换至「{{label}}」",
-  "memory": "查看或编辑本会话的个人长期记忆",
-  "promptOutline": "提问目录",
-  "promptOutlineCount": "提问目录 ({{count}})"
+  "switchedAccount": "已将当前会话切换至「{{label}}」"
 }

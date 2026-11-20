@@ -38,4 +38,4 @@ Host-scoped personal long-term memory shared across all 7 structured AI tools (C
 - UI:
   - `MemoryView.tsx`: host-level manager (Global + Projects sidebar, pending queue, search, editor modal, L0 prompt preview, move/split, rebind moved repo, and read-only importer scanning `.kiro/steering`, `.agents/rules`, `GEMINI.md`, `CLAUDE.local.md`, `.cursor/rules`, `.codebuddy/rules`, `~/.claude/projects/*/memory`, `~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`, `~/.gemini/GEMINI.md`, `~/.codebuddy/CODEBUDDY.md`), plus `SessionMemoryDrawer` opened from structured sessions.
   - `ChatView.tsx`: renders `EventBody::Memory` timeline cards with Edit / Undo (direct) or Confirm / Edit & Confirm / Dismiss (confirm), and gives `yi_memory` tool calls localized labels.
-  - Entry points: host row menu (`Sidebar.tsx`), Command Palette (`Palette.tsx`), host settings `MemoryCard` (`SettingsView.tsx`), and structured session header / menu (`SessionView.tsx`, `SessionActions.ts`).
+  - Entry points: host row menu (`Sidebar.tsx`), Command Palette (`Palette.tsx`), host settings `MemoryCard` (`SettingsView.tsx`), and structured session "More" menu (`SessionView.tsx`, `SessionActions.ts`).

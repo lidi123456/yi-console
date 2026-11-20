@@ -12,8 +12,6 @@
   "switching": "Switching…",
   "chatMode": "Chat Mode",
   "terminalMode": "Terminal Mode",
-  "replyStyleMinimalGroupedThinking": "Reply style: Minimal (grouped thinking & tool calls). Click to switch to Claude Code timeline",
-  "replyStyleClaudeCodeTimeline": "Reply style: Claude Code timeline. Click to switch to Minimal",
   "viewChanges": "View Changes",
   "workspaceFiles": "Workspace Files",
   "hideTerminal": "Hide Terminal",
@@ -29,8 +27,5 @@
   "switchAccountTitle": "Switch or manage account in this session",
   "defaultAccount": "Default Account",
   "manageAccounts": "Manage Accounts…",
-  "switchedAccount": "Switched this session to \"{{label}}\"",
-  "memory": "View or edit personal long-term memories for this session",
-  "promptOutline": "Prompt Outline",
-  "promptOutlineCount": "Prompt Outline ({{count}})"
+  "switchedAccount": "Switched this session to \"{{label}}\""
 }
