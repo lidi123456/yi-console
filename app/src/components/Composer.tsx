@@ -889,7 +889,7 @@ export function Composer({
               }
             }}
             onKeyDown={onKeyDown}
-            style={{ height: isMobile() && mobH ? mobH : Math.min(200, 22 + text.split('\n').length * 20) }}
+            style={{ height: isMobile() && mobH ? mobH : Math.min(200, 18 + text.split('\n').length * 22) }}
           />
         </div>
         <div className="composer-tools">

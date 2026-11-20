@@ -12,7 +12,7 @@ import { TOOL_LABEL, type FileDiff, type HubEvent, type ImageRef, type MemoryEnt
 import { clock, fmtTokens, isMobile, lsGet, lsSet } from '../util';
 import { writeClipboard } from '../clipboard';
 import { errorToast, navigate, toast, useStore } from '../store';
-import { handoffSession } from './SessionActions';
+import { handoffSession, showChanges } from './SessionActions';
 import { MemoryEditorModal, type MemoryEditorInit } from './MemoryView';
 import { DiffView, diffLines } from './DiffView';
 import { openImage } from './Lightbox';
@@ -71,6 +71,7 @@ type Item =
       ts: number;
       usage: Usage | null;
       tools: number;
+      diffStat?: { files: number; add: number; del: number };
       model?: string | null;
       reason?: string;
       text: string;
@@ -148,6 +149,7 @@ function buildItems(events: HubEvent[], hideCompactCmd = false): Item[] {
   let turnStart: number | null = null;
   let turnUsage: Usage | null = null;
   let turnTools = 0;
+  let turnToolItems: (Item & { k: 'tool' })[] = [];
   let turnTexts: string[] = [];
   let exitNote: Extract<Item, { k: 'note' }> | null = null;
   let openAsk: AsyncAsk | null = null;
@@ -248,6 +250,7 @@ function buildItems(events: HubEvent[], hideCompactCmd = false): Item[] {
           tools.set(e.id, it);
           items.push(it);
           turnTools++;
+          turnToolItems.push(it);
           const early = earlyRuns.findIndex((r) => desktopTools.get(r.actionId) === undefined && isDesktopTool(it, r));
           if (early >= 0) {
             it.desktop = earlyRuns[early];
@@ -367,7 +370,20 @@ function buildItems(events: HubEvent[], hideCompactCmd = false): Item[] {
         t.credits += u.credits;
         break;
       }
-      case 'turn_end':
+      case 'turn_end': {
+        const diffFiles = new Set<string>();
+        let diffAdd = 0;
+        let diffDel = 0;
+        for (const ti of turnToolItems) {
+          for (const d of ti.diffs) {
+            if (d.path) diffFiles.add(d.path);
+            const ls = diffLines(d);
+            for (const l of ls) {
+              if (l.t === 'add') diffAdd++;
+              else if (l.t === 'del') diffDel++;
+            }
+          }
+        }
         items.push({
           k: 'turn',
           key,
@@ -375,6 +391,7 @@ function buildItems(events: HubEvent[], hideCompactCmd = false): Item[] {
           ts: e.ts,
           usage: turnUsage,
           tools: turnTools,
+          diffStat: diffFiles.size > 0 ? { files: diffFiles.size, add: diffAdd, del: diffDel } : undefined,
           model: e.model,
           reason: e.stopReason && !NORMAL_END.includes(e.stopReason) ? reasonText(e.stopReason) : undefined,
           text: turnTexts.join('\n\n'),
@@ -382,8 +399,10 @@ function buildItems(events: HubEvent[], hideCompactCmd = false): Item[] {
         turnStart = null;
         turnUsage = null;
         turnTools = 0;
+        turnToolItems = [];
         turnTexts = [];
         break;
+      }
     }
   }
   return items;
@@ -1731,6 +1750,7 @@ function ActGroup({
   liveThought?: string;
   cwd?: string;
 }) {
+  useLang();
   const [toggled, setToggled] = useState<boolean | null>(null);
   const open = toggled ?? running;
   const tools = items.filter((x): x is Item & { k: 'tool' } => x.k === 'tool');
@@ -1838,59 +1858,92 @@ function fullTime(ms: number) {
   return `${t.getFullYear()}-${p(t.getMonth() + 1)}-${p(t.getDate())} ${p(t.getHours())}:${p(t.getMinutes())}`;
 }
 
-/** Compact-style action row under each reply: copy, mobile select-text, duration and usage; the time shows on hover */
+/** Compact-style action row under each reply: turn diff summary pill on the left, quiet duration/cost/copy on the right; detailed tokens live in the tooltip */
 function ModernTurnFooter({
   it,
   latest,
+  hostId,
+  sessionId,
   onSelectText,
 }: {
   it: Item & { k: 'turn' };
   latest: boolean;
+  hostId?: string;
+  sessionId?: string;
   onSelectText?: (text: string) => void;
 }) {
+  useLang();
   const u = it.usage;
   const parts: string[] = [];
   if (it.ms != null && it.ms >= 0) parts.push(`${t('took')} ${fmtDur(it.ms)}`);
   if (u) {
-    if (u.inputTokens || u.cacheReadTokens || u.cacheWriteTokens) parts.push(`${t('in')} ${fmtTokens(u.inputTokens + u.cacheReadTokens + u.cacheWriteTokens)}`);
-    if (u.outputTokens) parts.push(`${t('out')} ${fmtTokens(u.outputTokens)}`);
     if (u.costUsd) parts.push(`$${u.costUsd.toFixed(u.costUsd < 1 ? 3 : 2)}`);
     if (u.credits) parts.push(`${u.credits.toFixed(2)} credits`);
   }
-  if (it.model) parts.push(it.model);
-  const tip = u
-    ? t('inputCacheReadCacheWrite', { inputTokens: u.inputTokens, cacheReadTokens: u.cacheReadTokens, cacheWriteTokens: u.cacheWriteTokens, outputTokens: u.outputTokens })
-    : '';
+  const tipLines: string[] = [];
+  if (u) {
+    tipLines.push(
+      t('inputCacheReadCacheWrite', {
+        inputTokens: u.inputTokens,
+        cacheReadTokens: u.cacheReadTokens,
+        cacheWriteTokens: u.cacheWriteTokens,
+        outputTokens: u.outputTokens,
+      }),
+    );
+  }
+  if (it.model) tipLines.push(it.model);
+  tipLines.push(fullTime(it.ts));
+  const tip = tipLines.join('\n');
+  const ds = it.diffStat;
   return (
-    <div className={`m-actions ${latest ? 'latest' : ''}`}>
-      {it.reason && <span className="attn-text">{it.reason}</span>}
-      {it.text && (
-        <>
-          <button
-            className="m-act-btn"
-            title={t('copyThisReply')}
-            aria-label={t('copyThisReply')}
-            onClick={async () => toast((await writeClipboard(it.text)) ? t('copied') : t('copyFailed'))}
-          >
-            <Icon name="copy" size={14} />
-          </button>
-          {onSelectText && (
-            <button
-              type="button"
-              className="m-act-btn mobile-select-btn"
-              title={t('selectText')}
-              aria-label={t('selectText')}
-              onClick={() => onSelectText(it.text)}
-            >
-              <Icon name="text" size={14} />
-            </button>
-          )}
-        </>
+    <div className={`m-actions ${latest ? 'latest' : ''} ${ds ? 'has-diff' : ''}`}>
+      {ds && (
+        <button
+          type="button"
+          className="m-diff-pill"
+          title={t('viewTurnChanges')}
+          onClick={() => {
+            if (hostId && sessionId) showChanges(hostId, sessionId);
+          }}
+        >
+          <Icon name="diff" size={12} />
+          <span>{t('turnChangedFiles', { count: ds.files })}</span>
+          {ds.add > 0 && <span className="add mono">+{ds.add}</span>}
+          {ds.del > 0 && <span className="del mono">-{ds.del}</span>}
+        </button>
       )}
-      <span className="m-act-meta" title={tip}>
-        {parts.join(' · ')}
-      </span>
-      <span className="m-act-time">{fullTime(it.ts)}</span>
+      {it.reason && <span className="attn-text">{it.reason}</span>}
+      <div className="m-act-right">
+        <span className="m-act-time">{fullTime(it.ts)}</span>
+        {parts.length > 0 && (
+          <span className="m-act-meta" title={tip}>
+            {parts.join(' · ')}
+          </span>
+        )}
+        {it.text && (
+          <>
+            <button
+              className="m-act-btn"
+              title={t('copyThisReply')}
+              aria-label={t('copyThisReply')}
+              onClick={async () => toast((await writeClipboard(it.text)) ? t('copied') : t('copyFailed'))}
+            >
+              <Icon name="copy" size={14} />
+            </button>
+            {onSelectText && (
+              <button
+                type="button"
+                className="m-act-btn mobile-select-btn"
+                title={t('selectText')}
+                aria-label={t('selectText')}
+                onClick={() => onSelectText(it.text)}
+              >
+                <Icon name="text" size={14} />
+              </button>
+            )}
+          </>
+        )}
+      </div>
     </div>
   );
 }
@@ -2357,7 +2410,7 @@ export function ChatView({
               return <Plan key={it.key} plan={it.plan} busy={!!busy} />;
             case 'turn':
               return modern ? (
-                <ModernTurnFooter key={it.key} it={it} latest={it.key === lastTurnKey} onSelectText={setSelectingText} />
+                <ModernTurnFooter key={it.key} it={it} latest={it.key === lastTurnKey} hostId={hostId} sessionId={info?.id} onSelectText={setSelectingText} />
               ) : (
                 <TurnFooter key={it.key} it={it} onSelectText={setSelectingText} />
               );

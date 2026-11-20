@@ -8,6 +8,13 @@ import { renderDiagramMarkdown } from '../util';
 import { MermaidBlock } from './MermaidBlock';
 import { TableViewer } from './TableViewer';
 
+/** Extract fence language label from `<pre><code class="language-xxx">` */
+function codeBlockLang(pre: HTMLPreElement): string {
+  const cls = pre.querySelector('code')?.className ?? '';
+  const m = /\blanguage-([a-z0-9_+#.-]+)\b/i.exec(cls);
+  return m ? m[1].toLowerCase() : '';
+}
+
 /** Wrap chat code blocks and Markdown tables with floating top-right actions outside `<pre>` / `<table>` so manual selection stays clean */
 function hydrateCopyBlocks(root: HTMLElement, copiedUntil: Map<string, number>) {
   const now = Date.now();
@@ -15,13 +22,25 @@ function hydrateCopyBlocks(root: HTMLElement, copiedUntil: Map<string, number>) 
   for (const pre of Array.from(root.querySelectorAll<HTMLPreElement>('pre'))) {
     if (pre.closest('.mermaid-block, table') || pre.parentElement?.classList.contains('md-code-wrap')) continue;
     const key = `code:${codeIdx++}`;
+    const lang = codeBlockLang(pre);
     const wrap = document.createElement('div');
-    wrap.className = 'md-code-wrap';
+    wrap.className = lang ? 'md-code-wrap has-lang' : 'md-code-wrap';
     const anchor = document.createElement('div');
     anchor.className = 'copy-float-anchor';
     anchor.append(makeCopyBtn('code', key, (copiedUntil.get(key) ?? 0) > now));
     pre.replaceWith(wrap);
-    wrap.append(anchor, pre);
+    if (lang) {
+      const head = document.createElement('div');
+      head.className = 'md-code-head';
+      head.setAttribute('aria-hidden', 'true');
+      const tag = document.createElement('span');
+      tag.className = 'md-code-lang mono';
+      tag.textContent = lang;
+      head.append(tag);
+      wrap.append(anchor, head, pre);
+    } else {
+      wrap.append(anchor, pre);
+    }
   }
   enhanceTables(root, copiedUntil);
 }
