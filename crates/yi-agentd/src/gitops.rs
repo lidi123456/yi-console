@@ -440,6 +440,423 @@ pub fn worktree_remove(root: &Path, path: &str, force: bool, delete_branch: bool
     Ok(())
 }
 
+/// Normalize a path for equality checks across platforms (strip \\?\ verbatim prefix, unify separators, fold case on Windows)
+fn norm_path_key(p: &str) -> String {
+    let s = p.strip_prefix(r"\\?\").unwrap_or(p).replace('\\', "/");
+    let s = s.trim_end_matches('/');
+    if cfg!(windows) {
+        s.to_ascii_lowercase()
+    } else {
+        s.to_string()
+    }
+}
+
+/// Convert a git worktree path to a native display path (Windows uses backslashes; strip any \\?\ prefix)
+fn native_worktree_path(raw: &str) -> String {
+    let s = raw.strip_prefix(r"\\?\").unwrap_or(raw);
+    if cfg!(windows) {
+        s.replace('/', "\\")
+    } else {
+        s.to_string()
+    }
+}
+
+/// List all worktrees belonging to the git repository containing `cwd` (including user- or AI-created worktrees anywhere on disk)
+pub fn worktrees(cwd: &str) -> Result<Value> {
+    let dir = crate::paths::expand(cwd);
+    let Some(root) = repo_root(&dir) else {
+        return Ok(json!({ "repo": null, "current": null, "worktrees": [] }));
+    };
+    let current_canon = root.canonicalize().unwrap_or_else(|_| root.clone());
+    let current_key = norm_path_key(&current_canon.to_string_lossy());
+    let out = git_ok(&root, &["worktree", "list", "--porcelain"])?;
+
+    let mut items: Vec<Value> = Vec::new();
+    let mut path: Option<String> = None;
+    let mut head = String::new();
+    let mut branch: Option<String> = None;
+    let mut detached = false;
+    let mut bare = false;
+    let mut prunable = false;
+
+    let flush = |items: &mut Vec<Value>,
+                 path: &mut Option<String>,
+                 head: &mut String,
+                 branch: &mut Option<String>,
+                 detached: &mut bool,
+                 bare: &mut bool,
+                 prunable: &mut bool| {
+        if let Some(raw_path) = path.take() {
+            let native = native_worktree_path(&raw_path);
+            let item_canon = Path::new(&native)
+                .canonicalize()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|_| native.clone());
+            let is_current = norm_path_key(&item_canon) == current_key;
+            let is_main = items.is_empty();
+            items.push(json!({
+                "path": native,
+                "head": head.clone(),
+                "branch": branch.take(),
+                "detached": *detached,
+                "isMain": is_main,
+                "isCurrent": is_current,
+                "bare": *bare,
+                "prunable": *prunable,
+            }));
+        }
+        head.clear();
+        *branch = None;
+        *detached = false;
+        *bare = false;
+        *prunable = false;
+    };
+
+    for line in out.lines() {
+        let line = line.trim_end_matches('\r');
+        if line.is_empty() {
+            flush(&mut items, &mut path, &mut head, &mut branch, &mut detached, &mut bare, &mut prunable);
+            continue;
+        }
+        if let Some(v) = line.strip_prefix("worktree ") {
+            flush(&mut items, &mut path, &mut head, &mut branch, &mut detached, &mut bare, &mut prunable);
+            path = Some(v.to_string());
+        } else if let Some(v) = line.strip_prefix("HEAD ") {
+            head = v.to_string();
+        } else if let Some(v) = line.strip_prefix("branch ") {
+            branch = Some(v.strip_prefix("refs/heads/").unwrap_or(v).to_string());
+        } else if line == "detached" {
+            detached = true;
+        } else if line == "bare" {
+            bare = true;
+        } else if line.starts_with("prunable") {
+            prunable = true;
+        }
+    }
+    flush(&mut items, &mut path, &mut head, &mut branch, &mut detached, &mut bare, &mut prunable);
+
+    let main_path = items
+        .first()
+        .and_then(|v| v["path"].as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| native_worktree_path(&root.to_string_lossy()));
+
+    Ok(json!({
+        "repo": main_path,
+        "current": native_worktree_path(&root.to_string_lossy()),
+        "worktrees": items,
+    }))
+}
+
+/// Detect the repository's default branch name (origin/HEAD -> local main/master -> origin/main|master -> current branch)
+fn detect_default_branch(root: &Path) -> Option<String> {
+    if let Ok(sym) = git_ok(root, &["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"]) {
+        let sym = sym.trim();
+        let short = sym.strip_prefix("origin/").unwrap_or(sym);
+        if !short.is_empty() {
+            if git(root, &["show-ref", "--verify", "--quiet", &format!("refs/heads/{short}")])
+                .is_ok_and(|o| o.status.success())
+            {
+                return Some(short.to_string());
+            }
+            if git(root, &["show-ref", "--verify", "--quiet", &format!("refs/remotes/{sym}")])
+                .is_ok_and(|o| o.status.success())
+            {
+                return Some(sym.to_string());
+            }
+        }
+    }
+    for cand in ["main", "master"] {
+        if git(root, &["show-ref", "--verify", "--quiet", &format!("refs/heads/{cand}")])
+            .is_ok_and(|o| o.status.success())
+        {
+            return Some(cand.to_string());
+        }
+    }
+    for cand in ["origin/main", "origin/master"] {
+        if git(root, &["show-ref", "--verify", "--quiet", &format!("refs/remotes/{cand}")])
+            .is_ok_and(|o| o.status.success())
+        {
+            return Some(cand.to_string());
+        }
+    }
+    git_ok(root, &["symbolic-ref", "--quiet", "--short", "HEAD"])
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Parse `[ahead 2, behind 1]` / `[ahead 3]` / `[behind 1]` from `%(upstream:track)`
+fn parse_track(track: &str) -> (Option<u64>, Option<u64>) {
+    let mut ahead = None;
+    let mut behind = None;
+    let inner = track.trim().trim_start_matches('[').trim_end_matches(']');
+    for part in inner.split(',') {
+        let p = part.trim();
+        if let Some(n) = p.strip_prefix("ahead ") {
+            ahead = n.trim().parse().ok();
+        } else if let Some(n) = p.strip_prefix("behind ") {
+            behind = n.trim().parse().ok();
+        }
+    }
+    (ahead, behind)
+}
+
+/// List local branches, the current branch, and the detected default branch
+pub fn branches(cwd: &str) -> Result<Value> {
+    let dir = crate::paths::expand(cwd);
+    let Some(root) = repo_root(&dir) else {
+        return Ok(json!({ "repo": null, "current": null, "defaultBranch": null, "branches": [] }));
+    };
+    let current = git_ok(&root, &["symbolic-ref", "--quiet", "--short", "HEAD"])
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let default_branch = detect_default_branch(&root);
+    let fmt = format!("--format=%(HEAD){FS}%(refname:short){FS}%(upstream:short){FS}%(upstream:track){RS}");
+    let out = git_ok(&root, &["for-each-ref", "--sort=-committerdate", &fmt, "refs/heads"])?;
+    let mut list = Vec::new();
+    for rec in out.split(RS).map(|r| r.trim_start_matches('\n')).filter(|r| !r.is_empty()) {
+        let f: Vec<&str> = rec.splitn(4, FS).collect();
+        let [head_mark, name, upstream, track] = f[..] else {
+            continue;
+        };
+        let (ahead, behind) = parse_track(track);
+        list.push(json!({
+            "name": name,
+            "current": head_mark == "*",
+            "upstream": if upstream.is_empty() { Value::Null } else { json!(upstream) },
+            "ahead": ahead,
+            "behind": behind,
+        }));
+    }
+    Ok(json!({
+        "repo": root.display().to_string(),
+        "current": current,
+        "defaultBranch": default_branch,
+        "branches": list,
+    }))
+}
+
+/// Switch to an existing branch or create and switch to a new branch
+pub fn checkout(cwd: &str, branch: &str, create: bool, base: Option<&str>) -> Result<Value> {
+    let branch = branch.trim();
+    if branch.is_empty() || branch.starts_with('-') {
+        bail!("分支名无效: {branch}");
+    }
+    let dir = crate::paths::expand(cwd);
+    let root = repo_root(&dir).ok_or_else(|| anyhow!("不是 git 仓库"))?;
+    if git_ok(&root, &["check-ref-format", "--branch", branch]).is_err() {
+        bail!("分支名无效: {branch}");
+    }
+    if create {
+        let mut args = vec!["checkout", "-b", branch];
+        if let Some(b) = base.map(str::trim).filter(|s| !s.is_empty()) {
+            if b.starts_with('-') {
+                bail!("基准分支无效: {b}");
+            }
+            args.push(b);
+        }
+        git_ok(&root, &args)?;
+    } else {
+        git_ok(&root, &["checkout", branch])?;
+    }
+    Ok(json!({ "branch": branch }))
+}
+
+/// Push the current branch to its upstream or to `remote` (setting upstream when absent)
+pub fn push(cwd: &str, remote: Option<&str>, branch: Option<&str>, set_upstream: bool) -> Result<Value> {
+    let dir = crate::paths::expand(cwd);
+    let root = repo_root(&dir).ok_or_else(|| anyhow!("不是 git 仓库"))?;
+    let current_branch = match branch.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(b) => {
+            if b.starts_with('-') || git_ok(&root, &["check-ref-format", "--branch", b]).is_err() {
+                bail!("分支名无效: {b}");
+            }
+            b.to_string()
+        }
+        None => git_ok(&root, &["symbolic-ref", "--quiet", "--short", "HEAD"])
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| anyhow!("当前处于分离头指针状态，请先切换到分支再推送"))?,
+    };
+    let explicit_remote = remote.map(str::trim).filter(|s| !s.is_empty());
+    if let Some(r) = explicit_remote {
+        if r.starts_with('-') {
+            bail!("远程仓库名无效: {r}");
+        }
+    }
+    let has_upstream = git(&root, &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"])
+        .is_ok_and(|o| o.status.success());
+
+    let (chosen_remote, args): (String, Vec<String>) = if has_upstream && explicit_remote.is_none() && branch.is_none() {
+        let up = git_ok(&root, &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"])
+            .unwrap_or_default();
+        let rem = up.trim().split('/').next().unwrap_or("origin").to_string();
+        (rem, vec!["push".into()])
+    } else {
+        let rem = if let Some(r) = explicit_remote {
+            r.to_string()
+        } else {
+            let remotes = git_ok(&root, &["remote"])?;
+            let list: Vec<&str> = remotes.lines().map(str::trim).filter(|s| !s.is_empty()).collect();
+            if list.is_empty() {
+                bail!("未配置远程仓库（remote）");
+            }
+            if list.contains(&"origin") {
+                "origin".to_string()
+            } else {
+                list[0].to_string()
+            }
+        };
+        let mut a = vec!["push".to_string()];
+        if set_upstream {
+            a.push("-u".into());
+        }
+        a.push(rem.clone());
+        a.push(current_branch.clone());
+        (rem, a)
+    };
+
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let out = git(&root, &arg_refs)?;
+    let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    if !out.status.success() {
+        let msg = if !stderr.is_empty() { stderr } else { stdout };
+        bail!("{msg}");
+    }
+    let combined = [stdout, stderr].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join("\n");
+    Ok(json!({
+        "branch": current_branch,
+        "remote": chosen_remote,
+        "output": combined,
+    }))
+}
+
+/// Build a unified diff for an untracked file on disk (empty for binaries or oversized files)
+fn untracked_diff(root: &Path, path: &str) -> String {
+    let full = root.join(path);
+    match std::fs::read(&full) {
+        Ok(b) if b.len() > DIFF_MAX => String::new(),
+        Ok(b) if b.iter().take(8000).any(|&c| c == 0) => String::new(),
+        Ok(b) => {
+            let text = String::from_utf8_lossy(&b);
+            let n = text.lines().count();
+            let mut d = format!("--- /dev/null\n+++ b/{path}\n@@ -0,0 +1,{n} @@\n");
+            for l in text.lines() {
+                d.push('+');
+                d.push_str(l);
+                d.push('\n');
+            }
+            d
+        }
+        Err(_) => String::new(),
+    }
+}
+
+/// Working tree (including branch commits and untracked files) compared to `merge-base(base, HEAD)`
+pub fn branch_diff(cwd: &str, base: Option<&str>, with_diff: bool, only: Option<&[String]>) -> Result<Value> {
+    if let Some(o) = only {
+        check_paths(o)?;
+    }
+    let dir = crate::paths::expand(cwd);
+    let Some(root) = repo_root(&dir) else {
+        return Ok(json!({ "repo": null, "branch": "", "base": null, "mergeBase": null, "files": [] }));
+    };
+    let branch = git_ok(&root, &["rev-parse", "--abbrev-ref", "HEAD"])
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let Some(_) = git_ok(&root, &["rev-parse", "--verify", "-q", "HEAD"]).ok() else {
+        return Ok(json!({ "repo": root.display().to_string(), "branch": branch, "base": null, "mergeBase": null, "files": [] }));
+    };
+    let chosen_base = match base.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(b) => {
+            if b.starts_with('-') {
+                bail!("基准分支无效: {b}");
+            }
+            b.to_string()
+        }
+        None => match detect_default_branch(&root) {
+            Some(b) => b,
+            None => return Ok(json!({ "repo": root.display().to_string(), "branch": branch, "base": null, "mergeBase": null, "files": [] })),
+        },
+    };
+    let Ok(mb_raw) = git_ok(&root, &["merge-base", &chosen_base, "HEAD"]) else {
+        return Ok(json!({ "repo": root.display().to_string(), "branch": branch, "base": chosen_base, "mergeBase": null, "files": [] }));
+    };
+    let merge_base = mb_raw.trim().to_string();
+
+    let mut stats = std::collections::HashMap::new();
+    if let Ok(out) = git_ok(&root, &["diff", "--numstat", "-z", "--no-renames", &merge_base]) {
+        for rec in out.split('\0').filter(|s| !s.is_empty()) {
+            let mut it = rec.splitn(3, '\t');
+            if let (Some(a), Some(d), Some(path)) = (it.next(), it.next(), it.next()) {
+                stats.insert(path.to_string(), (a.parse::<u64>().ok(), d.parse::<u64>().ok()));
+            }
+        }
+    }
+
+    let mut entries: Vec<(String, String, bool)> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let names = git_ok(&root, &["diff", "--name-status", "-z", "--no-renames", &merge_base])?;
+    let mut parts = names.split('\0').filter(|s| !s.is_empty());
+    while let (Some(code), Some(path)) = (parts.next(), parts.next()) {
+        if seen.insert(path.to_string()) {
+            entries.push((path.to_string(), code.to_string(), false));
+        }
+    }
+    if let Ok(untracked) = git_ok(&root, &["ls-files", "--others", "--exclude-standard", "-z"]) {
+        for path in untracked.split('\0').filter(|s| !s.is_empty()) {
+            if seen.insert(path.to_string()) {
+                entries.push((path.to_string(), "new".to_string(), true));
+            }
+        }
+    }
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let total = entries.len();
+    let mut files = Vec::new();
+    let mut counted = 0usize;
+    for (path, code, is_untracked) in entries {
+        if only.is_some_and(|o| !o.iter().any(|x| x == &path)) || files.len() >= STATUS_MAX {
+            continue;
+        }
+        let diff = if !with_diff {
+            String::new()
+        } else if is_untracked {
+            untracked_diff(&root, &path)
+        } else {
+            let d = git_ok(&root, &["diff", &merge_base, "--no-color", "--", &path]).unwrap_or_default();
+            if d.len() > DIFF_MAX { String::new() } else { d }
+        };
+        let (added, deleted) = if is_untracked {
+            counted += 1;
+            (if counted <= COUNT_MAX { count_lines(&root.join(&path)) } else { None }, Some(0))
+        } else {
+            stats.get(&path).copied().unwrap_or((None, None))
+        };
+        files.push(json!({
+            "path": path,
+            "status": code,
+            "diff": diff,
+            "added": added,
+            "deleted": deleted,
+        }));
+    }
+
+    Ok(json!({
+        "repo": root.display().to_string(),
+        "branch": branch,
+        "base": chosen_base,
+        "mergeBase": merge_base,
+        "total": if only.is_none() && total > files.len() { Some(total) } else { None },
+        "files": files,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -482,6 +899,7 @@ mod tests {
         run(&["init", "-q"]);
         run(&["config", "user.email", "t@t"]);
         run(&["config", "user.name", "t"]);
+        run(&["config", "core.autocrlf", "false"]);
         std::fs::write(p.join("a.txt"), "1\n").unwrap();
         run(&["add", "."]);
         run(&["commit", "-qm", "init"]);
@@ -645,5 +1063,96 @@ mod tests {
         // Single-file diff fetch skips ignored collection
         let one = changes_with(&cwd, true, Some(&["bar/keep.txt".to_string()])).unwrap();
         assert!(one["ignored"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn worktrees_lists_main_and_added() {
+        let d = tempfile::tempdir().unwrap();
+        let repo = d.path().join("repo");
+        let wt_dir = d.path().join("repo-feat");
+        std::fs::create_dir_all(&repo).unwrap();
+        let run = |a: &[&str]| assert!(git(&repo, a).unwrap().status.success(), "{a:?}");
+        run(&["init", "-q", "-b", "main"]);
+        run(&["config", "user.email", "t@t"]);
+        run(&["config", "user.name", "t"]);
+        std::fs::write(repo.join("a.txt"), "1\n").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-qm", "init"]);
+        run(&["worktree", "add", "-b", "feat/x", &wt_dir.to_string_lossy()]);
+
+        let from_main = worktrees(&repo.to_string_lossy()).unwrap();
+        let list = from_main["worktrees"].as_array().unwrap();
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0]["isMain"], true);
+        assert_eq!(list[0]["isCurrent"], true);
+        assert_eq!(list[0]["branch"], "main");
+        assert_eq!(list[1]["isMain"], false);
+        assert_eq!(list[1]["isCurrent"], false);
+        assert_eq!(list[1]["branch"], "feat/x");
+
+        let from_wt = worktrees(&wt_dir.to_string_lossy()).unwrap();
+        let list2 = from_wt["worktrees"].as_array().unwrap();
+        assert_eq!(list2[0]["isCurrent"], false);
+        assert_eq!(list2[1]["isCurrent"], true);
+    }
+
+    #[test]
+    fn branches_checkout_push_and_branch_diff() {
+        let d = tempfile::tempdir().unwrap();
+        let remote = d.path().join("remote.git");
+        let repo = d.path().join("repo");
+        std::fs::create_dir_all(&remote).unwrap();
+        std::fs::create_dir_all(&repo).unwrap();
+        assert!(git(&remote, &["init", "--bare", "-q"]).unwrap().status.success());
+        let run = |a: &[&str]| assert!(git(&repo, a).unwrap().status.success(), "{a:?}");
+        run(&["init", "-q", "-b", "main"]);
+        run(&["config", "user.email", "t@t"]);
+        run(&["config", "user.name", "t"]);
+        run(&["remote", "add", "origin", &remote.to_string_lossy()]);
+        std::fs::write(repo.join("base.txt"), "v1\n").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-qm", "init"]);
+        let cwd = repo.to_string_lossy().to_string();
+
+        // Push initial main branch
+        let p1 = push(&cwd, None, None, true).unwrap();
+        assert_eq!(p1["branch"], "main");
+        assert_eq!(p1["remote"], "origin");
+
+        // Create and switch to feature branch
+        assert!(checkout(&cwd, "--bad", true, None).is_err());
+        let co = checkout(&cwd, "feat/demo", true, None).unwrap();
+        assert_eq!(co["branch"], "feat/demo");
+
+        let br = branches(&cwd).unwrap();
+        assert_eq!(br["current"], "feat/demo");
+        assert_eq!(br["defaultBranch"], "main");
+        assert_eq!(br["branches"].as_array().unwrap().len(), 2);
+
+        // Committed change + unstaged edit + untracked file
+        std::fs::write(repo.join("base.txt"), "v2\n").unwrap();
+        run(&["add", "base.txt"]);
+        run(&["commit", "-qm", "update base"]);
+        std::fs::write(repo.join("extra.txt"), "hello\nworld\n").unwrap();
+
+        let bd = branch_diff(&cwd, None, false, None).unwrap();
+        assert_eq!(bd["base"], "main");
+        assert!(bd["mergeBase"].as_str().is_some());
+        let files = bd["files"].as_array().unwrap();
+        assert_eq!(files.len(), 2);
+        let base_f = files.iter().find(|f| f["path"] == "base.txt").unwrap();
+        assert_eq!((base_f["added"].as_u64(), base_f["deleted"].as_u64()), (Some(1), Some(1)));
+        let extra_f = files.iter().find(|f| f["path"] == "extra.txt").unwrap();
+        assert_eq!(extra_f["status"], "new");
+        assert_eq!((extra_f["added"].as_u64(), extra_f["deleted"].as_u64()), (Some(2), Some(0)));
+
+        let one = branch_diff(&cwd, Some("main"), true, Some(&["base.txt".into()])).unwrap();
+        assert_eq!(one["files"].as_array().unwrap().len(), 1);
+        assert!(one["files"][0]["diff"].as_str().unwrap().contains("+v2"));
+
+        // Push feature branch
+        let p2 = push(&cwd, None, None, true).unwrap();
+        assert_eq!(p2["branch"], "feat/demo");
+        assert!(branch_diff(&cwd, Some("--bad"), false, None).is_err());
     }
 }

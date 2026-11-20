@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { useBack } from '../back';
 import { getT, trErr, useLang } from '../i18n';
-import { errorToast, hostStatus, skey, toast, useSessionData, useStore } from '../store';
+import { errorToast, hostStatus, openNewSession, skey, toast, useSessionData, useStore } from '../store';
 import { isTauri, rpc } from '../transport';
-import type { DirEntry, FileDiff } from '../types';
+import { TOOL_LABEL, type DirEntry, type FileDiff } from '../types';
 import { fmtSize, lsGet, lsSet } from '../util';
 import { writeClipboard } from '../clipboard';
 import { addContextRefToChat } from '../contextRefs';
@@ -21,6 +21,16 @@ import { AI_PREFIX, aiTabSession, AiBrowserPane, isAiTab, useAiBrowserBusy } fro
 import { registerWebTabs } from './NativeWeb';
 import { canUseBrowser } from '../browserUse';
 import { CommitDetails, GitHistory, isCommitTab, parseCommitTab } from './GitHistory';
+import { CommitDialog, type BranchesResult, type WorktreeEntry, type WorktreesResult } from './GitOpsDialogs';
+import {
+  deleteReviewMeta,
+  getReviewMeta,
+  isReviewTab,
+  REVIEW_PREFIX,
+  ReviewLaunchDialog,
+  ReviewPane,
+  reviewTabSession,
+} from './ReviewTab';
 
 const tx = getT('filePanel');
 const aiT = getT('browserUse');
@@ -60,6 +70,8 @@ interface OpenFile {
   commit?: { hash: string; rel: string; subject: string; message: string; author: string; time: number; status: string; diff: string };
   /** Untitled tab (path is untitled:Untitled-N): not on disk yet; saving asks for a path */
   untitled?: boolean;
+  /** Cross-tool read-only code review tab (path is review:<sessionId>) */
+  review?: boolean;
 }
 
 /** Dragging a file from the file panel to the input box: the value is "@relative-path " */
@@ -519,10 +531,23 @@ const gitKey = (hostId: string, cwd: string) => `${hostId}\n${cwd}`;
  *  both laid out against the root, so without it a remounted panel stays blank until fs.list returns. In memory only */
 const rootCache = new Map<string, { path: string; entries: DirEntry[] }>();
 const rootKey = (hostId: string, cwd: string, hidden: boolean) => `${hostId}\n${cwd}\n${hidden ? 1 : 0}`;
+/** Known worktree paths per (hostId + mainRepo) across panel remounts, so only genuinely newly created worktrees trigger the switch banner */
+const knownWorktreesByRepo = new Map<string, Set<string>>();
+
+interface BranchDiffInfo {
+  repo: string;
+  branch: string;
+  base: string | null;
+  mergeBase: string | null;
+  total?: number | null;
+  files: Map<string, GitFile>;
+}
 
 export function FilePanel({
   hostId,
   cwd,
+  baseCwd,
+  onSwitchCwd,
   sessionId,
   status,
   fullscreen,
@@ -533,6 +558,10 @@ export function FilePanel({
 }: {
   hostId: string;
   cwd: string;
+  /** The session's original working directory (differs from cwd when browsing another git worktree) */
+  baseCwd?: string;
+  /** Switch the file panel to another git worktree directory of the same repository */
+  onSwitchCwd?: (nextPath: string) => void;
   sessionId: string;
   /** Session status: refresh the tree and open files when a turn ends */
   status: string;
@@ -544,6 +573,7 @@ export function FilePanel({
   /** Files session: the panel is the whole page (no chat), can't be closed or made full screen, and tabs are kept per session */
   standalone?: boolean;
 }) {
+  const isOtherWorktree = !!baseCwd && norm(cwd) !== norm(baseCwd);
   const [, lang] = useLang();
   const [hidden, setHidden] = useState(() => lsGet('wp-hidden', true));
   const [root, setRoot] = useState<string | null>(() => rootCache.get(rootKey(hostId, cwd, hidden))?.path ?? null);
@@ -582,6 +612,16 @@ export function FilePanel({
   // Later than the webviews' own unmount, which parks them (closing the panel, switching sessions keeps them)
   useEffect(() => () => void setTimeout(() => registerWebTabs(panelId, null), 0), []); // eslint-disable-line react-hooks/exhaustive-deps
   const [git, setGit] = useState<GitInfo | null>(() => gitCache.get(gitKey(hostId, cwd))?.git ?? null);
+  const [worktrees, setWorktrees] = useState<WorktreeEntry[]>([]);
+  const [newWorktree, setNewWorktree] = useState<WorktreeEntry | null>(null);
+  const [diffScope, setDiffScope] = useState<'uncommitted' | 'branch'>('uncommitted');
+  const [branchBase, setBranchBase] = useState('');
+  const [branchDiff, setBranchDiff] = useState<BranchDiffInfo | null>(null);
+  const [branchDiffLoading, setBranchDiffLoading] = useState(false);
+  const [branchesInfo, setBranchesInfo] = useState<BranchesResult | null>(null);
+  const [commitOpen, setCommitOpen] = useState(false);
+  const [reviewOpen, setReviewOpen] = useState(false);
+  const [pushing, setPushing] = useState(false);
   const [view, setView] = useState<'all' | 'changes' | 'search'>(() => lsGet('wp-view', 'all'));
   const [showDiff, setShowDiff] = useState(false);
   // Default to Cursor-style single-file inline diff with the full file expanded
@@ -687,6 +727,75 @@ export function FilePanel({
   const gitSig = useRef(gitCache.get(gitKey(hostId, cwd))?.sig ?? '');
   const gitIgnSig = useRef(gitCache.get(gitKey(hostId, cwd))?.ignSig ?? '');
   /** quiet: background refresh (timer / window refocus); if the status didn't change, just quietly refetch the current file's diff */
+  const loadWorktrees = useCallback(() => {
+    rpc<WorktreesResult>(hostId, 'git.worktrees', { cwd })
+      .then((r) => {
+        const list = (r.worktrees ?? []).filter((w) => !w.bare);
+        setWorktrees(list);
+        if (!r.repo) return;
+        const rk = `${hostId}\n${norm(r.repo)}`;
+        const known = knownWorktreesByRepo.get(rk);
+        const curKeys = new Set(list.map((w) => norm(w.path)));
+        if (!known) {
+          knownWorktreesByRepo.set(rk, curKeys);
+        } else {
+          const added = list.find((w) => !w.isCurrent && !known.has(norm(w.path)));
+          for (const k of curKeys) known.add(k);
+          if (added && onSwitchCwd) setNewWorktree(added);
+        }
+      })
+      .catch(() => {});
+  }, [hostId, cwd, onSwitchCwd]);
+
+  const loadBranchDiff = useCallback(
+    (baseOverride?: string) => {
+      const b = baseOverride !== undefined ? baseOverride : branchBase;
+      setBranchDiffLoading(true);
+      rpc<{
+        repo: string | null;
+        branch?: string;
+        base?: string | null;
+        mergeBase?: string | null;
+        total?: number | null;
+        files: { path: string; status: string; diff: string; added?: number | null; deleted?: number | null }[];
+      }>(hostId, 'git.branchDiff', { cwd, base: b || undefined, diff: false })
+        .then((r) => {
+          setBranchDiffLoading(false);
+          if (!r.repo) {
+            setBranchDiff(null);
+            return;
+          }
+          const files = new Map<string, GitFile>();
+          const sep = sepOf(r.repo);
+          for (const f of r.files) {
+            const abs = join(r.repo, f.path.split('/').join(sep));
+            files.set(norm(abs), { ...f, path: abs, rel: f.path });
+          }
+          setBranchDiff({
+            repo: r.repo,
+            branch: r.branch ?? '',
+            base: r.base ?? null,
+            mergeBase: r.mergeBase ?? null,
+            total: r.total,
+            files,
+          });
+        })
+        .catch(() => setBranchDiffLoading(false));
+    },
+    [hostId, cwd, branchBase],
+  );
+
+  const loadBranches = useCallback(
+    () =>
+      rpc<BranchesResult>(hostId, 'git.branches', { cwd })
+        .then((r) => {
+          setBranchesInfo(r);
+          return r;
+        })
+        .catch(() => null),
+    [hostId, cwd],
+  );
+
   const loadGit = useCallback((quiet = false) => {
     // Without diffs: in a big repo with many changed files, running git diff for each takes ages, so fetch only the file that gets opened
     rpc<{
@@ -699,6 +808,7 @@ export function FilePanel({
     }>(hostId, 'git.changes', { cwd, diff: false })
       .then((r) => {
         setGitReady(true);
+        if (r.repo) loadWorktrees();
         const rawIgnored = r.ignored ?? [];
         const sig = `${r.repo}|${r.branch}|${r.head}|${r.files.map((f) => `${f.status} ${f.path} ${f.added ?? ''}/${f.deleted ?? ''}`).join('|')}`;
         const ignSig = rawIgnored.join('\0');
@@ -717,6 +827,8 @@ export function FilePanel({
         }
         if (!r.repo) {
           gitCache.set(gitKey(hostId, cwd), { git: null, sig, ignSig });
+          setWorktrees([]);
+          setBranchDiff(null);
           return setGit(null);
         }
         const files = new Map<string, GitFile>();
@@ -746,10 +858,16 @@ export function FilePanel({
         if (!filesChanged) refreshCurDiff.current();
       })
       .catch(() => (setGitReady(true), quiet || setGit(null)));
-  }, [hostId, cwd]);
+  }, [hostId, cwd, loadWorktrees]);
   const refreshCurDiff = useRef(() => {});
   // With a cached status this is a background refresh: nothing changes on screen unless the status did
   useEffect(() => loadGit(gitCache.has(gitKey(hostId, cwd))), [loadGit]);
+  useEffect(() => {
+    if (git && (diffScope === 'branch' || reviewOpen)) loadBranchDiff();
+  }, [git, diffScope, branchBase, reviewOpen, loadBranchDiff]);
+  useEffect(() => {
+    if (git && (commitOpen || view === 'changes')) void loadBranches();
+  }, [git?.branch, commitOpen, view, loadBranches]); // eslint-disable-line react-hooks/exhaustive-deps
   // Commits made by the AI in a terminal or files changed by other programs aren't caught by the end-of-turn refresh: check again when the window regains focus and every 10 s (while visible)
   useEffect(() => {
     const tick = () => document.visibilityState === 'visible' && loadGit(true);
@@ -807,6 +925,7 @@ export function FilePanel({
   // ---------- Opening and saving files ----------
 
   const readFile = async (path: string, quiet = false): Promise<OpenFile | null> => {
+    if (isReviewTab(path)) return { path, content: '', draft: '', binary: true, truncated: false, size: 0, modified: 0, rev: Date.now(), review: true };
     if (isWebTab(path)) return { path, content: '', draft: '', binary: true, truncated: false, size: 0, modified: 0, rev: Date.now(), web: true };
     if (isUntitled(path))
       return { path, content: '', draft: untitled.get(path) ?? '', binary: false, truncated: false, size: 0, modified: 0, rev: Date.now(), untitled: true };
@@ -854,33 +973,54 @@ export function FilePanel({
     }));
 
   const gitOf = (path: string) => git?.files.get(norm(path));
-  /** Changes to this file: in a git repo, the working tree vs the last commit; otherwise the edits recorded by tools in the session */
+  /** Active diff map for the current Changes scope: uncommitted vs HEAD, or branch vs merge-base */
+  const activeDiffFiles = diffScope === 'branch' && branchDiff ? branchDiff.files : git?.files;
+  const diffGitOf = (path: string) => activeDiffFiles?.get(norm(path));
+  const diffCacheKey = (path: string) => `${diffScope === 'branch' ? branchDiff?.mergeBase ?? 'branch' : 'HEAD'}\n${norm(path)}`;
+  /** Changes to this file: in a git repo, working tree vs HEAD or branch vs merge-base; otherwise session tool edits */
   const diffOf = (path: string): FileDiff | null => {
-    const g = gitOf(path);
-    const d = g?.diff || fileDiffs[norm(path)];
+    const g = diffGitOf(path);
+    const d = g?.diff || fileDiffs[diffCacheKey(path)];
     if (g && d) return { path: g.rel, unified: d.slice(Math.max(0, d.indexOf('@@'))) };
     return null;
   };
   /** Outside a git repo, each edit tools made to this file in the session (each is a snippet, shown separately) */
   const sessionDiffsOf = (path: string): FileDiff[] => (gitReady && !git ? touched.get(norm(path)) ?? [] : []);
   /** Whether this file has changes to view (the diff may not have arrived yet) */
-  const hasChange = (path: string) => !!gitOf(path) || sessionDiffsOf(path).length > 0;
+  const hasChange = (path: string) => !!diffGitOf(path) || sessionDiffsOf(path).length > 0;
 
   // Fetch the diff when a changed file is opened
-  const curKey = file && !file.web && !file.commit ? norm(file.path) : '';
-  const curGit = file ? gitOf(file.path) : undefined;
+  const curKey = file && !file.web && !file.commit && !file.review ? norm(file.path) : '';
+  const curDiffCacheKey = file && !file.web && !file.commit && !file.review ? diffCacheKey(file.path) : '';
+  const curGit = file ? diffGitOf(file.path) : undefined;
   useEffect(() => {
-    if (!curKey || !curGit || curGit.diff || curKey in fileDiffs) return;
-    const k = curKey;
-    rpc<{ files: { path: string; diff: string }[] }>(hostId, 'git.changes', { cwd, paths: [curGit.rel] })
+    if (!curKey || !curGit || curGit.diff || curDiffCacheKey in fileDiffs) return;
+    const k = curDiffCacheKey;
+    const req =
+      diffScope === 'branch'
+        ? rpc<{ files: { path: string; diff: string }[] }>(hostId, 'git.branchDiff', {
+            cwd,
+            base: branchBase || undefined,
+            paths: [curGit.rel],
+          })
+        : rpc<{ files: { path: string; diff: string }[] }>(hostId, 'git.changes', { cwd, paths: [curGit.rel] });
+    req
       .then((r) => setFileDiffs((m) => ({ ...m, [k]: r.files.find((f) => f.path === curGit.rel)?.diff ?? '' })))
       .catch(() => setFileDiffs((m) => ({ ...m, [k]: '' })));
-  }, [curKey, curGit, fileDiffs]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [curKey, curDiffCacheKey, curGit, fileDiffs, diffScope, branchBase]); // eslint-disable-line react-hooks/exhaustive-deps
   // Status unchanged but the content may have changed again: refetch the current file's diff in the background and swap it in when it arrives, without showing "loading"
   refreshCurDiff.current = () => {
-    if (!curKey || !curGit || !(curKey in fileDiffs)) return;
-    const k = curKey;
-    rpc<{ files: { path: string; diff: string }[] }>(hostId, 'git.changes', { cwd, paths: [curGit.rel] })
+    if (!curKey || !curGit || !(curDiffCacheKey in fileDiffs)) return;
+    const k = curDiffCacheKey;
+    const req =
+      diffScope === 'branch'
+        ? rpc<{ files: { path: string; diff: string }[] }>(hostId, 'git.branchDiff', {
+            cwd,
+            base: branchBase || undefined,
+            paths: [curGit.rel],
+          })
+        : rpc<{ files: { path: string; diff: string }[] }>(hostId, 'git.changes', { cwd, paths: [curGit.rel] });
+    req
       .then((r) => {
         const d = r.files.find((f) => f.path === curGit.rel)?.diff ?? '';
         setFileDiffs((m) => (m[k] === d ? m : { ...m, [k]: d }));
@@ -925,7 +1065,7 @@ export function FilePanel({
     }
     // An untitled tab keeps its text in memory when you switch away (it's written to untitled on every edit)
     if (!file?.untitled && !(await confirmDiscard())) return;
-    const g = gitOf(path);
+    const g = diffGitOf(path);
     const f: OpenFile | null =
       g && gitMark(g.status)[0] === 'D'
         ? { path, content: '', draft: '', binary: true, truncated: false, size: 0, modified: 0, rev: Date.now(), deleted: true }
@@ -1049,9 +1189,9 @@ export function FilePanel({
     openMenu(
       { clientX: r.right - 260, clientY: r.bottom + 4 },
       [...tabs].reverse().map((t) => ({
-        label: isWebTab(t) ? webTabTitle(t) : commitTabLabel(t) ?? nameOf(t),
-        icon: isWebTab(t) ? 'globe' : isCommitTab(t) ? 'diff' : 'file',
-        hint: isWebTab(t) || isCommitTab(t) || isUntitled(t) || rel(parentOf(t)) === '.' ? undefined : rel(parentOf(t)),
+        label: isReviewTab(t) ? reviewTabLabel(t) : isWebTab(t) ? webTabTitle(t) : commitTabLabel(t) ?? nameOf(t),
+        icon: isReviewTab(t) ? 'sparkles' : isWebTab(t) ? 'globe' : isCommitTab(t) ? 'diff' : 'file',
+        hint: isReviewTab(t) || isWebTab(t) || isCommitTab(t) || isUntitled(t) || rel(parentOf(t)) === '.' ? undefined : rel(parentOf(t)),
         active: t === file?.path,
         run: () => openFile(t),
       })),
@@ -1069,6 +1209,19 @@ export function FilePanel({
     setFile((cur) => (cur && cur.path === from ? { ...cur, path: to, rev: Date.now() } : cur));
   };
 
+  const cleanupReviewTab = (t: string) => {
+    if (!isReviewTab(t)) return;
+    const rsid = reviewTabSession(t);
+    deleteReviewMeta(rsid);
+    rpc(hostId, 'session.delete', { sessionId: rsid }).catch(() => {});
+  };
+  const reviewTabLabel = (t: string) => {
+    const rsid = reviewTabSession(t);
+    const meta = getReviewMeta(rsid);
+    const label = meta ? TOOL_LABEL[meta.tool] : tx('reviewTabShort');
+    return `${tx('reviewTabPrefix')} (${label})`;
+  };
+
   /** Close a tab: if it's the current file, switch to its neighbor; once all are closed, go back to tree only */
   const closeTab = async (path: string) => {
     const i = tabs.indexOf(path);
@@ -1076,10 +1229,12 @@ export function FilePanel({
     if (file?.path !== path) {
       if (!(await confirmLoseUntitled([path]))) return;
       untitled.delete(path);
+      cleanupReviewTab(path);
       return setTabs(rest);
     }
     if (!(await confirmDiscard())) return;
     untitled.delete(path);
+    cleanupReviewTab(path);
     setTabs(rest);
     const next = rest[Math.min(i, rest.length - 1)];
     if (next) {
@@ -1096,10 +1251,14 @@ export function FilePanel({
   const keepTabs = async (t: string, keep: string[]) => {
     const closing = tabs.filter((x) => !keep.includes(x));
     if (!(await confirmLoseUntitled(closing.filter((x) => x !== file?.path)))) return;
-    const dropUntitled = () => closing.forEach((x) => untitled.delete(x));
-    if (!file || keep.includes(file.path)) return dropUntitled(), setTabs(keep);
+    const dropClosed = () =>
+      closing.forEach((x) => {
+        untitled.delete(x);
+        cleanupReviewTab(x);
+      });
+    if (!file || keep.includes(file.path)) return dropClosed(), setTabs(keep);
     if (!(await confirmDiscard())) return;
-    dropUntitled();
+    dropClosed();
     setTabs(keep);
     const f = await readFile(t);
     setFile(f);
@@ -1190,7 +1349,9 @@ export function FilePanel({
   }, [root]); // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => {
     if (!restored.current || restoring.current || !root) return;
-    lsSet(tabsKey, { tabs, current: file?.path ?? null });
+    const persistTabs = tabs.filter((t) => !isReviewTab(t));
+    const persistCur = file?.path && !isReviewTab(file.path) ? file.path : null;
+    lsSet(tabsKey, { tabs: persistTabs, current: persistCur });
   }, [tabs.join('|'), file?.path, root]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const reload = async () => {
@@ -1368,11 +1529,158 @@ export function FilePanel({
   // The row last clicked / right-clicked in the tree; Ctrl+C copies it
   const lastRow = useRef<{ path: string; isDir: boolean } | null>(null);
   const addToChat = (path: string, isDir: boolean) => {
-    window.dispatchEvent(new CustomEvent(INSERT_COMPOSER, { detail: { sessionId, text: `@${rel(path)}${isDir ? '/' : ''} ` } }));
+    const refPath = isOtherWorktree ? path : rel(path);
+    window.dispatchEvent(new CustomEvent(INSERT_COMPOSER, { detail: { sessionId, text: `@${refPath}${isDir ? '/' : ''} ` } }));
     if (window.matchMedia('(max-width: 760px)').matches) {
       onClose();
       toast(tx('addedToInput'));
     }
+  };
+
+  // ---------- Git operations: discard, push, switch/create branch, switch worktree ----------
+  const doDiscard = async (rels: string[], label: string) => {
+    if (!rels.length) return;
+    const ok = await askConfirm({
+      title: tx('discardGitChangesTitle', { v: label }),
+      message: tx('discardGitChangesWarn'),
+      okText: tx('discard'),
+      danger: true,
+    });
+    if (!ok) return;
+    try {
+      await rpc(hostId, 'git.discard', { cwd, paths: rels });
+      toast(tx('discardedChanges'));
+      refreshTree();
+      const f = fileRef.current;
+      if (f && !f.web && !f.commit && !f.review && !f.untitled) {
+        const g = gitOf(f.path);
+        if (g && rels.includes(g.rel)) {
+          const next = await readFile(f.path, true);
+          if (next) setFile(next);
+          else closeTab(f.path);
+        }
+      }
+    } catch (e) {
+      errorToast(e);
+    }
+  };
+
+  const doPush = async () => {
+    if (pushing || !git) return;
+    setPushing(true);
+    try {
+      const r = await rpc<{ branch: string; remote: string }>(hostId, 'git.push', { cwd });
+      toast(tx('pushedBranch', { branch: r.branch, remote: r.remote }));
+      void loadBranches();
+    } catch (e) {
+      errorToast(e);
+    } finally {
+      setPushing(false);
+    }
+  };
+
+  const openBranchMenu = async (e: React.MouseEvent<HTMLElement>) => {
+    const r = e.currentTarget.getBoundingClientRect();
+    const info = (await loadBranches()) ?? branchesInfo;
+    const items: (MenuItem | '-')[] = [
+      ...(info?.branches ?? []).map((b) => {
+        const hintParts = [b.ahead ? `↑${b.ahead}` : '', b.behind ? `↓${b.behind}` : ''].filter(Boolean);
+        return {
+          label: b.name,
+          icon: 'git-branch',
+          active: b.current,
+          hint: hintParts.join(' ') || undefined,
+          run: async () => {
+            if (b.current) return;
+            try {
+              await rpc(hostId, 'git.checkout', { cwd, branch: b.name });
+              toast(tx('switchedToBranch', { branch: b.name }));
+              refreshTree();
+              void loadBranches();
+            } catch (err) {
+              errorToast(err);
+            }
+          },
+        };
+      }),
+      ...(info?.branches?.length ? (['-'] as const) : []),
+      {
+        label: tx('newBranch'),
+        icon: 'plus',
+        run: async () => {
+          const name = (await askText({ title: tx('newBranch'), placeholder: tx('newBranchPlaceholder') }))?.trim();
+          if (!name) return;
+          try {
+            await rpc(hostId, 'git.checkout', { cwd, branch: name, create: true });
+            toast(tx('switchedToBranch', { branch: name }));
+            refreshTree();
+            void loadBranches();
+          } catch (err) {
+            errorToast(err);
+          }
+        },
+      },
+    ];
+    openMenu({ clientX: r.left, clientY: r.bottom + 4 }, items);
+  };
+
+  const openBaseBranchMenu = async (e: React.MouseEvent<HTMLElement>) => {
+    const r = e.currentTarget.getBoundingClientRect();
+    const info = (await loadBranches()) ?? branchesInfo;
+    const activeBase = branchBase || branchDiff?.base || info?.defaultBranch || '';
+    const names = [...new Set([...(info?.defaultBranch ? [info.defaultBranch] : []), ...(info?.branches ?? []).map((b) => b.name)])];
+    openMenu(
+      { clientX: r.left, clientY: r.bottom + 4 },
+      names.map((name) => ({
+        label: name,
+        icon: 'git-branch',
+        active: name === activeBase,
+        hint: name === info?.defaultBranch ? tx('defaultBranchTag') : undefined,
+        run: () => {
+          setBranchBase(name === info?.defaultBranch ? '' : name);
+          setDiffScope('branch');
+        },
+      })),
+    );
+  };
+
+  const openWorktreeMenu = (e: React.MouseEvent<HTMLElement>) => {
+    if (!onSwitchCwd) return;
+    const r = e.currentTarget.getBoundingClientRect();
+    const curNorm = norm(cwd);
+    const items: (MenuItem | '-')[] = worktrees.map((w) => {
+      const active = norm(w.path) === curNorm;
+      const label = w.branch ? w.branch : baseName(w.path);
+      const hint = w.isMain ? `${tx('mainWorktreeTag')} · ${baseName(w.path)}` : baseName(w.path);
+      return {
+        label,
+        icon: 'git-branch',
+        active,
+        hint,
+        run: () => {
+          setNewWorktree(null);
+          if (!active) onSwitchCwd(w.path);
+        },
+      };
+    });
+    if (isOtherWorktree && baseCwd) {
+      items.push('-', {
+        label: tx('backToSessionDir'),
+        icon: 'back',
+        run: () => {
+          setNewWorktree(null);
+          onSwitchCwd(baseCwd);
+        },
+      });
+    }
+    if (!standalone) {
+      items.push('-', {
+        label: tx('newSessionInCurrentWorktree'),
+        icon: 'plus',
+        run: () => openNewSession({ hostId, cwd }),
+      });
+    }
+    openMenu({ clientX: r.left, clientY: r.bottom + 4 }, items);
   };
 
   // ---------- Download, open in the system ----------
@@ -1543,7 +1851,8 @@ export function FilePanel({
   const rowMenu = (ev: React.MouseEvent, r: TreeRow) => {
     if (r.loading) return;
     const dir = r.isDir ? r.path : parentOf(r.path);
-    const canSide = !r.isDir && !!file && !file.web && !file.commit && file.path !== r.path && wide();
+    const canSide = !r.isDir && !!file && !file.web && !file.commit && !file.review && file.path !== r.path && wide();
+    const rowGit = !r.isDir ? gitOf(r.path) : undefined;
     openMenu(ev, [
       r.isDir
         ? { label: r.expanded ? tx('collapse') : tx('expand'), icon: 'folder', run: () => toggle(r.path) }
@@ -1568,6 +1877,9 @@ export function FilePanel({
       '-',
       { label: tx('newFile'), icon: 'plus', run: () => create(dir, 'file') },
       { label: tx('newFolder'), icon: 'folder', run: () => create(dir, 'dir') },
+      ...(rowGit
+        ? ['-' as const, { label: tx('discardFileChanges'), icon: 'rotate-l', danger: true, run: () => void doDiscard([rowGit.rel], baseName(r.path)) }]
+        : []),
       '-',
       { label: tx('rename'), icon: 'edit', run: () => rename(r.path) },
       { label: tx('delete2'), icon: 'trash', danger: true, run: () => remove(r.path, r.isDir) },
@@ -1578,6 +1890,11 @@ export function FilePanel({
     lsSet('wp-wrap', !wrap);
     setWrap(!wrap);
   };
+  const displayRefPath = (targetPath: string, commitHash?: string) => {
+    if (commitHash) return targetPath;
+    if (isUntitled(targetPath)) return nameOf(targetPath);
+    return isOtherWorktree ? targetPath : rel(targetPath);
+  };
   const pushContextRef = (
     targetPath: string,
     snip: { kind: 'diff' | 'code'; fromLine: number; toLine: number; added?: number; deleted?: number; content: string },
@@ -1585,7 +1902,7 @@ export function FilePanel({
   ) => {
     if (standalone) return;
     const unt = isUntitled(targetPath);
-    const displayPath = commitHash ? targetPath : unt ? nameOf(targetPath) : rel(targetPath);
+    const displayPath = displayRefPath(targetPath, commitHash);
     addContextRefToChat(sessionId, {
       kind: snip.kind,
       path: displayPath,
@@ -1599,6 +1916,33 @@ export function FilePanel({
     });
     toast(tx('addedToInput'));
     if (window.matchMedia('(max-width: 760px)').matches) onClose();
+  };
+  const pushReviewComment = (
+    targetPath: string,
+    snip: { kind: 'diff' | 'code'; fromLine: number; toLine: number; added?: number; deleted?: number; content: string },
+    comment: string,
+    commitHash?: string,
+  ) => {
+    if (standalone) return;
+    const unt = isUntitled(targetPath);
+    const displayPath = displayRefPath(targetPath, commitHash);
+    addContextRefToChat(
+      sessionId,
+      {
+        kind: 'review',
+        path: displayPath,
+        commit: commitHash,
+        untitled: unt || undefined,
+        fromLine: snip.fromLine,
+        toLine: snip.toLine,
+        added: snip.added,
+        deleted: snip.deleted,
+        comment,
+        content: snip.content,
+      },
+      { focus: false },
+    );
+    toast(tx('reviewCommentAdded'));
   };
   /** Right-click menu inside the editor (VS Code's editor context menu, plus Cursor's "add selection to chat") */
   const editorMenu = (path: string, commitHash?: string) => (c: EditorMenuCtx): (MenuItem | '-')[] => {
@@ -1731,31 +2075,48 @@ export function FilePanel({
 
   const rows = useMemo(() => (root ? flatten(root, 0, kids, expanded) : []), [root, kids, expanded, lang]);
   const sRows = useMemo(() => (root && search ? searchRows(root, search.paths, collapsed) : []), [root, search, collapsed]);
-  // "Changes": files changed under this working directory, arranged as a tree by directory
+  // "Changes": files changed under this working directory (uncommitted vs HEAD, or branch vs merge-base)
   // Outside a git repo, the files tools changed in this session stand in for git status
+  const uncommittedKeys = useMemo(() => {
+    if (!root || !git) return [];
+    const r = norm(root);
+    return [...git.files.keys()].filter((k) => k.startsWith(r + '/'));
+  }, [git, root]);
+  const branchKeys = useMemo(() => {
+    if (!root || !branchDiff) return [];
+    const r = norm(root);
+    return [...branchDiff.files.keys()].filter((k) => k.startsWith(r + '/'));
+  }, [branchDiff, root]);
+  const activeChangesGit: GitInfo | null = useMemo(() => {
+    if (diffScope === 'branch' && branchDiff && git) {
+      return { ...git, files: branchDiff.files, total: branchDiff.total };
+    }
+    return git;
+  }, [diffScope, branchDiff, git]);
   const allChanged = useMemo(() => {
     if (!root) return [];
-    const keys = git ? [...git.files.keys()] : gitReady ? [...touched.keys()] : [];
+    if (diffScope === 'branch' && git) return branchKeys;
+    const keys = git ? uncommittedKeys : gitReady ? [...touched.keys()] : [];
     const r = norm(root);
     return keys.filter((k) => k.startsWith(r + '/'));
-  }, [git, gitReady, touched, root]);
+  }, [diffScope, git, branchKeys, uncommittedKeys, gitReady, touched, root]);
   const changed = useMemo(() => {
     if (!root) return [];
     const r = norm(root);
     // Keys are normalized (lowercased on Windows drives): take the original spelling from git status when there is one
-    return allChanged.map((k) => (git?.files.get(k)?.path.replace(/\\/g, '/') ?? k).slice(r.length + 1));
-  }, [allChanged, root, git]);
+    return allChanged.map((k) => (activeChangesGit?.files.get(k)?.path.replace(/\\/g, '/') ?? k).slice(r.length + 1));
+  }, [allChanged, root, activeChangesGit]);
   // Totals at the top of the Changes view: lines added/removed across the listed files (files that can't be computed are skipped)
   const totals = useMemo(() => {
     let a = 0, d = 0, any = false;
     for (const k of allChanged) {
-      const f = git?.files.get(k);
+      const f = activeChangesGit?.files.get(k);
       if (f?.added != null || f?.deleted != null) any = true;
       a += f?.added ?? 0;
       d += f?.deleted ?? 0;
     }
     return any ? { a, d } : null;
-  }, [allChanged, git]);
+  }, [allChanged, activeChangesGit]);
   const cRows = useMemo(() => (root ? searchRows(root, changed, collapsed) : []), [root, changed, collapsed]);
   const toggleCollapsed = (r: TreeRow) =>
     setCollapsed((s) => {
@@ -1794,7 +2155,7 @@ export function FilePanel({
   useBack(quick !== null, () => setQuick(null));
   const fileDiff = file ? diffOf(file.path) : null;
   const fileSessionDiffs = file ? sessionDiffsOf(file.path) : [];
-  const diffPending = !!curGit && !curGit.diff && !(curKey in fileDiffs);
+  const diffPending = !!curGit && !curGit.diff && !(curDiffCacheKey in fileDiffs);
   const state = saveState ?? (dirty ? 'dirty' : null);
   const md = !!file && isMarkdown(file.path) && !file.binary;
   const csv = !!file && isCsv(file.path) && !file.binary;
@@ -1809,13 +2170,14 @@ export function FilePanel({
   const viewing = compare ? 'compare' : showDiff ? 'diff' : 'file';
 
   // ---------- Full-file diff (VS Code style): both whole files, falling back to the hunk-only diff ----------
-  /** Revisions to fetch for the current view: the working tree is compared with HEAD, a commit with its first parent */
+  /** Revisions to fetch for the current view: working tree vs HEAD (or merge-base in branch diff mode), commit vs its first parent */
+  const diffBaseRev = diffScope === 'branch' && branchDiff?.mergeBase ? branchDiff.mergeBase : 'HEAD';
   const blobSpecs: [string, string][] = !file
     ? []
     : file.commit
       ? [[`${file.commit.hash}^`, file.commit.rel], [file.commit.hash, file.commit.rel]]
       : viewing === 'diff' && curGit && !file.truncated && (!file.binary || file.deleted)
-        ? [['HEAD', curGit.rel]]
+        ? [[diffBaseRev, curGit.rel]]
         : [];
   const blobWant = blobSpecs.map(([r, p]) => blobKey(r, p)).join('|');
   useEffect(() => {
@@ -1857,7 +2219,7 @@ export function FilePanel({
       <div className="wp-diff wp-diff-full">
         <MergeDiff
           ref={mergeRef}
-          docKey={file ? `${file.path}#${compare?.path ?? ''}` : name}
+          docKey={file ? `${file.path}#${compare?.path ?? ''}#${diffBaseRev}` : name}
           a={f.a}
           b={f.b}
           filename={name}
@@ -1878,6 +2240,7 @@ export function FilePanel({
           onToggleWrap={toggleWrap}
           menu={editorMenu(refPath, commitHash)}
           onAddContext={standalone ? undefined : (snip) => pushContextRef(refPath, snip, commitHash)}
+          onAddReview={standalone ? undefined : (snip, comment) => pushReviewComment(refPath, snip, comment, commitHash)}
           onCopyHunk={(content) => void copy(content, tx('diffCopied'))}
         />
       </div>
@@ -1937,6 +2300,18 @@ export function FilePanel({
     </button>
   );
 
+  const currentWorktree = worktrees.find((w) => norm(w.path) === norm(cwd));
+  const wtLabel = currentWorktree?.branch || git?.branch || baseName(cwd);
+  const effBranchBase = branchBase || branchDiff?.base || branchesInfo?.defaultBranch || '';
+  const commitFiles = useMemo(
+    () =>
+      uncommittedKeys
+        .map((k) => git?.files.get(k))
+        .filter((f): f is GitFile => !!f)
+        .map((f) => ({ rel: f.rel, status: f.status, added: f.added, deleted: f.deleted })),
+    [uncommittedKeys, git],
+  );
+
   // Changes view with nothing uncommitted: the commit history box below takes the remaining height
   const histGrow = view === 'changes' && !!git && gitReady && cRows.length === 0;
   const tree = (
@@ -1973,13 +2348,58 @@ export function FilePanel({
           <Icon name="refresh" size={14} />
         </button>
       </div>
+      {onSwitchCwd && (worktrees.length > 1 || isOtherWorktree) && (
+        <div className={`wp-wt-bar ${isOtherWorktree ? 'other' : ''}`}>
+          <button type="button" className="wp-wt-btn truncate" onClick={openWorktreeMenu} title={cwd}>
+            <Icon name="git-branch" size={12} />
+            <span className="truncate">{wtLabel}</span>
+            {worktrees.length > 1 && <span className="wp-wt-cnt">{worktrees.length}</span>}
+            <Icon name="down" size={11} />
+          </button>
+          {isOtherWorktree && baseCwd && (
+            <button
+              type="button"
+              className="wp-wt-back"
+              title={tx('backToSessionDir')}
+              onClick={() => {
+                setNewWorktree(null);
+                onSwitchCwd(baseCwd);
+              }}
+            >
+              <Icon name="back" size={11} />
+              <span>{tx('mainDirShort')}</span>
+            </button>
+          )}
+        </div>
+      )}
+      {onSwitchCwd && newWorktree && (
+        <div className="wp-wt-notice">
+          <span className="truncate" title={newWorktree.path}>
+            {tx('newWorktreeDetected', { name: newWorktree.branch || baseName(newWorktree.path) })}
+          </span>
+          <button
+            type="button"
+            className="wp-wt-notice-act"
+            onClick={() => {
+              const target = newWorktree.path;
+              setNewWorktree(null);
+              onSwitchCwd(target);
+            }}
+          >
+            {tx('switchToWorktree')}
+          </button>
+          <button type="button" className="icon-btn" title={tx('close')} onClick={() => setNewWorktree(null)}>
+            <Icon name="x" size={11} />
+          </button>
+        </div>
+      )}
       {view === 'search' && root ? (
         <GrepPanel
           hostId={hostId}
           root={root}
           onOpen={(r, line, col, len) => openFile(relOpen(r), false, { line, col, len })}
-          openFiles={tabs.filter((t) => !isWebTab(t) && !parseCommitTab(t) && rel(t) !== t).map(rel)}
-          dirty={file && dirty && !file.web && !file.commit && rel(file.path) !== file.path ? { rel: rel(file.path), draft: file.draft } : null}
+          openFiles={tabs.filter((t) => !isWebTab(t) && !isReviewTab(t) && !parseCommitTab(t) && rel(t) !== t).map(rel)}
+          dirty={file && dirty && !file.web && !file.commit && !file.review && rel(file.path) !== file.path ? { rel: rel(file.path), draft: file.draft } : null}
           includeRequest={grepInclude}
           onPreview={async (r, line, col, len, after) => {
             const abs = relOpen(r);
@@ -1998,6 +2418,85 @@ export function FilePanel({
         />
       ) : (
         <>
+          {view === 'changes' && git && (
+            <div className="wp-git-controls">
+              <div className="wp-scope-bar">
+                <button
+                  type="button"
+                  className={`wp-scope-btn ${diffScope === 'uncommitted' ? 'active' : ''}`}
+                  onClick={() => setDiffScope('uncommitted')}
+                >
+                  {tx('diffScopeUncommitted')}
+                  {uncommittedKeys.length > 0 && <span className="wp-scope-cnt">{uncommittedKeys.length}</span>}
+                </button>
+                <button
+                  type="button"
+                  className={`wp-scope-btn ${diffScope === 'branch' ? 'active' : ''}`}
+                  onClick={() => setDiffScope('branch')}
+                  title={effBranchBase ? tx('diffScopeBranchVs', { base: effBranchBase }) : tx('diffScopeBranch')}
+                >
+                  <span className="truncate">
+                    {effBranchBase ? tx('diffScopeBranchVs', { base: effBranchBase }) : tx('diffScopeBranch')}
+                  </span>
+                  {branchDiff && branchKeys.length > 0 && <span className="wp-scope-cnt">{branchKeys.length}</span>}
+                </button>
+                {diffScope === 'branch' && (
+                  <button
+                    type="button"
+                    className="icon-btn wp-scope-base"
+                    title={tx('changeBaseBranch')}
+                    onClick={(e) => void openBaseBranchMenu(e)}
+                  >
+                    <Icon name="down" size={11} />
+                  </button>
+                )}
+              </div>
+              <div className="wp-git-bar">
+                <button
+                  type="button"
+                  className="wp-git-btn branch truncate"
+                  title={tx('switchOrCreateBranch')}
+                  onClick={(e) => void openBranchMenu(e)}
+                >
+                  <Icon name="git-branch" size={12} />
+                  <span className="truncate">{git.branch || 'HEAD'}</span>
+                  <Icon name="down" size={10} />
+                </button>
+                <div className="grow" />
+                <button
+                  type="button"
+                  className="wp-git-btn"
+                  disabled={commitFiles.length === 0}
+                  title={tx('commitChanges')}
+                  onClick={() => setCommitOpen(true)}
+                >
+                  <Icon name="git-commit" size={12} />
+                  <span>{tx('commitBtn')}</span>
+                </button>
+                <button
+                  type="button"
+                  className="wp-git-btn"
+                  disabled={pushing}
+                  title={tx('pushBranch')}
+                  onClick={() => void doPush()}
+                >
+                  {pushing ? <span className="spinner mini" /> : <Icon name="upload" size={12} />}
+                  <span>{tx('pushBtn')}</span>
+                </button>
+                {!standalone && (
+                  <button
+                    type="button"
+                    className="wp-git-btn review"
+                    title={tx('crossToolReviewTitle')}
+                    onClick={() => setReviewOpen(true)}
+                  >
+                    <Icon name="sparkles" size={12} />
+                    <span>{tx('reviewBtn')}</span>
+                  </button>
+                )}
+              </div>
+            </div>
+          )}
           {view === 'all' && (
             <div className="wp-filter">
               <Icon name="search" size={13} />
@@ -2072,14 +2571,14 @@ export function FilePanel({
                   {search.truncated && <div className="wp-limit">{tx('showingTheFirstResultsNarrow', { length: search.paths.length })}</div>}
                 </>
               )
-            ) : view === 'changes' && !gitReady ? (
+            ) : view === 'changes' && (!gitReady || (diffScope === 'branch' && branchDiffLoading && !branchDiff)) ? (
               <div className="wp-tip">{tx('readingChanges')}</div>
             ) : view === 'changes' && (git || touched.size > 0) ? (
               <>
                 {!git && <div className="wp-limit">{tx('notAGitRepoFiles')}</div>}
-                {git?.total && (
+                {activeChangesGit?.total && (
                   <div className="wp-limit">
-                    {tx('tooManyChangesShowingThe', { total: git.total, size: git.files.size })}
+                    {tx('tooManyChangesShowingThe', { total: activeChangesGit.total, size: activeChangesGit.files.size })}
                   </div>
                 )}
                 {totals && changed.length > 0 && (
@@ -2093,7 +2592,7 @@ export function FilePanel({
                     rows={cRows}
                     scroller={treeBox}
                     stats
-                    git={git}
+                    git={activeChangesGit}
                     selected={file?.path}
                     focused={focusKey}
                     onToggle={toggleCollapsed}
@@ -2104,7 +2603,9 @@ export function FilePanel({
                 ) : (
                   <div className="wp-tip">
                     <b>{tx('noChanges')}</b>
-                    {tx('workingTreeMatchesTheLast')}
+                    {diffScope === 'branch' && effBranchBase
+                      ? tx('branchMatchesBase', { base: effBranchBase })
+                      : tx('workingTreeMatchesTheLast')}
                   </div>
                 )}
               </>
@@ -2182,8 +2683,18 @@ export function FilePanel({
     onCopyHunk: (content: string) => void copy(content, tx('diffCopied')),
   });
 
-  // Content of the editor column: file / changes / compare
-  const mainView = !file ? null : file.commit ? (
+  // Content of the editor column: file / changes / compare / review
+  const mainView = !file ? null : file.review ? (
+    <ReviewPane
+      hostId={hostId}
+      reviewSessionId={reviewTabSession(file.path)}
+      parentSessionId={sessionId}
+      onOpenFile={(relPath, line) => {
+        const abs = git ? join(git.repo, relPath.split('/').join(sepOf(git.repo))) : relOpen(relPath);
+        void openFile(abs, true, line ? { line } : undefined);
+      }}
+    />
+  ) : file.commit ? (
     full ? (
       mergeView(full, baseName(file.commit.rel), { refPath: file.commit.rel, commitHash: file.commit.hash })
     ) : full === undefined ? (
@@ -2377,6 +2888,37 @@ export function FilePanel({
           >
             {tabs.map((t) => {
               const cur = t === file.path;
+              if (isReviewTab(t))
+                return (
+                  <div
+                    key={t}
+                    role="tab"
+                    aria-selected={cur}
+                    className={`wp-ftab ${cur ? 'active' : ''}`}
+                    title={reviewTabLabel(t)}
+                    onClick={() => openFile(t)}
+                    onAuxClick={(e) => e.button === 1 && closeTab(t)}
+                    onContextMenu={(e) =>
+                      openMenu(e, [
+                        { label: tx('close'), icon: 'x', run: () => closeTab(t) },
+                        ...closeItems(t),
+                      ])
+                    }
+                  >
+                    <Icon name="sparkles" size={13} />
+                    <span className="truncate">{reviewTabLabel(t)}</span>
+                    <button
+                      className="wp-ftab-x"
+                      title={tx('close')}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        closeTab(t);
+                      }}
+                    >
+                      <Icon name="x" size={11} />
+                    </button>
+                  </div>
+                );
               const ct = parseCommitTab(t);
               if (ct)
                 return (
@@ -2586,7 +3128,7 @@ export function FilePanel({
           <CommitDetails hash={file.commit.hash} author={file.commit.author} time={file.commit.time} message={file.commit.message} />
         </div>
       )}
-      {file && !file.web && !file.commit && (
+      {file && !file.web && !file.commit && !file.review && (
         <div className="wp-head">
           {compare ? (
             <div className="wp-compare-title truncate" title={`${file.path}\n${compare.path}`}>
@@ -2723,7 +3265,7 @@ export function FilePanel({
           hostId={hostId}
           root={root}
           initial={quick}
-          recent={[...tabs].reverse().filter((t) => !isWebTab(t) && !isCommitTab(t) && !isUntitled(t)).map(rel)}
+          recent={[...tabs].reverse().filter((t) => !isWebTab(t) && !isReviewTab(t) && !isCommitTab(t) && !isUntitled(t)).map(rel)}
           current={file && !file.binary ? { name: baseName(file.path), text: file.draft, lines: file.draft.split('\n').length } : null}
           onOpen={(r) => openFile(relOpen(r))}
           onGoto={(line) => {
@@ -2736,6 +3278,38 @@ export function FilePanel({
             setGoto({ line, n: Date.now() });
           }}
           onClose={() => setQuick(null)}
+        />
+      )}
+      {commitOpen && git && (
+        <CommitDialog
+          hostId={hostId}
+          cwd={cwd}
+          branch={git.branch}
+          defaultBranch={branchesInfo?.defaultBranch}
+          files={commitFiles}
+          onCommitted={() => {
+            refreshTree();
+            void loadBranches();
+            if (diffScope === 'branch') loadBranchDiff();
+          }}
+          onClose={() => setCommitOpen(false)}
+        />
+      )}
+      {reviewOpen && !standalone && git && (
+        <ReviewLaunchDialog
+          hostId={hostId}
+          cwd={cwd}
+          parentSessionId={sessionId}
+          currentTool={sessInfo?.tool}
+          defaultScope={diffScope}
+          branchBase={effBranchBase || undefined}
+          branchMergeBase={branchDiff?.mergeBase || undefined}
+          uncommittedCount={uncommittedKeys.length}
+          branchCount={branchKeys.length}
+          onStarted={(rsid) => {
+            void openFile(REVIEW_PREFIX + rsid);
+          }}
+          onClose={() => setReviewOpen(false)}
         />
       )}
     </aside>

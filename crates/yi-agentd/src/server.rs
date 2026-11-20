@@ -729,6 +729,35 @@ pub async fn dispatch(
             let rev = s(&p, "rev")?.to_string();
             tokio::task::spawn_blocking(move || crate::gitops::blob(&cwd, &path, &rev)).await??
         }
+        GIT_WORKTREES => {
+            let cwd = s(&p, "cwd")?.to_string();
+            tokio::task::spawn_blocking(move || crate::gitops::worktrees(&cwd)).await??
+        }
+        GIT_BRANCHES => {
+            let cwd = s(&p, "cwd")?.to_string();
+            tokio::task::spawn_blocking(move || crate::gitops::branches(&cwd)).await??
+        }
+        GIT_CHECKOUT => {
+            let cwd = s(&p, "cwd")?.to_string();
+            let branch = s(&p, "branch")?.to_string();
+            let create = p["create"].as_bool().unwrap_or(false);
+            let base = p["base"].as_str().map(str::to_string);
+            tokio::task::spawn_blocking(move || crate::gitops::checkout(&cwd, &branch, create, base.as_deref())).await??
+        }
+        GIT_PUSH => {
+            let cwd = s(&p, "cwd")?.to_string();
+            let remote = p["remote"].as_str().map(str::to_string);
+            let branch = p["branch"].as_str().map(str::to_string);
+            let set_upstream = p["setUpstream"].as_bool().unwrap_or(true);
+            tokio::task::spawn_blocking(move || crate::gitops::push(&cwd, remote.as_deref(), branch.as_deref(), set_upstream)).await??
+        }
+        GIT_BRANCH_DIFF => {
+            let cwd = s(&p, "cwd")?.to_string();
+            let base = p["base"].as_str().map(str::to_string);
+            let with_diff = p["diff"].as_bool().unwrap_or(true);
+            let only: Option<Vec<String>> = p["paths"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect());
+            tokio::task::spawn_blocking(move || crate::gitops::branch_diff(&cwd, base.as_deref(), with_diff, only.as_deref())).await??
+        }
         FS_SEARCH => {
             let root = s(&p, "root")?.to_string();
             let q = p["query"].as_str().unwrap_or("").to_string();

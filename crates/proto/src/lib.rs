@@ -1436,6 +1436,17 @@ pub mod methods {
     /// {cwd, path, rev} -> {exists, text?, binary, tooLarge, notUtf8}: a file's full content at a revision, for the side-by-side diff.
     /// rev is "HEAD", a commit hash, or a hash followed by "^" (its first parent); path is relative to the repo root
     pub const GIT_BLOB: &str = "git.blob";
+    /// {cwd} -> {repo, current, worktrees:[{path, head, branch, detached, isMain, isCurrent, bare, prunable}]}: list all worktrees of the repo
+    pub const GIT_WORKTREES: &str = "git.worktrees";
+    /// {cwd} -> {repo, current, defaultBranch, branches:[{name, current, upstream?, ahead?, behind?}]}: list local branches
+    pub const GIT_BRANCHES: &str = "git.branches";
+    /// {cwd, branch, create?, base?} -> {branch}: switch to an existing branch or create and switch to a new one
+    pub const GIT_CHECKOUT: &str = "git.checkout";
+    /// {cwd, remote?, branch?, setUpstream?} -> {branch, remote, output}: push the current branch to a remote
+    pub const GIT_PUSH: &str = "git.push";
+    /// {cwd, base?, diff?, paths?} -> {repo, branch, base, mergeBase, total?, files:[{path, status, diff, added, deleted}]}:
+    /// working tree (including branch commits and untracked files) compared to merge-base(base, HEAD)
+    pub const GIT_BRANCH_DIFF: &str = "git.branchDiff";
     /// Parts of the status line computed on the host {sessionId} → {git: {branch, ahead, behind, changed}?, command: {text, source}?, error?}
     pub const SESSION_STATUS_LINE: &str = "session.statusLine";
     /// Page back to older events: {sessionId, beforeSeq, limit} → {events, hasMore}

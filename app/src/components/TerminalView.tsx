@@ -9,6 +9,7 @@ import { getT } from '../i18n';
 import { getSession, loadSession, skey } from '../store';
 import { rpc } from '../transport';
 import { lsGet, lsSet, toB64 } from '../util';
+import { Icon } from './Icon';
 import { openMenu } from './Overlay';
 import { isAppDark, onThemeChange, useTheme } from '../theme';
 import { termFontFamily, useFontPrefs } from '../fontPrefs';
@@ -132,7 +133,45 @@ export function TermTools() {
   );
 }
 
-export function TerminalView({ hostId, sessionId, running }: { hostId: string; sessionId: string; running: boolean }) {
+export interface TerminalApi {
+  getRecentOutput: (maxLines?: number) => string;
+}
+
+/** Read logical lines [fromLine, toLine] (inclusive) from xterm's active buffer, joining wrapped lines */
+function readBufferLines(term: Terminal, fromLine: number, toLine: number): string {
+  const buf = term.buffer.active;
+  const start = Math.max(0, fromLine);
+  const end = Math.min(buf.length - 1, toLine);
+  const out: string[] = [];
+  for (let i = start; i <= end; i++) {
+    const line = buf.getLine(i);
+    if (!line) continue;
+    const text = line.translateToString(true);
+    if (line.isWrapped && out.length > 0) {
+      out[out.length - 1] += text;
+    } else {
+      out.push(text);
+    }
+  }
+  while (out.length > 0 && out[out.length - 1].trim() === '') out.pop();
+  return out.join('\n');
+}
+
+export function TerminalView({
+  hostId,
+  sessionId,
+  running,
+  onAddSelection,
+  onCommandExit,
+  apiRef,
+}: {
+  hostId: string;
+  sessionId: string;
+  running: boolean;
+  onAddSelection?: (content: string) => void;
+  onCommandExit?: (info: { exitCode: number; output: string }) => void;
+  apiRef?: React.MutableRefObject<TerminalApi | null>;
+}) {
   const el = useRef<HTMLDivElement>(null);
   const termRef = useRef<Terminal | null>(null);
   const prefs = useTermPrefs();
@@ -140,6 +179,9 @@ export function TerminalView({ hostId, sessionId, running }: { hostId: string; s
   useTheme();
   const dark = isDark(prefs.scheme);
   const fitRef = useRef<() => void>(() => {});
+  const [hasSel, setHasSel] = useState(false);
+  const cbRef = useRef({ onAddSelection, onCommandExit });
+  cbRef.current = { onAddSelection, onCommandExit };
 
   // Sessions in tmux scroll tmux's own history. position is the number of lines from the bottom, history is the total history lines
   const [scroll, setScroll] = useState<{ inTmux: boolean; position: number; history: number }>({ inTmux: false, position: 0, history: 0 });
@@ -314,8 +356,54 @@ export function TerminalView({ hostId, sessionId, running }: { hostId: string; s
         readClipboard(false).then((t) => t && term.paste(t));
         return false;
       }
+      if ((e.ctrlKey || e.metaKey) && e.shiftKey && k === 'l' && cbRef.current.onAddSelection && term.hasSelection()) {
+        const sel = term.getSelection().trim();
+        if (sel) {
+          cbRef.current.onAddSelection(sel);
+          term.clearSelection();
+          setHasSel(false);
+        }
+        return false;
+      }
       return true;
     });
+    // OSC 133 shell integration: track command execution start (C) and exit status (D;code)
+    let cmdStartLine: number | null = null;
+    const osc133 = term.parser.registerOscHandler(133, (data) => {
+      const parts = data.split(';');
+      const code = parts[0];
+      const curLine = term.buffer.active.baseY + term.buffer.active.cursorY;
+      if (code === 'C') {
+        cmdStartLine = curLine;
+      } else if (code === 'D') {
+        const exitCode = parts[1] !== undefined && parts[1] !== '' ? Number(parts[1]) : 0;
+        if (Number.isFinite(exitCode)) {
+          if (exitCode !== 0) {
+            const from = cmdStartLine != null ? Math.max(cmdStartLine, curLine - 120) : Math.max(0, curLine - 80);
+            const output = readBufferLines(term, from, curLine);
+            cbRef.current.onCommandExit?.({ exitCode, output });
+          } else {
+            cbRef.current.onCommandExit?.({ exitCode: 0, output: '' });
+          }
+        }
+        cmdStartLine = null;
+      }
+      return false;
+    });
+    const selSub = term.onSelectionChange(() => {
+      const text = term.getSelection();
+      setHasSel(!!text && text.trim().length > 0);
+    });
+    if (apiRef) {
+      apiRef.current = {
+        getRecentOutput: (maxLines = 80) => {
+          const buf = term.buffer.active;
+          const end = buf.baseY + buf.cursorY;
+          const start = Math.max(0, end - maxLines + 1);
+          return readBufferLines(term, start, end);
+        },
+      };
+    }
     // Wheel: sessions in tmux scroll tmux's history; accumulate pixels and send once per full line
     let wheelAcc = 0;
     const cellHeight = () => (term.element?.querySelector('.xterm-screen')?.clientHeight ?? 0) / term.rows || 18;
@@ -383,6 +471,9 @@ export function TerminalView({ hostId, sessionId, running }: { hostId: string; s
     return () => {
       sub.dispose();
       outSub.dispose();
+      selSub.dispose();
+      osc133.dispose();
+      if (apiRef) apiRef.current = null;
       clearTimeout(histTimer);
       clearTimeout(resizeTimer);
       boxEl.removeEventListener('touchstart', onTouchStart);
@@ -421,6 +512,14 @@ export function TerminalView({ hostId, sessionId, running }: { hostId: string; s
     const t = termRef.current?.getSelection();
     if (t) writeClipboard(t);
   };
+  const sendSelection = () => {
+    const sel = termRef.current?.getSelection()?.trim();
+    if (sel && onAddSelection) {
+      onAddSelection(sel);
+      termRef.current?.clearSelection();
+      setHasSel(false);
+    }
+  };
   const paste = async () => {
     const t = await readClipboard(false);
     if (t) termRef.current?.paste(t);
@@ -435,6 +534,9 @@ export function TerminalView({ hostId, sessionId, running }: { hostId: string; s
         onClick={() => termRef.current?.focus()}
         onContextMenu={(e) =>
           openMenu(e, [
+            ...(onAddSelection
+              ? [{ label: t('addSelectionToChat'), icon: 'chat', disabled: !termRef.current?.hasSelection(), run: sendSelection }, '-' as const]
+              : []),
             { label: t('copy'), icon: 'copy', disabled: !termRef.current?.hasSelection(), run: copy },
             { label: t('paste'), icon: 'paste', run: paste },
             '-',
@@ -443,6 +545,18 @@ export function TerminalView({ hostId, sessionId, running }: { hostId: string; s
           ])
         }
       />
+      {onAddSelection && hasSel && (
+        <button
+          type="button"
+          className="term-sel-act"
+          onMouseDown={(e) => e.preventDefault()}
+          onClick={sendSelection}
+          title={t('addSelectionToChat')}
+        >
+          <Icon name="chat" size={12} />
+          <span>{t('addToChat')}</span>
+        </button>
+      )}
       {scroll.inTmux && scroll.history > 0 && (
         <TmuxScrollbar
           position={scroll.position}

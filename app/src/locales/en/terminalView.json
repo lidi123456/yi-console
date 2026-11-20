@@ -10,5 +10,7 @@
   "selectAll": "Select All",
   "clear": "Clear",
   "jumpToBottomTypingAlso": "Jump to bottom (typing also returns to bottom)",
-  "bottomLines": "↓ Bottom · +{{position}} lines"
+  "bottomLines": "↓ Bottom · +{{position}} lines",
+  "addToChat": "Add to chat",
+  "addSelectionToChat": "Add selected terminal output to chat"
 }

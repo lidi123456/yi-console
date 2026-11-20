@@ -90,6 +90,18 @@ export function SessionView({ hostId, sessionId, seq }: { hostId: string; sessio
   // Whether the file panel is open: remembered per session (like the bottom terminal), so opening it in one session doesn't open it in others
   const filesKey = `file-panel-${key}`;
   const [files, setFiles] = useState(() => lsGet(filesKey, false));
+  // Active directory in the file panel (defaults to info.cwd; can switch to any detected git worktree of the same repo)
+  const panelCwdKey = `file-panel-cwd-${key}`;
+  const [panelCwd, setPanelCwd] = useState(() => lsGet(panelCwdKey, ''));
+  useEffect(() => {
+    setPanelCwd(lsGet(panelCwdKey, ''));
+  }, [panelCwdKey]);
+  const switchPanelCwd = (next: string) => {
+    const val = !next || next === info?.cwd ? '' : next;
+    lsSet(panelCwdKey, val);
+    setPanelCwd(val);
+  };
+  const activeFileCwd = panelCwd || info?.cwd || '';
   const toggleFiles = () => {
     lsSet(filesKey, !files);
     setFiles(!files);
@@ -621,9 +633,11 @@ export function SessionView({ hostId, sessionId, seq }: { hostId: string; sessio
       {filesOnly ? (
         connected ? (
           <FilePanel
-            key={`${hostId}/${sessionId}`}
+            key={`${hostId}/${sessionId}/${activeFileCwd}`}
             hostId={hostId}
-            cwd={info.cwd}
+            cwd={activeFileCwd}
+            baseCwd={info.cwd}
+            onSwitchCwd={switchPanelCwd}
             sessionId={sessionId}
             status={info.status}
             fullscreen={false}
@@ -814,9 +828,11 @@ export function SessionView({ hostId, sessionId, seq }: { hostId: string; sessio
       {!filesOnly && files && connected && !full && fileOpen && <div className="panel-resizer hide-mobile" onPointerDown={dragPanel} title={t('dragToResize')} />}
       {!filesOnly && files && connected && (
         <FilePanel
-          key={`${hostId}/${info.cwd}`}
+          key={`${hostId}/${activeFileCwd}`}
           hostId={hostId}
-          cwd={info.cwd}
+          cwd={activeFileCwd}
+          baseCwd={info.cwd}
+          onSwitchCwd={switchPanelCwd}
           sessionId={sessionId}
           status={info.status}
           fullscreen={full}

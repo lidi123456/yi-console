@@ -1,11 +1,12 @@
 import { useEffect, useRef, useState } from 'react';
+import { addContextRefToChat } from '../contextRefs';
 import { getT } from '../i18n';
-import { errorToast, getSession, loadSession, skey, useStore } from '../store';
+import { errorToast, getSession, loadSession, skey, toast, useStore } from '../store';
 import { rpc } from '../transport';
 import type { SessionInfo } from '../types';
 import { lsGet, lsSet } from '../util';
 import { Icon } from './Icon';
-import { TermTools, TerminalView } from './TerminalView';
+import { TermTools, TerminalView, type TerminalApi } from './TerminalView';
 
 const tx = getT('termPanel');
 
@@ -25,7 +26,51 @@ export function TermPanel({ hostId, info, onClose }: { hostId: string; info: Ses
   const [active, setActive] = useState<string>(() => lsGet(`term-tab-${info.id}`, ''));
   const [creating, setCreating] = useState(false);
   const [error, setError] = useState('');
+  const [failed, setFailed] = useState<Record<string, { exitCode: number; output: string }>>({});
+  const termApi = useRef<TerminalApi | null>(null);
   const cur = tabs.find((t) => t.id === active) ?? tabs[tabs.length - 1];
+  const canChat = info.tool !== 'files' && info.tool !== 'shell';
+  const curFail = cur ? failed[cur.id] : undefined;
+
+  const sendTermOutput = (content: string, opts?: { exitCode?: number; prompt?: string }) => {
+    const clean = content.trim();
+    if (!clean) {
+      toast(tx('noTerminalOutput'));
+      return;
+    }
+    const lineCount = clean.split('\n').length;
+    addContextRefToChat(
+      info.id,
+      {
+        kind: 'terminal',
+        path: cur?.title || tx('terminal'),
+        fromLine: 1,
+        toLine: lineCount,
+        exitCode: opts?.exitCode,
+        content: clean,
+      },
+      { focus: true, prompt: opts?.prompt },
+    );
+  };
+
+  const triageFailed = () => {
+    if (!cur || !curFail) return;
+    const out = curFail.output.trim() || termApi.current?.getRecentOutput(80) || '';
+    sendTermOutput(out, {
+      exitCode: curFail.exitCode,
+      prompt: tx('triageExitPrompt', { code: curFail.exitCode }),
+    });
+    setFailed((m) => {
+      const next = { ...m };
+      delete next[cur.id];
+      return next;
+    });
+  };
+
+  const triageRecent = () => {
+    const out = termApi.current?.getRecentOutput(80) || '';
+    sendTermOutput(out, { prompt: tx('triageRecentPrompt') });
+  };
 
   const pick = (id: string) => {
     lsSet(`term-tab-${info.id}`, id);
@@ -142,6 +187,23 @@ export function TermPanel({ hostId, info, onClose }: { hostId: string; info: Ses
             <Icon name="plus" size={15} />
           </button>
         </div>
+        {canChat && cur && curFail && (
+          <button
+            type="button"
+            className="term-triage-btn fail"
+            title={tx('triageFailedTitle', { code: curFail.exitCode })}
+            onClick={triageFailed}
+          >
+            <Icon name="alert" size={12} />
+            <span>{tx('triageFailed', { code: curFail.exitCode })}</span>
+          </button>
+        )}
+        {canChat && cur && (
+          <button type="button" className="term-triage-btn" title={tx('triageRecentTitle')} onClick={triageRecent}>
+            <Icon name="sparkles" size={12} />
+            <span>{tx('triageRecent')}</span>
+          </button>
+        )}
         <TermTools />
         <button className="icon-btn" title={tx('hideTerminalPanelProcessesKeep')} onClick={onClose}>
           <Icon name="down" size={16} />
@@ -150,7 +212,30 @@ export function TermPanel({ hostId, info, onClose }: { hostId: string; info: Ses
       <div className="term-panel-body">
         {cur ? (
           <>
-            <TerminalView key={cur.id} hostId={hostId} sessionId={cur.id} running={cur.status !== 'error'} />
+            <TerminalView
+              key={cur.id}
+              hostId={hostId}
+              sessionId={cur.id}
+              running={cur.status !== 'error'}
+              apiRef={termApi}
+              onAddSelection={canChat ? (sel) => sendTermOutput(sel) : undefined}
+              onCommandExit={
+                canChat
+                  ? (ev) => {
+                      const tid = cur.id;
+                      setFailed((m) => {
+                        if (ev.exitCode === 0) {
+                          if (!(tid in m)) return m;
+                          const next = { ...m };
+                          delete next[tid];
+                          return next;
+                        }
+                        return { ...m, [tid]: ev };
+                      });
+                    }
+                  : undefined
+              }
+            />
             {cur.status === 'error' && (
               <div className="term-panel-exit">
                 <span>{tx('processExited', { reason: lastError(hostId, cur.id) || tx('unknownReason') })}</span>

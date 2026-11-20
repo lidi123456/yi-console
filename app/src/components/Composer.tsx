@@ -13,6 +13,7 @@ import {
   parseContextMessage,
   sameContextRef,
   serializeContextMessage,
+  type AddContextRefOptions,
   type ContextRef,
   type ContextRefInput,
 } from '../contextRefs';
@@ -21,7 +22,7 @@ import { ContextRefBar } from './ContextRefBar';
 import { openImage } from './Lightbox';
 import { imageMenu } from './ImageMenu';
 import { Icon } from './Icon';
-import { openMenu } from './Overlay';
+import { askText, openMenu } from './Overlay';
 import { copiedRef, DRAG_REF, INSERT_COMPOSER, toB64 } from './FilePanel';
 import { permLabel, permModes } from '../perm';
 import { nextPerm, PermPicker } from './PermPicker';
@@ -344,13 +345,16 @@ export function Composer({
     return () => window.removeEventListener(INSERT_COMPOSER, onInsert);
   }, [info.id]);
 
-  // Code / diff snippet referenced from the file panel: add as a compact pill above the input box
+  // Code / diff / review / terminal snippet referenced into chat: add as a compact pill above the input box
   useEffect(() => {
     const onAddRef = (e: Event) => {
-      const d = (e as CustomEvent<{ sessionId: string; ref: ContextRefInput }>).detail;
+      const d = (e as CustomEvent<{ sessionId: string; ref: ContextRefInput } & AddContextRefOptions>).detail;
       if (d.sessionId !== info.id) return;
       setRefs((cur) => (cur.some((x) => sameContextRef(x, d.ref)) ? cur : [...cur, { ...d.ref, id: nextContextRefId() }]));
-      requestAnimationFrame(() => ta.current?.focus());
+      if (d.prompt) {
+        setText((cur) => (cur.trim() ? cur : d.prompt!));
+      }
+      if (d.focus !== false) requestAnimationFrame(() => ta.current?.focus());
     };
     window.addEventListener(ADD_CONTEXT_REF, onAddRef);
     return () => window.removeEventListener(ADD_CONTEXT_REF, onAddRef);
@@ -642,9 +646,10 @@ export function Composer({
           // Terminal PTY has no chat UI to collapse <yi-context>: save snippets as files and pass @path references
           const atRefs: string[] = [];
           for (const r of curRefs) {
-            const ext = r.kind === 'diff' ? 'diff' : 'txt';
+            const ext = r.kind === 'diff' || r.kind === 'review' ? 'diff' : 'txt';
             const name = `${baseName(r.path)}.L${formatLineRange(r.fromLine, r.toLine)}.${ext}`;
-            const up = await rpc<{ path: string }>(hostId, 'session.attachFile', { sessionId: info.id, name, data: toB64Str(r.content) });
+            const body = r.kind === 'review' && r.comment ? `# Review comment: ${r.comment}\n\n${r.content}` : r.content;
+            const up = await rpc<{ path: string }>(hostId, 'session.attachFile', { sessionId: info.id, name, data: toB64Str(body) });
             atRefs.push(refOf(up.path));
           }
           payload = `${t ? t + ' ' : ''}${atRefs.join('')}`.trim();
@@ -843,7 +848,21 @@ export function Composer({
           hostId={hostId}
           sessionId={info.id}
           cwd={info.cwd}
+          sending={sending}
           onRemove={(id) => setRefs((l) => l.filter((x) => x.id !== id))}
+          onEditReview={async (r) => {
+            const next = (
+              await askText({
+                title: t('editReviewComment'),
+                label: `${r.path}:${formatLineRange(r.fromLine, r.toLine)}`,
+                value: r.comment ?? '',
+                placeholder: t('reviewCommentPlaceholder'),
+              })
+            )?.trim();
+            if (next) setRefs((l) => l.map((x) => (x.id === r.id ? { ...x, comment: next } : x)));
+          }}
+          onSendReviews={() => void send()}
+          onClearReviews={() => setRefs((l) => l.filter((x) => x.kind !== 'review'))}
         />
         <div className="composer-row">
           <textarea

@@ -1,38 +1,53 @@
-// Code and diff snippets referenced from the workspace file panel as AI context.
+// Code, diff, review comment and terminal snippets referenced into AI context.
 // - In the composer, references sit in a compact pill bar above the textarea (not dumped into the text).
 // - In structured chat mode, sending appends <yi-context ...> blocks to the prompt so every AI tool receives the exact
-//   code / unified diff (including deleted lines no longer on disk), while ChatView and QueueList strip the blocks and
+//   code / unified diff / inline review comment / terminal output, while ChatView and QueueList strip the blocks and
 //   render only compact clickable pills above the user bubble.
+
+export type ContextRefKind = 'diff' | 'code' | 'review' | 'terminal';
 
 export interface ContextRef {
   id: string;
-  kind: 'diff' | 'code';
-  /** Path relative to the workspace root (or repo-relative path for a commit file, or untitled tab label) */
+  kind: ContextRefKind;
+  /** Path relative to the workspace root (or repo-relative path for a commit file, untitled tab label, or terminal title) */
   path: string;
   /** Commit hash when referenced from a commit diff tab (git:<hash>:<rel>) */
   commit?: string;
   /** Referenced from an unsaved untitled tab (not a file on disk) */
   untitled?: boolean;
-  /** 1-based line range in the file */
+  /** 1-based line range in the file (or 1..lineCount for terminal output) */
   fromLine: number;
   toLine: number;
-  /** Added / deleted line counts when kind === 'diff' */
+  /** Added / deleted line counts when kind === 'diff' or 'review' */
   added?: number;
   deleted?: number;
-  /** Unified diff hunk (for 'diff') or raw selected lines (for 'code') */
+  /** Inline review comment text when kind === 'review' */
+  comment?: string;
+  /** Non-zero exit code when kind === 'terminal' (from OSC 133 triage) */
+  exitCode?: number;
+  /** Unified diff hunk (for 'diff' / 'review') or raw selected lines (for 'code' / 'terminal') */
   content: string;
 }
 
 export type ContextRefInput = Omit<ContextRef, 'id'>;
 
+export interface AddContextRefOptions {
+  /** Focus the composer textarea after adding (default true; false for batched inline review comments) */
+  focus?: boolean;
+  /** Optional prompt prefix to insert into the composer if it is currently empty */
+  prompt?: string;
+}
+
 export const ADD_CONTEXT_REF = 'yi-console:add-context-ref';
+export const UPDATE_CONTEXT_REF = 'yi-console:update-context-ref';
+export const REMOVE_CONTEXT_REF = 'yi-console:remove-context-ref';
 
 let refSeq = 0;
 export const nextContextRefId = () => `cref-${Date.now()}-${++refSeq}`;
 
-export function addContextRefToChat(sessionId: string, ref: ContextRefInput) {
-  if (!ref.content) return;
-  window.dispatchEvent(new CustomEvent(ADD_CONTEXT_REF, { detail: { sessionId, ref } }));
+export function addContextRefToChat(sessionId: string, ref: ContextRefInput, opts?: AddContextRefOptions) {
+  if (!ref.content && !ref.comment) return;
+  window.dispatchEvent(new CustomEvent(ADD_CONTEXT_REF, { detail: { sessionId, ref, ...opts } }));
 }
 
 export function sameContextRef(a: ContextRefInput, b: ContextRefInput): boolean {
@@ -42,6 +57,8 @@ export function sameContextRef(a: ContextRefInput, b: ContextRefInput): boolean 
     (a.commit ?? '') === (b.commit ?? '') &&
     a.fromLine === b.fromLine &&
     a.toLine === b.toLine &&
+    (a.comment ?? '') === (b.comment ?? '') &&
+    (a.exitCode ?? 0) === (b.exitCode ?? 0) &&
     a.content === b.content
   );
 }
@@ -51,10 +68,20 @@ export function formatLineRange(fromLine: number, toLine: number): string {
 }
 
 const escAttr = (s: string) =>
-  s.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  s
+    .replace(/&/g, '&amp;')
+    .replace(/"/g, '&quot;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/\r?\n/g, '&#10;');
 
 const unescAttr = (s: string) =>
-  s.replace(/&quot;/g, '"').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
+  s
+    .replace(/&#10;/g, '\n')
+    .replace(/&quot;/g, '"')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&amp;/g, '&');
 
 function extLang(path: string): string {
   const i = path.lastIndexOf('.');
@@ -78,8 +105,9 @@ function pickTag(body: string): string {
 export function serializeContextRef(r: ContextRefInput): string {
   const normContent = r.content.replace(/\r\n/g, '\n').replace(/\n$/, '');
   const fence = pickFence(normContent);
-  const lang = r.kind === 'diff' ? 'diff' : extLang(r.path);
-  const inner = `${fence}${lang}\n${normContent}\n${fence}`;
+  const lang = r.kind === 'diff' || r.kind === 'review' ? 'diff' : r.kind === 'terminal' ? 'text' : extLang(r.path);
+  const codeBlock = `${fence}${lang}\n${normContent}\n${fence}`;
+  const inner = r.kind === 'review' && r.comment ? `Review comment: ${r.comment.trim()}\n${codeBlock}` : codeBlock;
   const tag = pickTag(inner);
   const attrs = [
     `kind="${r.kind}"`,
@@ -88,9 +116,15 @@ export function serializeContextRef(r: ContextRefInput): string {
   ];
   if (r.commit) attrs.push(`commit="${escAttr(r.commit)}"`);
   if (r.untitled) attrs.push(`untitled="1"`);
-  if (r.kind === 'diff') {
+  if (r.kind === 'diff' || r.kind === 'review') {
     if (r.added) attrs.push(`add="${r.added}"`);
     if (r.deleted) attrs.push(`del="${r.deleted}"`);
+  }
+  if (r.kind === 'review' && r.comment) {
+    attrs.push(`comment="${escAttr(r.comment.trim())}"`);
+  }
+  if (r.kind === 'terminal' && r.exitCode !== undefined) {
+    attrs.push(`exit="${r.exitCode}"`);
   }
   return `<${tag} ${attrs.join(' ')}>\n${inner}\n</${tag}>`;
 }
@@ -100,7 +134,11 @@ export function serializeContextMessage(text: string, refs: readonly ContextRefI
   const clean = text.trim();
   if (!refs.length) return clean;
   const blocks = refs.map(serializeContextRef).join('\n\n');
-  return clean ? `${clean}\n\n${blocks}` : blocks;
+  if (clean) return `${clean}\n\n${blocks}`;
+  if (refs.every((r) => r.kind === 'review')) {
+    return `Please address the following inline review comments:\n\n${blocks}`;
+  }
+  return blocks;
 }
 
 const TAG_RE = /<(yi-context(?:-\d+)?)\s+([^>\n]+)>\n([\s\S]*?)\n<\/\1>/g;
@@ -114,16 +152,26 @@ export function parseContextMessage(raw: string): { text: string; refs: ContextR
   const stripped = raw.replace(TAG_RE, (_all, _tag: string, attrStr: string, body: string) => {
     const attrs: Record<string, string> = {};
     for (const m of attrStr.matchAll(ATTR_RE)) attrs[m[1]] = unescAttr(m[2]);
-    const kind: 'diff' | 'code' = attrs.kind === 'diff' ? 'diff' : 'code';
+    const kind: ContextRefKind =
+      attrs.kind === 'diff' || attrs.kind === 'review' || attrs.kind === 'terminal' ? attrs.kind : 'code';
     const path = attrs.path || 'snippet';
     const lm = /^(\d+)(?:-(\d+))?$/.exec(attrs.lines ?? '');
     const fromLine = lm ? Math.max(1, Number(lm[1])) : 1;
     const toLine = lm && lm[2] ? Math.max(fromLine, Number(lm[2])) : fromLine;
-    const trimmed = body.trim();
+    let trimmed = body.trim();
+    let comment = attrs.comment || undefined;
+    if (kind === 'review' && trimmed.startsWith('Review comment: ')) {
+      const nl = trimmed.indexOf('\n');
+      if (nl > 0) {
+        if (!comment) comment = trimmed.slice('Review comment: '.length, nl).trim();
+        trimmed = trimmed.slice(nl + 1).trim();
+      }
+    }
     const fm = /^(`{3,})[^\n]*\n([\s\S]*?)(?:\n\1)?$/.exec(trimmed);
     const content = fm ? fm[2] : trimmed;
     const added = attrs.add ? Number(attrs.add) : undefined;
     const deleted = attrs.del ? Number(attrs.del) : undefined;
+    const exitCode = attrs.exit !== undefined && attrs.exit !== '' ? Number(attrs.exit) : undefined;
     refs.push({
       id: `msg-ref-${idx++}`,
       kind,
@@ -134,6 +182,8 @@ export function parseContextMessage(raw: string): { text: string; refs: ContextR
       toLine,
       added: added || undefined,
       deleted: deleted || undefined,
+      comment,
+      exitCode: Number.isFinite(exitCode) ? exitCode : undefined,
       content,
     });
     return '';

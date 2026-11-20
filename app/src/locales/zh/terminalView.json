@@ -10,5 +10,7 @@
   "selectAll": "全选",
   "clear": "清屏",
   "jumpToBottomTypingAlso": "回到底部（直接打字也会回到底部）",
-  "bottomLines": "↓ 回到底部 · 上翻 {{position}} 行"
+  "bottomLines": "↓ 回到底部 · 上翻 {{position}} 行",
+  "addToChat": "添加到对话",
+  "addSelectionToChat": "将选中终端输出添加到对话"
 }

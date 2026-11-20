@@ -15,5 +15,12 @@
   "processExited": "The terminal process exited: {{reason}}",
   "unknownReason": "unknown reason",
   "restart": "Restart",
-  "close": "Close"
+  "close": "Close",
+  "noTerminalOutput": "No terminal output to send",
+  "triageFailed": "exit {{code}} · Ask AI",
+  "triageFailedTitle": "Last command failed with exit code {{code}}; click to ask AI to diagnose",
+  "triageRecent": "Triage",
+  "triageRecentTitle": "Send recent terminal output to AI for troubleshooting",
+  "triageExitPrompt": "Please diagnose and fix this terminal error (exit code {{code}}):",
+  "triageRecentPrompt": "Please inspect this terminal output and help diagnose any issues:"
 }

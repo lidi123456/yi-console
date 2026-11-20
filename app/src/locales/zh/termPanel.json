@@ -15,5 +15,12 @@
   "processExited": "终端进程已退出：{{reason}}",
   "unknownReason": "原因未知",
   "restart": "重新启动",
-  "close": "关闭"
+  "close": "关闭",
+  "noTerminalOutput": "终端里还没有可引用的输出",
+  "triageFailed": "exit {{code}} · 让 AI 排查",
+  "triageFailedTitle": "上一条命令以退出码 {{code}} 失败，点击发送给 AI 排查",
+  "triageRecent": "排查输出",
+  "triageRecentTitle": "截取终端最近输出发送给 AI 排查",
+  "triageExitPrompt": "请帮我排查并修复这条终端报错（退出码 {{code}}）：",
+  "triageRecentPrompt": "请帮我查看这段终端输出并排查问题："
 }

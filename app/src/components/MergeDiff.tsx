@@ -1,4 +1,5 @@
 import { forwardRef, useEffect, useImperativeHandle, useRef, useState } from 'react';
+import { useBack } from '../back';
 import { ChangeSet, Compartment, EditorState, Text, type Extension } from '@codemirror/state';
 import {
   crosshairCursor,
@@ -391,10 +392,11 @@ export const MergeDiff = forwardRef<
     goto?: GotoTarget | null;
     menu?: (ctx: EditorMenuCtx) => (MenuItem | '-')[];
     onAddContext?: (ref: DiffSnippet) => void;
+    onAddReview?: (ref: DiffSnippet, comment: string) => void;
     onCopyHunk?: (content: string) => void;
   }
 >(function MergeDiff(
-  { docKey = '', a, b, filename, layout, collapse, wrap, readOnly = true, onChange, onSave, onToggleWrap, goto, menu, onAddContext, onCopyHunk },
+  { docKey = '', a, b, filename, layout, collapse, wrap, readOnly = true, onChange, onSave, onToggleWrap, goto, menu, onAddContext, onAddReview, onCopyHunk },
   ref,
 ) {
   const host = useRef<HTMLDivElement>(null);
@@ -414,15 +416,25 @@ export const MergeDiff = forwardRef<
   const [ratio, setRatio] = useState(0.5);
   const [hoveredHunk, setHoveredHunk] = useState<{ index: number; top: number } | null>(null);
   const [selChip, setSelChip] = useState<{ top: number; left: number; side: 'a' | 'b' | 'del-file' } | null>(null);
+  const [commentDraft, setCommentDraft] = useState<{ top: number; snippet: DiffSnippet; text: string } | null>(null);
+  const commentRef = useRef<HTMLTextAreaElement>(null);
   const dragging = useRef(false);
   const activeSelSide = useRef<'a' | 'b' | 'del-file'>('b');
+  useBack(!!commentDraft, () => setCommentDraft(null));
+  useEffect(() => {
+    setCommentDraft(null);
+  }, [docKey]);
+  useEffect(() => {
+    if (commentDraft) requestAnimationFrame(() => commentRef.current?.focus());
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [!!commentDraft]);
 
   const text = useRef({ a, b });
   text.current = { a, b };
   const live = useRef<Live | null>(null);
   const roComp = useRef(new Compartment());
-  const cb = useRef({ onChange, onSave, onToggleWrap, onAddContext, onCopyHunk, menu });
-  cb.current = { onChange, onSave, onToggleWrap, onAddContext, onCopyHunk, menu };
+  const cb = useRef({ onChange, onSave, onToggleWrap, onAddContext, onAddReview, onCopyHunk, menu });
+  cb.current = { onChange, onSave, onToggleWrap, onAddContext, onAddReview, onCopyHunk, menu };
 
   const getActiveSelectionView = (): { view: EditorView; side: 'a' | 'b' | 'del-file' } | null => {
     const l = live.current;
@@ -455,12 +467,10 @@ export const MergeDiff = forwardRef<
     setSelChip(pos ? { ...pos, side: cur.side } : null);
   };
 
-  /** at: the view and side to take the selection from (right-click); default the one with a selection */
-  const triggerSelectionAdd = (at?: { view: EditorView; side: 'a' | 'b' | 'del-file' }): boolean => {
-    if (!cb.current.onAddContext) return false;
+  const getSelectionSnippet = (at?: { view: EditorView; side: 'a' | 'b' | 'del-file' }): { cur: { view: EditorView; side: 'a' | 'b' | 'del-file' }; snip: DiffSnippet } | null => {
     const l = live.current;
     const cur = at ?? getActiveSelectionView();
-    if (!l || !cur) return false;
+    if (!l || !cur) return null;
     let snip: DiffSnippet | null = null;
     if (l.kind === 'del-file') {
       snip = extractSelectionSnippet(l.view, l.view.state.doc, Text.empty, [], 'del-file');
@@ -471,11 +481,33 @@ export const MergeDiff = forwardRef<
       const chunks = getChunks(l.b.state)?.chunks ?? [];
       snip = extractSelectionSnippet(cur.view, l.a.state.doc, l.b.state.doc, chunks, cur.side);
     }
-    if (!snip) return false;
-    cb.current.onAddContext(snip);
-    cur.view.dispatch({ selection: { anchor: cur.view.state.selection.main.to } });
+    return snip ? { cur, snip } : null;
+  };
+
+  /** at: the view and side to take the selection from (right-click); default the one with a selection */
+  const triggerSelectionAdd = (at?: { view: EditorView; side: 'a' | 'b' | 'del-file' }): boolean => {
+    if (!cb.current.onAddContext) return false;
+    const got = getSelectionSnippet(at);
+    if (!got) return false;
+    cb.current.onAddContext(got.snip);
+    got.cur.view.dispatch({ selection: { anchor: got.cur.view.state.selection.main.to } });
     setSelChip(null);
     return true;
+  };
+
+  const openCommentPopover = (top: number, snippet: DiffSnippet) => {
+    const h = box.current?.clientHeight ?? 400;
+    const clampedTop = Math.max(8, Math.min(top, Math.max(8, h - 160)));
+    setSelChip(null);
+    setCommentDraft({ top: clampedTop, snippet, text: '' });
+  };
+
+  const submitComment = () => {
+    if (!commentDraft || !cb.current.onAddReview) return;
+    const body = commentDraft.text.trim();
+    if (!body) return;
+    cb.current.onAddReview(commentDraft.snippet, body);
+    setCommentDraft(null);
   };
 
   const currentHunkSnippet = (idx: number): DiffSnippet | null => {
@@ -717,8 +749,8 @@ export const MergeDiff = forwardRef<
 
   /** Locate the diff chunk under the pointer and place the hunk action bar at its top-right */
   const onPointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
-    if (!onAddContext && !onCopyHunk) return;
-    if ((e.target as Element | null)?.closest('.wp-hunk-bar, .cm-sel-act, .wp-merge-sash, .ed-find')) return;
+    if (!onAddContext && !onAddReview && !onCopyHunk) return;
+    if ((e.target as Element | null)?.closest('.wp-hunk-bar, .cm-sel-act, .cm-sel-group, .wp-comment-pop, .wp-merge-sash, .ed-find')) return;
     const el = box.current;
     const l = live.current;
     if (!el || !l) return;
@@ -853,7 +885,7 @@ export const MergeDiff = forwardRef<
       onPointerMove={onPointerMove}
       onPointerLeave={() => setHoveredHunk(null)}
       onPointerDown={(e) => {
-        if (e.button === 0 && !(e.target as Element | null)?.closest('.cm-sel-act, .wp-hunk-bar, .wp-merge-sash, .ed-find')) {
+        if (e.button === 0 && !(e.target as Element | null)?.closest('.cm-sel-act, .cm-sel-group, .wp-comment-pop, .wp-hunk-bar, .wp-merge-sash, .ed-find')) {
           dragging.current = true;
           setSelChip(null);
         }
@@ -862,8 +894,22 @@ export const MergeDiff = forwardRef<
     >
       <div className="wp-merge-host" ref={host} />
       {split && <div className="wp-merge-sash" title={t('dragToResizeDoubleClick')} onPointerDown={drag} onDoubleClick={() => setRatio(0.5)} />}
-      {hoveredHunk && !selChip && (onAddContext || onCopyHunk) && (
+      {hoveredHunk && !selChip && !commentDraft && (onAddContext || onAddReview || onCopyHunk) && (
         <div className="wp-hunk-bar" style={{ top: hoveredHunk.top }} onMouseDown={(e) => e.preventDefault()}>
+          {onAddReview && (
+            <button
+              type="button"
+              className="wp-hunk-btn review"
+              title={tx('addReviewComment')}
+              onClick={() => {
+                const snip = currentHunkSnippet(hoveredHunk.index);
+                if (snip) openCommentPopover(hoveredHunk.top + 30, snip);
+              }}
+            >
+              <Icon name="comment" size={12} />
+              <span>{tx('comment')}</span>
+            </button>
+          )}
           {onAddContext && (
             <button
               type="button"
@@ -894,18 +940,70 @@ export const MergeDiff = forwardRef<
           )}
         </div>
       )}
-      {selChip && onAddContext && (
-        <button
-          type="button"
-          className="cm-sel-act"
-          style={{ top: selChip.top, left: selChip.left }}
-          onMouseDown={(e) => e.preventDefault()}
-          onClick={() => triggerSelectionAdd()}
-        >
-          <Icon name="plus" size={12} />
-          <span>{tx('addToChat')}</span>
-          <kbd>{mod}</kbd>
-        </button>
+      {selChip && !commentDraft && (onAddContext || onAddReview) && (
+        <div className="cm-sel-group" style={{ top: selChip.top, left: selChip.left }} onMouseDown={(e) => e.preventDefault()}>
+          {onAddReview && (
+            <button
+              type="button"
+              className="cm-sel-act review"
+              onClick={() => {
+                const got = getSelectionSnippet();
+                if (got) openCommentPopover(selChip.top + 30, got.snip);
+              }}
+            >
+              <Icon name="comment" size={12} />
+              <span>{tx('comment')}</span>
+            </button>
+          )}
+          {onAddContext && (
+            <button type="button" className="cm-sel-act" onClick={() => triggerSelectionAdd()}>
+              <Icon name="plus" size={12} />
+              <span>{tx('addToChat')}</span>
+              <kbd>{mod}</kbd>
+            </button>
+          )}
+        </div>
+      )}
+      {commentDraft && onAddReview && (
+        <div className="wp-comment-pop" style={{ top: commentDraft.top }} onKeyDown={(e) => e.stopPropagation()}>
+          <div className="wp-comment-head">
+            <span className="wp-comment-loc mono">
+              <Icon name="comment" size={12} />
+              {`${filename}:${commentDraft.snippet.fromLine === commentDraft.snippet.toLine ? commentDraft.snippet.fromLine : `${commentDraft.snippet.fromLine}-${commentDraft.snippet.toLine}`}`}
+            </span>
+            <button type="button" className="icon-btn" title={tx('close')} onClick={() => setCommentDraft(null)}>
+              <Icon name="x" size={12} />
+            </button>
+          </div>
+          <textarea
+            ref={commentRef}
+            className="wp-comment-input"
+            rows={3}
+            value={commentDraft.text}
+            placeholder={tx('reviewCommentPlaceholder')}
+            onChange={(e) => setCommentDraft((c) => c && { ...c, text: e.target.value })}
+            onKeyDown={(e) => {
+              if (e.key === 'Escape' && !e.nativeEvent.isComposing) {
+                e.preventDefault();
+                setCommentDraft(null);
+              } else if ((e.metaKey || e.ctrlKey) && e.key === 'Enter' && !e.nativeEvent.isComposing) {
+                e.preventDefault();
+                submitComment();
+              }
+            }}
+          />
+          <div className="wp-comment-foot">
+            <span className="muted small">{tx('reviewCommentHint')}</span>
+            <div className="row">
+              <button type="button" className="btn small" onClick={() => setCommentDraft(null)}>
+                {tx('cancel')}
+              </button>
+              <button type="button" className="btn small primary" disabled={!commentDraft.text.trim()} onClick={submitComment}>
+                {tx('addReviewCommentBtn')}
+              </button>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );

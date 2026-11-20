@@ -82,5 +82,11 @@
   "contextRefCount_one": "{{count}} ref",
   "contextRefCount_other": "{{count}} refs",
   "clickToOpenContextRefHint": "Click to open, right-click to copy",
-  "moreLines": "{{n}} more lines"
+  "moreLines": "{{n}} more lines",
+  "reviewQueueCount": "{{n}} inline review comment(s)",
+  "sendReviewComments": "Send to AI ({{n}})",
+  "editReviewComment": "Edit comment",
+  "reviewCommentPlaceholder": "Enter your review feedback…",
+  "terminalLines": "{{n}} lines",
+  "exitCodeBadge": "exit {{code}}"
 }

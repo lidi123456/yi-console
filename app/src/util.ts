@@ -319,8 +319,13 @@ export function sessionMarkdown(info: SessionInfo, events: HubEvent[], toolLabel
       out.push('---', '', `### 🧑 ${tx('user')} · ${fullTime(e.ts)}`, '');
       if (parsed.refs.length) {
         const chips = parsed.refs.map((r) => {
+          if (r.kind === 'terminal') {
+            const lines = Math.max(1, r.toLine - r.fromLine + 1);
+            return `\`${r.path}\` (${lines}L${r.exitCode !== undefined ? `, exit ${r.exitCode}` : ''})`;
+          }
           const stat = r.kind === 'diff' && (r.added || r.deleted) ? ` (${[r.added ? `+${r.added}` : '', r.deleted ? `−${r.deleted}` : ''].filter(Boolean).join(' ')})` : '';
-          return `\`${r.path}:${formatLineRange(r.fromLine, r.toLine)}\`${stat}`;
+          const note = r.kind === 'review' && r.comment ? `: ${r.comment}` : '';
+          return `\`${r.path}:${formatLineRange(r.fromLine, r.toLine)}\`${stat}${note}`;
         });
         out.push(`> 📎 ${chips.join(' · ')}`, '');
       }

@@ -81,5 +81,11 @@
   "copyFailed": "复制失败",
   "contextRefCount_other": "{{count}} 处引用",
   "clickToOpenContextRefHint": "点击在右侧打开，右键复制",
-  "moreLines": "还有 {{n}} 行"
+  "moreLines": "还有 {{n}} 行",
+  "reviewQueueCount": "{{n}} 条行内批注",
+  "sendReviewComments": "发给 AI 修改 ({{n}})",
+  "editReviewComment": "编辑批注",
+  "reviewCommentPlaceholder": "输入修改意见…",
+  "terminalLines": "{{n}} 行",
+  "exitCodeBadge": "退出 {{code}}"
 }
