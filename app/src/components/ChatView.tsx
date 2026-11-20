@@ -1839,7 +1839,7 @@ function fullTime(ms: number) {
   return `${t.getFullYear()}-${p(t.getMonth() + 1)}-${p(t.getDate())} ${p(t.getHours())}:${p(t.getMinutes())}`;
 }
 
-/** Compact-style action row under each reply: quiet duration/cost/copy on the right; detailed tokens live in the tooltip */
+/** Compact-style action row under each reply: left-aligned copy, quiet duration/cost metadata, and hover timestamp; detailed tokens live in the tooltip */
 function ModernTurnFooter({
   it,
   latest,
@@ -1874,37 +1874,35 @@ function ModernTurnFooter({
   return (
     <div className={`m-actions ${latest ? 'latest' : ''}`}>
       {it.reason && <span className="attn-text">{it.reason}</span>}
-      <div className="m-act-right">
-        <span className="m-act-time">{fullTime(it.ts)}</span>
-        {parts.length > 0 && (
-          <span className="m-act-meta" title={tip}>
-            {parts.join(' · ')}
-          </span>
-        )}
-        {it.text && (
-          <>
+      {it.text && (
+        <>
+          <button
+            className="m-act-btn"
+            title={t('copyThisReply')}
+            aria-label={t('copyThisReply')}
+            onClick={async () => toast((await writeClipboard(it.text)) ? t('copied') : t('copyFailed'))}
+          >
+            <Icon name="copy" size={14} />
+          </button>
+          {onSelectText && (
             <button
-              className="m-act-btn"
-              title={t('copyThisReply')}
-              aria-label={t('copyThisReply')}
-              onClick={async () => toast((await writeClipboard(it.text)) ? t('copied') : t('copyFailed'))}
+              type="button"
+              className="m-act-btn mobile-select-btn"
+              title={t('selectText')}
+              aria-label={t('selectText')}
+              onClick={() => onSelectText(it.text)}
             >
-              <Icon name="copy" size={14} />
+              <Icon name="text" size={14} />
             </button>
-            {onSelectText && (
-              <button
-                type="button"
-                className="m-act-btn mobile-select-btn"
-                title={t('selectText')}
-                aria-label={t('selectText')}
-                onClick={() => onSelectText(it.text)}
-              >
-                <Icon name="text" size={14} />
-              </button>
-            )}
-          </>
-        )}
-      </div>
+          )}
+        </>
+      )}
+      {parts.length > 0 && (
+        <span className="m-act-meta" title={tip}>
+          {parts.join(' · ')}
+        </span>
+      )}
+      <span className="m-act-time">{fullTime(it.ts)}</span>
     </div>
   );
 }

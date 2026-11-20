@@ -37,11 +37,9 @@
   --add-fg: #116329;
   --del-bg: #ffebe9;
   --del-fg: #a40e26;
-  /* Full-file diff: crisp green/red line and token highlights (light) */
+  /* Full-file diff: crisp green/red line highlights (light) */
   --df-add-line: rgba(34, 197, 94, 0.08);
   --df-del-line: rgba(239, 68, 68, 0.08);
-  --df-add-text: rgba(34, 197, 94, 0.22);
-  --df-del-text: rgba(239, 68, 68, 0.18);
   --df-add-mark: #3fb950;
   --df-del-mark: #f0706a;
   --df-diag: rgba(34, 34, 34, 0.2);
@@ -114,11 +112,9 @@
     --add-fg: #7ee2a0;
     --del-bg: #3b1f1e;
     --del-fg: #f48771;
-    /* Full-file diff: crisp green/red line and token highlights (dark) */
+    /* Full-file diff: crisp green/red line highlights (dark) */
     --df-add-line: rgba(46, 160, 67, 0.12);
     --df-del-line: rgba(248, 81, 73, 0.11);
-    --df-add-text: rgba(63, 185, 80, 0.28);
-    --df-del-text: rgba(248, 81, 73, 0.26);
     --df-add-mark: #3fb950;
     --df-del-mark: #f85149;
     --df-diag: rgba(204, 204, 204, 0.2);
@@ -170,11 +166,9 @@
   --add-fg: #7ee2a0;
   --del-bg: #3b1f1e;
   --del-fg: #f48771;
-  /* Full-file diff: crisp green/red line and token highlights (dark) */
+  /* Full-file diff: crisp green/red line highlights (dark) */
   --df-add-line: rgba(46, 160, 67, 0.12);
   --df-del-line: rgba(248, 81, 73, 0.11);
-  --df-add-text: rgba(63, 185, 80, 0.28);
-  --df-del-text: rgba(248, 81, 73, 0.26);
   --df-add-mark: #3fb950;
   --df-del-mark: #f85149;
   --df-diag: rgba(204, 204, 204, 0.2);
@@ -14912,12 +14906,12 @@ button.wp-commit-title .chev {
   padding-top: 10px;
 }
 
-/* ---- Turn footer: quiet right-aligned metadata ---- */
+/* ---- Turn footer: left-aligned copy and quiet duration/cost metadata ---- */
 
 .m-actions {
-  justify-content: space-between;
-  gap: 8px;
-  margin: -4px 0 0;
+  justify-content: flex-start;
+  gap: 3px;
+  margin: -4px 0 0 -4px;
   padding-top: 2px;
   opacity: 0.55;
   transition: opacity 0.15s;
@@ -14929,17 +14923,8 @@ button.wp-commit-title .chev {
   opacity: 1;
 }
 
-.m-act-right {
-  margin-left: auto;
-  display: inline-flex;
-  align-items: center;
-  gap: 3px;
-  min-width: 0;
-}
-
 .m-act-meta {
-  margin-left: 0;
-  margin-right: 4px;
+  margin-left: 4px;
   font-size: 11.5px;
   color: var(--text-3);
   white-space: nowrap;
@@ -14948,8 +14933,7 @@ button.wp-commit-title .chev {
 }
 
 .m-act-time {
-  margin-left: 0;
-  margin-right: 4px;
+  margin-left: 8px;
   font-size: 11.5px;
 }
 

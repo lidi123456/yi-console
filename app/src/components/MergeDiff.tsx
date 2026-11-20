@@ -1,9 +1,7 @@
 import { forwardRef, useEffect, useImperativeHandle, useRef, useState } from 'react';
-import { ChangeSet, Compartment, EditorState, RangeSetBuilder, Text, type Extension } from '@codemirror/state';
+import { ChangeSet, Compartment, EditorState, Text, type Extension } from '@codemirror/state';
 import {
   crosshairCursor,
-  Decoration,
-  type DecorationSet,
   drawSelection,
   EditorView,
   gutter,
@@ -14,8 +12,6 @@ import {
   keymap,
   lineNumbers,
   rectangularSelection,
-  ViewPlugin,
-  type ViewUpdate,
 } from '@codemirror/view';
 import { closeBrackets, closeBracketsKeymap } from '@codemirror/autocomplete';
 import { defaultKeymap, history, historyKeymap, indentWithTab } from '@codemirror/commands';
@@ -76,82 +72,12 @@ const allDeletedGutter = gutter({
   lineMarker: () => delSignMarker,
 });
 
-/** Lines of chunks that only add or only remove text */
-const wholeChunkLine = Decoration.line({ class: 'cm-wholeChunk' });
-
-function wholeChunkLines(view: EditorView): DecorationSet {
-  const builder = new RangeSetBuilder<Decoration>();
-  const info = getChunks(view.state);
-  if (!info) return builder.finish();
-  const isA = info.side === 'a';
-  const doc = view.state.doc;
-  for (const ch of info.chunks) {
-    const pure = isA ? ch.fromB === ch.toB : ch.fromA === ch.toA;
-    const from = isA ? ch.fromA : ch.fromB;
-    const to = Math.min(isA ? ch.toA : ch.toB, doc.length + 1);
-    if (!pure) continue;
-    for (let pos = from; pos < to; ) {
-      const line = doc.lineAt(pos);
-      builder.add(line.from, line.from, wholeChunkLine);
-      pos = line.to + 1;
-    }
-  }
-  return builder.finish();
-}
-
-/** As in Cursor, word-level highlights only mark what changed inside a modified chunk: @codemirror/merge also marks every
- *  character of a pure insertion (a new file turned into dark stripes) or pure deletion, so tag those chunks to undo it.
- *  The unified view draws deleted lines as block widgets that line decorations don't reach; they are tagged after drawing. */
-const wholeChunks = ViewPlugin.fromClass(
-  class {
-    decorations: DecorationSet;
-    constructor(view: EditorView) {
-      this.decorations = wholeChunkLines(view);
-      this.tagDeleted(view);
-    }
-    update(u: ViewUpdate) {
-      if (u.docChanged || getChunks(u.state)?.chunks !== getChunks(u.startState)?.chunks) this.decorations = wholeChunkLines(u.view);
-      if (u.docChanged || u.viewportChanged || u.heightChanged) this.tagDeleted(u.view);
-    }
-    tagDeleted(view: EditorView) {
-      if (getChunks(view.state)?.side !== 'b') return;
-      view.requestMeasure({
-        read: () => null,
-        write: () => {
-          const chunks = getChunks(view.state)?.chunks ?? [];
-          for (const el of view.contentDOM.querySelectorAll<HTMLElement>('.cm-deletedChunk')) {
-            let pos = -1;
-            try {
-              pos = view.posAtDOM(el);
-            } catch {
-              continue;
-            }
-            const ch = chunks.find((c) => c.fromB === pos);
-            el.classList.toggle('cm-wholeChunk', !!ch && ch.fromB === ch.toB);
-          }
-        },
-      });
-    }
-  },
-  { decorations: (p) => p.decorations },
-);
-
 const mergeTheme = EditorView.theme({
-  // Cursor's look: faint line tints, a thin bar in the gutter, no +/- signs; removed text is dimmed, and only the
-  // changed words inside a modified chunk get a stronger tint (red text for removed words)
+  // Line-level diff look matching chat DiffView: faint line tints, a 2px bar in the gutter, no +/- signs and no
+  // word-level boxes; removed lines are dimmed
   '&.cm-merge-a .cm-changedLine, .cm-deletedChunk': { backgroundColor: 'var(--df-del-line)' },
   '&.cm-merge-b .cm-changedLine, .cm-inlineChangedLine': { backgroundColor: 'var(--df-add-line)' },
-  '&.cm-merge-a .cm-changedText, .cm-deletedChunk .cm-deletedText': { background: 'var(--df-del-text)', borderRadius: '2px' },
-  '&.cm-merge-b .cm-changedText': { background: 'var(--df-add-text)', borderRadius: '2px' },
-  '&.cm-merge-b .cm-deletedText': { background: 'var(--df-del-text)' },
   '& .cm-deletedLine, & .cm-deletedLine span': { color: 'var(--text-3)' },
-  '&.cm-merge-a .cm-changedText, &.cm-merge-a .cm-changedText span, & .cm-deletedText, & .cm-deletedText span': { color: 'var(--del-fg)' },
-  '&.cm-merge-b .cm-wholeChunk .cm-changedText, &.cm-merge-a .cm-wholeChunk .cm-changedText, & .cm-deletedChunk.cm-wholeChunk .cm-deletedText': {
-    background: 'transparent',
-  },
-  '&.cm-merge-a .cm-wholeChunk .cm-changedText, &.cm-merge-a .cm-wholeChunk .cm-changedText span, & .cm-deletedChunk.cm-wholeChunk .cm-deletedText, & .cm-deletedChunk.cm-wholeChunk .cm-deletedText span': {
-    color: 'var(--text-3)',
-  },
   '.cm-deletedChunk': { paddingLeft: '6px' },
   // Lines with no counterpart on the other side: VS Code's diagonal fill
   '.cm-mergeSpacer': {
@@ -670,7 +596,6 @@ export const MergeDiff = forwardRef<
       editableSide ? roComp.current.of([EditorState.readOnly.of(readOnly), EditorView.editable.of(!readOnly)]) : EditorState.readOnly.of(true),
       theme,
       mergeTheme,
-      wholeChunks,
       phrases(),
       wrap ? EditorView.lineWrapping : [],
       language,
@@ -720,7 +645,7 @@ export const MergeDiff = forwardRef<
         b: { doc: norm(b), extensions: makeExt(true, 'b') },
         parent: el,
         gutter: true,
-        highlightChanges: true,
+        highlightChanges: false,
         collapseUnchanged,
         diffConfig: DIFF_CONFIG,
       });
@@ -750,7 +675,7 @@ export const MergeDiff = forwardRef<
               original: norm(a),
               mergeControls: false,
               gutter: true,
-              highlightChanges: true,
+              highlightChanges: false,
               syntaxHighlightDeletions: true,
               syntaxHighlightDeletionsMaxLength: 20000,
               collapseUnchanged,
