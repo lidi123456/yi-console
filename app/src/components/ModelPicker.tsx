@@ -117,7 +117,7 @@ function ModelSubmenu({ anchor, menuRef, label, children }: {
 }
 
 /** The session's model button: reads the list from the session, changes go to the running tool */
-export function ModelPicker({ hostId, info, listenOpenEvent = true }: { hostId: string; info: SessionInfo; listenOpenEvent?: boolean }) {
+export function ModelPicker({ hostId, info }: { hostId: string; info: SessionInfo }) {
   const [models, setModels] = useState<ModelOption[] | null>(null);
   const load = useCallback(
     () =>
@@ -138,7 +138,9 @@ export function ModelPicker({ hostId, info, listenOpenEvent = true }: { hostId: 
       effort={info.effort ?? ''}
       models={models}
       onOpen={load}
-      openEvent={listenOpenEvent}
+      openEvent
+      openEventSessionId={info.id}
+      openEventIgnoreGeneric={!!info.sideChat}
       resetKey={`${hostId}/${info.id}/${info.model ?? ''}`}
       configOptions={info.modelConfigOptions}
       configPending={info.tool === 'cursor' && !!info.modelConfigPending}
@@ -160,6 +162,8 @@ export function ModelMenu({
   models,
   onOpen,
   openEvent,
+  openEventSessionId,
+  openEventIgnoreGeneric = false,
   resetKey,
   configOptions,
   configPending = false,
@@ -178,6 +182,10 @@ export function ModelMenu({
   onOpen?: () => void;
   /** Also open on the OPEN_MODEL event (/model in the session input box) */
   openEvent?: boolean;
+  /** Only react to OPEN_MODEL events targeting this session (when detail.sessionId is present) */
+  openEventSessionId?: string;
+  /** Ignore OPEN_MODEL events that carry no sessionId (used by side chats so global shortcuts stay on the main composer) */
+  openEventIgnoreGeneric?: boolean;
   /** Closes the submenus when this changes */
   resetKey?: string;
   configOptions?: ModelConfigOption[];
@@ -243,14 +251,20 @@ export function ModelMenu({
   }, [resetKey]);
   useEffect(() => {
     if (!openEvent) return;
-    const show = () => {
+    const show = (ev: Event) => {
+      const targetSid = (ev as CustomEvent<{ sessionId?: string }>).detail?.sessionId;
+      if (targetSid) {
+        if (openEventSessionId && targetSid !== openEventSessionId) return;
+      } else if (openEventIgnoreGeneric) {
+        return;
+      }
       onOpen?.();
       setSection(null);
       setOpen(true);
     };
     window.addEventListener(OPEN_MODEL, show);
     return () => window.removeEventListener(OPEN_MODEL, show);
-  }, [openEvent, onOpen]);
+  }, [openEvent, openEventSessionId, openEventIgnoreGeneric, onOpen]);
   const run = async (key: string, fn: () => unknown, after?: () => void) => {
     setChanging(key);
     try {

@@ -284,7 +284,5 @@
   "sideChatUnavailable": "这条旁路对话已不存在",
   "sideChatEmptyTitle": "只读旁路对话",
   "sideChatEmptyDesc": "已继承当前主会话上下文摘要（{{tool}}）。主线程继续运行不中断，模型与权限设置仅对当前旁路生效。",
-  "sideChatPlaceholder": "在旁路提问…（Enter 发送，Shift+Enter 换行）",
-  "sideChatStop": "停止回答",
-  "sideChatSend": "发送到旁路"
+  "sideChatPlaceholder": "在旁路提问…（Enter 发送，Shift+Enter 换行）"
 }

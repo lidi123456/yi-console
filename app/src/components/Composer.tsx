@@ -28,7 +28,7 @@ import { permLabel, permModes } from '../perm';
 import { nextPerm, PermPicker } from './PermPicker';
 import { ModelPicker, OPEN_MODEL } from './ModelPicker';
 import { QueueList } from './QueueList';
-import { bringSideChatToMain, sideChatTitle, startSideChat } from './SideChatTab';
+import { bringSideChatToMain, deriveSideTitle, sideChatTitle, startSideChat } from '../sideChat';
 import { noteOwnerMessage } from '../bots';
 
 const t = getT('composer');
@@ -200,15 +200,20 @@ export function Composer({
   onExport,
   onRename,
   desktopControls,
+  placeholder,
+  compact = false,
 }: {
   hostId: string;
   info: SessionInfo;
   connected: boolean;
-  onPrewarm: () => void;
+  onPrewarm?: () => void;
   onInterrupt: () => void;
-  onExport: () => void;
-  onRename: () => void;
+  onExport?: () => void;
+  onRename?: () => void;
   desktopControls?: ReactNode;
+  placeholder?: string;
+  /** Compact variant used inside embedded side chats: keeps full composer UX while hiding full-page navigation commands */
+  compact?: boolean;
 }) {
   const key = `${hostId}::${info.id}`;
   const [, lang] = useLang();
@@ -489,7 +494,7 @@ export function Composer({
             },
           ]
         : []),
-      { key: 'b-model', label: 'model', desc: t('switchModel'), group: 'Yi Console', icon: 'chat', apply: () => (clearSlash(), window.dispatchEvent(new Event(OPEN_MODEL))) },
+      { key: 'b-model', label: 'model', desc: t('switchModel'), group: 'Yi Console', icon: 'chat', apply: () => (clearSlash(), window.dispatchEvent(new CustomEvent(OPEN_MODEL, { detail: { sessionId: info.id } }))) },
       { key: 'b-mode', label: 'mode', desc: t('permissionModeCurrent', { v: permLabel(info.permissionMode) }), group: 'Yi Console', icon: 'shield', apply: () => (clearSlash(), setPermOpen(true)) },
       ...permModes(info.tool, info.mode).map(([id, label, desc]) => ({
         key: `b-mode-${id}`,
@@ -499,15 +504,25 @@ export function Composer({
         icon: 'shield',
         apply: () => (clearSlash(), setPermMode(hostId, info, id)),
       })),
-      ...(info.tool === 'codex'
+      ...(!compact && info.tool === 'codex'
         ? [{ key: 'b-diff', label: 'diff', desc: t('viewWorkspaceChangesSameAs'), group: 'Yi Console', icon: 'edit' as const, apply: () => (clearSlash(), showChanges(hostId, info.id)) }]
         : []),
-      { key: 'b-changes', label: 'changes', desc: t('viewFilesModifiedInThis'), group: 'Yi Console', icon: 'edit', apply: () => (clearSlash(), showChanges(hostId, info.id)) },
-      { key: 'b-export', label: 'export', desc: t('exportAsMarkdown'), group: 'Yi Console', icon: 'copy', apply: () => (clearSlash(), onExport()) },
-      { key: 'b-rename', label: 'rename', desc: t('renameSession'), group: 'Yi Console', icon: 'edit', apply: () => (clearSlash(), onRename()) },
-      { key: 'b-new', label: 'new', desc: t('newSessionInTheSame'), group: 'Yi Console', icon: 'plus', apply: () => (clearSlash(), openNewSession({ hostId, cwd: info.cwd, tool: info.tool })) },
-      { key: 'b-files', label: 'files', desc: t('browseWorkingDirectory'), group: 'Yi Console', icon: 'folder', apply: () => (clearSlash(), navigate({ kind: 'files', hostId, path: info.cwd })) },
-      { key: 'b-search', label: 'search', desc: t('searchMessagesAcrossAllSessions'), group: 'Yi Console', icon: 'search', apply: () => (clearSlash(), navigate({ kind: 'search' })) },
+      ...(!compact
+        ? [{ key: 'b-changes', label: 'changes', desc: t('viewFilesModifiedInThis'), group: 'Yi Console', icon: 'edit' as const, apply: () => (clearSlash(), showChanges(hostId, info.id)) }]
+        : []),
+      ...(onExport
+        ? [{ key: 'b-export', label: 'export', desc: t('exportAsMarkdown'), group: 'Yi Console', icon: 'copy' as const, apply: () => (clearSlash(), onExport()) }]
+        : []),
+      ...(onRename
+        ? [{ key: 'b-rename', label: 'rename', desc: t('renameSession'), group: 'Yi Console', icon: 'edit' as const, apply: () => (clearSlash(), onRename()) }]
+        : []),
+      ...(!compact
+        ? [
+            { key: 'b-new', label: 'new', desc: t('newSessionInTheSame'), group: 'Yi Console', icon: 'plus' as const, apply: () => (clearSlash(), openNewSession({ hostId, cwd: info.cwd, tool: info.tool })) },
+            { key: 'b-files', label: 'files', desc: t('browseWorkingDirectory'), group: 'Yi Console', icon: 'folder' as const, apply: () => (clearSlash(), navigate({ kind: 'files', hostId, path: info.cwd })) },
+            { key: 'b-search', label: 'search', desc: t('searchMessagesAcrossAllSessions'), group: 'Yi Console', icon: 'search' as const, apply: () => (clearSlash(), navigate({ kind: 'search' })) },
+          ]
+        : []),
     ];
     if (info.mode !== 'terminal')
       builtin.splice(2 + permModes(info.tool, info.mode).length, 0, {
@@ -720,6 +735,11 @@ export function Composer({
         } else {
           payload = serializeContextMessage(t, curRefs);
         }
+      }
+      // Auto-name an untitled side chat from its first sent question so the tab label stays readable
+      if (info.sideChat && !info.title?.trim() && t) {
+        const autoTitle = deriveSideTitle(t);
+        if (autoTitle) rpc(hostId, 'session.rename', { sessionId: info.id, title: autoTitle }).catch(() => {});
       }
       await rpc(hostId, 'session.send', {
         sessionId: info.id,
@@ -940,17 +960,19 @@ export function Composer({
                   ? steer
                     ? t('typeAFollowUpAi')
                     : t('typeAMessageToQueue')
-                  : info.status === 'exited' || info.status === 'error'
-                    ? t('sessionExitedSendAMessage')
-                    : isMobile()
-                      ? t('messageCommandsFiles')
-                      : t('typeAMessageEnterTo')
+                  : placeholder
+                    ? placeholder
+                    : info.status === 'exited' || info.status === 'error'
+                      ? t('sessionExitedSendAMessage')
+                      : isMobile()
+                        ? t('messageCommandsFiles')
+                        : t('typeAMessageEnterTo')
             }
             disabled={!connected}
             onChange={(e) => {
               setText(e.target.value);
               setCaret(e.target.selectionStart ?? e.target.value.length);
-              onPrewarm();
+              onPrewarm?.();
             }}
             onSelect={syncCaret}
             onClick={syncCaret}

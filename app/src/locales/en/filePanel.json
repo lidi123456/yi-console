@@ -284,7 +284,5 @@
   "sideChatUnavailable": "This side chat is no longer available",
   "sideChatEmptyTitle": "Side chat",
   "sideChatEmptyDesc": "Seeded with recent context from the main thread ({{tool}}). The main thread keeps running; model and permission changes here apply only to this side chat.",
-  "sideChatPlaceholder": "Ask a side question… (Enter to send, Shift+Enter for newline)",
-  "sideChatStop": "Stop",
-  "sideChatSend": "Send"
+  "sideChatPlaceholder": "Ask a side question… (Enter to send, Shift+Enter for newline)"
 }

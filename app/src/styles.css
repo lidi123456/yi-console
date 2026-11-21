@@ -16278,76 +16278,13 @@ button.wp-commit-title .chev {
 }
 .wp-side-composer {
   flex: none;
-  padding: 8px 10px 10px;
-  border-top: 1px solid var(--border);
-  background: var(--panel);
-}
-.wp-side-input-box {
-  border: 1px solid var(--border-2);
-  border-radius: 10px;
-  background: var(--bg);
-  padding: 7px 9px 6px;
-  transition: border-color 0.12s, box-shadow 0.12s;
-}
-.wp-side-input-box:focus-within {
-  border-color: color-mix(in srgb, var(--link) 45%, var(--border-2));
-  box-shadow: 0 0 0 2px var(--focus);
-}
-.wp-side-ta {
+  padding: 6px 14px 28px;
+  max-width: none;
   width: 100%;
-  resize: none;
-  border: none;
-  outline: none;
-  background: transparent;
-  color: var(--text);
-  font-family: var(--font-chat);
-  font-size: 13px;
-  line-height: 1.48;
-  min-height: 36px;
-  max-height: 120px;
-  display: block;
+  margin: 0;
 }
-.wp-side-bar {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 6px;
-  margin-top: 5px;
-}
-.wp-side-controls {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  min-width: 0;
-  flex-wrap: wrap;
-}
-.wp-side-send-wrap {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  flex: none;
-}
-.wp-side-stop {
-  width: 26px;
-  height: 26px;
-  color: var(--err);
-  background: var(--err-soft);
-}
-.wp-side-send {
-  width: 26px;
-  height: 26px;
-  border-radius: 7px;
-  border: none;
-  background: var(--accent);
-  color: var(--bg);
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  cursor: pointer;
-}
-.wp-side-send:disabled {
-  opacity: 0.35;
-  cursor: default;
+.wp-side-composer .composer textarea {
+  min-height: 42px;
 }
 .turn-bring-btn {
   display: inline-flex;
