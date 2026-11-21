@@ -11,7 +11,7 @@ import { TOOL_LABEL, supportsAccountsTool, type QuestionAnswer, type ToolAccount
 import { fmtUsage, isMobile, lsGet, lsSet, shortPath, STATUS_LABEL } from '../util';
 import { openAccountManager } from './AccountManagerModal';
 import { openMenu } from './Overlay';
-import { exportSession, OPEN_CHANGES, OPEN_FILE, openFileInPanel, renameSession, sessionMenu, showChanges, switchMode } from './SessionActions';
+import { exportSession, OPEN_CHANGES, OPEN_FILE, openFileInPanel, renameSession, sessionMenu, showChanges, showTurnDiff, switchMode } from './SessionActions';
 import { AI_PREFIX } from './AiBrowser';
 import { FilePanel } from './FilePanel';
 import { TermPanel } from './TermPanel';
@@ -752,6 +752,7 @@ export function SessionView({ hostId, sessionId, seq }: { hostId: string; sessio
                 }}
                 pendingOutside
                 skippedAsks={skippedAsks}
+                onOpenTurnDiff={connected ? (turn) => showTurnDiff(hostId, sessionId, turn) : undefined}
               />
             </div>
             <div className="composer-wrap">

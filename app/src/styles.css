@@ -15352,8 +15352,8 @@ button.wp-commit-title .chev {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 8px;
-  padding: 0 10px;
+  gap: 6px;
+  padding: 0 8px;
   height: 32px;
   border-bottom: 1px solid var(--border);
   background: var(--panel);
@@ -15362,21 +15362,30 @@ button.wp-commit-title .chev {
 .wp-scope-tabs {
   display: flex;
   align-items: stretch;
-  gap: 12px;
+  gap: 8px;
   min-width: 0;
   height: 100%;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+.wp-scope-tabs::-webkit-scrollbar {
+  display: none;
 }
 .wp-scope-tab {
   display: inline-flex;
   align-items: center;
-  gap: 4px;
-  min-width: 0;
+  gap: 3px;
+  flex: none;
+  white-space: nowrap;
   padding: 0 1px;
-  font-size: 12px;
+  font-size: 11.5px;
   font-weight: 500;
   color: var(--text-2);
   border-bottom: 2px solid transparent;
   margin-bottom: -1px;
+}
+.wp-scope-tab .trunc {
+  max-width: 68px;
 }
 .wp-scope-tab:hover {
   color: var(--text);
@@ -15962,4 +15971,33 @@ button.wp-commit-title .chev {
 }
 .term-triage-btn.fail:hover {
   filter: brightness(0.96);
+}
+
+/* Turn checkpoints (minimal, quiet) */
+.turn-ckpt-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 1px 6px;
+  border-radius: 5px;
+  font-size: 11.5px;
+  color: var(--text-2);
+  background: transparent;
+  border: 1px solid transparent;
+  transition: background 0.12s, border-color 0.12s, color 0.12s;
+}
+.turn-ckpt-btn:hover {
+  background: var(--bg-2);
+  border-color: var(--border);
+  color: var(--text);
+}
+.turn-ckpt-btn .ls-a {
+  color: var(--ok);
+  font-family: var(--mono);
+  font-size: 11px;
+}
+.turn-ckpt-btn .ls-d {
+  color: var(--err);
+  font-family: var(--mono);
+  font-size: 11px;
 }

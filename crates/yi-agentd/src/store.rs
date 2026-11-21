@@ -395,6 +395,7 @@ mod tests {
             append_system_prompt: None,
             account_id: None,
             account_label: None,
+            checkpoints: vec![],
             queued: vec![],
             queue_paused: None,
             restart_interrupted: false,

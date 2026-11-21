@@ -266,6 +266,33 @@ pub struct SessionInfo {
     pub account_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_label: Option<String>,
+    /// Per-turn hidden git checkpoints (`refs/yi/checkpoints/<sid>/...`) captured around structured turns
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub checkpoints: Vec<TurnCheckpoint>,
+}
+
+/// One structured turn's hidden git checkpoint pair (pre-turn base and post-turn end when files changed)
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnCheckpoint {
+    /// 1-based turn index within the session
+    pub turn: u32,
+    /// Sequence number of the turn's UserMessage event
+    pub user_seq: i64,
+    /// Sequence number of the turn's TurnEnd event once completed
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_end_seq: Option<i64>,
+    /// Hidden git ref captured before the turn started
+    pub base_ref: String,
+    /// Hidden git ref captured when the turn ended (absent when no files changed)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_ref: Option<String>,
+    #[serde(default)]
+    pub files_changed: u32,
+    #[serde(default)]
+    pub added: u64,
+    #[serde(default)]
+    pub deleted: u64,
 }
 
 /// Which Bot a session belongs to. Bot state itself lives in the desktop client that runs the Bot
@@ -1405,6 +1432,8 @@ pub mod methods {
     pub const SESSION_COMPACT: &str = "session.compact";
     /// {sessionId}: clear the conversation (/clear): delete the chat history and reset usage; the next message starts a new tool session; the Yi Console session stays
     pub const SESSION_CLEAR: &str = "session.clear";
+    /// {cwd, baseRef, endRef, diff?, paths?} -> {repo, baseRef, endRef, total?, files}: diff between two hidden checkpoint refs
+    pub const GIT_REF_DIFF: &str = "git.refDiff";
     /// The desktop client syncs forwardable SSH hosts to the local yi-agentd (local connections only)
     pub const PROXY_SET_HOSTS: &str = "proxy.setHosts";
     /// Paired devices query the hosts reachable through this machine

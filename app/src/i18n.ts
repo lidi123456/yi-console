@@ -84,6 +84,7 @@ export function onLangChange(f: () => void): () => void {
 }
 
 const ERR_PATTERNS: [RegExp, string | ((...m: string[]) => string)][] = [
+  [/快照引用无效[:：]?\s*(.*)/, (_, r) => (r ? `Invalid checkpoint ref: ${r}` : 'Invalid checkpoint ref')],
   [/这个会话不支持调整模型参数/, 'This session does not support model parameters'],
   [/^ChatGPT 登录已失效（令牌过期且无法刷新），请点击「重新登录」$/, 'The ChatGPT login has expired and its token can no longer be refreshed. Click Re-authenticate'],
   [/^子 agent 在等待审批/, "A subagent is waiting for approval, but agy doesn't pass subagent approval requests on to Yi Console. Stop it in the background tasks, switch to Bypass All and try again, or handle it in terminal mode"],

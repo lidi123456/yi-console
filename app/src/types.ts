@@ -70,6 +70,19 @@ export interface SessionInfo {
   /** MCP servers served by a desktop client (the Bot tools) */
   clientMcp?: { name: string; clientId: string }[];
   appendSystemPrompt?: string;
+  /** Per-turn hidden git checkpoints captured around structured turns */
+  checkpoints?: TurnCheckpoint[];
+}
+
+export interface TurnCheckpoint {
+  turn: number;
+  userSeq: number;
+  turnEndSeq?: number | null;
+  baseRef: string;
+  endRef?: string | null;
+  filesChanged: number;
+  added: number;
+  deleted: number;
 }
 
 export interface BotLink {

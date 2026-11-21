@@ -155,6 +155,16 @@ struct SessionRt {
     term_size: Mutex<Option<(u16, u16)>>,
     /// Last task snapshot read from the Qoder account and tool session's own directory
     qoder_plan: Mutex<Option<(PathBuf, Vec<PlanEntry>)>>,
+    /// Active turn's pre-turn hidden git checkpoint awaiting TurnEnd finalization
+    active_checkpoint: Mutex<Option<ActiveCheckpoint>>,
+}
+
+#[derive(Debug, Clone)]
+struct ActiveCheckpoint {
+    turn: u32,
+    user_seq: i64,
+    base_ref: String,
+    base_tree: String,
 }
 
 /// One terminal-mode process run
@@ -865,6 +875,7 @@ impl Hub {
             append_system_prompt: p.append_system_prompt.clone().filter(|s| !s.trim().is_empty()),
             account_id,
             account_label,
+            checkpoints: vec![],
         };
         self.store.save_session(&info)?;
         let rt = Arc::new(new_rt(info.clone()));
@@ -1308,7 +1319,36 @@ impl Hub {
             Some(h) if !h.is_empty() => format!("{h}\n\n{text}"),
             _ => text.to_string(),
         };
-        self.emit(
+
+        // Capture a hidden pre-turn git snapshot so TurnEnd can compute an exact per-turn diff
+        let track_ckpt = !slash
+            && info.mode == SessionMode::Structured
+            && info.tool.has_process()
+            && info.tool != ToolKind::Shell
+            && info.parent_id.is_none()
+            && safe_sid(id);
+        let pre_ckpt = if track_ckpt {
+            if let Some(prev) = rt.active_checkpoint.lock().unwrap().take() {
+                crate::gitops::delete_ref(&info.cwd, &prev.base_ref);
+            }
+            let next_turn = rt
+                .info
+                .lock()
+                .unwrap()
+                .checkpoints
+                .last()
+                .map(|c| c.turn.saturating_add(1))
+                .unwrap_or(1);
+            let base_ref = format!("{}{id}/t{next_turn}-base", crate::gitops::CHECKPOINT_PREFIX);
+            match crate::gitops::capture_checkpoint(&info.cwd, &base_ref) {
+                Ok(Some(base_tree)) => Some((next_turn, base_ref, base_tree)),
+                _ => None,
+            }
+        } else {
+            None
+        };
+
+        let user_seq = self.emit_returning_seq(
             id,
             0,
             EventBody::UserMessage {
@@ -1317,6 +1357,18 @@ impl Hub {
                 origin,
             },
         );
+        if let Some((turn, base_ref, base_tree)) = pre_ckpt {
+            if user_seq > 0 {
+                *rt.active_checkpoint.lock().unwrap() = Some(ActiveCheckpoint {
+                    turn,
+                    user_seq,
+                    base_ref,
+                    base_tree,
+                });
+            } else {
+                crate::gitops::delete_ref(&info.cwd, &base_ref);
+            }
+        }
         if tx
             .send(AdapterCmd::Send(Prompt {
                 text: adapter_text,
@@ -1325,6 +1377,9 @@ impl Hub {
             .is_err()
         {
             *rt.pending_handoff.lock().unwrap() = handoff;
+            if let Some(aborted) = rt.active_checkpoint.lock().unwrap().take() {
+                crate::gitops::delete_ref(&info.cwd, &aborted.base_ref);
+            }
             bail!("会话已结束");
         }
         Ok(())
@@ -1616,6 +1671,7 @@ impl Hub {
             i.limit_hits = 0;
             i.pending = None;
             i.turn = None;
+            i.checkpoints.clear();
             i.clone()
         };
         let _ = self.store.save_queue(id, "[]");
@@ -1632,6 +1688,7 @@ impl Hub {
         *rt.restart_pending.lock().unwrap() = false;
         rt.watch_active.store(false, std::sync::atomic::Ordering::Relaxed);
         *rt.qoder_plan.lock().unwrap() = None;
+        *rt.active_checkpoint.lock().unwrap() = None;
         *rt.pending_handoff.lock().unwrap() = None;
         *rt.pending_failover.lock().unwrap() = None;
         rt.failover_tried.lock().unwrap().clear();
@@ -1640,6 +1697,7 @@ impl Hub {
         // Images and attachments in the chat are only referenced by the deleted records, so delete them too
         if safe_sid(id) {
             let _ = std::fs::remove_dir_all(uploads_dir(id));
+            crate::gitops::delete_session_checkpoints(&info.cwd, id);
         }
         self.broadcast_updated(&info);
         // seq keeps counting up; clients drop earlier events based on this one, and also receive it in reconnect catch-ups
@@ -2471,6 +2529,7 @@ impl Hub {
         self.store.delete_session(id)?;
         if safe_sid(id) {
             let _ = std::fs::remove_dir_all(uploads_dir(id));
+            crate::gitops::delete_session_checkpoints(&session_cwd, id);
         }
         if let Some(bot) = bot_link {
             let safe = |s: &str| !s.is_empty() && s.len() <= 64 && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
@@ -3053,12 +3112,16 @@ impl Hub {
 
     /// Number, update session state, persist, broadcast. gen=0 means emitted by the hub itself (generation not checked)
     pub fn emit(&self, sid: &str, gen: u64, body: EventBody) {
-        self.emit_inner(sid, gen, body, true);
+        let _ = self.emit_inner(sid, gen, body, true);
     }
 
-    fn emit_inner(&self, sid: &str, gen: u64, mut body: EventBody, mut update_activity_time: bool) {
+    fn emit_returning_seq(&self, sid: &str, gen: u64, body: EventBody) -> i64 {
+        self.emit_inner(sid, gen, body, true)
+    }
+
+    fn emit_inner(&self, sid: &str, gen: u64, mut body: EventBody, mut update_activity_time: bool) -> i64 {
         let Some(rt) = self.alive(sid, gen) else {
-            return;
+            return 0;
         };
         if let EventBody::TurnEnd { model, .. } = &mut body {
             if model.is_none() {
@@ -3072,7 +3135,7 @@ impl Hub {
                 methods::EV_SESSION_EVENT,
                 json!({ "sessionId": sid, "event": Event { seq: 0, ts, body } }),
             );
-            return;
+            return 0;
         }
 
         let mut notify: Option<(String, String)> = None;
@@ -3255,6 +3318,65 @@ impl Hub {
                 p["limit"] = n;
             }
             self.publish(None, methods::EV_NOTIFY, p);
+        }
+        if kind_turn_end {
+            self.finalize_turn_checkpoint(&rt, ev.seq);
+        }
+        ev.seq
+    }
+
+    /// Capture the post-turn hidden git snapshot and compute exact per-turn diff stats before `after_turn()` runs
+    fn finalize_turn_checkpoint(&self, rt: &Arc<SessionRt>, turn_end_seq: i64) {
+        let Some(active) = rt.active_checkpoint.lock().unwrap().take() else {
+            return;
+        };
+        let (sid, cwd) = {
+            let i = rt.info.lock().unwrap();
+            (i.id.clone(), i.cwd.clone())
+        };
+        let end_ref = format!("{}{sid}/t{}-end", crate::gitops::CHECKPOINT_PREFIX, active.turn);
+        let Ok(Some(end_tree)) = crate::gitops::capture_checkpoint(&cwd, &end_ref) else {
+            crate::gitops::delete_ref(&cwd, &active.base_ref);
+            return;
+        };
+        let changed = if end_tree == active.base_tree {
+            None
+        } else {
+            match crate::gitops::diff_stat_refs(&cwd, &active.base_ref, &end_ref) {
+                Ok((fc, a, d)) if fc > 0 => Some((fc, a, d)),
+                _ => None,
+            }
+        };
+        let Some((files_changed, added, deleted)) = changed else {
+            crate::gitops::delete_refs(&cwd, &[active.base_ref, end_ref]);
+            return;
+        };
+        let mut trimmed_refs = Vec::new();
+        self.set_info_any(rt, |i| {
+            i.checkpoints.push(yi_proto::TurnCheckpoint {
+                turn: active.turn,
+                user_seq: active.user_seq,
+                turn_end_seq: Some(turn_end_seq),
+                base_ref: active.base_ref,
+                end_ref: Some(end_ref),
+                files_changed,
+                added,
+                deleted,
+            });
+            const MAX_CHECKPOINTS: usize = 200;
+            if i.checkpoints.len() > MAX_CHECKPOINTS {
+                let drop_n = i.checkpoints.len() - MAX_CHECKPOINTS;
+                for old in i.checkpoints.drain(0..drop_n) {
+                    trimmed_refs.push(old.base_ref);
+                    if let Some(er) = old.end_ref {
+                        trimmed_refs.push(er);
+                    }
+                }
+            }
+            true
+        });
+        if !trimmed_refs.is_empty() {
+            crate::gitops::delete_refs(&cwd, &trimmed_refs);
         }
     }
 
@@ -4062,6 +4184,7 @@ fn new_rt(info: SessionInfo) -> SessionRt {
         failover_tried: Mutex::new(vec![]),
         term_size: Mutex::new(None),
         qoder_plan: Mutex::new(None),
+        active_checkpoint: Mutex::new(None),
     }
 }
 
@@ -5017,6 +5140,7 @@ mod tests {
             append_system_prompt: None,
             account_id: None,
             account_label: None,
+            checkpoints: vec![],
         };
         let rt = new_rt(info);
         let (tx, rx) = mpsc::unbounded_channel();
@@ -5762,6 +5886,82 @@ mod tests {
         rt.info.lock().unwrap().status = SessionStatus::Idle;
         hub.send("s-clear", "fresh prompt", vec![], false, None).unwrap();
         assert!(matches!(rx2.try_recv(), Ok(AdapterCmd::Send(p)) if p.text == "fresh prompt"));
+    }
+
+    #[tokio::test]
+    async fn turn_checkpoints_capture_diff_and_cleanup() {
+        let d = tempfile::tempdir().unwrap();
+        let repo = d.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let run = |a: &[&str]| {
+            let st = std::process::Command::new("git")
+                .args(a)
+                .current_dir(&repo)
+                .env("GIT_OPTIONAL_LOCKS", "0")
+                .status()
+                .unwrap();
+            assert!(st.success(), "{a:?}");
+        };
+        run(&["init", "-q", "-b", "main"]);
+        run(&["config", "user.email", "t@t"]);
+        run(&["config", "user.name", "t"]);
+        run(&["config", "core.autocrlf", "false"]);
+        std::fs::write(repo.join("app.txt"), "v0\n").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-qm", "init"]);
+        let cwd = repo.to_string_lossy().to_string();
+
+        let sid = "00000000-0000-0000-0000-000000000001";
+        let hub = Hub::new(Store::open_memory().unwrap(), DaemonSettings::default());
+        let mut rx = live(&hub, sid, SessionMode::Structured, SessionStatus::Idle, 1);
+        hub.get(sid).unwrap().info.lock().unwrap().cwd = cwd.clone();
+
+        // Turn with no file changes should not record a checkpoint or leave refs behind
+        hub.send(sid, "Read-only question", vec![], false, None).unwrap();
+        assert!(matches!(rx.try_recv(), Ok(AdapterCmd::Send(_))));
+        hub.emit(sid, 0, EventBody::AssistantText { id: "a0".into(), text: "Just answering".into() });
+        hub.emit(sid, 0, EventBody::TurnEnd { stop_reason: Some("end_turn".into()), model: None });
+        assert!(hub.info(sid).unwrap().checkpoints.is_empty());
+
+        // Turn 1: edits app.txt -> v1
+        hub.send(sid, "First edit", vec![], false, None).unwrap();
+        assert!(matches!(rx.try_recv(), Ok(AdapterCmd::Send(_))));
+        std::fs::write(repo.join("app.txt"), "v1\n").unwrap();
+        hub.emit(sid, 0, EventBody::AssistantText { id: "a1".into(), text: "Updated to v1".into() });
+        hub.emit(sid, 0, EventBody::TurnEnd { stop_reason: Some("end_turn".into()), model: None });
+
+        // Turn 2: edits app.txt -> v2 and adds extra.txt
+        hub.send(sid, "Second edit", vec![], false, None).unwrap();
+        assert!(matches!(rx.try_recv(), Ok(AdapterCmd::Send(_))));
+        std::fs::write(repo.join("app.txt"), "v2\n").unwrap();
+        std::fs::write(repo.join("extra.txt"), "new file\n").unwrap();
+        hub.emit(sid, 0, EventBody::AssistantText { id: "a2".into(), text: "Updated to v2".into() });
+        hub.emit(sid, 0, EventBody::TurnEnd { stop_reason: Some("end_turn".into()), model: None });
+
+        let info = hub.info(sid).unwrap();
+        assert_eq!(info.checkpoints.len(), 2);
+        assert_eq!(info.checkpoints[0].turn, 1);
+        assert_eq!(info.checkpoints[0].files_changed, 1);
+        assert!(info.checkpoints[0].end_ref.is_some());
+        assert_eq!(info.checkpoints[1].turn, 2);
+        assert_eq!(info.checkpoints[1].files_changed, 2);
+        assert!(info.checkpoints[1].end_ref.is_some());
+
+        // Turn 2 diff only sees Turn 2's changes (v1 -> v2 + extra.txt)
+        let c2 = &info.checkpoints[1];
+        let diff = crate::gitops::ref_diff(&cwd, &c2.base_ref, c2.end_ref.as_deref().unwrap(), true, None).unwrap();
+        assert_eq!(diff["files"].as_array().unwrap().len(), 2);
+
+        // /clear removes all checkpoints and hidden refs
+        drop(rx);
+        hub.clear(sid).await.unwrap();
+        assert!(hub.info(sid).unwrap().checkpoints.is_empty());
+        let out = std::process::Command::new("git")
+            .args(["for-each-ref", "refs/yi/checkpoints/"])
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&out.stdout).trim().is_empty());
     }
 }
 

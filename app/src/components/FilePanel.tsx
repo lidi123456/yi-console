@@ -15,7 +15,7 @@ import { MergeDiff, oneSided, type MergeDiffHandle } from './MergeDiff';
 import { CsvView, ImageView, MdPreview, PdfView } from './FilePreview';
 import { GrepPanel } from './GrepPanel';
 import { QuickOpen, type QuickMode } from './QuickOpen';
-import { OPEN_CHANGES, OPEN_FILE, takeOpenChanges, takeOpenFile } from './SessionActions';
+import { OPEN_CHANGES, OPEN_FILE, takeOpenChanges, takeOpenFile, takeOpenTurn } from './SessionActions';
 import { BrowserPane, isWebTab, WEB_PREFIX, webTabFile, webTabTitle } from './Browser';
 import { AI_PREFIX, aiTabSession, AiBrowserPane, isAiTab, useAiBrowserBusy } from './AiBrowser';
 import { registerWebTabs } from './NativeWeb';
@@ -614,7 +614,23 @@ export function FilePanel({
   const [git, setGit] = useState<GitInfo | null>(() => gitCache.get(gitKey(hostId, cwd))?.git ?? null);
   const [worktrees, setWorktrees] = useState<WorktreeEntry[]>([]);
   const [newWorktree, setNewWorktree] = useState<WorktreeEntry | null>(null);
-  const [diffScope, setDiffScope] = useState<'uncommitted' | 'branch'>('uncommitted');
+  const sessInfo = useStore((st) => st.sessions[hostId]?.find((x) => x.id === sessionId));
+  const turnCheckpoints = useMemo(
+    () => (sessInfo?.checkpoints ?? []).filter((c) => c.filesChanged > 0 && !!c.endRef),
+    [sessInfo?.checkpoints],
+  );
+  const [diffScope, setDiffScope] = useState<'uncommitted' | 'branch' | 'turn'>('uncommitted');
+  const [selectedTurn, setSelectedTurn] = useState<number | null>(null);
+  const activeTurnCkpt = useMemo(() => {
+    if (!turnCheckpoints.length) return null;
+    if (selectedTurn != null) {
+      const exact = turnCheckpoints.find((c) => c.turn === selectedTurn);
+      if (exact) return exact;
+    }
+    return turnCheckpoints[turnCheckpoints.length - 1];
+  }, [turnCheckpoints, selectedTurn]);
+  const [turnDiff, setTurnDiff] = useState<{ baseRef: string; endRef: string; total?: number | null; files: Map<string, GitFile> } | null>(null);
+  const [turnDiffLoading, setTurnDiffLoading] = useState(false);
   const [branchBase, setBranchBase] = useState('');
   const [branchDiff, setBranchDiff] = useState<BranchDiffInfo | null>(null);
   const [branchDiffLoading, setBranchDiffLoading] = useState(false);
@@ -785,6 +801,35 @@ export function FilePanel({
     [hostId, cwd, branchBase],
   );
 
+  const loadTurnDiff = useCallback(
+    (baseRef: string, endRef: string) => {
+      setTurnDiffLoading(true);
+      rpc<{
+        repo: string | null;
+        baseRef?: string;
+        endRef?: string;
+        total?: number | null;
+        files: { path: string; status: string; diff: string; added?: number | null; deleted?: number | null }[];
+      }>(hostId, 'git.refDiff', { cwd, baseRef, endRef, diff: false })
+        .then((r) => {
+          setTurnDiffLoading(false);
+          if (!r.repo) {
+            setTurnDiff(null);
+            return;
+          }
+          const files = new Map<string, GitFile>();
+          const sep = sepOf(r.repo);
+          for (const f of r.files) {
+            const abs = join(r.repo, f.path.split('/').join(sep));
+            files.set(norm(abs), { ...f, path: abs, rel: f.path });
+          }
+          setTurnDiff({ baseRef, endRef, total: r.total, files });
+        })
+        .catch(() => setTurnDiffLoading(false));
+    },
+    [hostId, cwd],
+  );
+
   const loadBranches = useCallback(
     () =>
       rpc<BranchesResult>(hostId, 'git.branches', { cwd })
@@ -865,6 +910,16 @@ export function FilePanel({
   useEffect(() => {
     if (git && (diffScope === 'branch' || reviewOpen)) loadBranchDiff();
   }, [git, diffScope, branchBase, reviewOpen, loadBranchDiff]);
+  useEffect(() => {
+    if (diffScope === 'turn') {
+      if (!activeTurnCkpt?.endRef) {
+        setDiffScope('uncommitted');
+        setTurnDiff(null);
+      } else if (git) {
+        loadTurnDiff(activeTurnCkpt.baseRef, activeTurnCkpt.endRef);
+      }
+    }
+  }, [git, diffScope, activeTurnCkpt?.baseRef, activeTurnCkpt?.endRef, loadTurnDiff]);
   useEffect(() => {
     if (git && (commitOpen || view === 'changes')) void loadBranches();
   }, [git?.branch, commitOpen, view, loadBranches]); // eslint-disable-line react-hooks/exhaustive-deps
@@ -973,11 +1028,23 @@ export function FilePanel({
     }));
 
   const gitOf = (path: string) => git?.files.get(norm(path));
-  /** Active diff map for the current Changes scope: uncommitted vs HEAD, or branch vs merge-base */
-  const activeDiffFiles = diffScope === 'branch' && branchDiff ? branchDiff.files : git?.files;
+  /** Active diff map for the current Changes scope: uncommitted vs HEAD, branch vs merge-base, or per-turn checkpoint */
+  const activeDiffFiles =
+    diffScope === 'turn' && turnDiff
+      ? turnDiff.files
+      : diffScope === 'branch' && branchDiff
+        ? branchDiff.files
+        : git?.files;
   const diffGitOf = (path: string) => activeDiffFiles?.get(norm(path));
-  const diffCacheKey = (path: string) => `${diffScope === 'branch' ? branchDiff?.mergeBase ?? 'branch' : 'HEAD'}\n${norm(path)}`;
-  /** Changes to this file: in a git repo, working tree vs HEAD or branch vs merge-base; otherwise session tool edits */
+  const diffCacheKey = (path: string) =>
+    `${
+      diffScope === 'turn' && activeTurnCkpt?.endRef
+        ? `${activeTurnCkpt.baseRef}..${activeTurnCkpt.endRef}`
+        : diffScope === 'branch'
+          ? branchDiff?.mergeBase ?? 'branch'
+          : 'HEAD'
+    }\n${norm(path)}`;
+  /** Changes to this file: in a git repo, working tree vs HEAD, branch vs merge-base, or turn checkpoint; otherwise session tool edits */
   const diffOf = (path: string): FileDiff | null => {
     const g = diffGitOf(path);
     const d = g?.diff || fileDiffs[diffCacheKey(path)];
@@ -997,20 +1064,27 @@ export function FilePanel({
     if (!curKey || !curGit || curGit.diff || curDiffCacheKey in fileDiffs) return;
     const k = curDiffCacheKey;
     const req =
-      diffScope === 'branch'
-        ? rpc<{ files: { path: string; diff: string }[] }>(hostId, 'git.branchDiff', {
+      diffScope === 'turn' && activeTurnCkpt?.endRef
+        ? rpc<{ files: { path: string; diff: string }[] }>(hostId, 'git.refDiff', {
             cwd,
-            base: branchBase || undefined,
+            baseRef: activeTurnCkpt.baseRef,
+            endRef: activeTurnCkpt.endRef,
             paths: [curGit.rel],
           })
-        : rpc<{ files: { path: string; diff: string }[] }>(hostId, 'git.changes', { cwd, paths: [curGit.rel] });
+        : diffScope === 'branch'
+          ? rpc<{ files: { path: string; diff: string }[] }>(hostId, 'git.branchDiff', {
+              cwd,
+              base: branchBase || undefined,
+              paths: [curGit.rel],
+            })
+          : rpc<{ files: { path: string; diff: string }[] }>(hostId, 'git.changes', { cwd, paths: [curGit.rel] });
     req
       .then((r) => setFileDiffs((m) => ({ ...m, [k]: r.files.find((f) => f.path === curGit.rel)?.diff ?? '' })))
       .catch(() => setFileDiffs((m) => ({ ...m, [k]: '' })));
-  }, [curKey, curDiffCacheKey, curGit, fileDiffs, diffScope, branchBase]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [curKey, curDiffCacheKey, curGit, fileDiffs, diffScope, branchBase, activeTurnCkpt?.baseRef, activeTurnCkpt?.endRef]); // eslint-disable-line react-hooks/exhaustive-deps
   // Status unchanged but the content may have changed again: refetch the current file's diff in the background and swap it in when it arrives, without showing "loading"
   refreshCurDiff.current = () => {
-    if (!curKey || !curGit || !(curDiffCacheKey in fileDiffs)) return;
+    if (!curKey || !curGit || !(curDiffCacheKey in fileDiffs) || diffScope === 'turn') return;
     const k = curDiffCacheKey;
     const req =
       diffScope === 'branch'
@@ -1069,7 +1143,10 @@ export function FilePanel({
     const f: OpenFile | null =
       g && gitMark(g.status)[0] === 'D'
         ? { path, content: '', draft: '', binary: true, truncated: false, size: 0, modified: 0, rev: Date.now(), deleted: true }
-        : await readFile(path);
+        : (await readFile(path)) ??
+          (diffScope === 'turn' && g
+            ? { path, content: '', draft: '', binary: false, truncated: false, size: 0, modified: 0, rev: Date.now(), deleted: true }
+            : null);
     if (!f) return;
     setFile(f);
     setTabs((t) => (t.includes(path) ? t : [...t, path].slice(-30)));
@@ -1685,6 +1762,23 @@ export function FilePanel({
     );
   };
 
+  const openTurnMenu = (e: React.MouseEvent<HTMLElement>) => {
+    const r = e.currentTarget.getBoundingClientRect();
+    openMenu(
+      { clientX: r.left, clientY: r.bottom + 4 },
+      [...turnCheckpoints].reverse().map((c) => ({
+        label: tx('diffScopeTurnN', { n: c.turn }),
+        icon: 'history',
+        active: activeTurnCkpt?.turn === c.turn,
+        hint: `+${c.added} −${c.deleted}`,
+        run: () => {
+          setSelectedTurn(c.turn);
+          setDiffScope('turn');
+        },
+      })),
+    );
+  };
+
   const openWorktreeMenu = (e: React.MouseEvent<HTMLElement>) => {
     if (!onSwitchCwd) return;
     const r = e.currentTarget.getBoundingClientRect();
@@ -2128,19 +2222,28 @@ export function FilePanel({
     const r = norm(root);
     return [...branchDiff.files.keys()].filter((k) => k.startsWith(r + '/'));
   }, [branchDiff, root]);
+  const turnKeys = useMemo(() => {
+    if (!root || !turnDiff) return [];
+    const r = norm(root);
+    return [...turnDiff.files.keys()].filter((k) => k.startsWith(r + '/'));
+  }, [turnDiff, root]);
   const activeChangesGit: GitInfo | null = useMemo(() => {
+    if (diffScope === 'turn' && turnDiff && git) {
+      return { ...git, files: turnDiff.files, total: turnDiff.total };
+    }
     if (diffScope === 'branch' && branchDiff && git) {
       return { ...git, files: branchDiff.files, total: branchDiff.total };
     }
     return git;
-  }, [diffScope, branchDiff, git]);
+  }, [diffScope, turnDiff, branchDiff, git]);
   const allChanged = useMemo(() => {
     if (!root) return [];
+    if (diffScope === 'turn' && git) return turnKeys;
     if (diffScope === 'branch' && git) return branchKeys;
     const keys = git ? uncommittedKeys : gitReady ? [...touched.keys()] : [];
     const r = norm(root);
     return keys.filter((k) => k.startsWith(r + '/'));
-  }, [diffScope, git, branchKeys, uncommittedKeys, gitReady, touched, root]);
+  }, [diffScope, git, turnKeys, branchKeys, uncommittedKeys, gitReady, touched, root]);
   const changed = useMemo(() => {
     if (!root) return [];
     const r = norm(root);
@@ -2174,22 +2277,36 @@ export function FilePanel({
   };
   // "View changes": switch the side column to "Changes" and make sure it's visible; the editor keeps whatever it shows
   // (like VS Code's Source Control view). Taken on mount too, since a closed panel mounts after the event has fired
+  const autoOpenTurnRef = useRef<number | null>(null);
   useEffect(() => {
     const take = () => {
       if (!takeOpenChanges(hostId, sessionId)) return;
+      const reqTurn = takeOpenTurn(hostId, sessionId);
       forChanges.current = true;
       pickView('changes');
+      if (reqTurn != null) {
+        autoOpenTurnRef.current = reqTurn;
+        setSelectedTurn(reqTurn);
+        setDiffScope('turn');
+      }
       setTreeOpen(true);
       loadGit();
     };
     take();
     const on = (e: Event) => {
-      const d = (e as CustomEvent<{ hostId: string; sessionId: string }>).detail;
+      const d = (e as CustomEvent<{ hostId: string; sessionId: string; turn?: number }>).detail;
       if (d.hostId === hostId && d.sessionId === sessionId) take();
     };
     window.addEventListener(OPEN_CHANGES, on);
     return () => window.removeEventListener(OPEN_CHANGES, on);
   }, [hostId, sessionId, loadGit]); // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => {
+    if (autoOpenTurnRef.current == null || diffScope !== 'turn' || !activeTurnCkpt || activeTurnCkpt.turn !== autoOpenTurnRef.current) return;
+    if (!turnDiff || turnDiff.endRef !== activeTurnCkpt.endRef || !turnDiff.files.size) return;
+    autoOpenTurnRef.current = null;
+    const first = [...turnDiff.files.values()][0];
+    if (first) void openFileRef.current(first.path, true);
+  }, [diffScope, activeTurnCkpt, turnDiff]);
   const showTree = treeOpen || !file;
   // On mobile, after opening a file from the tree, back returns to the tree first; pressing again closes the whole file panel
   useBack(!!file && !treeOpen && window.matchMedia('(max-width: 760px)').matches, () => setTreeOpen(true));
@@ -2211,15 +2328,23 @@ export function FilePanel({
   const viewing = compare ? 'compare' : showDiff ? 'diff' : 'file';
 
   // ---------- Full-file diff (VS Code style): both whole files, falling back to the hunk-only diff ----------
-  /** Revisions to fetch for the current view: working tree vs HEAD (or merge-base in branch diff mode), commit vs its first parent */
-  const diffBaseRev = diffScope === 'branch' && branchDiff?.mergeBase ? branchDiff.mergeBase : 'HEAD';
+  /** Revisions to fetch for the current view: working tree vs HEAD/merge-base, turn checkpoint pair, or commit vs parent */
+  const isTurnSnapshot = diffScope === 'turn' && !!activeTurnCkpt?.endRef;
+  const diffBaseRev = isTurnSnapshot
+    ? activeTurnCkpt!.baseRef
+    : diffScope === 'branch' && branchDiff?.mergeBase
+      ? branchDiff.mergeBase
+      : 'HEAD';
+  const diffEndRev = isTurnSnapshot ? activeTurnCkpt!.endRef! : '';
   const blobSpecs: [string, string][] = !file
     ? []
     : file.commit
       ? [[`${file.commit.hash}^`, file.commit.rel], [file.commit.hash, file.commit.rel]]
-      : viewing === 'diff' && curGit && !file.truncated && (!file.binary || file.deleted)
-        ? [[diffBaseRev, curGit.rel]]
-        : [];
+      : viewing === 'diff' && curGit && isTurnSnapshot
+        ? [[diffBaseRev, curGit.rel], [diffEndRev, curGit.rel]]
+        : viewing === 'diff' && curGit && !file.truncated && (!file.binary || file.deleted)
+          ? [[diffBaseRev, curGit.rel]]
+          : [];
   const blobWant = blobSpecs.map(([r, p]) => blobKey(r, p)).join('|');
   useEffect(() => {
     for (const [r, p] of blobSpecs) {
@@ -2245,8 +2370,8 @@ export function FilePanel({
     });
     if (texts.some((x) => x === null)) return null;
     if (texts.some((x) => x === undefined)) return undefined;
-    // Working tree: the editor's current text, so unsaved edits show too (as in VS Code); a deleted file is empty
-    return file.commit ? { a: texts[0]!, b: texts[1]! } : { a: texts[0]!, b: file.deleted ? '' : file.draft };
+    // Historical snapshot (commit or turn checkpoint): both sides from git.blob; working tree: editor draft
+    return file.commit || isTurnSnapshot ? { a: texts[0]!, b: texts[1]! } : { a: texts[0]!, b: file.deleted ? '' : file.draft };
   })();
   const flipCollapse = () => {
     lsSet('wp-diff-fold', !diffCollapse);
@@ -2260,7 +2385,7 @@ export function FilePanel({
       <div className="wp-diff wp-diff-full">
         <MergeDiff
           ref={mergeRef}
-          docKey={file ? `${file.path}#${compare?.path ?? ''}#${diffBaseRev}` : name}
+          docKey={file ? `${file.path}#${compare?.path ?? ''}#${diffBaseRev}#${diffEndRev}` : name}
           a={f.a}
           b={f.b}
           filename={name}
@@ -2311,7 +2436,6 @@ export function FilePanel({
     </div>
   );
 
-  const sessInfo = useStore((st) => st.sessions[hostId]?.find((x) => x.id === sessionId));
   const aiBrowserOk = !!sessInfo && canUseBrowser(hostStatus(hostId).hello, sessInfo);
   const toggleHidden = () => (lsSet('wp-hidden', !hidden), setHidden(!hidden));
   const newMenu = (e: React.MouseEvent<HTMLElement>) => {
@@ -2492,6 +2616,22 @@ export function FilePanel({
                   </span>
                   {diffScope === 'branch' && <Icon name="down" size={10} />}
                 </button>
+                {turnCheckpoints.length > 0 && activeTurnCkpt && (
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected={diffScope === 'turn'}
+                    className={`wp-scope-tab ${diffScope === 'turn' ? 'active' : ''}`}
+                    title={diffScope === 'turn' ? tx('changeTurnCheckpoint') : tx('diffScopeTurnN', { n: activeTurnCkpt.turn })}
+                    onClick={(e) => {
+                      if (diffScope === 'turn' && turnCheckpoints.length > 1) openTurnMenu(e);
+                      else setDiffScope('turn');
+                    }}
+                  >
+                    <span>{tx('diffScopeTurnN', { n: activeTurnCkpt.turn })}</span>
+                    {diffScope === 'turn' && turnCheckpoints.length > 1 && <Icon name="down" size={10} />}
+                  </button>
+                )}
               </div>
               {totals && changed.length > 0 && <LineStat a={totals.a} d={totals.d} />}
             </div>
@@ -2570,7 +2710,10 @@ export function FilePanel({
                   {search.truncated && <div className="wp-limit">{tx('showingTheFirstResultsNarrow', { length: search.paths.length })}</div>}
                 </>
               )
-            ) : view === 'changes' && (!gitReady || (diffScope === 'branch' && branchDiffLoading && !branchDiff)) ? (
+            ) : view === 'changes' &&
+              (!gitReady ||
+                (diffScope === 'branch' && branchDiffLoading && !branchDiff) ||
+                (diffScope === 'turn' && turnDiffLoading && !turnDiff)) ? (
               <div className="wp-tip">{tx('readingChanges')}</div>
             ) : view === 'changes' && (git || touched.size > 0) ? (
               <>
@@ -2799,7 +2942,7 @@ export function FilePanel({
   ) : viewing === 'diff' ? (
     full ? (
       mergeView(full, baseName(file.path), {
-        editable: !file.deleted && !file.truncated && !file.notUtf8 && !file.binary,
+        editable: !isTurnSnapshot && !file.deleted && !file.truncated && !file.notUtf8 && !file.binary,
         refPath: file.path,
       })
     ) : full === undefined ? (
@@ -3372,7 +3515,7 @@ export function FilePanel({
           cwd={cwd}
           parentSessionId={sessionId}
           currentTool={sessInfo?.tool}
-          defaultScope={diffScope}
+          defaultScope={diffScope === 'branch' ? 'branch' : 'uncommitted'}
           branchBase={effBranchBase || undefined}
           branchMergeBase={branchDiff?.mergeBase || undefined}
           uncommittedCount={uncommittedKeys.length}

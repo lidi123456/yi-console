@@ -104,5 +104,8 @@
   "selectTextHint": "Long-press and drag to select",
   "copySelection": "Copy selection",
   "copyAll": "Copy all",
-  "close": "Close"
+  "close": "Close",
+  "viewTurnDiff": "View changes from this turn",
+  "turnFilesChanged_one": "{{count}} file",
+  "turnFilesChanged_other": "{{count}} files"
 }

@@ -263,5 +263,7 @@
   "selectAtLeastOneFinding": "Select at least one finding",
   "reviewSendBackHeader": "Please review and fix the following {{n}} finding(s) reported by {{tool}}:",
   "reviewSendBackRawHeader": "Please address the valid findings from {{tool}}'s code review below:",
-  "reviewInsertedToChat": "Inserted into main chat composer"
+  "reviewInsertedToChat": "Inserted into main chat composer",
+  "diffScopeTurnN": "Turn {{n}}",
+  "changeTurnCheckpoint": "Switch to another turn's diff"
 }

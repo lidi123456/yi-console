@@ -14,21 +14,94 @@ const STATUS_MAX: usize = 10_000;
 const IGNORED_MAX: usize = 10_000;
 /// New files beyond this many don't get their lines counted (that reads each file)
 const COUNT_MAX: usize = 2_000;
+/// Prefix for hidden per-turn checkpoint git refs (never appears in `git branch` or `git log`)
+pub const CHECKPOINT_PREFIX: &str = "refs/yi/checkpoints/";
+/// Skip capturing a checkpoint when untracked non-ignored files exceed these limits
+const CHECKPOINT_MAX_UNTRACKED_FILES: usize = 2_000;
+const CHECKPOINT_MAX_UNTRACKED_BYTES: u64 = 50 * 1024 * 1024;
 
-fn git(cwd: &Path, args: &[&str]) -> Result<std::process::Output> {
+fn git_cmd(cwd: &Path, args: &[&str]) -> Command {
     let mut cmd = Command::new("git");
     cmd.args(["-c", "core.quotepath=false"]).args(args).current_dir(cwd);
     // Read-only commands like status may otherwise take index.lock to refresh the index; the panel polls status, and an
     // agent's git commit landing at the same moment would fail with "index.lock exists" (VS Code sets the same)
     cmd.env("GIT_OPTIONAL_LOCKS", "0");
+    cmd.env("GIT_TERMINAL_PROMPT", "0");
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(0x0800_0000);
     }
+    cmd
+}
+
+fn git(cwd: &Path, args: &[&str]) -> Result<std::process::Output> {
+    git_cmd(cwd, args)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| anyhow!("运行 git 失败（这台机器装了 git 吗）: {e}"))
+}
+
+fn git_env(cwd: &Path, args: &[&str], envs: &[(&str, &str)]) -> Result<std::process::Output> {
+    let mut cmd = git_cmd(cwd, args);
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
     cmd.stdin(Stdio::null())
         .output()
         .map_err(|e| anyhow!("运行 git 失败（这台机器装了 git 吗）: {e}"))
+}
+
+fn git_env_ok(cwd: &Path, args: &[&str], envs: &[(&str, &str)]) -> Result<String> {
+    let out = git_env(cwd, args, envs)?;
+    if !out.status.success() {
+        bail!("{}", String::from_utf8_lossy(&out.stderr).trim());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+fn git_stdin(cwd: &Path, args: &[&str], envs: &[(&str, &str)], input: &[u8]) -> Result<std::process::Output> {
+    use std::io::Write;
+    let mut cmd = git_cmd(cwd, args);
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    let mut child = cmd
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| anyhow!("运行 git 失败（这台机器装了 git 吗）: {e}"))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(input);
+    }
+    child
+        .wait_with_output()
+        .map_err(|e| anyhow!("等待 git 执行失败: {e}"))
+}
+
+/// Validate a hidden checkpoint ref name (`refs/yi/checkpoints/<sid>/<name>`)
+pub fn is_valid_checkpoint_ref(rev: &str) -> bool {
+    let Some(rest) = rev.strip_prefix(CHECKPOINT_PREFIX) else {
+        return false;
+    };
+    if rest.is_empty() || rest.len() > 160 || rest.contains("..") {
+        return false;
+    }
+    let mut parts = rest.split('/');
+    let Some(sid) = parts.next() else { return false };
+    let Some(name) = parts.next() else { return false };
+    if parts.next().is_some() {
+        return false;
+    }
+    let ok_seg = |s: &str| {
+        !s.is_empty()
+            && !s.starts_with(['-', '.'])
+            && !s.ends_with('.')
+            && !s.ends_with(".lock")
+            && s.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+    };
+    ok_seg(sid) && ok_seg(name)
 }
 
 fn git_ok(cwd: &Path, args: &[&str]) -> Result<String> {
@@ -297,12 +370,13 @@ pub fn show(cwd: &str, hash: &str, only: Option<&[String]>) -> Result<Value> {
 /// Size limit for git.blob (same as fs.read's text limit): larger files fall back to the hunk-only diff
 const BLOB_MAX: u64 = 1024 * 1024;
 
-/// A file's full content at `rev` ("HEAD", a commit hash, or a hash + "^" for its first parent).
+/// A file's full content at `rev` ("HEAD", a commit hash, a hash + "^" for its first parent, or a hidden checkpoint ref).
 /// A path missing at that revision (added / deleted files, or a root commit's parent) gives exists=false
 pub fn blob(cwd: &str, path: &str, rev: &str) -> Result<Value> {
     check_paths(&[path.to_string()])?;
     let hash = rev.strip_suffix('^').unwrap_or(rev);
-    if rev != "HEAD" && (hash.len() < 4 || hash.len() > 64 || !hash.bytes().all(|c| c.is_ascii_hexdigit())) {
+    let is_hash = hash.len() >= 4 && hash.len() <= 64 && hash.bytes().all(|c| c.is_ascii_hexdigit());
+    if rev != "HEAD" && !is_hash && !is_valid_checkpoint_ref(rev) {
         bail!("提交号无效: {rev}");
     }
     let dir = crate::paths::expand(cwd);
@@ -857,6 +931,229 @@ pub fn branch_diff(cwd: &str, base: Option<&str>, with_diff: bool, only: Option<
     }))
 }
 
+/// RAII guard for a temporary `GIT_INDEX_FILE` so checkpoints never touch the repository's real `.git/index`
+struct TempIndex(std::path::PathBuf);
+
+impl TempIndex {
+    fn new() -> Self {
+        let p = std::env::temp_dir().join(format!("yi-ckpt-idx-{}", uuid::Uuid::new_v4().simple()));
+        let _ = std::fs::remove_file(&p);
+        Self(p)
+    }
+
+    fn as_str(&self) -> String {
+        self.0.to_string_lossy().into_owned()
+    }
+}
+
+impl Drop for TempIndex {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Build a git tree OID representing the current working tree (tracked + non-ignored untracked files)
+/// without touching the repository's real `.git/index`. Returns `None` if untracked files exceed safety caps.
+fn write_working_tree(root: &Path) -> Result<Option<String>> {
+    if let Ok(untracked) = git_ok(root, &["ls-files", "--others", "--exclude-standard", "-z"]) {
+        let mut count = 0usize;
+        let mut bytes = 0u64;
+        for rel in untracked.split('\0').filter(|s| !s.is_empty()) {
+            count += 1;
+            if count > CHECKPOINT_MAX_UNTRACKED_FILES {
+                return Ok(None);
+            }
+            if let Ok(meta) = std::fs::symlink_metadata(root.join(rel)) {
+                if meta.is_file() {
+                    bytes = bytes.saturating_add(meta.len());
+                    if bytes > CHECKPOINT_MAX_UNTRACKED_BYTES {
+                        return Ok(None);
+                    }
+                }
+            }
+        }
+    }
+    let tmp = TempIndex::new();
+    let idx = tmp.as_str();
+    let env = [("GIT_INDEX_FILE", idx.as_str())];
+    if git(root, &["rev-parse", "--verify", "-q", "HEAD"])?.status.success() {
+        let _ = git_env(root, &["read-tree", "HEAD"], &env)?;
+    }
+    let add = git_env(root, &["add", "-A", "--", "."], &env)?;
+    if !add.status.success() {
+        bail!("{}", String::from_utf8_lossy(&add.stderr).trim());
+    }
+    let tree = git_env_ok(root, &["write-tree"], &env)?.trim().to_string();
+    Ok(Some(tree))
+}
+
+/// Capture the current working tree (including non-ignored untracked files) into a hidden git ref
+/// under `refs/yi/checkpoints/<sid>/<name>`. Returns `Ok(None)` for non-git directories or oversized untracked trees.
+pub fn capture_checkpoint(cwd: &str, ref_name: &str) -> Result<Option<String>> {
+    if !is_valid_checkpoint_ref(ref_name) {
+        bail!("快照引用无效: {ref_name}");
+    }
+    let dir = crate::paths::expand(cwd);
+    let Some(root) = repo_root(&dir) else {
+        return Ok(None);
+    };
+    let Some(tree) = write_working_tree(&root)? else {
+        return Ok(None);
+    };
+    let commit_env = [
+        ("GIT_AUTHOR_NAME", "Yi Console"),
+        ("GIT_AUTHOR_EMAIL", "checkpoint@yi-console.local"),
+        ("GIT_COMMITTER_NAME", "Yi Console"),
+        ("GIT_COMMITTER_EMAIL", "checkpoint@yi-console.local"),
+    ];
+    let commit = git_env_ok(&root, &["commit-tree", &tree, "-m", "yi-checkpoint"], &commit_env)?
+        .trim()
+        .to_string();
+    git_ok(&root, &["update-ref", ref_name, &commit])?;
+    Ok(Some(tree))
+}
+
+/// Exact `(files_changed, added_lines, deleted_lines)` between two checkpoint refs
+pub fn diff_stat_refs(cwd: &str, base_ref: &str, end_ref: &str) -> Result<(u32, u64, u64)> {
+    if !is_valid_checkpoint_ref(base_ref) || !is_valid_checkpoint_ref(end_ref) {
+        bail!("快照引用无效");
+    }
+    let dir = crate::paths::expand(cwd);
+    let Some(root) = repo_root(&dir) else {
+        return Ok((0, 0, 0));
+    };
+    let out = git_ok(&root, &["diff", "--numstat", "-z", "--no-renames", base_ref, end_ref])?;
+    let mut files = 0u32;
+    let mut added = 0u64;
+    let mut deleted = 0u64;
+    for rec in out.split('\0').filter(|s| !s.is_empty()) {
+        let mut it = rec.splitn(3, '\t');
+        if let (Some(a), Some(d), Some(_path)) = (it.next(), it.next(), it.next()) {
+            files = files.saturating_add(1);
+            added = added.saturating_add(a.parse::<u64>().unwrap_or(0));
+            deleted = deleted.saturating_add(d.parse::<u64>().unwrap_or(0));
+        }
+    }
+    Ok((files, added, deleted))
+}
+
+/// Diff between two hidden checkpoint refs (`base_ref..end_ref`), used by the per-turn Diff view
+pub fn ref_diff(cwd: &str, base_ref: &str, end_ref: &str, with_diff: bool, only: Option<&[String]>) -> Result<Value> {
+    if let Some(o) = only {
+        check_paths(o)?;
+    }
+    if !is_valid_checkpoint_ref(base_ref) || !is_valid_checkpoint_ref(end_ref) {
+        bail!("快照引用无效");
+    }
+    let dir = crate::paths::expand(cwd);
+    let Some(root) = repo_root(&dir) else {
+        return Ok(json!({ "repo": null, "baseRef": base_ref, "endRef": end_ref, "files": [] }));
+    };
+    if !git(&root, &["rev-parse", "--verify", "-q", &format!("{base_ref}^{{commit}}")])?.status.success()
+        || !git(&root, &["rev-parse", "--verify", "-q", &format!("{end_ref}^{{commit}}")])?.status.success()
+    {
+        return Ok(json!({ "repo": root.display().to_string(), "baseRef": base_ref, "endRef": end_ref, "missing": true, "files": [] }));
+    }
+
+    let mut stats = std::collections::HashMap::new();
+    if let Ok(out) = git_ok(&root, &["diff", "--numstat", "-z", "--no-renames", base_ref, end_ref]) {
+        for rec in out.split('\0').filter(|s| !s.is_empty()) {
+            let mut it = rec.splitn(3, '\t');
+            if let (Some(a), Some(d), Some(path)) = (it.next(), it.next(), it.next()) {
+                stats.insert(path.to_string(), (a.parse::<u64>().ok(), d.parse::<u64>().ok()));
+            }
+        }
+    }
+
+    let mut entries: Vec<(String, String)> = Vec::new();
+    let names = git_ok(&root, &["diff", "--name-status", "-z", "--no-renames", base_ref, end_ref])?;
+    let mut parts = names.split('\0').filter(|s| !s.is_empty());
+    while let (Some(code), Some(path)) = (parts.next(), parts.next()) {
+        let mapped = if code == "A" { "new" } else { code };
+        entries.push((path.to_string(), mapped.to_string()));
+    }
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let total = entries.len();
+    let mut files = Vec::new();
+    for (path, code) in entries {
+        if only.is_some_and(|o| !o.iter().any(|x| x == &path)) || files.len() >= STATUS_MAX {
+            continue;
+        }
+        let diff = if !with_diff {
+            String::new()
+        } else {
+            let d = git_ok(&root, &["diff", base_ref, end_ref, "--no-color", "--", &path]).unwrap_or_default();
+            if d.len() > DIFF_MAX { String::new() } else { d }
+        };
+        let (added, deleted) = stats.get(&path).copied().unwrap_or((None, None));
+        files.push(json!({
+            "path": path,
+            "status": code,
+            "diff": diff,
+            "added": added,
+            "deleted": deleted,
+        }));
+    }
+
+    Ok(json!({
+        "repo": root.display().to_string(),
+        "baseRef": base_ref,
+        "endRef": end_ref,
+        "total": if only.is_none() && total > files.len() { Some(total) } else { None },
+        "files": files,
+    }))
+}
+
+/// Delete a single hidden checkpoint ref if it exists
+pub fn delete_ref(cwd: &str, ref_name: &str) {
+    if !is_valid_checkpoint_ref(ref_name) {
+        return;
+    }
+    let dir = crate::paths::expand(cwd);
+    if let Some(root) = repo_root(&dir) {
+        let _ = git(&root, &["update-ref", "-d", ref_name]);
+    }
+}
+
+/// Delete a batch of hidden checkpoint refs in one `git update-ref --stdin` call
+pub fn delete_refs(cwd: &str, ref_names: &[String]) {
+    let valid: Vec<&str> = ref_names.iter().map(String::as_str).filter(|r| is_valid_checkpoint_ref(r)).collect();
+    if valid.is_empty() {
+        return;
+    }
+    let dir = crate::paths::expand(cwd);
+    let Some(root) = repo_root(&dir) else {
+        return;
+    };
+    let mut script = String::new();
+    for r in valid {
+        script.push_str("delete ");
+        script.push_str(r);
+        script.push('\n');
+    }
+    let _ = git_stdin(&root, &["update-ref", "--stdin"], &[], script.as_bytes());
+}
+
+/// Delete all hidden checkpoint refs belonging to a session (`refs/yi/checkpoints/<sid>/*`)
+pub fn delete_session_checkpoints(cwd: &str, sid: &str) {
+    if sid.is_empty() || !sid.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-')) {
+        return;
+    }
+    let dir = crate::paths::expand(cwd);
+    let Some(root) = repo_root(&dir) else {
+        return;
+    };
+    let prefix = format!("{CHECKPOINT_PREFIX}{sid}/");
+    let Ok(out) = git_ok(&root, &["for-each-ref", "--format=%(refname)", &prefix]) else {
+        return;
+    };
+    let refs: Vec<String> = out.lines().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string).collect();
+    if !refs.is_empty() {
+        delete_refs(cwd, &refs);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1154,5 +1451,65 @@ mod tests {
         let p2 = push(&cwd, None, None, true).unwrap();
         assert_eq!(p2["branch"], "feat/demo");
         assert!(branch_diff(&cwd, Some("--bad"), false, None).is_err());
+    }
+
+    #[test]
+    fn checkpoint_capture_diff_and_preserves_real_index() {
+        let d = tempfile::tempdir().unwrap();
+        let repo = d.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let run = |a: &[&str]| assert!(git(&repo, a).unwrap().status.success(), "{a:?}");
+        run(&["init", "-q", "-b", "main"]);
+        run(&["config", "user.email", "t@t"]);
+        run(&["config", "user.name", "t"]);
+        run(&["config", "core.autocrlf", "false"]);
+        std::fs::write(repo.join("a.txt"), "line1\nline2\n").unwrap();
+        std::fs::write(repo.join("staged.txt"), "before\n").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-qm", "init"]);
+
+        // Stage a change in the real .git/index so we verify checkpoints never disturb staged changes
+        std::fs::write(repo.join("staged.txt"), "staged-v2\n").unwrap();
+        run(&["add", "staged.txt"]);
+
+        let cwd = repo.to_string_lossy().to_string();
+        let r_base = "refs/yi/checkpoints/s1/t1-base";
+        let r_end = "refs/yi/checkpoints/s1/t1-end";
+        let t_base = capture_checkpoint(&cwd, r_base).unwrap().unwrap();
+
+        // Simulate an AI turn editing a.txt and creating an untracked nested file
+        std::fs::write(repo.join("a.txt"), "line1\nline2-edited\nline3\n").unwrap();
+        std::fs::create_dir_all(repo.join("sub")).unwrap();
+        std::fs::write(repo.join("sub/new.txt"), "hello\nworld\n").unwrap();
+
+        let t_end = capture_checkpoint(&cwd, r_end).unwrap().unwrap();
+        assert_ne!(t_base, t_end);
+
+        // Real staged index must be untouched
+        let cached = git_ok(&repo, &["diff", "--cached", "--name-only"]).unwrap();
+        assert_eq!(cached.trim(), "staged.txt");
+
+        // Exact turn diff stats & ref_diff
+        let (fc, add, del) = diff_stat_refs(&cwd, r_base, r_end).unwrap();
+        assert_eq!((fc, add, del), (2, 4, 1));
+        let rd = ref_diff(&cwd, r_base, r_end, true, None).unwrap();
+        let files = rd["files"].as_array().unwrap();
+        assert_eq!(files.len(), 2);
+        let nf = files.iter().find(|f| f["path"] == "sub/new.txt").unwrap();
+        assert_eq!(nf["status"], "new");
+        assert!(nf["diff"].as_str().unwrap().contains("+hello"));
+
+        // git.blob reads hidden checkpoint refs cleanly
+        let b_old = blob(&cwd, "a.txt", r_base).unwrap();
+        let b_new = blob(&cwd, "a.txt", r_end).unwrap();
+        assert_eq!(b_old["text"], "line1\nline2\n");
+        assert_eq!(b_new["text"], "line1\nline2-edited\nline3\n");
+        let b_missing = blob(&cwd, "sub/new.txt", r_base).unwrap();
+        assert_eq!(b_missing["exists"], false);
+
+        // Cleanup removes all refs for s1
+        delete_session_checkpoints(&cwd, "s1");
+        assert!(!git(&repo, &["rev-parse", "--verify", "-q", r_base]).unwrap().status.success());
+        assert!(!git(&repo, &["rev-parse", "--verify", "-q", r_end]).unwrap().status.success());
     }
 }

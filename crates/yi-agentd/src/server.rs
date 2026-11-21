@@ -758,6 +758,14 @@ pub async fn dispatch(
             let only: Option<Vec<String>> = p["paths"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect());
             tokio::task::spawn_blocking(move || crate::gitops::branch_diff(&cwd, base.as_deref(), with_diff, only.as_deref())).await??
         }
+        GIT_REF_DIFF => {
+            let cwd = s(&p, "cwd")?.to_string();
+            let base_ref = s(&p, "baseRef")?.to_string();
+            let end_ref = s(&p, "endRef")?.to_string();
+            let with_diff = p["diff"].as_bool().unwrap_or(true);
+            let only: Option<Vec<String>> = p["paths"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect());
+            tokio::task::spawn_blocking(move || crate::gitops::ref_diff(&cwd, &base_ref, &end_ref, with_diff, only.as_deref())).await??
+        }
         FS_SEARCH => {
             let root = s(&p, "root")?.to_string();
             let q = p["query"].as_str().unwrap_or("").to_string();

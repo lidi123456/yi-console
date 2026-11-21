@@ -263,5 +263,7 @@
   "selectAtLeastOneFinding": "请至少勾选一条审阅意见",
   "reviewSendBackHeader": "请根据 {{tool}} 的代码审阅意见，逐项核实并修复以下 {{n}} 个问题：",
   "reviewSendBackRawHeader": "请参考以下 {{tool}} 的代码审阅意见并修复合理问题：",
-  "reviewInsertedToChat": "已填入主会话输入框"
+  "reviewInsertedToChat": "已填入主会话输入框",
+  "diffScopeTurnN": "第 {{n}} 轮",
+  "changeTurnCheckpoint": "切换查看其他轮次的改动"
 }

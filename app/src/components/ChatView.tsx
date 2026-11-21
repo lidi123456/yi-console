@@ -8,7 +8,7 @@ import { parseContextMessage } from '../contextRefs';
 import { type ImgCtx } from '../chatImages';
 import { getT, isEn, trErr, useLang } from '../i18n';
 import { rpc } from '../transport';
-import { TOOL_LABEL, type FileDiff, type HubEvent, type ImageRef, type MemoryEntry, type MemoryEvent, type MemoryListResponse, type PermissionOption, type PlanEntry, type Question, type QuestionAnswer, type SessionInfo, type Usage } from '../types';
+import { TOOL_LABEL, type FileDiff, type HubEvent, type ImageRef, type MemoryEntry, type MemoryEvent, type MemoryListResponse, type PermissionOption, type PlanEntry, type Question, type QuestionAnswer, type SessionInfo, type TurnCheckpoint, type Usage } from '../types';
 import { clock, fmtTokens, isMobile, lsGet, lsSet } from '../util';
 import { writeClipboard } from '../clipboard';
 import { errorToast, navigate, toast, useStore } from '../store';
@@ -67,6 +67,7 @@ type Item =
   | {
       k: 'turn';
       key: string;
+      seq: number;
       ms: number | null;
       ts: number;
       usage: Usage | null;
@@ -371,6 +372,7 @@ function buildItems(events: HubEvent[], hideCompactCmd = false): Item[] {
         items.push({
           k: 'turn',
           key,
+          seq: e.seq,
           ms: turnStart != null ? e.ts - turnStart : null,
           ts: e.ts,
           usage: turnUsage,
@@ -554,7 +556,17 @@ function SelectTextModal({ text, onClose }: { text: string; onClose: () => void 
 }
 
 /** The line under each reply: duration, tokens, cost, tool call count, model, plus copying the whole turn */
-function TurnFooter({ it, onSelectText }: { it: Item & { k: 'turn' }; onSelectText?: (text: string) => void }) {
+function TurnFooter({
+  it,
+  checkpoint,
+  onOpenTurnDiff,
+  onSelectText,
+}: {
+  it: Item & { k: 'turn' };
+  checkpoint?: TurnCheckpoint;
+  onOpenTurnDiff?: (turn: number) => void;
+  onSelectText?: (text: string) => void;
+}) {
   const u = it.usage;
   const parts: string[] = [];
   if (it.ms != null && it.ms >= 0) parts.push(fmtMs(it.ms));
@@ -574,6 +586,13 @@ function TurnFooter({ it, onSelectText }: { it: Item & { k: 'turn' }; onSelectTe
     <div className="turn-foot" title={tip}>
       {it.reason && <span className="attn-text">{it.reason}</span>}
       <span>{parts.join(' · ')}</span>
+      {checkpoint && checkpoint.filesChanged > 0 && checkpoint.endRef && onOpenTurnDiff && (
+        <button type="button" className="turn-ckpt-btn" title={t('viewTurnDiff')} onClick={() => onOpenTurnDiff(checkpoint.turn)}>
+          <span>{t('turnFilesChanged', { count: checkpoint.filesChanged })}</span>
+          <span className="ls-a">+{checkpoint.added}</span>
+          <span className="ls-d">−{checkpoint.deleted}</span>
+        </button>
+      )}
       <span className="turn-time">{clock(it.ts)}</span>
       {it.text && (
         <>
@@ -1843,10 +1862,14 @@ function fullTime(ms: number) {
 function ModernTurnFooter({
   it,
   latest,
+  checkpoint,
+  onOpenTurnDiff,
   onSelectText,
 }: {
   it: Item & { k: 'turn' };
   latest: boolean;
+  checkpoint?: TurnCheckpoint;
+  onOpenTurnDiff?: (turn: number) => void;
   onSelectText?: (text: string) => void;
 }) {
   useLang();
@@ -1902,6 +1925,13 @@ function ModernTurnFooter({
           {parts.join(' · ')}
         </span>
       )}
+      {checkpoint && checkpoint.filesChanged > 0 && checkpoint.endRef && onOpenTurnDiff && (
+        <button type="button" className="turn-ckpt-btn" title={t('viewTurnDiff')} onClick={() => onOpenTurnDiff(checkpoint.turn)}>
+          <span>{t('turnFilesChanged', { count: checkpoint.filesChanged })}</span>
+          <span className="ls-a">+{checkpoint.added}</span>
+          <span className="ls-d">−{checkpoint.deleted}</span>
+        </button>
+      )}
       <span className="m-act-time">{fullTime(it.ts)}</span>
     </div>
   );
@@ -1927,6 +1957,7 @@ export function ChatView({
   onPromptScrollState,
   pendingOutside,
   skippedAsks,
+  onOpenTurnDiff,
 }: {
   events: HubEvent[];
   live: Map<string, string>;
@@ -1954,10 +1985,19 @@ export function ChatView({
   pendingOutside?: boolean;
   /** Async questions (by id) the user skipped */
   skippedAsks?: string[];
+  /** Open the file panel scoped to a completed turn's checkpoint diff */
+  onOpenTurnDiff?: (turn: number) => void;
 }) {
   const hideCompactCmd = info?.tool === 'claude' || info?.tool === 'codex' || info?.tool === 'cursor' || info?.tool === 'antigravity';
   const [, lang] = useLang();
   const items = useMemo(() => buildItems(events, hideCompactCmd), [events, events.length, hideCompactCmd, lang]);
+  const ckptByEndSeq = useMemo(() => {
+    const byEnd = new Map<number, TurnCheckpoint>();
+    for (const c of info?.checkpoints ?? []) {
+      if (c.turnEndSeq != null) byEnd.set(c.turnEndSeq, c);
+    }
+    return byEnd;
+  }, [info?.checkpoints]);
   const [limit, setLimit] = useState(PAGE);
   const ref = useRef<HTMLDivElement>(null);
   const stick = useRef(true);
@@ -2367,12 +2407,27 @@ export function ChatView({
               return <PermissionCard key={it.key} it={it} onAnswer={onAnswer} />;
             case 'plan':
               return <Plan key={it.key} plan={it.plan} busy={!!busy} />;
-            case 'turn':
+            case 'turn': {
+              const ckpt = ckptByEndSeq.get(it.seq);
               return modern ? (
-                <ModernTurnFooter key={it.key} it={it} latest={it.key === lastTurnKey} onSelectText={setSelectingText} />
+                <ModernTurnFooter
+                  key={it.key}
+                  it={it}
+                  latest={it.key === lastTurnKey}
+                  checkpoint={ckpt}
+                  onOpenTurnDiff={onOpenTurnDiff}
+                  onSelectText={setSelectingText}
+                />
               ) : (
-                <TurnFooter key={it.key} it={it} onSelectText={setSelectingText} />
+                <TurnFooter
+                  key={it.key}
+                  it={it}
+                  checkpoint={ckpt}
+                  onOpenTurnDiff={onOpenTurnDiff}
+                  onSelectText={setSelectingText}
+                />
               );
+            }
             case 'bgdone':
               return <BgTaskNote key={it.key} it={it} />;
             case 'desktop':
