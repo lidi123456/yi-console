@@ -80,6 +80,7 @@ pub fn validate(list: &[ClientMcp], settings: &yi_proto::DaemonSettings) -> Resu
         if m.name == crate::mcp::DESKTOP_SERVER
             || m.name == crate::mcp::BROWSER_SERVER
             || m.name == crate::mcp::MEMORY_SERVER
+            || m.name == crate::mcp::SESSION_SERVER
             || settings.mcp_servers.iter().any(|s| s.name == m.name)
         {
             bail!("MCP 名称和这台主机上已有的 MCP 重名：{}", m.name);

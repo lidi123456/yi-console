@@ -1602,6 +1602,8 @@ pub mod methods {
     pub const MEMORY_REBIND_PROJECT: &str = "memory.rebindProject";
     /// Private, locally authenticated `yi_memory` MCP proxy traffic; remote peers cannot invoke it
     pub const MEMORY_MCP: &str = "memory.mcp";
+    /// Private, locally authenticated `yi_session` read-only MCP proxy traffic; remote peers cannot invoke it
+    pub const SESSION_MCP: &str = "session.mcp";
 
     // Notifications
     pub const EV_SESSION_EVENT: &str = "session.event";

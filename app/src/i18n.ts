@@ -100,6 +100,7 @@ const ERR_PATTERNS: [RegExp, string | ((...m: string[]) => string)][] = [
   [/MCP 名称 yi_computer_use 为内置操作电脑保留/, 'The MCP name yi_computer_use is reserved for Computer Use'],
   [/MCP 名称 yi_browser 为内置浏览器保留/, 'The MCP name yi_browser is reserved for AI Browser'],
   [/MCP 名称 yi_memory 为内置长期记忆保留/, 'The MCP name yi_memory is reserved for Personal Memory'],
+  [/MCP 名称 yi_session 为内置会话读取保留/, 'The MCP name yi_session is reserved for built-in session reading'],
   [/记忆标识只能包含字母、数字、下划线和短横线，长度为 1–64（不能为 project）/, 'Memory id must be 1–64 ASCII letters, digits, underscores or hyphens (cannot be "project")'],
   [/记忆正文不能为空/, 'Memory content cannot be empty'],
   [/^记忆正文超过上限（最多 (\d+) KB）$/, (_, kb) => `Memory content exceeds the limit (max ${kb} KB)`],

@@ -164,6 +164,10 @@ pub struct StartSpec {
     pub auth_method: Option<String>,
     /// Compact `<yi-account-handoff>` summary if cross-account native resume falls back to fresh session
     pub account_handoff: Option<String>,
+    /// Fork from `resume` into a new native provider session (side chat native fork: Claude `--fork-session`, Codex `thread/fork`)
+    pub fork_session: bool,
+    /// Full portable `<yi-side-context>` digest used if native fork fails and falls back to a fresh session
+    pub fork_fallback_handoff: Option<String>,
 }
 
 pub fn start(spec: StartSpec, em: Emitter, rx: mpsc::UnboundedReceiver<AdapterCmd>) {

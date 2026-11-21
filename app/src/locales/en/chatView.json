@@ -108,5 +108,7 @@
   "viewTurnDiff": "View changes from this turn",
   "turnFilesChanged_one": "{{count}} file",
   "turnFilesChanged_other": "{{count}} files",
-  "bringBackThisReply": "Add to chat"
+  "bringBackThisReply": "Add to chat",
+  "sessionToolRead": "Read related session",
+  "sessionToolList": "List related sessions"
 }

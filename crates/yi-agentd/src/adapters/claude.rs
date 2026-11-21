@@ -27,6 +27,9 @@ pub fn build_args(spec: &StartSpec) -> Vec<String> {
     if let Some(r) = &spec.resume {
         a.push("--resume".into());
         a.push(r.clone());
+        if spec.fork_session {
+            a.push("--fork-session".into());
+        }
     }
     if let Some(m) = spec.model.as_ref().filter(|m| !m.is_empty()) {
         a.push("--model".into());
@@ -63,6 +66,9 @@ pub fn build_args(spec: &StartSpec) -> Vec<String> {
     }
     if crate::memory::has_in_args(&spec.extra_args) {
         allow_tools(&mut a, "mcp__yi_memory__*");
+    }
+    if crate::session_mcp::has_in_args(&spec.extra_args) {
+        allow_tools(&mut a, "mcp__yi_session__*");
     }
     // Client MCP tools (a Bot's own tools) are answered by the desktop app, which does its own checks
     for name in &spec.allow_mcp {
@@ -173,90 +179,124 @@ struct State {
     rejected: Option<(Option<i64>, Option<String>)>,
 }
 
-pub async fn run(spec: StartSpec, em: Emitter, mut rx: mpsc::UnboundedReceiver<AdapterCmd>) {
-    let args = build_args(&spec);
-    let mut p = match JsonProc::spawn_with_env(&spec.program, &args, &spec.cwd, &spec.env, &spec.env_unset) {
-        Ok(p) => p,
-        Err(e) => return em.exited(Some(format!("启动 claude 失败: {e}"))),
-    };
-    let mut st = State::default();
-    let _ = p
-        .send(&json!({"type":"control_request","request_id":"init","request":{"subtype":"initialize"}}))
-        .await;
-
-    let mut killed = false;
+pub async fn run(mut spec: StartSpec, em: Emitter, mut rx: mpsc::UnboundedReceiver<AdapterCmd>) {
+    let mut carry_queue: Vec<Prompt> = vec![];
     loop {
-        tokio::select! {
-            line = p.stdout.next_line() => {
-                let Ok(Some(line)) = line else { break };
-                let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
-                for out in handle(&mut st, &v, &em) {
-                    let _ = p.send(&out).await;
-                }
-                if st.ready && !st.queue.is_empty() {
-                    for prompt in std::mem::take(&mut st.queue) {
-                        let _ = p.send(&user_msg(&prompt)).await;
+        let args = build_args(&spec);
+        let mut p = match JsonProc::spawn_with_env(&spec.program, &args, &spec.cwd, &spec.env, &spec.env_unset) {
+            Ok(p) => p,
+            Err(e) => return em.exited(Some(format!("启动 claude 失败: {e}"))),
+        };
+        let mut st = State {
+            queue: std::mem::take(&mut carry_queue),
+            ..Default::default()
+        };
+        if !st.queue.is_empty() {
+            st.in_turn = true;
+        }
+        let _ = p
+            .send(&json!({"type":"control_request","request_id":"init","request":{"subtype":"initialize"}}))
+            .await;
+
+        let mut killed = false;
+        loop {
+            tokio::select! {
+                line = p.stdout.next_line() => {
+                    let Ok(Some(line)) = line else { break };
+                    let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
+                    for out in handle(&mut st, &v, &em) {
+                        let _ = p.send(&out).await;
+                    }
+                    if st.ready && !st.queue.is_empty() {
+                        for prompt in std::mem::take(&mut st.queue) {
+                            let _ = p.send(&user_msg(&prompt)).await;
+                        }
                     }
                 }
-            }
-            cmd = rx.recv() => match cmd {
-                Some(AdapterCmd::Send(prompt)) => {
-                    st.in_turn = true;
-                    em.status(SessionStatus::Running, None);
-                    if st.ready { let _ = p.send(&user_msg(&prompt)).await; } else { st.queue.push(prompt); }
-                }
-                Some(AdapterCmd::SetModel(model)) => {
-                    st.req_n += 1;
-                    let _ = p.send(&json!({"type":"control_request","request_id":format!("model{}", st.req_n),
-                        "request":{"subtype":"set_model","model":model}})).await;
-                }
-                Some(AdapterCmd::SetEffort(effort)) => {
-                    // Change settings while running; the next request uses the new level; null means back to default
-                    st.req_n += 1;
-                    let lvl = if effort.is_empty() { Value::Null } else { json!(effort) };
-                    let _ = p.send(&json!({"type":"control_request","request_id":format!("effort{}", st.req_n),
-                        "request":{"subtype":"apply_flag_settings","settings":{"effortLevel":lvl}}})).await;
-                }
-                Some(AdapterCmd::SetPermissionMode(mode)) => {
-                    st.req_n += 1;
-                    let m = permission_mode(&mode).unwrap_or("default");
-                    let _ = p.send(&json!({"type":"control_request","request_id":format!("pm{}", st.req_n),
-                        "request":{"subtype":"set_permission_mode","mode":m}})).await;
-                }
-                Some(AdapterCmd::StopTask(id)) => {
-                    st.req_n += 1;
-                    let _ = p.send(&json!({"type":"control_request","request_id":format!("stop{}", st.req_n),
-                        "request":{"subtype":"stop_task","task_id":id}})).await;
-                }
-                Some(AdapterCmd::Interrupt) => {
-                    st.interrupting = true;
-                    st.req_n += 1;
-                    let _ = p.send(&json!({"type":"control_request","request_id":format!("int{}", st.req_n),
-                        "request":{"subtype":"interrupt"}})).await;
-                }
-                Some(AdapterCmd::Permission { request_id, option_id, answers }) => {
-                    if let Some(resp) = permission_response(&mut st, &request_id, &option_id, &answers) {
-                        let _ = p.send(&resp).await;
-                        em.event(EventBody::PermissionResolved { request_id, option_id, answers });
+                cmd = rx.recv() => match cmd {
+                    Some(AdapterCmd::Send(prompt)) => {
+                        st.in_turn = true;
+                        em.status(SessionStatus::Running, None);
+                        if st.ready { let _ = p.send(&user_msg(&prompt)).await; } else { st.queue.push(prompt); }
                     }
+                    Some(AdapterCmd::SetModel(model)) => {
+                        st.req_n += 1;
+                        let _ = p.send(&json!({"type":"control_request","request_id":format!("model{}", st.req_n),
+                            "request":{"subtype":"set_model","model":model}})).await;
+                    }
+                    Some(AdapterCmd::SetEffort(effort)) => {
+                        // Change settings while running; the next request uses the new level; null means back to default
+                        st.req_n += 1;
+                        let lvl = if effort.is_empty() { Value::Null } else { json!(effort) };
+                        let _ = p.send(&json!({"type":"control_request","request_id":format!("effort{}", st.req_n),
+                            "request":{"subtype":"apply_flag_settings","settings":{"effortLevel":lvl}}})).await;
+                    }
+                    Some(AdapterCmd::SetPermissionMode(mode)) => {
+                        st.req_n += 1;
+                        let m = permission_mode(&mode).unwrap_or("default");
+                        let _ = p.send(&json!({"type":"control_request","request_id":format!("pm{}", st.req_n),
+                            "request":{"subtype":"set_permission_mode","mode":m}})).await;
+                    }
+                    Some(AdapterCmd::StopTask(id)) => {
+                        st.req_n += 1;
+                        let _ = p.send(&json!({"type":"control_request","request_id":format!("stop{}", st.req_n),
+                            "request":{"subtype":"stop_task","task_id":id}})).await;
+                    }
+                    Some(AdapterCmd::Interrupt) => {
+                        st.interrupting = true;
+                        st.req_n += 1;
+                        let _ = p.send(&json!({"type":"control_request","request_id":format!("int{}", st.req_n),
+                            "request":{"subtype":"interrupt"}})).await;
+                    }
+                    Some(AdapterCmd::Permission { request_id, option_id, answers }) => {
+                        if let Some(resp) = permission_response(&mut st, &request_id, &option_id, &answers) {
+                            let _ = p.send(&resp).await;
+                            em.event(EventBody::PermissionResolved { request_id, option_id, answers });
+                        }
+                    }
+                    Some(AdapterCmd::Kill) | None => { killed = true; break; }
+                    Some(_) => {}
                 }
-                Some(AdapterCmd::Kill) | None => { killed = true; break; }
-                Some(_) => {}
             }
         }
+        let msg = p.finish(killed).await;
+        // Native side-chat fork failed before init (e.g. CLI without --fork-session or missing parent transcript):
+        // transparently restart as a fresh session carrying the full portable digest instead of failing the first turn.
+        if !st.ready && spec.fork_session && !killed {
+            spec.fork_session = false;
+            spec.resume = None;
+            let fallback = spec.fork_fallback_handoff.take();
+            if let Some(fb) = fallback {
+                if let Some(first) = st.queue.first_mut() {
+                    let clean = crate::hub::strip_handoff_prefix(&first.text).to_string();
+                    first.text = if clean.is_empty() {
+                        fb
+                    } else {
+                        format!("{fb}\n\n{clean}")
+                    };
+                    em.fork_fallback(None);
+                } else {
+                    em.fork_fallback(Some(fb));
+                }
+            } else {
+                em.fork_fallback(None);
+            }
+            carry_queue = st.queue;
+            continue;
+        }
+        if !st.ready
+            && spec.resume.is_some()
+            && !killed
+            && msg.as_deref().is_some_and(|m| {
+                let low = m.to_lowercase();
+                low.contains("no conversation") || low.contains("not found")
+            })
+        {
+            em.resume_fallback();
+        }
+        em.exited(msg);
+        return;
     }
-    let msg = p.finish(killed).await;
-    if !st.ready
-        && spec.resume.is_some()
-        && !killed
-        && msg.as_deref().is_some_and(|m| {
-            let low = m.to_lowercase();
-            low.contains("no conversation") || low.contains("not found")
-        })
-    {
-        em.resume_fallback();
-    }
-    em.exited(msg);
 }
 
 fn user_msg(p: &Prompt) -> Value {
@@ -963,11 +1003,21 @@ mod tests {
             data_dir,
             auth_method: None,
             account_handoff: None,
+            fork_session: false,
+            fork_fallback_handoff: None,
         };
         let args_home = build_args(&mk(home.clone(), Some("/tmp/acc1".into())));
         assert!(args_home.windows(2).any(|w| w == ["--setting-sources", "user"]));
         let args_project = build_args(&mk(std::env::temp_dir(), Some("/tmp/acc1".into())));
         assert!(!args_project.iter().any(|a| a == "--setting-sources"));
+
+        let mut forked = mk(std::env::temp_dir(), None);
+        forked.resume = Some("parent-uuid-1".into());
+        forked.fork_session = true;
+        forked.extra_args = vec!["--mcp-config".into(), "{\"mcpServers\":{\"yi_session\":{}}}".into()];
+        let args_fork = build_args(&forked);
+        assert!(args_fork.windows(3).any(|w| w == ["--resume", "parent-uuid-1", "--fork-session"]));
+        assert!(args_fork.iter().any(|a| a.contains("mcp__yi_session__*")));
     }
 }
 

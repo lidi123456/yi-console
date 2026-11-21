@@ -107,5 +107,7 @@
   "close": "关闭",
   "viewTurnDiff": "查看本轮文件改动",
   "turnFilesChanged_other": "{{count}} 个文件",
-  "bringBackThisReply": "带回主对话"
+  "bringBackThisReply": "带回主对话",
+  "sessionToolRead": "读取关联会话",
+  "sessionToolList": "列出关联会话"
 }

@@ -33,6 +33,7 @@ mod proxy;
 mod statusline;
 mod relay;
 mod server;
+mod session_mcp;
 mod settings;
 mod stats;
 mod store;
@@ -59,6 +60,7 @@ fn main() {
         "computer-use-mcp" => computer_use::proxy_main(&args[1..]),
         "browser-mcp" => browser::proxy_main(&args[1..]),
         "memory-mcp" => memory::proxy_main(&args[1..]),
+        "session-mcp" => session_mcp::proxy_main(&args[1..]),
         "client-mcp" => clientmcp::proxy_main(&args[1..]),
         "serve" => serve(args.iter().any(|a| a == "-f" || a == "--foreground")),
         "bridge" => bridge(args.iter().any(|a| a == "--local")),

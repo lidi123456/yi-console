@@ -52,6 +52,8 @@ struct State {
     steers: HashMap<u64, Prompt>,
     /// This run continues an existing thread (thread/resume was sent) rather than a new one; reset to false when resuming fails and we start a new one
     resumed: bool,
+    /// This run attempted a native `thread/fork` from a parent session; on any failure, fall back transparently to `thread/start` with portable context
+    forked: bool,
     /// Parameters for starting a new thread, reused when resuming fails and we start a new one
     thread_params: Value,
     /// Latest rateLimits from account/rateLimits/updated (Codex sends one right before a usage limit error)
@@ -455,6 +457,26 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Vec<Valu
                 return out;
             }
             let msg = err["message"].as_str().unwrap_or("codex 返回错误").to_string();
+            // Native side-chat fork failed (e.g. older Codex without thread/fork, archived/missing rollout, or provider mismatch):
+            // fall back transparently to a fresh thread carrying the full portable side-chat digest.
+            if kind == Pending::Thread && st.forked {
+                st.forked = false;
+                st.resumed = false;
+                st.replaying = false;
+                em.fork_fallback(None);
+                let mut params = st.thread_params.clone();
+                if let Some(handoff) = spec.fork_fallback_handoff.as_deref().filter(|s| !s.is_empty()) {
+                    let existing = params["developerInstructions"].as_str().unwrap_or("");
+                    let combined = if existing.is_empty() {
+                        handoff.to_string()
+                    } else {
+                        format!("{existing}\n\n{handoff}")
+                    };
+                    params["developerInstructions"] = json!(combined);
+                }
+                out.push(st.req(Pending::Thread, "thread/start", params));
+                return out;
+            }
             // If a thread was opened but no message was ever sent, Codex doesn't write a rollout file, so it can't be resumed once the process is gone (just created or just /clear-ed).
             // The old thread had no content anyway, so just start a new one; same if provider mismatch prevented native resume.
             if kind == Pending::Thread && st.resumed && (is_missing_thread(&msg) || is_provider_mismatch(err, &msg)) {
@@ -521,10 +543,16 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Vec<Valu
                 }
                 st.thread_params = params.clone();
                 let msg = if let Some(tid) = &spec.resume {
-                    st.resumed = true;
                     params["threadId"] = json!(tid);
-                    st.replaying = spec.replay;
-                    st.req(Pending::Thread, "thread/resume", params)
+                    if spec.fork_session {
+                        st.forked = true;
+                        st.replaying = false;
+                        st.req(Pending::Thread, "thread/fork", params)
+                    } else {
+                        st.resumed = true;
+                        st.replaying = spec.replay;
+                        st.req(Pending::Thread, "thread/resume", params)
+                    }
                 } else {
                     st.req(Pending::Thread, "thread/start", params)
                 };
@@ -1370,6 +1398,8 @@ mod tests {
             data_dir: None,
             auth_method: None,
             account_handoff: None,
+            fork_session: false,
+            fork_fallback_handoff: None,
         }
     }
 
@@ -1532,5 +1562,37 @@ mod tests {
         let evs = hub.store.events_since("s", 0, 100).unwrap();
         assert!(evs.iter().any(|e| matches!(&e.body, EventBody::Error { message } if message == "bad config")));
         assert!(evs.iter().any(|e| matches!(&e.body, EventBody::TurnEnd { stop_reason: Some(r), .. } if r == "error")));
+    }
+
+    #[test]
+    fn thread_fork_sends_fork_and_falls_back_to_start_with_portable_digest() {
+        let (hub, em, _rx) = crate::hub::test_emitter();
+        let mut sp = spec();
+        sp.resume = Some("parent-thread-1".into());
+        sp.fork_session = true;
+        sp.fork_fallback_handoff = Some("<yi-side-context>\nportable parent history\n</yi-side-context>".into());
+        let mut st = State::default();
+
+        let init = st.req(Pending::Init, "initialize", json!({}));
+        let init_out = handle(&mut st, &sp, &json!({"id": init["id"], "result": {}}), &em);
+        assert_eq!(init_out.len(), 3);
+        let fork_id = init_out[2]["id"].as_u64().unwrap();
+        assert_eq!(init_out[2]["method"], "thread/fork");
+        assert_eq!(init_out[2]["params"]["threadId"], "parent-thread-1");
+        assert!(st.forked);
+
+        let unsupported = json!({
+            "id": fork_id,
+            "error": {"code": -32601, "message": "Method not found: thread/fork"}
+        });
+        let fb_out = handle(&mut st, &sp, &unsupported, &em);
+        assert_eq!(fb_out.len(), 1);
+        assert_eq!(fb_out[0]["method"], "thread/start");
+        let dev = fb_out[0]["params"]["developerInstructions"].as_str().unwrap();
+        assert!(dev.contains("<yi-side-context>\nportable parent history\n</yi-side-context>"), "{dev}");
+        assert!(!st.forked);
+        // Fallback must be silent (no Error event emitted to user)
+        let evs = hub.store.events_since("s", 0, 100).unwrap();
+        assert!(!evs.iter().any(|e| matches!(&e.body, EventBody::Error { .. })));
     }
 }

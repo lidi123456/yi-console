@@ -320,6 +320,9 @@ pub fn build_args(spec: &StartSpec) -> Vec<String> {
         if has(crate::mcp::MEMORY_SERVER) {
             rules.extend(crate::memory::tool_names().map(|name| format!("@{}/{name}", crate::mcp::MEMORY_SERVER)));
         }
+        if has(crate::mcp::SESSION_SERVER) {
+            rules.extend(crate::session_mcp::tool_names().map(|name| format!("@{}/{name}", crate::mcp::SESSION_SERVER)));
+        }
         if !rules.is_empty() {
             let rules = rules.join(",");
             if let Some(index) = a.iter().rposition(|arg| arg == "--trust-tools" || arg.starts_with("--trust-tools=")) {
@@ -1799,10 +1802,10 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Result<V
                     return Ok(out);
                 }
             }
-            // A yi_browser or yi_memory call: the gateway enforces plan mode, write policy, bot read-only and secret checks
+            // A yi_browser, yi_memory or yi_session call: the gateway enforces plan mode, write policy, family scope and secret checks
             if !question {
                 if let Some(name) = gateway_tool(&known.name, &title, &tc["rawInput"]) {
-                    if em.browser_tool_allowed(&name) || em.memory_tool_allowed(&name) {
+                    if em.browser_tool_allowed(&name) || em.memory_tool_allowed(&name) || em.session_tool_allowed(&name) {
                         if let Some(o) = options.iter().find(|o| o.kind == "allow_once").or_else(|| options.iter().find(|o| o.kind.starts_with("allow"))) {
                             out.push(json!({"jsonrpc":"2.0","id":v["id"],
                                 "result":{"outcome":{"outcome":"selected","optionId":o.id}}}));
@@ -2267,6 +2270,7 @@ fn gateway_tool(name: &str, title: &str, input: &Value) -> Option<String> {
     };
     check_server(crate::mcp::BROWSER_SERVER, &|t| yi_browser::tool_names().any(|x| x == t))
         .or_else(|| check_server(crate::mcp::MEMORY_SERVER, &|t| crate::memory::tool_names().any(|x| x == t)))
+        .or_else(|| check_server(crate::mcp::SESSION_SERVER, &|t| crate::session_mcp::tool_names().any(|x| x == t)))
 }
 
 /// Kiro's `_kiro.dev/compaction/status`: status.type is started, then completed (or failed)
@@ -5010,6 +5014,13 @@ mod tests {
         assert_eq!(gateway_tool("DeferExecuteTool", "DeferExecuteTool", &mem_wrapped).as_deref(), Some("mcp__yi_memory__memory_save"));
         assert_eq!(gateway_tool("mcp__yi_memory__memory_nope", "", &none), None);
         assert_eq!(gateway_tool("Bash", "echo memory_read (yi_memory)", &json!({"command": "mcp__yi_memory__memory_read"})), None);
+        // yi_session exact forms
+        assert_eq!(gateway_tool("mcp__yi_session__session_read", "", &none).as_deref(), Some("mcp__yi_session__session_read"));
+        assert_eq!(gateway_tool("tool", "session_list_related (yi_session)", &none).as_deref(), Some("mcp__yi_session__session_list_related"));
+        let sess_wrapped = json!({"toolName": "mcp__yi_session__session_read", "params": {"sessionId": "p"}});
+        assert_eq!(gateway_tool("DeferExecuteTool", "DeferExecuteTool", &sess_wrapped).as_deref(), Some("mcp__yi_session__session_read"));
+        assert_eq!(gateway_tool("mcp__yi_session__session_write", "", &none), None);
+        assert_eq!(gateway_tool("Bash", "echo session_read (yi_session)", &json!({"command": "mcp__yi_session__session_read"})), None);
     }
 
     #[test]
@@ -5312,7 +5323,7 @@ mod model_config_tests {
             replay_skip: 0, model: Some(model.into()), effort: None, model_config_options: vec![],
             permission_mode: "default".into(), command: None, program: "cursor-agent".into(), extra_args: vec![],
             mcp_servers: vec![], mcp_fingerprint: String::new(), allow_mcp: vec![], system_prompt: None, system_notice: false, memory_prompt: None, memory_notice: false, cols: 80, rows: 24, tmux: None, session_id: None,
-            env: Default::default(), env_unset: vec![], data_dir: None, auth_method: None, account_handoff: None,
+            env: Default::default(), env_unset: vec![], data_dir: None, auth_method: None, account_handoff: None, fork_session: false, fork_fallback_handoff: None,
         }
     }
 
@@ -5654,6 +5665,8 @@ mod model_config_tests {
             data_dir: None,
             auth_method: None,
             account_handoff: None,
+            fork_session: false,
+            fork_fallback_handoff: None,
         };
         let req = resume_session(&mut st4, &sp, "agy-1");
         let outs = handle(&mut st4, &sp, &json!({"id": req["id"], "result": r}), &em).unwrap();
@@ -5873,6 +5886,8 @@ mod model_config_tests {
             data_dir: None,
             auth_method: None,
             account_handoff: None,
+            fork_session: false,
+            fork_fallback_handoff: None,
         }
     }
 

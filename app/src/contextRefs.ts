@@ -121,7 +121,9 @@ export function serializeContextRef(r: ContextRefInput): string {
     r.kind === 'review' && r.comment
       ? `Review comment: ${r.comment.trim()}\n${codeBlock}`
       : r.kind === 'side'
-        ? `Side chat notes (${r.path}):\n${normContent}`
+        ? r.sideSessionId
+          ? `Side chat notes (${r.path}; sessionId=${r.sideSessionId} — call session_read({"sessionId":"${r.sideSessionId}"}) from yi_session if you need the full conversation):\n${normContent}`
+          : `Side chat notes (${r.path}):\n${normContent}`
         : codeBlock;
   const tag = pickTag(inner);
   const attrs = [

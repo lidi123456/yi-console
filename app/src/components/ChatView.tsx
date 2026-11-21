@@ -1567,7 +1567,42 @@ function toolView(it: Item & { k: 'tool' }, cwd?: string) {
   if (browserTool) return { shown, kind, arg, parsed, err, label: getT('browserUse')('action', { tool: browserTool }) };
   const memTool = memoryToolName(it);
   if (memTool) return { shown, kind, arg: memoryToolArg(it), parsed, err, label: memoryToolLabel(memTool) };
+  const sessTool = sessionToolName(it);
+  if (sessTool) return { shown, kind, arg: sessionToolArg(it), parsed, err, label: sessionToolLabel(sessTool) };
   return { shown, kind, arg, parsed, err, label: generic ? it.title : toolUiLabel(shown) };
+}
+
+/** The yi_session read-only tool a row calls across Claude / Codex / ACP providers */
+function sessionToolName(it: Item & { k: 'tool' }): string | null {
+  const wrapped = (it.input as { toolName?: unknown } | null)?.toolName;
+  for (const s of [it.name, typeof wrapped === 'string' ? wrapped : '', it.title]) {
+    const m =
+      /^(?:mcp__yi_session__|yi_session\.|mcp_yi_session_|@yi_session\/)?(session_(?:read|list_related))$/.exec(s ?? '') ??
+      /^(session_(?:read|list_related)) \(yi_session\)$/.exec(s ?? '');
+    if (m) return m[1];
+  }
+  return null;
+}
+
+function sessionToolLabel(tool: string): string {
+  switch (tool) {
+    case 'session_read':
+      return t('sessionToolRead');
+    case 'session_list_related':
+      return t('sessionToolList');
+    default:
+      return tool;
+  }
+}
+
+function sessionToolArg(it: Item & { k: 'tool' }): string {
+  const inp = (it.input as Record<string, unknown> | null) ?? {};
+  const inner = (inp.params as Record<string, unknown> | undefined) ?? inp;
+  const parts: string[] = [];
+  if (typeof inner.sessionId === 'string' && inner.sessionId) parts.push(inner.sessionId);
+  if (typeof inner.seq === 'number') parts.push(`#${inner.seq}`);
+  else if (typeof inner.view === 'string' && inner.view !== 'messages') parts.push(inner.view);
+  return parts.join(' ');
 }
 
 /** The yi_memory tool a row calls across Claude / Codex / ACP providers (including Kiro bare names) */

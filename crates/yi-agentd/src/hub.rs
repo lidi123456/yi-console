@@ -116,6 +116,10 @@ struct SessionRt {
     models: Mutex<Vec<ModelOption>>,
     /// Last reply segment of this turn; its beginning goes into the turn-finished notification
     last_text: Mutex<String>,
+    /// In-progress streaming assistant deltas `(message_id, accumulated_text)`, cleared once finalized or turn ends
+    live_text: Mutex<Vec<(String, String)>>,
+    /// Side chat has not yet resolved its initial parent context (lazy resolution on first launch/delivery)
+    side_context_pending: Mutex<bool>,
     /// Slash commands reported by the tool
     commands: Mutex<Vec<SlashCommand>>,
     /// Messages queued until the current turn ends
@@ -270,6 +274,8 @@ pub struct Hub {
     pub browsers: crate::browser::Browsers,
     /// Host personal long-term memory (`yi_memory`), shared across all AI tools
     pub memories: crate::memory::Memories,
+    /// Read-only related-session MCP gateway (`yi_session`) for side chats and parent conversations
+    pub session_mcp: crate::session_mcp::SessionMcp,
     /// Clients that said who they are (`client.hello`), and the client MCP bridge
     pub clients: crate::clientmcp::Clients,
     /// Each tool's most recently reported model list (persisted, used for new sessions)
@@ -361,6 +367,7 @@ impl Hub {
             desktop: crate::computer_use::Desktop::new(),
             browsers: crate::browser::Browsers::new(),
             memories: crate::memory::Memories::default(),
+            session_mcp: crate::session_mcp::SessionMcp::default(),
             clients: Default::default(),
             tool_models: Mutex::new(
                 std::fs::read(models_path())
@@ -394,6 +401,7 @@ impl Hub {
             desktop: crate::computer_use::Desktop::new(),
             browsers: crate::browser::Browsers::new(),
             memories: crate::memory::Memories::default(),
+            session_mcp: crate::session_mcp::SessionMcp::default(),
             clients: Default::default(),
             tool_models: Mutex::new(HashMap::new()),
             tool_commands: Mutex::new(HashMap::new()),
@@ -956,9 +964,7 @@ impl Hub {
             self.emit(&info.id, 0, EventBody::Handoff { session_id: fid.clone(), tool, to: false });
         }
         if info.side_chat {
-            if let Some(pid) = info.parent_id.as_deref() {
-                *rt.pending_handoff.lock().unwrap() = Some(self.side_context_digest(pid));
-            }
+            *rt.side_context_pending.lock().unwrap() = true;
         }
         let images = if mode == SessionMode::Structured { p.images } else { vec![] };
         match p.prompt.filter(|s| !s.trim().is_empty()) {
@@ -1073,6 +1079,13 @@ impl Hub {
                 .memories
                 .build_l0_prompt(Path::new(&info.cwd), &settings, readonly_session);
         }
+        if structured_ai && info.bot.is_none() {
+            if self.session_mcp.ensure_session(&info.id).is_ok() {
+                if let Some(config) = self.session_mcp.mcp_config(&info.id) {
+                    servers.push(crate::mcp::session(config)?);
+                }
+            }
+        }
         let mut allow_mcp = vec![];
         if structured_ai {
             for m in &info.client_mcp {
@@ -1081,6 +1094,34 @@ impl Hub {
             }
         }
         let mcp_servers = crate::mcp::inject(info.tool, &servers, &mut extra_args);
+        let mut fork_session = false;
+        let mut fork_fallback_handoff = None;
+        if info.side_chat && info.mode == SessionMode::Structured {
+            if let Some(pid) = info.parent_id.as_deref() {
+                if resume.is_none() {
+                    if let Some((_, parent_ext)) = self.can_native_fork_side(info) {
+                        resume = Some(parent_ext);
+                        fork_session = true;
+                        fork_fallback_handoff = Some(self.side_context_digest(pid));
+                        if let Ok(rt) = self.get(&info.id) {
+                            if std::mem::take(&mut *rt.side_context_pending.lock().unwrap()) {
+                                let mut pending = rt.pending_handoff.lock().unwrap();
+                                if pending.is_none() {
+                                    *pending = Some(self.side_chat_native_framing(pid));
+                                }
+                            }
+                        }
+                    } else if let Ok(rt) = self.get(&info.id) {
+                        if std::mem::take(&mut *rt.side_context_pending.lock().unwrap()) {
+                            let mut pending = rt.pending_handoff.lock().unwrap();
+                            if pending.is_none() {
+                                *pending = Some(self.side_context_digest(pid));
+                            }
+                        }
+                    }
+                }
+            }
+        }
         let system_prompt = info.append_system_prompt.clone().filter(|_| structured_ai);
         // A new tool session has not seen the prompt yet; `launch` also sets this after the prompt changed
         let system_notice = system_prompt.is_some() && resume.is_none();
@@ -1088,6 +1129,7 @@ impl Hub {
         let account_handoff = if info.mode == SessionMode::Structured
             && matches!(info.tool, ToolKind::Codex | ToolKind::Cursor)
             && resume.is_some()
+            && !fork_session
             && info.account_id.is_some()
         {
             self.handoff_digest(&info.id)
@@ -1138,6 +1180,8 @@ impl Hub {
             data_dir: resolved.as_ref().and_then(|r| r.data_dir.clone()),
             auth_method: resolved.as_ref().and_then(|r| r.auth_method.clone()),
             account_handoff,
+            fork_session,
+            fork_fallback_handoff,
         })
     }
 
@@ -1197,10 +1241,11 @@ impl Hub {
             rt.watch_active.store(false, std::sync::atomic::Ordering::Relaxed);
             (tx, rx, gen)
         };
-        // The new tool process starts its own desktop, browser, memory and client MCP proxies
+        // The new tool process starts its own desktop, browser, memory, session and client MCP proxies
         self.desktop.release_proxy(&sid);
         self.browsers.release_proxy(&sid);
         self.memories.release_proxy(&sid);
+        self.session_mcp.release_proxy(&sid);
         self.clients.release_proxies(&sid);
         if spec.mode == SessionMode::Terminal && matches!(spec.tool, ToolKind::Codex | ToolKind::Kiro) {
             let mut runs = rt.runs.lock().unwrap();
@@ -1333,6 +1378,16 @@ impl Hub {
         // A slash command must stay first for the tool to recognize it, so the hand-off waits for the next message.
         // Cursor's /compact is emulated in `acp.rs`, which folds the pending context into its summary
         let slash = text.trim_start().starts_with('/');
+        if !slash && info.side_chat {
+            if let Some(pid) = info.parent_id.as_deref() {
+                if std::mem::take(&mut *rt.side_context_pending.lock().unwrap()) {
+                    let mut pending = rt.pending_handoff.lock().unwrap();
+                    if pending.is_none() {
+                        *pending = Some(self.side_context_digest(pid));
+                    }
+                }
+            }
+        }
         let handoff = if slash && !(info.tool == ToolKind::Cursor && crate::adapters::acp::is_compact_command(text)) {
             None
         } else {
@@ -1707,6 +1762,8 @@ impl Hub {
         rt.queue.lock().unwrap().clear();
         rt.term.lock().unwrap().clear();
         rt.last_text.lock().unwrap().clear();
+        rt.live_text.lock().unwrap().clear();
+        *rt.side_context_pending.lock().unwrap() = false;
         *rt.interrupted.lock().unwrap() = false;
         *rt.restart_pending.lock().unwrap() = false;
         rt.watch_active.store(false, std::sync::atomic::Ordering::Relaxed);
@@ -2524,6 +2581,7 @@ impl Hub {
     pub fn delete(&self, id: &str) -> Result<()> {
         self.revoke_desktop(id);
         self.memories.remove_session(id);
+        self.session_mcp.remove_session(id);
         // The id comes from the client and is later used in a path for remove_dir_all: only handle sessions that really exist
         let rt = self.get(id)?;
         let (bot_link, session_cwd) = {
@@ -3152,6 +3210,19 @@ impl Hub {
             }
         }
         let ts = now_ms();
+        if let EventBody::AssistantDelta { id, delta } = &body {
+            if !delta.is_empty() {
+                let mut live = rt.live_text.lock().unwrap();
+                let total_bytes: usize = live.iter().map(|(_, s)| s.len()).sum();
+                if total_bytes < 32 * 1024 {
+                    if let Some((_, buf)) = live.iter_mut().find(|(k, _)| k == id) {
+                        buf.push_str(delta);
+                    } else {
+                        live.push((id.clone(), delta.clone()));
+                    }
+                }
+            }
+        }
         if body.is_ephemeral() {
             self.publish(
                 Some(sid.to_string()),
@@ -3176,6 +3247,7 @@ impl Hub {
                     }
                     // The process is gone: so is the turn it was running (the next message starts a new one)
                     if matches!(status, SessionStatus::Exited | SessionStatus::Error) {
+                        rt.live_text.lock().unwrap().clear();
                         update_activity_time = false;
                         if *status == SessionStatus::Error {
                             info.last_process_error_at = Some(ts);
@@ -3254,7 +3326,8 @@ impl Hub {
                     t.activity = Some(TurnActivity { name: name.clone(), title: one_line(title, 160), at: ts });
                     activity = true;
                 }
-                EventBody::AssistantText { text, .. } => {
+                EventBody::AssistantText { id, text } => {
+                    rt.live_text.lock().unwrap().retain(|(k, _)| k != id);
                     if !text.trim().is_empty() {
                         *rt.last_text.lock().unwrap() = text.clone();
                     }
@@ -3266,6 +3339,7 @@ impl Hub {
                     }
                 }
                 EventBody::TurnEnd { stop_reason, .. } => {
+                    rt.live_text.lock().unwrap().clear();
                     if !matches!(info.status, SessionStatus::Exited | SessionStatus::Error) {
                         info.status = SessionStatus::Idle;
                     }
@@ -3986,56 +4060,286 @@ impl Hub {
         }
     }
 
-    fn side_context_digest(&self, parent_id: &str) -> String {
+    fn fork_fallback(&self, sid: &str, gen: u64, handoff: Option<String>) {
+        let Some(rt) = self.alive(sid, gen) else {
+            return;
+        };
+        // Release MCP proxy bindings so an in-place restarted child (Claude fallback) can rebind cleanly.
+        self.desktop.release_proxy(sid);
+        self.browsers.release_proxy(sid);
+        self.memories.release_proxy(sid);
+        self.session_mcp.release_proxy(sid);
+        self.clients.release_proxies(sid);
+        if let Some(h) = handoff {
+            *rt.pending_handoff.lock().unwrap() = Some(h);
+            *rt.side_context_pending.lock().unwrap() = false;
+        }
+    }
+
+    /// Snapshot of currently streaming (unfinalized) assistant text for a running session
+    pub(crate) fn live_text_snapshot(&self, sid: &str) -> String {
+        let Ok(rt) = self.get(sid) else {
+            return String::new();
+        };
+        let live = rt.live_text.lock().unwrap();
+        if live.is_empty() {
+            return String::new();
+        }
+        let parts: Vec<&str> = live
+            .iter()
+            .map(|(_, s)| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect();
+        parts.join("\n\n")
+    }
+
+    /// True when a side chat can safely use a provider-native fork (`claude --fork-session` / Codex `thread/fork`)
+    /// from its parent session: same provider & account, strong native session id, and parent is currently idle.
+    fn can_native_fork_side(&self, info: &SessionInfo) -> Option<(String, String)> {
+        if !info.side_chat || info.mode != SessionMode::Structured || info.external_id.is_some() {
+            return None;
+        }
+        if !matches!(info.tool, ToolKind::Claude | ToolKind::Codex) {
+            return None;
+        }
+        let pid = info.parent_id.as_deref()?;
+        let parent_rt = self.get(pid).ok()?;
+        if parent_rt.watch_active.load(std::sync::atomic::Ordering::Relaxed) {
+            return None;
+        }
+        let parent = parent_rt.info.lock().unwrap().clone();
+        if parent.mode != SessionMode::Structured
+            || parent.tool != info.tool
+            || parent.account_id != info.account_id
+            || !parent.background_tasks.is_empty()
+            || matches!(parent.status, SessionStatus::Running | SessionStatus::WaitingPermission)
+        {
+            return None;
+        }
+        let parent_ext = parent.external_id.filter(|s| !s.trim().is_empty())?;
+        Some((pid.to_string(), parent_ext))
+    }
+
+    /// Concise framing guardrail sent on the first turn of a natively forked side chat (history is already in the fork)
+    fn side_chat_native_framing(&self, parent_id: &str) -> String {
         let parent_meta = self.info(parent_id).ok();
-        let (evs, _) = self.store.events_tail(parent_id, None, 60).unwrap_or_default();
-        let mut lines = Vec::new();
-        for ev in evs {
-            match ev.body {
-                EventBody::UserMessage { text, .. } => {
-                    let clean = strip_handoff_prefix(&text);
-                    if !clean.is_empty() {
-                        lines.push(format!("User: {}", truncate(clean, 500)));
-                    }
-                }
-                EventBody::AssistantText { text, .. } => {
-                    let t = text.trim();
-                    if !t.is_empty() {
-                        lines.push(format!("Assistant: {}", truncate(t, 650)));
-                    }
-                }
-                EventBody::ToolCall { name, title, .. } => {
-                    lines.push(format!("Tool {name}: {}", truncate(&title, 180)));
-                }
-                EventBody::Error { message } => {
-                    lines.push(format!("Error: {}", truncate(&message, 180)));
-                }
-                _ => {}
+        let mut out = String::from(
+            "<yi-side-context>\nYou are in a side chat beside the main conversation sharing the same workspace.\nThe main conversation may still be running in parallel. Answer the user's questions concisely; do NOT continue, finish, or redo the main conversation's task, and do NOT edit, write, or commit workspace files unless the user explicitly asks you to and permission allows it.\nYour conversation starts from a fork of the main conversation.",
+        );
+        if let Some(ref info) = parent_meta {
+            if !info.title.trim().is_empty() {
+                out.push_str(&format!(
+                    "\nMain session: \"{}\" (id={}, status={:?}).",
+                    truncate(info.title.trim(), 120),
+                    parent_id,
+                    info.status
+                ));
+            } else {
+                out.push_str(&format!(
+                    "\nMain session id={} (status={:?}).",
+                    parent_id, info.status
+                ));
+            }
+            if let Some(act) = info
+                .turn
+                .as_ref()
+                .filter(|t| t.ended_at.is_none())
+                .and_then(|t| t.activity.as_ref())
+            {
+                out.push_str(&format!(
+                    "\nMain session live activity: {} — {}",
+                    act.name,
+                    truncate(&act.title, 180)
+                ));
             }
         }
-        let header = match parent_meta {
-            Some(ref info) if !info.title.trim().is_empty() => format!(
-                "Parent session: \"{}\" (status: {:?}).",
-                truncate(info.title.trim(), 120),
-                info.status
-            ),
-            Some(ref info) => format!("Parent session status: {:?}.", info.status),
-            None => String::new(),
+        out.push_str(&format!(
+            "\nUse session_read({{\"sessionId\":\"{parent_id}\"}}) from yi_session if you need the main conversation's latest live state.\n</yi-side-context>"
+        ));
+        out
+    }
+
+    /// Portable side-chat context: framing guardrail + budgeted intact-message selection (T3 Code priority:
+    /// live streaming output -> latest user -> latest assistant -> original first user -> newest-to-oldest fill)
+    /// + omitted seq pointers for on-demand recovery via `yi_session` `session_read`.
+    fn side_context_digest(&self, parent_id: &str) -> String {
+        const TOTAL_BUDGET: usize = 16_000;
+        const ITEM_MAX_CHARS: usize = 6_000;
+        const LIVE_MAX_CHARS: usize = 4_000;
+        const MAX_OMITTED_SEQS: usize = 20;
+
+        #[derive(Clone)]
+        struct Entry {
+            seq: i64,
+            is_user: bool,
+            is_assistant: bool,
+            rendered: String,
+            chars: usize,
+        }
+
+        let parent_meta = self.info(parent_id).ok();
+        let (evs, has_older) = self.store.events_tail(parent_id, None, 300).unwrap_or_default();
+        let mut entries: Vec<Entry> = Vec::new();
+        for ev in evs {
+            let (is_user, is_assistant, label, body) = match ev.body {
+                EventBody::UserMessage { text, .. } => {
+                    let clean = strip_handoff_prefix(&text).trim();
+                    if clean.is_empty() {
+                        continue;
+                    }
+                    (true, false, "User", truncate_for_side(clean, ITEM_MAX_CHARS, parent_id, ev.seq))
+                }
+                EventBody::AssistantText { text, .. } => {
+                    let clean = text.trim();
+                    if clean.is_empty() {
+                        continue;
+                    }
+                    (false, true, "Assistant", truncate_for_side(clean, ITEM_MAX_CHARS, parent_id, ev.seq))
+                }
+                EventBody::Plan { entries: plan, .. } => {
+                    if plan.is_empty() {
+                        continue;
+                    }
+                    let text = plan
+                        .iter()
+                        .map(|p| format!("[{}] {}", p.status, p.content))
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                    (false, false, "Plan", truncate(&text, 600))
+                }
+                EventBody::ToolCall { name, title, .. } => {
+                    (false, false, "Tool", format!("{name}: {}", truncate(title.trim(), 240)))
+                }
+                EventBody::Error { message } => {
+                    let clean = message.trim();
+                    if clean.is_empty() {
+                        continue;
+                    }
+                    (false, false, "Error", truncate(clean, 240))
+                }
+                _ => continue,
+            };
+            let rendered = format!("[seq={} {label}]\n{body}", ev.seq);
+            let chars = rendered.chars().count();
+            entries.push(Entry {
+                seq: ev.seq,
+                is_user,
+                is_assistant,
+                rendered,
+                chars,
+            });
+        }
+
+        let live_raw = self.live_text_snapshot(parent_id);
+        let live_section = if live_raw.is_empty() {
+            None
+        } else {
+            let trimmed = truncate(&live_raw, LIVE_MAX_CHARS);
+            Some(format!("[in-progress assistant output (streaming)]\n{trimmed}"))
         };
+
         let mut out = String::from(
-            "<yi-side-context>\nYou are running inside a hidden side chat attached to a parent conversation sharing the same workspace.\nThe parent conversation may still be running in parallel. Focus on reading, searching, and answering concisely; do NOT edit, write, or commit workspace files unless the user explicitly asks you to and permission allows it.",
+            "<yi-side-context>\nYou are in a side chat beside the main conversation sharing the same workspace.\nThe main conversation may still be running in parallel. Answer the user's questions concisely; do NOT continue, finish, or redo the main conversation's task, and do NOT edit, write, or commit workspace files unless the user explicitly asks you to and permission allows it.",
         );
-        if !header.is_empty() {
-            out.push('\n');
-            out.push_str(&header);
+        if let Some(ref info) = parent_meta {
+            if !info.title.trim().is_empty() {
+                out.push_str(&format!(
+                    "\nMain session: \"{}\" (id={}, tool={}, status={:?}).",
+                    truncate(info.title.trim(), 120),
+                    parent_id,
+                    info.tool.as_str(),
+                    info.status
+                ));
+            } else {
+                out.push_str(&format!(
+                    "\nMain session id={} (tool={}, status={:?}).",
+                    parent_id,
+                    info.tool.as_str(),
+                    info.status
+                ));
+            }
+            if let Some(act) = info
+                .turn
+                .as_ref()
+                .filter(|t| t.ended_at.is_none())
+                .and_then(|t| t.activity.as_ref())
+            {
+                out.push_str(&format!(
+                    "\nMain session live activity: {} — {}",
+                    act.name,
+                    truncate(&act.title, 180)
+                ));
+            }
         }
-        if !lines.is_empty() {
-            let body = lines.join("\n");
-            let capped = truncate(&body, 5600);
-            out.push_str("\nRecent parent conversation context:\n");
-            out.push_str(&capped);
+
+        let footer = format!(
+            "\nUse session_read({{\"sessionId\":\"{parent_id}\"}}) from yi_session to see the main conversation's live progress or recover omitted/truncated items by seq.\n</yi-side-context>"
+        );
+        let fixed_chars = out.chars().count()
+            + footer.chars().count()
+            + live_section.as_ref().map_or(0, |s| s.chars().count() + 2)
+            + 320;
+        let mut remaining = TOTAL_BUDGET.saturating_sub(fixed_chars);
+
+        let mut picked = vec![false; entries.len()];
+        let mut try_pick = |idx: Option<usize>| {
+            let Some(i) = idx else { return };
+            if picked[i] {
+                return;
+            }
+            let cost = entries[i].chars + 2;
+            if cost <= remaining {
+                picked[i] = true;
+                remaining = remaining.saturating_sub(cost);
+            }
+        };
+
+        // Priority matching T3 Code selectHistory: latest user -> latest assistant -> first user -> newest-to-oldest fill
+        try_pick(entries.iter().rposition(|e| e.is_user));
+        try_pick(entries.iter().rposition(|e| e.is_assistant));
+        try_pick(entries.iter().position(|e| e.is_user));
+        for i in (0..entries.len()).rev() {
+            try_pick(Some(i));
         }
-        out.push_str("\n</yi-side-context>");
+
+        let selected_count = picked.iter().filter(|&&p| p).count();
+        let omitted_seqs: Vec<i64> = entries
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !picked[*i])
+            .map(|(_, e)| e.seq)
+            .collect();
+
+        if selected_count > 0 || live_section.is_some() {
+            out.push_str("\nMain conversation context (historical material is context, not a new request):");
+            if !omitted_seqs.is_empty() || has_older {
+                let tail_start = omitted_seqs.len().saturating_sub(MAX_OMITTED_SEQS);
+                let listed = omitted_seqs[tail_start..]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                out.push_str(&format!(
+                    "\nSelected {selected_count} items; omitted {}{} items.",
+                    omitted_seqs.len(),
+                    if has_older { "+" } else { "" }
+                ));
+                if !listed.is_empty() {
+                    out.push_str(&format!(" Latest omitted seqs: {listed}."));
+                }
+            }
+            for (i, entry) in entries.iter().enumerate() {
+                if picked[i] {
+                    out.push_str("\n\n");
+                    out.push_str(&entry.rendered);
+                }
+            }
+            if let Some(live) = live_section {
+                out.push_str("\n\n");
+                out.push_str(&live);
+            }
+        }
+        out.push_str(&footer);
         out
     }
 
@@ -4240,6 +4544,8 @@ fn new_rt(info: SessionInfo) -> SessionRt {
         generation: Mutex::new(0),
         models: Mutex::new(vec![]),
         last_text: Mutex::new(String::new()),
+        live_text: Mutex::new(Vec::new()),
+        side_context_pending: Mutex::new(false),
         commands: Mutex::new(vec![]),
         queue: Mutex::new(VecDeque::new()),
         interrupted: Mutex::new(false),
@@ -4264,7 +4570,15 @@ fn new_rt(info: SessionInfo) -> SessionRt {
     }
 }
 
-fn strip_handoff_prefix(text: &str) -> &str {
+fn truncate_for_side(text: &str, max_chars: usize, parent_id: &str, seq: i64) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let kept: String = text.chars().take(max_chars).collect();
+    format!("{kept}\n... [truncated; call session_read({{\"sessionId\":\"{parent_id}\",\"seq\":{seq},\"textOffset\":{max_chars}}}) for remainder]")
+}
+
+pub(crate) fn strip_handoff_prefix(text: &str) -> &str {
     let mut t = text.trim();
     for tag in ["</yi-account-handoff>", "</yi-side-context>"] {
         if let Some(idx) = t.find(tag) {
@@ -4446,6 +4760,11 @@ impl Emitter {
         self.hub.memories.authorizes(&self.sid, name)
     }
 
+    /// A yi_session tool may run without CLI prompts; the gateway is strictly read-only and family-scoped
+    pub fn session_tool_allowed(&self, name: &str) -> bool {
+        self.hub.session_mcp.authorizes(&self.sid, name)
+    }
+
     /// Build a fresh L0 memory snapshot for this session (used after ACP compaction or load fallback)
     pub fn memory_prompt_snapshot(&self) -> Option<String> {
         let info = self.hub.info(&self.sid).ok()?;
@@ -4462,6 +4781,7 @@ impl Emitter {
         self.hub.desktop.authorizes(&self.sid, name)
             || self.hub.browsers.authorizes(&self.sid, name)
             || self.hub.memories.authorizes(&self.sid, name)
+            || self.hub.session_mcp.authorizes(&self.sid, name)
     }
 
     pub fn event(&self, body: EventBody) {
@@ -4685,6 +5005,10 @@ impl Emitter {
     /// Notify hub that resuming an account's native tool session failed and fell back to a fresh thread/session
     pub fn resume_fallback(&self) {
         self.hub.resume_fallback(&self.sid, self.gen);
+    }
+
+    pub fn fork_fallback(&self, handoff: Option<String>) {
+        self.hub.fork_fallback(&self.sid, self.gen, handoff);
     }
 
     /// Context put before the next delivered message, replacing any pending hand-off (Cursor's emulated /compact
@@ -5933,6 +6257,8 @@ mod tests {
             data_dir: None,
             auth_method: None,
             account_handoff: None,
+            fork_session: false,
+            fork_fallback_handoff: None,
         };
         let before_gen = *rt.generation.lock().unwrap();
         let returned_tx = hub.launch_if_stopped(&rt, spec).unwrap();
@@ -6131,6 +6457,232 @@ mod tests {
         // Deleting parent cascades to side chats
         hub.delete("parent").unwrap();
         assert!(hub.info("side-1").is_err());
+    }
+
+    #[tokio::test]
+    async fn side_chat_digest_captures_live_deltas_and_budget_prioritizes_first_and_latest() {
+        let hub = Hub::new(crate::store::Store::open_memory().unwrap(), DaemonSettings::default());
+        let _parent_rx = live(&hub, "parent", SessionMode::Structured, SessionStatus::Running, 1);
+
+        // Emit first goal + many bulky middle messages (>16k chars) + latest Q&A + live streaming delta
+        hub.emit("parent", 0, EventBody::UserMessage {
+            text: "ORIGINAL_GOAL_TOKEN: migrate billing API to v2".into(),
+            images: vec![],
+            origin: None,
+        });
+        for i in 1..=12 {
+            let filler = format!("MIDDLE_BLOCK_{i:02} {}", "x".repeat(1600));
+            hub.emit("parent", 0, EventBody::AssistantText {
+                id: format!("mid-{i}"),
+                text: filler,
+            });
+        }
+        hub.emit("parent", 0, EventBody::UserMessage {
+            text: "LATEST_USER_TOKEN: check invoice retries".into(),
+            images: vec![],
+            origin: None,
+        });
+        hub.emit("parent", 0, EventBody::AssistantText {
+            id: "last-a".into(),
+            text: "LATEST_ASSISTANT_TOKEN: updated invoices.ts".into(),
+        });
+        hub.emit("parent", 0, EventBody::AssistantDelta {
+            id: "stream-1".into(),
+            delta: "STREAMING_NOW: running billing ".into(),
+        });
+        hub.emit("parent", 0, EventBody::AssistantDelta {
+            id: "stream-1".into(),
+            delta: "test suite...".into(),
+        });
+
+        let digest = hub.side_context_digest("parent");
+        assert!(digest.contains("do NOT continue, finish, or redo the main conversation's task"), "{digest}");
+        assert!(digest.contains("ORIGINAL_GOAL_TOKEN"), "must retain first user goal");
+        assert!(digest.contains("LATEST_USER_TOKEN"), "must retain latest user message");
+        assert!(digest.contains("LATEST_ASSISTANT_TOKEN"), "must retain latest assistant reply");
+        assert!(digest.contains("STREAMING_NOW: running billing test suite..."), "must include live streaming output");
+        assert!(digest.contains("Latest omitted seqs:"), "must report omitted seqs for on-demand recovery");
+        assert!(digest.contains("session_read"), "must guide model to yi_session session_read");
+
+        // Finalizing stream-1 clears it from live_text_snapshot
+        hub.emit("parent", 0, EventBody::AssistantText {
+            id: "stream-1".into(),
+            text: "Final test output".into(),
+        });
+        assert!(hub.live_text_snapshot("parent").is_empty());
+    }
+
+    #[tokio::test]
+    async fn side_chat_native_fork_eligibility_and_session_mcp_family_isolation() {
+        let hub = Hub::new(crate::store::Store::open_memory().unwrap(), DaemonSettings::default());
+        let _parent_rx = live(&hub, "parent", SessionMode::Structured, SessionStatus::Idle, 1);
+        let _side_rx = live(&hub, "side-1", SessionMode::Structured, SessionStatus::Idle, 1);
+        let _other_rx = live(&hub, "unrelated", SessionMode::Structured, SessionStatus::Idle, 1);
+
+        {
+            let prt = hub.get("parent").unwrap();
+            let mut pinfo = prt.info.lock().unwrap();
+            pinfo.tool = ToolKind::Claude;
+            pinfo.title = "Main billing work".into();
+            pinfo.external_id = Some("claude-parent-uuid".into());
+            pinfo.account_id = Some("acc-1".into());
+            hub.store.save_session(&pinfo).unwrap();
+
+            let srt = hub.get("side-1").unwrap();
+            let mut sinfo = srt.info.lock().unwrap();
+            sinfo.tool = ToolKind::Claude;
+            sinfo.title = "Side question".into();
+            sinfo.parent_id = Some("parent".into());
+            sinfo.side_chat = true;
+            sinfo.external_id = None;
+            sinfo.account_id = Some("acc-1".into());
+            hub.store.save_session(&sinfo).unwrap();
+        }
+
+        // Eligible when parent is idle, same tool/account, and has external_id
+        let side_info = hub.info("side-1").unwrap();
+        assert_eq!(
+            hub.can_native_fork_side(&side_info),
+            Some(("parent".into(), "claude-parent-uuid".into()))
+        );
+        // Once the side chat has its own external_id, it resumes itself instead of forking again
+        let mut already_started = side_info.clone();
+        already_started.external_id = Some("side-own-uuid".into());
+        assert!(hub.can_native_fork_side(&already_started).is_none());
+
+        // Ineligible when parent is running
+        {
+            let prt = hub.get("parent").unwrap();
+            prt.info.lock().unwrap().status = SessionStatus::Running;
+        }
+        assert!(hub.can_native_fork_side(&side_info).is_none());
+
+        // Ineligible across tools or accounts even when parent is idle again
+        {
+            let prt = hub.get("parent").unwrap();
+            prt.info.lock().unwrap().status = SessionStatus::Idle;
+        }
+        let mut cross_tool = side_info.clone();
+        cross_tool.tool = ToolKind::Codex;
+        assert!(hub.can_native_fork_side(&cross_tool).is_none());
+        let mut diff_acc = side_info.clone();
+        diff_acc.account_id = Some("acc-2".into());
+        assert!(hub.can_native_fork_side(&diff_acc).is_none());
+
+        // Populate parent + unrelated sessions and verify yi_session MCP gateway
+        let long_reply = format!("HEAD_{}_TAIL", "a".repeat(500));
+        let seq_user = hub.emit_returning_seq("parent", 0, EventBody::UserMessage {
+            text: "Explain auth flow".into(),
+            images: vec![],
+            origin: None,
+        });
+        hub.emit("parent", 0, EventBody::ToolCall {
+            id: "tc1".into(),
+            name: "Read".into(),
+            title: "src/auth.rs".into(),
+            input: json!({}),
+            diffs: vec![],
+        });
+        let seq_reply = hub.emit_returning_seq("parent", 0, EventBody::AssistantText {
+            id: "a1".into(),
+            text: long_reply.clone(),
+        });
+        hub.emit("parent", 0, EventBody::AssistantDelta {
+            id: "live-1".into(),
+            delta: "Checking refresh token...".into(),
+        });
+        hub.emit("unrelated", 0, EventBody::UserMessage {
+            text: "TOP_SECRET_OTHER_SESSION".into(),
+            images: vec![],
+            origin: None,
+        });
+
+        let tmp = tempfile::tempdir().unwrap();
+        let smcp = crate::session_mcp::SessionMcp::new(tmp.path().to_path_buf());
+        smcp.ensure_session("side-1").unwrap();
+        let ticket_val: Value =
+            serde_json::from_slice(&std::fs::read(tmp.path().join("side-1.json")).unwrap()).unwrap();
+        let ticket = ticket_val["ticket"].as_str().unwrap();
+
+        // 1) Side chat defaults to reading its parent, includes liveText and hides ToolCall in messages view
+        let res = smcp
+            .mcp(
+                &hub,
+                "side-1",
+                ticket,
+                json!({"method": "tools/call", "params": {"name": "session_read", "arguments": {}}}),
+            )
+            .unwrap();
+        assert_eq!(res["isError"], false);
+        assert_eq!(res["structuredContent"]["session"]["sessionId"], "parent");
+        assert_eq!(res["structuredContent"]["session"]["liveText"], "Checking refresh token...");
+        let items = res["structuredContent"]["items"].as_array().unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0]["seq"], seq_user);
+        assert_eq!(items[1]["seq"], seq_reply);
+
+        // 2) activity view includes ToolCall
+        let act_res = smcp
+            .mcp(
+                &hub,
+                "side-1",
+                ticket,
+                json!({"method": "tools/call", "params": {"name": "session_read", "arguments": {"view": "activity"}}}),
+            )
+            .unwrap();
+        assert_eq!(act_res["structuredContent"]["items"].as_array().unwrap().len(), 3);
+
+        // 3) Single-item slice pagination by seq + textOffset
+        let slice1 = smcp
+            .mcp(
+                &hub,
+                "side-1",
+                ticket,
+                json!({"method": "tools/call", "params": {"name": "session_read", "arguments": {"seq": seq_reply, "maxCharsPerItem": 200}}}),
+            )
+            .unwrap();
+        assert_eq!(slice1["structuredContent"]["items"][0]["truncated"], true);
+        let next_off = slice1["structuredContent"]["items"][0]["nextTextOffset"].as_u64().unwrap();
+        assert_eq!(next_off, 200);
+        let slice2 = smcp
+            .mcp(
+                &hub,
+                "side-1",
+                ticket,
+                json!({"method": "tools/call", "params": {"name": "session_read", "arguments": {"seq": seq_reply, "textOffset": next_off, "maxCharsPerItem": 400}}}),
+            )
+            .unwrap();
+        assert_eq!(slice2["structuredContent"]["items"][0]["truncated"], false);
+        assert!(slice2["structuredContent"]["items"][0]["text"].as_str().unwrap().ends_with("_TAIL"));
+
+        // 4) Unrelated session is strictly refused
+        let denied = smcp
+            .mcp(
+                &hub,
+                "side-1",
+                ticket,
+                json!({"method": "tools/call", "params": {"name": "session_read", "arguments": {"sessionId": "unrelated"}}}),
+            )
+            .unwrap();
+        assert_eq!(denied["isError"], true);
+        assert!(!denied["content"][0]["text"].as_str().unwrap().contains("TOP_SECRET"));
+
+        // 5) session_list_related returns parent + side-1, excluding unrelated
+        let rel = smcp
+            .mcp(
+                &hub,
+                "side-1",
+                ticket,
+                json!({"method": "tools/call", "params": {"name": "session_list_related", "arguments": {}}}),
+            )
+            .unwrap();
+        let rel_ids: Vec<&str> = rel["structuredContent"]["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v["sessionId"].as_str())
+            .collect();
+        assert_eq!(rel_ids, vec!["parent", "side-1"]);
     }
 }
 
