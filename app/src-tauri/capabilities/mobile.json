@@ -1,8 +1,17 @@
 {
   "$schema": "../gen/schemas/mobile-schema.json",
   "identifier": "mobile",
-  "description": "Open links in the system browser on mobile",
+  "description": "Open links in the system or in-app browser on mobile",
   "windows": ["main"],
   "platforms": ["android", "iOS"],
-  "permissions": ["opener:allow-open-url", "opener:allow-default-urls"]
+  "permissions": [
+    {
+      "identifier": "opener:allow-open-url",
+      "allow": [
+        { "url": "http://*", "app": "inAppBrowser" },
+        { "url": "https://*", "app": "inAppBrowser" }
+      ]
+    },
+    "opener:allow-default-urls"
+  ]
 }

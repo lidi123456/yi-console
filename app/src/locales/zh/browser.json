@@ -11,6 +11,7 @@
   "forwarded2": "已转发",
   "copyAddress": "复制地址",
   "copied": "已复制",
+  "openInAppBrowser": "应用内全屏查看",
   "openInSystemBrowser": "用系统浏览器打开",
   "blankPageSomeSitesRefuse": "页面空白？有的网站不允许被嵌入，",
   "cannotOpenThisAddress": "打不开这个地址",

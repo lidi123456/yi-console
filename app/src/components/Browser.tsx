@@ -4,7 +4,7 @@ import { errorToast, hostStatus, sessionInfo, toast, useStore } from '../store';
 import { hubCall, isTauri, rpc } from '../transport';
 import { writeClipboard } from '../clipboard';
 import { Icon } from './Icon';
-import { forwardPort, openUrlExternal } from './PortsView';
+import { forwardPort, isMobileApp, openUrl, openUrlExternal } from './PortsView';
 import { AI_PREFIX, handToAiBrowser, isAiTab } from './AiBrowser';
 import { canUseBrowser } from '../browserUse';
 import { NATIVE_WEB, NativeWeb, type WebEvent } from './NativeWeb';
@@ -263,6 +263,11 @@ export function BrowserPane({
         <button className="icon-btn" title={tx('copyAddress')} disabled={!external} onClick={() => writeClipboard(external).then(() => toast(tx('copied')))}>
           <Icon name="copy" size={14} />
         </button>
+        {isMobileApp && (
+          <button className="icon-btn" title={tx('openInAppBrowser')} disabled={!external} onClick={() => openUrl(external)}>
+            <Icon name="maximize" size={14} />
+          </button>
+        )}
         <button className="icon-btn" title={tx('openInSystemBrowser')} disabled={!external} onClick={() => openUrlExternal(external)}>
           <Icon name="external" size={14} />
         </button>
@@ -284,6 +289,14 @@ export function BrowserPane({
       {remoteHint && src && (
         <div className="wb-tip">
           {tx('blankPageSomeSitesRefuse')}
+          {isMobileApp && (
+            <>
+              <button className="link-btn" onClick={() => openUrl(src)}>
+                {tx('openInAppBrowser')}
+              </button>
+              {' · '}
+            </>
+          )}
           <button className="link-btn" onClick={() => openUrlExternal(src)}>
             {tx('openInSystemBrowser')}
           </button>

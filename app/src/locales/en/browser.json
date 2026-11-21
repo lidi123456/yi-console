@@ -11,6 +11,7 @@
   "forwarded2": "Forwarded",
   "copyAddress": "Copy address",
   "copied": "Copied",
+  "openInAppBrowser": "Open in full-screen browser",
   "openInSystemBrowser": "Open in system browser",
   "blankPageSomeSitesRefuse": "Blank page? Some sites refuse to be embedded. ",
   "cannotOpenThisAddress": "Cannot open this address",

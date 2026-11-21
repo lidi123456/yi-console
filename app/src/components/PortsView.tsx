@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
-import { getT } from '../i18n';
+import { getLang, getT } from '../i18n';
 import { errorToast, toast, useStore } from '../store';
+import { isAppDark } from '../theme';
 import { hubCall, isTauri, onHubEvent, rpc } from '../transport';
 import { writeClipboard } from '../clipboard';
 import { Icon } from './Icon';
@@ -30,18 +31,32 @@ interface Listening {
 
 export const isMobileApp = isTauri && /Android|iPhone|iPad/i.test(navigator.userAgent);
 
-/** Open a URL: the system browser on desktop, the in-app browser in the mobile app (Android Custom Tabs, whose menu can switch to another browser), a new tab in the browser build */
+interface AndroidBridge {
+  openExternal?(u: string): void;
+  openInApp?(u: string, dark: boolean, lang: string): void;
+}
+
+/** Open a URL: system browser on desktop; native in-app WebView on Android, SFSafariViewController on iOS, new tab in browser build */
 export function openUrl(url: string) {
-  // On mobile ClientHub can't open the system browser, so hand it to the opener plugin
-  if (isMobileApp) import('@tauri-apps/plugin-opener').then((m) => m.openUrl(url, 'inAppBrowser')).catch(errorToast);
-  else if (isTauri) hubCall('url.open', { url }).catch(errorToast);
+  const web = /^https?:/i.test(url.trim());
+  if (isMobileApp) {
+    const native = (window as { YiConsoleAndroid?: AndroidBridge }).YiConsoleAndroid;
+    if (web && native?.openInApp) {
+      native.openInApp(url, isAppDark(), getLang());
+      return;
+    }
+    // Non-http(s) schemes (mailto:, tel:) must not pass 'inAppBrowser' (SFSafariViewController crashes on non-http(s))
+    import('@tauri-apps/plugin-opener')
+      .then((m) => (web ? m.openUrl(url, 'inAppBrowser') : m.openUrl(url)))
+      .catch(errorToast);
+  } else if (isTauri) hubCall('url.open', { url }).catch(errorToast);
   else window.open(url, '_blank', 'noopener');
 }
 
 /** Open in another browser on mobile: Android shows the system app chooser (YiConsoleAndroid injected by MainActivity), otherwise the default browser */
 export function openUrlExternal(url: string) {
-  const native = (window as { YiConsoleAndroid?: { openExternal(u: string): void } }).YiConsoleAndroid;
-  if (isMobileApp && native) native.openExternal(url);
+  const native = (window as { YiConsoleAndroid?: AndroidBridge }).YiConsoleAndroid;
+  if (isMobileApp && native?.openExternal) native.openExternal(url);
   else if (isMobileApp) import('@tauri-apps/plugin-opener').then((m) => m.openUrl(url)).catch(errorToast);
   else openUrl(url);
 }
