@@ -11,9 +11,10 @@ import { TOOL_LABEL, supportsAccountsTool, type QuestionAnswer, type ToolAccount
 import { fmtUsage, isMobile, lsGet, lsSet, shortPath, STATUS_LABEL } from '../util';
 import { openAccountManager } from './AccountManagerModal';
 import { openMenu } from './Overlay';
-import { exportSession, OPEN_CHANGES, OPEN_FILE, openFileInPanel, renameSession, sessionMenu, showChanges, showTurnDiff, switchMode } from './SessionActions';
+import { exportSession, OPEN_CHANGES, OPEN_FILE, openFileInPanel, renameSession, sessionMenu, showTurnDiff, switchMode } from './SessionActions';
 import { AI_PREFIX } from './AiBrowser';
 import { FilePanel } from './FilePanel';
+import { sideChatTitle, sideChatTools, sideTabPath, startSideChat } from './SideChatTab';
 import { TermPanel } from './TermPanel';
 import { AsyncAskCard, ChatView, openAsyncAsk, PermissionCard, setChatStyle, useChatStyle } from './ChatView';
 import { PlanDock } from './PlanDock';
@@ -53,7 +54,13 @@ function useNarrowViewport() {
 export function SessionView({ hostId, sessionId, seq }: { hostId: string; sessionId: string; seq?: number }) {
   const key = skey(hostId, sessionId);
   const data = useSessionData(key);
-  const info = useStore((s) => s.sessions[hostId]?.find((x) => x.id === sessionId));
+  const hostSessions = useStore((s) => s.sessions[hostId]);
+  const info = useMemo(() => hostSessions?.find((x) => x.id === sessionId), [hostSessions, sessionId]);
+  const sideChats = useMemo(
+    () => (hostSessions ? hostSessions.filter((x) => x.parentId === sessionId && x.sideChat) : []),
+    [hostSessions, sessionId],
+  );
+  const liveSideCount = sideChats.filter((x) => x.status === 'running' || x.status === 'starting').length;
   const connected = useStore((s) => s.hosts.find((h) => h.config.id === hostId)?.status.status === 'connected');
   const attn = useStore((s) =>
     Object.values(s.sessions).reduce((n, l) => n + l.filter((x) => x.pendingPermissions > 0).length, 0),
@@ -480,16 +487,19 @@ export function SessionView({ hostId, sessionId, seq }: { hostId: string; sessio
         </button>
         <ToolBadge tool={info.tool} size={20} />
         <div className="session-meta">
-          <div
-            className="session-name truncate"
-            onDoubleClick={rename}
-            title={
-              isEn()
-                ? `${info.externalId ? `${TOOL_LABEL[info.tool]} Session ID: ${info.externalId}\n` : ''}Yi Console Session ID: ${info.id}\nDouble-click to rename, copy ID from More menu`
-                : `${info.externalId ? `${TOOL_LABEL[info.tool]} 会话 ID：${info.externalId}\n` : ''}Yi Console 会话 ID：${info.id}\n双击重命名，「更多」菜单里可复制 ID`
-            }
-          >
-            {info.title || t('newSession')}
+          <div className="session-title-row">
+            <div
+              className="session-name truncate"
+              onDoubleClick={rename}
+              title={
+                isEn()
+                  ? `${info.externalId ? `${TOOL_LABEL[info.tool]} Session ID: ${info.externalId}\n` : ''}Yi Console Session ID: ${info.id}\nDouble-click to rename, copy ID from More menu`
+                  : `${info.externalId ? `${TOOL_LABEL[info.tool]} 会话 ID：${info.externalId}\n` : ''}Yi Console 会话 ID：${info.id}\n双击重命名，「更多」菜单里可复制 ID`
+              }
+            >
+              {info.title || t('newSession')}
+            </div>
+            {!filesOnly && <span className={`status-chip st-${info.status}`}>{STATUS_LABEL[info.status]}</span>}
           </div>
           <div className="muted small truncate">
             {TOOL_LABEL[info.tool]}
@@ -542,91 +552,142 @@ export function SessionView({ hostId, sessionId, seq }: { hostId: string; sessio
             {info.contextPercent != null && ` · ${t('context')} ${Math.round(info.contextPercent)}%`}
           </div>
         </div>
-        {!filesOnly && <span className={`status-chip st-${info.status}`}>{STATUS_LABEL[info.status]}</span>}
-        {info.tool !== 'shell' && !filesOnly && (
-          <button
-            className="btn small usage-btn hide-mobile"
-            onClick={() => setUsage(true)}
-            title={t('viewSessionUsageAndAccount')}
-          >
-            <Icon name="chart" size={14} />
-            <span className="hide-mobile narrow-hide">{fmtUsage(info.usage) || t('usage')}</span>
-          </button>
-        )}
-        {info.tool !== 'shell' && !filesOnly && (
-          <button
-            className="btn small hide-mobile"
-            disabled={!connected || switching}
-            onClick={async () => {
-              setSwitching(true);
-              await switchMode(hostId, info);
-              setSwitching(false);
-            }}
-            title={
-              info.mode === 'terminal'
-                ? t('switchToChatModeAnd')
-                : t('switchToTerminalModeAnd')
-            }
-          >
-            <Icon name={info.mode === 'terminal' ? 'chat' : 'terminal'} size={14} />
-            <span className="hide-mobile narrow-hide">
-              {switching
-                ? t('switching')
-                : info.mode === 'terminal'
-                  ? t('chatMode')
-                  : t('terminalMode')}
-            </span>
-          </button>
-        )}
-        <button className="icon-btn" title={t('viewChanges')} aria-label={t('viewChanges')} onClick={() => showChanges(hostId, sessionId)}>
-          <Icon name="diff" size={17} />
-        </button>
-        {!filesOnly && (
-          <button className={`icon-btn ${files ? 'active' : ''}`} title={t('workspaceFiles')} onClick={toggleFiles}>
-            <Icon name="folder" size={17} />
-          </button>
-        )}
-        {/* On mobile this spot holds "Usage" (the top-bar usage button is hidden on mobile), and the bottom terminal panel moves into the "More" menu */}
-        {info.tool !== 'shell' && !filesOnly && (
-          <button
-            className="icon-btn show-mobile"
-            title={t('viewSessionUsageAndAccount')}
-            aria-label={t('usage')}
-            onClick={() => setUsage(true)}
-          >
-            <Icon name="chart" size={17} />
-          </button>
-        )}
-        {info.tool !== 'shell' && (
-          // Files sessions have no usage button, so the terminal button stays in the top bar on mobile too
-          <button className={`icon-btn ${filesOnly ? '' : 'hide-mobile'} ${term ? 'active' : ''}`} title={term ? t('hideTerminal') : t('openTerminal')} onClick={toggleTerm}>
-            <Icon name="terminal" size={17} />
-          </button>
-        )}
-        <button
-          className="icon-btn"
-          title={t('more')}
-          onClick={(e) => {
-            const r = e.currentTarget.getBoundingClientRect();
-            openMenu(
-              { clientX: r.right - 200, clientY: r.bottom + 4 },
-              sessionMenu(hostId, info, {
-                inSession: true,
-                onUsage: () => setUsage(true),
-                onMemory: () => setMemoryOpen(true),
-                onPromptOutline: isChatMode ? toggleOutlineBtn : undefined,
-                outlineActive,
-                promptCount: prompts.length,
-                term,
-                onToggleTerm: toggleTerm,
-                style,
-                onToggleStyle: () => setChatStyle(style === 'modern' ? 'claude' : 'modern'),
-              }),
-            );
-          }}
-        >
-          <Icon name="more" size={18} />
-        </button>
+        <div className="head-toolbar">
+          {sideChats.length > 0 && isChatMode && (
+            <button
+              type="button"
+              className={`head-side-btn ${files ? 'open' : ''}`}
+              title={t('sideChatsMenuTip')}
+              onClick={(e) => {
+                const r = e.currentTarget.getBoundingClientRect();
+                const otherTools = sideChatTools(hostId).filter((tk) => tk !== info.tool);
+                openMenu(
+                  { clientX: r.right - 260, clientY: r.bottom + 4 },
+                  [
+                    ...sideChats.map((sc) => ({
+                      label: sideChatTitle(sc),
+                      icon: 'sideChat',
+                      hint: [TOOL_LABEL[sc.tool], STATUS_LABEL[sc.status]].join(' · '),
+                      run: () => openFileInPanel(hostId, sessionId, sideTabPath(sc.id)),
+                    })),
+                    '-' as const,
+                    {
+                      label: t('newSideChat'),
+                      icon: 'plus',
+                      hint: TOOL_LABEL[info.tool],
+                      run: () => void startSideChat({ hostId, parent: info }).catch(errorToast),
+                    },
+                    ...otherTools.map((tk) => ({
+                      label: t('newSideChatWithTool', { tool: TOOL_LABEL[tk] }),
+                      icon: 'sideChat',
+                      run: () => void startSideChat({ hostId, parent: info, tool: tk }).catch(errorToast),
+                    })),
+                  ],
+                );
+              }}
+            >
+              {liveSideCount > 0 ? <span className="wp-side-dot running" /> : <Icon name="sideChat" size={13} />}
+              <span>{t('sideChatsCount', { count: sideChats.length })}</span>
+              <Icon name="down" size={11} />
+            </button>
+          )}
+          {info.tool !== 'shell' && !filesOnly && (
+            <div className="head-group hide-mobile">
+              <button
+                type="button"
+                className="head-ghost-btn usage-btn"
+                onClick={() => setUsage(true)}
+                title={t('viewSessionUsageAndAccount')}
+              >
+                <Icon name="chart" size={14} />
+                <span className="narrow-hide">{fmtUsage(info.usage) || t('usage')}</span>
+              </button>
+              <button
+                type="button"
+                className="head-ghost-btn"
+                disabled={!connected || switching}
+                onClick={async () => {
+                  setSwitching(true);
+                  await switchMode(hostId, info);
+                  setSwitching(false);
+                }}
+                title={info.mode === 'terminal' ? t('switchToChatModeAnd') : t('switchToTerminalModeAnd')}
+              >
+                <Icon name={info.mode === 'terminal' ? 'chat' : 'terminal'} size={14} />
+                <span className="narrow-hide">
+                  {switching ? t('switching') : info.mode === 'terminal' ? t('chatMode') : t('terminalMode')}
+                </span>
+              </button>
+            </div>
+          )}
+          {info.tool !== 'shell' && !filesOnly && <span className="head-sep hide-mobile" aria-hidden="true" />}
+          <div className="head-group head-layout-group">
+            {/* On mobile this spot holds "Usage" (the desktop ghost usage button is hidden), and the bottom terminal panel moves into "More" */}
+            {info.tool !== 'shell' && !filesOnly && (
+              <button
+                type="button"
+                className="head-toggle-btn show-mobile"
+                title={t('viewSessionUsageAndAccount')}
+                aria-label={t('usage')}
+                onClick={() => setUsage(true)}
+              >
+                <Icon name="chart" size={16} />
+              </button>
+            )}
+            {info.tool !== 'shell' && (
+              <button
+                type="button"
+                className={`head-toggle-btn ${filesOnly ? '' : 'hide-mobile'} ${term ? 'active' : ''}`}
+                aria-pressed={term}
+                title={term ? t('hideTerminal') : t('openTerminal')}
+                aria-label={term ? t('hideTerminal') : t('openTerminal')}
+                onClick={toggleTerm}
+              >
+                <Icon name="panelBottom" size={16} />
+              </button>
+            )}
+            {!filesOnly && (
+              <button
+                type="button"
+                className={`head-toggle-btn ${files ? 'active' : ''}`}
+                aria-pressed={files}
+                title={t('workspaceFiles')}
+                aria-label={t('workspaceFiles')}
+                onClick={toggleFiles}
+              >
+                <Icon name="panelRight" size={16} />
+                {liveSideCount > 0 && <span className="head-live-badge">{liveSideCount}</span>}
+              </button>
+            )}
+            <button
+              type="button"
+              className="head-toggle-btn"
+              title={t('more')}
+              aria-label={t('more')}
+              onClick={(e) => {
+                const r = e.currentTarget.getBoundingClientRect();
+                openMenu(
+                  { clientX: r.right - 200, clientY: r.bottom + 4 },
+                  sessionMenu(hostId, info, {
+                    inSession: true,
+                    onUsage: () => setUsage(true),
+                    onMemory: () => setMemoryOpen(true),
+                    onNewSideChat: isChatMode && connected ? () => void startSideChat({ hostId, parent: info }).catch(errorToast) : undefined,
+                    onPromptOutline: isChatMode ? toggleOutlineBtn : undefined,
+                    outlineActive,
+                    promptCount: prompts.length,
+                    term,
+                    onToggleTerm: toggleTerm,
+                    style,
+                    onToggleStyle: () => setChatStyle(style === 'modern' ? 'claude' : 'modern'),
+                  }),
+                );
+              }}
+            >
+              <Icon name="more" size={16} />
+            </button>
+          </div>
+        </div>
       </header>
       {info.bot && <SessionBotBar info={info} />}
 

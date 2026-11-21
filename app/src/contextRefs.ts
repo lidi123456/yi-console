@@ -4,28 +4,30 @@
 //   code / unified diff / inline review comment / terminal output, while ChatView and QueueList strip the blocks and
 //   render only compact clickable pills above the user bubble.
 
-export type ContextRefKind = 'diff' | 'code' | 'review' | 'terminal';
+export type ContextRefKind = 'diff' | 'code' | 'review' | 'terminal' | 'side';
 
 export interface ContextRef {
   id: string;
   kind: ContextRefKind;
-  /** Path relative to the workspace root (or repo-relative path for a commit file, untitled tab label, or terminal title) */
+  /** Path relative to the workspace root (or repo-relative path for a commit file, untitled tab label, terminal title, or side chat title) */
   path: string;
   /** Commit hash when referenced from a commit diff tab (git:<hash>:<rel>) */
   commit?: string;
   /** Referenced from an unsaved untitled tab (not a file on disk) */
   untitled?: boolean;
-  /** 1-based line range in the file (or 1..lineCount for terminal output) */
+  /** 1-based line range in the file (or 1..lineCount for terminal / side chat notes) */
   fromLine: number;
   toLine: number;
   /** Added / deleted line counts when kind === 'diff' or 'review' */
   added?: number;
   deleted?: number;
-  /** Inline review comment text when kind === 'review' */
+  /** Inline review comment text when kind === 'review', or short summary when kind === 'side' */
   comment?: string;
   /** Non-zero exit code when kind === 'terminal' (from OSC 133 triage) */
   exitCode?: number;
-  /** Unified diff hunk (for 'diff' / 'review') or raw selected lines (for 'code' / 'terminal') */
+  /** Side chat session id when kind === 'side' (allows clicking the pill to reopen that side chat tab) */
+  sideSessionId?: string;
+  /** Unified diff hunk (for 'diff' / 'review'), raw selected lines (for 'code' / 'terminal'), or side chat conclusion markdown */
   content: string;
 }
 
@@ -59,6 +61,7 @@ export function sameContextRef(a: ContextRefInput, b: ContextRefInput): boolean 
     a.toLine === b.toLine &&
     (a.comment ?? '') === (b.comment ?? '') &&
     (a.exitCode ?? 0) === (b.exitCode ?? 0) &&
+    (a.sideSessionId ?? '') === (b.sideSessionId ?? '') &&
     a.content === b.content
   );
 }
@@ -105,9 +108,21 @@ function pickTag(body: string): string {
 export function serializeContextRef(r: ContextRefInput): string {
   const normContent = r.content.replace(/\r\n/g, '\n').replace(/\n$/, '');
   const fence = pickFence(normContent);
-  const lang = r.kind === 'diff' || r.kind === 'review' ? 'diff' : r.kind === 'terminal' ? 'text' : extLang(r.path);
+  const lang =
+    r.kind === 'diff' || r.kind === 'review'
+      ? 'diff'
+      : r.kind === 'terminal'
+        ? 'text'
+        : r.kind === 'side'
+          ? 'markdown'
+          : extLang(r.path);
   const codeBlock = `${fence}${lang}\n${normContent}\n${fence}`;
-  const inner = r.kind === 'review' && r.comment ? `Review comment: ${r.comment.trim()}\n${codeBlock}` : codeBlock;
+  const inner =
+    r.kind === 'review' && r.comment
+      ? `Review comment: ${r.comment.trim()}\n${codeBlock}`
+      : r.kind === 'side'
+        ? `Side chat notes (${r.path}):\n${normContent}`
+        : codeBlock;
   const tag = pickTag(inner);
   const attrs = [
     `kind="${r.kind}"`,
@@ -120,11 +135,14 @@ export function serializeContextRef(r: ContextRefInput): string {
     if (r.added) attrs.push(`add="${r.added}"`);
     if (r.deleted) attrs.push(`del="${r.deleted}"`);
   }
-  if (r.kind === 'review' && r.comment) {
+  if ((r.kind === 'review' || r.kind === 'side') && r.comment) {
     attrs.push(`comment="${escAttr(r.comment.trim())}"`);
   }
   if (r.kind === 'terminal' && r.exitCode !== undefined) {
     attrs.push(`exit="${r.exitCode}"`);
+  }
+  if (r.kind === 'side' && r.sideSessionId) {
+    attrs.push(`sid="${escAttr(r.sideSessionId)}"`);
   }
   return `<${tag} ${attrs.join(' ')}>\n${inner}\n</${tag}>`;
 }
@@ -153,7 +171,9 @@ export function parseContextMessage(raw: string): { text: string; refs: ContextR
     const attrs: Record<string, string> = {};
     for (const m of attrStr.matchAll(ATTR_RE)) attrs[m[1]] = unescAttr(m[2]);
     const kind: ContextRefKind =
-      attrs.kind === 'diff' || attrs.kind === 'review' || attrs.kind === 'terminal' ? attrs.kind : 'code';
+      attrs.kind === 'diff' || attrs.kind === 'review' || attrs.kind === 'terminal' || attrs.kind === 'side'
+        ? attrs.kind
+        : 'code';
     const path = attrs.path || 'snippet';
     const lm = /^(\d+)(?:-(\d+))?$/.exec(attrs.lines ?? '');
     const fromLine = lm ? Math.max(1, Number(lm[1])) : 1;
@@ -166,6 +186,10 @@ export function parseContextMessage(raw: string): { text: string; refs: ContextR
         if (!comment) comment = trimmed.slice('Review comment: '.length, nl).trim();
         trimmed = trimmed.slice(nl + 1).trim();
       }
+    }
+    if (kind === 'side' && trimmed.startsWith('Side chat notes (')) {
+      const nl = trimmed.indexOf('\n');
+      if (nl > 0) trimmed = trimmed.slice(nl + 1).trim();
     }
     const fm = /^(`{3,})[^\n]*\n([\s\S]*?)(?:\n\1)?$/.exec(trimmed);
     const content = fm ? fm[2] : trimmed;
@@ -184,6 +208,7 @@ export function parseContextMessage(raw: string): { text: string; refs: ContextR
       deleted: deleted || undefined,
       comment,
       exitCode: Number.isFinite(exitCode) ? exitCode : undefined,
+      sideSessionId: attrs.sid || undefined,
       content,
     });
     return '';

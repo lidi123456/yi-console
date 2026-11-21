@@ -28,6 +28,7 @@ import { permLabel, permModes } from '../perm';
 import { nextPerm, PermPicker } from './PermPicker';
 import { ModelPicker, OPEN_MODEL } from './ModelPicker';
 import { QueueList } from './QueueList';
+import { bringSideChatToMain, sideChatTitle, startSideChat } from './SideChatTab';
 import { noteOwnerMessage } from '../bots';
 
 const t = getT('composer');
@@ -428,19 +429,66 @@ export function Composer({
 
   const clearSlash = () => replaceTrigger('');
 
+  const canSideChat = info.mode === 'structured' && info.tool !== 'shell' && info.tool !== 'files' && !info.sideChat;
+  const hostSessions = useStore((s) => s.sessions[hostId]);
+  const sideChats = useMemo(
+    () => (hostSessions ? hostSessions.filter((x) => x.parentId === info.id && x.sideChat) : []),
+    [hostSessions, info.id],
+  );
+
   const items: PopItem[] = useMemo(() => {
     if (!popOpen) return [];
     if (at) {
-      return (files ?? []).map((f) => ({
+      const q = at[1].toLowerCase();
+      const sideItems: PopItem[] = canSideChat
+        ? sideChats
+            .filter((sc) => {
+              if (!q) return true;
+              return sideChatTitle(sc).toLowerCase().includes(q) || sc.tool.toLowerCase().includes(q);
+            })
+            .map((sc) => ({
+              key: `side-${sc.id}`,
+              label: sideChatTitle(sc),
+              desc: sc.status === 'running' || sc.status === 'starting' ? t('sideChatRunningHint') : t('sideChatMentionHint'),
+              group: t('sideChatsGroup'),
+              icon: 'sideChat',
+              apply: () => {
+                replaceTrigger('');
+                void bringSideChatToMain(hostId, info.id, sc);
+              },
+            }))
+        : [];
+      const fileItems: PopItem[] = (files ?? []).map((f) => ({
         key: f.path,
         label: f.path + (f.isDir ? '/' : ''),
         group: t('files'),
         icon: f.isDir ? 'folder' : 'file',
         apply: () => (f.isDir ? replaceTrigger(`@${f.path}/`, true) : replaceTrigger(`@${f.path} `)),
       }));
+      return [...sideItems, ...fileItems];
     }
     const q = slash![1];
     const builtin: PopItem[] = [
+      ...(canSideChat
+        ? [
+            {
+              key: 'b-side',
+              label: 'side',
+              desc: t('sideChatSlashDesc'),
+              group: 'Yi Console',
+              icon: 'sideChat',
+              apply: () => replaceTrigger('/side '),
+            },
+            {
+              key: 'b-btw',
+              label: 'btw',
+              desc: t('sideChatBtwDesc'),
+              group: 'Yi Console',
+              icon: 'sideChat',
+              apply: () => replaceTrigger('/btw '),
+            },
+          ]
+        : []),
       { key: 'b-model', label: 'model', desc: t('switchModel'), group: 'Yi Console', icon: 'chat', apply: () => (clearSlash(), window.dispatchEvent(new Event(OPEN_MODEL))) },
       { key: 'b-mode', label: 'mode', desc: t('permissionModeCurrent', { v: permLabel(info.permissionMode) }), group: 'Yi Console', icon: 'shield', apply: () => (clearSlash(), setPermOpen(true)) },
       ...permModes(info.tool, info.mode).map(([id, label, desc]) => ({
@@ -504,7 +552,7 @@ export function Composer({
       .sort((a, b) => b.s - a.s)
       .map((x) => x.it);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [popOpen, trigger, files, commands, snippets, info.permissionMode, running, lang]);
+  }, [popOpen, trigger, files, commands, snippets, info.permissionMode, running, lang, canSideChat, sideChats]);
 
   useEffect(() => setSel(0), [trigger]);
   const listRef = useRef<HTMLDivElement>(null);
@@ -635,6 +683,22 @@ export function Composer({
     if (t === '/clear' && curImgs.length === 0 && curRefs.length === 0 && info.mode !== 'terminal') {
       setText('');
       clearSession(hostId, info);
+      return;
+    }
+    // /side [question] or /btw [question]: open a hidden read-only side chat in the right panel without interrupting the main turn
+    const sideMatch = canSideChat && curImgs.length === 0 && curRefs.length === 0 ? /^\/(?:side|btw)(?:\s+([\s\S]*))?$/i.exec(t) : null;
+    if (sideMatch) {
+      const from = key;
+      setSendingKey(from);
+      try {
+        await startSideChat({ hostId, parent: info, prompt: sideMatch[1]?.trim() });
+        if (keyRef.current === from) setText((cur) => (cur.trim() === t ? '' : cur));
+        if (draftOf(from).trim() === t) setDraftOf(from, '');
+      } catch (e) {
+        errorToast(e);
+      } finally {
+        setSendingKey((k) => (k === from ? null : k));
+      }
       return;
     }
     const from = key;

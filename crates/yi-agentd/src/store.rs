@@ -383,6 +383,7 @@ mod tests {
             model_config_pending: false,
             pinned: false,
             parent_id: None,
+            side_chat: false,
             synced_users: None,
             auto_resume: None,
             limit_hits: 0,

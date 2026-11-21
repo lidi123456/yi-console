@@ -117,7 +117,7 @@ function ModelSubmenu({ anchor, menuRef, label, children }: {
 }
 
 /** The session's model button: reads the list from the session, changes go to the running tool */
-export function ModelPicker({ hostId, info }: { hostId: string; info: SessionInfo }) {
+export function ModelPicker({ hostId, info, listenOpenEvent = true }: { hostId: string; info: SessionInfo; listenOpenEvent?: boolean }) {
   const [models, setModels] = useState<ModelOption[] | null>(null);
   const load = useCallback(
     () =>
@@ -138,7 +138,7 @@ export function ModelPicker({ hostId, info }: { hostId: string; info: SessionInf
       effort={info.effort ?? ''}
       models={models}
       onOpen={load}
-      openEvent
+      openEvent={listenOpenEvent}
       resetKey={`${hostId}/${info.id}/${info.model ?? ''}`}
       configOptions={info.modelConfigOptions}
       configPending={info.tool === 'cursor' && !!info.modelConfigPending}

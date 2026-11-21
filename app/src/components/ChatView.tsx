@@ -560,11 +560,13 @@ function TurnFooter({
   it,
   checkpoint,
   onOpenTurnDiff,
+  onBringBack,
   onSelectText,
 }: {
   it: Item & { k: 'turn' };
   checkpoint?: TurnCheckpoint;
   onOpenTurnDiff?: (turn: number) => void;
+  onBringBack?: (text: string) => void;
   onSelectText?: (text: string) => void;
 }) {
   const u = it.usage;
@@ -594,6 +596,17 @@ function TurnFooter({
         </button>
       )}
       <span className="turn-time">{clock(it.ts)}</span>
+      {it.text && onBringBack && (
+        <button
+          type="button"
+          className="turn-bring-btn"
+          title={t('bringBackThisReply')}
+          onClick={() => onBringBack(it.text)}
+        >
+          <Icon name="back" size={12} />
+          <span>{t('bringBackThisReply')}</span>
+        </button>
+      )}
       {it.text && (
         <>
           <button
@@ -1864,12 +1877,14 @@ function ModernTurnFooter({
   latest,
   checkpoint,
   onOpenTurnDiff,
+  onBringBack,
   onSelectText,
 }: {
   it: Item & { k: 'turn' };
   latest: boolean;
   checkpoint?: TurnCheckpoint;
   onOpenTurnDiff?: (turn: number) => void;
+  onBringBack?: (text: string) => void;
   onSelectText?: (text: string) => void;
 }) {
   useLang();
@@ -1899,6 +1914,17 @@ function ModernTurnFooter({
       {it.reason && <span className="attn-text">{it.reason}</span>}
       {it.text && (
         <>
+          {onBringBack && (
+            <button
+              type="button"
+              className="turn-bring-btn"
+              title={t('bringBackThisReply')}
+              onClick={() => onBringBack(it.text)}
+            >
+              <Icon name="back" size={12} />
+              <span>{t('bringBackThisReply')}</span>
+            </button>
+          )}
           <button
             className="m-act-btn"
             title={t('copyThisReply')}
@@ -1958,6 +1984,7 @@ export function ChatView({
   pendingOutside,
   skippedAsks,
   onOpenTurnDiff,
+  onBringBack,
 }: {
   events: HubEvent[];
   live: Map<string, string>;
@@ -1987,6 +2014,8 @@ export function ChatView({
   skippedAsks?: string[];
   /** Open the file panel scoped to a completed turn's checkpoint diff */
   onOpenTurnDiff?: (turn: number) => void;
+  /** Optional "bring back to main chat" action on each completed assistant reply (used inside side chats) */
+  onBringBack?: (text: string) => void;
 }) {
   const hideCompactCmd = info?.tool === 'claude' || info?.tool === 'codex' || info?.tool === 'cursor' || info?.tool === 'antigravity';
   const [, lang] = useLang();
@@ -2416,6 +2445,7 @@ export function ChatView({
                   latest={it.key === lastTurnKey}
                   checkpoint={ckpt}
                   onOpenTurnDiff={onOpenTurnDiff}
+                  onBringBack={onBringBack}
                   onSelectText={setSelectingText}
                 />
               ) : (
@@ -2424,6 +2454,7 @@ export function ChatView({
                   it={it}
                   checkpoint={ckpt}
                   onOpenTurnDiff={onOpenTurnDiff}
+                  onBringBack={onBringBack}
                   onSelectText={setSelectingText}
                 />
               );

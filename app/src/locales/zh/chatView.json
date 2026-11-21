@@ -106,5 +106,6 @@
   "copyAll": "复制全文",
   "close": "关闭",
   "viewTurnDiff": "查看本轮文件改动",
-  "turnFilesChanged_other": "{{count}} 个文件"
+  "turnFilesChanged_other": "{{count}} 个文件",
+  "bringBackThisReply": "带回主对话"
 }

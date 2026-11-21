@@ -87,5 +87,12 @@
   "editReviewComment": "编辑批注",
   "reviewCommentPlaceholder": "输入修改意见…",
   "terminalLines": "{{n}} 行",
-  "exitCodeBadge": "退出 {{code}}"
+  "exitCodeBadge": "退出 {{code}}",
+  "openSideChat": "打开旁路对话",
+  "sideChatRefBadge": "旁路",
+  "sideChatsGroup": "旁路对话",
+  "sideChatRunningHint": "旁路对话 · 运行中",
+  "sideChatMentionHint": "旁路对话 · 点击引用结论",
+  "sideChatSlashDesc": "在右侧开启隐藏旁路对话（不中断主线程，可紧跟问题回车）",
+  "sideChatBtwDesc": "同 /side：开启右侧旁路快问，不写入主会话历史"
 }

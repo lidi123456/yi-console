@@ -27,5 +27,9 @@
   "switchAccountTitle": "Switch or manage account in this session",
   "defaultAccount": "Default Account",
   "manageAccounts": "Manage Accounts…",
-  "switchedAccount": "Switched this session to \"{{label}}\""
+  "switchedAccount": "Switched this session to \"{{label}}\"",
+  "sideChatsCount": "Side · {{count}}",
+  "sideChatsMenuTip": "View or reopen side chats attached to this session",
+  "newSideChat": "New side chat",
+  "newSideChatWithTool": "New side chat with {{tool}}…"
 }

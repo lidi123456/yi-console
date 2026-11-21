@@ -88,5 +88,12 @@
   "editReviewComment": "Edit comment",
   "reviewCommentPlaceholder": "Enter your review feedback…",
   "terminalLines": "{{n}} lines",
-  "exitCodeBadge": "exit {{code}}"
+  "exitCodeBadge": "exit {{code}}",
+  "openSideChat": "Open side chat",
+  "sideChatRefBadge": "Side chat",
+  "sideChatsGroup": "Side chats",
+  "sideChatRunningHint": "Side chat · running",
+  "sideChatMentionHint": "Side chat · insert notes",
+  "sideChatSlashDesc": "Start a hidden side chat in the right panel without interrupting the main thread",
+  "sideChatBtwDesc": "Alias of /side: ask a side question beside the main thread"
 }

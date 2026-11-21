@@ -265,6 +265,11 @@ const ERR_PATTERNS: [RegExp, string | ((...m: string[]) => string)][] = [
   [/^升级命令超过 (\d+) 分钟没有结束，已停止$/, (_, m) => `The update command was stopped after running for ${m} minutes`],
   [/^启动升级命令失败[:：]\s*(.+)$/, (_, m) => `Could not start the update command: ${m}`],
   [/^查询最新版本失败[:：]\s*(.+)$/, (_, m) => `Could not look up the latest version: ${m}`],
+  // Side chats (hub.rs)
+  [/旁路对话仅支持 AI 工具的聊天模式/, 'Side chats are only supported in structured chat mode for AI tools'],
+  [/旁路对话缺少所属主会话/, 'Side chat is missing its parent session'],
+  [/所属主会话不存在/, 'Parent session no longer exists'],
+  [/不能在旁路对话内嵌套创建旁路对话/, 'Cannot start a side chat inside another side chat'],
 ];
 
 /** Translate Chinese error messages from the backend or runtime (applies in the English UI) */

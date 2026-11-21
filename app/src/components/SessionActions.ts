@@ -352,6 +352,7 @@ export function sessionMenu(
     inSession?: boolean;
     onUsage?: () => void;
     onMemory?: () => void;
+    onNewSideChat?: () => void;
     style?: 'modern' | 'claude';
     onToggleStyle?: () => void;
     onPromptOutline?: () => void;
@@ -423,8 +424,10 @@ export function sessionMenu(
       ? [{ label: tx('continueInAnotherTool'), icon: 'forward', run: () => handoffSession(hostId, info) }]
       : []),
     '-',
-    // The session page has its own "View Changes" button in the top bar
-    ...(opts.inSession ? [] : [{ label: tx('viewChanges'), icon: 'diff', run: () => showChanges(hostId, sid) }]),
+    ...(opts.onNewSideChat && info.tool !== 'shell' && info.mode === 'structured' && !info.sideChat
+      ? [{ label: tx('newSideChat'), icon: 'sideChat', hint: '/side', run: opts.onNewSideChat }]
+      : []),
+    { label: tx('viewChanges'), icon: 'diff', run: () => showChanges(hostId, sid) },
     // The mobile top bar already has a usage button, so don't repeat it in the menu; the terminal panel is the reverse and only appears in the mobile menu
     ...(opts.onUsage && info.tool !== 'shell' && !mobile ? [{ label: tx('viewUsage'), icon: 'chart', run: opts.onUsage }] : []),
     ...(opts.onMemory && info.tool !== 'shell' && info.mode === 'structured' ? [{ label: tx('memory'), icon: 'book', run: opts.onMemory }] : []),

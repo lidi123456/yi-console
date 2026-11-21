@@ -107,5 +107,6 @@
   "close": "Close",
   "viewTurnDiff": "View changes from this turn",
   "turnFilesChanged_one": "{{count}} file",
-  "turnFilesChanged_other": "{{count}} files"
+  "turnFilesChanged_other": "{{count}} files",
+  "bringBackThisReply": "Add to chat"
 }

@@ -318,6 +318,9 @@ pub struct CreateParams {
     /// Bottom terminal panel: the chat session it belongs to
     #[serde(default)]
     pub parent_id: Option<String>,
+    /// Start as a hidden side chat attached to `parent_id`, inheriting a compact digest of the parent's recent context
+    #[serde(default)]
+    pub side_chat: bool,
     /// Continue with another tool: the session this one takes over from (see `hand_over`)
     #[serde(default)]
     pub handoff_from: Option<String>,
@@ -810,6 +813,20 @@ impl Hub {
                 }
             }
         }
+        if p.side_chat {
+            if mode != SessionMode::Structured || !tool.has_process() || tool == ToolKind::Shell {
+                bail!("旁路对话仅支持 AI 工具的聊天模式");
+            }
+            let pid = p
+                .parent_id
+                .as_deref()
+                .filter(|s| !s.trim().is_empty())
+                .ok_or_else(|| anyhow!("旁路对话缺少所属主会话"))?;
+            let parent = self.info(pid).map_err(|_| anyhow!("所属主会话不存在"))?;
+            if parent.side_chat {
+                bail!("不能在旁路对话内嵌套创建旁路对话");
+            }
+        }
         let id = uuid::Uuid::new_v4().to_string();
         if p.computer_use {
             self.desktop.configure(&id)?;
@@ -863,6 +880,7 @@ impl Hub {
             restart_interrupted: false,
             background_tasks: vec![],
             parent_id: p.parent_id.clone(),
+            side_chat: p.side_chat,
             synced_users: None,
             auto_resume: None,
             limit_hits: 0,
@@ -936,6 +954,11 @@ impl Hub {
         if let Some((fid, frt)) = &from {
             let tool = frt.info.lock().unwrap().tool;
             self.emit(&info.id, 0, EventBody::Handoff { session_id: fid.clone(), tool, to: false });
+        }
+        if info.side_chat {
+            if let Some(pid) = info.parent_id.as_deref() {
+                *rt.pending_handoff.lock().unwrap() = Some(self.side_context_digest(pid));
+            }
         }
         let images = if mode == SessionMode::Structured { p.images } else { vec![] };
         match p.prompt.filter(|s| !s.trim().is_empty()) {
@@ -3963,6 +3986,59 @@ impl Hub {
         }
     }
 
+    fn side_context_digest(&self, parent_id: &str) -> String {
+        let parent_meta = self.info(parent_id).ok();
+        let (evs, _) = self.store.events_tail(parent_id, None, 60).unwrap_or_default();
+        let mut lines = Vec::new();
+        for ev in evs {
+            match ev.body {
+                EventBody::UserMessage { text, .. } => {
+                    let clean = strip_handoff_prefix(&text);
+                    if !clean.is_empty() {
+                        lines.push(format!("User: {}", truncate(clean, 500)));
+                    }
+                }
+                EventBody::AssistantText { text, .. } => {
+                    let t = text.trim();
+                    if !t.is_empty() {
+                        lines.push(format!("Assistant: {}", truncate(t, 650)));
+                    }
+                }
+                EventBody::ToolCall { name, title, .. } => {
+                    lines.push(format!("Tool {name}: {}", truncate(&title, 180)));
+                }
+                EventBody::Error { message } => {
+                    lines.push(format!("Error: {}", truncate(&message, 180)));
+                }
+                _ => {}
+            }
+        }
+        let header = match parent_meta {
+            Some(ref info) if !info.title.trim().is_empty() => format!(
+                "Parent session: \"{}\" (status: {:?}).",
+                truncate(info.title.trim(), 120),
+                info.status
+            ),
+            Some(ref info) => format!("Parent session status: {:?}.", info.status),
+            None => String::new(),
+        };
+        let mut out = String::from(
+            "<yi-side-context>\nYou are running inside a hidden side chat attached to a parent conversation sharing the same workspace.\nThe parent conversation may still be running in parallel. Focus on reading, searching, and answering concisely; do NOT edit, write, or commit workspace files unless the user explicitly asks you to and permission allows it.",
+        );
+        if !header.is_empty() {
+            out.push('\n');
+            out.push_str(&header);
+        }
+        if !lines.is_empty() {
+            let body = lines.join("\n");
+            let capped = truncate(&body, 5600);
+            out.push_str("\nRecent parent conversation context:\n");
+            out.push_str(&capped);
+        }
+        out.push_str("\n</yi-side-context>");
+        out
+    }
+
     fn handoff_digest(&self, sid: &str) -> Option<String> {
         let (evs, _) = self.store.events_tail(sid, None, 40).ok()?;
         let mut lines = Vec::new();
@@ -4189,12 +4265,13 @@ fn new_rt(info: SessionInfo) -> SessionRt {
 }
 
 fn strip_handoff_prefix(text: &str) -> &str {
-    let t = text.trim();
-    if let Some(idx) = t.find("</yi-account-handoff>") {
-        t[idx + "</yi-account-handoff>".len()..].trim()
-    } else {
-        t
+    let mut t = text.trim();
+    for tag in ["</yi-account-handoff>", "</yi-side-context>"] {
+        if let Some(idx) = t.find(tag) {
+            t = t[idx + tag.len()..].trim();
+        }
     }
+    t
 }
 
 /// What the automatic continue sends (wording follows Claude Code's own auto-continue)
@@ -5128,6 +5205,7 @@ mod tests {
             restart_interrupted: false,
             background_tasks: vec![],
             parent_id: None,
+            side_chat: false,
             synced_users: None,
             auto_resume: None,
             limit_hits: 0,
@@ -5962,6 +6040,97 @@ mod tests {
             .output()
             .unwrap();
         assert!(String::from_utf8_lossy(&out.stdout).trim().is_empty());
+    }
+
+    #[tokio::test]
+    async fn side_chat_inherits_parent_context_and_cascades_delete() {
+        let hub = Hub::new(crate::store::Store::open_memory().unwrap(), DaemonSettings::default());
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().display().to_string();
+
+        // Reject invalid side chat configurations (missing parent, non-chat tool, nested side chat)
+        assert!(hub
+            .create(CreateParams {
+                tool: "claude".into(),
+                cwd: cwd.clone(),
+                side_chat: true,
+                ..Default::default()
+            })
+            .is_err());
+        assert!(hub
+            .create(CreateParams {
+                tool: "files".into(),
+                cwd: cwd.clone(),
+                parent_id: Some("p".into()),
+                side_chat: true,
+                ..Default::default()
+            })
+            .is_err());
+
+        // Set up a running parent session with conversation history
+        let _parent_rx = live(&hub, "parent", SessionMode::Structured, SessionStatus::Running, 1);
+        {
+            let rt = hub.get("parent").unwrap();
+            let mut info = rt.info.lock().unwrap();
+            info.cwd = cwd.clone();
+            info.title = "Refactor queue persistence".into();
+            hub.store.save_session(&info).unwrap();
+        }
+        hub.emit("parent", 0, EventBody::UserMessage { text: "Persist session queue in SQLite".into(), images: vec![], origin: None });
+        hub.emit("parent", 0, EventBody::AssistantText { id: "a1".into(), text: "Updated store.rs with queues table".into() });
+
+        // Digest includes parent title, status, and recent events
+        let digest = hub.side_context_digest("parent");
+        assert!(digest.starts_with("<yi-side-context>") && digest.ends_with("</yi-side-context>"), "{digest}");
+        assert!(digest.contains("Refactor queue persistence"), "{digest}");
+        assert!(digest.contains("Persist session queue in SQLite"), "{digest}");
+        assert!(digest.contains("Updated store.rs with queues table"), "{digest}");
+
+        // Seed a child side chat, inject side context, and verify deliver() sends context to adapter without polluting UserMessage
+        let mut side_rx = live(&hub, "side-1", SessionMode::Structured, SessionStatus::Idle, 1);
+        {
+            let rt = hub.get("side-1").unwrap();
+            {
+                let mut info = rt.info.lock().unwrap();
+                info.cwd = cwd.clone();
+                info.parent_id = Some("parent".into());
+                info.side_chat = true;
+                hub.store.save_session(&info).unwrap();
+            }
+            *rt.pending_handoff.lock().unwrap() = Some(digest);
+        }
+
+        // Reject nesting a side chat inside another side chat
+        assert!(hub
+            .create(CreateParams {
+                tool: "claude".into(),
+                cwd: cwd.clone(),
+                parent_id: Some("side-1".into()),
+                side_chat: true,
+                ..Default::default()
+            })
+            .is_err());
+
+        hub.send("side-1", "Why does deliver() split locks?", vec![], false, None).unwrap();
+        let sent = match side_rx.try_recv().unwrap() {
+            AdapterCmd::Send(p) => p.text,
+            other => panic!("unexpected adapter cmd: {other:?}"),
+        };
+        assert!(sent.contains("<yi-side-context>"), "{sent}");
+        assert!(sent.ends_with("Why does deliver() split locks?"), "{sent}");
+
+        // Stored UserMessage stays clean and no checkpoints are recorded for side chats
+        let evs = hub.backlog("side-1", 0).unwrap();
+        let user_text = evs.iter().find_map(|e| match &e.body {
+            EventBody::UserMessage { text, .. } => Some(text.as_str()),
+            _ => None,
+        });
+        assert_eq!(user_text, Some("Why does deliver() split locks?"));
+        assert!(hub.info("side-1").unwrap().checkpoints.is_empty());
+
+        // Deleting parent cascades to side chats
+        hub.delete("parent").unwrap();
+        assert!(hub.info("side-1").is_err());
     }
 }
 

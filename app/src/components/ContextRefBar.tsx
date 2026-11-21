@@ -14,6 +14,10 @@ const t = getT('composer');
 
 function openRef(r: ContextRef, hostId?: string, sessionId?: string, cwd?: string) {
   if (!hostId || !sessionId || r.untitled || r.kind === 'terminal') return;
+  if (r.kind === 'side') {
+    if (r.sideSessionId) openFileInPanel(hostId, sessionId, `side:${r.sideSessionId}`);
+    return;
+  }
   if (r.commit) {
     openFileInPanel(hostId, sessionId, commitTab(r.commit, r.path), { line: r.fromLine, endLine: r.toLine, diff: true });
     return;
@@ -82,8 +86,8 @@ export function ContextRefBar({
     e.stopPropagation();
     const lines = formatLineRange(r.fromLine, r.toLine);
     const items: (MenuItem | '-')[] = [
-      ...(canOpen && !r.untitled && r.kind !== 'terminal'
-        ? [{ label: t('openInFilePanel'), icon: 'file', run: () => openRef(r, hostId, sessionId, cwd) }]
+      ...(canOpen && !r.untitled && r.kind !== 'terminal' && (r.kind !== 'side' || !!r.sideSessionId)
+        ? [{ label: r.kind === 'side' ? t('openSideChat') : t('openInFilePanel'), icon: r.kind === 'side' ? 'sideChat' : 'file', run: () => openRef(r, hostId, sessionId, cwd) }]
         : []),
       ...(r.kind === 'review' && onEditReview
         ? [{ label: t('editReviewComment'), icon: 'edit', run: () => onEditReview(r) }]
@@ -93,7 +97,7 @@ export function ContextRefBar({
         icon: 'copy',
         run: async () => toast((await writeClipboard(r.content)) ? t('snippetCopied') : t('copyFailed')),
       },
-      ...(r.kind !== 'terminal'
+      ...(r.kind !== 'terminal' && r.kind !== 'side'
         ? [
             {
               label: t('copyPathWithLine'),
@@ -132,16 +136,19 @@ export function ContextRefBar({
           const lines = formatLineRange(r.fromLine, r.toLine);
           const isTerm = r.kind === 'terminal';
           const isReview = r.kind === 'review';
-          const name = isTerm ? r.path : basename(r.path);
-          const clickable = canOpen && !r.untitled && !isTerm;
+          const isSide = r.kind === 'side';
+          const name = isTerm || isSide ? r.path : basename(r.path);
+          const clickable = canOpen && !r.untitled && !isTerm && (!isSide || !!r.sideSessionId);
           const lineCount = Math.max(1, r.toLine - r.fromLine + 1);
-          const fullLoc = isTerm
-            ? `${r.path} · ${t('terminalLines', { n: lineCount })}${r.exitCode !== undefined ? ` · exit ${r.exitCode}` : ''}`
-            : `${r.path}:${lines}${r.commit ? ` @${r.commit.slice(0, 7)}` : ''}`;
+          const fullLoc = isSide
+            ? `${t('sideChatRefBadge')} · ${r.path}`
+            : isTerm
+              ? `${r.path} · ${t('terminalLines', { n: lineCount })}${r.exitCode !== undefined ? ` · exit ${r.exitCode}` : ''}`
+              : `${r.path}:${lines}${r.commit ? ` @${r.commit.slice(0, 7)}` : ''}`;
           return (
             <div
               key={r.id}
-              className={`cref-chip ${clickable ? 'clickable' : ''} ${onRemove ? 'removable' : ''} ${isReview ? 'review' : ''} ${isTerm ? 'terminal' : ''}`}
+              className={`cref-chip ${clickable ? 'clickable' : ''} ${onRemove ? 'removable' : ''} ${isReview ? 'review' : ''} ${isTerm ? 'terminal' : ''} ${isSide ? 'side' : ''}`}
               role={clickable ? 'button' : undefined}
               tabIndex={clickable ? 0 : undefined}
               aria-label={fullLoc}
@@ -154,7 +161,9 @@ export function ContextRefBar({
               }}
               onContextMenu={(e) => menu(e, r)}
             >
-              {isTerm ? (
+              {isSide ? (
+                <Icon name="sideChat" size={13} />
+              ) : isTerm ? (
                 <Icon name="terminal" size={13} />
               ) : isReview ? (
                 <Icon name="comment" size={13} />
@@ -162,7 +171,9 @@ export function ContextRefBar({
                 <FileIcon name={name} size={13} />
               )}
               <span className="cref-name truncate">{name}</span>
-              {isTerm ? (
+              {isSide ? (
+                r.comment ? <span className="cref-comment truncate">{r.comment}</span> : <span className="cref-lines">{t('sideChatRefBadge')}</span>
+              ) : isTerm ? (
                 <span className="cref-lines">{t('terminalLines', { n: lineCount })}</span>
               ) : (
                 <span className="cref-lines">{lines}</span>

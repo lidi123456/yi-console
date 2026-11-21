@@ -49,6 +49,8 @@ export interface SessionInfo {
   backgroundTasks?: BackgroundTask[];
   /** Terminal opened in the session page's bottom panel: the chat session it belongs to; not listed separately in the sidebar etc. */
   parentId?: string;
+  /** True when this child session (`parentId` set) is a hidden side chat */
+  sideChat?: boolean;
   /** Number of user messages already in the tool session when switching from chat to terminal (switching back only imports the ones after) */
   syncedUsers?: number;
   /** The tool hit its usage limit; "continue" is sent automatically at `at` (chat mode, Claude / Codex) */

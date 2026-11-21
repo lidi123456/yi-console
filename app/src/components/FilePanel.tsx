@@ -31,6 +31,15 @@ import {
   ReviewPane,
   reviewTabSession,
 } from './ReviewTab';
+import {
+  isSideTab,
+  sideChatHasMessages,
+  SideChatPane,
+  sideChatTitle,
+  sideChatTools,
+  sideTabSession,
+  startSideChat,
+} from './SideChatTab';
 
 const tx = getT('filePanel');
 const aiT = getT('browserUse');
@@ -72,6 +81,8 @@ interface OpenFile {
   untitled?: boolean;
   /** Cross-tool read-only code review tab (path is review:<sessionId>) */
   review?: boolean;
+  /** Hidden side chat tab (path is side:<sessionId>) */
+  side?: boolean;
 }
 
 /** Dragging a file from the file panel to the input box: the value is "@relative-path " */
@@ -614,7 +625,10 @@ export function FilePanel({
   const [git, setGit] = useState<GitInfo | null>(() => gitCache.get(gitKey(hostId, cwd))?.git ?? null);
   const [worktrees, setWorktrees] = useState<WorktreeEntry[]>([]);
   const [newWorktree, setNewWorktree] = useState<WorktreeEntry | null>(null);
-  const sessInfo = useStore((st) => st.sessions[hostId]?.find((x) => x.id === sessionId));
+  const rawHostSessions = useStore((st) => st.sessions[hostId]);
+  const hostSessions = useMemo(() => rawHostSessions ?? [], [rawHostSessions]);
+  const sessInfo = useMemo(() => hostSessions.find((x) => x.id === sessionId), [hostSessions, sessionId]);
+  const canSideChat = !standalone && !!sessInfo && sessInfo.mode === 'structured' && sessInfo.tool !== 'shell' && sessInfo.tool !== 'files' && !sessInfo.sideChat;
   const turnCheckpoints = useMemo(
     () => (sessInfo?.checkpoints ?? []).filter((c) => c.filesChanged > 0 && !!c.endRef),
     [sessInfo?.checkpoints],
@@ -980,6 +994,7 @@ export function FilePanel({
   // ---------- Opening and saving files ----------
 
   const readFile = async (path: string, quiet = false): Promise<OpenFile | null> => {
+    if (isSideTab(path)) return { path, content: '', draft: '', binary: true, truncated: false, size: 0, modified: 0, rev: Date.now(), side: true };
     if (isReviewTab(path)) return { path, content: '', draft: '', binary: true, truncated: false, size: 0, modified: 0, rev: Date.now(), review: true };
     if (isWebTab(path)) return { path, content: '', draft: '', binary: true, truncated: false, size: 0, modified: 0, rev: Date.now(), web: true };
     if (isUntitled(path))
@@ -1057,8 +1072,8 @@ export function FilePanel({
   const hasChange = (path: string) => !!diffGitOf(path) || sessionDiffsOf(path).length > 0;
 
   // Fetch the diff when a changed file is opened
-  const curKey = file && !file.web && !file.commit && !file.review ? norm(file.path) : '';
-  const curDiffCacheKey = file && !file.web && !file.commit && !file.review ? diffCacheKey(file.path) : '';
+  const curKey = file && !file.web && !file.commit && !file.review && !file.side ? norm(file.path) : '';
+  const curDiffCacheKey = file && !file.web && !file.commit && !file.review && !file.side ? diffCacheKey(file.path) : '';
   const curGit = file ? diffGitOf(file.path) : undefined;
   useEffect(() => {
     if (!curKey || !curGit || curGit.diff || curDiffCacheKey in fileDiffs) return;
@@ -1150,8 +1165,8 @@ export function FilePanel({
     if (!f) return;
     setFile(f);
     setTabs((t) => (t.includes(path) ? t : [...t, path].slice(-30)));
-    // The live picture needs the room: hide the tree for it (not remembered)
-    if (isAiTab(path)) setTreeOpen(false);
+    // The live picture / side chat needs the room: hide the tree for it (not remembered)
+    if (isAiTab(path) || isSideTab(path)) setTreeOpen(false);
     setSaveState(null);
     previewFor(path, at);
     setCompare(null);
@@ -1266,9 +1281,9 @@ export function FilePanel({
     openMenu(
       { clientX: r.right - 260, clientY: r.bottom + 4 },
       [...tabs].reverse().map((t) => ({
-        label: isReviewTab(t) ? reviewTabLabel(t) : isWebTab(t) ? webTabTitle(t) : commitTabLabel(t) ?? nameOf(t),
-        icon: isReviewTab(t) ? 'sparkles' : isWebTab(t) ? 'globe' : isCommitTab(t) ? 'diff' : 'file',
-        hint: isReviewTab(t) || isWebTab(t) || isCommitTab(t) || isUntitled(t) || rel(parentOf(t)) === '.' ? undefined : rel(parentOf(t)),
+        label: isSideTab(t) ? sideTabLabel(t) : isReviewTab(t) ? reviewTabLabel(t) : isWebTab(t) ? webTabTitle(t) : commitTabLabel(t) ?? nameOf(t),
+        icon: isSideTab(t) ? 'sideChat' : isReviewTab(t) ? 'sparkles' : isWebTab(t) ? 'globe' : isCommitTab(t) ? 'diff' : 'file',
+        hint: isSideTab(t) || isReviewTab(t) || isWebTab(t) || isCommitTab(t) || isUntitled(t) || rel(parentOf(t)) === '.' ? undefined : rel(parentOf(t)),
         active: t === file?.path,
         run: () => openFile(t),
       })),
@@ -1292,11 +1307,49 @@ export function FilePanel({
     deleteReviewMeta(rsid);
     rpc(hostId, 'session.delete', { sessionId: rsid }).catch(() => {});
   };
+  /** Closing an unused side chat deletes it automatically (T3 Code convention); used side chats remain reopenable */
+  const cleanupSideTab = (t: string) => {
+    if (!isSideTab(t)) return;
+    const ssid = sideTabSession(t);
+    const s = hostSessions.find((x) => x.id === ssid);
+    if (!s) return;
+    if (!sideChatHasMessages(hostId, ssid, s)) {
+      rpc(hostId, 'session.delete', { sessionId: ssid }).catch(() => {});
+    }
+  };
+  const sideTabInfo = (t: string) => hostSessions.find((x) => x.id === sideTabSession(t));
+  const sideTabLabel = (t: string) => sideChatTitle(sideTabInfo(t));
   const reviewTabLabel = (t: string) => {
     const rsid = reviewTabSession(t);
     const meta = getReviewMeta(rsid);
     const label = meta ? TOOL_LABEL[meta.tool] : tx('reviewTabShort');
     return `${tx('reviewTabPrefix')} (${label})`;
+  };
+
+  const openPlusMenu = (e: React.MouseEvent<HTMLElement>) => {
+    const r = e.currentTarget.getBoundingClientRect();
+    const otherTools = canSideChat && sessInfo ? sideChatTools(hostId).filter((tk) => tk !== sessInfo.tool) : [];
+    const items: (MenuItem | '-')[] = [
+      ...(canSideChat && sessInfo
+        ? [
+            {
+              label: tx('sideChatNew'),
+              icon: 'sideChat',
+              hint: TOOL_LABEL[sessInfo.tool],
+              run: () => void startSideChat({ hostId, parent: sessInfo }).catch(errorToast),
+            },
+            ...otherTools.map((tk) => ({
+              label: tx('sideChatNewWithTool', { tool: TOOL_LABEL[tk] }),
+              icon: 'sideChat',
+              run: () => void startSideChat({ hostId, parent: sessInfo, tool: tk }).catch(errorToast),
+            })),
+            '-' as const,
+          ]
+        : []),
+      { label: tx('openWebPageNewBrowser'), icon: 'globe', run: () => openWeb() },
+      { label: tx('newUntitledFile'), icon: 'file', run: () => newUntitled() },
+    ];
+    openMenu({ clientX: r.right - 220, clientY: r.bottom + 4 }, items);
   };
 
   /** Close a tab: if it's the current file, switch to its neighbor; once all are closed, go back to tree only */
@@ -1307,11 +1360,13 @@ export function FilePanel({
       if (!(await confirmLoseUntitled([path]))) return;
       untitled.delete(path);
       cleanupReviewTab(path);
+      cleanupSideTab(path);
       return setTabs(rest);
     }
     if (!(await confirmDiscard())) return;
     untitled.delete(path);
     cleanupReviewTab(path);
+    cleanupSideTab(path);
     setTabs(rest);
     const next = rest[Math.min(i, rest.length - 1)];
     if (next) {
@@ -1332,6 +1387,7 @@ export function FilePanel({
       closing.forEach((x) => {
         untitled.delete(x);
         cleanupReviewTab(x);
+        cleanupSideTab(x);
       });
     if (!file || keep.includes(file.path)) return dropClosed(), setTabs(keep);
     if (!(await confirmDiscard())) return;
@@ -1403,8 +1459,16 @@ export function FilePanel({
     if (!saved?.tabs?.length) return;
     const r = norm(root);
     const inRoot = (p: string) => norm(p).startsWith(r + '/');
-    const keep = [...new Set(saved.tabs.map((t) => (isWebTab(t) || isUntitled(t) ? t : unverbatim(t))))].filter((t) =>
-      isUntitled(t) ? untitled.has(t) : isAiTab(t) ? aiTabSession(t) === sessionId : isWebTab(t) ? !webTabFile(t) || inRoot(webTabFile(t)!) : inRoot(t),
+    const keep = [...new Set(saved.tabs.map((t) => (isSideTab(t) || isWebTab(t) || isUntitled(t) ? t : unverbatim(t))))].filter((t) =>
+      isSideTab(t)
+        ? hostSessions.some((s) => s.id === sideTabSession(t) && s.parentId === sessionId && s.sideChat)
+        : isUntitled(t)
+          ? untitled.has(t)
+          : isAiTab(t)
+            ? aiTabSession(t) === sessionId
+            : isWebTab(t)
+              ? !webTabFile(t) || inRoot(webTabFile(t)!)
+              : inRoot(t),
     );
     const cur = saved.current && keep.includes(saved.current) ? saved.current : keep[keep.length - 1];
     if (!cur) return;
@@ -1430,6 +1494,19 @@ export function FilePanel({
     const persistCur = file?.path && !isReviewTab(file.path) ? file.path : null;
     lsSet(tabsKey, { tabs: persistTabs, current: persistCur });
   }, [tabs.join('|'), file?.path, root]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Drop side chat tabs whose underlying session was deleted elsewhere (e.g. from the topbar side chat menu)
+  useEffect(() => {
+    const dead = tabs.filter((t) => isSideTab(t) && !hostSessions.some((s) => s.id === sideTabSession(t)));
+    if (!dead.length) return;
+    const alive = tabs.filter((t) => !dead.includes(t));
+    setTabs(alive);
+    if (file && dead.includes(file.path)) {
+      const next = alive[alive.length - 1];
+      if (next) readFile(next, true).then((f) => setFile(f));
+      else setFile(null);
+    }
+  }, [hostSessions]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const reload = async () => {
     if (!file) return;
@@ -1986,7 +2063,7 @@ export function FilePanel({
   const rowMenu = (ev: React.MouseEvent, r: TreeRow) => {
     if (r.loading) return;
     const dir = r.isDir ? r.path : parentOf(r.path);
-    const canSide = !r.isDir && !!file && !file.web && !file.commit && !file.review && file.path !== r.path && wide();
+    const canSide = !r.isDir && !!file && !file.web && !file.commit && !file.review && !file.side && file.path !== r.path && wide();
     const rowGit = !r.isDir ? gitOf(r.path) : undefined;
     openMenu(ev, [
       r.isDir
@@ -2567,8 +2644,8 @@ export function FilePanel({
           hostId={hostId}
           root={root}
           onOpen={(r, line, col, len) => openFile(relOpen(r), false, { line, col, len })}
-          openFiles={tabs.filter((t) => !isWebTab(t) && !isReviewTab(t) && !parseCommitTab(t) && rel(t) !== t).map(rel)}
-          dirty={file && dirty && !file.web && !file.commit && !file.review && rel(file.path) !== file.path ? { rel: rel(file.path), draft: file.draft } : null}
+          openFiles={tabs.filter((t) => !isWebTab(t) && !isReviewTab(t) && !isSideTab(t) && !parseCommitTab(t) && rel(t) !== t).map(rel)}
+          dirty={file && dirty && !file.web && !file.commit && !file.review && !file.side && rel(file.path) !== file.path ? { rel: rel(file.path), draft: file.draft } : null}
           includeRequest={grepInclude}
           onPreview={async (r, line, col, len, after) => {
             const abs = relOpen(r);
@@ -2897,8 +2974,16 @@ export function FilePanel({
     onCopyHunk: (content: string) => void copy(content, tx('diffCopied')),
   });
 
-  // Content of the editor column: file / changes / compare / review
-  const mainView = !file ? null : file.review ? (
+  // Content of the editor column: file / changes / compare / review / side chat
+  const mainView = !file ? null : file.side ? (
+    <SideChatPane
+      key={sideTabSession(file.path)}
+      hostId={hostId}
+      parentSessionId={sessionId}
+      sideSessionId={sideTabSession(file.path)}
+      onDeleted={() => void closeTab(file.path)}
+    />
+  ) : file.review ? (
     <ReviewPane
       hostId={hostId}
       reviewSessionId={reviewTabSession(file.path)}
@@ -3080,8 +3165,12 @@ export function FilePanel({
             </span>
           )}
           <div className="grow" />
-          <button className="icon-btn" title={tx('openWebPageNewBrowser')} onClick={() => openWeb()}>
-            <Icon name="globe" size={14} />
+          <button
+            className="icon-btn"
+            title={canSideChat ? tx('sideChatPlusTip') : tx('openWebPageNewBrowser')}
+            onClick={canSideChat ? openPlusMenu : () => openWeb()}
+          >
+            <Icon name={canSideChat ? 'plus' : 'globe'} size={14} />
           </button>
           {panelBtns}
         </div>
@@ -3102,6 +3191,41 @@ export function FilePanel({
           >
             {tabs.map((t) => {
               const cur = t === file.path;
+              if (isSideTab(t)) {
+                const sinfo = sideTabInfo(t);
+                const sbusy = sinfo?.status === 'running' || sinfo?.status === 'starting';
+                const label = sideTabLabel(t);
+                return (
+                  <div
+                    key={t}
+                    role="tab"
+                    aria-selected={cur}
+                    className={`wp-ftab wp-ftab-side ${cur ? 'active' : ''}`}
+                    title={label}
+                    onClick={() => openFile(t)}
+                    onAuxClick={(e) => e.button === 1 && closeTab(t)}
+                    onContextMenu={(e) =>
+                      openMenu(e, [
+                        { label: tx('close'), icon: 'x', run: () => closeTab(t) },
+                        ...closeItems(t),
+                      ])
+                    }
+                  >
+                    {sbusy ? <span className="wp-side-dot running" /> : <Icon name="sideChat" size={13} />}
+                    <span className="truncate">{label}</span>
+                    <button
+                      className="wp-ftab-x"
+                      title={tx('close')}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        closeTab(t);
+                      }}
+                    >
+                      <Icon name="x" size={11} />
+                    </button>
+                  </div>
+                );
+              }
               if (isReviewTab(t))
                 return (
                   <div
@@ -3288,8 +3412,12 @@ export function FilePanel({
               <Icon name="down" size={14} />
             </button>
           )}
-          <button className="icon-btn" title={tx('openWebPageNewBrowser')} onClick={() => openWeb()}>
-            <Icon name="globe" size={14} />
+          <button
+            className="icon-btn"
+            title={canSideChat ? tx('sideChatPlusTip') : tx('openWebPageNewBrowser')}
+            onClick={canSideChat ? openPlusMenu : () => openWeb()}
+          >
+            <Icon name={canSideChat ? 'plus' : 'globe'} size={14} />
           </button>
           <button
             className={`icon-btn ${treeOpen ? 'active' : ''}`}
@@ -3342,7 +3470,7 @@ export function FilePanel({
           <CommitDetails hash={file.commit.hash} author={file.commit.author} time={file.commit.time} message={file.commit.message} />
         </div>
       )}
-      {file && !file.web && !file.commit && !file.review && (
+      {file && !file.web && !file.commit && !file.review && !file.side && (
         <div className="wp-head">
           {compare ? (
             <div className="wp-compare-title truncate" title={`${file.path}\n${compare.path}`}>
@@ -3479,7 +3607,7 @@ export function FilePanel({
           hostId={hostId}
           root={root}
           initial={quick}
-          recent={[...tabs].reverse().filter((t) => !isWebTab(t) && !isReviewTab(t) && !isCommitTab(t) && !isUntitled(t)).map(rel)}
+          recent={[...tabs].reverse().filter((t) => !isWebTab(t) && !isReviewTab(t) && !isSideTab(t) && !isCommitTab(t) && !isUntitled(t)).map(rel)}
           current={file && !file.binary ? { name: baseName(file.path), text: file.draft, lines: file.draft.split('\n').length } : null}
           onOpen={(r) => openFile(relOpen(r))}
           onGoto={(line) => {

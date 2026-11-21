@@ -58,5 +58,6 @@
   "newWithSameSettings": "以相同配置新建会话",
   "switchOrManageAccount": "切换 / 管理账号…",
   "memory": "个人长期记忆…",
-  "promptOutline": "提问目录"
+  "promptOutline": "提问目录",
+  "newSideChat": "新建旁路对话"
 }

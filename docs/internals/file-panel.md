@@ -70,3 +70,9 @@ The session page's "workspace files" (`FilePanel.tsx`), also used standalone by 
   - Navigation updates the tab key (`selfNav` in `Browser.tsx` keeps that from re-resolving the tab); forwarded remote ports are mapped back to the host's own `localhost:<port>`. `target=_blank` / `window.open` open a new web tab.
   - Safety: Tauri's ACL rejects IPC from remote origins, so the risk is the child reaching a local origin. `on_navigation` allows only `http(s)` and `about:blank`, not the app's origin and not the `*.localhost` hosts of custom protocols (`ahfs`, `ipc`, `asset`, `tauri`); the capability is scoped to `webviews: ["main"]`; the app's CSP has `frame-ancestors 'none'` so a page can't frame the app either.
   - Test: `scripts/browser/windows-webtab-e2e.mjs` runs a debug build with a test identifier and WebView2 remote debugging and drives both webviews over CDP (needs an interactive desktop).
+
+## Side chat tabs
+
+- Side chats open in the right panel alongside code/diff/web tabs with tab key `side:<sessionId>` (`SideChatTab.tsx`, `isSideTab`). Opening a side chat hides the file tree (like `aiweb:`) so the conversation gets room; the tree can be toggled back anytime.
+- Multiple side chats can stay open in parallel tabs (running tabs show a blue status dot). Closing a side chat tab with no messages deletes its session automatically; closing a used one only closes the tab and leaves it reopenable from the parent session header's side chat menu.
+- The tab bar `+` button offers creating a new side chat (same tool or another installed AI tool), a web tab, or an untitled file.

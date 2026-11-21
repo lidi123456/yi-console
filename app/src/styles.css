@@ -16001,3 +16001,375 @@ button.wp-commit-title .chev {
   font-family: var(--mono);
   font-size: 11px;
 }
+
+/* T3-style session header layout: title + status on left, ghost toolbar + layout toggles on right */
+.session-title-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  max-width: 56%;
+  flex: 0 1 auto;
+}
+.session-title-row .session-name {
+  min-width: 0;
+  max-width: none;
+  flex: 0 1 auto;
+}
+.session-title-row .status-chip {
+  flex: none;
+  padding: 1px 7px;
+  font-size: 11px;
+  line-height: 1.45;
+}
+.head-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: none;
+  margin-left: auto;
+}
+.head-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+}
+.head-sep {
+  width: 1px;
+  height: 14px;
+  background: var(--border-2);
+  margin: 0 2px;
+  flex: none;
+}
+.head-ghost-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 28px;
+  padding: 0 8px;
+  border-radius: 7px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--text-2);
+  font-size: 12px;
+  font-weight: 500;
+  white-space: nowrap;
+  transition: background 0.12s, color 0.12s;
+}
+.head-ghost-btn:hover:not(:disabled) {
+  background: var(--bg-2);
+  color: var(--text);
+}
+.head-ghost-btn:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+.head-toggle-btn {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border-radius: 7px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--text-2);
+  transition: background 0.12s, color 0.12s;
+}
+.head-toggle-btn:hover {
+  background: var(--bg-2);
+  color: var(--text);
+}
+.head-toggle-btn.active {
+  background: var(--bg-3);
+  color: var(--text);
+}
+.head-toggle-btn.show-mobile {
+  display: none;
+}
+.head-live-badge {
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  min-width: 13px;
+  height: 13px;
+  padding: 0 3px;
+  border-radius: 999px;
+  background: var(--link);
+  color: #fff;
+  font-size: 9.5px;
+  font-weight: 600;
+  line-height: 13px;
+  text-align: center;
+}
+.head-side-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 28px;
+  padding: 0 9px;
+  border-radius: 7px;
+  border: 1px solid var(--border);
+  background: var(--bg-2);
+  color: var(--text);
+  font-size: 11.5px;
+  font-weight: 500;
+  white-space: nowrap;
+  transition: background 0.12s, border-color 0.12s, color 0.12s;
+}
+.head-side-btn:hover {
+  background: var(--bg-3);
+  border-color: var(--border-2);
+}
+.head-side-btn.open {
+  border-color: color-mix(in srgb, var(--link) 32%, transparent);
+  background: color-mix(in srgb, var(--link) 9%, var(--panel));
+  color: var(--link);
+}
+@container (max-width: 640px) {
+  .session-title-row {
+    max-width: 100%;
+  }
+  .head-ghost-btn {
+    width: 28px;
+    padding: 0;
+    justify-content: center;
+    gap: 0;
+  }
+}
+@media (max-width: 760px) {
+  .head-group.hide-mobile,
+  .head-sep.hide-mobile,
+  .head-toggle-btn.hide-mobile {
+    display: none;
+  }
+  .head-toggle-btn.show-mobile {
+    display: inline-flex;
+  }
+}
+
+/* Side chat tab & embedded pane (T3 Code multi-tab style) */
+.wp-side-dot.running {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--link);
+  box-shadow: 0 0 0 2.5px color-mix(in srgb, var(--link) 22%, transparent);
+  flex: none;
+}
+.wp-ftab-side .icon {
+  color: var(--link);
+}
+.wp-side-pane {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg);
+}
+.wp-side-head {
+  gap: 8px;
+  padding: 0 10px 0 12px;
+}
+.wp-side-head-left {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  flex: 1;
+}
+.wp-side-title {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text);
+  background: transparent;
+  border: none;
+  padding: 2px 4px;
+  border-radius: 5px;
+  text-align: left;
+  cursor: pointer;
+}
+.wp-side-title:hover {
+  background: var(--bg-2);
+}
+.wp-side-sub {
+  font-size: 11px;
+  white-space: nowrap;
+  flex: none;
+}
+.wp-side-head-acts {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex: none;
+}
+.wp-side-add-btn {
+  height: 26px;
+  padding: 0 9px;
+  gap: 5px;
+  font-size: 11.5px;
+  font-weight: 500;
+  border-color: color-mix(in srgb, var(--link) 30%, transparent);
+  background: color-mix(in srgb, var(--link) 9%, var(--panel));
+  color: var(--link);
+}
+.wp-side-add-btn:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--link) 15%, var(--panel));
+  border-color: color-mix(in srgb, var(--link) 45%, transparent);
+}
+.wp-side-body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.wp-side-body .chat {
+  flex: 1;
+  min-height: 0;
+}
+.wp-side-body .chat-inner {
+  max-width: none;
+  padding: 12px 14px;
+}
+.wp-side-empty {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  padding: 28px 24px;
+  gap: 8px;
+  color: var(--text-2);
+}
+.wp-side-empty-ico {
+  width: 38px;
+  height: 38px;
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--link) 10%, var(--bg-2));
+  color: var(--link);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin-bottom: 2px;
+}
+.wp-side-empty-title {
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--text);
+}
+.wp-side-empty-desc {
+  max-width: 320px;
+  font-size: 12px;
+  line-height: 1.55;
+  color: var(--text-3);
+  margin: 0;
+}
+.wp-side-perms {
+  flex: none;
+  padding: 6px 10px 0;
+  border-top: 1px solid var(--border);
+  background: var(--bg-2);
+  max-height: 40%;
+  overflow-y: auto;
+}
+.wp-side-composer {
+  flex: none;
+  padding: 8px 10px 10px;
+  border-top: 1px solid var(--border);
+  background: var(--panel);
+}
+.wp-side-input-box {
+  border: 1px solid var(--border-2);
+  border-radius: 10px;
+  background: var(--bg);
+  padding: 7px 9px 6px;
+  transition: border-color 0.12s, box-shadow 0.12s;
+}
+.wp-side-input-box:focus-within {
+  border-color: color-mix(in srgb, var(--link) 45%, var(--border-2));
+  box-shadow: 0 0 0 2px var(--focus);
+}
+.wp-side-ta {
+  width: 100%;
+  resize: none;
+  border: none;
+  outline: none;
+  background: transparent;
+  color: var(--text);
+  font-family: var(--font-chat);
+  font-size: 13px;
+  line-height: 1.48;
+  min-height: 36px;
+  max-height: 120px;
+  display: block;
+}
+.wp-side-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  margin-top: 5px;
+}
+.wp-side-controls {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  flex-wrap: wrap;
+}
+.wp-side-send-wrap {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex: none;
+}
+.wp-side-stop {
+  width: 26px;
+  height: 26px;
+  color: var(--err);
+  background: var(--err-soft);
+}
+.wp-side-send {
+  width: 26px;
+  height: 26px;
+  border-radius: 7px;
+  border: none;
+  background: var(--accent);
+  color: var(--bg);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+}
+.wp-side-send:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+.turn-bring-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 1px 7px;
+  border-radius: 5px;
+  font-size: 11.5px;
+  font-weight: 500;
+  color: var(--link);
+  background: color-mix(in srgb, var(--link) 8%, transparent);
+  border: 1px solid color-mix(in srgb, var(--link) 22%, transparent);
+  transition: background 0.12s;
+}
+.turn-bring-btn:hover {
+  background: color-mix(in srgb, var(--link) 15%, transparent);
+}
+.cref-chip.side {
+  background: color-mix(in srgb, var(--link) 9%, var(--bg-2));
+  border-color: color-mix(in srgb, var(--link) 28%, transparent);
+  color: var(--link);
+}
+.cref-chip.side .cref-name {
+  color: var(--text);
+}

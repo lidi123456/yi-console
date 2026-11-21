@@ -227,6 +227,9 @@ pub struct SessionInfo {
     /// Terminal opened in the session page's bottom panel: id of the chat session it belongs to. Not listed separately in the sidebar; deleted along with the chat
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_id: Option<String>,
+    /// True when this child session (`parent_id` set) is a hidden side chat started beside the parent thread
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub side_chat: bool,
     /// Number of user messages already in the tool session when switching from chat to terminal mode. Switching back to chat only imports the part after this
     /// (i.e. what was said in the terminal); no value means the session started in terminal mode, and everything is imported on switching back
     #[serde(default, skip_serializing_if = "Option::is_none")]
