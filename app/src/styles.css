@@ -15347,87 +15347,181 @@ button.wp-commit-title .chev {
   opacity: 0.9;
 }
 
-/* Changes view: Diff scope toggle & Git action toolbar */
-.wp-git-controls {
-  display: flex;
-  flex-direction: column;
-  gap: 5px;
-  padding: 6px 8px;
-  border-bottom: 1px solid var(--border);
-  background: var(--bg-2);
-}
-.wp-scope-bar {
+/* Changes view: minimalist scope strip & Zed-style bottom Git action dock */
+.wp-scope-strip {
   display: flex;
   align-items: center;
-  gap: 3px;
-  padding: 2px;
-  border-radius: 7px;
-  background: var(--bg-3);
+  justify-content: space-between;
+  gap: 8px;
+  padding: 0 10px;
+  height: 32px;
+  border-bottom: 1px solid var(--border);
+  background: var(--panel);
+  flex: none;
 }
-.wp-scope-btn {
-  flex: 1;
+.wp-scope-tabs {
+  display: flex;
+  align-items: stretch;
+  gap: 12px;
   min-width: 0;
+  height: 100%;
+}
+.wp-scope-tab {
   display: inline-flex;
   align-items: center;
-  justify-content: center;
   gap: 4px;
-  height: 22px;
-  padding: 0 6px;
-  border-radius: 5px;
-  font-size: 11.5px;
-  color: var(--text-2);
-}
-.wp-scope-btn.active {
-  background: var(--panel);
-  color: var(--text);
+  min-width: 0;
+  padding: 0 1px;
+  font-size: 12px;
   font-weight: 500;
-  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.06);
+  color: var(--text-2);
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+}
+.wp-scope-tab:hover {
+  color: var(--text);
+}
+.wp-scope-tab.active {
+  color: var(--text);
+  font-weight: 600;
+  border-bottom-color: var(--text);
 }
 .wp-scope-cnt {
   flex: none;
   font-size: 10.5px;
+  font-weight: 500;
   color: var(--text-3);
 }
-.wp-scope-base {
+.wp-git-dock {
   flex: none;
-  width: 22px;
-  height: 22px;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  padding: 8px 9px;
+  border-top: 1px solid var(--border);
+  background: var(--panel);
 }
-.wp-git-bar {
+.wp-git-dock-ctx {
   display: flex;
   align-items: center;
-  gap: 4px;
-  flex-wrap: wrap;
+  gap: 5px;
+  min-width: 0;
 }
-.wp-git-btn {
+.wp-git-dock-branch {
   display: inline-flex;
   align-items: center;
   gap: 4px;
+  min-width: 0;
+  max-width: 100%;
   height: 24px;
   padding: 0 7px;
   border-radius: 6px;
-  border: 1px solid var(--border);
-  background: var(--panel);
+  background: var(--bg-2);
   color: var(--text);
-  font-size: 11.5px;
-  white-space: nowrap;
-}
-.wp-git-btn:hover:not(:disabled) {
-  border-color: var(--border-2);
-  background: var(--bg-3);
-}
-.wp-git-btn:disabled {
-  opacity: 0.45;
-  cursor: default;
-}
-.wp-git-btn.branch {
-  max-width: 120px;
   font-family: var(--mono);
   font-size: 11px;
 }
-.wp-git-btn.review {
+.wp-git-dock-branch:hover {
+  background: var(--bg-3);
+}
+.wp-git-dock-branch.other {
+  background: color-mix(in srgb, var(--link) 10%, var(--bg-2));
   color: var(--link);
-  border-color: color-mix(in srgb, var(--link) 28%, var(--border));
+}
+.wp-dock-wt-cnt {
+  flex: none;
+  color: var(--text-3);
+  font-size: 10.5px;
+}
+.wp-git-dock-branch.other .wp-dock-wt-cnt {
+  color: color-mix(in srgb, var(--link) 75%, var(--text-3));
+}
+.wp-git-dock-back {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  height: 24px;
+  padding: 0 6px;
+  border-radius: 6px;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--link);
+  background: color-mix(in srgb, var(--link) 10%, transparent);
+}
+.wp-git-dock-back:hover {
+  background: color-mix(in srgb, var(--link) 18%, transparent);
+}
+.wp-dock-icon {
+  flex: none;
+  width: 24px;
+  height: 24px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--bg-2);
+  color: var(--text-2);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.wp-dock-icon:hover:not(:disabled) {
+  color: var(--text);
+  border-color: var(--border-2);
+  background: var(--bg-3);
+}
+.wp-dock-icon:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+.wp-git-dock-cta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.wp-dock-btn {
+  flex: 1;
+  min-width: 0;
+  height: 29px;
+  padding: 0 8px;
+  border-radius: 7px;
+  border: 1px solid var(--border);
+  background: var(--bg-2);
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 500;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  white-space: nowrap;
+}
+.wp-dock-btn:hover:not(:disabled) {
+  background: var(--bg-3);
+  border-color: var(--border-2);
+}
+.wp-dock-btn:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+.wp-dock-btn.primary {
+  flex: 1.25;
+  border-color: transparent;
+  background: var(--text);
+  color: var(--panel);
+  font-weight: 600;
+}
+.wp-dock-btn.primary:hover:not(:disabled) {
+  opacity: 0.88;
+  background: var(--text);
+}
+.wp-dock-btn.ai {
+  border-color: color-mix(in srgb, var(--link) 22%, transparent);
+  background: color-mix(in srgb, var(--link) 10%, var(--panel));
+  color: var(--link);
+}
+.wp-dock-btn.ai:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--link) 16%, var(--panel));
+  border-color: color-mix(in srgb, var(--link) 35%, transparent);
 }
 
 /* Commit & Cross-tool Review modals */

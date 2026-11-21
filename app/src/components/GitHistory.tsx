@@ -95,7 +95,7 @@ export function GitHistory({
   onOpen: (tab: string) => void;
 }) {
   useLang();
-  const [open, setOpen] = useState(() => lsGet('wp-hist-open', !window.matchMedia('(max-width: 760px)').matches));
+  const [open, setOpen] = useState(() => lsGet('wp-hist-open', false));
   const [height, setHeight] = useState(() => lsGet('wp-hist-h', 280));
   // With nothing above, the box fills the column until the user drags it; that height is kept separately
   const [growH, setGrowH] = useState<number | null>(() => lsGet<number | null>('wp-hist-grow-h', null));

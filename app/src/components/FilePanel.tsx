@@ -1579,49 +1579,90 @@ export function FilePanel({
     }
   };
 
-  const openBranchMenu = async (e: React.MouseEvent<HTMLElement>) => {
+  const openGitContextMenu = async (e: React.MouseEvent<HTMLElement>) => {
     const r = e.currentTarget.getBoundingClientRect();
     const info = (await loadBranches()) ?? branchesInfo;
-    const items: (MenuItem | '-')[] = [
-      ...(info?.branches ?? []).map((b) => {
-        const hintParts = [b.ahead ? `↑${b.ahead}` : '', b.behind ? `↓${b.behind}` : ''].filter(Boolean);
-        return {
-          label: b.name,
+    const items: (MenuItem | '-')[] = [];
+    const curNorm = norm(cwd);
+    const hasMultiWt = !!onSwitchCwd && worktrees.length > 1;
+    const wtBranches = new Set<string>();
+
+    if (hasMultiWt) {
+      for (const w of worktrees) {
+        if (w.branch) wtBranches.add(w.branch);
+        const active = norm(w.path) === curNorm;
+        const label = w.branch ? w.branch : baseName(w.path);
+        const hint = w.isMain ? `${tx('mainWorktreeTag')} · ${baseName(w.path)}` : baseName(w.path);
+        items.push({
+          label,
           icon: 'git-branch',
-          active: b.current,
-          hint: hintParts.join(' ') || undefined,
-          run: async () => {
-            if (b.current) return;
-            try {
-              await rpc(hostId, 'git.checkout', { cwd, branch: b.name });
-              toast(tx('switchedToBranch', { branch: b.name }));
-              refreshTree();
-              void loadBranches();
-            } catch (err) {
-              errorToast(err);
-            }
+          active,
+          hint,
+          run: () => {
+            setNewWorktree(null);
+            if (!active) onSwitchCwd!(w.path);
           },
-        };
-      }),
-      ...(info?.branches?.length ? (['-'] as const) : []),
-      {
-        label: tx('newBranch'),
-        icon: 'plus',
+        });
+      }
+      if (isOtherWorktree && baseCwd) {
+        items.push({
+          label: tx('backToSessionDir'),
+          icon: 'back',
+          run: () => {
+            setNewWorktree(null);
+            onSwitchCwd!(baseCwd);
+          },
+        });
+      }
+      items.push('-');
+    }
+
+    const extraBranches = (info?.branches ?? []).filter((b) => !hasMultiWt || !wtBranches.has(b.name));
+    for (const b of extraBranches) {
+      const hintParts = [b.ahead ? `↑${b.ahead}` : '', b.behind ? `↓${b.behind}` : ''].filter(Boolean);
+      items.push({
+        label: b.name,
+        icon: 'git-branch',
+        active: b.current,
+        hint: hintParts.join(' ') || undefined,
         run: async () => {
-          const name = (await askText({ title: tx('newBranch'), placeholder: tx('newBranchPlaceholder') }))?.trim();
-          if (!name) return;
+          if (b.current) return;
           try {
-            await rpc(hostId, 'git.checkout', { cwd, branch: name, create: true });
-            toast(tx('switchedToBranch', { branch: name }));
+            await rpc(hostId, 'git.checkout', { cwd, branch: b.name });
+            toast(tx('switchedToBranch', { branch: b.name }));
             refreshTree();
             void loadBranches();
           } catch (err) {
             errorToast(err);
           }
         },
+      });
+    }
+    if (extraBranches.length) items.push('-');
+    items.push({
+      label: tx('newBranch'),
+      icon: 'plus',
+      run: async () => {
+        const name = (await askText({ title: tx('newBranch'), placeholder: tx('newBranchPlaceholder') }))?.trim();
+        if (!name) return;
+        try {
+          await rpc(hostId, 'git.checkout', { cwd, branch: name, create: true });
+          toast(tx('switchedToBranch', { branch: name }));
+          refreshTree();
+          void loadBranches();
+        } catch (err) {
+          errorToast(err);
+        }
       },
-    ];
-    openMenu({ clientX: r.left, clientY: r.bottom + 4 }, items);
+    });
+    if (!standalone) {
+      items.push('-', {
+        label: tx('newSessionInCurrentWorktree'),
+        icon: 'plus',
+        run: () => openNewSession({ hostId, cwd }),
+      });
+    }
+    openMenu({ clientX: r.left, clientY: r.top - 4 }, items);
   };
 
   const openBaseBranchMenu = async (e: React.MouseEvent<HTMLElement>) => {
@@ -2338,25 +2379,29 @@ export function FilePanel({
           {viewTab('search', tx('search'), { title: tx('searchInFileContents') })}
         </div>
         <div className="grow" />
-        <button className="icon-btn" title={tx('quickOpenP', { v: navigator.platform.includes('Mac') ? '⌘' : 'Ctrl+' })} onClick={() => setQuick('')}>
-          <Icon name="zoom" size={14} />
-        </button>
-        <button className="icon-btn" title={tx('new')} disabled={!root} onClick={newMenu}>
-          <Icon name="plus" size={15} />
-        </button>
+        {view !== 'changes' && (
+          <>
+            <button className="icon-btn" title={tx('quickOpenP', { v: navigator.platform.includes('Mac') ? '⌘' : 'Ctrl+' })} onClick={() => setQuick('')}>
+              <Icon name="zoom" size={14} />
+            </button>
+            <button className="icon-btn" title={tx('new')} disabled={!root} onClick={newMenu}>
+              <Icon name="plus" size={15} />
+            </button>
+          </>
+        )}
         <button className="icon-btn" title={tx('refresh')} onClick={refreshTree}>
           <Icon name="refresh" size={14} />
         </button>
       </div>
-      {onSwitchCwd && (worktrees.length > 1 || isOtherWorktree) && (
-        <div className={`wp-wt-bar ${isOtherWorktree ? 'other' : ''}`}>
+      {view !== 'changes' && onSwitchCwd && isOtherWorktree && (
+        <div className="wp-wt-bar other">
           <button type="button" className="wp-wt-btn truncate" onClick={openWorktreeMenu} title={cwd}>
             <Icon name="git-branch" size={12} />
             <span className="truncate">{wtLabel}</span>
             {worktrees.length > 1 && <span className="wp-wt-cnt">{worktrees.length}</span>}
             <Icon name="down" size={11} />
           </button>
-          {isOtherWorktree && baseCwd && (
+          {baseCwd && (
             <button
               type="button"
               className="wp-wt-back"
@@ -2419,82 +2464,36 @@ export function FilePanel({
       ) : (
         <>
           {view === 'changes' && git && (
-            <div className="wp-git-controls">
-              <div className="wp-scope-bar">
+            <div className="wp-scope-strip">
+              <div className="wp-scope-tabs" role="tablist">
                 <button
                   type="button"
-                  className={`wp-scope-btn ${diffScope === 'uncommitted' ? 'active' : ''}`}
+                  role="tab"
+                  aria-selected={diffScope === 'uncommitted'}
+                  className={`wp-scope-tab ${diffScope === 'uncommitted' ? 'active' : ''}`}
                   onClick={() => setDiffScope('uncommitted')}
                 >
-                  {tx('diffScopeUncommitted')}
+                  <span>{tx('diffScopeUncommitted')}</span>
                   {uncommittedKeys.length > 0 && <span className="wp-scope-cnt">{uncommittedKeys.length}</span>}
                 </button>
                 <button
                   type="button"
-                  className={`wp-scope-btn ${diffScope === 'branch' ? 'active' : ''}`}
-                  onClick={() => setDiffScope('branch')}
-                  title={effBranchBase ? tx('diffScopeBranchVs', { base: effBranchBase }) : tx('diffScopeBranch')}
+                  role="tab"
+                  aria-selected={diffScope === 'branch'}
+                  className={`wp-scope-tab ${diffScope === 'branch' ? 'active' : ''}`}
+                  title={diffScope === 'branch' ? tx('changeBaseBranch') : effBranchBase ? tx('diffScopeBranchVs', { base: effBranchBase }) : tx('diffScopeBranch')}
+                  onClick={(e) => {
+                    if (diffScope === 'branch') void openBaseBranchMenu(e);
+                    else setDiffScope('branch');
+                  }}
                 >
                   <span className="truncate">
                     {effBranchBase ? tx('diffScopeBranchVs', { base: effBranchBase }) : tx('diffScopeBranch')}
                   </span>
-                  {branchDiff && branchKeys.length > 0 && <span className="wp-scope-cnt">{branchKeys.length}</span>}
+                  {diffScope === 'branch' && <Icon name="down" size={10} />}
                 </button>
-                {diffScope === 'branch' && (
-                  <button
-                    type="button"
-                    className="icon-btn wp-scope-base"
-                    title={tx('changeBaseBranch')}
-                    onClick={(e) => void openBaseBranchMenu(e)}
-                  >
-                    <Icon name="down" size={11} />
-                  </button>
-                )}
               </div>
-              <div className="wp-git-bar">
-                <button
-                  type="button"
-                  className="wp-git-btn branch truncate"
-                  title={tx('switchOrCreateBranch')}
-                  onClick={(e) => void openBranchMenu(e)}
-                >
-                  <Icon name="git-branch" size={12} />
-                  <span className="truncate">{git.branch || 'HEAD'}</span>
-                  <Icon name="down" size={10} />
-                </button>
-                <div className="grow" />
-                <button
-                  type="button"
-                  className="wp-git-btn"
-                  disabled={commitFiles.length === 0}
-                  title={tx('commitChanges')}
-                  onClick={() => setCommitOpen(true)}
-                >
-                  <Icon name="git-commit" size={12} />
-                  <span>{tx('commitBtn')}</span>
-                </button>
-                <button
-                  type="button"
-                  className="wp-git-btn"
-                  disabled={pushing}
-                  title={tx('pushBranch')}
-                  onClick={() => void doPush()}
-                >
-                  {pushing ? <span className="spinner mini" /> : <Icon name="upload" size={12} />}
-                  <span>{tx('pushBtn')}</span>
-                </button>
-                {!standalone && (
-                  <button
-                    type="button"
-                    className="wp-git-btn review"
-                    title={tx('crossToolReviewTitle')}
-                    onClick={() => setReviewOpen(true)}
-                  >
-                    <Icon name="sparkles" size={12} />
-                    <span>{tx('reviewBtn')}</span>
-                  </button>
-                )}
-              </div>
+              {totals && changed.length > 0 && <LineStat a={totals.a} d={totals.d} />}
             </div>
           )}
           {view === 'all' && (
@@ -2581,7 +2580,7 @@ export function FilePanel({
                     {tx('tooManyChangesShowingThe', { total: activeChangesGit.total, size: activeChangesGit.files.size })}
                   </div>
                 )}
-                {totals && changed.length > 0 && (
+                {!git && totals && changed.length > 0 && (
                   <div className="wp-totals">
                     {tx('files2', { length: changed.length })}
                     <LineStat a={totals.a} d={totals.d} />
@@ -2634,6 +2633,78 @@ export function FilePanel({
           {/* Independent of git status: shows right away and loads on its own; hidden only once status says this isn't a repo */}
           {view === 'changes' && (!gitReady || git) && (
             <GitHistory hostId={hostId} cwd={cwd} head={git?.head} selected={file?.path} grow={histGrow} onOpen={(t) => openFile(t)} />
+          )}
+          {view === 'changes' && git && (
+            <div className="wp-git-dock">
+              <div className="wp-git-dock-ctx">
+                <button
+                  type="button"
+                  className={`wp-git-dock-branch truncate ${isOtherWorktree ? 'other' : ''}`}
+                  title={onSwitchCwd && worktrees.length > 1 ? tx('switchBranchOrWorktree') : tx('switchOrCreateBranch')}
+                  onClick={(e) => void openGitContextMenu(e)}
+                >
+                  <Icon name="git-branch" size={12} />
+                  <span className="truncate">{git.branch || 'HEAD'}</span>
+                  {onSwitchCwd && worktrees.length > 1 && <span className="wp-dock-wt-cnt">· {worktrees.length}</span>}
+                  <Icon name="down" size={10} />
+                </button>
+                {onSwitchCwd && isOtherWorktree && baseCwd && (
+                  <button
+                    type="button"
+                    className="wp-git-dock-back"
+                    title={tx('backToSessionDir')}
+                    onClick={() => {
+                      setNewWorktree(null);
+                      onSwitchCwd(baseCwd);
+                    }}
+                  >
+                    <Icon name="back" size={11} />
+                    <span>{tx('mainTiny')}</span>
+                  </button>
+                )}
+                <div className="grow" />
+                {commitFiles.length > 0 && (
+                  <button
+                    type="button"
+                    className="wp-dock-icon"
+                    disabled={pushing}
+                    title={tx('pushBranch')}
+                    onClick={() => void doPush()}
+                  >
+                    {pushing ? <span className="spinner mini" /> : <Icon name="upload" size={13} />}
+                  </button>
+                )}
+              </div>
+              <div className="wp-git-dock-cta">
+                {commitFiles.length > 0 ? (
+                  <>
+                    <button type="button" className="wp-dock-btn primary" title={tx('commitChanges')} onClick={() => setCommitOpen(true)}>
+                      <Icon name="git-commit" size={13} />
+                      <span>{tx('commitCount', { n: commitFiles.length })}</span>
+                    </button>
+                    {!standalone && (
+                      <button type="button" className="wp-dock-btn ai" title={tx('crossToolReviewTitle')} onClick={() => setReviewOpen(true)}>
+                        <Icon name="sparkles" size={13} />
+                        <span>{tx('reviewBtn')}</span>
+                      </button>
+                    )}
+                  </>
+                ) : (
+                  <>
+                    {!standalone && (
+                      <button type="button" className="wp-dock-btn ai" title={tx('crossToolReviewTitle')} onClick={() => setReviewOpen(true)}>
+                        <Icon name="sparkles" size={13} />
+                        <span>{tx('reviewBtn')}</span>
+                      </button>
+                    )}
+                    <button type="button" className="wp-dock-btn" disabled={pushing} title={tx('pushBranch')} onClick={() => void doPush()}>
+                      {pushing ? <span className="spinner mini" /> : <Icon name="upload" size={13} />}
+                      <span>{tx('pushBtn')}</span>
+                    </button>
+                  </>
+                )}
+              </div>
+            </div>
           )}
           {(dropDir || uploading > 0) && (
             <div className="wp-dropbar">
