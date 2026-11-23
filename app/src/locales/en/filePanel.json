@@ -279,8 +279,6 @@
   "sideChatRenameTitle": "Rename side chat",
   "sideChatRenameHint": "Click to rename side chat",
   "sideChatHiddenBadge": "Side chat",
-  "sideChatAddToMain": "Add to chat",
-  "sideChatAddToMainTip": "Attach side chat notes as a context pill in the main composer",
   "sideChatDelete": "Delete side chat",
   "sideChatDeleteConfirm": "Permanently delete side chat \"{{title}}\"?",
   "sideChatUnavailable": "This side chat is no longer available",

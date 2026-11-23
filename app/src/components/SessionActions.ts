@@ -350,8 +350,8 @@ export function sessionMenu(
   info: SessionInfo,
   opts: {
     inSession?: boolean;
-    onUsage?: () => void;
     onMemory?: () => void;
+    /** Desktop exposes "New Side Chat" in the top bar, so this entry only appears in the menu on mobile */
     onNewSideChat?: () => void;
     style?: 'modern' | 'claude';
     onToggleStyle?: () => void;
@@ -424,12 +424,11 @@ export function sessionMenu(
       ? [{ label: tx('continueInAnotherTool'), icon: 'forward', run: () => handoffSession(hostId, info) }]
       : []),
     '-',
-    ...(opts.onNewSideChat && info.tool !== 'shell' && info.mode === 'structured' && !info.sideChat
+    // Top-bar actions (usage on all viewports; new side chat and bottom terminal panel on desktop) are not repeated in the menu
+    ...(opts.onNewSideChat && info.tool !== 'shell' && info.mode === 'structured' && !info.sideChat && mobile
       ? [{ label: tx('newSideChat'), icon: 'sideChat', hint: '/side', run: opts.onNewSideChat }]
       : []),
     { label: tx('viewChanges'), icon: 'diff', run: () => showChanges(hostId, sid) },
-    // The mobile top bar already has a usage button, so don't repeat it in the menu; the terminal panel is the reverse and only appears in the mobile menu
-    ...(opts.onUsage && info.tool !== 'shell' && !mobile ? [{ label: tx('viewUsage'), icon: 'chart', run: opts.onUsage }] : []),
     ...(opts.onMemory && info.tool !== 'shell' && info.mode === 'structured' ? [{ label: tx('memory'), icon: 'book', run: opts.onMemory }] : []),
     ...(opts.onPromptOutline && info.tool !== 'shell' && info.mode === 'structured'
       ? [

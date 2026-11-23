@@ -1,6 +1,6 @@
 import { useEffect, useMemo } from 'react';
 import { getT, useLang } from '../i18n';
-import { bringSideChatToMain, deriveSideTitle, extractSideChatNotes, sideChatTitle } from '../sideChat';
+import { bringSideChatToMain, deriveSideTitle, sideChatTitle } from '../sideChat';
 import { errorToast, loadOlder, loadSession, skey, useSessionData, useStore } from '../store';
 import { rpc } from '../transport';
 import { TOOL_LABEL, type QuestionAnswer } from '../types';
@@ -45,10 +45,6 @@ export function SideChatPane({
 
   const openAsk = useMemo(() => openAsyncAsk(data.events), [data.events, data.events.length]);
   const busy = info?.status === 'running' || info?.status === 'starting';
-  const hasNotes = useMemo(
-    () => extractSideChatNotes(data.events, data.live).length > 0,
-    [data.events, data.live, data.version],
-  );
   const hasMessages = useMemo(
     () => data.events.some((e) => e.kind === 'user_message' || e.kind === 'assistant_text'),
     [data.events, data.events.length],
@@ -140,16 +136,6 @@ export function SideChatPane({
           <span className="wp-side-sub muted hide-mobile">· {tx('sideChatHiddenBadge')}</span>
         </div>
         <div className="wp-side-head-acts">
-          <button
-            type="button"
-            className="btn small wp-side-add-btn"
-            disabled={!hasNotes}
-            title={tx('sideChatAddToMainTip')}
-            onClick={() => bringSideChatToMain(hostId, parentSessionId, info)}
-          >
-            <Icon name="back" size={12} />
-            <span>{tx('sideChatAddToMain')}</span>
-          </button>
           <button
             type="button"
             className="icon-btn"

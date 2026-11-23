@@ -16391,20 +16391,6 @@ button.wp-commit-title .chev {
   gap: 4px;
   flex: none;
 }
-.wp-side-add-btn {
-  height: 26px;
-  padding: 0 9px;
-  gap: 5px;
-  font-size: 11.5px;
-  font-weight: 500;
-  border-color: color-mix(in srgb, var(--link) 30%, transparent);
-  background: color-mix(in srgb, var(--link) 9%, var(--panel));
-  color: var(--link);
-}
-.wp-side-add-btn:hover:not(:disabled) {
-  background: color-mix(in srgb, var(--link) 15%, var(--panel));
-  border-color: color-mix(in srgb, var(--link) 45%, transparent);
-}
 .wp-side-body {
   flex: 1;
   min-height: 0;

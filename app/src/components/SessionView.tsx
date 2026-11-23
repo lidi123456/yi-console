@@ -11,7 +11,7 @@ import { TOOL_LABEL, supportsAccountsTool, type QuestionAnswer, type ToolAccount
 import { fmtUsage, isMobile, lsGet, lsSet, shortPath, STATUS_LABEL } from '../util';
 import { openAccountManager } from './AccountManagerModal';
 import { openMenu } from './Overlay';
-import { exportSession, OPEN_CHANGES, OPEN_FILE, openFileInPanel, renameSession, sessionMenu, showTurnDiff, switchMode } from './SessionActions';
+import { exportSession, OPEN_CHANGES, OPEN_FILE, openFileInPanel, renameSession, sessionMenu, showTurnDiff } from './SessionActions';
 import { AI_PREFIX } from './AiBrowser';
 import { FilePanel } from './FilePanel';
 import { sideChatTitle, sideChatTools, sideTabPath, startSideChat } from './SideChatTab';
@@ -147,7 +147,7 @@ export function SessionView({ hostId, sessionId, seq }: { hostId: string; sessio
   const [full, setFull] = useState(false);
   // A file is open in the panel: wider and resizable; with only the tree it's a narrow column
   const [fileOpen, setFileOpen] = useState(false);
-  const [switching, setSwitching] = useState(false);
+  const [startingSide, setStartingSide] = useState(false);
   const [usage, setUsage] = useState(false);
   const [memoryOpen, setMemoryOpen] = useState(false);
   const [recovering, setRecovering] = useState(false);
@@ -602,22 +602,28 @@ export function SessionView({ hostId, sessionId, seq }: { hostId: string; sessio
                 <Icon name="chart" size={14} />
                 <span className="narrow-hide">{fmtUsage(info.usage) || t('usage')}</span>
               </button>
-              <button
-                type="button"
-                className="head-ghost-btn"
-                disabled={!connected || switching}
-                onClick={async () => {
-                  setSwitching(true);
-                  await switchMode(hostId, info);
-                  setSwitching(false);
-                }}
-                title={info.mode === 'terminal' ? t('switchToChatModeAnd') : t('switchToTerminalModeAnd')}
-              >
-                <Icon name={info.mode === 'terminal' ? 'chat' : 'terminal'} size={14} />
-                <span className="narrow-hide">
-                  {switching ? t('switching') : info.mode === 'terminal' ? t('chatMode') : t('terminalMode')}
-                </span>
-              </button>
+              {isChatMode && !info.sideChat && (
+                <button
+                  type="button"
+                  className="head-ghost-btn"
+                  disabled={!connected || startingSide}
+                  onClick={async () => {
+                    setStartingSide(true);
+                    try {
+                      await startSideChat({ hostId, parent: info });
+                    } catch (e) {
+                      errorToast(e);
+                    } finally {
+                      setStartingSide(false);
+                    }
+                  }}
+                  title={t('newSideChatTip')}
+                  aria-label={t('newSideChat')}
+                >
+                  <Icon name="sideChatPlus" size={14} />
+                  <span className="narrow-hide">{t('addSideChat')}</span>
+                </button>
+              )}
             </div>
           )}
           {info.tool !== 'shell' && !filesOnly && <span className="head-sep hide-mobile" aria-hidden="true" />}
@@ -670,9 +676,8 @@ export function SessionView({ hostId, sessionId, seq }: { hostId: string; sessio
                   { clientX: r.right - 200, clientY: r.bottom + 4 },
                   sessionMenu(hostId, info, {
                     inSession: true,
-                    onUsage: () => setUsage(true),
                     onMemory: () => setMemoryOpen(true),
-                    onNewSideChat: isChatMode && connected ? () => void startSideChat({ hostId, parent: info }).catch(errorToast) : undefined,
+                    onNewSideChat: isChatMode && connected && !info.sideChat ? () => void startSideChat({ hostId, parent: info }).catch(errorToast) : undefined,
                     onPromptOutline: isChatMode ? toggleOutlineBtn : undefined,
                     outlineActive,
                     promptCount: prompts.length,

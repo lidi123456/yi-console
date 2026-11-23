@@ -279,8 +279,6 @@
   "sideChatRenameTitle": "重命名旁路对话",
   "sideChatRenameHint": "点击重命名旁路对话",
   "sideChatHiddenBadge": "隐藏旁路",
-  "sideChatAddToMain": "添加到主对话",
-  "sideChatAddToMainTip": "将旁路结论以引用胶囊填入主会话输入框",
   "sideChatDelete": "删除旁路对话",
   "sideChatDeleteConfirm": "确定彻底删除旁路对话「{{title}}」吗？",
   "sideChatUnavailable": "这条旁路对话已不存在",
