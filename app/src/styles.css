@@ -16290,6 +16290,9 @@ button.wp-commit-title .chev {
   line-height: 13px;
   text-align: center;
 }
+.head-live-badge.attn {
+  background: var(--warn);
+}
 .head-side-btn {
   display: inline-flex;
   align-items: center;
@@ -16343,6 +16346,14 @@ button.wp-commit-title .chev {
   border-radius: 50%;
   background: var(--link);
   box-shadow: 0 0 0 2.5px color-mix(in srgb, var(--link) 22%, transparent);
+  flex: none;
+}
+.wp-side-dot.attn {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--warn);
+  box-shadow: 0 0 0 2.5px color-mix(in srgb, var(--warn) 22%, transparent);
   flex: none;
 }
 .wp-ftab-side .icon {

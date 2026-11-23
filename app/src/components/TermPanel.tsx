@@ -20,7 +20,7 @@ const EMPTY: SessionInfo[] = [];
 
 export function TermPanel({ hostId, info, onClose }: { hostId: string; info: SessionInfo; onClose: () => void }) {
   const all = useStore((s) => s.sessions[hostId]) ?? EMPTY;
-  const mine = all.filter((s) => s.parentId === info.id).sort((a, b) => a.createdAt - b.createdAt);
+  const mine = all.filter((s) => s.parentId === info.id && s.tool === 'shell' && !s.sideChat).sort((a, b) => a.createdAt - b.createdAt);
   // Cleanly exited terminals are being closed (below): leave them out right away
   const tabs = mine.filter((s) => s.status !== 'exited');
   const [active, setActive] = useState<string>(() => lsGet(`term-tab-${info.id}`, ''));

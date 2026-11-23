@@ -1166,6 +1166,7 @@ export function FilePanel({
             ? { path, content: '', draft: '', binary: false, truncated: false, size: 0, modified: 0, rev: Date.now(), deleted: true }
             : null);
     if (!f) return;
+    fileRef.current = f;
     setFile(f);
     setTabs((t) => (t.includes(path) ? t : [...t, path].slice(-30)));
     // The live picture / side chat needs the room: hide the tree for it (not remembered)
@@ -1232,8 +1233,10 @@ export function FilePanel({
     const take = async () => {
       const r = takeOpenFile(hostId, sessionId);
       if (!r) return;
+      const isVirtual =
+        isWebTab(r.path) || isAiTab(r.path) || isSideTab(r.path) || isReviewTab(r.path) || isUntitled(r.path) || isCommitTab(r.path);
       // A folder link: show it in the tree instead of trying to read it as a file
-      if (!r.line && !r.diff && !isWebTab(r.path) && (await revealRef.current(r.path))) return;
+      if (!r.line && !r.diff && !isVirtual && (await revealRef.current(r.path))) return;
       openFileRef.current(r.path, !!r.diff, r.line ? { line: r.line, endLine: r.endLine } : undefined);
     };
     take();
@@ -1508,6 +1511,7 @@ export function FilePanel({
 
   // Drop side chat tabs whose underlying session was deleted elsewhere (e.g. from the topbar side chat menu)
   useEffect(() => {
+    if (!rawHostSessions) return;
     const dead = tabs.filter((t) => isSideTab(t) && !hostSessions.some((s) => s.id === sideTabSession(t)));
     if (!dead.length) return;
     const alive = tabs.filter((t) => !dead.includes(t));
@@ -1517,7 +1521,7 @@ export function FilePanel({
       if (next) readFile(next, true).then((f) => setFile(f));
       else setFile(null);
     }
-  }, [hostSessions]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [rawHostSessions, hostSessions]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const reload = async () => {
     if (!file) return;
@@ -2899,6 +2903,7 @@ export function FilePanel({
     />
   ) : file.review ? (
     <ReviewPane
+      key={reviewTabSession(file.path)}
       hostId={hostId}
       reviewSessionId={reviewTabSession(file.path)}
       parentSessionId={sessionId}
@@ -3105,6 +3110,7 @@ export function FilePanel({
               const cur = t === file.path;
               if (isSideTab(t)) {
                 const sinfo = sideTabInfo(t);
+                const sattn = (sinfo?.pendingPermissions ?? 0) > 0 || sinfo?.status === 'waiting-permission';
                 const sbusy = sinfo?.status === 'running' || sinfo?.status === 'starting';
                 const label = sideTabLabel(t);
                 return (
@@ -3123,7 +3129,7 @@ export function FilePanel({
                       ])
                     }
                   >
-                    {sbusy ? <span className="wp-side-dot running" /> : <Icon name="sideChat" size={13} />}
+                    {sattn ? <span className="wp-side-dot attn" /> : sbusy ? <span className="wp-side-dot running" /> : <Icon name="sideChat" size={13} />}
                     <span className="truncate">{label}</span>
                     <button
                       className="wp-ftab-x"

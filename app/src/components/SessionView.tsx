@@ -5,7 +5,7 @@ import { canUseBrowser } from '../browserUse';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useBack } from '../back';
 import { getT, isEn, useLang } from '../i18n';
-import { errorToast, getState, hostStatus, loadOlder, loadSession, loadUserMessages, navigate, setState, skey, toast, useSessionData, useStore } from '../store';
+import { errorToast, getState, hostStatus, loadOlder, loadSession, loadUserMessages, navigate, replaceView, setState, skey, toast, useSessionData, useStore } from '../store';
 import { rpc } from '../transport';
 import { TOOL_LABEL, supportsAccountsTool, type QuestionAnswer, type ToolAccountsSummary } from '../types';
 import { fmtUsage, isMobile, lsGet, lsSet, shortPath, STATUS_LABEL } from '../util';
@@ -56,11 +56,26 @@ export function SessionView({ hostId, sessionId, seq }: { hostId: string; sessio
   const data = useSessionData(key);
   const hostSessions = useStore((s) => s.sessions[hostId]);
   const info = useMemo(() => hostSessions?.find((x) => x.id === sessionId), [hostSessions, sessionId]);
+  const parentExists = !!info?.parentId && !!hostSessions?.some((x) => x.id === info.parentId);
+  useEffect(() => {
+    if (!info?.parentId || !parentExists) return;
+    const pid = info.parentId;
+    if (info.sideChat) {
+      openFileInPanel(hostId, pid, sideTabPath(info.id));
+    } else if (info.mode === 'structured' && info.tool !== 'shell' && info.tool !== 'files') {
+      openFileInPanel(hostId, pid, `review:${info.id}`);
+    } else if (info.tool === 'shell') {
+      lsSet(`term-panel-${skey(hostId, pid)}`, true);
+      lsSet(`term-tab-${pid}`, info.id);
+    }
+    replaceView({ kind: 'session', hostId, sessionId: pid });
+  }, [hostId, info?.id, info?.parentId, info?.sideChat, info?.mode, info?.tool, parentExists]);
   const sideChats = useMemo(
     () => (hostSessions ? hostSessions.filter((x) => x.parentId === sessionId && x.sideChat) : []),
     [hostSessions, sessionId],
   );
   const liveSideCount = sideChats.filter((x) => x.status === 'running' || x.status === 'starting').length;
+  const attnSideCount = sideChats.filter((x) => x.pendingPermissions > 0 || x.status === 'waiting-permission').length;
   const connected = useStore((s) => s.hosts.find((h) => h.config.id === hostId)?.status.status === 'connected');
   const attn = useStore((s) =>
     Object.values(s.sessions).reduce((n, l) => n + l.filter((x) => x.pendingPermissions > 0).length, 0),
@@ -435,6 +450,9 @@ export function SessionView({ hostId, sessionId, seq }: { hostId: string; sessio
       </div>
     );
   }
+  if (info.parentId && parentExists) {
+    return null;
+  }
 
   const alive = info.status !== 'exited' && info.status !== 'error';
 
@@ -586,7 +604,7 @@ export function SessionView({ hostId, sessionId, seq }: { hostId: string; sessio
                 );
               }}
             >
-              {liveSideCount > 0 ? <span className="wp-side-dot running" /> : <Icon name="sideChat" size={13} />}
+              {attnSideCount > 0 ? <span className="wp-side-dot attn" /> : liveSideCount > 0 ? <span className="wp-side-dot running" /> : <Icon name="sideChat" size={13} />}
               <span>{t('sideChatsCount', { count: sideChats.length })}</span>
               <Icon name="down" size={11} />
             </button>
@@ -662,7 +680,11 @@ export function SessionView({ hostId, sessionId, seq }: { hostId: string; sessio
                 onClick={toggleFiles}
               >
                 <Icon name="panelRight" size={16} />
-                {liveSideCount > 0 && <span className="head-live-badge">{liveSideCount}</span>}
+                {attnSideCount > 0 ? (
+                  <span className="head-live-badge attn">{attnSideCount}</span>
+                ) : (
+                  liveSideCount > 0 && <span className="head-live-badge">{liveSideCount}</span>
+                )}
               </button>
             )}
             <button

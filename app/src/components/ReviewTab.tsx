@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { useBack } from '../back';
 import { getT, isEn, useLang } from '../i18n';
 import { permModes } from '../perm';
-import { errorToast, hostStatus, loadSession, skey, toast, useSessionData, useStore } from '../store';
+import { errorToast, hostStatus, loadSession, registerVisibleChildSession, skey, toast, useSessionData, useStore } from '../store';
 import { rpc } from '../transport';
 import { TOOL_LABEL, type SessionInfo, type ToolKind } from '../types';
 import { ChatMarkdown } from './ChatMarkdown';
@@ -343,6 +343,8 @@ export function ReviewPane({
   useEffect(() => {
     loadSession(hostId, reviewSessionId).catch(() => {});
   }, [hostId, reviewSessionId]);
+
+  useEffect(() => registerVisibleChildSession(hostId, reviewSessionId), [hostId, reviewSessionId]);
 
   const busy = info?.status === 'running' || info?.status === 'starting';
   const tool: ToolKind = meta?.tool ?? info?.tool ?? 'claude';

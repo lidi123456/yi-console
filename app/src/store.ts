@@ -661,7 +661,93 @@ export async function notifyPermission(ask: boolean): Promise<'granted' | 'denie
 }
 
 /** Which session a notification points at: clicking the system notification brings the window to front and opens it */
-type NotifyTarget = { hostId: string; sessionId: string };
+type NotifyTarget = { hostId: string; sessionId: string; parentId?: string; sideChat?: boolean };
+
+/** When the session page receives this, it opens the file panel and the panel opens the file left in pendingFiles */
+export const OPEN_FILE = 'yi-console:open-file';
+export interface OpenFileReq {
+  path: string;
+  line?: number;
+  endLine?: number;
+  diff?: boolean;
+}
+/** Same reason as pendingChanges: a closed panel mounts after the event and takes the request then */
+const pendingFiles = new Map<string, OpenFileReq>();
+export function takeOpenFile(hostId: string, sessionId: string) {
+  const k = skey(hostId, sessionId);
+  const r = pendingFiles.get(k);
+  pendingFiles.delete(k);
+  return r;
+}
+
+/** Open a file (a link or context pill in chat) in the session's file panel, optionally at a line/range or diff view */
+export function openFileInPanel(
+  hostId: string,
+  sessionId: string,
+  path: string,
+  opts?: number | { line?: number; endLine?: number; diff?: boolean },
+) {
+  lsSet(`file-panel-${skey(hostId, sessionId)}`, true);
+  const req: OpenFileReq =
+    typeof opts === 'number' ? { path, line: opts } : { path, line: opts?.line, endLine: opts?.endLine, diff: opts?.diff };
+  pendingFiles.set(skey(hostId, sessionId), req);
+  setTimeout(() => window.dispatchEvent(new CustomEvent(OPEN_FILE, { detail: { hostId, sessionId } })), 0);
+}
+
+/** Embedded child panes (side chat / review tabs) currently mounted and visible inside their parent session's right panel */
+const visibleChildSessions = new Map<string, number>();
+
+export function registerVisibleChildSession(hostId: string, childSessionId: string): () => void {
+  const k = skey(hostId, childSessionId);
+  visibleChildSessions.set(k, (visibleChildSessions.get(k) ?? 0) + 1);
+  return () => {
+    const n = (visibleChildSessions.get(k) ?? 0) - 1;
+    if (n > 0) visibleChildSessions.set(k, n);
+    else visibleChildSessions.delete(k);
+  };
+}
+
+export function isChildSessionVisible(hostId: string, childSessionId: string): boolean {
+  return (visibleChildSessions.get(skey(hostId, childSessionId)) ?? 0) > 0;
+}
+
+/** Resolve a hidden child session (side chat, review tab, bottom terminal) to its parent session + embedded panel opener */
+function resolveChildSession(
+  hostId: string,
+  sessionId: string,
+  hint?: { parentId?: string; sideChat?: boolean },
+): { view: Extract<View, { kind: 'session' }>; openPanel?: () => void } {
+  const info = sessionInfo(hostId, sessionId);
+  const parentId = info?.parentId ?? hint?.parentId;
+  if (!parentId) return { view: { kind: 'session', hostId, sessionId } };
+  const hostList = state.sessions[hostId];
+  if (hostList && !hostList.some((x) => x.id === parentId)) {
+    return { view: { kind: 'session', hostId, sessionId } };
+  }
+  const isSide = info ? !!info.sideChat : !!hint?.sideChat;
+  if (isSide) {
+    return {
+      view: { kind: 'session', hostId, sessionId: parentId },
+      openPanel: () => openFileInPanel(hostId, parentId, `side:${sessionId}`),
+    };
+  }
+  if ((info && info.mode === 'structured' && info.tool !== 'shell' && info.tool !== 'files') || (!info && hint?.parentId)) {
+    return {
+      view: { kind: 'session', hostId, sessionId: parentId },
+      openPanel: () => openFileInPanel(hostId, parentId, `review:${sessionId}`),
+    };
+  }
+  if (info && info.tool === 'shell') {
+    return {
+      view: { kind: 'session', hostId, sessionId: parentId },
+      openPanel: () => {
+        lsSet(`term-panel-${skey(hostId, parentId)}`, true);
+        lsSet(`term-tab-${parentId}`, sessionId);
+      },
+    };
+  }
+  return { view: { kind: 'session', hostId, sessionId } };
+}
 
 async function focusWindow() {
   if (isTauri) {
@@ -672,9 +758,15 @@ async function focusWindow() {
   } else window.focus();
 }
 
+function openSessionTarget(t: NotifyTarget) {
+  const resolved = resolveChildSession(t.hostId, t.sessionId, { parentId: t.parentId, sideChat: t.sideChat });
+  resolved.openPanel?.();
+  navigate(resolved.view);
+}
+
 function openTarget(t: NotifyTarget) {
   focusWindow().catch(() => {});
-  navigate({ kind: 'session', hostId: t.hostId, sessionId: t.sessionId });
+  openSessionTarget(t);
 }
 
 /** On desktop, clicks are only reported if an onAction listener exists when the notification is sent, so register before the first one */
@@ -683,7 +775,14 @@ function listenNotifyClick(n: typeof import('@tauri-apps/plugin-notification')) 
   actionListener ??= n
     .onAction((e) => {
       const x = e.notification?.extra as Partial<NotifyTarget> | undefined;
-      if (x?.hostId && x.sessionId) openTarget({ hostId: x.hostId, sessionId: x.sessionId });
+      if (x?.hostId && x.sessionId) {
+        openTarget({
+          hostId: x.hostId,
+          sessionId: x.sessionId,
+          ...(typeof x.parentId === 'string' && x.parentId ? { parentId: x.parentId } : {}),
+          ...(typeof x.sideChat === 'boolean' ? { sideChat: x.sideChat } : {}),
+        });
+      }
     })
     .catch(() => null);
   return actionListener;
@@ -748,14 +847,22 @@ export function toggleSidebar() {
 }
 
 export function navigate(view: View) {
+  let next = view;
+  if (next.kind === 'session') {
+    const resolved = resolveChildSession(next.hostId, next.sessionId);
+    if (resolved.openPanel) {
+      resolved.openPanel();
+      next = resolved.view;
+    }
+  }
   const cur = getState().view;
-  if (!sameView(cur, view)) {
+  if (!sameView(cur, next)) {
     past.push(cur);
     if (past.length > 50) past.shift();
     future.length = 0;
     syncNav();
   }
-  show(view);
+  show(next);
 }
 
 /** Open the new session page */
@@ -765,9 +872,17 @@ export function openNewSession(p: NewSessionParams) {
 
 /** Show a view in place of the current one, without a back entry (the new session page hands over to its session) */
 export function replaceView(view: View) {
+  let next = view;
+  if (next.kind === 'session') {
+    const resolved = resolveChildSession(next.hostId, next.sessionId);
+    if (resolved.openPanel) {
+      resolved.openPanel();
+      next = resolved.view;
+    }
+  }
   future.length = 0;
   syncNav();
-  show(view);
+  show(next);
 }
 
 function show(view: View) {
@@ -996,7 +1111,14 @@ function onNotification(hostId: string, method: string, p: any) {
     case 'notify': {
       const prefs = state.client?.notify ?? DEFAULT_NOTIFY;
       const v = state.view;
-      const viewing = v.kind === 'session' && v.hostId === hostId && v.sessionId === p.sessionId;
+      const sess = sessionInfo(hostId, p.sessionId);
+      const parentId = sess?.parentId ?? (typeof p.parentId === 'string' && p.parentId ? p.parentId : undefined);
+      const sideChat = !!(sess?.sideChat ?? p.sideChat);
+      const viewing =
+        v.kind === 'session' &&
+        v.hostId === hostId &&
+        (v.sessionId === p.sessionId ||
+          (!!parentId && v.sessionId === parentId && isChildSessionVisible(hostId, p.sessionId)));
       // A window behind others (covered, minimized) also counts as not watching, hence hasFocus rather than just hidden
       const away = document.hidden || !document.hasFocus() || !viewing;
       const want = p.kind === 'permission' ? prefs.onPermission : prefs.onTurnEnd;
@@ -1005,7 +1127,6 @@ function onNotification(hostId: string, method: string, p: any) {
       if (p.kind === 'rate_limit' && p.limit) {
         // Usage limit: built here so it follows this device's language
         const at: number | null = p.limit.resumeAt ?? null;
-        const sess = state.sessions[hostId]?.find((x) => x.id === p.sessionId);
         title = t('usageLimitReached', { name: p.limit.name });
         body = [
           sess?.title,
@@ -1018,12 +1139,18 @@ function onNotification(hostId: string, method: string, p: any) {
           .filter(Boolean)
           .join(' · ');
       }
-      if (prefs.enabled && want && (prefs.when === 'always' || away)) systemNotify(title, body, { hostId, sessionId: p.sessionId });
+      const target: NotifyTarget = {
+        hostId,
+        sessionId: p.sessionId,
+        ...(parentId ? { parentId } : {}),
+        ...(sideChat ? { sideChat: true } : {}),
+      };
+      if (prefs.enabled && want && (prefs.when === 'always' || away)) systemNotify(title, body, target);
       // In-app toast: remind the user when they're in another session
       if (!viewing) {
         toast(title, 'info', {
           label: t('view'),
-          run: () => navigate({ kind: 'session', hostId, sessionId: p.sessionId }),
+          run: () => openSessionTarget(target),
         });
       }
       break;

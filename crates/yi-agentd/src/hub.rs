@@ -2382,6 +2382,9 @@ impl Hub {
             .filter_map(|(sid, seq, ts, body)| {
                 let rt = sessions.get(&sid)?;
                 let info = rt.info.lock().unwrap();
+                if info.parent_id.is_some() {
+                    return None;
+                }
                 let (kind, text) = match &body {
                     EventBody::UserMessage { text, .. } => ("user", text.as_str()),
                     EventBody::AssistantText { text, .. } => ("assistant", text.as_str()),
@@ -3410,6 +3413,12 @@ impl Hub {
         if let Some((title, body)) = notify {
             let mut p = json!({ "sessionId": sid, "title": title, "body": body,
                         "kind": if kind_turn_end { "turn_end" } else { "permission" } });
+            if let Some(pid) = &info.parent_id {
+                p["parentId"] = json!(pid);
+            }
+            if info.side_chat {
+                p["sideChat"] = json!(true);
+            }
             if let Some(n) = limit_notice {
                 p["kind"] = json!("rate_limit");
                 p["limit"] = n;
@@ -6683,6 +6692,93 @@ mod tests {
             .filter_map(|v| v["sessionId"].as_str())
             .collect();
         assert_eq!(rel_ids, vec!["parent", "side-1"]);
+    }
+
+    #[tokio::test]
+    async fn side_chat_excluded_from_search_and_notify_carries_parent_hints() {
+        let hub = Hub::new(crate::store::Store::open_memory().unwrap(), DaemonSettings::default());
+        let _parent_rx = live(&hub, "parent", SessionMode::Structured, SessionStatus::Idle, 1);
+        let _side_rx = live(&hub, "side-1", SessionMode::Structured, SessionStatus::Running, 1);
+
+        {
+            let prt = hub.get("parent").unwrap();
+            let mut pinfo = prt.info.lock().unwrap();
+            pinfo.title = "Main session".into();
+            hub.store.save_session(&pinfo).unwrap();
+
+            let srt = hub.get("side-1").unwrap();
+            let mut sinfo = srt.info.lock().unwrap();
+            sinfo.title = "Side question".into();
+            sinfo.parent_id = Some("parent".into());
+            sinfo.side_chat = true;
+            hub.store.save_session(&sinfo).unwrap();
+        }
+
+        hub.emit(
+            "parent",
+            0,
+            EventBody::UserMessage {
+                text: "unique_needle parent hit".into(),
+                images: vec![],
+                origin: None,
+            },
+        );
+        hub.emit(
+            "side-1",
+            0,
+            EventBody::UserMessage {
+                text: "unique_needle side hidden hit".into(),
+                images: vec![],
+                origin: None,
+            },
+        );
+
+        let hits = hub.search("unique_needle", 10).unwrap();
+        let hit_ids: Vec<&str> = hits
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v["sessionId"].as_str())
+            .collect();
+        assert_eq!(hit_ids, vec!["parent"]);
+
+        let mut bus_rx = hub.bus.subscribe();
+        hub.emit(
+            "side-1",
+            0,
+            EventBody::PermissionRequest {
+                request_id: "req-1".into(),
+                tool_name: "Bash".into(),
+                title: "git grep -n openCanvas".into(),
+                input: json!({ "command": "git grep -n openCanvas" }),
+                options: vec![],
+                questions: vec![],
+            },
+        );
+        hub.emit(
+            "side-1",
+            0,
+            EventBody::TurnEnd {
+                stop_reason: Some("end_turn".into()),
+                model: None,
+            },
+        );
+
+        let mut notices = Vec::new();
+        while let Ok(msg) = bus_rx.try_recv() {
+            if msg.method == methods::EV_NOTIFY {
+                notices.push(msg.params.clone());
+            }
+        }
+        assert_eq!(notices.len(), 2);
+        assert_eq!(notices[0]["sessionId"], "side-1");
+        assert_eq!(notices[0]["kind"], "permission");
+        assert_eq!(notices[0]["parentId"], "parent");
+        assert_eq!(notices[0]["sideChat"], true);
+        assert_eq!(notices[1]["sessionId"], "side-1");
+        assert_eq!(notices[1]["kind"], "turn_end");
+        assert_eq!(notices[1]["parentId"], "parent");
+        assert_eq!(notices[1]["sideChat"], true);
     }
 }
 

@@ -1,7 +1,7 @@
 import { useEffect, useMemo } from 'react';
 import { getT, useLang } from '../i18n';
 import { bringSideChatToMain, deriveSideTitle, sideChatTitle } from '../sideChat';
-import { errorToast, loadOlder, loadSession, skey, useSessionData, useStore } from '../store';
+import { errorToast, loadOlder, loadSession, registerVisibleChildSession, skey, useSessionData, useStore } from '../store';
 import { rpc } from '../transport';
 import { TOOL_LABEL, type QuestionAnswer } from '../types';
 import { AsyncAskCard, ChatView, openAsyncAsk, PermissionCard } from './ChatView';
@@ -33,6 +33,8 @@ export function SideChatPane({
   useEffect(() => {
     if (connected) loadSession(hostId, sideSessionId).catch(errorToast);
   }, [hostId, sideSessionId, connected, data.loaded]);
+
+  useEffect(() => registerVisibleChildSession(hostId, sideSessionId), [hostId, sideSessionId]);
 
   const pending = useMemo(() => {
     const open = new Map<string, any>();
