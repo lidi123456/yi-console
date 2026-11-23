@@ -37,6 +37,7 @@ function RefPreview({ r, loc, hint }: { r: ContextRef; loc: string; hint: string
   return (
     <div className="cref-pop" role="tooltip">
       <div className="cref-pop-loc mono truncate">{loc}</div>
+      {r.kind === 'review' && r.reviewSource && <div className="cref-pop-hint">{t('aiReviewSourceLabel', { source: r.reviewSource })}</div>}
       {r.kind === 'review' && r.comment && <div className="cref-pop-comment">{r.comment}</div>}
       {r.content && (
         <pre className="cref-pop-code">
@@ -88,6 +89,9 @@ export function ContextRefBar({
     const items: (MenuItem | '-')[] = [
       ...(canOpen && !r.untitled && r.kind !== 'terminal' && (r.kind !== 'side' || !!r.sideSessionId)
         ? [{ label: r.kind === 'side' ? t('openSideChat') : t('openInFilePanel'), icon: r.kind === 'side' ? 'sideChat' : 'file', run: () => openRef(r, hostId, sessionId, cwd) }]
+        : []),
+      ...(canOpen && r.kind === 'review' && r.sideSessionId
+        ? [{ label: t('openReviewSideChat'), icon: 'sparkles', run: () => openFileInPanel(hostId, sessionId, `side:${r.sideSessionId}`) }]
         : []),
       ...(r.kind === 'review' && onEditReview
         ? [{ label: t('editReviewComment'), icon: 'edit', run: () => onEditReview(r) }]
@@ -144,11 +148,11 @@ export function ContextRefBar({
             ? `${t('sideChatRefBadge')} · ${r.path}`
             : isTerm
               ? `${r.path} · ${t('terminalLines', { n: lineCount })}${r.exitCode !== undefined ? ` · exit ${r.exitCode}` : ''}`
-              : `${r.path}:${lines}${r.commit ? ` @${r.commit.slice(0, 7)}` : ''}`;
+              : `${r.reviewSource ? `${r.reviewSource} · ` : ''}${r.path}:${lines}${r.commit ? ` @${r.commit.slice(0, 7)}` : ''}`;
           return (
             <div
               key={r.id}
-              className={`cref-chip ${clickable ? 'clickable' : ''} ${onRemove ? 'removable' : ''} ${isReview ? 'review' : ''} ${isTerm ? 'terminal' : ''} ${isSide ? 'side' : ''}`}
+              className={`cref-chip ${clickable ? 'clickable' : ''} ${onRemove ? 'removable' : ''} ${isReview ? 'review' : ''} ${r.reviewSource ? 'ai-review' : ''} ${isTerm ? 'terminal' : ''} ${isSide ? 'side' : ''}`}
               role={clickable ? 'button' : undefined}
               tabIndex={clickable ? 0 : undefined}
               aria-label={fullLoc}
@@ -165,6 +169,8 @@ export function ContextRefBar({
                 <Icon name="sideChat" size={13} />
               ) : isTerm ? (
                 <Icon name="terminal" size={13} />
+              ) : isReview && r.reviewSource ? (
+                <Icon name="sparkles" size={13} />
               ) : isReview ? (
                 <Icon name="comment" size={13} />
               ) : (

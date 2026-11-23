@@ -19,6 +19,7 @@ import { BotSource } from './bots';
 import { Palette, useShortcuts } from './components/Palette';
 import { SearchView } from './components/SearchView';
 import { setState, skey, useStore } from './store';
+import { isHostSession } from './types';
 import { Overlays, useContextMenu } from './components/Overlay';
 import { customFrame, TitleBar } from './components/TitleBar';
 import { Lightbox } from './components/Lightbox';
@@ -113,7 +114,7 @@ export function App() {
   const view = useStore((s) => s.view);
   const sideHidden = useStore((s) => s.sidebarHidden);
   const attn = useStore((s) =>
-    Object.values(s.sessions).reduce((n, l) => n + l.filter((x) => x.pendingPermissions > 0).length, 0),
+    Object.values(s.sessions).reduce((n, l) => n + l.filter((x) => isHostSession(x) && x.pendingPermissions > 0).length, 0),
   );
   useEffect(() => {
     document.title = attn > 0 ? `(${attn}) Yi Console` : 'Yi Console';

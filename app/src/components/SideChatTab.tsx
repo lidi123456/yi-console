@@ -8,6 +8,8 @@ import { AsyncAskCard, ChatView, openAsyncAsk, PermissionCard } from './ChatView
 import { Composer } from './Composer';
 import { Icon, ToolBadge } from './Icon';
 import { askConfirm, askText } from './Overlay';
+import { getReviewMeta, ReviewSidePane } from './ReviewTab';
+import { setActiveReviewId } from '../reviewState';
 import { StatusLine } from './StatusLine';
 
 export * from '../sideChat';
@@ -18,17 +20,36 @@ export function SideChatPane({
   hostId,
   parentSessionId,
   sideSessionId,
+  onOpenFile,
   onDeleted,
 }: {
   hostId: string;
   parentSessionId: string;
   sideSessionId: string;
+  onOpenFile?: (relPath: string, line?: number) => void;
   onDeleted: () => void;
 }) {
   useLang();
   const key = skey(hostId, sideSessionId);
   const data = useSessionData(key);
   const info = useStore((s) => s.sessions[hostId]?.find((x) => x.id === sideSessionId));
+  const isReviewSide = !!(info?.review || getReviewMeta(sideSessionId));
+
+  useEffect(() => {
+    if (isReviewSide) setActiveReviewId(hostId, parentSessionId, sideSessionId);
+  }, [isReviewSide, hostId, parentSessionId, sideSessionId]);
+
+  if (isReviewSide) {
+    return (
+      <ReviewSidePane
+        hostId={hostId}
+        reviewSessionId={sideSessionId}
+        parentSessionId={parentSessionId}
+        onOpenFile={onOpenFile}
+        onDeleted={onDeleted}
+      />
+    );
+  }
   const connected = useStore((s) => s.hosts.find((h) => h.config.id === hostId)?.status.status === 'connected');
 
   useEffect(() => {

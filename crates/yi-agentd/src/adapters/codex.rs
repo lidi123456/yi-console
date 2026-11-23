@@ -63,6 +63,8 @@ struct State {
     /// Subagent threads (multi_agent `spawn_agent`), by thread id. app-server streams their notifications on this
     /// connection with their own threadId. Running ones are the session's background tasks
     subs: HashMap<String, SubThread>,
+    /// Strictly read-only code review side chat guard
+    read_only_review: bool,
 }
 
 /// One subagent thread
@@ -105,6 +107,15 @@ fn policy(mode: &str) -> (&'static str, &'static str) {
     }
 }
 
+fn policy_for(mode: &str, read_only_review: bool) -> (&'static str, &'static str) {
+    if read_only_review {
+        // Read-only sandbox + on-request avoids prompting on trusted read commands while adapter guard handles the rest
+        ("on-request", "read-only")
+    } else {
+        policy(mode)
+    }
+}
+
 /// Who handles approval requests: Codex's automatic reviewer in auto mode, the user otherwise
 fn reviewer(mode: &str) -> &'static str {
     if mode == "auto" {
@@ -136,6 +147,7 @@ pub async fn run(spec: StartSpec, em: Emitter, mut rx: mpsc::UnboundedReceiver<A
     };
     let mut st = State {
         effort: spec.effort.clone().filter(|e| !e.is_empty()),
+        read_only_review: spec.read_only_review,
         ..Default::default()
     };
     let init = st.req(
@@ -312,7 +324,7 @@ fn start_turn_with(st: &mut State, tid: String, prompt: &Prompt) -> Value {
         params["effort"] = json!(e);
     }
     if let Some(mode) = &st.perm {
-        let (approval, sandbox) = policy(mode);
+        let (approval, sandbox) = policy_for(mode, st.read_only_review);
         params["approvalPolicy"] = json!(approval);
         params["sandboxPolicy"] = json!({ "type": sandbox_type(sandbox) });
         params["approvalsReviewer"] = json!(reviewer(mode));
@@ -526,7 +538,7 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Vec<Valu
             Pending::Init => {
                 out.push(json!({"method":"initialized"}));
                 out.push(st.req(Pending::Models, "model/list", json!({})));
-                let (approval, sandbox) = policy(&spec.permission_mode);
+                let (approval, sandbox) = policy_for(&spec.permission_mode, st.read_only_review || spec.read_only_review);
                 let mut params = json!({
                     "cwd": spec.cwd.display().to_string(),
                     "approvalPolicy": approval,
@@ -632,6 +644,36 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Vec<Valu
                         })
                     })
                     .unwrap_or_default();
+                if st.read_only_review {
+                    match super::review_guard::classify_review_action(
+                        "shell",
+                        Some("execute"),
+                        &cmd,
+                        &json!({ "command": cmd }),
+                    ) {
+                        super::review_guard::ReviewGuardDecision::Allow => {
+                            let a = PendingApproval {
+                                rpc_id: v["id"].clone(),
+                                method: method.to_string(),
+                                params: params.clone(),
+                                questions: vec![],
+                            };
+                            out.push(json!({"id": v["id"], "result": approval_result(&a, "accept")}));
+                            return out;
+                        }
+                        super::review_guard::ReviewGuardDecision::Deny(_) => {
+                            let a = PendingApproval {
+                                rpc_id: v["id"].clone(),
+                                method: method.to_string(),
+                                params: params.clone(),
+                                questions: vec![],
+                            };
+                            out.push(json!({"id": v["id"], "result": approval_result(&a, "decline")}));
+                            return out;
+                        }
+                        super::review_guard::ReviewGuardDecision::Ask => {}
+                    }
+                }
                 let reason = params["reason"].as_str().unwrap_or("");
                 let title = if reason.is_empty() {
                     format!("执行命令: {cmd}")
@@ -639,6 +681,17 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Vec<Valu
                     format!("执行命令: {cmd}（{reason}）")
                 };
                 ask(st, em, v, method, rid, "shell", title, codex_options(true));
+            }
+            "item/fileChange/requestApproval" | "applyPatchApproval"
+                if st.read_only_review =>
+            {
+                let a = PendingApproval {
+                    rpc_id: v["id"].clone(),
+                    method: method.to_string(),
+                    params: params.clone(),
+                    questions: vec![],
+                };
+                out.push(json!({"id": v["id"], "result": approval_result(&a, "decline")}));
             }
             "item/fileChange/requestApproval" | "applyPatchApproval"
                 if st.perm.as_deref().unwrap_or(&spec.permission_mode) == "acceptEdits" =>
@@ -664,6 +717,15 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Vec<Valu
                     format!("修改文件{}", if reason.is_empty() { String::new() } else { format!("（{reason}）") }),
                     codex_options(true),
                 );
+            }
+            "item/permissions/requestApproval" if st.read_only_review => {
+                let a = PendingApproval {
+                    rpc_id: v["id"].clone(),
+                    method: method.to_string(),
+                    params: params.clone(),
+                    questions: vec![],
+                };
+                out.push(json!({"id": v["id"], "result": approval_result(&a, "decline")}));
             }
             "item/permissions/requestApproval" => {
                 let reason = params["reason"].as_str().unwrap_or("申请额外权限");
@@ -1400,7 +1462,50 @@ mod tests {
             account_handoff: None,
             fork_session: false,
             fork_fallback_handoff: None,
+            read_only_review: false,
         }
+    }
+
+    #[test]
+    fn read_only_review_guard_in_codex_adapter() {
+        assert_eq!(policy_for("plan", true), ("on-request", "read-only"));
+        let (hub, em, _rx) = crate::hub::test_emitter();
+        let sp = spec();
+        let mut st = State { read_only_review: true, ..Default::default() };
+
+        let out_read = handle(
+            &mut st,
+            &sp,
+            &json!({"id": 1, "method": "item/commandExecution/requestApproval", "params": {"command": ["git", "diff", "HEAD"]}}),
+            &em,
+        );
+        assert_eq!(out_read[0]["result"]["decision"], "accept");
+
+        let out_write = handle(
+            &mut st,
+            &sp,
+            &json!({"id": 2, "method": "item/fileChange/requestApproval", "params": {"reason": "edit"}}),
+            &em,
+        );
+        assert_eq!(out_write[0]["result"]["decision"], "decline");
+
+        let out_mut_cmd = handle(
+            &mut st,
+            &sp,
+            &json!({"id": 3, "method": "item/commandExecution/requestApproval", "params": {"command": "rm -rf foo"}}),
+            &em,
+        );
+        assert_eq!(out_mut_cmd[0]["result"]["decision"], "decline");
+
+        let out_ask = handle(
+            &mut st,
+            &sp,
+            &json!({"id": 4, "method": "item/commandExecution/requestApproval", "params": {"command": "cargo test"}}),
+            &em,
+        );
+        assert!(out_ask.is_empty());
+        assert_eq!(st.approvals.len(), 1);
+        assert_eq!(hub.store.events_since("s", 0, 20).unwrap().len(), 1);
     }
 
     fn note(method: &str, thread: &str, extra: Value) -> Value {

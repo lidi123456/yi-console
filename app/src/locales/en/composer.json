@@ -95,5 +95,9 @@
   "sideChatRunningHint": "Side chat · running",
   "sideChatMentionHint": "Side chat · insert notes",
   "sideChatSlashDesc": "Start a hidden side chat in the right panel without interrupting the main thread",
-  "sideChatBtwDesc": "Alias of /side: ask a side question beside the main thread"
+  "sideChatBtwDesc": "Alias of /side: ask a side question beside the main thread",
+  "aiReviewSourceLabel": "Code review by {{source}}",
+  "openReviewSideChat": "Open AI review side chat",
+  "reviewReadonlyModeLocked": "AI review is locked to read-only mode",
+  "readonlyLockedLabel": "Read-only locked"
 }

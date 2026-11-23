@@ -94,5 +94,9 @@
   "sideChatRunningHint": "旁路对话 · 运行中",
   "sideChatMentionHint": "旁路对话 · 点击引用结论",
   "sideChatSlashDesc": "在右侧开启隐藏旁路对话（不中断主线程，可紧跟问题回车）",
-  "sideChatBtwDesc": "同 /side：开启右侧旁路快问，不写入主会话历史"
+  "sideChatBtwDesc": "同 /side：开启右侧旁路快问，不写入主会话历史",
+  "aiReviewSourceLabel": "来自 {{source}} 的代码审阅",
+  "openReviewSideChat": "打开 AI 审阅旁路",
+  "reviewReadonlyModeLocked": "AI 审阅固定为只读模式，不可切换写入权限",
+  "readonlyLockedLabel": "只读已锁定"
 }

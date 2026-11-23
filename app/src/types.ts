@@ -74,6 +74,26 @@ export interface SessionInfo {
   appendSystemPrompt?: string;
   /** Per-turn hidden git checkpoints captured around structured turns */
   checkpoints?: TurnCheckpoint[];
+  /** Metadata for a read-only cross-tool AI code review side chat */
+  review?: ReviewSessionMeta | null;
+}
+
+export interface ReviewSessionMeta {
+  scope: 'uncommitted' | 'branch' | 'commits' | 'range' | string;
+  uncommittedFilter?: 'all' | 'tracked' | 'staged' | string;
+  base?: string;
+  target?: string;
+  includeUncommitted?: boolean;
+  mergeBase?: string;
+  baseRev?: string;
+  endRev?: string;
+  commits?: string[];
+  contiguous?: boolean;
+  rangeExpr?: string;
+  scopeLabel?: string;
+  includedFiles?: string[];
+  excludedFiles?: string[];
+  totalFilesCount?: number;
 }
 
 export interface TurnCheckpoint {

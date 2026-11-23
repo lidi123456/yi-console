@@ -6,6 +6,7 @@ pub mod claude;
 pub mod codex;
 pub mod pty;
 pub(crate) mod qoder_tasks;
+pub mod review_guard;
 
 use crate::hub::Emitter;
 use yi_proto::{QuestionAnswer, SessionMode, ToolKind};
@@ -27,9 +28,26 @@ For flowcharts and other supported diagrams, use fenced code blocks with the lan
 Yi Console renders them inline. Start with the diagram type, use plain text labels, close the code fence, \
 and omit configuration directives, HTML, external resources, click actions and custom style statements.";
 
+/// Concise read-only review mode prompt hint injected for review side chats
+pub fn review_system_hint(spec: &StartSpec) -> &'static str {
+    if !spec.read_only_review {
+        return "";
+    }
+    "\n\n[Yi Console Read-Only Review Guard] This session is locked to STRICT READ-ONLY code review mode. \
+    Do NOT attempt to write, edit, delete, or commit files, or modify git state (writes are blocked). \
+    Prefer the pre-authorized `yi_review` MCP tools (`review_scope`, `review_diff`, `review_read_file`, `review_grep`) \
+    or read-only inspection so no permission prompts are needed."
+}
+
 /// Everything we add to the system prompt of Claude (`--append-system-prompt`) and Codex (`developerInstructions`)
 pub fn system_text(spec: &StartSpec) -> String {
-    let mut s = format!("{}{}{}", IMAGE_HINT, crate::computer_use::model_hint(&spec.extra_args), crate::browser::model_hint(&spec.extra_args));
+    let mut s = format!(
+        "{}{}{}{}",
+        IMAGE_HINT,
+        crate::computer_use::model_hint(&spec.extra_args),
+        crate::browser::model_hint(&spec.extra_args),
+        review_system_hint(spec)
+    );
     if let Some(m) = &spec.memory_prompt {
         s.push_str("\n\n");
         s.push_str(m);
@@ -48,9 +66,18 @@ pub fn acp_system_notice(spec: &StartSpec) -> Option<String> {
 
 /// The session's appended system prompt as sent in a prompt, whether or not this tool session has seen it
 pub fn acp_system_reminder(spec: &StartSpec) -> Option<String> {
-    spec.system_prompt
-        .as_ref()
-        .map(|p| format!("<system-reminder>\n{p}\n</system-reminder>"))
+    let mut parts = vec![];
+    if let Some(p) = spec.system_prompt.as_ref() {
+        parts.push(p.clone());
+    }
+    if spec.read_only_review {
+        parts.push(review_system_hint(spec).trim().to_string());
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(format!("<system-reminder>\n{}\n</system-reminder>", parts.join("\n\n")))
+    }
 }
 
 /// ACP tools: host personal memory L0 snapshot, sent on a fresh tool session and re-armed after compaction
@@ -168,6 +195,8 @@ pub struct StartSpec {
     pub fork_session: bool,
     /// Full portable `<yi-side-context>` digest used if native fork fails and falls back to a fresh session
     pub fork_fallback_handoff: Option<String>,
+    /// Lock the adapter to strict read-only code review (auto-allows read-only tools/commands, hard-denies writes)
+    pub read_only_review: bool,
 }
 
 pub fn start(spec: StartSpec, em: Emitter, rx: mpsc::UnboundedReceiver<AdapterCmd>) {

@@ -1,15 +1,44 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useBack } from '../back';
+import { addContextRefToChat, removeReviewContextRef } from '../contextRefs';
 import { getT, isEn, trErr, useLang } from '../i18n';
 import { permModes } from '../perm';
-import { errorToast, hostStatus, loadSession, registerVisibleChildSession, skey, toast, useSessionData, useStore } from '../store';
+import {
+  emitFocusFinding,
+  extractFindingThreads,
+  extractReviewSnapshot,
+  formatFindingFollowUp,
+  getAllDispositions,
+  getFindingDisposition,
+  parseReviewIssues,
+  resolveReviewMeta,
+  setActiveReviewId,
+  setFindingDisposition,
+  useReviewStoreVersion,
+  type ReviewIssue,
+  type ReviewSeverity,
+} from '../reviewState';
+import { deriveSideTitle, sideChatTitle } from '../sideChat';
+import { errorToast, hostStatus, loadOlder, loadSession, registerVisibleChildSession, skey, toast, useSessionData, useStore } from '../store';
 import { rpc } from '../transport';
-import { TOOL_LABEL, type CommitInfo, type SessionInfo, type ToolKind } from '../types';
+import { TOOL_LABEL, type CommitInfo, type HubEvent, type QuestionAnswer, type ReviewSessionMeta, type SessionInfo, type ToolKind } from '../types';
 import { timeAgo } from '../util';
 import { ChatMarkdown } from './ChatMarkdown';
+import { AsyncAskCard, ChatView, openAsyncAsk, PermissionCard } from './ChatView';
+import { Composer } from './Composer';
 import type { BranchesResult } from './GitOpsDialogs';
 import { Icon, ToolBadge } from './Icon';
 import { INSERT_COMPOSER } from './FilePanel';
+import { askConfirm, askText } from './Overlay';
+import { bringSideChatToMain } from '../sideChat';
+import { StatusLine } from './StatusLine';
+
+export type { ReviewIssue };
+export { parseReviewIssues };
+
+const PREFED_MAX_FILES = 25;
+const PREFED_MAX_LINES = 1200;
+const PREFED_MAX_CHARS = 55_000;
 
 const tx = getT('filePanel');
 const GIT_HEAD_REF = 'HEAD';
@@ -41,6 +70,7 @@ export interface ReviewScopeFile {
   binary?: boolean;
   untracked?: boolean;
   staged?: boolean;
+  diff?: string | null;
 }
 
 export interface ReviewScopeResult {
@@ -81,22 +111,14 @@ export interface ReviewMeta {
   contiguous?: boolean;
   rangeExpr?: string;
   scopeLabel?: string;
+  includedFiles?: string[];
+  excludedFiles?: string[];
   includedFilesCount?: number;
   totalFilesCount?: number;
   cwd: string;
 }
 
-export interface ReviewIssue {
-  id: string;
-  severity: 'high' | 'medium' | 'low';
-  title: string;
-  file?: string;
-  line?: number;
-  summary: string;
-  suggestion?: string;
-}
-
-/** In-memory metadata for review tabs opened in this window (fallback to SessionInfo on reload) */
+/** In-memory metadata for review tabs opened in this window (fallback to SessionInfo.review on reload) */
 const reviewMetaMap = new Map<string, ReviewMeta>();
 export function setReviewMeta(meta: ReviewMeta) {
   reviewMetaMap.set(meta.sessionId, meta);
@@ -106,6 +128,59 @@ export function getReviewMeta(reviewSid: string): ReviewMeta | undefined {
 }
 export function deleteReviewMeta(reviewSid: string) {
   reviewMetaMap.delete(reviewSid);
+}
+
+/** Add one or more AI review findings to the parent session's ContextRefBar queue and mark them adopted. */
+export function adoptReviewFindings(opts: {
+  hostId: string;
+  reviewSessionId: string;
+  parentSessionId: string;
+  tool: ToolKind;
+  issues: ReviewIssue[];
+  commitHash?: string;
+}): number {
+  const { hostId, reviewSessionId, parentSessionId, tool, issues, commitHash } = opts;
+  const source = TOOL_LABEL[tool] ?? tool;
+  let count = 0;
+  for (const it of issues) {
+    const sevLabel = it.severity === 'high' ? tx('sevHigh') : it.severity === 'medium' ? tx('sevMedium') : tx('sevLow');
+    const detailLines = [
+      `[${it.severity.toUpperCase()}] ${it.title}`,
+      it.summary ? `Summary: ${it.summary}` : '',
+      it.suggestion ? `Suggestion: ${it.suggestion}` : '',
+    ].filter(Boolean);
+    addContextRefToChat(
+      parentSessionId,
+      {
+        kind: 'review',
+        path: it.file || 'review-general',
+        ...(it.file ? {} : { untitled: true }),
+        ...(commitHash ? { commit: commitHash } : {}),
+        fromLine: it.line ?? 1,
+        toLine: it.line ?? 1,
+        comment: `[${sevLabel}] ${it.title}`,
+        sideSessionId: reviewSessionId,
+        reviewSource: source,
+        reviewFindingId: it.id,
+        content: detailLines.join('\n'),
+      },
+      { focus: false },
+    );
+    setFindingDisposition(hostId, reviewSessionId, it.id, 'adopted');
+    count += 1;
+  }
+  return count;
+}
+
+/** Undo an un-sent adoption: mark finding open again and remove any pending pill from main Composer. */
+export function unadoptReviewFinding(opts: {
+  hostId: string;
+  reviewSessionId: string;
+  parentSessionId: string;
+  findingId: string;
+}) {
+  setFindingDisposition(opts.hostId, opts.reviewSessionId, opts.findingId, 'open');
+  removeReviewContextRef(opts.parentSessionId, opts.reviewSessionId, opts.findingId);
 }
 
 const LOCK_FILE_RE = /^(package-lock\.json|yarn\.lock|pnpm-lock\.yaml|Cargo\.lock|poetry\.lock|composer\.lock|Gemfile\.lock|go\.sum)$/;
@@ -167,6 +242,8 @@ export function buildReviewPrompt(opts: {
   excludedFiles?: string[];
   focus?: string;
   filesCount: number;
+  prefedDiff?: string;
+  legacyDaemon?: boolean;
   zh: boolean;
 }): string {
   let diffCmd = 'git diff HEAD (and untracked files via git status --short)';
@@ -222,7 +299,7 @@ export function buildReviewPrompt(opts: {
       ].join('\n');
     } else if (opts.excludedFiles.length <= 40) {
       fileScopeBlock = [
-        `IMPORTANT: Skip and DO NOT review these ${opts.excludedFiles.length} excluded file(s) (you can exclude them with \`:!<path>\` pathspecs):`,
+        `IMPORTANT: Skip and DO NOT review these ${opts.excludedFiles.length} excluded file(s):`,
         ...opts.excludedFiles.map((p) => `- ${p}`),
       ].join('\n');
     } else if (inc.length > 0) {
@@ -234,15 +311,24 @@ export function buildReviewPrompt(opts: {
     }
   }
 
+  const toolGuidance = opts.prefedDiff
+    ? 'The complete unified diff for this review is embedded below inside `<yi-review-diff>`. Start reviewing from it directly without re-running `git diff`. If you need surrounding file context or callers, prefer the pre-authorized read-only `yi_review` MCP tools (`review_read_file`, `review_grep`, `review_scope`, `review_diff`).'
+    : opts.legacyDaemon
+      ? `Inspect the changes using read-only commands such as \`${diffCmd}\` and read surrounding code as needed.`
+      : 'Inspect the changes using the pre-authorized read-only `yi_review` MCP tools (`review_scope`, `review_diff`, `review_read_file`, `review_grep`) instead of running interactive shell git commands.';
+
   const langRule = opts.zh ? 'Write all titles, summaries, and suggestions in concise Chinese.' : 'Write all titles, summaries, and suggestions in concise English.';
   const focusLine = opts.focus?.trim() ? `\nExtra review focus from the user: ${opts.focus.trim()}` : '';
+  const diffBlock = opts.prefedDiff ? `\n<yi-review-diff>\n${opts.prefedDiff.trim()}\n</yi-review-diff>` : '';
+
   return [
     `You are performing a READ-ONLY code review of ${scopeDesc} (${opts.filesCount} changed files).`,
-    `DO NOT edit, write, or commit any files. Inspect the changes using read-only commands such as \`${diffCmd}\` and read surrounding code as needed.`,
+    `DO NOT edit, write, delete, or commit any files, and DO NOT run mutating commands. ${toolGuidance}`,
     fileScopeBlock,
     `Focus on real bugs, logic errors, security/safety issues, race conditions, regressions, and edge cases. Skip trivial style nitpicks unless important.`,
     langRule,
     focusLine,
+    diffBlock,
     '',
     'Provide a brief summary first, then ALWAYS end your response with a fenced JSON block tagged `yi-review-json` containing an array of findings (or `[]` if no issues found):',
     '```yi-review-json',
@@ -260,46 +346,6 @@ export function buildReviewPrompt(opts: {
   ]
     .filter((l, i, arr) => l !== '' || (i > 0 && arr[i - 1] !== ''))
     .join('\n');
-}
-
-/** Parse structured findings from a reviewer's markdown output (returns null if no valid JSON block found) */
-export function parseReviewIssues(text: string): { issues: ReviewIssue[]; prose: string } | null {
-  if (!text) return null;
-  const match = /```yi-review-json\s*\n([\s\S]*?)```/i.exec(text) ?? /```json\s*\n(\s*\[[\s\S]*?\])\s*```/i.exec(text);
-  if (!match) return null;
-  try {
-    const raw = JSON.parse(match[1].trim());
-    if (!Array.isArray(raw)) return null;
-    const issues: ReviewIssue[] = [];
-    for (let i = 0; i < raw.length; i++) {
-      const it = raw[i];
-      if (!it || typeof it !== 'object') continue;
-      const sevRaw = String(it.severity ?? 'medium').toLowerCase();
-      const severity: 'high' | 'medium' | 'low' =
-        sevRaw === 'high' || sevRaw === 'critical' || sevRaw === 'error'
-          ? 'high'
-          : sevRaw === 'low' || sevRaw === 'nit' || sevRaw === 'info'
-            ? 'low'
-            : 'medium';
-      const title = String(it.title ?? '').trim();
-      const summary = String(it.summary ?? it.description ?? '').trim();
-      if (!title && !summary) continue;
-      const lineNum = Number(it.line);
-      issues.push({
-        id: `ri-${i}`,
-        severity,
-        title: title || summary.slice(0, 60),
-        file: typeof it.file === 'string' && it.file.trim() ? it.file.trim() : undefined,
-        line: Number.isFinite(lineNum) && lineNum > 0 ? Math.floor(lineNum) : undefined,
-        summary,
-        suggestion: typeof it.suggestion === 'string' && it.suggestion.trim() ? it.suggestion.trim() : undefined,
-      });
-    }
-    const prose = text.replace(match[0], '').trim();
-    return { issues, prose };
-  } catch {
-    return null;
-  }
 }
 
 export function ReviewLaunchDialog({
@@ -658,17 +704,89 @@ export function ReviewLaunchDialog({
           : 'uncommitted'
         : scope;
       const perm = readonlyPermFor(tool);
+      const resolvedBase = scopeRes?.base || base || branchBase;
+      const resolvedTarget = scopeRes?.target || target || headTarget;
+      const resolvedCommits = scopeRes?.commits?.length ? scopeRes.commits.map((c) => c.hash) : selectedCommits;
+      const resolvedIncludeUncommitted = effScope === 'branch' ? (legacyDaemon ? true : (scopeRes?.includeUncommitted ?? false)) : undefined;
+      const incPaths = legacyDaemon ? undefined : includedFiles.map((f) => f.path);
+      const excPaths = legacyDaemon ? undefined : excludedFiles.map((f) => f.path);
+
+      // Pre-feed small diffs directly into the prompt so the reviewer doesn't even need a diff tool call.
+      let prefedDiff: string | undefined;
+      const lineTotal = includedTotals.added + includedTotals.deleted;
+      if (!legacyDaemon && includedFiles.length > 0 && includedFiles.length <= PREFED_MAX_FILES && lineTotal <= PREFED_MAX_LINES) {
+        try {
+          const diffParams: Record<string, unknown> = { cwd, mode: effScope, diff: true, paths: incPaths };
+          if (effScope === 'uncommitted') diffParams.uncommittedFilter = uncommittedFilter;
+          else if (effScope === 'branch') {
+            if (resolvedBase) diffParams.base = resolvedBase;
+            if (resolvedTarget) diffParams.target = resolvedTarget;
+            diffParams.includeUncommitted = resolvedIncludeUncommitted ?? false;
+          } else if (effScope === 'commits') {
+            diffParams.commits = resolvedCommits;
+          } else if (effScope === 'range') {
+            diffParams.range = debouncedRange.trim();
+          }
+          const diffRes = await rpc<ReviewScopeResult>(hostId, 'git.reviewScope', diffParams);
+          const parts: string[] = [];
+          let totalChars = 0;
+          let overBudget = false;
+          for (const f of diffRes.files ?? []) {
+            if (f.binary) {
+              const b = `=== [${f.status}] ${f.path} (binary file) ===\n`;
+              totalChars += b.length;
+              if (totalChars > PREFED_MAX_CHARS) {
+                overBudget = true;
+                break;
+              }
+              parts.push(b);
+              continue;
+            }
+            const d = f.diff ?? '';
+            if (!d.trim()) continue;
+            const block = `=== [${f.status}] ${f.path} ===\n${d.endsWith('\n') ? d : d + '\n'}`;
+            totalChars += block.length;
+            if (totalChars > PREFED_MAX_CHARS) {
+              overBudget = true;
+              break;
+            }
+            parts.push(block);
+          }
+          if (!overBudget && parts.length > 0) prefedDiff = parts.join('\n');
+        } catch {
+          prefedDiff = undefined;
+        }
+      }
+
+      const reviewPayload: ReviewSessionMeta = {
+        scope: effScope,
+        ...(effScope === 'uncommitted' ? { uncommittedFilter } : {}),
+        ...(resolvedBase ? { base: resolvedBase } : {}),
+        ...(effScope === 'branch' && resolvedTarget ? { target: resolvedTarget } : {}),
+        ...(resolvedIncludeUncommitted !== undefined ? { includeUncommitted: resolvedIncludeUncommitted } : {}),
+        ...(scopeRes?.mergeBase ?? branchMergeBase ? { mergeBase: (scopeRes?.mergeBase ?? branchMergeBase)! } : {}),
+        ...(scopeRes?.baseRev ? { baseRev: scopeRes.baseRev } : {}),
+        ...(scopeRes?.endRev ? { endRev: scopeRes.endRev } : {}),
+        ...(effScope === 'commits' ? { commits: resolvedCommits } : {}),
+        ...(scopeRes?.contiguous !== undefined ? { contiguous: scopeRes.contiguous } : {}),
+        ...(effScope === 'range' ? { rangeExpr: debouncedRange.trim() } : {}),
+        scopeLabel,
+        ...(incPaths ? { includedFiles: incPaths } : {}),
+        ...(excPaths ? { excludedFiles: excPaths } : {}),
+        ...(!legacyDaemon ? { totalFilesCount: scopeFiles.length } : {}),
+      };
+
       const created = await rpc<SessionInfo>(hostId, 'session.create', {
         tool,
         cwd,
         mode: 'structured',
         parentId: parentSessionId,
+        sideChat: true,
         permissionMode: perm,
-        title: `Review (${TOOL_LABEL[tool]})`,
+        title: tx('reviewSessionTitle', { tool: TOOL_LABEL[tool], scope: scopeLabel }),
+        review: reviewPayload,
       });
-      const resolvedBase = scopeRes?.base || base || branchBase;
-      const resolvedTarget = scopeRes?.target || target || headTarget;
-      const resolvedCommits = scopeRes?.commits?.length ? scopeRes.commits.map((c) => c.hash) : selectedCommits;
+
       setReviewMeta({
         sessionId: created.id,
         parentSessionId,
@@ -677,7 +795,7 @@ export function ReviewLaunchDialog({
         uncommittedFilter: effScope === 'uncommitted' ? uncommittedFilter : undefined,
         base: resolvedBase,
         target: effScope === 'branch' ? resolvedTarget : undefined,
-        includeUncommitted: effScope === 'branch' ? (scopeRes?.includeUncommitted ?? false) : undefined,
+        includeUncommitted: resolvedIncludeUncommitted,
         mergeBase: scopeRes?.mergeBase ?? branchMergeBase,
         baseRev: scopeRes?.baseRev ?? undefined,
         endRev: scopeRes?.endRev ?? undefined,
@@ -685,26 +803,32 @@ export function ReviewLaunchDialog({
         contiguous: scopeRes?.contiguous,
         rangeExpr: effScope === 'range' ? debouncedRange.trim() : undefined,
         scopeLabel,
+        includedFiles: incPaths,
+        excludedFiles: excPaths,
         includedFilesCount: legacyDaemon ? undefined : includedFiles.length,
         totalFilesCount: legacyDaemon ? undefined : scopeFiles.length,
         cwd,
       });
+      setActiveReviewId(hostId, parentSessionId, created.id);
+
       const prompt = buildReviewPrompt({
         scope: effScope,
         uncommittedFilter,
         base: resolvedBase,
         target: resolvedTarget,
-        includeUncommitted: legacyDaemon ? true : (scopeRes?.includeUncommitted ?? false),
+        includeUncommitted: resolvedIncludeUncommitted ?? true,
         mergeBase: scopeRes?.mergeBase ?? branchMergeBase,
         baseRev: scopeRes?.baseRev ?? undefined,
         endRev: scopeRes?.endRev ?? undefined,
         commits: resolvedCommits,
         contiguous: scopeRes?.contiguous,
         rangeExpr: debouncedRange.trim(),
-        includedFiles: legacyDaemon ? undefined : includedFiles.map((f) => f.path),
-        excludedFiles: legacyDaemon ? undefined : excludedFiles.map((f) => f.path),
+        includedFiles: incPaths,
+        excludedFiles: excPaths,
         focus,
         filesCount: effectiveFilesCount,
+        prefedDiff,
+        legacyDaemon,
         zh: !isEn(),
       });
       await rpc(hostId, 'session.send', { sessionId: created.id, text: prompt, queue: true });
@@ -1328,43 +1452,59 @@ export function ReviewLaunchDialog({
   );
 }
 
-export function ReviewPane({
+export function ReviewSidePane({
   hostId,
   reviewSessionId,
   parentSessionId,
   onOpenFile,
+  onDeleted,
 }: {
   hostId: string;
   reviewSessionId: string;
   parentSessionId: string;
-  onOpenFile: (relPath: string, line?: number) => void;
+  onOpenFile?: (relPath: string, line?: number) => void;
+  onDeleted?: () => void;
 }) {
   useLang();
+  useReviewStoreVersion();
   const key = skey(hostId, reviewSessionId);
   const data = useSessionData(key);
   const info = useStore((s) => s.sessions[hostId]?.find((x) => x.id === reviewSessionId));
-  const meta = getReviewMeta(reviewSessionId);
-  const [showRaw, setShowRaw] = useState(false);
-  const [selected, setSelected] = useState<Set<string> | null>(null);
+  const connected = useStore((s) => s.hosts.find((h) => h.config.id === hostId)?.status.status === 'connected');
+  const inMemMeta = getReviewMeta(reviewSessionId);
+  const meta = resolveReviewMeta(info, inMemMeta);
+
+  const [viewMode, setViewMode] = useState<'issues' | 'process'>('issues');
+  const [sevFilter, setSevFilter] = useState<'all' | ReviewSeverity>('all');
+  const [showDismissed, setShowDismissed] = useState(false);
+  const [focusedFinding, setFocusedFinding] = useState<ReviewIssue | null>(null);
 
   useEffect(() => {
-    loadSession(hostId, reviewSessionId).catch(() => {});
-  }, [hostId, reviewSessionId]);
+    if (connected) loadSession(hostId, reviewSessionId).catch(errorToast);
+  }, [hostId, reviewSessionId, connected, data.loaded]);
+
+  useEffect(() => {
+    setActiveReviewId(hostId, parentSessionId, reviewSessionId);
+  }, [hostId, parentSessionId, reviewSessionId]);
 
   useEffect(() => registerVisibleChildSession(hostId, reviewSessionId), [hostId, reviewSessionId]);
 
   const busy = info?.status === 'running' || info?.status === 'starting';
-  const tool: ToolKind = meta?.tool ?? info?.tool ?? 'claude';
+  const tool: ToolKind = inMemMeta?.tool ?? info?.tool ?? 'claude';
+  const effCwd = info?.cwd ?? inMemMeta?.cwd;
 
-  const latestText = useMemo(() => {
-    const streaming = [...data.live.values()].join('\n').trim();
-    if (streaming) return streaming;
-    for (let i = data.events.length - 1; i >= 0; i--) {
-      const e = data.events[i];
-      if (e.kind === 'assistant_text' && e.text.trim()) return e.text;
-    }
-    return '';
-  }, [data.events, data.live, data.version]);
+  const liveStream = useMemo(() => [...data.live.values()].join('\n').trim(), [data.live, data.version]);
+
+  const snapshot = useMemo(
+    () =>
+      extractReviewSnapshot(data.events, liveStream, busy, {
+        knownFiles: meta?.includedFiles,
+        cwd: effCwd,
+      }),
+    [data.events, data.events.length, liveStream, busy, meta?.includedFiles, effCwd],
+  );
+
+  const threads = useMemo(() => extractFindingThreads(data.events), [data.events, data.events.length]);
 
   const lastError = useMemo(() => {
     for (let i = data.events.length - 1; i >= 0; i--) {
@@ -1372,250 +1512,555 @@ export function ReviewPane({
       if (e.kind === 'error') return e.message;
     }
     return '';
-  }, [data.events]);
+  }, [data.events, data.events.length]);
 
-  const pendingPerm = useMemo(() => {
-    const resolved = new Set<string>();
+  const pending = useMemo(() => {
+    const open = new Map<string, Extract<HubEvent, { kind: 'permission_request' }>>();
     for (const e of data.events) {
-      if (e.kind === 'permission_resolved') resolved.add(e.requestId);
+      if (e.kind === 'permission_request') open.set(e.requestId, e);
+      if (e.kind === 'permission_resolved') open.delete(e.requestId);
     }
-    for (let i = data.events.length - 1; i >= 0; i--) {
-      const e = data.events[i];
-      if (e.kind === 'permission_request' && !resolved.has(e.requestId)) return e;
-    }
-    return null;
-  }, [data.events]);
+    return [...open.values()];
+  }, [data.events, data.events.length]);
 
-  const parsed = useMemo(() => (busy ? null : parseReviewIssues(latestText)), [busy, latestText]);
+  const openAsk = useMemo(() => openAsyncAsk(data.events), [data.events, data.events.length]);
 
-  // Auto-select high & medium severity findings once parsing completes
-  useEffect(() => {
-    if (!parsed) return;
-    setSelected((cur) => {
-      if (cur !== null) return cur;
-      return new Set(parsed.issues.filter((i) => i.severity !== 'low').map((i) => i.id));
-    });
-  }, [parsed]);
+  const answer = (requestId: string, optionId: string, answers?: QuestionAnswer[]) => {
+    rpc(hostId, 'session.permission', {
+      sessionId: reviewSessionId,
+      requestId,
+      optionId,
+      answers,
+    }).catch(errorToast);
+  };
 
-  const activeSelected = selected ?? new Set<string>();
-  const toggleIssue = (id: string) =>
-    setSelected((cur) => {
-      const next = new Set(cur ?? []);
-      if (next.has(id)) next.delete(id);
-      else next.add(id);
-      return next;
-    });
-
-  const sendBack = () => {
-    if (parsed && parsed.issues.length > 0) {
-      const chosen = parsed.issues.filter((i) => activeSelected.has(i.id));
-      if (!chosen.length) {
-        toast(tx('selectAtLeastOneFinding'));
-        return;
+  const sendAskReply = async (raw: string) => {
+    const body = raw.trim();
+    if (!body || !connected || !info) return;
+    try {
+      if (!info.title?.trim()) {
+        const autoTitle = deriveSideTitle(body);
+        if (autoTitle) rpc(hostId, 'session.rename', { sessionId: reviewSessionId, title: autoTitle }).catch(() => {});
       }
-      const lines = chosen.map((it, idx) => {
-        const loc = it.file ? ` (${it.file}${it.line ? `:${it.line}` : ''})` : '';
-        const sev = it.severity.toUpperCase();
-        const parts = [`${idx + 1}. [${sev}] ${it.title}${loc}`, `   ${it.summary}`];
-        if (it.suggestion) parts.push(`   ${isEn() ? 'Suggestion' : '建议'}: ${it.suggestion}`);
-        return parts.join('\n');
-      });
-      const header = tx('reviewSendBackHeader', { tool: TOOL_LABEL[tool], n: chosen.length });
-      window.dispatchEvent(
-        new CustomEvent(INSERT_COMPOSER, {
-          detail: { sessionId: parentSessionId, text: `${header}\n\n${lines.join('\n\n')}` },
-        }),
-      );
-      toast(tx('reviewInsertedToChat'));
-      return;
-    }
-    if (latestText.trim()) {
-      const header = tx('reviewSendBackRawHeader', { tool: TOOL_LABEL[tool] });
-      window.dispatchEvent(
-        new CustomEvent(INSERT_COMPOSER, {
-          detail: { sessionId: parentSessionId, text: `${header}\n\n${latestText.trim()}` },
-        }),
-      );
-      toast(tx('reviewInsertedToChat'));
+      await rpc(hostId, 'session.send', { sessionId: reviewSessionId, text: body });
+    } catch (err) {
+      errorToast(err);
     }
   };
 
   const stop = () => rpc(hostId, 'session.interrupt', { sessionId: reviewSessionId }).catch(errorToast);
-  const answerPerm = (decision: 'allow' | 'deny') => {
-    if (!pendingPerm) return;
-    rpc(hostId, 'session.respondPermission', {
-      sessionId: reviewSessionId,
-      requestId: pendingPerm.requestId,
-      decision,
-    }).catch(errorToast);
+
+  const rename = async () => {
+    if (!info) return;
+    const next = await askText({ title: tx('sideChatRenameTitle'), value: info.title || '' });
+    if (next == null) return;
+    rpc(hostId, 'session.rename', { sessionId: reviewSessionId, title: next.trim() }).catch(errorToast);
   };
 
-  const sevLabel = (s: ReviewIssue['severity']) => (s === 'high' ? tx('sevHigh') : s === 'medium' ? tx('sevMedium') : tx('sevLow'));
+  const remove = async () => {
+    if (!info) {
+      setActiveReviewId(hostId, parentSessionId, null);
+      onDeleted?.();
+      return;
+    }
+    const ok = await askConfirm({
+      title: tx('sideChatDelete'),
+      message: tx('sideChatDeleteConfirm', { title: sideChatTitle(info) }),
+      danger: true,
+    });
+    if (!ok) return;
+    try {
+      await rpc(hostId, 'session.delete', { sessionId: reviewSessionId });
+    } catch (err) {
+      errorToast(err);
+      return;
+    }
+    deleteReviewMeta(reviewSessionId);
+    setActiveReviewId(hostId, parentSessionId, null);
+    onDeleted?.();
+  };
 
-  return (
-    <div className="wp-review-pane">
-      <div className="wp-review-head">
-        <div className="wp-review-meta">
-          <ToolBadge tool={tool} size={15} />
-          <b>{TOOL_LABEL[tool]}</b>
-          <span className="wp-review-pill readonly">{tx('readonlyBadge')}</span>
-          {meta && (
-            <span className="muted small truncate">
-              {meta.scopeLabel ??
-                (meta.scope === 'branch' && meta.base ? tx('diffScopeBranchVs', { base: meta.base }) : tx('diffScopeUncommitted'))}
-              {meta.includedFilesCount != null && meta.totalFilesCount != null && meta.includedFilesCount < meta.totalFilesCount
-                ? ` (${meta.includedFilesCount}/${meta.totalFilesCount})`
-                : ''}
-            </span>
+  const disps = getAllDispositions(hostId, reviewSessionId);
+  const sevCounts = useMemo(() => {
+    let high = 0;
+    let medium = 0;
+    let low = 0;
+    let dismissed = 0;
+    let openHighMed = 0;
+    let openAll = 0;
+    for (const it of snapshot.issues) {
+      const d = disps[it.id] ?? 'open';
+      if (d === 'dismissed') dismissed += 1;
+      if (d !== 'dismissed') {
+        if (it.severity === 'high') high += 1;
+        else if (it.severity === 'medium') medium += 1;
+        else low += 1;
+      }
+      if (d === 'open') {
+        openAll += 1;
+        if (it.severity !== 'low') openHighMed += 1;
+      }
+    }
+    return { high, medium, low, active: high + medium + low, dismissed, openHighMed, openAll };
+  }, [snapshot.issues, disps]);
+
+  const visibleIssues = useMemo(
+    () =>
+      snapshot.issues.filter((it) => {
+        const d = disps[it.id] ?? 'open';
+        if (!showDismissed && d === 'dismissed') return false;
+        if (sevFilter !== 'all' && it.severity !== sevFilter) return false;
+        return true;
+      }),
+    [snapshot.issues, disps, showDismissed, sevFilter],
+  );
+
+  const sevLabel = (s: ReviewSeverity) => (s === 'high' ? tx('sevHigh') : s === 'medium' ? tx('sevMedium') : tx('sevLow'));
+
+  const batchCommitHash = meta?.scope === 'commits' && meta.commits?.length === 1 ? meta.commits[0] : undefined;
+
+  const adoptList = (list: ReviewIssue[]) => {
+    if (!list.length) return;
+    const count = adoptReviewFindings({
+      hostId,
+      reviewSessionId,
+      parentSessionId,
+      tool,
+      issues: list,
+      commitHash: batchCommitHash,
+    });
+    if (count > 0) toast(tx('reviewAdoptedToast', { n: count }));
+  };
+
+  const askAboutFinding = (it: ReviewIssue) => {
+    setFocusedFinding(it);
+    window.dispatchEvent(new CustomEvent(INSERT_COMPOSER, { detail: { sessionId: reviewSessionId, text: '' } }));
+  };
+
+  const jumpToDiff = (it: ReviewIssue) => {
+    if (!it.file || !onOpenFile) return;
+    onOpenFile(it.file, it.line);
+    emitFocusFinding({
+      hostId,
+      parentSessionId,
+      reviewSessionId,
+      findingId: it.id,
+      file: it.file,
+      line: it.line,
+    });
+  };
+
+  const headerTitle = info ? sideChatTitle(info) : tx('reviewSessionTitle', { tool: TOOL_LABEL[tool], scope: meta?.scopeLabel ?? '' });
+  const totalFilesCount = meta?.totalFilesCount ?? inMemMeta?.totalFilesCount;
+  const includedCount = meta?.includedFiles?.length ?? inMemMeta?.includedFilesCount;
+
+  if (!info && !inMemMeta) {
+    return (
+      <div className="wp-side-pane">
+        <div className="wp-side-empty">
+          <Icon name="sparkles" size={22} />
+          <div className="wp-side-empty-title">{tx('sideChatUnavailable')}</div>
+          {onDeleted && (
+            <button type="button" className="btn small" onClick={onDeleted}>
+              {tx('close')}
+            </button>
           )}
         </div>
-        <div className="wp-review-head-acts">
-          {busy ? (
+      </div>
+    );
+  }
+
+  const focusedFindingChip = focusedFinding ? (
+    <div className="wp-review-focus-chip">
+      <Icon name="sparkles" size={12} />
+      <span className="truncate">
+        {tx('reviewAskingFindingPrefix')}
+        {focusedFinding.file ? ` ${focusedFinding.file}${focusedFinding.line ? `:${focusedFinding.line}` : ''} · ` : ' '}
+        {focusedFinding.title}
+      </span>
+      <button type="button" className="icon-btn" onClick={() => setFocusedFinding(null)} title={tx('clear')}>
+        <Icon name="x" size={11} />
+      </button>
+    </div>
+  ) : null;
+
+  return (
+    <div className="wp-side-pane wp-review-pane">
+      <div className="wp-head wp-side-chat-head">
+        <div className="wp-side-head-left">
+          <ToolBadge tool={tool} size={15} />
+          <button
+            type="button"
+            className="wp-side-title truncate"
+            title={tx('sideChatRenameHint')}
+            onDoubleClick={rename}
+            onClick={rename}
+          >
+            {headerTitle}
+          </button>
+          <span className="wp-review-pill readonly" title={tx('reviewReadonlyNotice')}>
+            <Icon name="shield" size={11} />
+            {tx('readonlyBadge')}
+          </span>
+          {meta?.scopeLabel &&
+            (!headerTitle.includes(meta.scopeLabel) ||
+              (includedCount != null && totalFilesCount != null && includedCount < totalFilesCount)) && (
+              <span className="muted small truncate hide-mobile" title={meta.scopeLabel}>
+                {headerTitle.includes(meta.scopeLabel)
+                  ? `${includedCount}/${totalFilesCount}`
+                  : meta.scopeLabel +
+                    (includedCount != null && totalFilesCount != null && includedCount < totalFilesCount
+                      ? ` (${includedCount}/${totalFilesCount})`
+                      : '')}
+              </span>
+            )}
+        </div>
+        <div className="wp-side-head-acts">
+          {busy && (
             <button type="button" className="btn small" onClick={stop}>
               <Icon name="stop" size={12} /> {tx('stopReview')}
             </button>
-          ) : (
-            parsed && (
-              <button type="button" className="btn small" onClick={() => setShowRaw((v) => !v)}>
-                {showRaw ? tx('showStructuredFindings') : tx('showRawOutput')}
-              </button>
-            )
+          )}
+          {onDeleted && (
+            <button
+              type="button"
+              className="icon-btn"
+              title={tx('sideChatDelete')}
+              aria-label={tx('sideChatDelete')}
+              onClick={remove}
+            >
+              <Icon name="trash" size={14} />
+            </button>
           )}
         </div>
       </div>
 
-      {pendingPerm && (
-        <div className="wp-review-perm">
-          <div className="wp-review-perm-text">
-            <Icon name="shield" size={13} />
-            <span>{tx('reviewPermNeeded', { tool: pendingPerm.toolName })}</span>
-          </div>
-          <div className="row">
-            <button type="button" className="btn small" onClick={() => answerPerm('deny')}>
-              {tx('deny')}
-            </button>
-            <button type="button" className="btn small primary" onClick={() => answerPerm('allow')}>
-              {tx('allowOnce')}
-            </button>
-          </div>
+      <div className="wp-review-segbar">
+        <div className="wp-review-seg" role="tablist">
+          <button
+            type="button"
+            role="tab"
+            aria-selected={viewMode === 'issues'}
+            className={`wp-review-seg-btn ${viewMode === 'issues' ? 'active' : ''}`}
+            onClick={() => setViewMode('issues')}
+          >
+            <Icon name="sparkles" size={12} />
+            <span>{tx('reviewTabFindings')}</span>
+            {snapshot.hasStructuredBlock && <span className="wp-review-seg-cnt">{sevCounts.active}</span>}
+          </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={viewMode === 'process'}
+            className={`wp-review-seg-btn ${viewMode === 'process' ? 'active' : ''}`}
+            onClick={() => setViewMode('process')}
+          >
+            <Icon name="chat" size={12} />
+            <span>{tx('reviewTabProcess')}</span>
+            {busy && <span className="spinner mini" />}
+          </button>
         </div>
-      )}
-
-      <div className="wp-review-body">
-        {busy && !latestText ? (
-          <div className="wp-review-loading">
-            <span className="spinner" />
-            <span>{tx('reviewingWithTool', { tool: TOOL_LABEL[tool] })}</span>
-          </div>
-        ) : lastError && !latestText ? (
-          <div className="wp-review-error">{lastError}</div>
-        ) : parsed && !showRaw ? (
-          <div className="wp-review-results">
-            {parsed.prose && (
-              <div className="wp-review-prose">
-                <ChatMarkdown text={parsed.prose} />
-              </div>
-            )}
-            {parsed.issues.length === 0 ? (
-              <div className="wp-review-clean">
-                <Icon name="check" size={16} />
-                <span>{tx('reviewNoIssuesFound')}</span>
-              </div>
+        {snapshot.issues.length > 0 && (
+          <div className="wp-review-seg-right">
+            {sevCounts.openHighMed > 0 ? (
+              <button
+                type="button"
+                className="btn small primary"
+                onClick={() =>
+                  adoptList(
+                    snapshot.issues.filter((it) => (disps[it.id] ?? 'open') === 'open' && it.severity !== 'low'),
+                  )
+                }
+              >
+                <Icon name="check" size={12} />
+                {tx('reviewAdoptHighMed', { n: sevCounts.openHighMed })}
+              </button>
             ) : (
-              <>
-                <div className="wp-review-selbar">
-                  <span className="muted small">{tx('reviewFoundCount', { n: parsed.issues.length })}</span>
-                  <div className="row">
-                    <button
-                      type="button"
-                      className="wp-review-link"
-                      onClick={() => setSelected(new Set(parsed.issues.map((i) => i.id)))}
-                    >
-                      {tx('selectAll')}
-                    </button>
-                    <button
-                      type="button"
-                      className="wp-review-link"
-                      onClick={() => setSelected(new Set(parsed.issues.filter((i) => i.severity === 'high').map((i) => i.id)))}
-                    >
-                      {tx('selectHighOnly')}
-                    </button>
-                    <button type="button" className="wp-review-link" onClick={() => setSelected(new Set())}>
-                      {tx('clearSelection')}
-                    </button>
-                  </div>
-                </div>
-                <div className="wp-review-cards">
-                  {parsed.issues.map((it) => {
-                    const checked = activeSelected.has(it.id);
-                    return (
-                      <div key={it.id} className={`wp-review-card sev-${it.severity} ${checked ? 'checked' : ''}`}>
-                        <label className="wp-review-card-head">
-                          <input type="checkbox" checked={checked} onChange={() => toggleIssue(it.id)} />
-                          <span className={`wp-review-sev sev-${it.severity}`}>{sevLabel(it.severity)}</span>
-                          <span className="wp-review-card-title">{it.title}</span>
-                        </label>
-                        {it.file && (
-                          <button
-                            type="button"
-                            className="wp-review-loc mono"
-                            onClick={() => onOpenFile(it.file!, it.line)}
-                            title={tx('openInDiff')}
-                          >
-                            <Icon name="file" size={12} />
-                            <span>
-                              {it.file}
-                              {it.line ? `:${it.line}` : ''}
-                            </span>
-                          </button>
-                        )}
-                        {it.summary && <div className="wp-review-card-desc">{it.summary}</div>}
-                        {it.suggestion && (
-                          <div className="wp-review-card-sug">
-                            <b>{tx('reviewSuggestion')}: </b>
-                            {it.suggestion}
-                          </div>
-                        )}
-                      </div>
-                    );
-                  })}
-                </div>
-              </>
+              sevCounts.openAll > 0 && (
+                <button
+                  type="button"
+                  className="btn small primary"
+                  onClick={() => adoptList(snapshot.issues.filter((it) => (disps[it.id] ?? 'open') === 'open'))}
+                >
+                  <Icon name="check" size={12} />
+                  {tx('reviewAdoptAllOpen', { n: sevCounts.openAll })}
+                </button>
+              )
             )}
           </div>
-        ) : latestText ? (
-          <div className="wp-review-raw">
-            {busy && (
-              <div className="wp-review-streaming">
-                <span className="spinner mini" />
-                <span>{tx('reviewingWithTool', { tool: TOOL_LABEL[tool] })}</span>
-              </div>
-            )}
-            <ChatMarkdown text={latestText} streaming={busy} />
-          </div>
-        ) : (
-          <div className="wp-review-loading muted small">{tx('waitingForReviewOutput')}</div>
         )}
       </div>
 
-      {!busy && latestText && (
-        <div className="wp-review-foot">
-          <span className="muted small">
-            {parsed && parsed.issues.length > 0 ? tx('selectedFindingsCount', { n: activeSelected.size }) : ''}
-          </span>
-          <button
-            type="button"
-            className="btn primary small"
-            disabled={!!parsed && parsed.issues.length > 0 && activeSelected.size === 0}
-            onClick={sendBack}
-          >
-            <Icon name="send" size={12} />
-            {parsed && parsed.issues.length > 0
-              ? tx('sendFindingsToMainChat', { n: activeSelected.size })
-              : tx('sendReviewSummaryToMainChat')}
-          </button>
+      <div className="wp-side-body wp-review-body-wrap">
+        {viewMode === 'process' && info ? (
+          <ChatView
+            events={data.events}
+            live={data.live}
+            liveThinking={data.liveThinking}
+            info={info}
+            hostId={hostId}
+            onAnswer={answer}
+            hasMore={data.hasMore}
+            loadingOlder={data.loadingOlder}
+            loading={data.loading}
+            onLoadOlder={(targetSeq) => loadOlder(hostId, reviewSessionId, targetSeq).catch(errorToast)}
+            pendingOutside
+            onBringBack={(replyText) => bringSideChatToMain(hostId, parentSessionId, info, replyText)}
+          />
+        ) : (
+          <div className="wp-review-body">
+            {busy && (
+              <div className="wp-review-live-banner">
+                <span className="spinner mini" />
+                <span className="truncate">
+                  {info?.turn?.activity?.title
+                    ? `${info.turn.activity.name}: ${info.turn.activity.title}`
+                    : tx('reviewingWithTool', { tool: TOOL_LABEL[tool] })}
+                </span>
+                <button type="button" className="wp-review-link" onClick={() => setViewMode('process')}>
+                  {tx('reviewInspectProcess')}
+                </button>
+              </div>
+            )}
+
+            {lastError && !snapshot.latestText && <div className="wp-review-error">{lastError}</div>}
+
+            {!snapshot.hasStructuredBlock ? (
+              snapshot.prose || liveStream ? (
+                (() => {
+                  const rawText = liveStream || snapshot.prose;
+                  const jsonFenceIdx = busy ? rawText.search(/```(?:yi-review-json|json\s*\r?\n\s*\[)/i) : -1;
+                  const shownRaw = jsonFenceIdx >= 0 ? rawText.slice(0, jsonFenceIdx).trim() : rawText;
+                  return (
+                    <div className="wp-review-raw">
+                      {shownRaw && <ChatMarkdown text={shownRaw} streaming={busy} />}
+                      {jsonFenceIdx >= 0 && (
+                        <div className="wp-review-streaming">
+                          <span className="spinner mini" />
+                          <span>{tx('reviewParsingJsonLive')}</span>
+                        </div>
+                      )}
+                    </div>
+                  );
+                })()
+              ) : (
+                !busy && <div className="wp-review-loading muted small">{tx('waitingForReviewOutput')}</div>
+              )
+            ) : (
+              <div className="wp-review-results">
+                {snapshot.prose && (
+                  <div className="wp-review-prose">
+                    <ChatMarkdown text={snapshot.prose} />
+                  </div>
+                )}
+
+                {snapshot.issues.length === 0 ? (
+                  <div className="wp-review-clean">
+                    <Icon name="check" size={16} />
+                    <span>{tx('reviewNoIssuesFound')}</span>
+                  </div>
+                ) : (
+                  <>
+                    <div className="wp-review-filterbar">
+                      <div className="wp-review-sev-pills">
+                        <button
+                          type="button"
+                          className={`wp-review-chip ${sevFilter === 'all' ? 'active' : ''}`}
+                          onClick={() => setSevFilter('all')}
+                        >
+                          {tx('reviewFilterAll')} ({sevCounts.active})
+                        </button>
+                        {sevCounts.high > 0 && (
+                          <button
+                            type="button"
+                            className={`wp-review-chip sev-high ${sevFilter === 'high' ? 'active' : ''}`}
+                            onClick={() => setSevFilter('high')}
+                          >
+                            {tx('sevHigh')} ({sevCounts.high})
+                          </button>
+                        )}
+                        {sevCounts.medium > 0 && (
+                          <button
+                            type="button"
+                            className={`wp-review-chip sev-medium ${sevFilter === 'medium' ? 'active' : ''}`}
+                            onClick={() => setSevFilter('medium')}
+                          >
+                            {tx('sevMedium')} ({sevCounts.medium})
+                          </button>
+                        )}
+                        {sevCounts.low > 0 && (
+                          <button
+                            type="button"
+                            className={`wp-review-chip sev-low ${sevFilter === 'low' ? 'active' : ''}`}
+                            onClick={() => setSevFilter('low')}
+                          >
+                            {tx('sevLow')} ({sevCounts.low})
+                          </button>
+                        )}
+                      </div>
+                      {sevCounts.dismissed > 0 && (
+                        <button
+                          type="button"
+                          className="wp-review-link"
+                          onClick={() => setShowDismissed((v) => !v)}
+                        >
+                          {showDismissed
+                            ? tx('reviewHideDismissed')
+                            : tx('reviewShowDismissed', { n: sevCounts.dismissed })}
+                        </button>
+                      )}
+                    </div>
+
+                    <div className="wp-review-cards">
+                      {visibleIssues.map((it) => {
+                        const disp = getFindingDisposition(hostId, reviewSessionId, it.id);
+                        const threadCount = threads.get(it.id)?.length ?? 0;
+                        return (
+                          <div
+                            key={it.id}
+                            className={`wp-review-card sev-${it.severity} disp-${disp} ${focusedFinding?.id === it.id ? 'focused' : ''}`}
+                          >
+                            <div className="wp-review-card-head">
+                              <span className={`wp-review-sev sev-${it.severity}`}>{sevLabel(it.severity)}</span>
+                              <span className="wp-review-card-title">{it.title}</span>
+                              {disp !== 'open' && (
+                                <span className={`wp-review-disp disp-${disp}`}>
+                                  {disp === 'adopted' ? tx('reviewStatusAdopted') : tx('reviewStatusDismissed')}
+                                </span>
+                              )}
+                            </div>
+                            {it.file && (
+                              <button
+                                type="button"
+                                className="wp-review-loc mono"
+                                onClick={() => jumpToDiff(it)}
+                                title={tx('openInDiff')}
+                              >
+                                <Icon name="file" size={12} />
+                                <span>
+                                  {it.file}
+                                  {it.line ? `:${it.line}` : ''}
+                                </span>
+                              </button>
+                            )}
+                            {it.summary && <div className="wp-review-card-desc">{it.summary}</div>}
+                            {it.suggestion && (
+                              <div className="wp-review-card-sug">
+                                <b>{tx('reviewSuggestion')}: </b>
+                                {it.suggestion}
+                              </div>
+                            )}
+                            <div className="wp-review-card-acts">
+                              {it.file && onOpenFile && (
+                                <button type="button" className="wp-review-act-btn" onClick={() => jumpToDiff(it)}>
+                                  <Icon name="diff" size={12} />
+                                  <span>{tx('reviewOpenDiffBtn')}</span>
+                                </button>
+                              )}
+                              <button type="button" className="wp-review-act-btn" onClick={() => askAboutFinding(it)}>
+                                <Icon name="chat" size={12} />
+                                <span>{tx('reviewAskThisBtn')}</span>
+                                {threadCount > 0 && <span className="wp-review-act-cnt">{threadCount}</span>}
+                              </button>
+                              {disp === 'adopted' ? (
+                                <button
+                                  type="button"
+                                  className="wp-review-act-btn active"
+                                  onClick={() =>
+                                    unadoptReviewFinding({
+                                      hostId,
+                                      reviewSessionId,
+                                      parentSessionId,
+                                      findingId: it.id,
+                                    })
+                                  }
+                                >
+                                  <Icon name="check" size={12} />
+                                  <span>{tx('reviewUnadoptBtn')}</span>
+                                </button>
+                              ) : (
+                                <button type="button" className="wp-review-act-btn primary" onClick={() => adoptList([it])}>
+                                  <Icon name="plus" size={12} />
+                                  <span>{tx('reviewAdoptBtn')}</span>
+                                </button>
+                              )}
+                              {disp === 'dismissed' ? (
+                                <button
+                                  type="button"
+                                  className="wp-review-act-btn"
+                                  onClick={() => setFindingDisposition(hostId, reviewSessionId, it.id, 'open')}
+                                >
+                                  <span>{tx('reviewRestoreBtn')}</span>
+                                </button>
+                              ) : (
+                                <button
+                                  type="button"
+                                  className="wp-review-act-btn muted"
+                                  onClick={() => {
+                                    if (disp === 'adopted') {
+                                      removeReviewContextRef(parentSessionId, reviewSessionId, it.id);
+                                    }
+                                    setFindingDisposition(hostId, reviewSessionId, it.id, 'dismissed');
+                                  }}
+                                >
+                                  <span>{tx('reviewDismissBtn')}</span>
+                                </button>
+                              )}
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </>
+                )}
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+
+      {(pending.length > 0 || openAsk) && (
+        <div className="wp-side-perms">
+          {pending.map((p) => (
+            <PermissionCard key={p.requestId} it={{ ...p, input: p.input }} onAnswer={answer} compact />
+          ))}
+          {openAsk && (
+            <AsyncAskCard key={openAsk.id} ask={openAsk} tool={tool} compact onSend={sendAskReply} onSkip={() => {}} />
+          )}
+        </div>
+      )}
+
+      {info && (
+        <div className="composer-wrap wp-side-composer">
+          <Composer
+            hostId={hostId}
+            info={info}
+            connected={connected}
+            onInterrupt={stop}
+            onRename={rename}
+            placeholder={tx('reviewFollowUpPlaceholder')}
+            compact
+            topSlot={focusedFindingChip}
+            transformSend={(txt) =>
+              focusedFinding
+                ? formatFindingFollowUp(
+                    {
+                      findingId: focusedFinding.id,
+                      file: focusedFinding.file,
+                      line: focusedFinding.line,
+                      title: focusedFinding.title,
+                    },
+                    txt,
+                  )
+                : txt
+            }
+            onAfterSend={() => setFocusedFinding(null)}
+          />
+          <StatusLine hostId={hostId} info={info} events={data.events} compact />
         </div>
       )}
     </div>
   );
 }
+
+export const ReviewPane = ReviewSidePane;

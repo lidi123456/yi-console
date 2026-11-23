@@ -16464,7 +16464,11 @@ button.wp-commit-title .chev {
   font-size: 12.5px;
 }
 .wp-review-pill.readonly {
-  padding: 1px 6px;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  flex: none;
+  padding: 1px 7px;
   border-radius: 999px;
   background: color-mix(in srgb, var(--ok) 12%, transparent);
   color: var(--ok);
@@ -16567,7 +16571,7 @@ button.wp-commit-title .chev {
   display: flex;
   align-items: center;
   gap: 7px;
-  cursor: pointer;
+  min-width: 0;
 }
 .wp-review-sev {
   flex: none;
@@ -17031,4 +17035,536 @@ button.wp-commit-title .chev {
 }
 .cref-chip.side .cref-name {
   color: var(--text);
+}
+.cref-chip.review.ai-review {
+  border-color: color-mix(in srgb, var(--link) 32%, transparent);
+  background: color-mix(in srgb, var(--link) 8%, var(--bg-2));
+  color: var(--link);
+}
+.cref-chip.review.ai-review .cref-name {
+  color: var(--text);
+}
+
+/* Composer locked read-only chip & finding follow-up pill in user bubbles */
+.tool-chip.readonly-lock {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 24px;
+  padding: 0 7px;
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--ok) 12%, transparent);
+  color: var(--ok);
+  font-size: 11px;
+  font-weight: 500;
+  cursor: default;
+  user-select: none;
+}
+.tool-chip.readonly-lock:hover {
+  background: color-mix(in srgb, var(--ok) 12%, transparent);
+  color: var(--ok);
+}
+.msg-review-ref {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  padding: 3px 9px;
+  margin-bottom: 5px;
+  border-radius: 7px;
+  border: 1px solid color-mix(in srgb, var(--link) 28%, transparent);
+  background: color-mix(in srgb, var(--link) 8%, var(--bg-2));
+  color: var(--link);
+  font-size: 11.5px;
+}
+.msg-review-ref-loc {
+  color: var(--text);
+  font-weight: 500;
+  flex: none;
+}
+
+/* Unified Review Side Pane (ReviewSidePane) */
+.wp-review-segbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 12px;
+  border-bottom: 1px solid var(--border);
+  background: var(--panel);
+  flex: none;
+}
+.wp-review-seg {
+  display: inline-flex;
+  padding: 2px;
+  border-radius: 8px;
+  background: var(--bg-3);
+  border: 1px solid var(--border);
+  gap: 2px;
+}
+.wp-review-seg-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 10px;
+  border-radius: 6px;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-2);
+}
+.wp-review-seg-btn:hover {
+  color: var(--text);
+}
+.wp-review-seg-btn.active {
+  background: var(--panel);
+  color: var(--text);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.08);
+}
+.wp-review-seg-cnt {
+  padding: 0 5px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--link) 14%, transparent);
+  color: var(--link);
+  font-size: 10.5px;
+  line-height: 15px;
+  font-weight: 600;
+}
+.wp-review-seg-right {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.wp-review-body-wrap {
+  display: flex;
+  flex-direction: column;
+}
+.wp-review-live-banner {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 7px 10px;
+  margin-bottom: 10px;
+  border-radius: 7px;
+  border: 1px solid color-mix(in srgb, var(--link) 25%, transparent);
+  background: color-mix(in srgb, var(--link) 8%, var(--bg-2));
+  color: var(--text-2);
+  font-size: 12px;
+}
+.wp-review-live-banner .wp-review-link {
+  margin-left: auto;
+  flex: none;
+}
+.wp-review-filterbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.wp-review-sev-pills {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+.wp-review-disp {
+  margin-left: auto;
+  flex: none;
+  padding: 1px 6px;
+  border-radius: 999px;
+  font-size: 10.5px;
+  font-weight: 600;
+}
+.wp-review-disp.disp-adopted {
+  background: color-mix(in srgb, var(--ok) 14%, transparent);
+  color: var(--ok);
+}
+.wp-review-disp.disp-dismissed {
+  background: var(--bg-3);
+  color: var(--text-3);
+}
+.wp-review-card.disp-adopted {
+  border-color: color-mix(in srgb, var(--ok) 35%, var(--border));
+}
+.wp-review-card.disp-dismissed {
+  opacity: 0.62;
+}
+.wp-review-card.focused {
+  border-color: var(--link);
+  box-shadow: 0 0 0 2px var(--focus);
+}
+.wp-review-card-acts {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 5px;
+  padding-top: 2px;
+}
+.wp-review-act-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 8px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--text-2);
+  font-size: 11.5px;
+  font-weight: 500;
+}
+.wp-review-act-btn:hover {
+  border-color: var(--border-2);
+  color: var(--text);
+}
+.wp-review-act-btn.primary {
+  border-color: color-mix(in srgb, var(--link) 36%, transparent);
+  background: color-mix(in srgb, var(--link) 10%, var(--panel));
+  color: var(--link);
+}
+.wp-review-act-btn.primary:hover {
+  background: color-mix(in srgb, var(--link) 18%, var(--panel));
+}
+.wp-review-act-btn.active {
+  border-color: color-mix(in srgb, var(--ok) 40%, transparent);
+  background: color-mix(in srgb, var(--ok) 12%, var(--panel));
+  color: var(--ok);
+}
+.wp-review-act-btn.muted {
+  color: var(--text-3);
+}
+.wp-review-act-cnt {
+  padding: 0 4px;
+  border-radius: 999px;
+  background: var(--bg-3);
+  color: var(--text-2);
+  font-size: 10.5px;
+  line-height: 15px;
+}
+.wp-review-focus-chip {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px;
+  margin-bottom: 5px;
+  border-radius: 7px;
+  border: 1px solid color-mix(in srgb, var(--link) 30%, transparent);
+  background: color-mix(in srgb, var(--link) 9%, var(--bg-2));
+  color: var(--link);
+  font-size: 11.5px;
+}
+.wp-review-focus-chip .truncate {
+  flex: 1;
+  color: var(--text);
+}
+
+/* Changes sidebar AI review summary bar & per-file badges */
+.wp-review-ov-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  padding: 6px 8px;
+  margin: 4px 6px 6px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--bg-2);
+}
+.wp-review-ov-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  text-align: left;
+  font-size: 11.5px;
+  color: var(--text-2);
+}
+.wp-review-ov-main:hover {
+  color: var(--text);
+}
+.wp-review-ov-stat,
+.wp-review-ov-counts {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+}
+.wp-review-ov-clean {
+  color: var(--ok);
+  font-size: 11.5px;
+  font-weight: 500;
+}
+.wp-review-ov-acts {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  flex: none;
+}
+.wp-row-rev-badge {
+  flex: none;
+  min-width: 17px;
+  height: 16px;
+  padding: 0 5px;
+  border-radius: 999px;
+  font-size: 10.5px;
+  font-weight: 600;
+  line-height: 16px;
+  text-align: center;
+  margin-right: 4px;
+}
+.wp-row-rev-badge.sev-high {
+  background: var(--err-soft);
+  color: var(--err);
+}
+.wp-row-rev-badge.sev-medium {
+  background: var(--warn-soft);
+  color: var(--warn);
+}
+.wp-row-rev-badge.sev-low {
+  background: var(--bg-3);
+  color: var(--text-2);
+}
+.wp-row-rev-badge.done {
+  opacity: 0.55;
+}
+.wp-row-rev-clean {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  color: var(--ok);
+  opacity: 0.78;
+  margin-right: 4px;
+}
+
+/* Diff header ribbon & CM6 inline AI review card (Proposal 4) */
+.wp-diff-review-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 5px 8px;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border);
+  background: color-mix(in srgb, var(--link) 6%, var(--bg-2));
+  flex: none;
+}
+.wp-diff-review-left {
+  display: flex;
+  align-items: center;
+  flex: 1 1 auto;
+  gap: 6px;
+  min-width: 0;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text);
+}
+.wp-diff-review-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.wp-diff-review-open {
+  padding: 0 6px;
+  border-radius: 999px;
+  background: var(--warn-soft);
+  color: var(--warn);
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 17px;
+}
+.wp-diff-review-acts {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  margin-left: auto;
+}
+.cm-review-widget-slot {
+  position: sticky;
+  left: var(--cm-gutter-w, 0px);
+  width: var(--cm-rev-w, 100%);
+  max-width: 100%;
+  box-sizing: border-box;
+  padding: 6px 12px 8px 10px;
+  white-space: normal;
+  font-family: var(--font);
+  user-select: text;
+}
+.wp-inline-rev {
+  width: 100%;
+  max-width: 760px;
+  box-sizing: border-box;
+  border-radius: 9px;
+  border: 1px solid var(--border);
+  border-left-width: 3px;
+  background: var(--panel);
+  padding: 9px 11px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.06);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-family: var(--font);
+}
+.wp-inline-rev.sev-high {
+  border-left-color: var(--err);
+}
+.wp-inline-rev.sev-medium {
+  border-left-color: var(--warn);
+}
+.wp-inline-rev.sev-low {
+  border-left-color: var(--border-2);
+}
+.wp-inline-rev.disp-adopted {
+  border-color: color-mix(in srgb, var(--ok) 35%, var(--border));
+  border-left-color: var(--ok);
+}
+.wp-inline-rev.disp-dismissed {
+  opacity: 0.65;
+}
+.wp-inline-rev.highlighted {
+  box-shadow: 0 0 0 2px var(--focus), 0 4px 14px rgba(0, 0, 0, 0.12);
+}
+.wp-inline-rev-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.wp-inline-rev-tool {
+  display: inline-flex;
+  align-items: center;
+  flex: none;
+}
+.wp-inline-rev-title {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.wp-inline-rev-head .wp-review-disp {
+  margin-left: 0;
+  flex: none;
+  white-space: nowrap;
+}
+.wp-inline-rev-line {
+  font-size: 11px;
+  color: var(--text-3);
+  flex: none;
+}
+.wp-inline-rev-collapse {
+  margin-left: auto;
+  flex: none;
+}
+.wp-inline-rev-desc {
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--text);
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+.wp-inline-rev-sug {
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--text-2);
+  padding: 6px 8px;
+  border-radius: 6px;
+  background: var(--bg-2);
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+.wp-inline-rev-acts {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 5px;
+}
+.wp-inline-rev-acts .ml-auto {
+  margin-left: auto;
+}
+.wp-inline-rev-drawer {
+  margin-top: 2px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.wp-inline-rev-thread {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 260px;
+  overflow: auto;
+}
+.wp-inline-rev-msg.user {
+  align-self: flex-end;
+  max-width: 88%;
+}
+.wp-inline-rev-user {
+  padding: 5px 9px;
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--link) 13%, var(--bg-2));
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+.wp-inline-rev-ai {
+  padding: 6px 9px;
+  border-radius: 8px;
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  font-size: 12.5px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+.wp-inline-rev-streaming {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-2);
+  font-size: 11.5px;
+  margin-bottom: 4px;
+}
+.wp-inline-rev-perms {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.wp-inline-rev-input-row {
+  display: flex;
+  align-items: flex-end;
+  gap: 6px;
+}
+.wp-inline-rev-input-row textarea {
+  flex: 1;
+  min-width: 0;
+  min-height: 30px;
+  max-height: 110px;
+  resize: vertical;
+  padding: 5px 8px;
+  border-radius: 7px;
+  border: 1px solid var(--border-2);
+  background: var(--bg-2);
+  color: var(--text);
+  font-family: var(--font);
+  font-size: 12px;
+  line-height: 1.45;
+}
+.wp-inline-rev-input-row textarea:focus {
+  outline: none;
+  border-color: var(--link);
+  box-shadow: 0 0 0 2px var(--focus);
+}
+@media (max-width: 760px) {
+  .cm-review-widget-slot {
+    padding: 5px 8px;
+  }
 }

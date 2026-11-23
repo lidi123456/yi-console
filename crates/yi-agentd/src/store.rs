@@ -449,6 +449,7 @@ mod tests {
             account_id: None,
             account_label: None,
             checkpoints: vec![],
+            review: None,
             queued: vec![],
             queue_paused: None,
             restart_interrupted: false,

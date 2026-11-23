@@ -70,6 +70,25 @@ pub fn build_args(spec: &StartSpec) -> Vec<String> {
     if crate::session_mcp::has_in_args(&spec.extra_args) {
         allow_tools(&mut a, "mcp__yi_session__*");
     }
+    if crate::review_mcp::has_in_args(&spec.extra_args) {
+        allow_tools(&mut a, "mcp__yi_review__*");
+    }
+    if spec.read_only_review {
+        for rule in [
+            "Read",
+            "Grep",
+            "Glob",
+            "LS",
+            "Bash(git diff:*)",
+            "Bash(git show:*)",
+            "Bash(git status:*)",
+            "Bash(git log:*)",
+            "Bash(git blame:*)",
+            "Bash(git grep:*)",
+        ] {
+            allow_tools(&mut a, rule);
+        }
+    }
     // Client MCP tools (a Bot's own tools) are answered by the desktop app, which does its own checks
     for name in &spec.allow_mcp {
         allow_tools(&mut a, &format!("mcp__{name}__*"));
@@ -177,6 +196,8 @@ struct State {
     tasks: Vec<BackgroundTask>,
     /// Last rate_limit_event said rejected: (resets at ms, limit type). Reported when the turn fails
     rejected: Option<(Option<i64>, Option<String>)>,
+    /// Strictly read-only code review side chat guard
+    read_only_review: bool,
 }
 
 pub async fn run(mut spec: StartSpec, em: Emitter, mut rx: mpsc::UnboundedReceiver<AdapterCmd>) {
@@ -189,6 +210,7 @@ pub async fn run(mut spec: StartSpec, em: Emitter, mut rx: mpsc::UnboundedReceiv
         };
         let mut st = State {
             queue: std::mem::take(&mut carry_queue),
+            read_only_review: spec.read_only_review,
             ..Default::default()
         };
         if !st.queue.is_empty() {
@@ -523,6 +545,22 @@ fn handle(st: &mut State, v: &Value, em: &Emitter) -> Vec<Value> {
                 "can_use_tool" => {
                     let name = req["tool_name"].as_str().unwrap_or("tool").to_string();
                     let input = req["input"].clone();
+                    if st.read_only_review {
+                        let desc = req["description"].as_str().unwrap_or("");
+                        match super::review_guard::classify_review_action(&name, None, desc, &input) {
+                            super::review_guard::ReviewGuardDecision::Allow => {
+                                out.push(json!({"type":"control_response","response":{
+                                    "subtype":"success","request_id":rid,"response":{"behavior":"allow","updatedInput":input}}}));
+                                return out;
+                            }
+                            super::review_guard::ReviewGuardDecision::Deny(msg) => {
+                                out.push(json!({"type":"control_response","response":{
+                                    "subtype":"success","request_id":rid,"response":{"behavior":"deny","message":msg}}}));
+                                return out;
+                            }
+                            super::review_guard::ReviewGuardDecision::Ask => {}
+                        }
+                    }
                     let suggestions = req["permission_suggestions"].clone();
                     let mut options = vec![PermissionOption {
                         id: "allow_once".into(),
@@ -1005,6 +1043,7 @@ mod tests {
             account_handoff: None,
             fork_session: false,
             fork_fallback_handoff: None,
+            read_only_review: false,
         };
         let args_home = build_args(&mk(home.clone(), Some("/tmp/acc1".into())));
         assert!(args_home.windows(2).any(|w| w == ["--setting-sources", "user"]));
@@ -1018,6 +1057,47 @@ mod tests {
         let args_fork = build_args(&forked);
         assert!(args_fork.windows(3).any(|w| w == ["--resume", "parent-uuid-1", "--fork-session"]));
         assert!(args_fork.iter().any(|a| a.contains("mcp__yi_session__*")));
+
+        let mut rev = mk(std::env::temp_dir(), None);
+        rev.read_only_review = true;
+        rev.extra_args = vec!["--mcp-config".into(), "{\"mcpServers\":{\"yi_review\":{}}}".into()];
+        let args_rev = build_args(&rev);
+        assert!(args_rev.iter().any(|a| a.contains("mcp__yi_review__*")));
+        assert!(args_rev.iter().any(|a| a.contains("Bash(git diff:*)")));
+    }
+
+    #[test]
+    fn read_only_review_guard_in_claude_adapter() {
+        let (hub, em, _rx) = crate::hub::test_emitter();
+        let mut st = State { read_only_review: true, ..Default::default() };
+        let read_req = json!({
+            "type": "control_request",
+            "request_id": "r1",
+            "request": { "subtype": "can_use_tool", "tool_name": "Bash", "input": { "command": "git diff HEAD" } }
+        });
+        let out_read = handle(&mut st, &read_req, &em);
+        assert_eq!(out_read[0]["response"]["response"]["behavior"], "allow");
+        assert!(st.perms.is_empty());
+
+        let write_req = json!({
+            "type": "control_request",
+            "request_id": "r2",
+            "request": { "subtype": "can_use_tool", "tool_name": "Edit", "input": { "file_path": "a.rs" } }
+        });
+        let out_write = handle(&mut st, &write_req, &em);
+        assert_eq!(out_write[0]["response"]["response"]["behavior"], "deny");
+        assert!(st.perms.is_empty());
+
+        let ask_req = json!({
+            "type": "control_request",
+            "request_id": "r3",
+            "request": { "subtype": "can_use_tool", "tool_name": "Bash", "input": { "command": "cargo test" } }
+        });
+        let out_ask = handle(&mut st, &ask_req, &em);
+        assert!(out_ask.is_empty());
+        assert!(st.perms.contains_key("r3"));
+        let evs = hub.store.events_since("s", 0, 20).unwrap();
+        assert_eq!(evs.len(), 1);
     }
 }
 

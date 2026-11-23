@@ -35,7 +35,7 @@ fn git_cmd(cwd: &Path, args: &[&str]) -> Command {
     cmd
 }
 
-fn git(cwd: &Path, args: &[&str]) -> Result<std::process::Output> {
+pub(crate) fn git(cwd: &Path, args: &[&str]) -> Result<std::process::Output> {
     git_cmd(cwd, args)
         .stdin(Stdio::null())
         .output()
@@ -104,7 +104,7 @@ pub fn is_valid_checkpoint_ref(rev: &str) -> bool {
     ok_seg(sid) && ok_seg(name)
 }
 
-fn git_ok(cwd: &Path, args: &[&str]) -> Result<String> {
+pub(crate) fn git_ok(cwd: &Path, args: &[&str]) -> Result<String> {
     let out = git(cwd, args)?;
     if !out.status.success() {
         bail!("{}", String::from_utf8_lossy(&out.stderr).trim());
@@ -113,14 +113,14 @@ fn git_ok(cwd: &Path, args: &[&str]) -> Result<String> {
 }
 
 /// Repository root; None if not a git repo
-fn repo_root(cwd: &Path) -> Option<std::path::PathBuf> {
+pub(crate) fn repo_root(cwd: &Path) -> Option<std::path::PathBuf> {
     git_ok(cwd, &["rev-parse", "--show-toplevel"])
         .ok()
         .map(|s| std::path::PathBuf::from(s.trim()))
 }
 
 /// Paths must stay inside the repo, so things like ../ can't escape it
-fn check_paths(paths: &[String]) -> Result<()> {
+pub(crate) fn check_paths(paths: &[String]) -> Result<()> {
     for p in paths {
         if p.is_empty() || p.starts_with('-') || Path::new(p).is_absolute() || p.split(['/', '\\']).any(|c| c == "..") {
             bail!("路径无效: {p}");
@@ -987,7 +987,7 @@ pub fn branch_diff(cwd: &str, base: Option<&str>, with_diff: bool, only: Option<
     }))
 }
 
-fn is_safe_ref_token(s: &str) -> bool {
+pub(crate) fn is_safe_ref_token(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 200
         && !s.starts_with('-')

@@ -189,6 +189,14 @@ where
                     (Ok(sid), Ok(ticket)) => hub.session_mcp.proxy_call(&hub, sid, ticket, p["packet"].clone(), peer_pid).await,
                     (Err(e), _) | (_, Err(e)) => Err(e),
                 }
+            } else if req.method == methods::REVIEW_MCP && !local {
+                Err(anyhow!("代码审阅代理只接受本机连接"))
+            } else if req.method == methods::REVIEW_MCP {
+                let p = &req.params;
+                match (s(p, "sessionId"), s(p, "ticket")) {
+                    (Ok(sid), Ok(ticket)) => hub.review_mcp.proxy_call(&hub, sid, ticket, p["packet"].clone(), peer_pid).await,
+                    (Err(e), _) | (_, Err(e)) => Err(e),
+                }
             } else if local
                 && matches!(
                     req.method.as_str(),

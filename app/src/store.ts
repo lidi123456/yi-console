@@ -724,7 +724,7 @@ function resolveChildSession(
   if (hostList && !hostList.some((x) => x.id === parentId)) {
     return { view: { kind: 'session', hostId, sessionId } };
   }
-  const isSide = info ? !!info.sideChat : !!hint?.sideChat;
+  const isSide = info ? !!(info.sideChat || info.review) : !!hint?.sideChat;
   if (isSide) {
     return {
       view: { kind: 'session', hostId, sessionId: parentId },
@@ -1113,12 +1113,13 @@ function onNotification(hostId: string, method: string, p: any) {
       const v = state.view;
       const sess = sessionInfo(hostId, p.sessionId);
       const parentId = sess?.parentId ?? (typeof p.parentId === 'string' && p.parentId ? p.parentId : undefined);
-      const sideChat = !!(sess?.sideChat ?? p.sideChat);
+      const isReview = !!(sess?.review ?? p.review);
+      const sideChat = !!(sess?.sideChat ?? p.sideChat ?? isReview);
+      const viewingParent = v.kind === 'session' && v.hostId === hostId && !!parentId && v.sessionId === parentId;
       const viewing =
         v.kind === 'session' &&
         v.hostId === hostId &&
-        (v.sessionId === p.sessionId ||
-          (!!parentId && v.sessionId === parentId && isChildSessionVisible(hostId, p.sessionId)));
+        (v.sessionId === p.sessionId || (viewingParent && isChildSessionVisible(hostId, p.sessionId)));
       // A window behind others (covered, minimized) also counts as not watching, hence hasFocus rather than just hidden
       const away = document.hidden || !document.hasFocus() || !viewing;
       const want = p.kind === 'permission' ? prefs.onPermission : prefs.onTurnEnd;
@@ -1146,8 +1147,8 @@ function onNotification(hostId: string, method: string, p: any) {
         ...(sideChat ? { sideChat: true } : {}),
       };
       if (prefs.enabled && want && (prefs.when === 'always' || away)) systemNotify(title, body, target);
-      // In-app toast: remind the user when they're in another session
-      if (!viewing) {
+      // In-app toast: remind the user when they're in another session (review side chats stay quiet while viewing their parent session)
+      if (!viewing && !(isReview && viewingParent)) {
         toast(title, 'info', {
           label: t('view'),
           run: () => openSessionTarget(target),

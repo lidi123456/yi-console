@@ -272,6 +272,45 @@ pub struct SessionInfo {
     /// Per-turn hidden git checkpoints (`refs/yi/checkpoints/<sid>/...`) captured around structured turns
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub checkpoints: Vec<TurnCheckpoint>,
+    /// Metadata for a read-only cross-tool AI code review side chat
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review: Option<ReviewMeta>,
+}
+
+/// Scope and filter metadata attached to a read-only AI code review side chat
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewMeta {
+    /// uncommitted | branch | commits | range
+    pub scope: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uncommitted_filter: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub include_uncommitted: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merge_base: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_rev: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_rev: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub commits: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contiguous: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub range_expr: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub included_files: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub excluded_files: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_files_count: Option<u32>,
 }
 
 /// One structured turn's hidden git checkpoint pair (pre-turn base and post-turn end when files changed)
@@ -1609,6 +1648,8 @@ pub mod methods {
     pub const MEMORY_MCP: &str = "memory.mcp";
     /// Private, locally authenticated `yi_session` read-only MCP proxy traffic; remote peers cannot invoke it
     pub const SESSION_MCP: &str = "session.mcp";
+    /// Private, locally authenticated `yi_review` MCP proxy traffic; remote peers cannot invoke it.
+    pub const REVIEW_MCP: &str = "review.mcp";
 
     // Notifications
     pub const EV_SESSION_EVENT: &str = "session.event";

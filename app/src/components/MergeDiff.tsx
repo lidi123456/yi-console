@@ -1,8 +1,11 @@
-import { forwardRef, useEffect, useImperativeHandle, useRef, useState } from 'react';
+import { forwardRef, type ReactNode, useEffect, useImperativeHandle, useMemo, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { useBack } from '../back';
-import { ChangeSet, Compartment, EditorState, Text, type Extension } from '@codemirror/state';
+import { ChangeSet, Compartment, EditorState, StateEffect, StateField, Text, type Extension } from '@codemirror/state';
 import {
   crosshairCursor,
+  Decoration,
+  type DecorationSet,
   drawSelection,
   EditorView,
   gutter,
@@ -13,6 +16,7 @@ import {
   keymap,
   lineNumbers,
   rectangularSelection,
+  WidgetType,
 } from '@codemirror/view';
 import { closeBrackets, closeBracketsKeymap } from '@codemirror/autocomplete';
 import { defaultKeymap, history, historyKeymap, indentWithTab } from '@codemirror/commands';
@@ -49,6 +53,98 @@ const tx = getT('filePanel');
 const DIFF_CONFIG = { scanLimit: 500, timeout: 1000 };
 const COLLAPSE = { margin: 3, minSize: 4 };
 const CTX_LINES = 3;
+
+export interface InlineReviewPlacement {
+  id: string;
+  line: number;
+}
+
+class ReviewSlotWidget extends WidgetType {
+  readonly id: string;
+  readonly line: number;
+  private readonly mount: (id: string, dom: HTMLElement) => void;
+  private readonly unmount: (id: string, dom: HTMLElement) => void;
+
+  constructor(
+    id: string,
+    line: number,
+    mount: (id: string, dom: HTMLElement) => void,
+    unmount: (id: string, dom: HTMLElement) => void,
+  ) {
+    super();
+    this.id = id;
+    this.line = line;
+    this.mount = mount;
+    this.unmount = unmount;
+  }
+
+  eq(other: ReviewSlotWidget) {
+    return other.id === this.id && other.line === this.line;
+  }
+
+  toDOM(view: EditorView) {
+    const dom = document.createElement('div');
+    dom.className = 'cm-review-widget-slot';
+    dom.dataset.reviewId = this.id;
+    const ro = new ResizeObserver(() => {
+      try {
+        view.requestMeasure();
+      } catch {
+        /* ignore after view destroy */
+      }
+    });
+    ro.observe(dom);
+    (dom as HTMLElement & { __yiRevRo?: ResizeObserver }).__yiRevRo = ro;
+    this.mount(this.id, dom);
+    return dom;
+  }
+
+  destroy(dom: HTMLElement) {
+    const ro = (dom as HTMLElement & { __yiRevRo?: ResizeObserver }).__yiRevRo;
+    ro?.disconnect();
+    this.unmount(this.id, dom);
+  }
+
+  ignoreEvent() {
+    return true;
+  }
+}
+
+interface ReviewWidgetEffectSpec {
+  items: InlineReviewPlacement[];
+  mount: (id: string, dom: HTMLElement) => void;
+  unmount: (id: string, dom: HTMLElement) => void;
+}
+
+const setInlineReviewsEffect = StateEffect.define<ReviewWidgetEffectSpec>();
+
+function buildReviewDecos(doc: Text, spec: ReviewWidgetEffectSpec): DecorationSet {
+  if (!spec.items.length || doc.lines < 1) return Decoration.none;
+  const sorted = [...spec.items].sort((x, y) => x.line - y.line || x.id.localeCompare(y.id));
+  const ranges = sorted.map((it) => {
+    const ln = Math.max(1, Math.min(doc.lines, Math.floor(it.line)));
+    const pos = doc.line(ln).to;
+    return Decoration.widget({
+      widget: new ReviewSlotWidget(it.id, ln, spec.mount, spec.unmount),
+      block: true,
+      side: 1,
+    }).range(pos);
+  });
+  return Decoration.set(ranges, true);
+}
+
+const inlineReviewsField = StateField.define<DecorationSet>({
+  create: () => Decoration.none,
+  update(value, tr) {
+    for (const e of tr.effects) {
+      if (e.is(setInlineReviewsEffect)) {
+        return buildReviewDecos(tr.state.doc, e.value);
+      }
+    }
+    return tr.docChanged ? value.map(tr.changes) : value;
+  },
+  provide: (f) => EditorView.decorations.from(f),
+});
 
 class SignMarker extends GutterMarker {
   sign: string;
@@ -132,6 +228,27 @@ function syncScroll(a: EditorView, b: EditorView): () => void {
   return () => {
     a.scrollDOM.removeEventListener('scroll', fa);
     b.scrollDOM.removeEventListener('scroll', fb);
+  };
+}
+
+/** Keeps block review widgets framed inside the visible scrollport next to the gutter during horizontal code scrolling. */
+function observeReviewViewport(v: EditorView): () => void {
+  const sync = () => {
+    const gutter = v.dom.querySelector('.cm-gutters');
+    const gw = gutter ? Math.ceil(gutter.getBoundingClientRect().width) : 0;
+    const vw = Math.max(200, Math.floor(v.scrollDOM.clientWidth - gw - 2));
+    v.scrollDOM.style.setProperty('--cm-gutter-w', `${gw}px`);
+    v.scrollDOM.style.setProperty('--cm-rev-w', `${vw}px`);
+  };
+  sync();
+  const ro = new ResizeObserver(sync);
+  ro.observe(v.scrollDOM);
+  const gutter = v.dom.querySelector('.cm-gutters');
+  if (gutter) ro.observe(gutter);
+  const raf = requestAnimationFrame(sync);
+  return () => {
+    cancelAnimationFrame(raf);
+    ro.disconnect();
   };
 }
 
@@ -394,15 +511,60 @@ export const MergeDiff = forwardRef<
     onAddContext?: (ref: DiffSnippet) => void;
     onAddReview?: (ref: DiffSnippet, comment: string) => void;
     onCopyHunk?: (content: string) => void;
+    inlineReviews?: InlineReviewPlacement[];
+    renderInlineReview?: (id: string) => ReactNode;
   }
 >(function MergeDiff(
-  { docKey = '', a, b, filename, layout, collapse, wrap, readOnly = true, onChange, onSave, onToggleWrap, goto, menu, onAddContext, onAddReview, onCopyHunk },
+  {
+    docKey = '',
+    a,
+    b,
+    filename,
+    layout,
+    collapse,
+    wrap,
+    readOnly = true,
+    onChange,
+    onSave,
+    onToggleWrap,
+    goto,
+    menu,
+    onAddContext,
+    onAddReview,
+    onCopyHunk,
+    inlineReviews,
+    renderInlineReview,
+  },
   ref,
 ) {
   const host = useRef<HTMLDivElement>(null);
   const box = useRef<HTMLDivElement>(null);
   const nav = useRef<EditorView | null>(null);
   const [, lang] = useLang();
+  const mountedSlots = useRef(new Map<string, HTMLElement>());
+  const slotSyncRaf = useRef<number | null>(null);
+  const [slotNodes, setSlotNodes] = useState<[string, HTMLElement][]>([]);
+  const scheduleSlotSync = () => {
+    if (slotSyncRaf.current != null) return;
+    slotSyncRaf.current = requestAnimationFrame(() => {
+      slotSyncRaf.current = null;
+      setSlotNodes(Array.from(mountedSlots.current.entries()));
+    });
+  };
+  const mountSlot = (id: string, dom: HTMLElement) => {
+    mountedSlots.current.set(id, dom);
+    scheduleSlotSync();
+  };
+  const unmountSlot = (id: string, dom: HTMLElement) => {
+    if (mountedSlots.current.get(id) === dom) {
+      mountedSlots.current.delete(id);
+      scheduleSlotSync();
+    }
+  };
+  const inlineItems = useMemo(() => inlineReviews ?? [], [inlineReviews]);
+  const inlineKey = useMemo(() => inlineItems.map((x) => `${x.id}@${x.line}`).join('|'), [inlineItems]);
+  const inlineItemsRef = useRef<InlineReviewPlacement[]>(inlineItems);
+  inlineItemsRef.current = inlineItems;
 
   useImperativeHandle(ref, () => ({
     next: () => nav.current && goToNextChunk(nav.current),
@@ -580,6 +742,19 @@ export const MergeDiff = forwardRef<
 
   useEffect(() => {
     const l = live.current;
+    if (!l) return;
+    const reviewView = l.kind === 'split' ? l.b : l.view;
+    reviewView.dispatch({
+      effects: setInlineReviewsEffect.of({
+        items: inlineItemsRef.current,
+        mount: mountSlot,
+        unmount: unmountSlot,
+      }),
+    });
+  }, [inlineKey, docKey, layout, emptyReadOnly, deletedFile]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    const l = live.current;
     if (!l || !goto) return;
     const target = l.kind === 'split' ? l.b : l.view;
     applyGoto(target, goto);
@@ -631,6 +806,7 @@ export const MergeDiff = forwardRef<
       phrases(),
       wrap ? EditorView.lineWrapping : [],
       language,
+      ...(selSide !== 'a' ? [inlineReviewsField] : []),
       EditorView.updateListener.of((u) => {
         if (editableSide && u.docChanged && cb.current.onChange) {
           cb.current.onChange(u.state.doc.sliceString(0, u.state.doc.length, eol));
@@ -659,12 +835,25 @@ export const MergeDiff = forwardRef<
         state: EditorState.create({ doc: norm(a), extensions: [...makeExt(false, 'del-file'), allDeletedGutter] }),
       });
       live.current = { kind: 'del-file', view: v };
+      if (inlineItemsRef.current.length) {
+        v.dispatch({
+          effects: setInlineReviewsEffect.of({ items: inlineItemsRef.current, mount: mountSlot, unmount: unmountSlot }),
+        });
+      }
       const onSc = () => syncSelChip();
+      const stopObserve = observeReviewViewport(v);
       v.scrollDOM.addEventListener('scroll', onSc, { passive: true });
       return () => {
+        if (slotSyncRaf.current != null) {
+          cancelAnimationFrame(slotSyncRaf.current);
+          slotSyncRaf.current = null;
+        }
+        mountedSlots.current.clear();
+        setSlotNodes([]);
         window.removeEventListener('pointerup', onUp);
         window.removeEventListener('pointercancel', onUp);
         v.scrollDOM.removeEventListener('scroll', onSc);
+        stopObserve();
         v.destroy();
       };
     }
@@ -683,7 +872,13 @@ export const MergeDiff = forwardRef<
       });
       views = [mv.a, mv.b];
       live.current = { kind: 'split', a: mv.a, b: mv.b };
+      if (inlineItemsRef.current.length) {
+        mv.b.dispatch({
+          effects: setInlineReviewsEffect.of({ items: inlineItemsRef.current, mount: mountSlot, unmount: unmountSlot }),
+        });
+      }
       const unsync = syncScroll(mv.a, mv.b);
+      const stopObserve = observeReviewViewport(mv.b);
       const onSc = () => {
         syncSelChip();
         setHoveredHunk(null);
@@ -691,8 +886,15 @@ export const MergeDiff = forwardRef<
       mv.a.scrollDOM.addEventListener('scroll', onSc, { passive: true });
       mv.b.scrollDOM.addEventListener('scroll', onSc, { passive: true });
       destroy = () => {
+        if (slotSyncRaf.current != null) {
+          cancelAnimationFrame(slotSyncRaf.current);
+          slotSyncRaf.current = null;
+        }
+        mountedSlots.current.clear();
+        setSlotNodes([]);
         mv.a.scrollDOM.removeEventListener('scroll', onSc);
         mv.b.scrollDOM.removeEventListener('scroll', onSc);
+        stopObserve();
         unsync();
         mv.destroy();
       };
@@ -718,13 +920,26 @@ export const MergeDiff = forwardRef<
       });
       views = [v];
       live.current = { kind: 'unified', view: v };
+      if (inlineItemsRef.current.length) {
+        v.dispatch({
+          effects: setInlineReviewsEffect.of({ items: inlineItemsRef.current, mount: mountSlot, unmount: unmountSlot }),
+        });
+      }
+      const stopObserve = observeReviewViewport(v);
       const onSc = () => {
         syncSelChip();
         setHoveredHunk(null);
       };
       v.scrollDOM.addEventListener('scroll', onSc, { passive: true });
       destroy = () => {
+        if (slotSyncRaf.current != null) {
+          cancelAnimationFrame(slotSyncRaf.current);
+          slotSyncRaf.current = null;
+        }
+        mountedSlots.current.clear();
+        setSlotNodes([]);
         v.scrollDOM.removeEventListener('scroll', onSc);
+        stopObserve();
         v.destroy();
       };
     }
@@ -750,7 +965,7 @@ export const MergeDiff = forwardRef<
   /** Locate the diff chunk under the pointer and place the hunk action bar at its top-right */
   const onPointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
     if (!onAddContext && !onAddReview && !onCopyHunk) return;
-    if ((e.target as Element | null)?.closest('.wp-hunk-bar, .cm-sel-act, .cm-sel-group, .wp-comment-pop, .wp-merge-sash, .ed-find')) return;
+    if ((e.target as Element | null)?.closest('.wp-hunk-bar, .cm-sel-act, .cm-sel-group, .wp-comment-pop, .wp-merge-sash, .ed-find, .cm-review-widget-slot')) return;
     const el = box.current;
     const l = live.current;
     if (!el || !l) return;
@@ -885,7 +1100,7 @@ export const MergeDiff = forwardRef<
       onPointerMove={onPointerMove}
       onPointerLeave={() => setHoveredHunk(null)}
       onPointerDown={(e) => {
-        if (e.button === 0 && !(e.target as Element | null)?.closest('.cm-sel-act, .cm-sel-group, .wp-comment-pop, .wp-hunk-bar, .wp-merge-sash, .ed-find')) {
+        if (e.button === 0 && !(e.target as Element | null)?.closest('.cm-sel-act, .cm-sel-group, .wp-comment-pop, .wp-hunk-bar, .wp-merge-sash, .ed-find, .cm-review-widget-slot')) {
           dragging.current = true;
           setSelChip(null);
         }
@@ -893,6 +1108,8 @@ export const MergeDiff = forwardRef<
       onContextMenu={onContextMenu}
     >
       <div className="wp-merge-host" ref={host} />
+      {renderInlineReview &&
+        slotNodes.map(([id, slotEl]) => createPortal(renderInlineReview(id), slotEl, `rev-slot-${id}`))}
       {split && <div className="wp-merge-sash" title={t('dragToResizeDoubleClick')} onPointerDown={drag} onDoubleClick={() => setRatio(0.5)} />}
       {hoveredHunk && !selChip && !commentDraft && (onAddContext || onAddReview || onCopyHunk) && (
         <div className="wp-hunk-bar" style={{ top: hoveredHunk.top }} onMouseDown={(e) => e.preventDefault()}>

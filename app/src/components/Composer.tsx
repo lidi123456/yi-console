@@ -8,6 +8,7 @@ import type { SessionInfo, SlashCommand, Snippet } from '../types';
 import { fuzzyScore, isMobile, toB64 as toB64Str } from '../util';
 import {
   ADD_CONTEXT_REF,
+  REMOVE_REVIEW_CONTEXT_REF,
   formatLineRange,
   nextContextRefId,
   parseContextMessage,
@@ -18,6 +19,7 @@ import {
   type ContextRefInput,
 } from '../contextRefs';
 import { ContextRefBar } from './ContextRefBar';
+import { unadoptFindingByRef } from '../reviewState';
 
 import { openImage } from './Lightbox';
 import { imageMenu } from './ImageMenu';
@@ -202,6 +204,9 @@ export function Composer({
   desktopControls,
   placeholder,
   compact = false,
+  topSlot,
+  transformSend,
+  onAfterSend,
 }: {
   hostId: string;
   info: SessionInfo;
@@ -214,6 +219,12 @@ export function Composer({
   placeholder?: string;
   /** Compact variant used inside embedded side chats: keeps full composer UX while hiding full-page navigation commands */
   compact?: boolean;
+  /** Optional chip/banner rendered above the textarea row (e.g. focused review finding tag) */
+  topSlot?: ReactNode;
+  /** Optional message body transformer executed right before sending (when no text-only bypass happens) */
+  transformSend?: (text: string) => string;
+  /** Optional hook invoked right after `session.send` succeeds */
+  onAfterSend?: () => void;
 }) {
   const key = `${hostId}::${info.id}`;
   const [, lang] = useLang();
@@ -338,7 +349,7 @@ export function Composer({
     const onInsert = (e: Event) => {
       const d = (e as CustomEvent<{ sessionId: string; text: string }>).detail;
       if (d.sessionId !== info.id) return;
-      setText((t) => (t && !/\s$/.test(t) ? t + ' ' : t) + d.text);
+      if (d.text) setText((t) => (t && !/\s$/.test(t) ? t + ' ' : t) + d.text);
       requestAnimationFrame(() => {
         const el = ta.current;
         if (!el) return;
@@ -364,6 +375,17 @@ export function Composer({
     };
     window.addEventListener(ADD_CONTEXT_REF, onAddRef);
     return () => window.removeEventListener(ADD_CONTEXT_REF, onAddRef);
+  }, [info.id]);
+
+  // Remove a review finding pill when un-adopted from the Review Side Pane or Diff inline card before send
+  useEffect(() => {
+    const onRmReviewRef = (e: Event) => {
+      const d = (e as CustomEvent<{ sessionId: string; sideSessionId: string; findingId: string }>).detail;
+      if (d.sessionId !== info.id) return;
+      setRefs((cur) => cur.filter((x) => !(x.kind === 'review' && x.sideSessionId === d.sideSessionId && x.reviewFindingId === d.findingId)));
+    };
+    window.addEventListener(REMOVE_REVIEW_CONTEXT_REF, onRmReviewRef);
+    return () => window.removeEventListener(REMOVE_REVIEW_CONTEXT_REF, onRmReviewRef);
   }, [info.id]);
 
   // Refill a past prompt from the prompt outline or sticky current-prompt bar
@@ -495,15 +517,19 @@ export function Composer({
           ]
         : []),
       { key: 'b-model', label: 'model', desc: t('switchModel'), group: 'Yi Console', icon: 'chat', apply: () => (clearSlash(), window.dispatchEvent(new CustomEvent(OPEN_MODEL, { detail: { sessionId: info.id } }))) },
-      { key: 'b-mode', label: 'mode', desc: t('permissionModeCurrent', { v: permLabel(info.permissionMode) }), group: 'Yi Console', icon: 'shield', apply: () => (clearSlash(), setPermOpen(true)) },
-      ...permModes(info.tool, info.mode).map(([id, label, desc]) => ({
-        key: `b-mode-${id}`,
-        label: `mode ${id}`,
-        desc: isEn() ? `${label}: ${desc}` : `${label}：${desc}`,
-        group: 'Yi Console',
-        icon: 'shield',
-        apply: () => (clearSlash(), setPermMode(hostId, info, id)),
-      })),
+      ...(info.review
+        ? []
+        : [
+            { key: 'b-mode', label: 'mode', desc: t('permissionModeCurrent', { v: permLabel(info.permissionMode) }), group: 'Yi Console', icon: 'shield', apply: () => (clearSlash(), setPermOpen(true)) },
+            ...permModes(info.tool, info.mode).map(([id, label, desc]) => ({
+              key: `b-mode-${id}`,
+              label: `mode ${id}`,
+              desc: isEn() ? `${label}: ${desc}` : `${label}：${desc}`,
+              group: 'Yi Console',
+              icon: 'shield',
+              apply: () => (clearSlash(), setPermMode(hostId, info, id)),
+            })),
+          ]),
       ...(!compact && info.tool === 'codex'
         ? [{ key: 'b-diff', label: 'diff', desc: t('viewWorkspaceChangesSameAs'), group: 'Yi Console', icon: 'edit' as const, apply: () => (clearSlash(), showChanges(hostId, info.id)) }]
         : []),
@@ -524,8 +550,9 @@ export function Composer({
           ]
         : []),
     ];
+    const insertIdx = Math.max(0, builtin.findIndex((b) => b.key === 'b-model') + 1 + (info.review ? 0 : 1 + permModes(info.tool, info.mode).length));
     if (info.mode !== 'terminal')
-      builtin.splice(2 + permModes(info.tool, info.mode).length, 0, {
+      builtin.splice(insertIdx, 0, {
         key: 'b-compact',
         label: 'compact',
         desc: t('compactContextSummarizeEarlierConversation'),
@@ -534,7 +561,7 @@ export function Composer({
         apply: () => (clearSlash(), rpc(hostId, 'session.compact', { sessionId: info.id }).then(() => toast(t('compactingContext')), errorToast)),
       });
     if (info.mode !== 'terminal')
-      builtin.splice(3 + permModes(info.tool, info.mode).length, 0, {
+      builtin.splice(insertIdx + 1, 0, {
         key: 'b-clear',
         label: 'clear',
         desc: t('clearConversationDeleteMessagesReset'),
@@ -719,7 +746,8 @@ export function Composer({
     const from = key;
     setSendingKey(from);
     try {
-      let payload = t;
+      const transformed = transformSend ? transformSend(t) : t;
+      let payload = transformed;
       if (curRefs.length > 0) {
         if (info.mode === 'terminal') {
           // Terminal PTY has no chat UI to collapse <yi-context>: save snippets as files and pass @path references
@@ -731,9 +759,9 @@ export function Composer({
             const up = await rpc<{ path: string }>(hostId, 'session.attachFile', { sessionId: info.id, name, data: toB64Str(body) });
             atRefs.push(refOf(up.path));
           }
-          payload = `${t ? t + ' ' : ''}${atRefs.join('')}`.trim();
+          payload = `${transformed ? transformed + ' ' : ''}${atRefs.join('')}`.trim();
         } else {
-          payload = serializeContextMessage(t, curRefs);
+          payload = serializeContextMessage(transformed, curRefs);
         }
       }
       // Auto-name an untitled side chat from its first sent question so the tab label stays readable
@@ -748,6 +776,7 @@ export function Composer({
         // Turn still running: Claude and Codex read it at their next step; other tools queue it until the turn ends
         queue: true,
       });
+      onAfterSend?.();
       noteOwnerMessage(info);
       // Only clear once sent. If we switched sessions mid-send, only clear the original session's draft and leave the current input box alone
       if (keyRef.current === from) {
@@ -786,7 +815,10 @@ export function Composer({
     }
   };
 
-  const cyclePerm = () => setPermMode(hostId, info, nextPerm(info.tool, info.mode, info.permissionMode));
+  const cyclePerm = () => {
+    if (info.review) return;
+    setPermMode(hostId, info, nextPerm(info.tool, info.mode, info.permissionMode));
+  };
 
   const onKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     // WebKit can end composition before its confirming keydown; keyCode 229 still identifies the IME key.
@@ -933,7 +965,11 @@ export function Composer({
           sessionId={info.id}
           cwd={info.cwd}
           sending={sending}
-          onRemove={(id) => setRefs((l) => l.filter((x) => x.id !== id))}
+          onRemove={(id) => {
+            const removed = refs.find((x) => x.id === id);
+            setRefs((l) => l.filter((x) => x.id !== id));
+            if (removed?.kind === 'review') unadoptFindingByRef(hostId, removed);
+          }}
           onEditReview={async (r) => {
             const next = (
               await askText({
@@ -946,8 +982,14 @@ export function Composer({
             if (next) setRefs((l) => l.map((x) => (x.id === r.id ? { ...x, comment: next } : x)));
           }}
           onSendReviews={() => void send()}
-          onClearReviews={() => setRefs((l) => l.filter((x) => x.kind !== 'review'))}
+          onClearReviews={() => {
+            for (const r of refs) {
+              if (r.kind === 'review') unadoptFindingByRef(hostId, r);
+            }
+            setRefs((l) => l.filter((x) => x.kind !== 'review'));
+          }}
         />
+        {topSlot}
         <div className="composer-row">
           <textarea
             ref={ta}
@@ -1034,14 +1076,21 @@ export function Composer({
               e.target.value = '';
             }}
           />
-          <PermPicker
-            tool={info.tool}
-            mode={info.mode}
-            value={info.permissionMode}
-            onChange={(m) => setPermMode(hostId, info, m)}
-            open={permOpen}
-            setOpen={setPermOpen}
-          />
+          {info.review ? (
+            <span className="tool-chip readonly-lock" title={t('reviewReadonlyModeLocked')}>
+              <Icon name="shield" size={12} />
+              <span>{t('readonlyLockedLabel')}</span>
+            </span>
+          ) : (
+            <PermPicker
+              tool={info.tool}
+              mode={info.mode}
+              value={info.permissionMode}
+              onChange={(m) => setPermMode(hostId, info, m)}
+              open={permOpen}
+              setOpen={setPermOpen}
+            />
+          )}
           <button
             className="tool-chip"
             title={t('slashCommandsSnippets')}

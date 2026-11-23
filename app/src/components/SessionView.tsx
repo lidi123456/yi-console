@@ -7,7 +7,7 @@ import { useBack } from '../back';
 import { getT, isEn, useLang } from '../i18n';
 import { errorToast, getState, hostStatus, loadOlder, loadSession, loadUserMessages, navigate, replaceView, setState, skey, toast, useSessionData, useStore } from '../store';
 import { rpc } from '../transport';
-import { TOOL_LABEL, supportsAccountsTool, type QuestionAnswer, type ToolAccountsSummary } from '../types';
+import { isHostSession, TOOL_LABEL, supportsAccountsTool, type QuestionAnswer, type ToolAccountsSummary } from '../types';
 import { fmtUsage, isMobile, lsGet, lsSet, shortPath, STATUS_LABEL } from '../util';
 import { openAccountManager } from './AccountManagerModal';
 import { openMenu } from './Overlay';
@@ -60,7 +60,7 @@ export function SessionView({ hostId, sessionId, seq }: { hostId: string; sessio
   useEffect(() => {
     if (!info?.parentId || !parentExists) return;
     const pid = info.parentId;
-    if (info.sideChat) {
+    if (info.sideChat || info.review) {
       openFileInPanel(hostId, pid, sideTabPath(info.id));
     } else if (info.mode === 'structured' && info.tool !== 'shell' && info.tool !== 'files') {
       openFileInPanel(hostId, pid, `review:${info.id}`);
@@ -69,16 +69,16 @@ export function SessionView({ hostId, sessionId, seq }: { hostId: string; sessio
       lsSet(`term-tab-${pid}`, info.id);
     }
     replaceView({ kind: 'session', hostId, sessionId: pid });
-  }, [hostId, info?.id, info?.parentId, info?.sideChat, info?.mode, info?.tool, parentExists]);
+  }, [hostId, info?.id, info?.parentId, info?.sideChat, info?.review, info?.mode, info?.tool, parentExists]);
   const sideChats = useMemo(
-    () => (hostSessions ? hostSessions.filter((x) => x.parentId === sessionId && x.sideChat) : []),
+    () => (hostSessions ? hostSessions.filter((x) => x.parentId === sessionId && (x.sideChat || !!x.review)) : []),
     [hostSessions, sessionId],
   );
   const liveSideCount = sideChats.filter((x) => x.status === 'running' || x.status === 'starting').length;
   const attnSideCount = sideChats.filter((x) => x.pendingPermissions > 0 || x.status === 'waiting-permission').length;
   const connected = useStore((s) => s.hosts.find((h) => h.config.id === hostId)?.status.status === 'connected');
   const attn = useStore((s) =>
-    Object.values(s.sessions).reduce((n, l) => n + l.filter((x) => x.pendingPermissions > 0).length, 0),
+    Object.values(s.sessions).reduce((n, l) => n + l.filter((x) => isHostSession(x) && x.pendingPermissions > 0).length, 0),
   );
   const home = hostStatus(hostId).hello?.home;
   const desktopRevision = useMemo(() => data.events.reduce((seq, event) => event.kind === 'computer_use' && event.status === 'control' ? event.seq : seq, 0), [data.events, data.events.length]);
@@ -581,8 +581,8 @@ export function SessionView({ hostId, sessionId, seq }: { hostId: string; sessio
                   [
                     ...sideChats.map((sc) => ({
                       label: sideChatTitle(sc),
-                      icon: 'sideChat',
-                      hint: [TOOL_LABEL[sc.tool], STATUS_LABEL[sc.status]].join(' · '),
+                      icon: sc.review ? 'sparkles' : 'sideChat',
+                      hint: [TOOL_LABEL[sc.tool], sc.review?.scopeLabel, STATUS_LABEL[sc.status]].filter(Boolean).join(' · '),
                       run: () => openFileInPanel(hostId, sessionId, sideTabPath(sc.id)),
                     })),
                     '-' as const,

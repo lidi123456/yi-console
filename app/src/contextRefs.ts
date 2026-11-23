@@ -25,8 +25,12 @@ export interface ContextRef {
   comment?: string;
   /** Non-zero exit code when kind === 'terminal' (from OSC 133 triage) */
   exitCode?: number;
-  /** Side chat session id when kind === 'side' (allows clicking the pill to reopen that side chat tab) */
+  /** Side chat session id when kind === 'side' or 'review' (allows clicking the pill to reopen that side chat tab) */
   sideSessionId?: string;
+  /** Tool label / key when kind === 'review' comes from an AI review finding */
+  reviewSource?: string;
+  /** Stable finding id ('ri-0', etc.) when kind === 'review' comes from an AI review */
+  reviewFindingId?: string;
   /** Unified diff hunk (for 'diff' / 'review'), raw selected lines (for 'code' / 'terminal'), or side chat conclusion markdown */
   content: string;
 }
@@ -43,6 +47,7 @@ export interface AddContextRefOptions {
 export const ADD_CONTEXT_REF = 'yi-console:add-context-ref';
 export const UPDATE_CONTEXT_REF = 'yi-console:update-context-ref';
 export const REMOVE_CONTEXT_REF = 'yi-console:remove-context-ref';
+export const REMOVE_REVIEW_CONTEXT_REF = 'yi-console:remove-review-context-ref';
 
 let refSeq = 0;
 export const nextContextRefId = () => `cref-${Date.now()}-${++refSeq}`;
@@ -50,6 +55,11 @@ export const nextContextRefId = () => `cref-${Date.now()}-${++refSeq}`;
 export function addContextRefToChat(sessionId: string, ref: ContextRefInput, opts?: AddContextRefOptions) {
   if (!ref.content && !ref.comment) return;
   window.dispatchEvent(new CustomEvent(ADD_CONTEXT_REF, { detail: { sessionId, ref, ...opts } }));
+}
+
+export function removeReviewContextRef(sessionId: string, sideSessionId: string, findingId: string) {
+  if (!sessionId || !sideSessionId || !findingId) return;
+  window.dispatchEvent(new CustomEvent(REMOVE_REVIEW_CONTEXT_REF, { detail: { sessionId, sideSessionId, findingId } }));
 }
 
 export function sameContextRef(a: ContextRefInput, b: ContextRefInput): boolean {
@@ -62,6 +72,8 @@ export function sameContextRef(a: ContextRefInput, b: ContextRefInput): boolean 
     (a.comment ?? '') === (b.comment ?? '') &&
     (a.exitCode ?? 0) === (b.exitCode ?? 0) &&
     (a.sideSessionId ?? '') === (b.sideSessionId ?? '') &&
+    (a.reviewSource ?? '') === (b.reviewSource ?? '') &&
+    (a.reviewFindingId ?? '') === (b.reviewFindingId ?? '') &&
     a.content === b.content
   );
 }
@@ -119,7 +131,9 @@ export function serializeContextRef(r: ContextRefInput): string {
   const codeBlock = `${fence}${lang}\n${normContent}\n${fence}`;
   const inner =
     r.kind === 'review' && r.comment
-      ? `Review comment: ${r.comment.trim()}\n${codeBlock}`
+      ? r.reviewSource
+        ? `AI review comment (${r.reviewSource}${r.sideSessionId ? `; sessionId=${r.sideSessionId}` : ''}): ${r.comment.trim()}\n${codeBlock}`
+        : `Review comment: ${r.comment.trim()}\n${codeBlock}`
       : r.kind === 'side'
         ? r.sideSessionId
           ? `Side chat notes (${r.path}; sessionId=${r.sideSessionId} — call session_read({"sessionId":"${r.sideSessionId}"}) from yi_session if you need the full conversation):\n${normContent}`
@@ -143,8 +157,14 @@ export function serializeContextRef(r: ContextRefInput): string {
   if (r.kind === 'terminal' && r.exitCode !== undefined) {
     attrs.push(`exit="${r.exitCode}"`);
   }
-  if (r.kind === 'side' && r.sideSessionId) {
+  if ((r.kind === 'side' || r.kind === 'review') && r.sideSessionId) {
     attrs.push(`sid="${escAttr(r.sideSessionId)}"`);
+  }
+  if (r.kind === 'review' && r.reviewSource) {
+    attrs.push(`source="${escAttr(r.reviewSource)}"`);
+  }
+  if (r.kind === 'review' && r.reviewFindingId) {
+    attrs.push(`fid="${escAttr(r.reviewFindingId)}"`);
   }
   return `<${tag} ${attrs.join(' ')}>\n${inner}\n</${tag}>`;
 }
@@ -182,10 +202,14 @@ export function parseContextMessage(raw: string): { text: string; refs: ContextR
     const toLine = lm && lm[2] ? Math.max(fromLine, Number(lm[2])) : fromLine;
     let trimmed = body.trim();
     let comment = attrs.comment || undefined;
-    if (kind === 'review' && trimmed.startsWith('Review comment: ')) {
+    if (kind === 'review' && (trimmed.startsWith('Review comment: ') || trimmed.startsWith('AI review comment ('))) {
       const nl = trimmed.indexOf('\n');
       if (nl > 0) {
-        if (!comment) comment = trimmed.slice('Review comment: '.length, nl).trim();
+        if (!comment) {
+          const line = trimmed.slice(0, nl);
+          const colon = line.indexOf(': ');
+          comment = (colon >= 0 ? line.slice(colon + 2) : line).trim();
+        }
         trimmed = trimmed.slice(nl + 1).trim();
       }
     }
@@ -211,6 +235,8 @@ export function parseContextMessage(raw: string): { text: string; refs: ContextR
       comment,
       exitCode: Number.isFinite(exitCode) ? exitCode : undefined,
       sideSessionId: attrs.sid || undefined,
+      reviewSource: attrs.source || undefined,
+      reviewFindingId: attrs.fid || undefined,
       content,
     });
     return '';

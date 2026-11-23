@@ -5,6 +5,7 @@ import { useBack } from '../back';
 import { ENGINE_ORIGIN, EngineNote } from './EngineNote';
 import { ContextRefBar } from './ContextRefBar';
 import { parseContextMessage } from '../contextRefs';
+import { parseFindingFollowUp } from '../reviewState';
 import { type ImgCtx } from '../chatImages';
 import { getT, isEn, trErr, useLang } from '../i18n';
 import { rpc } from '../transport';
@@ -2408,7 +2409,8 @@ export function ChatView({
                   </div>
                 );
               const parsed = parseContextMessage(it.text);
-              const shownText = parsed.text;
+              const followUp = parseFindingFollowUp(parsed.text);
+              const shownText = followUp.text;
               return (
                 <div key={it.key} data-key={it.key} data-prompt-seq={it.seq} className="msg-user">
                   {it.images.length > 0 && hostId && info && (
@@ -2420,6 +2422,18 @@ export function ChatView({
                   )}
                   {parsed.refs.length > 0 && (
                     <ContextRefBar refs={parsed.refs} hostId={hostId} sessionId={info?.id} cwd={info?.cwd} className="msg-refs" />
+                  )}
+                  {followUp.ref && (
+                    <div className="msg-review-ref">
+                      <Icon name="sparkles" size={12} />
+                      {followUp.ref.file && (
+                        <span className="mono msg-review-ref-loc">
+                          {followUp.ref.file}
+                          {followUp.ref.line ? `:${followUp.ref.line}` : ''}
+                        </span>
+                      )}
+                      {followUp.ref.title && <span className="truncate">{followUp.ref.title}</span>}
+                    </div>
                   )}
                   {shownText.trim() && <div className="bubble">{shownText}</div>}
                   {modern ? (

@@ -1,13 +1,29 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { useBack } from '../back';
 import { getT, trErr, useLang } from '../i18n';
-import { errorToast, getState, hostStatus, openNewSession, skey, toast, useSessionData, useStore } from '../store';
+import { errorToast, getState, hostStatus, loadSession, openNewSession, skey, toast, useSessionData, useStore } from '../store';
 import { isTauri, rpc } from '../transport';
-import { TOOL_LABEL, type DirEntry, type FileDiff } from '../types';
+import { TOOL_LABEL, type DirEntry, type FileDiff, type HubEvent, type QuestionAnswer } from '../types';
 import { fmtSize, lsGet, lsSet } from '../util';
 import { writeClipboard } from '../clipboard';
 import { addContextRefToChat } from '../contextRefs';
-import { Icon } from './Icon';
+import {
+  computeFileIssueBadges,
+  extractFindingThreads,
+  extractReviewSnapshot,
+  getActiveFindingStream,
+  getActiveReviewId,
+  getAllDispositions,
+  getFindingDisposition,
+  normalizeReviewPath,
+  resolveReviewMeta,
+  setActiveReviewId,
+  subscribeFocusFinding,
+  useReviewStoreVersion,
+  type FileIssueBadge,
+  type ReviewIssue,
+} from '../reviewState';
+import { Icon, ToolBadge } from './Icon';
 import { askConfirm, askText, openMenu, type MenuItem } from './Overlay';
 import { CodeEditor, type EditorMenuCtx, type GotoTarget } from './CodeEditor';
 import { PaneDiff } from './DiffView';
@@ -23,21 +39,23 @@ import { canUseBrowser } from '../browserUse';
 import { CommitDetails, commitRangeTab, commitTab, GitHistory, isCommitTab, parseCommitTab } from './GitHistory';
 import { BranchWorktreePopover, CommitDialog, type BranchesResult, type WorktreeEntry, type WorktreesResult } from './GitOpsDialogs';
 import {
+  adoptReviewFindings,
   deleteReviewMeta,
   getReviewMeta,
   isReviewTab,
-  REVIEW_PREFIX,
   ReviewLaunchDialog,
   type ReviewLaunchPreset,
   ReviewPane,
   reviewTabSession,
 } from './ReviewTab';
+import { ReviewInlineWidget } from './ReviewInlineWidget';
 import {
   isSideTab,
   sideChatHasMessages,
   SideChatPane,
   sideChatTitle,
   sideChatTools,
+  sideTabPath,
   sideTabSession,
   startSideChat,
 } from './SideChatTab';
@@ -426,6 +444,9 @@ function Rows({
   dropDir,
   onDropOver,
   stats,
+  reviewBadges,
+  reviewRelOf,
+  reviewCleanCheck,
 }: {
   rows: TreeRow[];
   /** The scrolling element the rows sit in; given, long lists are virtualized (rows all share one height) */
@@ -445,6 +466,9 @@ function Rows({
   onToggle: (r: TreeRow) => void;
   onOpen: (r: TreeRow) => void;
   onMenu?: (e: React.MouseEvent, r: TreeRow) => void;
+  reviewBadges?: Map<string, FileIssueBadge>;
+  reviewRelOf?: (absPath: string) => string;
+  reviewCleanCheck?: (relPath: string) => boolean;
 }) {
   const box = useRef<HTMLDivElement>(null);
   const virtual = !!scroller && rows.length > VIRTUAL_MIN;
@@ -493,6 +517,10 @@ function Rows({
         const mark = g ? gitMark(g.status) : null;
         const dirChanged = !!git && r.isDir && !r.expanded && git.dirs.has(norm(r.path));
         const ignored = !r.loading && !mark && !dirChanged && isGitIgnored(git, r.path);
+        const revRel = !r.isDir && reviewRelOf ? reviewRelOf(r.path) : '';
+        const revBadge = revRel && reviewBadges ? reviewBadges.get(revRel) : undefined;
+        const revTopSev = revBadge ? (revBadge.high > 0 ? 'high' : revBadge.medium > 0 ? 'medium' : 'low') : null;
+        const revClean = !!revRel && !revBadge && !!reviewCleanCheck?.(revRel);
         return (
         <div
           key={r.key}
@@ -547,6 +575,18 @@ function Rows({
               <Icon name="more" size={13} />
             </button>
           )}
+          {revBadge && revBadge.total > 0 && revTopSev ? (
+            <span
+              className={`wp-row-rev-badge sev-${revTopSev} ${revBadge.open === 0 ? 'done' : ''}`}
+              title={tx('reviewFoundCount', { n: revBadge.total })}
+            >
+              {revBadge.total}
+            </span>
+          ) : revClean ? (
+            <span className="wp-row-rev-clean" title={tx('reviewFileCleanTip')}>
+              <Icon name="check" size={11} />
+            </span>
+          ) : null}
           {stats && g && <LineStat a={g.added} d={g.deleted} />}
           {mark && <span className="wp-git">{mark[0]}</span>}
           {dirChanged && <span className="wp-git-dot" />}
@@ -768,6 +808,57 @@ export function FilePanel({
   const [dropDir, setDropDir] = useState<string | null>(null);
   const [uploading, setUploading] = useState(0);
   const isLocal = useStore((st) => st.hosts.find((h) => h.config.id === hostId)?.config.kind === 'local');
+  const connected = useStore((st) => st.hosts.find((h) => h.config.id === hostId)?.status.status === 'connected');
+  useReviewStoreVersion();
+  const [reviewOnlyFilter, setReviewOnlyFilter] = useState(false);
+  const [showInlineReviews, setShowInlineReviews] = useState(true);
+  const [highlightedFindingId, setHighlightedFindingId] = useState<string | null>(null);
+  const [diffIssueCursor, setDiffIssueCursor] = useState(0);
+
+  const reviewSessions = useMemo(
+    () =>
+      standalone
+        ? []
+        : hostSessions
+            .filter((x) => x.parentId === sessionId && (!!x.review || !!getReviewMeta(x.id)))
+            .sort((a, b) => (b.updatedAt ?? b.createdAt) - (a.updatedAt ?? a.createdAt)),
+    [standalone, hostSessions, sessionId],
+  );
+  const storedActiveReviewId = getActiveReviewId(hostId, sessionId);
+  const activeReviewInfo = useMemo(
+    () => (storedActiveReviewId ? reviewSessions.find((s) => s.id === storedActiveReviewId) : undefined) ?? reviewSessions[0],
+    [reviewSessions, storedActiveReviewId],
+  );
+  const activeReviewId = activeReviewInfo?.id ?? null;
+  const activeReviewData = useSessionData(activeReviewId ? skey(hostId, activeReviewId) : '');
+  const activeReviewMeta = resolveReviewMeta(activeReviewInfo, activeReviewId ? getReviewMeta(activeReviewId) : null);
+  const activeReviewBusy = activeReviewInfo?.status === 'running' || activeReviewInfo?.status === 'starting';
+
+  useEffect(() => {
+    if (connected && activeReviewId && !activeReviewData.loaded) {
+      loadSession(hostId, activeReviewId).catch(() => {});
+    }
+  }, [connected, hostId, activeReviewId, activeReviewData.loaded]);
+
+  useEffect(() => {
+    if (!activeReviewId) setReviewOnlyFilter(false);
+  }, [activeReviewId]);
+
+  useEffect(() => {
+    let timer: number | undefined;
+    const unsub = subscribeFocusFinding((p) => {
+      if (p.hostId !== hostId || p.parentSessionId !== sessionId) return;
+      setShowInlineReviews(true);
+      setHighlightedFindingId(p.findingId);
+      window.clearTimeout(timer);
+      timer = window.setTimeout(() => setHighlightedFindingId((cur) => (cur === p.findingId ? null : cur)), 3200);
+    });
+    return () => {
+      window.clearTimeout(timer);
+      unsub();
+    };
+  }, [hostId, sessionId]);
+
   const sdata = useSessionData(skey(hostId, sessionId));
   // Files changed by tools in this session: norm(absolute path) -> each edit made to that file
   const touched = useMemo(() => {
@@ -1399,13 +1490,16 @@ export function FilePanel({
     const r = e.currentTarget.getBoundingClientRect();
     openMenu(
       { clientX: r.right - 260, clientY: r.bottom + 4 },
-      [...tabs].reverse().map((t) => ({
-        label: isSideTab(t) ? sideTabLabel(t) : isReviewTab(t) ? reviewTabLabel(t) : isWebTab(t) ? webTabTitle(t) : commitTabLabel(t) ?? nameOf(t),
-        icon: isSideTab(t) ? 'sideChat' : isReviewTab(t) ? 'sparkles' : isWebTab(t) ? 'globe' : isCommitTab(t) ? 'diff' : 'file',
-        hint: isSideTab(t) || isReviewTab(t) || isWebTab(t) || isCommitTab(t) || isUntitled(t) || rel(parentOf(t)) === '.' ? undefined : rel(parentOf(t)),
-        active: t === file?.path,
-        run: () => openFile(t),
-      })),
+      [...tabs].reverse().map((t) => {
+        const isRevSide = isSideTab(t) && !!(sideTabInfo(t)?.review || getReviewMeta(sideTabSession(t)));
+        return {
+          label: isSideTab(t) ? sideTabLabel(t) : isReviewTab(t) ? reviewTabLabel(t) : isWebTab(t) ? webTabTitle(t) : commitTabLabel(t) ?? nameOf(t),
+          icon: isSideTab(t) ? (isRevSide ? 'sparkles' : 'sideChat') : isReviewTab(t) ? 'sparkles' : isWebTab(t) ? 'globe' : isCommitTab(t) ? 'diff' : 'file',
+          hint: isSideTab(t) || isReviewTab(t) || isWebTab(t) || isCommitTab(t) || isUntitled(t) || rel(parentOf(t)) === '.' ? undefined : rel(parentOf(t)),
+          active: t === file?.path,
+          run: () => openFile(t),
+        };
+      }),
     );
   };
 
@@ -1426,12 +1520,12 @@ export function FilePanel({
     deleteReviewMeta(rsid);
     rpc(hostId, 'session.delete', { sessionId: rsid }).catch(() => {});
   };
-  /** Closing an unused side chat deletes it automatically (T3 Code convention); used side chats remain reopenable */
+  /** Closing an unused normal side chat deletes it automatically; review side chats and used side chats remain reopenable */
   const cleanupSideTab = (t: string) => {
     if (!isSideTab(t)) return;
     const ssid = sideTabSession(t);
     const s = hostSessions.find((x) => x.id === ssid);
-    if (!s) return;
+    if (!s || s.review || getReviewMeta(ssid)) return;
     if (!sideChatHasMessages(hostId, ssid, s)) {
       rpc(hostId, 'session.delete', { sessionId: ssid }).catch(() => {});
     }
@@ -1582,7 +1676,7 @@ export function FilePanel({
     const inRoot = (p: string) => norm(p).startsWith(r + '/');
     const keep = [...new Set(saved.tabs.map((t) => (isSideTab(t) || isWebTab(t) || isUntitled(t) ? t : unverbatim(t))))].filter((t) =>
       isSideTab(t)
-        ? hostSessions.some((s) => s.id === sideTabSession(t) && s.parentId === sessionId && s.sideChat)
+        ? hostSessions.some((s) => s.id === sideTabSession(t) && s.parentId === sessionId && (s.sideChat || !!s.review))
         : isUntitled(t)
           ? untitled.has(t)
           : isAiTab(t)
@@ -2382,7 +2476,103 @@ export function FilePanel({
     }
     return any ? { a, d } : null;
   }, [allChanged, activeChangesGit]);
-  const cRows = useMemo(() => (root ? searchRows(root, changed, collapsed) : []), [root, changed, collapsed]);
+
+  const normRootSlash = root ? root.replace(/\\/g, '/').replace(/\/+$/, '') : '';
+  const reviewRelOf = useCallback(
+    (p: string) => {
+      const ps = p.replace(/\\/g, '/');
+      if (normRootSlash && ps.toLowerCase().startsWith((normRootSlash + '/').toLowerCase())) {
+        return ps.slice(normRootSlash.length + 1);
+      }
+      if (root && ps.startsWith(root.replace(/\\/g, '/'))) {
+        return ps.slice(root.length).replace(/^[\\/]/, '') || '.';
+      }
+      return ps;
+    },
+    [normRootSlash, root],
+  );
+  const knownReviewFiles = useMemo(() => {
+    const s = new Set<string>(changed);
+    for (const p of activeReviewMeta?.includedFiles ?? []) s.add(p);
+    return s;
+  }, [changed, activeReviewMeta?.includedFiles]);
+  const activeReviewLive = useMemo(
+    () => (activeReviewId ? [...activeReviewData.live.values()].join('\n').trim() : ''),
+    [activeReviewData.live, activeReviewData.version, activeReviewId],
+  );
+  const activeReviewSnapshot = useMemo(
+    () =>
+      activeReviewId
+        ? extractReviewSnapshot(activeReviewData.events, activeReviewLive, activeReviewBusy, {
+            knownFiles: knownReviewFiles,
+            cwd: activeReviewInfo?.cwd ?? cwd,
+          })
+        : { issues: [], prose: '', latestText: '', hasStructuredBlock: false, round: 0, messageSeq: 0 },
+    [activeReviewId, activeReviewData.events, activeReviewData.events.length, activeReviewLive, activeReviewBusy, knownReviewFiles, activeReviewInfo?.cwd, cwd],
+  );
+  const activeReviewThreads = useMemo(
+    () => (activeReviewId ? extractFindingThreads(activeReviewData.events) : new Map()),
+    [activeReviewId, activeReviewData.events, activeReviewData.events.length],
+  );
+  const activeReviewStream = useMemo(
+    () => (activeReviewId ? getActiveFindingStream(activeReviewData.events, activeReviewLive, activeReviewBusy) : null),
+    [activeReviewId, activeReviewData.events, activeReviewData.events.length, activeReviewLive, activeReviewBusy],
+  );
+  const activeReviewPendingPerms = useMemo(() => {
+    if (!activeReviewId) return [];
+    const open = new Map<string, Extract<HubEvent, { kind: 'permission_request' }>>();
+    for (const e of activeReviewData.events) {
+      if (e.kind === 'permission_request') open.set(e.requestId, e);
+      if (e.kind === 'permission_resolved') open.delete(e.requestId);
+    }
+    return [...open.values()];
+  }, [activeReviewId, activeReviewData.events, activeReviewData.events.length]);
+  const answerActiveReviewPerm = (requestId: string, optionId: string, answers?: QuestionAnswer[]) => {
+    if (!activeReviewId) return;
+    rpc(hostId, 'session.permission', {
+      sessionId: activeReviewId,
+      requestId,
+      optionId,
+      answers,
+    }).catch(errorToast);
+  };
+  const activeDispositions = activeReviewId ? getAllDispositions(hostId, activeReviewId) : {};
+  const fileIssueBadges = useMemo(
+    () =>
+      activeReviewId
+        ? computeFileIssueBadges(activeReviewSnapshot.issues, activeDispositions, knownReviewFiles, activeReviewInfo?.cwd ?? cwd)
+        : new Map<string, FileIssueBadge>(),
+    [activeReviewId, activeReviewSnapshot.issues, activeDispositions, knownReviewFiles, activeReviewInfo?.cwd, cwd],
+  );
+  const activeReviewTotals = useMemo(() => {
+    let high = 0, medium = 0, low = 0, open = 0;
+    for (const it of activeReviewSnapshot.issues) {
+      const d = activeDispositions[it.id] ?? 'open';
+      if (d === 'dismissed') continue;
+      if (it.severity === 'high') high += 1;
+      else if (it.severity === 'medium') medium += 1;
+      else low += 1;
+      if (d === 'open') open += 1;
+    }
+    return { high, medium, low, total: high + medium + low, open };
+  }, [activeReviewSnapshot.issues, activeDispositions]);
+  const reviewIncludedSet = useMemo(
+    () => (activeReviewMeta?.includedFiles?.length ? new Set(activeReviewMeta.includedFiles) : null),
+    [activeReviewMeta?.includedFiles],
+  );
+  const reviewCleanCheck = useCallback(
+    (relPath: string) => {
+      if (!activeReviewId || activeReviewBusy || !activeReviewSnapshot.hasStructuredBlock) return false;
+      if (reviewIncludedSet && !reviewIncludedSet.has(relPath)) return false;
+      return true;
+    },
+    [activeReviewId, activeReviewBusy, activeReviewSnapshot.hasStructuredBlock, reviewIncludedSet],
+  );
+  const displayedChanged = useMemo(() => {
+    if (!reviewOnlyFilter || !activeReviewId) return changed;
+    return changed.filter((r) => (fileIssueBadges.get(r)?.total ?? 0) > 0);
+  }, [changed, reviewOnlyFilter, activeReviewId, fileIssueBadges]);
+  const cRows = useMemo(() => (root ? searchRows(root, displayedChanged, collapsed) : []), [root, displayedChanged, collapsed]);
   const toggleCollapsed = (r: TreeRow) =>
     setCollapsed((s) => {
       const n = new Set(s);
@@ -2502,8 +2692,97 @@ export function FilePanel({
     const refPath = opts?.refPath ?? (file?.commit ? file.commit.rel : file?.path ?? name);
     const commitHash = opts?.commitHash ?? file?.commit?.hash;
     const editable = !!opts?.editable;
+    const diffRelPath = activeReviewId
+      ? normalizeReviewPath(reviewRelOf(refPath), knownReviewFiles, activeReviewInfo?.cwd ?? cwd) ?? reviewRelOf(refPath)
+      : '';
+    const fileIssues =
+      activeReviewId && diffRelPath
+        ? activeReviewSnapshot.issues.filter((it) => it.file && it.file === diffRelPath)
+        : [];
+    const fileIssuesById = new Map<string, ReviewIssue>();
+    for (const it of fileIssues) fileIssuesById.set(it.id, it);
+    const openInFileIssues = fileIssues.filter((it) => (activeDispositions[it.id] ?? 'open') === 'open');
+    const stepFileIssue = (delta: number) => {
+      if (!fileIssues.length) return;
+      const idx = (diffIssueCursor + delta + fileIssues.length) % fileIssues.length;
+      const target = fileIssues[idx];
+      setDiffIssueCursor(idx);
+      setShowInlineReviews(true);
+      setHighlightedFindingId(target.id);
+      setGoto({ line: target.line ?? 1, n: Date.now() });
+    };
     return (
       <div className="wp-diff wp-diff-full">
+        {activeReviewId && activeReviewInfo && fileIssues.length > 0 && (
+          <div className="wp-diff-review-bar">
+            <div className="wp-diff-review-left">
+              <ToolBadge tool={activeReviewInfo.tool} size={13} />
+              <span className="wp-diff-review-title">
+                {tx('reviewFileRibbonTitle', { tool: TOOL_LABEL[activeReviewInfo.tool], n: fileIssues.length })}
+              </span>
+              {openInFileIssues.length > 0 && (
+                <span className="wp-diff-review-open">{openInFileIssues.length}</span>
+              )}
+            </div>
+            <div className="wp-diff-review-acts">
+              {fileIssues.length > 1 && (
+                <>
+                  <button
+                    type="button"
+                    className="icon-btn"
+                    title={tx('reviewPrevIssue')}
+                    onClick={() => stepFileIssue(-1)}
+                  >
+                    <Icon name="up" size={12} />
+                  </button>
+                  <button
+                    type="button"
+                    className="icon-btn"
+                    title={tx('reviewNextIssue')}
+                    onClick={() => stepFileIssue(1)}
+                  >
+                    <Icon name="down" size={12} />
+                  </button>
+                </>
+              )}
+              <button
+                type="button"
+                className="wp-review-link"
+                onClick={() => setShowInlineReviews((v) => !v)}
+              >
+                {showInlineReviews ? tx('reviewHideInline') : tx('reviewShowInline')}
+              </button>
+              {openInFileIssues.length > 0 && (
+                <button
+                  type="button"
+                  className="btn small primary"
+                  onClick={() => {
+                    const count = adoptReviewFindings({
+                      hostId,
+                      reviewSessionId: activeReviewId,
+                      parentSessionId: sessionId,
+                      tool: activeReviewInfo.tool,
+                      issues: openInFileIssues,
+                      commitHash,
+                    });
+                    if (count > 0) toast(tx('reviewAdoptedToast', { n: count }));
+                  }}
+                >
+                  <Icon name="check" size={11} />
+                  {tx('reviewAdoptAllOpen', { n: openInFileIssues.length })}
+                </button>
+              )}
+              <button
+                type="button"
+                className="btn small"
+                onClick={() => void openFile(sideTabPath(activeReviewId))}
+              >
+                <Icon name="sideChat" size={11} />
+                {tx('reviewOpenSideBtn')}
+              </button>
+            </div>
+          </div>
+        )}
         <MergeDiff
           ref={mergeRef}
           docKey={file ? `${file.path}#${compare?.path ?? ''}#${diffBaseRev}#${diffEndRev}` : name}
@@ -2529,6 +2808,34 @@ export function FilePanel({
           onAddContext={standalone ? undefined : (snip) => pushContextRef(refPath, snip, commitHash)}
           onAddReview={standalone ? undefined : (snip, comment) => pushReviewComment(refPath, snip, comment, commitHash)}
           onCopyHunk={(content) => void copy(content, tx('diffCopied'))}
+          inlineReviews={showInlineReviews && activeReviewId ? fileIssues.map((it) => ({ id: it.id, line: it.line ?? 1 })) : undefined}
+          renderInlineReview={
+            showInlineReviews && activeReviewId
+              ? (fid) => {
+                  const it = fileIssuesById.get(fid);
+                  if (!it || !activeReviewInfo) return null;
+                  return (
+                    <ReviewInlineWidget
+                      hostId={hostId}
+                      parentSessionId={sessionId}
+                      reviewSessionId={activeReviewId}
+                      tool={activeReviewInfo.tool}
+                      issue={it}
+                      disposition={getFindingDisposition(hostId, activeReviewId, it.id)}
+                      thread={activeReviewThreads.get(it.id) ?? []}
+                      streamingText={activeReviewStream?.findingId === it.id ? activeReviewStream.liveText : undefined}
+                      busy={activeReviewBusy}
+                      connected={connected}
+                      pendingPerms={activeReviewPendingPerms}
+                      onAnswerPerm={answerActiveReviewPerm}
+                      highlighted={highlightedFindingId === it.id}
+                      commitHash={commitHash}
+                      onOpenSideChat={() => void openFile(sideTabPath(activeReviewId))}
+                    />
+                  );
+                }
+              : undefined
+          }
         />
       </div>
     );
@@ -2860,6 +3167,69 @@ export function FilePanel({
                     <LineStat a={totals.a} d={totals.d} />
                   </div>
                 )}
+                {!standalone && activeReviewInfo && (
+                  <div className="wp-review-ov-bar">
+                    <button
+                      type="button"
+                      className="wp-review-ov-main"
+                      onClick={() => void openFile(sideTabPath(activeReviewInfo.id))}
+                      title={activeReviewMeta?.scopeLabel ?? tx('reviewTabPrefix')}
+                    >
+                      <ToolBadge tool={activeReviewInfo.tool} size={13} />
+                      {activeReviewBusy ? (
+                        <span className="wp-review-ov-stat">
+                          <span className="spinner mini" />
+                          <span>{tx('reviewOverviewRunning')}</span>
+                        </span>
+                      ) : activeReviewSnapshot.hasStructuredBlock ? (
+                        activeReviewTotals.total > 0 ? (
+                          <span className="wp-review-ov-counts">
+                            {activeReviewTotals.high > 0 && <span className="wp-review-sev sev-high">{activeReviewTotals.high}</span>}
+                            {activeReviewTotals.medium > 0 && <span className="wp-review-sev sev-medium">{activeReviewTotals.medium}</span>}
+                            {activeReviewTotals.low > 0 && <span className="wp-review-sev sev-low">{activeReviewTotals.low}</span>}
+                          </span>
+                        ) : (
+                          <span className="wp-review-ov-clean">{tx('reviewNoIssuesFound')}</span>
+                        )
+                      ) : (
+                        <span className="truncate muted small">{activeReviewMeta?.scopeLabel ?? tx('reviewTabPrefix')}</span>
+                      )}
+                    </button>
+                    <div className="wp-review-ov-acts">
+                      {activeReviewTotals.total > 0 && (
+                        <button
+                          type="button"
+                          className={`wp-review-chip ${reviewOnlyFilter ? 'active' : ''}`}
+                          onClick={() => setReviewOnlyFilter((v) => !v)}
+                        >
+                          {tx('reviewOnlyWithIssues')}
+                        </button>
+                      )}
+                      {reviewSessions.length > 1 && (
+                        <button
+                          type="button"
+                          className="icon-btn"
+                          title={tx('reviewSwitchRun')}
+                          onClick={(e) => {
+                            const r = e.currentTarget.getBoundingClientRect();
+                            openMenu(
+                              { clientX: r.right - 220, clientY: r.bottom + 4 },
+                              reviewSessions.map((rs) => ({
+                                label: sideChatTitle(rs),
+                                icon: 'sparkles',
+                                active: rs.id === activeReviewId,
+                                hint: rs.review?.scopeLabel ?? TOOL_LABEL[rs.tool],
+                                run: () => setActiveReviewId(hostId, sessionId, rs.id),
+                              })),
+                            );
+                          }}
+                        >
+                          <Icon name="down" size={11} />
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                )}
                 {cRows.length ? (
                   <Rows
                     rows={cRows}
@@ -2872,7 +3242,17 @@ export function FilePanel({
                     onOpen={(r) => openFile(r.path, true)}
                     onMenu={rowMenu}
                     onDragRow={dragRow}
+                    reviewBadges={activeReviewId ? fileIssueBadges : undefined}
+                    reviewRelOf={activeReviewId ? reviewRelOf : undefined}
+                    reviewCleanCheck={activeReviewId ? reviewCleanCheck : undefined}
                   />
+                ) : reviewOnlyFilter && changed.length > 0 ? (
+                  <div className="wp-tip">
+                    <b>{tx('reviewNoIssuesUnderFilter')}</b>
+                    <button type="button" className="wp-review-link" onClick={() => setReviewOnlyFilter(false)}>
+                      {tx('reviewShowAllChanged')}
+                    </button>
+                  </div>
                 ) : (
                   <div className="wp-tip">
                     <b>{tx('noChanges')}</b>
@@ -3006,6 +3386,27 @@ export function FilePanel({
     onCopyHunk: (content: string) => void copy(content, tx('diffCopied')),
   });
 
+  const openReviewFile = (reviewSid: string, relPath: string, line?: number) => {
+    const cleanRel = relPath.replace(/\\/g, '/').replace(/^\.\//, '');
+    const rmeta = resolveReviewMeta(hostSessions.find((x) => x.id === reviewSid), getReviewMeta(reviewSid));
+    if (rmeta?.scope === 'commits' && rmeta.commits?.length === 1) {
+      void openFile(commitTab(rmeta.commits[0], cleanRel), true, line ? { line } : undefined);
+      return;
+    }
+    if (rmeta?.baseRev && rmeta?.endRev) {
+      void openFile(commitRangeTab(rmeta.baseRev, rmeta.endRev, cleanRel), true, line ? { line } : undefined);
+      return;
+    }
+    if (rmeta?.scope === 'uncommitted') {
+      setDiffScope('uncommitted');
+    } else if (rmeta?.scope === 'branch' && rmeta.includeUncommitted && rmeta.base) {
+      setBranchBase(rmeta.base);
+      setDiffScope('branch');
+    }
+    const abs = git ? join(git.repo, cleanRel.split('/').join(sepOf(git.repo))) : relOpen(cleanRel);
+    void openFile(abs, true, line ? { line } : undefined);
+  };
+
   // Content of the editor column: file / changes / compare / review / side chat
   const mainView = !file ? null : file.side ? (
     <SideChatPane
@@ -3013,6 +3414,7 @@ export function FilePanel({
       hostId={hostId}
       parentSessionId={sessionId}
       sideSessionId={sideTabSession(file.path)}
+      onOpenFile={(relPath, line) => openReviewFile(sideTabSession(file.path), relPath, line)}
       onDeleted={() => void closeTab(file.path)}
     />
   ) : file.review ? (
@@ -3021,26 +3423,7 @@ export function FilePanel({
       hostId={hostId}
       reviewSessionId={reviewTabSession(file.path)}
       parentSessionId={sessionId}
-      onOpenFile={(relPath, line) => {
-        const cleanRel = relPath.replace(/\\/g, '/').replace(/^\.\//, '');
-        const rmeta = getReviewMeta(reviewTabSession(file.path));
-        if (rmeta?.scope === 'commits' && rmeta.commits?.length === 1) {
-          void openFile(commitTab(rmeta.commits[0], cleanRel), true, line ? { line } : undefined);
-          return;
-        }
-        if (rmeta?.baseRev && rmeta?.endRev) {
-          void openFile(commitRangeTab(rmeta.baseRev, rmeta.endRev, cleanRel), true, line ? { line } : undefined);
-          return;
-        }
-        if (rmeta?.scope === 'uncommitted') {
-          setDiffScope('uncommitted');
-        } else if (rmeta?.scope === 'branch' && rmeta.includeUncommitted && rmeta.base) {
-          setBranchBase(rmeta.base);
-          setDiffScope('branch');
-        }
-        const abs = git ? join(git.repo, cleanRel.split('/').join(sepOf(git.repo))) : relOpen(cleanRel);
-        void openFile(abs, true, line ? { line } : undefined);
-      }}
+      onOpenFile={(relPath, line) => openReviewFile(reviewTabSession(file.path), relPath, line)}
     />
   ) : file.commit ? (
     full ? (
@@ -3242,6 +3625,7 @@ export function FilePanel({
                 const sinfo = sideTabInfo(t);
                 const sattn = (sinfo?.pendingPermissions ?? 0) > 0 || sinfo?.status === 'waiting-permission';
                 const sbusy = sinfo?.status === 'running' || sinfo?.status === 'starting';
+                const isRevSide = !!(sinfo?.review || getReviewMeta(sideTabSession(t)));
                 const label = sideTabLabel(t);
                 return (
                   <div
@@ -3259,7 +3643,7 @@ export function FilePanel({
                       ])
                     }
                   >
-                    {sattn ? <span className="wp-side-dot attn" /> : sbusy ? <span className="wp-side-dot running" /> : <Icon name="sideChat" size={13} />}
+                    {sattn ? <span className="wp-side-dot attn" /> : sbusy ? <span className="wp-side-dot running" /> : <Icon name={isRevSide ? 'sparkles' : 'sideChat'} size={13} />}
                     <span className="truncate">{label}</span>
                     <button
                       className="wp-ftab-x"
@@ -3726,7 +4110,7 @@ export function FilePanel({
           branchCount={branchKeys.length}
           preset={reviewPreset}
           onStarted={(rsid) => {
-            void openFile(REVIEW_PREFIX + rsid);
+            void openFile(sideTabPath(rsid));
           }}
           onClose={() => setReviewPreset(null)}
         />

@@ -207,6 +207,8 @@ struct State {
     /// Active pre-turn replay guard during an Antigravity `session/prompt`
     agy_replay: Option<AgyReplayGuard>,
     agy_replay_hidden: HashSet<String>,
+    /// Strictly read-only code review side chat guard
+    read_only_review: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -323,6 +325,9 @@ pub fn build_args(spec: &StartSpec) -> Vec<String> {
         if has(crate::mcp::SESSION_SERVER) {
             rules.extend(crate::session_mcp::tool_names().map(|name| format!("@{}/{name}", crate::mcp::SESSION_SERVER)));
         }
+        if has(crate::mcp::REVIEW_SERVER) {
+            rules.extend(crate::review_mcp::tool_names().map(|name| format!("@{}/{name}", crate::mcp::REVIEW_SERVER)));
+        }
         if !rules.is_empty() {
             let rules = rules.join(",");
             if let Some(index) = a.iter().rposition(|arg| arg == "--trust-tools" || arg.starts_with("--trust-tools=")) {
@@ -353,6 +358,7 @@ pub async fn run(spec: StartSpec, em: Emitter, mut rx: mpsc::UnboundedReceiver<A
         memory_notice: super::acp_memory_notice(&spec),
         memory_enabled: spec.memory_prompt.is_some()
             || spec.mcp_servers.iter().any(|server| server["name"] == crate::mcp::MEMORY_SERVER),
+        read_only_review: spec.read_only_review,
         ..Default::default()
     };
     let init = st.req(
@@ -1802,16 +1808,46 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Result<V
                     return Ok(out);
                 }
             }
-            // A yi_browser, yi_memory or yi_session call: the gateway enforces plan mode, write policy, family scope and secret checks
+            // A yi_browser, yi_memory, yi_session or yi_review call: the gateway enforces plan mode, write policy, family scope and secret checks
             if !question {
                 if let Some(name) = gateway_tool(&known.name, &title, &tc["rawInput"]) {
-                    if em.browser_tool_allowed(&name) || em.memory_tool_allowed(&name) || em.session_tool_allowed(&name) {
+                    if em.browser_tool_allowed(&name)
+                        || em.memory_tool_allowed(&name)
+                        || em.session_tool_allowed(&name)
+                        || em.review_tool_allowed(&name)
+                    {
                         if let Some(o) = options.iter().find(|o| o.kind == "allow_once").or_else(|| options.iter().find(|o| o.kind.starts_with("allow"))) {
                             out.push(json!({"jsonrpc":"2.0","id":v["id"],
                                 "result":{"outcome":{"outcome":"selected","optionId":o.id}}}));
                             return Ok(out);
                         }
                     }
+                }
+            }
+            if !question && st.read_only_review {
+                match super::review_guard::classify_review_action(
+                    &known.name,
+                    tc["kind"].as_str(),
+                    &title,
+                    &tc["rawInput"],
+                ) {
+                    super::review_guard::ReviewGuardDecision::Allow => {
+                        if let Some(o) = options.iter().find(|o| o.kind == "allow_once").or_else(|| options.iter().find(|o| o.kind.starts_with("allow"))) {
+                            out.push(json!({"jsonrpc":"2.0","id":v["id"],
+                                "result":{"outcome":{"outcome":"selected","optionId":o.id}}}));
+                            return Ok(out);
+                        }
+                    }
+                    super::review_guard::ReviewGuardDecision::Deny(_) => {
+                        let outcome = if let Some(o) = options.iter().find(|o| o.kind == "reject_once").or_else(|| options.iter().find(|o| o.kind.starts_with("reject"))) {
+                            json!({"outcome":"selected","optionId":o.id})
+                        } else {
+                            json!({"outcome":"cancelled"})
+                        };
+                        out.push(json!({"jsonrpc":"2.0","id":v["id"],"result":{"outcome":outcome}}));
+                        return Ok(out);
+                    }
+                    super::review_guard::ReviewGuardDecision::Ask => {}
                 }
             }
             st.perms.insert(rid.clone(), v["id"].clone());
@@ -2271,6 +2307,7 @@ fn gateway_tool(name: &str, title: &str, input: &Value) -> Option<String> {
     check_server(crate::mcp::BROWSER_SERVER, &|t| yi_browser::tool_names().any(|x| x == t))
         .or_else(|| check_server(crate::mcp::MEMORY_SERVER, &|t| crate::memory::tool_names().any(|x| x == t)))
         .or_else(|| check_server(crate::mcp::SESSION_SERVER, &|t| crate::session_mcp::tool_names().any(|x| x == t)))
+        .or_else(|| check_server(crate::mcp::REVIEW_SERVER, &|t| crate::review_mcp::tool_names().any(|x| x == t)))
 }
 
 /// Kiro's `_kiro.dev/compaction/status`: status.type is started, then completed (or failed)
@@ -5021,6 +5058,43 @@ mod tests {
         assert_eq!(gateway_tool("DeferExecuteTool", "DeferExecuteTool", &sess_wrapped).as_deref(), Some("mcp__yi_session__session_read"));
         assert_eq!(gateway_tool("mcp__yi_session__session_write", "", &none), None);
         assert_eq!(gateway_tool("Bash", "echo session_read (yi_session)", &json!({"command": "mcp__yi_session__session_read"})), None);
+        // yi_review exact forms
+        assert_eq!(gateway_tool("mcp__yi_review__review_diff", "", &none).as_deref(), Some("mcp__yi_review__review_diff"));
+        assert_eq!(gateway_tool("tool", "review_scope (yi_review)", &none).as_deref(), Some("mcp__yi_review__review_scope"));
+        let rev_wrapped = json!({"toolName": "mcp__yi_review__review_read_file", "params": {"path": "a.rs"}});
+        assert_eq!(gateway_tool("DeferExecuteTool", "DeferExecuteTool", &rev_wrapped).as_deref(), Some("mcp__yi_review__review_read_file"));
+        assert_eq!(gateway_tool("mcp__yi_review__review_write", "", &none), None);
+    }
+
+    #[test]
+    fn read_only_review_guard_in_acp_adapter() {
+        use super::*;
+        let (hub, em, _rx) = crate::hub::test_emitter();
+        let mut st = State { perm: "default".into(), read_only_review: true, ..Default::default() };
+        let opts = json!([
+            {"optionId": "once", "name": "Allow", "kind": "allow_once"},
+            {"optionId": "no", "name": "Reject", "kind": "reject_once"}
+        ]);
+
+        let read_req = json!({"jsonrpc": "2.0", "id": 10, "method": "session/request_permission", "params": {
+            "toolCall": {"toolCallId": "r1", "kind": "read", "title": "Read file", "rawInput": {}},
+            "options": opts}});
+        let out_read = handle(&mut st, &super::model_config_tests::agy_test_spec(), &read_req, &em).unwrap();
+        assert_eq!(out_read[0]["result"]["outcome"]["optionId"], "once");
+
+        let write_req = json!({"jsonrpc": "2.0", "id": 11, "method": "session/request_permission", "params": {
+            "toolCall": {"toolCallId": "w1", "kind": "edit", "title": "Edit file", "rawInput": {}},
+            "options": opts}});
+        let out_write = handle(&mut st, &super::model_config_tests::agy_test_spec(), &write_req, &em).unwrap();
+        assert_eq!(out_write[0]["result"]["outcome"]["optionId"], "no");
+
+        let ask_req = json!({"jsonrpc": "2.0", "id": 12, "method": "session/request_permission", "params": {
+            "toolCall": {"toolCallId": "a1", "kind": "execute", "title": "Run", "rawInput": {"command": "npm test"}},
+            "options": opts}});
+        let out_ask = handle(&mut st, &super::model_config_tests::agy_test_spec(), &ask_req, &em).unwrap();
+        assert!(out_ask.is_empty());
+        assert!(st.perms.contains_key("12"));
+        assert_eq!(hub.store.events_since("s", 0, 20).unwrap().len(), 1);
     }
 
     #[test]
@@ -5323,7 +5397,7 @@ mod model_config_tests {
             replay_skip: 0, model: Some(model.into()), effort: None, model_config_options: vec![],
             permission_mode: "default".into(), command: None, program: "cursor-agent".into(), extra_args: vec![],
             mcp_servers: vec![], mcp_fingerprint: String::new(), allow_mcp: vec![], system_prompt: None, system_notice: false, memory_prompt: None, memory_notice: false, cols: 80, rows: 24, tmux: None, session_id: None,
-            env: Default::default(), env_unset: vec![], data_dir: None, auth_method: None, account_handoff: None, fork_session: false, fork_fallback_handoff: None,
+            env: Default::default(), env_unset: vec![], data_dir: None, auth_method: None, account_handoff: None, fork_session: false, fork_fallback_handoff: None, read_only_review: false,
         }
     }
 
@@ -5667,6 +5741,7 @@ mod model_config_tests {
             account_handoff: None,
             fork_session: false,
             fork_fallback_handoff: None,
+            read_only_review: false,
         };
         let req = resume_session(&mut st4, &sp, "agy-1");
         let outs = handle(&mut st4, &sp, &json!({"id": req["id"], "result": r}), &em).unwrap();
@@ -5888,6 +5963,7 @@ mod model_config_tests {
             account_handoff: None,
             fork_session: false,
             fork_fallback_handoff: None,
+            read_only_review: false,
         }
     }
 

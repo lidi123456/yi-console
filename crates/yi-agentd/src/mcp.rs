@@ -8,6 +8,7 @@ pub const DESKTOP_SERVER: &str = "yi_computer_use";
 pub const BROWSER_SERVER: &str = crate::browser::SERVER;
 pub const MEMORY_SERVER: &str = crate::memory::SERVER;
 pub const SESSION_SERVER: &str = crate::session_mcp::SERVER;
+pub const REVIEW_SERVER: &str = crate::review_mcp::SERVER;
 const MASK: &str = "********";
 
 pub fn supported(tool: ToolKind) -> bool {
@@ -46,6 +47,9 @@ pub fn validate(settings: &DaemonSettings) -> Result<()> {
         }
         if server.name == SESSION_SERVER {
             bail!("MCP 名称 yi_session 为内置会话读取保留");
+        }
+        if server.name == REVIEW_SERVER {
+            bail!("MCP 名称 yi_review 为内置代码审阅保留");
         }
         if !names.insert(&server.name) {
             bail!("MCP 名称重复：{}", server.name);
@@ -145,6 +149,10 @@ pub fn memory(config: Value) -> Result<McpServerConfig> {
 
 pub fn session(config: Value) -> Result<McpServerConfig> {
     Ok(serde_json::from_value(json!({"name":SESSION_SERVER,"command":config["command"],"args":config["args"]}))?)
+}
+
+pub fn review(config: Value) -> Result<McpServerConfig> {
+    Ok(serde_json::from_value(json!({"name":REVIEW_SERVER,"command":config["command"],"args":config["args"]}))?)
 }
 
 /// Cache identity only; the digest is not used as an authorization credential.
@@ -251,6 +259,8 @@ mod tests {
         settings.mcp_servers[0].name = MEMORY_SERVER.into();
         assert!(validate(&settings).is_err());
         settings.mcp_servers[0].name = SESSION_SERVER.into();
+        assert!(validate(&settings).is_err());
+        settings.mcp_servers[0].name = REVIEW_SERVER.into();
         assert!(validate(&settings).is_err());
         settings.mcp_servers[0] = fixture();
         let mut hidden = redact(settings.clone());

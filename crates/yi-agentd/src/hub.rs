@@ -276,6 +276,8 @@ pub struct Hub {
     pub memories: crate::memory::Memories,
     /// Read-only related-session MCP gateway (`yi_session`) for side chats and parent conversations
     pub session_mcp: crate::session_mcp::SessionMcp,
+    /// Strictly read-only AI code review MCP gateway (`yi_review`) for review side chats
+    pub review_mcp: crate::review_mcp::ReviewMcp,
     /// Clients that said who they are (`client.hello`), and the client MCP bridge
     pub clients: crate::clientmcp::Clients,
     /// Each tool's most recently reported model list (persisted, used for new sessions)
@@ -351,6 +353,9 @@ pub struct CreateParams {
     /// Configured account id to bind this session to (when omitted, uses the tool's active account if configured)
     #[serde(default)]
     pub account_id: Option<String>,
+    /// Read-only cross-tool AI code review metadata (implies `side_chat = true`)
+    #[serde(default)]
+    pub review: Option<ReviewMeta>,
 }
 
 impl Hub {
@@ -368,6 +373,7 @@ impl Hub {
             browsers: crate::browser::Browsers::new(),
             memories: crate::memory::Memories::default(),
             session_mcp: crate::session_mcp::SessionMcp::default(),
+            review_mcp: crate::review_mcp::ReviewMcp::default(),
             clients: Default::default(),
             tool_models: Mutex::new(
                 std::fs::read(models_path())
@@ -402,6 +408,7 @@ impl Hub {
             browsers: crate::browser::Browsers::new(),
             memories: crate::memory::Memories::default(),
             session_mcp: crate::session_mcp::SessionMcp::default(),
+            review_mcp: crate::review_mcp::ReviewMcp::default(),
             clients: Default::default(),
             tool_models: Mutex::new(HashMap::new()),
             tool_commands: Mutex::new(HashMap::new()),
@@ -825,7 +832,8 @@ impl Hub {
                 }
             }
         }
-        if p.side_chat {
+        let side_chat = p.side_chat || (p.review.is_some() && p.parent_id.as_deref().is_some_and(|s| !s.trim().is_empty()));
+        if side_chat {
             if mode != SessionMode::Structured || !tool.has_process() || tool == ToolKind::Shell {
                 bail!("旁路对话仅支持 AI 工具的聊天模式");
             }
@@ -892,7 +900,7 @@ impl Hub {
             restart_interrupted: false,
             background_tasks: vec![],
             parent_id: p.parent_id.clone(),
-            side_chat: p.side_chat,
+            side_chat,
             synced_users: None,
             auto_resume: None,
             limit_hits: 0,
@@ -906,6 +914,7 @@ impl Hub {
             account_id,
             account_label,
             checkpoints: vec![],
+            review: p.review.clone(),
         };
         self.store.save_session(&info)?;
         let rt = Arc::new(new_rt(info.clone()));
@@ -967,7 +976,7 @@ impl Hub {
             let tool = frt.info.lock().unwrap().tool;
             self.emit(&info.id, 0, EventBody::Handoff { session_id: fid.clone(), tool, to: false });
         }
-        if info.side_chat {
+        if info.side_chat && info.review.is_none() {
             *rt.side_context_pending.lock().unwrap() = true;
         }
         let images = if mode == SessionMode::Structured { p.images } else { vec![] };
@@ -1089,6 +1098,11 @@ impl Hub {
                     servers.push(crate::mcp::session(config)?);
                 }
             }
+            if info.review.is_some() && self.review_mcp.ensure_session(&info.id).is_ok() {
+                if let Some(config) = self.review_mcp.mcp_config(&info.id) {
+                    servers.push(crate::mcp::review(config)?);
+                }
+            }
         }
         let mut allow_mcp = vec![];
         if structured_ai {
@@ -1100,7 +1114,7 @@ impl Hub {
         let mcp_servers = crate::mcp::inject(info.tool, &servers, &mut extra_args);
         let mut fork_session = false;
         let mut fork_fallback_handoff = None;
-        if info.side_chat && info.mode == SessionMode::Structured {
+        if info.side_chat && info.review.is_none() && info.mode == SessionMode::Structured {
             if let Some(pid) = info.parent_id.as_deref() {
                 if resume.is_none() {
                     if let Some((_, parent_ext)) = self.can_native_fork_side(info) {
@@ -1142,7 +1156,7 @@ impl Hub {
         }
         let system_prompt = info.append_system_prompt.clone().filter(|_| structured_ai);
         // A new tool session has not seen the prompt yet; `launch` also sets this after the prompt changed
-        let system_notice = system_prompt.is_some() && resume.is_none();
+        let system_notice = (system_prompt.is_some() || info.review.is_some()) && resume.is_none();
         let memory_notice = memory_prompt.is_some() && resume.is_none();
         let account_handoff = if info.mode == SessionMode::Structured
             && matches!(info.tool, ToolKind::Codex | ToolKind::Cursor)
@@ -1200,6 +1214,7 @@ impl Hub {
             account_handoff,
             fork_session,
             fork_fallback_handoff,
+            read_only_review: info.review.is_some(),
         })
     }
 
@@ -1244,7 +1259,7 @@ impl Hub {
                 }
             }
             if std::mem::take(&mut *rt.prompt_dirty.lock().unwrap()) {
-                spec.system_notice = spec.system_prompt.is_some();
+                spec.system_notice = spec.system_prompt.is_some() || spec.read_only_review;
             }
             let gen = {
                 let mut g = rt.generation.lock().unwrap();
@@ -1264,6 +1279,7 @@ impl Hub {
         self.browsers.release_proxy(&sid);
         self.memories.release_proxy(&sid);
         self.session_mcp.release_proxy(&sid);
+        self.review_mcp.release_proxy(&sid);
         self.clients.release_proxies(&sid);
         if spec.mode == SessionMode::Terminal && matches!(spec.tool, ToolKind::Codex | ToolKind::Kiro) {
             let mut runs = rt.runs.lock().unwrap();
@@ -1396,7 +1412,7 @@ impl Hub {
         // A slash command must stay first for the tool to recognize it, so the hand-off waits for the next message.
         // Cursor's /compact is emulated in `acp.rs`, which folds the pending context into its summary
         let slash = text.trim_start().starts_with('/');
-        if !slash && info.side_chat {
+        if !slash && info.side_chat && info.review.is_none() {
             if let Some(pid) = info.parent_id.as_deref() {
                 if std::mem::take(&mut *rt.side_context_pending.lock().unwrap()) {
                     let mut pending = rt.pending_handoff.lock().unwrap();
@@ -2356,6 +2372,9 @@ impl Hub {
             if i.mode == SessionMode::Terminal {
                 bail!("终端模式的审批模式在启动时就定了，要换请新开一个会话");
             }
+            if i.review.is_some() {
+                bail!("代码审阅会话锁定为只读模式");
+            }
             if !permission_modes(i.tool, i.mode).contains(&mode) {
                 bail!("{} 不支持这个审批模式: {mode}", i.tool.as_str());
             }
@@ -2603,6 +2622,7 @@ impl Hub {
         self.revoke_desktop(id);
         self.memories.remove_session(id);
         self.session_mcp.remove_session(id);
+        self.review_mcp.remove_session(id);
         // The id comes from the client and is later used in a path for remove_dir_all: only handle sessions that really exist
         let rt = self.get(id)?;
         let (bot_link, session_cwd) = {
@@ -3440,6 +3460,9 @@ impl Hub {
             if info.side_chat {
                 p["sideChat"] = json!(true);
             }
+            if info.review.is_some() {
+                p["review"] = json!(true);
+            }
             if let Some(n) = limit_notice {
                 p["kind"] = json!("rate_limit");
                 p["limit"] = n;
@@ -4147,6 +4170,7 @@ impl Hub {
         self.browsers.release_proxy(sid);
         self.memories.release_proxy(sid);
         self.session_mcp.release_proxy(sid);
+        self.review_mcp.release_proxy(sid);
         self.clients.release_proxies(sid);
         if let Some(h) = handoff {
             *rt.pending_handoff.lock().unwrap() = Some(h);
@@ -4174,7 +4198,11 @@ impl Hub {
     /// True when a side chat can safely use a provider-native fork (`claude --fork-session` / Codex `thread/fork`)
     /// from its parent session: same provider & account, strong native session id, and parent is currently idle.
     fn can_native_fork_side(&self, info: &SessionInfo) -> Option<(String, String)> {
-        if !info.side_chat || info.mode != SessionMode::Structured || info.external_id.is_some() {
+        if !info.side_chat
+            || info.review.is_some()
+            || info.mode != SessionMode::Structured
+            || info.external_id.is_some()
+        {
             return None;
         }
         if !matches!(info.tool, ToolKind::Claude | ToolKind::Codex) {
@@ -4868,6 +4896,11 @@ impl Emitter {
         self.hub.session_mcp.authorizes(&self.sid, name)
     }
 
+    /// A yi_review tool may run without CLI prompts; the gateway is strictly read-only
+    pub fn review_tool_allowed(&self, name: &str) -> bool {
+        self.hub.review_mcp.authorizes(&self.sid, name)
+    }
+
     /// Build a fresh L0 memory snapshot for this session (used after ACP compaction or load fallback)
     pub fn memory_prompt_snapshot(&self) -> Option<String> {
         let info = self.hub.info(&self.sid).ok()?;
@@ -4885,6 +4918,7 @@ impl Emitter {
             || self.hub.browsers.authorizes(&self.sid, name)
             || self.hub.memories.authorizes(&self.sid, name)
             || self.hub.session_mcp.authorizes(&self.sid, name)
+            || self.hub.review_mcp.authorizes(&self.sid, name)
     }
 
     pub fn event(&self, body: EventBody) {
@@ -5646,6 +5680,7 @@ mod tests {
             account_id: None,
             account_label: None,
             checkpoints: vec![],
+            review: None,
         };
         let rt = new_rt(info);
         let (tx, rx) = mpsc::unbounded_channel();
@@ -6461,6 +6496,7 @@ mod tests {
             account_handoff: None,
             fork_session: false,
             fork_fallback_handoff: None,
+            read_only_review: false,
         };
         let before_gen = *rt.generation.lock().unwrap();
         let returned_tx = hub.launch_if_stopped(&rt, spec).unwrap();
@@ -7193,6 +7229,7 @@ mod tests {
             account_id: None,
             account_label: None,
             checkpoints: vec![],
+            review: None,
             queued: vec![],
             queue_paused: None,
             restart_interrupted: false,
@@ -7261,6 +7298,62 @@ mod tests {
         assert_eq!(by_id["s-polluted"].updated_at, 1500);
         assert_eq!(by_id["s-empty"].updated_at, 400);
         assert_eq!(by_id["s-clean"].updated_at, 8000);
+    }
+
+    #[test]
+    fn review_side_chat_skips_parent_context_locks_readonly_and_tags_notify() {
+        let hub = Hub::new(crate::store::Store::open_memory().unwrap(), DaemonSettings::default());
+        let _parent_rx = live(&hub, "parent", SessionMode::Structured, SessionStatus::Idle, 1);
+        let _rev_rx = live(&hub, "rev-1", SessionMode::Structured, SessionStatus::Idle, 2);
+        {
+            let prt = hub.get("parent").unwrap();
+            let mut pinfo = prt.info.lock().unwrap();
+            pinfo.tool = ToolKind::Claude;
+            pinfo.external_id = Some("claude-parent".into());
+            hub.store.save_session(&pinfo).unwrap();
+
+            let rrt = hub.get("rev-1").unwrap();
+            let mut rinfo = rrt.info.lock().unwrap();
+            rinfo.tool = ToolKind::Claude;
+            rinfo.parent_id = Some("parent".into());
+            rinfo.side_chat = true;
+            rinfo.external_id = None;
+            rinfo.permission_mode = Some("plan".into());
+            rinfo.review = Some(yi_proto::ReviewMeta {
+                scope: "uncommitted".into(),
+                included_files: vec!["src/lib.rs".into()],
+                ..Default::default()
+            });
+            hub.store.save_session(&rinfo).unwrap();
+        }
+
+        // Review side chats must NOT fork parent session
+        let rev_info = hub.info("rev-1").unwrap();
+        assert!(hub.can_native_fork_side(&rev_info).is_none());
+
+        // Permission mode is locked to read-only for review sessions
+        assert!(hub.set_permission_mode("rev-1", "bypass").is_err());
+
+        // Notifications carry parentId, sideChat, and review flags
+        let mut rx = hub.bus.subscribe();
+        hub.emit(
+            "rev-1",
+            0,
+            EventBody::TurnEnd {
+                stop_reason: Some("end_turn".into()),
+                model: None,
+            },
+        );
+        let mut saw_notify = false;
+        while let Ok(msg) = rx.try_recv() {
+            if msg.method == yi_proto::methods::EV_NOTIFY {
+                assert_eq!(msg.params["parentId"], "parent");
+                assert_eq!(msg.params["sideChat"], true);
+                assert_eq!(msg.params["review"], true);
+                saw_notify = true;
+            }
+        }
+        assert!(saw_notify, "expected EV_NOTIFY with review=true");
     }
 }
 
