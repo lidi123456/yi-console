@@ -1117,7 +1117,13 @@ function LimitNote({ it, live, hostId, info }: { it: Extract<Item, { k: 'limit' 
   const ok = it.last.phase === 'resumed';
   // The latest limit with no automatic continue pending (that one has the button in LimitDock): offer another tool.
   // Not after it was handed off already, or the user carried on in this session
-  const settled = ok || (it.last.phase === 'cancelled' && (it.last.reason === 'handoff' || it.last.reason === 'manual'));
+  const settled =
+    ok ||
+    (it.last.phase === 'cancelled' &&
+      (it.last.reason === 'handoff' ||
+        it.last.reason === 'manual' ||
+        it.last.reason === 'account_switched' ||
+        it.last.reason === 'rate_limit_failover'));
   const offer = live && !settled && !!hostId && !!info && !info.autoResume && info.mode === 'structured';
   return (
     <div className={`note limit-note ${ok ? 'note-muted' : 'limit-note-warn'}`}>

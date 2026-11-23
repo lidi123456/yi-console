@@ -18,5 +18,6 @@
   "switchedToTheTerminalUi": "switched to the terminal UI, automatic continue dropped",
   "theSessionWasBusyAutomatic": "the session was busy, automatic continue skipped",
   "automaticContinueCancelled2": "automatic continue cancelled",
-  "handedOffAutomaticContinueCancelled": "handed off to another tool, no automatic continue"
+  "handedOffAutomaticContinueCancelled": "handed off to another tool, no automatic continue",
+  "switchedAccountAutomaticContinueCancelled": "switched accounts, automatic continue dropped"
 }

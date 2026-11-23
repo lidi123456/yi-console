@@ -89,6 +89,9 @@ export function limitOutcome(e: LimitEvent, live: boolean): string {
           return t('theSessionWasBusyAutomatic');
         case 'handoff':
           return t('handedOffAutomaticContinueCancelled');
+        case 'account_switched':
+        case 'rate_limit_failover':
+          return t('switchedAccountAutomaticContinueCancelled');
         default:
           return t('automaticContinueCancelled2');
       }

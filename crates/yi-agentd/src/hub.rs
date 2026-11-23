@@ -3807,6 +3807,7 @@ impl Hub {
         self: &Arc<Self>,
         sid: &str,
         account_id: &str,
+        auto_continue: bool,
     ) -> Result<SessionInfo> {
         let rt = self.get(sid)?;
         let (tool, mode, cur_account_id) = {
@@ -3827,9 +3828,10 @@ impl Hub {
             bail!("当前 Cursor 授权账号保存的凭据实际为 API Key 而非网页授权登录，请在账号管理中点击「重新登录」完成授权");
         }
 
+        let switched = cur_account_id.as_deref() != Some(account_id);
         let is_terminal = mode == SessionMode::Terminal;
         let mut was_live_terminal = false;
-        if is_terminal && cur_account_id.as_deref() != Some(account_id) {
+        if is_terminal && switched {
             self.guess_terminal_session(sid).await;
             let has_tx = self.running_tx(&rt).is_some();
             let tmux_name = crate::tmux::session_name(sid);
@@ -3849,7 +3851,12 @@ impl Hub {
         let sid_owned = sid.to_string();
         let aid_owned = account_id.to_string();
         let updated = tokio::task::spawn_blocking(move || {
-            hub2.switch_session_account(&sid_owned, &aid_owned, Some("manual"), false)
+            let switched_info = hub2.switch_session_account(&sid_owned, &aid_owned, Some("manual"), false)?;
+            if auto_continue && switched && mode == SessionMode::Structured {
+                hub2.continue_after_manual_switch(&sid_owned, &switched_info);
+                return Ok::<_, anyhow::Error>(hub2.info(&sid_owned).unwrap_or(switched_info));
+            }
+            Ok(switched_info)
         })
         .await??;
 
@@ -3888,7 +3895,6 @@ impl Hub {
             .get_stored(info.tool, account_id)
             .ok_or_else(|| anyhow!("目标账号不存在: {account_id}"))?;
         let iso = crate::accounts::AccountManager::effective_isolation(info.tool, to_acc.auth_kind);
-        self.cancel_resume(sid, reason.unwrap_or("account_switched"));
 
         if info.account_id.as_deref() == Some(account_id) {
             if iso == AccountIsolation::HostActive {
@@ -3900,6 +3906,13 @@ impl Hub {
             }
             return Ok(rt.info.lock().unwrap().clone());
         }
+
+        let cancel_reason = if is_failover || reason == Some("rate_limit_failover") {
+            "rate_limit_failover"
+        } else {
+            "account_switched"
+        };
+        self.cancel_resume(sid, cancel_reason);
 
         if iso == AccountIsolation::HostActive {
             let outcome = self.accounts.activate(info.tool, &to_acc.id)?;
@@ -4397,6 +4410,28 @@ impl Hub {
         .to_string()
     }
 
+    fn manual_switch_continue_text(&self, info: &SessionInfo) -> String {
+        if self.continue_text(info) == CONTINUE_ZH {
+            SWITCH_CONTINUE_ZH
+        } else {
+            SWITCH_CONTINUE_EN
+        }
+        .to_string()
+    }
+
+    fn continue_after_manual_switch(self: &Arc<Self>, sid: &str, info: &SessionInfo) {
+        let text = self.manual_switch_continue_text(info);
+        if let Err(e) = self.send(sid, &text, vec![], false, None) {
+            self.emit(
+                sid,
+                0,
+                EventBody::Error {
+                    message: format!("切换备用账号后自动继续失败: {e}"),
+                },
+            );
+        }
+    }
+
     fn session_launch_fingerprint(
         &self,
         settings: &DaemonSettings,
@@ -4607,6 +4642,9 @@ const CONTINUE_EN: &str =
 const FAILOVER_CONTINUE_ZH: &str = "已自动切换到备用账号。请继续完成刚才因额度限制中断的任务，已经完成的部分不要重复做。";
 const FAILOVER_CONTINUE_EN: &str =
     "Switched to a backup account due to usage limits. Continue the task that was interrupted; do not repeat work that is already complete.";
+const SWITCH_CONTINUE_ZH: &str = "已切换到备用账号。请继续完成刚才因额度限制中断的任务，已经完成的部分不要重复做。";
+const SWITCH_CONTINUE_EN: &str =
+    "Switched to a backup account. Continue the task that was interrupted by the usage limit; do not repeat work that is already complete.";
 
 fn limit_event(phase: &str, resets_at: Option<i64>, limit: Option<String>, resume_at: Option<i64>, reason: Option<&str>) -> EventBody {
     EventBody::RateLimit { phase: phase.into(), resets_at, limit, resume_at, reason: reason.map(str::to_string) }
@@ -6121,6 +6159,105 @@ mod tests {
         assert!(rt.failover_tried.lock().unwrap().is_empty());
         let summary2 = accounts.list(Some(ToolKind::Claude), &HashMap::new(), &|_, _| None, false);
         assert_eq!(summary2[0].accounts.iter().find(|a| a.id == oauth_b.id).unwrap().state, AccountState::Ready);
+    }
+
+    #[tokio::test]
+    async fn switch_account_auto_continue_and_cancel_reason() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("yi-base");
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        let accounts = Arc::new(crate::accounts::AccountManager::with_dirs(base, home));
+        accounts.set_policy(ToolKind::Claude, false).unwrap();
+
+        let mut settings = DaemonSettings {
+            ui_lang: Some("zh".into()),
+            ..Default::default()
+        };
+        settings.tools.insert(
+            "claude".into(),
+            yi_proto::ToolOverride {
+                command: tmp.path().join("no-such-claude").display().to_string(),
+                ..Default::default()
+            },
+        );
+        let hub = Hub::with_accounts(crate::store::Store::open_memory().unwrap(), settings, accounts.clone());
+
+        let dir1 = tmp.path().join("c1");
+        let dir2 = tmp.path().join("c2");
+        std::fs::create_dir_all(&dir1).unwrap();
+        std::fs::create_dir_all(&dir2).unwrap();
+        std::fs::write(dir1.join(".credentials.json"), "{}").unwrap();
+        std::fs::write(dir2.join(".credentials.json"), "{}").unwrap();
+        let acc_a = accounts
+            .save_oauth_from_dir(ToolKind::Claude, None, Some("Claude A"), Some(&dir1), None, true)
+            .unwrap();
+        let acc_b = accounts
+            .save_oauth_from_dir(ToolKind::Claude, None, Some("Claude B"), Some(&dir2), None, false)
+            .unwrap();
+
+        let _rx1 = live(&hub, "s-switch-1", SessionMode::Structured, SessionStatus::Running, 0);
+        {
+            let rt = hub.get("s-switch-1").unwrap();
+            let mut i = rt.info.lock().unwrap();
+            i.tool = ToolKind::Claude;
+            i.cwd = tmp.path().display().to_string();
+            i.account_id = Some(acc_a.id.clone());
+            i.account_label = Some(acc_a.label.clone());
+        }
+        let resets = now_ms() + 3_600_000;
+        let em1 = Emitter { hub: hub.clone(), sid: "s-switch-1".into(), gen: 0 };
+        em1.event(crate::adapters::limit_hit(Some(resets), Some("five_hour".into())));
+        em1.event(EventBody::TurnEnd { stop_reason: Some("error".into()), model: None });
+        assert!(hub.info("s-switch-1").unwrap().auto_resume.is_some());
+
+        // Clicking the already-active account must neither cancel auto_resume nor send a prompt
+        let same = hub.switch_session_account_async("s-switch-1", &acc_a.id, true).await.unwrap();
+        assert!(same.auto_resume.is_some());
+        assert!(!hub.backlog("s-switch-1", 0).unwrap().iter().any(|e| matches!(e.body, EventBody::UserMessage { .. })));
+
+        // Switching without auto_continue cancels auto_resume with "account_switched" (never "manual") and sends no prompt
+        let manual = hub.switch_session_account_async("s-switch-1", &acc_b.id, false).await.unwrap();
+        assert_eq!(manual.account_id.as_deref(), Some(acc_b.id.as_str()));
+        assert!(manual.auto_resume.is_none());
+        assert_eq!(limit_phases(&hub, "s-switch-1"), ["hit", "scheduled", "cancelled:account_switched"]);
+        assert!(!hub.backlog("s-switch-1", 0).unwrap().iter().any(|e| matches!(e.body, EventBody::UserMessage { .. })));
+
+        // Switching from LimitDock with auto_continue=true cancels auto_resume and emits the continue UserMessage
+        let _rx2 = live(&hub, "s-switch-2", SessionMode::Structured, SessionStatus::Running, 0);
+        {
+            let rt = hub.get("s-switch-2").unwrap();
+            let mut i = rt.info.lock().unwrap();
+            i.tool = ToolKind::Claude;
+            i.cwd = tmp.path().display().to_string();
+            i.account_id = Some(acc_b.id.clone());
+            i.account_label = Some(acc_b.label.clone());
+        }
+        let em2 = Emitter { hub: hub.clone(), sid: "s-switch-2".into(), gen: 0 };
+        em2.event(crate::adapters::limit_hit(Some(resets), Some("five_hour".into())));
+        em2.event(EventBody::TurnEnd { stop_reason: Some("error".into()), model: None });
+        assert!(hub.info("s-switch-2").unwrap().auto_resume.is_some());
+
+        let switched = hub.switch_session_account_async("s-switch-2", &acc_a.id, true).await.unwrap();
+        assert_eq!(switched.account_id.as_deref(), Some(acc_a.id.as_str()));
+        assert!(switched.auto_resume.is_none());
+        assert_eq!(limit_phases(&hub, "s-switch-2"), ["hit", "scheduled", "cancelled:account_switched"]);
+
+        let evs = hub.backlog("s-switch-2", 0).unwrap();
+        let switched_idx = evs
+            .iter()
+            .position(|e| matches!(&e.body, EventBody::AccountSwitched { to_id, reason, .. } if to_id == &acc_a.id && reason == "manual"))
+            .expect("expected AccountSwitched event");
+        let user_idx = evs
+            .iter()
+            .position(|e| matches!(&e.body, EventBody::UserMessage { text, .. } if text == SWITCH_CONTINUE_ZH))
+            .expect("expected continue UserMessage");
+        assert!(user_idx > switched_idx);
+
+        // Also check English continue wording
+        hub.settings.write().unwrap().ui_lang = Some("en".into());
+        assert_eq!(hub.manual_switch_continue_text(&switched), SWITCH_CONTINUE_EN);
     }
 
     #[tokio::test]

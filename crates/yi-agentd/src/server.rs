@@ -1180,7 +1180,8 @@ pub async fn dispatch(
         SESSION_SWITCH_ACCOUNT => {
             let sid = s(&p, "sessionId")?.to_string();
             let account_id = s(&p, "accountId")?.to_string();
-            let info = hub.switch_session_account_async(&sid, &account_id).await?;
+            let auto_continue = p["autoContinue"].as_bool().unwrap_or(false);
+            let info = hub.switch_session_account_async(&sid, &account_id, auto_continue).await?;
             serde_json::to_value(info)?
         }
         "session.resume" => {

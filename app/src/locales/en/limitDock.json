@@ -11,7 +11,8 @@
   "handOffToAnotherToolTitle": "Don't wait for the limit: hand this to another tool (its first turn reports back)",
   "switchBackupAccount": "Switch Account",
   "switchAccountShort": "Account",
-  "switchBackupAccountTitle": "Switch this session in-place to another account or API Key",
+  "switchBackupAccountTitle": "Switch this session in-place to another account or API Key and continue",
   "switchedBackupAccount": "Switched this session to \"{{label}}\"",
+  "switchedBackupAccountContinuing": "Switched to \"{{label}}\", continuing",
   "manageAccounts": "Manage Accounts…"
 }

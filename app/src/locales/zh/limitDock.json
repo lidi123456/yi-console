@@ -11,7 +11,8 @@
   "handOffToAnotherToolTitle": "不等额度恢复，交给另一个工具接着做（第一轮先汇报）",
   "switchBackupAccount": "切换备用账号",
   "switchAccountShort": "换账号",
-  "switchBackupAccountTitle": "在当前会话原地切换到其他账号或 API Key",
+  "switchBackupAccountTitle": "在当前会话原地切换到其他账号或 API Key，并立即继续",
   "switchedBackupAccount": "已将当前会话切换至「{{label}}」",
+  "switchedBackupAccountContinuing": "已切换至「{{label}}」，正在继续",
   "manageAccounts": "管理账号…"
 }

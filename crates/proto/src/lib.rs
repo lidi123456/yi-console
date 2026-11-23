@@ -1541,7 +1541,7 @@ pub mod methods {
     /// {tool, apiConfig, accountId?} -> {ok, models?, error?}: whether an API key profile's endpoint answers
     /// (Claude / Codex / Antigravity: GET the models list). A redacted key falls back to the saved account's
     pub const TOOLS_ACCOUNTS_TEST: &str = "tools.accounts.test";
-    /// Switch account in-place inside an existing session {sessionId, accountId}
+    /// Switch account in-place inside an existing session {sessionId, accountId, autoContinue?}
     pub const SESSION_SWITCH_ACCOUNT: &str = "session.switchAccount";
     /// {refresh?} -> {tools: {<tool>: {latest?, error?, via?, canUpdate}}, jobs: {<tool>: ToolJob}, info: [ToolInfo]}: the newest published
     /// version of each tool (npm registry, where the tool is published there), how it was installed, and upgrade jobs

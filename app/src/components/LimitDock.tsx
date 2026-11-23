@@ -75,8 +75,18 @@ export function LimitDock({ hostId, info, connected }: { hostId: string; info: S
                   run: async () => {
                     setBusy(true);
                     try {
-                      await rpc(hostId, 'session.switchAccount', { sessionId: info.id, accountId: acc.id });
-                      toast(t('switchedBackupAccount', { label: acc.label }), 'info');
+                      const switching = acc.id !== info.accountId;
+                      const updated = await rpc<SessionInfo>(hostId, 'session.switchAccount', {
+                        sessionId: info.id,
+                        accountId: acc.id,
+                        ...(switching ? { autoContinue: true } : {}),
+                      });
+                      toast(
+                        switching && (updated.status === 'running' || updated.status === 'starting')
+                          ? t('switchedBackupAccountContinuing', { label: acc.label })
+                          : t('switchedBackupAccount', { label: acc.label }),
+                        'info',
+                      );
                     } catch (err) {
                       errorToast(err);
                     } finally {
