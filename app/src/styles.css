@@ -15113,6 +15113,29 @@ button.wp-commit-title .chev {
   opacity: 0.72;
 }
 
+.composer-wrap > .status-line {
+  flex-wrap: nowrap;
+  height: 24px;
+  min-height: 24px;
+  line-height: 18px;
+  overflow: hidden;
+  gap: 0 12px;
+}
+
+.composer-wrap > .status-line > .sl-builtin,
+.composer-wrap > .status-line > .sl-cmd,
+.composer-wrap > .status-line > .sl-err {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.composer-wrap > .status-line .sl-cmd {
+  white-space: nowrap;
+}
+
 @media (hover: none) {
   .md-code-wrap.has-lang > .copy-float-anchor {
     height: 36px;
@@ -16917,9 +16940,10 @@ button.wp-commit-title .chev {
   flex: 1;
   min-height: 0;
 }
-.wp-side-body .chat-inner {
+.wp-side-body .chat-inner,
+.wp-side-body .chat.modern .chat-inner {
   max-width: none;
-  padding: 12px 14px;
+  padding: 12px 14px 24px;
 }
 .wp-side-empty {
   flex: 1;
@@ -16965,13 +16989,21 @@ button.wp-commit-title .chev {
 }
 .wp-side-composer {
   flex: none;
-  padding: 6px 14px 28px;
+  padding: 6px 14px calc(16px + env(safe-area-inset-bottom));
   max-width: none;
   width: 100%;
   margin: 0;
 }
 .wp-side-composer .composer textarea {
   min-height: 42px;
+}
+@media (max-width: 760px) {
+  .wp-side-composer {
+    padding: 4px 10px calc(8px + env(safe-area-inset-bottom));
+  }
+  .wp-side-composer .composer textarea {
+    min-height: 28px;
+  }
 }
 .turn-bring-btn {
   display: inline-flex;

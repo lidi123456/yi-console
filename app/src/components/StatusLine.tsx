@@ -55,6 +55,8 @@ export const STATUS_FIELDS = STATUS_FIELDS_ZH;
 export const TEMPLATE_VARS = ['model', 'context', 'tokens', 'cost', 'lastTurn', 'branch', 'dirty', 'changed', 'ahead', 'behind', 'dir', 'cwd', 'status', 'tool', 'account', 'title', 'quota', 'command'];
 
 const GIT_KEYS = ['branch', 'dirty', 'changed', 'ahead', 'behind'];
+const COMPACT_LOCAL_KEYS = new Set(['model', 'context', 'tokens', 'cost', 'lastTurn', 'account', 'tool', 'status']);
+const COMPACT_DEFAULT_ITEMS = ['model', 'context', 'tokens', 'cost', 'lastTurn'];
 
 // ---------- Host settings cache: fetched once per host, invalidated when the settings page saves ----------
 
@@ -150,6 +152,8 @@ export function parseAnsi(s: string): Span[] {
   return out;
 }
 
+const stripAnsi = (s: string) => parseAnsi(s).map((p) => p.text).join('');
+
 function Ansi({ text }: { text: string }) {
   const spans = useMemo(() => parseAnsi(text), [text]);
   return (
@@ -225,7 +229,19 @@ function itemText(id: string, v: Record<string, string>, git: Git | null) {
   return v[id] ?? '';
 }
 
-export function StatusLine({ hostId, info, events }: { hostId: string; info: SessionInfo; events: HubEvent[] }) {
+export function StatusLine({
+  hostId,
+  info,
+  events,
+  compact = false,
+  reserveSpace = false,
+}: {
+  hostId: string;
+  info: SessionInfo;
+  events: HubEvent[];
+  compact?: boolean;
+  reserveSpace?: boolean;
+}) {
   const [cfg, setCfg] = useState<StatusLineSettings | null>(null);
   const [git, setGit] = useState<Git | null>(null);
   const [cmd, setCmd] = useState<{ text: string; source: string } | null>(null);
@@ -245,20 +261,30 @@ export function StatusLine({ hostId, info, events }: { hostId: string; info: Ses
     };
   }, [hostId]);
 
-  const used = cfg ? (cfg.template.trim() ? TEMPLATE_VARS.filter((k) => cfg.template.includes(`{${k}}`)) : cfg.items) : [];
-  const wantGit = used.some((k) => GIT_KEYS.includes(k));
-  const wantQuota = used.includes('quota') && info.tool !== 'shell';
-  const wantCmd = !!cfg && (!!cfg.command.trim() || (cfg.useClaude && info.tool === 'claude'));
+  const hasConfiguredFields =
+    !!cfg && (cfg.template.trim().length > 0 || cfg.items.length > 0 || cfg.command.trim().length > 0);
+  const used =
+    !cfg || compact
+      ? []
+      : cfg.template.trim()
+        ? TEMPLATE_VARS.filter((k) => cfg.template.includes(`{${k}}`))
+        : cfg.items;
+  const wantGit = !compact && used.some((k) => GIT_KEYS.includes(k));
+  const wantQuota = !compact && used.includes('quota') && info.tool !== 'shell';
+  const wantCmd = !compact && !!cfg && (!!cfg.command.trim() || (cfg.useClaude && info.tool === 'claude'));
+  const needPoll = wantGit || wantCmd || wantQuota;
 
   // Refresh every 20 s (while visible), and 1 s after the session changes (turn ends, usage changes)
   useEffect(() => {
+    if (!needPoll) return;
     const t = setInterval(() => document.visibilityState === 'visible' && setTick((x) => x + 1), 20_000);
     return () => clearInterval(t);
-  }, []);
+  }, [needPoll]);
   useEffect(() => {
+    if (!needPoll) return;
     const t = setTimeout(() => setTick((x) => x + 1), 1000);
     return () => clearTimeout(t);
-  }, [info.updatedAt, info.status]);
+  }, [info.updatedAt, info.status, needPoll]);
 
   useEffect(() => {
     if (!cfg || (!wantGit && !wantCmd)) return;
@@ -290,9 +316,24 @@ export function StatusLine({ hostId, info, events }: { hostId: string; info: Ses
   }, [hostId, info.tool, info.accountId, wantQuota, Math.floor(tick / 3)]);
 
   if (!cfg) return null;
+  if (compact && !hasConfiguredFields) return null;
   const v = values(info, events, git, quota, cmd?.text ?? '', home);
   let builtin = '';
-  if (cfg.template.trim()) {
+  if (compact) {
+    const fromTemplate = cfg.template.trim()
+      ? Array.from(cfg.template.matchAll(/\{(\w+)\}/g), (m) => m[1]).filter(
+          (k, idx, arr) => COMPACT_LOCAL_KEYS.has(k) && arr.indexOf(k) === idx,
+        )
+      : [];
+    const fromItems = cfg.items.filter((id) => COMPACT_LOCAL_KEYS.has(id));
+    const compactItems =
+      fromTemplate.length > 0 ? fromTemplate : fromItems.length > 0 ? fromItems : COMPACT_DEFAULT_ITEMS;
+    builtin = compactItems
+      .map((id) => itemText(id, v, null))
+      .filter(Boolean)
+      .join('  ·  ');
+    if (!builtin.trim()) builtin = v.model || v.tool;
+  } else if (cfg.template.trim()) {
     builtin = cfg.template.replace(/\{(\w+)\}/g, (_, k: string) => v[k] ?? `{${k}}`);
   } else {
     builtin = cfg.items
@@ -301,16 +342,34 @@ export function StatusLine({ hostId, info, events }: { hostId: string; info: Ses
       .join('  ·  ');
   }
   // If the template references {command}, don't show the command output separately
-  const showCmd = cmd?.text && !cfg.template.includes('{command}');
-  if (!builtin.trim() && !showCmd && !err) return null;
+  const showCmd = !compact && !!cmd?.text && !cfg.template.includes('{command}');
+  const showErr = !compact && !!err && !showCmd;
+  if (!builtin.trim() && !showCmd && !showErr) {
+    if ((reserveSpace || compact) && hasConfiguredFields) {
+      return <div className="status-line status-line-empty" aria-hidden="true" />;
+    }
+    return null;
+  }
+  const titleParts: string[] = [];
+  if (builtin.trim()) titleParts.push(!compact && cfg.template.includes('{command}') ? stripAnsi(builtin).trim() : builtin.trim());
+  if (showCmd) titleParts.push(stripAnsi(cmd!.text).trim());
+  if (showErr) titleParts.push(err.trim());
+  const fullTitle = titleParts.filter(Boolean).join('  ·  ');
+  const title =
+    !compact && cmd?.source === 'claude'
+      ? fullTitle
+        ? `${fullTitle}\n${t('rightSideFromStatuslineCommand')}`
+        : t('rightSideFromStatuslineCommand')
+      : fullTitle || undefined;
   return (
-    <div
-      className="status-line"
-      title={cmd?.source === 'claude' ? t('rightSideFromStatuslineCommand') : undefined}
-    >
-      {builtin.trim() && <span className="sl-builtin">{cfg.template.includes('{command}') ? <Ansi text={builtin} /> : builtin}</span>}
+    <div className="status-line" title={title}>
+      {builtin.trim() && (
+        <span className="sl-builtin">
+          {!compact && cfg.template.includes('{command}') ? <Ansi text={builtin} /> : builtin}
+        </span>
+      )}
       {showCmd && <Ansi text={cmd!.text} />}
-      {err && !showCmd && <span className="sl-err">{err}</span>}
+      {showErr && <span className="sl-err">{err}</span>}
     </div>
   );
 }

@@ -8,6 +8,7 @@ import { AsyncAskCard, ChatView, openAsyncAsk, PermissionCard } from './ChatView
 import { Composer } from './Composer';
 import { Icon, ToolBadge } from './Icon';
 import { askConfirm, askText } from './Overlay';
+import { StatusLine } from './StatusLine';
 
 export * from '../sideChat';
 
@@ -198,6 +199,7 @@ export function SideChatPane({
           placeholder={tx('sideChatPlaceholder')}
           compact
         />
+        <StatusLine hostId={hostId} info={info} events={data.events} compact />
       </div>
     </div>
   );

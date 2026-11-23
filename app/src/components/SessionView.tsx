@@ -885,7 +885,7 @@ export function SessionView({ hostId, sessionId, seq }: { hostId: string; sessio
                 onExport={() => exportSession(hostId, info, 'download')}
                 onRename={rename}
               />
-              <StatusLine hostId={hostId} info={info} events={data.events} />
+              <StatusLine hostId={hostId} info={info} events={data.events} reserveSpace />
             </div>
           </div>
           {docked && (
