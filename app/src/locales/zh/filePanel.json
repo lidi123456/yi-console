@@ -274,6 +274,8 @@
   "sideChatNewWithTool": "用 {{tool}} 新建旁路…",
   "sideChatPlusTip": "新建旁路对话、网页或文件",
   "newUntitledFile": "新建空白文件",
+  "newUntitledFileTip": "新建空白文件（Ctrl+Alt+N）",
+  "sideChatOrWebTip": "新建旁路对话或网页",
   "sideChatRenameTitle": "重命名旁路对话",
   "sideChatRenameHint": "点击重命名旁路对话",
   "sideChatHiddenBadge": "隐藏旁路",

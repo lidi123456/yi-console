@@ -274,6 +274,8 @@
   "sideChatNewWithTool": "New side chat with {{tool}}…",
   "sideChatPlusTip": "New side chat, web tab, or file",
   "newUntitledFile": "New untitled file",
+  "newUntitledFileTip": "New untitled file (Ctrl+Alt+N)",
+  "sideChatOrWebTip": "New side chat or web tab",
   "sideChatRenameTitle": "Rename side chat",
   "sideChatRenameHint": "Click to rename side chat",
   "sideChatHiddenBadge": "Side chat",

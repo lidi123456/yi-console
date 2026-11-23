@@ -7891,9 +7891,10 @@ body.resizing .side-resizer::after {
 .wp-tabbar {
   padding-left: 4px;
   gap: 2px;
+  user-select: none;
 }
 .wp-filetabs {
-  flex: 1;
+  flex: 0 1 auto;
   min-width: 0;
   display: flex;
   align-items: stretch;
@@ -7903,6 +7904,14 @@ body.resizing .side-resizer::after {
 }
 .wp-filetabs::-webkit-scrollbar {
   display: none;
+}
+.wp-filetabs.fade-r {
+  -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 16px), transparent);
+  mask-image: linear-gradient(to right, #000 calc(100% - 16px), transparent);
+}
+.wp-tab-new {
+  margin-left: 2px;
+  margin-right: auto;
 }
 .wp-ftab {
   flex: none;

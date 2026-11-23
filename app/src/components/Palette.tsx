@@ -71,7 +71,7 @@ export function useShortcuts() {
       } else if (mod && e.shiftKey && k === 'f') {
         e.preventDefault();
         navigate({ kind: 'search' });
-      } else if ((mod && !e.shiftKey && k === 'n') || (e.altKey && !mod && k === 'n')) {
+      } else if ((mod && !e.shiftKey && !e.altKey && k === 'n') || (e.altKey && !mod && !e.shiftKey && k === 'n')) {
         e.preventDefault();
         newSession();
       } else if (e.altKey && !mod && !e.shiftKey && (e.key === 'ArrowUp' || e.key === 'ArrowDown')) {

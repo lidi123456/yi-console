@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { useBack } from '../back';
 import { getT, trErr, useLang } from '../i18n';
-import { errorToast, hostStatus, openNewSession, skey, toast, useSessionData, useStore } from '../store';
+import { errorToast, getState, hostStatus, openNewSession, skey, toast, useSessionData, useStore } from '../store';
 import { isTauri, rpc } from '../transport';
 import { TOOL_LABEL, type DirEntry, type FileDiff } from '../types';
 import { fmtSize, lsGet, lsSet } from '../util';
@@ -1245,9 +1245,12 @@ export function FilePanel({
   // ---------- When the tab bar overflows: scroll the current tab into view and add a dropdown on the right listing all tabs (like VS Code) ----------
   const tabsRef = useRef<HTMLDivElement>(null);
   const [tabsOverflow, setTabsOverflow] = useState(false);
+  const [tabsMoreRight, setTabsMoreRight] = useState(false);
   const measureTabs = () => {
     const el = tabsRef.current;
-    setTabsOverflow(!!el && el.scrollWidth > el.clientWidth + 1);
+    const ov = !!el && el.scrollWidth > el.clientWidth + 1;
+    setTabsOverflow(ov);
+    setTabsMoreRight(ov && el!.scrollLeft + el!.clientWidth < el!.scrollWidth - 1);
   };
   // Scroll the current tab into view: only change the tab bar's own scrollLeft (scrollIntoView would scroll outer containers too)
   const revealActiveTab = () => {
@@ -1258,23 +1261,26 @@ export function FilePanel({
     const r = tab.getBoundingClientRect();
     const left = r.left - b.left + bar.scrollLeft;
     const right = left + r.width;
+    const pad = r.width + 16 <= bar.clientWidth ? 16 : 0;
     if (left < bar.scrollLeft) bar.scrollLeft = left;
-    else if (right > bar.scrollLeft + bar.clientWidth) bar.scrollLeft = right - bar.clientWidth;
+    else if (right > bar.scrollLeft + bar.clientWidth - pad) {
+      bar.scrollLeft = Math.min(bar.scrollWidth - bar.clientWidth, right - bar.clientWidth + pad);
+    }
   };
   useEffect(() => {
     const el = tabsRef.current;
     if (!el) return;
     // When the panel narrows / is resized, keep the current file's tab visible
     const ro = new ResizeObserver(() => {
-      measureTabs();
       revealActiveTab();
+      measureTabs();
     });
     ro.observe(el);
     return () => ro.disconnect();
   }, [!!file]); // eslint-disable-line react-hooks/exhaustive-deps
   useLayoutEffect(() => {
-    measureTabs();
     revealActiveTab();
+    measureTabs();
   }, [file?.path, tabs.length]);
   const tabsMenu = (e: React.MouseEvent<HTMLElement>) => {
     const r = e.currentTarget.getBoundingClientRect();
@@ -1347,7 +1353,7 @@ export function FilePanel({
           ]
         : []),
       { label: tx('openWebPageNewBrowser'), icon: 'globe', run: () => openWeb() },
-      { label: tx('newUntitledFile'), icon: 'file', run: () => newUntitled() },
+      ...(!file ? [{ label: tx('newUntitledFile'), icon: 'file', run: () => newUntitled() }] : []),
     ];
     openMenu({ clientX: r.right - 220, clientY: r.bottom + 4 }, items);
   };
@@ -1448,6 +1454,8 @@ export function FilePanel({
     untitled.set(t, '');
     openFile(t);
   };
+  const newUntitledRef = useRef(newUntitled);
+  newUntitledRef.current = newUntitled;
   const restored = useRef(false);
   /** The panel was opened by "View changes": keep the side column visible when tabs are restored */
   const forChanges = useRef(false);
@@ -2242,11 +2250,19 @@ export function FilePanel({
     openMenu({ clientX: r.right - 220, clientY: r.bottom + 4 }, items);
   };
 
-  // ---------- Shortcuts: Ctrl+P quick open, Ctrl+Shift+O symbols, Ctrl+G go to line ----------
+  // ---------- Shortcuts: Ctrl+P quick open, Ctrl+Shift+O symbols, Ctrl+G go to line, Ctrl+Alt+N new untitled file ----------
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (!(e.ctrlKey || e.metaKey) || e.altKey) return;
+      if (e.isComposing || e.keyCode === 229 || getState().palette) return;
+      if (!(e.ctrlKey || e.metaKey)) return;
       const k = e.key.toLowerCase();
+      if (e.altKey) {
+        if (!e.shiftKey && (k === 'n' || e.code === 'KeyN')) {
+          e.preventDefault();
+          newUntitledRef.current();
+        }
+        return;
+      }
       const m: QuickMode | null = k === 'p' && !e.shiftKey ? '' : k === 'o' && e.shiftKey ? '@' : k === 'g' && !e.shiftKey ? ':' : null;
       if (m === null || (m !== '' && !fileRef.current)) return;
       e.preventDefault();
@@ -3175,9 +3191,12 @@ export function FilePanel({
           {panelBtns}
         </div>
       ) : (
-        <div className="wp-top wp-tabbar">
+        <div
+          className="wp-top wp-tabbar"
+          onDoubleClick={(e) => e.target === e.currentTarget && newUntitled()}
+        >
           <div
-            className="wp-filetabs"
+            className={`wp-filetabs ${tabsMoreRight ? 'fade-r' : ''}`}
             role="tablist"
             aria-label={tx('openFiles')}
             ref={tabsRef}
@@ -3407,6 +3426,13 @@ export function FilePanel({
               );
             })}
           </div>
+          <button
+            className="icon-btn wp-tab-new"
+            title={tx('newUntitledFileTip')}
+            onClick={newUntitled}
+          >
+            <Icon name="plus" size={14} />
+          </button>
           {tabsOverflow && (
             <button className="icon-btn wp-tabs-more" title={tx('allOpenFiles', { length: tabs.length })} onClick={tabsMenu}>
               <Icon name="down" size={14} />
@@ -3414,10 +3440,10 @@ export function FilePanel({
           )}
           <button
             className="icon-btn"
-            title={canSideChat ? tx('sideChatPlusTip') : tx('openWebPageNewBrowser')}
+            title={canSideChat ? tx('sideChatOrWebTip') : tx('openWebPageNewBrowser')}
             onClick={canSideChat ? openPlusMenu : () => openWeb()}
           >
-            <Icon name={canSideChat ? 'plus' : 'globe'} size={14} />
+            <Icon name={canSideChat ? 'sideChat' : 'globe'} size={14} />
           </button>
           <button
             className={`icon-btn ${treeOpen ? 'active' : ''}`}
