@@ -702,6 +702,18 @@ pub async fn dispatch(
             tokio::task::spawn_blocking(move || crate::gitops::worktree_remove(&root, &path, force, delete_branch)).await??;
             Value::Null
         }
+        SESSION_ENTER_WORKTREE => {
+            let sid = s(&p, "sessionId")?.to_string();
+            let name = p["name"].as_str().map(str::to_string);
+            let branch = p["branch"].as_str().map(str::to_string);
+            let base = p["base"].as_str().map(str::to_string);
+            let hub2 = hub.clone();
+            let info = tokio::task::spawn_blocking(move || {
+                hub2.enter_worktree(&sid, name.as_deref(), branch.as_deref(), base.as_deref())
+            })
+            .await??;
+            serde_json::to_value(info)?
+        }
         SESSION_SET_CLIENT_MCP => {
             let list: Vec<ClientMcp> = serde_json::from_value(p["clientMcp"].clone()).map_err(|e| anyhow!("clientMcp 无效: {e}"))?;
             serde_json::to_value(hub.set_client_mcp(s(&p, "sessionId")?, list)?)?

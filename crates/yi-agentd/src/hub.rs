@@ -161,6 +161,16 @@ struct SessionRt {
     qoder_plan: Mutex<Option<(PathBuf, Vec<PlanEntry>)>>,
     /// Active turn's pre-turn hidden git checkpoint awaiting TurnEnd finalization
     active_checkpoint: Mutex<Option<ActiveCheckpoint>>,
+    /// Guards in-flight worktree migration against concurrent sends or duplicate enter_worktree calls
+    worktree_busy: std::sync::atomic::AtomicBool,
+}
+
+struct WtBusyGuard<'a>(&'a std::sync::atomic::AtomicBool);
+
+impl Drop for WtBusyGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -169,6 +179,7 @@ struct ActiveCheckpoint {
     user_seq: i64,
     base_ref: String,
     base_tree: String,
+    shared_concurrent: bool,
 }
 
 /// One terminal-mode process run
@@ -356,6 +367,15 @@ pub struct CreateParams {
     /// Read-only cross-tool AI code review metadata (implies `side_chat = true`)
     #[serde(default)]
     pub review: Option<ReviewMeta>,
+    /// Create a managed Git worktree for this session (`~/.yi-console/worktrees/...`)
+    #[serde(default)]
+    pub worktree: bool,
+    /// Optional branch name for the new worktree (defaults to `yi/<name>`)
+    #[serde(default)]
+    pub worktree_branch: Option<String>,
+    /// Optional base branch/ref for the new worktree (defaults to HEAD)
+    #[serde(default)]
+    pub worktree_base: Option<String>,
 }
 
 impl Hub {
@@ -847,14 +867,48 @@ impl Hub {
                 bail!("不能在旁路对话内嵌套创建旁路对话");
             }
         }
+        if p.worktree {
+            if mode != SessionMode::Structured || !tool.has_process() || tool == ToolKind::Shell || side_chat || p.review.is_some() || p.parent_id.is_some() {
+                bail!("只有顶层 AI 对话会话支持独立 Worktree");
+            }
+        }
         let id = uuid::Uuid::new_v4().to_string();
+        let (cwd, session_worktree) = if p.worktree {
+            let wt_root = crate::gitops::worktree_root(&self.settings.read().unwrap());
+            let wt_name = derive_worktree_name(&id, p.title.as_deref(), p.prompt.as_deref());
+            let (wt_path, wt_meta) = crate::gitops::worktree_add_session(
+                &wt_root,
+                &cwd.to_string_lossy(),
+                &wt_name,
+                p.worktree_branch.as_deref(),
+                p.worktree_base.as_deref(),
+            )?;
+            (PathBuf::from(wt_path), Some(wt_meta))
+        } else {
+            let detected = if mode == SessionMode::Structured && tool.has_process() && tool != ToolKind::Shell && !side_chat && p.review.is_none() && p.parent_id.is_none() {
+                crate::gitops::detect_existing_worktree(&cwd.to_string_lossy())
+            } else {
+                None
+            };
+            (cwd, detected)
+        };
+        let cleanup_new_wt = |wt: &Option<yi_proto::SessionWorktree>, wt_dir: &Path| {
+            if wt.is_some() {
+                let wt_root = crate::gitops::worktree_root(&self.settings.read().unwrap());
+                crate::gitops::worktree_remove_best_effort(&wt_root, &wt_dir.to_string_lossy(), true, true);
+            }
+        };
         if p.computer_use {
-            self.desktop.configure(&id)?;
+            if let Err(e) = self.desktop.configure(&id) {
+                cleanup_new_wt(&session_worktree, &cwd);
+                return Err(e);
+            }
         }
         if p.browser_use {
             let settings = self.settings.read().unwrap().clone();
             if let Err(e) = self.browsers.configure(&id, &settings) {
                 let _ = self.desktop.change(&id, "stop");
+                cleanup_new_wt(&session_worktree, &cwd);
                 return Err(e);
             }
         }
@@ -915,8 +969,15 @@ impl Hub {
             account_label,
             checkpoints: vec![],
             review: p.review.clone(),
+            worktree: session_worktree.clone(),
         };
-        self.store.save_session(&info)?;
+        if let Err(e) = self.store.save_session(&info) {
+            if session_worktree.is_some() {
+                let wt_root = crate::gitops::worktree_root(&self.settings.read().unwrap());
+                crate::gitops::worktree_remove_best_effort(&wt_root, &info.cwd, true, true);
+            }
+            return Err(e);
+        }
         let rt = Arc::new(new_rt(info.clone()));
         self.sessions
             .lock()
@@ -1323,6 +1384,9 @@ impl Hub {
     /// (anything that misses that is handled by the tool after the turn ends); other tools queue it and send in order after the turn
     pub fn send(self: &Arc<Self>, id: &str, text: &str, images: Vec<IncomingImage>, queue: bool, origin: Option<String>) -> Result<()> {
         let rt = self.get(id)?;
+        if rt.worktree_busy.load(std::sync::atomic::Ordering::Acquire) {
+            bail!("会话正在切入 Worktree，请稍候再发送");
+        }
         // The user carried on by hand: the automatic continue is no longer needed
         self.cancel_resume(id, "manual");
         self.desktop.resume_if_paused(id);
@@ -1439,6 +1503,11 @@ impl Hub {
             && info.tool != ToolKind::Shell
             && info.parent_id.is_none()
             && safe_sid(id);
+        let shared_concurrent = if track_ckpt {
+            self.mark_concurrent_checkpoints(id, &info.cwd)
+        } else {
+            false
+        };
         let pre_ckpt = if track_ckpt {
             if let Some(prev) = rt.active_checkpoint.lock().unwrap().take() {
                 crate::gitops::delete_ref(&info.cwd, &prev.base_ref);
@@ -1476,6 +1545,7 @@ impl Hub {
                     user_seq,
                     base_ref,
                     base_tree,
+                    shared_concurrent,
                 });
             } else {
                 crate::gitops::delete_ref(&info.cwd, &base_ref);
@@ -2625,9 +2695,9 @@ impl Hub {
         self.review_mcp.remove_session(id);
         // The id comes from the client and is later used in a path for remove_dir_all: only handle sessions that really exist
         let rt = self.get(id)?;
-        let (bot_link, session_cwd) = {
+        let (bot_link, session_cwd, session_wt) = {
             let i = rt.info.lock().unwrap();
-            (i.bot.clone(), i.cwd.clone())
+            (i.bot.clone(), i.cwd.clone(), i.worktree.clone())
         };
         // First delete its terminals in the bottom terminal panel
         let kids: Vec<String> = self
@@ -2652,6 +2722,22 @@ impl Hub {
         if safe_sid(id) {
             let _ = std::fs::remove_dir_all(uploads_dir(id));
             crate::gitops::delete_session_checkpoints(&session_cwd, id);
+        }
+        if let Some(wt) = session_wt {
+            let wt_root = crate::gitops::worktree_root(&self.settings.read().unwrap());
+            let under_root = Path::new(&session_cwd)
+                .canonicalize()
+                .ok()
+                .zip(wt_root.canonicalize().ok())
+                .is_some_and(|(d, r)| d.starts_with(&r) && d != r);
+            if under_root && crate::gitops::worktree_is_clean_and_merged(&session_cwd, &wt) {
+                if crate::gitops::worktree_remove(&wt_root, &session_cwd, true, true).is_err() {
+                    let cwd_clone = session_cwd.clone();
+                    std::thread::spawn(move || {
+                        let _ = crate::gitops::worktree_remove_best_effort(&wt_root, &cwd_clone, true, true);
+                    });
+                }
+            }
         }
         if let Some(bot) = bot_link {
             let safe = |s: &str| !s.is_empty() && s.len() <= 64 && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
@@ -2717,6 +2803,169 @@ impl Hub {
             json!({ "sessionId": id }),
         );
         Ok(())
+    }
+
+    /// Retire any idle child process and wait briefly for it to close so directory handles are released (e.g. on Windows)
+    fn retire_idle_process(&self, id: &str, rt: &Arc<SessionRt>, mode: SessionMode) -> bool {
+        let tx = rt.cmd.lock().unwrap().take();
+        let had_proc = tx.is_some();
+        if let Some(tx) = tx {
+            *rt.generation.lock().unwrap() += 1;
+            let _ = tx.send(AdapterCmd::Kill);
+            for _ in 0..10 {
+                if tx.is_closed() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
+        if mode == SessionMode::Terminal {
+            crate::tmux::kill(&crate::tmux::session_name(id));
+        }
+        had_proc
+    }
+
+    /// Migrate a main-directory session in-place into a new managed Git worktree, carrying over recent conversation context
+    pub fn enter_worktree(
+        self: &Arc<Self>,
+        id: &str,
+        name: Option<&str>,
+        branch: Option<&str>,
+        base: Option<&str>,
+    ) -> Result<SessionInfo> {
+        let rt = self.get(id)?;
+        if rt
+            .worktree_busy
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_err()
+        {
+            bail!("Worktree 切换进行中，请稍候");
+        }
+        let _busy_guard = WtBusyGuard(&rt.worktree_busy);
+        let cur = rt.info.lock().unwrap().clone();
+        if cur.parent_id.is_some() || cur.side_chat || cur.review.is_some() || cur.mode != SessionMode::Structured || !cur.tool.has_process() || cur.tool == ToolKind::Shell {
+            bail!("只有顶层 AI 对话会话支持切入独立 Worktree");
+        }
+        if cur.worktree.is_some() {
+            bail!("当前会话已在独立 Worktree 中");
+        }
+        if matches!(cur.status, SessionStatus::Running | SessionStatus::WaitingPermission)
+            || !cur.background_tasks.is_empty()
+            || rt.watch_active.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            bail!("会话正在回复中，请等当前轮次结束后再切入 Worktree");
+        }
+
+        let wt_root = crate::gitops::worktree_root(&self.settings.read().unwrap());
+        let wt_name = name
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                let first_msg = self
+                    .store
+                    .events_tail(id, None, 20)
+                    .ok()
+                    .and_then(|(evs, _)| {
+                        evs.into_iter().find_map(|e| match e.body {
+                            EventBody::UserMessage { text, .. } => Some(text),
+                            _ => None,
+                        })
+                    });
+                derive_worktree_name(id, Some(&cur.title), first_msg.as_deref())
+            });
+        let (wt_path, wt_meta) = crate::gitops::worktree_add_session(&wt_root, &cur.cwd, &wt_name, branch, base)?;
+
+        let retired = self.retire_idle_process(id, &rt, cur.mode);
+        let has_history = cur.external_id.is_some() || self.store.count_user_messages(id).unwrap_or(0) > 0;
+        let base_label = wt_meta.base_branch.as_deref().unwrap_or("HEAD").to_string();
+        if has_history {
+            let note = format!(
+                "This session moved in place from the main repository ({}) into an isolated Git worktree at {wt_path} on branch {} (based on {base_label}). Perform all further edits and commands inside this worktree directory.",
+                wt_meta.repo_root, wt_meta.branch
+            );
+            *rt.pending_handoff.lock().unwrap() = self.workspace_handoff_digest(id, &note);
+        }
+        *rt.restart_pending.lock().unwrap() = false;
+        let updated = {
+            let mut i = rt.info.lock().unwrap();
+            i.cwd = wt_path;
+            i.worktree = Some(wt_meta.clone());
+            i.external_id = None;
+            i.synced_users = None;
+            if retired && matches!(i.status, SessionStatus::Idle | SessionStatus::Starting) {
+                i.status = SessionStatus::Exited;
+            }
+            i.clone()
+        };
+        self.store.save_session(&updated)?;
+        self.broadcast_updated(&updated);
+        self.emit(
+            id,
+            0,
+            EventBody::System {
+                text: format!("已切入独立 Worktree：{}（基于 {}）", wt_meta.branch, base_label),
+            },
+        );
+        Ok(updated)
+    }
+
+    /// Detect concurrent active turns sharing the exact same `cwd` and mark both checkpoints as concurrent so stats never mix
+    fn mark_concurrent_checkpoints(&self, sid: &str, cwd: &str) -> bool {
+        let target = norm_cwd(cwd);
+        let list: Vec<Arc<SessionRt>> = self.sessions.lock().unwrap().values().cloned().collect();
+        let mut hit = false;
+        for other in list {
+            let same_busy_dir = {
+                let i = other.info.lock().unwrap();
+                i.id != sid
+                    && i.parent_id.is_none()
+                    && i.tool.has_process()
+                    && norm_cwd(&i.cwd) == target
+                    && (matches!(i.status, SessionStatus::Running | SessionStatus::WaitingPermission)
+                        || i.turn.as_ref().is_some_and(|t| t.ended_at.is_none()))
+            };
+            if same_busy_dir {
+                hit = true;
+                if let Some(ref mut ckpt) = *other.active_checkpoint.lock().unwrap() {
+                    ckpt.shared_concurrent = true;
+                }
+            } else {
+                let same_dir = {
+                    let i = other.info.lock().unwrap();
+                    i.id != sid && i.parent_id.is_none() && norm_cwd(&i.cwd) == target
+                };
+                if same_dir {
+                    let mut ckpt_guard = other.active_checkpoint.lock().unwrap();
+                    if let Some(ref mut ckpt) = *ckpt_guard {
+                        hit = true;
+                        ckpt.shared_concurrent = true;
+                    }
+                }
+            }
+        }
+        hit
+    }
+
+    fn has_concurrent_turn_in_cwd(&self, sid: &str, cwd: &str) -> bool {
+        let target = norm_cwd(cwd);
+        let list: Vec<Arc<SessionRt>> = self.sessions.lock().unwrap().values().cloned().collect();
+        list.into_iter().any(|other| {
+            let active = other.active_checkpoint.lock().unwrap().is_some();
+            let i = other.info.lock().unwrap();
+            i.id != sid
+                && i.parent_id.is_none()
+                && i.tool.has_process()
+                && norm_cwd(&i.cwd) == target
+                && (active
+                    || matches!(i.status, SessionStatus::Running | SessionStatus::WaitingPermission)
+                    || i.turn.as_ref().is_some_and(|t| t.ended_at.is_none()))
+        })
     }
 
     /// Record the tool's own session id (used to resume when terminal mode restarts)
@@ -3489,8 +3738,26 @@ impl Hub {
             crate::gitops::delete_ref(&cwd, &active.base_ref);
             return;
         };
+        let concurrent = active.shared_concurrent || self.has_concurrent_turn_in_cwd(&sid, &cwd);
+        let mut rel_paths: Vec<String> = Vec::new();
         let changed = if end_tree == active.base_tree {
             None
+        } else if concurrent {
+            let mut seen = std::collections::BTreeSet::new();
+            for raw in rt.turn_files.lock().unwrap().iter() {
+                if let Some(rel) = crate::gitops::normalize_repo_rel(&cwd, raw) {
+                    seen.insert(rel);
+                }
+            }
+            rel_paths = seen.into_iter().collect();
+            if rel_paths.is_empty() {
+                None
+            } else {
+                match crate::gitops::diff_stat_refs_filtered(&cwd, &active.base_ref, &end_ref, Some(&rel_paths)) {
+                    Ok((fc, a, d)) if fc > 0 => Some((fc, a, d)),
+                    _ => None,
+                }
+            }
         } else {
             match crate::gitops::diff_stat_refs(&cwd, &active.base_ref, &end_ref) {
                 Ok((fc, a, d)) if fc > 0 => Some((fc, a, d)),
@@ -3512,6 +3779,7 @@ impl Hub {
                 files_changed,
                 added,
                 deleted,
+                paths: rel_paths,
             });
             const MAX_CHECKPOINTS: usize = 200;
             if i.checkpoints.len() > MAX_CHECKPOINTS {
@@ -4449,7 +4717,7 @@ impl Hub {
         out
     }
 
-    fn handoff_digest(&self, sid: &str) -> Option<String> {
+    fn recent_context_lines(&self, sid: &str) -> Option<String> {
         let (evs, _) = self.store.events_tail(sid, None, 40).ok()?;
         let mut lines = Vec::new();
         for ev in evs {
@@ -4478,10 +4746,20 @@ impl Hub {
         if lines.is_empty() {
             return None;
         }
-        let body = lines.join("\n");
-        let capped = truncate(&body, 3200);
+        Some(truncate(&lines.join("\n"), 3200))
+    }
+
+    fn handoff_digest(&self, sid: &str) -> Option<String> {
+        let capped = self.recent_context_lines(sid)?;
         Some(format!(
             "<yi-account-handoff>\nThis session switched accounts in place; native tool history was not available on the new account. Continue seamlessly from this recent context without repeating completed work:\n{capped}\n</yi-account-handoff>"
+        ))
+    }
+
+    fn workspace_handoff_digest(&self, sid: &str, note: &str) -> Option<String> {
+        let capped = self.recent_context_lines(sid)?;
+        Some(format!(
+            "<yi-workspace-handoff>\n{note}\nRecent conversation context (continue seamlessly without repeating completed work):\n{capped}\n</yi-workspace-handoff>"
         ))
     }
 
@@ -4695,6 +4973,7 @@ fn new_rt(info: SessionInfo) -> SessionRt {
         term_size: Mutex::new(None),
         qoder_plan: Mutex::new(None),
         active_checkpoint: Mutex::new(None),
+        worktree_busy: std::sync::atomic::AtomicBool::new(false),
     }
 }
 
@@ -4708,12 +4987,43 @@ fn truncate_for_side(text: &str, max_chars: usize, parent_id: &str, seq: i64) ->
 
 pub(crate) fn strip_handoff_prefix(text: &str) -> &str {
     let mut t = text.trim();
-    for tag in ["</yi-account-handoff>", "</yi-side-context>"] {
+    for tag in ["</yi-account-handoff>", "</yi-workspace-handoff>", "</yi-side-context>"] {
         if let Some(idx) = t.find(tag) {
             t = t[idx + tag.len()..].trim();
         }
     }
     t
+}
+
+/// Derive a short, safe worktree folder/branch suffix from session title/prompt + id
+fn derive_worktree_name(id: &str, title: Option<&str>, prompt: Option<&str>) -> String {
+    let short_id: String = id.chars().filter(|c| c.is_ascii_alphanumeric()).take(8).collect();
+    let short_id = if short_id.is_empty() { "wt".to_string() } else { short_id };
+    let source = title
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .or_else(|| prompt.map(str::trim).filter(|s| !s.is_empty()))
+        .unwrap_or("");
+    let mut slug = String::new();
+    let mut last_dash = false;
+    for ch in source.chars() {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch.to_ascii_lowercase());
+            last_dash = false;
+            if slug.len() >= 20 {
+                break;
+            }
+        } else if !slug.is_empty() && !last_dash && (ch.is_whitespace() || ch == '-' || ch == '_' || ch == '/') {
+            slug.push('-');
+            last_dash = true;
+        }
+    }
+    let slug = slug.trim_matches('-');
+    if slug.is_empty() {
+        format!("s-{short_id}")
+    } else {
+        format!("{slug}-{short_id}")
+    }
 }
 
 /// What the automatic continue sends (wording follows Claude Code's own auto-continue)
@@ -5681,6 +5991,7 @@ mod tests {
             account_label: None,
             checkpoints: vec![],
             review: None,
+            worktree: None,
         };
         let rt = new_rt(info);
         let (tx, rx) = mpsc::unbounded_channel();
@@ -7230,6 +7541,7 @@ mod tests {
             account_label: None,
             checkpoints: vec![],
             review: None,
+            worktree: None,
             queued: vec![],
             queue_paused: None,
             restart_interrupted: false,
@@ -7354,6 +7666,165 @@ mod tests {
             }
         }
         assert!(saw_notify, "expected EV_NOTIFY with review=true");
+    }
+
+    #[tokio::test]
+    async fn session_worktree_enter_attach_and_safe_delete_cleanup() {
+        let d = tempfile::tempdir().unwrap();
+        let wt_root = d.path().join("worktrees");
+        let repo = d.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let run = |dir: &Path, a: &[&str]| {
+            let st = std::process::Command::new("git")
+                .args(a)
+                .current_dir(dir)
+                .env("GIT_OPTIONAL_LOCKS", "0")
+                .status()
+                .unwrap();
+            assert!(st.success(), "{a:?}");
+        };
+        run(&repo, &["init", "-q", "-b", "main"]);
+        run(&repo, &["config", "user.email", "t@t"]);
+        run(&repo, &["config", "user.name", "t"]);
+        run(&repo, &["config", "core.autocrlf", "false"]);
+        std::fs::write(repo.join("app.txt"), "base\n").unwrap();
+        run(&repo, &["add", "."]);
+        run(&repo, &["commit", "-qm", "init"]);
+
+        let settings = DaemonSettings {
+            worktree_root: Some(wt_root.to_string_lossy().to_string()),
+            ..Default::default()
+        };
+        let hub = Hub::new(Store::open_memory().unwrap(), settings);
+
+        // 1. Busy session refuses enter_worktree; idle session migrates in place
+        let sid1 = "11111111-1111-1111-1111-111111111111";
+        let _rx1 = live(&hub, sid1, SessionMode::Structured, SessionStatus::Idle, 1);
+        {
+            let rt = hub.get(sid1).unwrap();
+            let mut info = rt.info.lock().unwrap();
+            info.cwd = repo.to_string_lossy().to_string();
+            info.title = "Fix limit switch".into();
+            hub.store.save_session(&info).unwrap();
+        }
+        hub.emit(sid1, 0, EventBody::UserMessage { text: "Investigate bug".into(), images: vec![], origin: None });
+        hub.emit(sid1, 0, EventBody::AssistantText { id: "a1".into(), text: "Found cause in app.txt".into() });
+        assert!(hub.enter_worktree(sid1, None, None, None).is_err());
+        hub.emit(sid1, 0, EventBody::TurnEnd { stop_reason: Some("end_turn".into()), model: None });
+
+        let migrated = hub.enter_worktree(sid1, Some("dirty-wt"), None, None).unwrap();
+        let wt1 = migrated.worktree.clone().expect("worktree metadata must be attached");
+        assert_eq!(wt1.branch, "yi/dirty-wt");
+        assert!(Path::new(&migrated.cwd).starts_with(&wt_root));
+        assert!(migrated.external_id.is_none());
+        assert!(test_pending_handoff(&hub, sid1).is_some_and(|h| h.contains("<yi-workspace-handoff>")));
+
+        // Editing inside the worktree must preserve directory & branch when session is deleted
+        std::fs::write(Path::new(&migrated.cwd).join("app.txt"), "fixed\n").unwrap();
+        assert_eq!(std::fs::read_to_string(repo.join("app.txt")).unwrap(), "base\n");
+        hub.delete(sid1).unwrap();
+        assert!(Path::new(&migrated.cwd).exists(), "dirty worktree must be preserved on session delete");
+
+        // 2. Clean 0-ahead managed worktree is automatically removed (including its yi/* branch) on session delete
+        let sid2 = "22222222-2222-2222-2222-222222222222";
+        let _rx2 = live(&hub, sid2, SessionMode::Structured, SessionStatus::Idle, 1);
+        hub.get(sid2).unwrap().info.lock().unwrap().cwd = repo.to_string_lossy().to_string();
+        let wt2 = hub.enter_worktree(sid2, Some("clean-del"), None, None).unwrap();
+        let branch2 = wt2.worktree.as_ref().unwrap().branch.clone();
+        assert!(Path::new(&wt2.cwd).exists());
+        hub.delete(sid2).unwrap();
+        assert!(!Path::new(&wt2.cwd).exists(), "clean worktree dir must be removed on delete");
+        let br_check = std::process::Command::new("git")
+            .args(["branch", "--list", &branch2])
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&br_check.stdout).trim().is_empty(), "empty worktree branch must be deleted");
+
+        // 3. Attaching an existing external worktree detects metadata, and deleting the session never removes it
+        let ext_wt = d.path().join("external-wt");
+        run(&repo, &["worktree", "add", "-qb", "feat/external", &ext_wt.to_string_lossy(), "main"]);
+        let sid3 = "33333333-3333-3333-3333-333333333333";
+        let _rx3 = live(&hub, sid3, SessionMode::Structured, SessionStatus::Idle, 1);
+        let det = crate::gitops::detect_existing_worktree(&ext_wt.to_string_lossy()).unwrap();
+        assert_eq!(det.branch, "feat/external");
+        {
+            let rt3 = hub.get(sid3).unwrap();
+            let mut info = rt3.info.lock().unwrap();
+            info.cwd = ext_wt.to_string_lossy().to_string();
+            info.worktree = Some(det);
+        }
+        hub.delete(sid3).unwrap();
+        assert!(ext_wt.exists(), "external worktree outside wt_root must never be deleted");
+    }
+
+    #[tokio::test]
+    async fn concurrent_shared_cwd_checkpoints_do_not_contaminate() {
+        let d = tempfile::tempdir().unwrap();
+        let repo = d.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let run = |a: &[&str]| {
+            let st = std::process::Command::new("git")
+                .args(a)
+                .current_dir(&repo)
+                .env("GIT_OPTIONAL_LOCKS", "0")
+                .status()
+                .unwrap();
+            assert!(st.success(), "{a:?}");
+        };
+        run(&["init", "-q", "-b", "main"]);
+        run(&["config", "user.email", "t@t"]);
+        run(&["config", "user.name", "t"]);
+        run(&["config", "core.autocrlf", "false"]);
+        std::fs::write(repo.join("a.txt"), "a0\n").unwrap();
+        std::fs::write(repo.join("b.txt"), "b0\n").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-qm", "init"]);
+        let cwd = repo.to_string_lossy().to_string();
+
+        let hub = Hub::new(Store::open_memory().unwrap(), DaemonSettings::default());
+        let sid_a = "aaaaaaaa-0000-0000-0000-000000000001";
+        let sid_b = "bbbbbbbb-0000-0000-0000-000000000002";
+        let mut rx_a = live(&hub, sid_a, SessionMode::Structured, SessionStatus::Idle, 1);
+        let mut rx_b = live(&hub, sid_b, SessionMode::Structured, SessionStatus::Idle, 1);
+        hub.get(sid_a).unwrap().info.lock().unwrap().cwd = cwd.clone();
+        hub.get(sid_b).unwrap().info.lock().unwrap().cwd = cwd.clone();
+
+        // Session A starts turn 1 alone; while A is running, Session B starts and finishes editing b.txt
+        hub.send(sid_a, "Edit a.txt", vec![], false, None).unwrap();
+        assert!(matches!(rx_a.try_recv(), Ok(AdapterCmd::Send(_))));
+        hub.emit(sid_a, 0, EventBody::ToolCall {
+            id: "ta".into(),
+            name: "Edit".into(),
+            title: "a.txt".into(),
+            input: json!({}),
+            diffs: vec![FileDiff { path: "a.txt".into(), old_text: None, new_text: None, unified: None }],
+        });
+        std::fs::write(repo.join("a.txt"), "a1\n").unwrap();
+
+        hub.send(sid_b, "Edit b.txt", vec![], false, None).unwrap();
+        assert!(matches!(rx_b.try_recv(), Ok(AdapterCmd::Send(_))));
+        hub.emit(sid_b, 0, EventBody::ToolCall {
+            id: "tb".into(),
+            name: "Edit".into(),
+            title: "b.txt".into(),
+            input: json!({}),
+            diffs: vec![FileDiff { path: "b.txt".into(), old_text: None, new_text: None, unified: None }],
+        });
+        std::fs::write(repo.join("b.txt"), "b1\n").unwrap();
+        hub.emit(sid_b, 0, EventBody::TurnEnd { stop_reason: Some("end_turn".into()), model: None });
+
+        // Session A finishes AFTER Session B has already ended
+        hub.emit(sid_a, 0, EventBody::TurnEnd { stop_reason: Some("end_turn".into()), model: None });
+
+        let info_a = hub.info(sid_a).unwrap();
+        let info_b = hub.info(sid_b).unwrap();
+        assert_eq!(info_a.checkpoints.len(), 1);
+        assert_eq!(info_b.checkpoints.len(), 1);
+        assert_eq!(info_a.checkpoints[0].files_changed, 1);
+        assert_eq!(info_a.checkpoints[0].paths, vec!["a.txt".to_string()]);
+        assert_eq!(info_b.checkpoints[0].files_changed, 1);
+        assert_eq!(info_b.checkpoints[0].paths, vec!["b.txt".to_string()]);
     }
 }
 

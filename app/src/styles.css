@@ -6957,6 +6957,27 @@ body.resizing .side-resizer::after {
   color: var(--text-3);
 }
 
+.row-wt-badge {
+  display: inline-flex;
+  align-items: center;
+  flex: none;
+  gap: 3px;
+  padding: 0 5px;
+  height: 16px;
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--ok) 12%, transparent);
+  border: 1px solid color-mix(in srgb, var(--ok) 25%, transparent);
+  color: var(--ok);
+  font-size: 10.5px;
+  font-family: var(--mono);
+  max-width: 92px;
+}
+.row-wt-badge > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 /* Tool icons no longer grey out with status; terminal mode adds a small badge at the bottom right */
 .row-badge {
   position: relative;
@@ -16728,7 +16749,7 @@ button.wp-commit-title .chev {
   align-items: center;
   gap: 8px;
   min-width: 0;
-  max-width: 56%;
+  max-width: 68%;
   flex: 0 1 auto;
 }
 .session-title-row .session-name {
@@ -17567,4 +17588,167 @@ button.wp-commit-title .chev {
   .cm-review-widget-slot {
     padding: 5px 8px;
   }
+}
+
+.ns-wt-auto-hint {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 11px;
+  margin-bottom: 10px;
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--ok) 10%, var(--panel));
+  border: 1px solid color-mix(in srgb, var(--ok) 28%, transparent);
+  color: var(--ok);
+  font-size: 12px;
+}
+
+.ns-wt-chip {
+  max-width: 220px;
+}
+
+.ns-wt-chip.active,
+.ov-pick.ov-wt-pick.active {
+  background: color-mix(in srgb, var(--ok) 12%, var(--panel));
+  border: 1px solid color-mix(in srgb, var(--ok) 36%, transparent);
+  color: var(--ok);
+  font-weight: 500;
+}
+
+.wt-head-pill {
+  display: inline-flex;
+  align-items: center;
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 170px;
+  gap: 4px;
+  padding: 0 6px;
+  height: 18px;
+  border-radius: 5px;
+  background: color-mix(in srgb, var(--ok) 12%, transparent);
+  border: 1px solid color-mix(in srgb, var(--ok) 28%, transparent);
+  color: var(--ok);
+  font-size: 11px;
+  font-family: var(--mono);
+  cursor: pointer;
+  transition: background 0.12s, border-color 0.12s;
+}
+.wt-head-pill:hover {
+  background: color-mix(in srgb, var(--ok) 18%, transparent);
+  border-color: color-mix(in srgb, var(--ok) 45%, transparent);
+}
+.wt-head-pill > svg {
+  flex: none;
+}
+.wt-head-pill > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.wt-dock {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 8px;
+  padding: 5px 6px 5px 8px;
+  border-radius: 8px;
+  font-size: 12.5px;
+}
+.wt-dock-main {
+  display: flex;
+  align-items: center;
+  flex-wrap: nowrap;
+  gap: 8px;
+  min-width: 0;
+}
+.wt-conflict-dock {
+  background: color-mix(in srgb, var(--warn) 10%, var(--panel));
+  border: 1px solid color-mix(in srgb, var(--warn) 28%, transparent);
+  color: var(--warn);
+}
+.wt-dock-toggle {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 4px 2px 2px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.12s;
+}
+.wt-dock-toggle:hover {
+  background: color-mix(in srgb, var(--warn) 10%, transparent);
+}
+.wt-dock-toggle:focus-visible {
+  outline: 1.5px solid color-mix(in srgb, var(--warn) 65%, transparent);
+  outline-offset: 1px;
+}
+.wt-dock-toggle > svg,
+.wt-dock-chev {
+  flex: none;
+}
+.wt-dock-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.wt-dock-chev {
+  display: inline-flex;
+  align-items: center;
+  opacity: 0.72;
+  transition: transform 0.14s ease, opacity 0.12s;
+}
+.wt-dock-toggle:hover .wt-dock-chev,
+.wt-dock.expanded .wt-dock-chev {
+  opacity: 1;
+}
+.wt-dock.expanded .wt-dock-chev {
+  transform: rotate(90deg);
+}
+.wt-dock-detail {
+  padding: 5px 4px 1px 22px;
+  border-top: 1px solid color-mix(in srgb, var(--warn) 18%, transparent);
+  font-size: 12px;
+  line-height: 1.45;
+  color: color-mix(in srgb, var(--warn) 90%, var(--text));
+  word-break: break-word;
+}
+.wt-dock .btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex: none;
+  white-space: nowrap;
+}
+.wt-dock-close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: currentColor;
+  opacity: 0.7;
+  cursor: pointer;
+  flex: none;
+  transition: opacity 0.12s, background 0.12s;
+}
+.wt-dock-close:hover:not(:disabled) {
+  opacity: 1;
+  background: color-mix(in srgb, var(--warn) 14%, transparent);
+}
+.wt-dock-close:disabled {
+  opacity: 0.35;
+  cursor: default;
 }

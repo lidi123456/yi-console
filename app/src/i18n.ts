@@ -277,6 +277,14 @@ const ERR_PATTERNS: [RegExp, string | ((...m: string[]) => string)][] = [
   [/旁路对话缺少所属主会话/, 'Side chat is missing its parent session'],
   [/所属主会话不存在/, 'Parent session no longer exists'],
   [/不能在旁路对话内嵌套创建旁路对话/, 'Cannot start a side chat inside another side chat'],
+  // Session-bound worktrees (hub.rs)
+  [/^只有顶层 AI 对话会话支持独立 Worktree$/, 'Only top-level AI chat sessions support isolated worktrees'],
+  [/^只有顶层 AI 对话会话支持切入独立 Worktree$/, 'Only top-level AI chat sessions can move into an isolated worktree'],
+  [/^当前会话已在独立 Worktree 中$/, 'This session is already in an isolated worktree'],
+  [/^会话正在回复中，请等当前轮次结束后再切入 Worktree$/, 'Wait for the current turn to finish before moving to a worktree'],
+  [/^会话正在切入 Worktree，请稍候再发送$/, 'Moving session into worktree, please try again shortly'],
+  [/^Worktree 切换进行中，请稍候$/, 'Worktree migration is already in progress'],
+  [/^已切入独立 Worktree：(.+?)（基于 (.+?)）$/, (_, br, base) => `Moved to isolated worktree: ${br} (from ${base})`],
 ];
 
 /** Translate Chinese error messages from the backend or runtime (applies in the English UI) */

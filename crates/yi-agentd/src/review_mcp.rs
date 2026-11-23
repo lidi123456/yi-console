@@ -909,6 +909,7 @@ mod tests {
             account_label: None,
             checkpoints: vec![],
             review,
+            worktree: None,
         }
     }
 

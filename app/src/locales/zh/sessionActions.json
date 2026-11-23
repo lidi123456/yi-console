@@ -58,5 +58,8 @@
   "switchOrManageAccount": "切换 / 管理账号…",
   "memory": "个人长期记忆…",
   "promptOutline": "提问目录",
-  "newSideChat": "新建旁路对话"
+  "newSideChat": "新建旁路对话",
+  "enterIsolatedWorktree": "切入独立 Worktree",
+  "enteredWorktreeToast": "已切入独立 Worktree（{{branch}}）",
+  "deleteSessionWithWorktreeNote": "这只是从 Yi Console 里删掉记录，工具本身保留在机器上的文件不动；如果绑定的 Worktree（{{branch}}）还有未提交或未合并的改动，目录和分支也会为你保留。"
 }

@@ -1,7 +1,7 @@
 import { getT, isEn } from '../i18n';
 import { errorToast, getState, loadSession, navigate, openNewSession, skey, toast } from '../store';
 import { rpc } from '../transport';
-import { isHostSession, TOOL_LABEL, supportsAccountsTool, type HubEvent, type SessionInfo } from '../types';
+import { isHostSession, sessionProjectDir, TOOL_LABEL, supportsAccountsTool, type HubEvent, type SessionInfo } from '../types';
 import { downloadText, isMobile, lsSet, safeFileName, sessionMarkdown, toB64 } from '../util';
 import { handoffPrompt } from '../handoff';
 import { writeClipboard } from '../clipboard';
@@ -134,7 +134,7 @@ export async function handoffSession(hostId: string, info: SessionInfo, opts: { 
 
 /** Delete every session in one working directory (the sidebar's directory row). Bottom-panel terminals go with their chat in Hub::delete */
 export async function deleteDirSessions(hostId: string, cwd: string) {
-  const list = (getState().sessions[hostId] ?? []).filter((s) => s.cwd === cwd && isHostSession(s));
+  const list = (getState().sessions[hostId] ?? []).filter((s) => sessionProjectDir(s) === cwd && isHostSession(s));
   if (list.length === 0) return;
   const busy = list.filter((s) => s.status === 'running' || s.status === 'starting' || s.status === 'waiting-permission').length;
   const name = cwd.split(/[\\/]/).filter(Boolean).pop() || cwd;
@@ -167,9 +167,12 @@ export async function deleteDirSessions(hostId: string, cwd: string) {
 
 export async function deleteSession(hostId: string, info: SessionInfo) {
   const name = info.title || tx('newSession');
+  const message = info.worktree
+    ? tx('deleteSessionWithWorktreeNote', { branch: info.worktree.branch })
+    : tx('onlyRemovesTheRecordIn');
   const ok = await askConfirm({
     title: tx('deleteSession', { name }),
-    message: tx('onlyRemovesTheRecordIn'),
+    message,
     okText: tx('delete'),
     danger: true,
   });
@@ -192,6 +195,16 @@ export async function clearSession(hostId: string, info: SessionInfo) {
   });
   if (!ok) return;
   await call(hostId, info.id, 'session.clear', {}, tx('conversationCleared'));
+}
+
+/** Migrate a main-directory session in-place into an isolated Git worktree */
+export async function enterWorktree(hostId: string, info: SessionInfo) {
+  try {
+    const updated = await rpc<SessionInfo>(hostId, 'session.enterWorktree', { sessionId: info.id });
+    toast(tx('enteredWorktreeToast', { branch: updated.worktree?.branch ?? '' }), 'info');
+  } catch (e) {
+    errorToast(e);
+  }
 }
 
 /** Switch the same session between chat mode and terminal mode; the tool continues its original session */
@@ -410,6 +423,16 @@ export function sessionMenu(
       : []),
     ...(canHandoffSession(info, opts.promptCount)
       ? [{ label: tx('continueInAnotherTool'), icon: 'forward', run: () => handoffSession(hostId, info) }]
+      : []),
+    ...(isHostSession(info) && info.mode === 'structured' && info.tool !== 'shell' && !info.worktree
+      ? [
+          {
+            label: tx('enterIsolatedWorktree'),
+            icon: 'git-branch',
+            disabled: info.status === 'running' || info.status === 'starting' || info.status === 'waiting-permission',
+            run: () => void enterWorktree(hostId, info),
+          },
+        ]
       : []),
     '-',
     // Top-bar actions (usage on all viewports; new side chat and bottom terminal panel on desktop) are not repeated in the menu

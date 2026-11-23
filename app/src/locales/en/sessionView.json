@@ -28,5 +28,11 @@
   "sideChatsCount": "Side · {{count}}",
   "sideChatsMenuTip": "View or reopen side chats attached to this session",
   "newSideChat": "New side chat",
-  "newSideChatWithTool": "New side chat with {{tool}}…"
+  "newSideChatWithTool": "New side chat with {{tool}}…",
+  "enteredWorktreeToast": "Moved to isolated worktree ({{branch}})",
+  "worktreeConflictNotice": "Another session is active here",
+  "worktreeConflictTip": "\"{{title}}\" is running in this directory; concurrent edits may overwrite each other",
+  "forkWorktreeAndContinue": "Use Worktree",
+  "keepSharedDirectory": "Dismiss, keep main dir",
+  "worktreeHeadPillTip": "Running in worktree {{branch}} ({{cwd}})\nClick to view workspace changes"
 }

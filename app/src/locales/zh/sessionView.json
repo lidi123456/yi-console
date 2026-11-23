@@ -28,5 +28,11 @@
   "sideChatsCount": "旁路 · {{count}}",
   "sideChatsMenuTip": "查看或重新打开当前会话的旁路对话",
   "newSideChat": "新建旁路对话",
-  "newSideChatWithTool": "用 {{tool}} 新建旁路…"
+  "newSideChatWithTool": "用 {{tool}} 新建旁路…",
+  "enteredWorktreeToast": "已切入独立 Worktree（{{branch}}）",
+  "worktreeConflictNotice": "同目录有其他会话运行中",
+  "worktreeConflictTip": "「{{title}}」正在同一目录运行，继续改动可能会互相覆盖",
+  "forkWorktreeAndContinue": "切入 Worktree",
+  "keepSharedDirectory": "忽略，仍共用主目录",
+  "worktreeHeadPillTip": "当前运行于 Worktree {{branch}}（{{cwd}}）\n点击查看文件改动"
 }

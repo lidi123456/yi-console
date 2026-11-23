@@ -9,7 +9,7 @@ import { addDraft, projKey, removeDraft, useDrafts, useFeed, usePageVisible, typ
 import { permLabel, permModes } from '../perm';
 import { errorToast, navigate, openNewSession, toast, useStore, type HostEntry } from '../store';
 import { rpc } from '../transport';
-import { isHostSession, TOOL_LABEL, type GitStatus, type SessionInfo, type ToolKind, type Usage } from '../types';
+import { isHostSession, sessionProjectDir, TOOL_LABEL, type GitStatus, type SessionInfo, type ToolKind, type Usage } from '../types';
 import { basename, clock, fmtTokens, isMobile, lsGet, lsSet, shortPath, timeAgo } from '../util';
 import { type Attached, FILE_MAX, IMAGE_TYPES, localPaths, readImage, refOf, uploadChunked } from './Composer';
 import type { Item } from './Home';
@@ -19,6 +19,7 @@ import { DirPicker, PREFS_KEY, prefModel, recentDirs, rememberDir, type ToolPref
 import { openMenu, type MenuItem } from './Overlay';
 import { showChanges } from './SessionActions';
 import { QuotaCard, quotaToolsFor, TOOL_VAR } from './StatsView';
+import { useWorktreeChoice } from './WorktreePicker';
 
 const t = getT('home');
 const tc = getT('composer');
@@ -66,7 +67,7 @@ function dirList(hostId: string, sessions: Record<string, SessionInfo[]>) {
   const fromSessions = (sessions[hostId] ?? [])
     .filter(isHostSession)
     .sort((a, b) => b.updatedAt - a.updatedAt)
-    .map((s) => s.cwd);
+    .map(sessionProjectDir);
   return [...new Set([...recentDirs(hostId), ...fromSessions])].slice(0, DIR_MENU_MAX);
 }
 
@@ -82,7 +83,7 @@ type Progress = { name: string; sent: number; total: number } | null;
 
 /** Start a chat session with a first message; the board shows it, so the page stays where it is */
 async function startSession(
-  d: Pick<Draft, 'text' | 'hostId' | 'cwd' | 'tool' | 'perm'>,
+  d: Pick<Draft, 'text' | 'hostId' | 'cwd' | 'tool' | 'perm'> & { worktree?: boolean; worktreeBase?: string },
   items: Pending[] = [],
   setProgress: (p: Progress | ((p: Progress) => Progress)) => void = () => {},
 ): Promise<boolean> {
@@ -106,11 +107,13 @@ async function startSession(
       effort: prefs.model ? prefs.effort || undefined : undefined,
       // Cursor parameters chosen there; the host drops the ones the model lacks
       modelConfig: d.tool === 'cursor' && prefModel(prefs) ? prefs.config : undefined,
+      worktree: d.worktree ? true : undefined,
+      worktreeBase: d.worktree && d.worktreeBase ? d.worktreeBase : undefined,
       cols: 120,
       rows: 32,
     });
     const id = info.id;
-    rememberDir(d.hostId, info.cwd);
+    rememberDir(d.hostId, info.worktree?.repoRoot ?? info.cwd);
     lsSet('last-tool', d.tool);
     if (later) {
       const refs: string[] = [];
@@ -172,6 +175,13 @@ export function QuickStart({ hosts, sessions }: { hosts: HostEntry[]; sessions: 
 
   const ready = !!host && !!tool && !busy;
   const canAttach = !!host && !!tool;
+  const wt = useWorktreeChoice({
+    hostId,
+    connected: !!host,
+    cwd,
+    enabled: !!host && !!tool,
+    hostSessions: sessions[hostId] ?? [],
+  });
   // Same rules as the new session page (NewSession.tsx addFiles)
   const addFiles = async (fs: File[]) => {
     const local = host?.config.kind === 'local' ? await localPaths(fs.filter((f) => !IMAGE_TYPES.includes(f.type))) : null;
@@ -207,9 +217,30 @@ export function QuickStart({ hosts, sessions }: { hosts: HostEntry[]; sessions: 
     const v = text.trim();
     if (!v || !ready || !tool) return;
     setBusy(true);
-    if (await startSession({ text: v, hostId, cwd, tool, perm }, items, setProgress)) {
+    const targetCwd =
+      wt.choice.kind === 'existing'
+        ? wt.choice.path
+        : wt.choice.kind === 'main' && wt.isGitRepo
+          ? wt.mainDir
+          : cwd;
+    if (
+      await startSession(
+        {
+          text: v,
+          hostId,
+          cwd: targetCwd,
+          tool,
+          perm,
+          worktree: wt.choice.kind === 'new',
+          worktreeBase: wt.choice.kind === 'new' ? wt.choice.base : undefined,
+        },
+        items,
+        setProgress,
+      )
+    ) {
       setText('');
       setItems([]);
+      wt.resetManual();
     }
     setBusy(false);
   };
@@ -403,6 +434,18 @@ export function QuickStart({ hosts, sessions }: { hosts: HostEntry[]; sessions: 
               <span className="truncate">{shortPath(cwd, host?.status.hello?.home)}</span>
               <Icon name="down" size={11} />
             </button>
+            {wt.isGitRepo && (
+              <button
+                type="button"
+                className={`ov-pick ov-wt-pick ${wt.choice.kind !== 'main' ? 'active' : ''}`}
+                title={getT('newSession')('worktreeChipTip')}
+                onClick={(e) => menuUnder(e, wt.buildMenuItems(host?.status.hello?.home))}
+              >
+                <Icon name="git-branch" size={12} />
+                <span className="truncate">{wt.chipLabel}</span>
+                <Icon name="down" size={11} />
+              </button>
+            )}
             {tool && perms.length > 0 && (
               <button
                 className={`ov-pick perm-${perm}`}

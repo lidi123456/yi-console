@@ -305,7 +305,10 @@ function buildItems(events: HubEvent[], hideCompactCmd = false): Item[] {
             : t('backgroundTask', { v: bg[1].trim() });
           const what = (sub ? bg[2].replace(/^子 agent /, '') : bg[2]).replace(/\s+/g, ' ').trim();
           items.push({ k: 'bgdone', key, status: s, label, what });
-        } else if (e.text.trim()) items.push({ k: 'note', key, text: e.text, tone: 'muted' });
+        } else if (e.text.trim()) {
+          const text = /^已切入独立 Worktree/.test(e.text) ? trErr(e.text) : e.text;
+          items.push({ k: 'note', key, text, tone: 'muted' });
+        }
         break;
       }
       case 'rate_limit': {

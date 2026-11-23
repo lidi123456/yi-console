@@ -7,7 +7,7 @@ import { rpc } from '../transport';
 import { botCall, unmapHost } from '../bots';
 import { localHost } from './BotsSection';
 import { openAccountManager } from './AccountManagerModal';
-import { isHostSession, TOOL_LABEL, supportsAccountsTool, type DirEntry, type ModelConfigOption, type ModelOption, type SessionInfo, type SessionMode, type ToolAccountsSummary, type ToolKind } from '../types';
+import { isHostSession, sessionProjectDir, TOOL_LABEL, supportsAccountsTool, type DirEntry, type ModelConfigOption, type ModelOption, type SessionInfo, type SessionMode, type ToolAccountsSummary, type ToolKind } from '../types';
 import { isMobile, lsGet, lsSet, shortPath } from '../util';
 import { type Attached, FILE_MAX, IMAGE_TYPES, localPaths, readImage, refOf, uploadChunked } from './Composer';
 import { useDrives } from './FilesView';
@@ -16,6 +16,7 @@ import { openImage } from './Lightbox';
 import { ModelMenu } from './ModelPicker';
 import { askText, openMenu, type MenuItem } from './Overlay';
 import { nextPerm, PermPicker } from './PermPicker';
+import { useWorktreeChoice } from './WorktreePicker';
 
 const tx = getT('newSession');
 const tb = getT('bots');
@@ -361,9 +362,18 @@ export function NewSessionPage({ params }: { params: NewSessionParams }) {
     const fromSessions = (hostSessions[hostId] ?? [])
       .filter(isHostSession)
       .sort((a, b) => b.updatedAt - a.updatedAt)
-      .map((s) => s.cwd);
+      .map(sessionProjectDir);
     return [...new Set([...recentDirs(hostId), ...fromSessions])].slice(0, DIR_MENU_MAX);
   }, [hostId, hostSessions]);
+
+  const wtEnabled = connected && aiTool && !bot && !ns.resumeId && effectiveMode === 'structured';
+  const wt = useWorktreeChoice({
+    hostId,
+    connected,
+    cwd,
+    enabled: wtEnabled,
+    hostSessions: hostSessions[hostId] ?? [],
+  });
 
   const switchHost = (id: string) => {
     if (id === hostId) return;
@@ -454,9 +464,15 @@ export function NewSessionPage({ params }: { params: NewSessionParams }) {
     let info: SessionInfo | null = null;
     let message = prompt;
     try {
+      const targetCwd =
+        wtEnabled && wt.choice.kind === 'existing'
+          ? wt.choice.path
+          : wtEnabled && wt.choice.kind === 'main' && wt.isGitRepo
+            ? wt.mainDir
+            : cwd.trim();
       info = await rpc<SessionInfo>(hostId, 'session.create', {
         tool,
-        cwd: cwd.trim(),
+        cwd: targetCwd,
         mode: effectiveMode,
         accountId: aiTool && !bot && accountId ? accountId : undefined,
         prompt: later ? undefined : prompt || undefined,
@@ -469,10 +485,12 @@ export function NewSessionPage({ params }: { params: NewSessionParams }) {
         resumeId: ns.resumeId,
         handoffFrom: ns.handoff?.fromId,
         title: ns.title,
+        worktree: wtEnabled && wt.choice.kind === 'new' ? true : undefined,
+        worktreeBase: wtEnabled && wt.choice.kind === 'new' && wt.choice.base ? wt.choice.base : undefined,
         cols: 120,
         rows: 32,
       });
-      rememberDir(hostId, info.cwd);
+      rememberDir(hostId, info.worktree?.repoRoot ?? info.cwd);
       lsSet('last-tool', tool);
       if (aiTool) {
         // Continue with another tool always uses chat mode; don't record that as the user's chosen UI
@@ -572,6 +590,12 @@ export function NewSessionPage({ params }: { params: NewSessionParams }) {
   return (
     <div className="page ns-page">
       <div className="ns-center">
+        {wt.autoSelected && (
+          <div className="ns-wt-auto-hint" role="status">
+            <Icon name="git-branch" size={13} />
+            <span>{tx('worktreeAutoSelectedHint')}</span>
+          </div>
+        )}
         <h2 className="ns-title">{title}</h2>
         <div className="ns-chips">
           <button
@@ -619,6 +643,18 @@ export function NewSessionPage({ params }: { params: NewSessionParams }) {
             <span className="truncate">{baseName(shortPath(cwd, home))}</span>
             <Icon name="down" size={11} />
           </button>
+          {wtEnabled && wt.isGitRepo && (
+            <button
+              type="button"
+              className={`ns-chip ns-wt-chip ${wt.choice.kind !== 'main' ? 'active' : ''}`}
+              title={tx('worktreeChipTip')}
+              onClick={(e) => menuUnder(e, wt.buildMenuItems(home))}
+            >
+              <Icon name="git-branch" size={14} />
+              <span className="truncate">{wt.chipLabel}</span>
+              <Icon name="down" size={11} />
+            </button>
+          )}
           <button
             type="button"
             className="ns-chip"

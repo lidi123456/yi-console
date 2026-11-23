@@ -38,5 +38,15 @@
   "titleFiles": "浏览文件",
   "account": "账号",
   "defaultAccount": "默认账号",
-  "manageAccounts": "管理账号…"
+  "manageAccounts": "管理账号…",
+  "mainDirectory": "主目录",
+  "worktreeChipTip": "选择在主目录运行、基于某个分支新建独立 Worktree，或直接接入已有 Worktree",
+  "worktreeAutoSelectedHint": "检测到主目录正有会话运行，已自动选「独立 Worktree」（点芯片可切回）",
+  "worktreeChipNew": "Worktree · {{base}}",
+  "worktreeChipExisting": "接入 · {{branch}}",
+  "menuMainDir": "主目录（当前 {{branch}}）",
+  "menuMainBusyHint": "运行中",
+  "menuNewFromBranch": "基于 {{branch}} 新建 Worktree",
+  "menuRecommended": "推荐",
+  "menuAttachExisting": "接入已有：{{branch}}"
 }

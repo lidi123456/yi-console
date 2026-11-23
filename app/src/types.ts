@@ -76,6 +76,8 @@ export interface SessionInfo {
   checkpoints?: TurnCheckpoint[];
   /** Metadata for a read-only cross-tool AI code review side chat */
   review?: ReviewSessionMeta | null;
+  /** Managed Git worktree bound to this session */
+  worktree?: SessionWorktree | null;
 }
 
 export interface ReviewSessionMeta {
@@ -96,6 +98,13 @@ export interface ReviewSessionMeta {
   totalFilesCount?: number;
 }
 
+export interface SessionWorktree {
+  repoRoot: string;
+  branch: string;
+  baseBranch?: string | null;
+  baseCommit?: string | null;
+}
+
 export interface TurnCheckpoint {
   turn: number;
   userSeq: number;
@@ -105,6 +114,7 @@ export interface TurnCheckpoint {
   filesChanged: number;
   added: number;
   deleted: number;
+  paths?: string[];
 }
 
 export interface BotLink {
@@ -120,6 +130,17 @@ export interface BotLink {
 /** Ordinary top-level host session: neither a bottom-panel terminal (`parentId`) nor a Bot / Bot-task session (`bot`) */
 export function isHostSession(s: SessionInfo): boolean {
   return !s.parentId && !s.bot;
+}
+
+/** Main repository directory for grouping a session (resolves a bound worktree back to its main repository) */
+export function sessionProjectDir(s: SessionInfo): string {
+  return s.worktree?.repoRoot || s.cwd;
+}
+
+/** Normalize a local directory path for case/separator-insensitive matching across platforms */
+export function normDirPath(p: string): string {
+  const s = p.trim().replace(/\\/g, '/').replace(/\/+$/, '');
+  return /^[A-Za-z]:/.test(s) ? s.toLowerCase() : s;
 }
 
 export interface PendingBrief {

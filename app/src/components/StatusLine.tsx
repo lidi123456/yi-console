@@ -303,8 +303,9 @@ export function StatusLine({
     return () => {
       alive = false;
     };
+    // Refresh immediately when cwd/worktree changes in addition to throttled status updates.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [hostId, info.id, cfg, wantGit, wantCmd, tick]);
+  }, [hostId, info.id, info.cwd, info.worktree?.branch, cfg, wantGit, wantCmd, tick]);
 
   useEffect(() => {
     if (!wantQuota) return setQuota(null);

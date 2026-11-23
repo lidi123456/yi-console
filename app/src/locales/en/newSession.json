@@ -38,5 +38,15 @@
   "titleFiles": "Browse files",
   "account": "Account",
   "defaultAccount": "Default Account",
-  "manageAccounts": "Manage Accounts…"
+  "manageAccounts": "Manage Accounts…",
+  "mainDirectory": "Main Dir",
+  "worktreeChipTip": "Run in the main directory, create an isolated worktree from a branch, or attach an existing worktree",
+  "worktreeAutoSelectedHint": "Another session is active in the main directory; auto-selected isolated worktree (click chip to change)",
+  "worktreeChipNew": "Worktree · {{base}}",
+  "worktreeChipExisting": "Attach · {{branch}}",
+  "menuMainDir": "Main directory (current {{branch}})",
+  "menuMainBusyHint": "running",
+  "menuNewFromBranch": "New worktree from {{branch}}",
+  "menuRecommended": "recommended",
+  "menuAttachExisting": "Attach existing: {{branch}}"
 }

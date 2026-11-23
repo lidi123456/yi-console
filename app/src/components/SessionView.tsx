@@ -11,7 +11,7 @@ import { isHostSession, TOOL_LABEL, supportsAccountsTool, type QuestionAnswer, t
 import { fmtUsage, isMobile, lsGet, lsSet, shortPath, STATUS_LABEL } from '../util';
 import { openAccountManager } from './AccountManagerModal';
 import { openMenu } from './Overlay';
-import { exportSession, OPEN_CHANGES, OPEN_FILE, openFileInPanel, renameSession, sessionMenu, showTurnDiff } from './SessionActions';
+import { exportSession, OPEN_CHANGES, OPEN_FILE, openFileInPanel, renameSession, sessionMenu, showChanges, showTurnDiff } from './SessionActions';
 import { AI_PREFIX } from './AiBrowser';
 import { beginWidthDrag, FilePanel } from './FilePanel';
 import { sideChatTitle, sideChatTools, sideTabPath, startSideChat } from './SideChatTab';
@@ -19,6 +19,7 @@ import { TermPanel } from './TermPanel';
 import { AsyncAskCard, ChatView, openAsyncAsk, PermissionCard, setChatStyle, useChatStyle } from './ChatView';
 import { PlanDock } from './PlanDock';
 import { LimitDock } from './LimitDock';
+import { WorktreeDock } from './WorktreeDock';
 import { Composer, restoreToComposer } from './Composer';
 import { Icon, ToolBadge } from './Icon';
 import { PromptOutlinePanel, PromptOutlineSheet, PromptStickyBar, PromptTickRail, buildPromptEntries } from './PromptNav';
@@ -115,9 +116,20 @@ export function SessionView({ hostId, sessionId, seq }: { hostId: string; sessio
   // Active directory in the file panel (defaults to info.cwd; can switch to any detected git worktree of the same repo)
   const panelCwdKey = `file-panel-cwd-${key}`;
   const [panelCwd, setPanelCwd] = useState(() => lsGet(panelCwdKey, ''));
+  const prevInfoCwd = useRef(info?.cwd);
   useEffect(() => {
     setPanelCwd(lsGet(panelCwdKey, ''));
-  }, [panelCwdKey]);
+    prevInfoCwd.current = info?.cwd;
+  }, [panelCwdKey]); // eslint-disable-line react-hooks/exhaustive-deps
+  // Auto-follow the session's active workspace when a worktree is entered or changed
+  useEffect(() => {
+    if (!info?.cwd) return;
+    if (prevInfoCwd.current && prevInfoCwd.current !== info.cwd) {
+      lsSet(panelCwdKey, '');
+      setPanelCwd('');
+    }
+    prevInfoCwd.current = info.cwd;
+  }, [info?.cwd, panelCwdKey]);
   const switchPanelCwd = (next: string) => {
     const val = !next || next === info?.cwd ? '' : next;
     lsSet(panelCwdKey, val);
@@ -514,6 +526,17 @@ export function SessionView({ hostId, sessionId, seq }: { hostId: string; sessio
             >
               {info.title || t('newSession')}
             </div>
+            {info.worktree && (
+              <button
+                type="button"
+                className="wt-head-pill"
+                title={t('worktreeHeadPillTip', { branch: info.worktree.branch, cwd: info.cwd })}
+                onClick={() => showChanges(hostId, sessionId)}
+              >
+                <Icon name="git-branch" size={11} />
+                <span>{info.worktree.branch}</span>
+              </button>
+            )}
             {!filesOnly && <span className={`status-chip st-${info.status}`}>{STATUS_LABEL[info.status]}</span>}
           </div>
           <div className="muted small truncate">
@@ -563,7 +586,8 @@ export function SessionView({ hostId, sessionId, seq }: { hostId: string; sessio
                 </button>
               </>
             )}
-            {info.mode === 'terminal' && info.model ? ` · ${info.model}` : ''} · {shortPath(info.cwd, home)}
+            {info.mode === 'terminal' && info.model ? ` · ${info.model}` : ''}
+            {` · ${shortPath(info.worktree?.repoRoot ?? info.cwd, home)}`}
             {info.contextPercent != null && ` · ${t('context')} ${Math.round(info.contextPercent)}%`}
           </div>
         </div>
@@ -843,6 +867,7 @@ export function SessionView({ hostId, sessionId, seq }: { hostId: string; sessio
             <div className="composer-wrap">
               <BgTasks hostId={hostId} info={info} />
               <PlanDock events={data.events} busy={info.status === 'running' || info.status === 'starting'} alive={connected && alive} />
+              <WorktreeDock hostId={hostId} info={info} connected={connected} />
               <LimitDock hostId={hostId} info={info} connected={connected} />
               {info.status === 'error' && (
                 <div className="session-recover" role="status">

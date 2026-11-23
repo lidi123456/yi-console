@@ -275,6 +275,9 @@ pub struct SessionInfo {
     /// Metadata for a read-only cross-tool AI code review side chat
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review: Option<ReviewMeta>,
+    /// Managed Git worktree bound to this session
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<SessionWorktree>,
 }
 
 /// Scope and filter metadata attached to a read-only AI code review side chat
@@ -313,6 +316,22 @@ pub struct ReviewMeta {
     pub total_files_count: Option<u32>,
 }
 
+/// Managed Git worktree bound to an ordinary session (`~/.yi-console/worktrees/<repo>-<hash>/<name>`)
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionWorktree {
+    /// Main repository root directory this worktree belongs to (used for sidebar grouping and Apply/Merge target)
+    pub repo_root: String,
+    /// Branch name checked out in this worktree (e.g. `yi/feat-auth`)
+    pub branch: String,
+    /// Base branch in the main repository when the worktree was created (e.g. `main`)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_branch: Option<String>,
+    /// Base commit OID when the worktree was created
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_commit: Option<String>,
+}
+
 /// One structured turn's hidden git checkpoint pair (pre-turn base and post-turn end when files changed)
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -335,6 +354,9 @@ pub struct TurnCheckpoint {
     pub added: u64,
     #[serde(default)]
     pub deleted: u64,
+    /// When captured during concurrent activity in a shared directory, restricts diff viewing to tool-touched paths
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub paths: Vec<String>,
 }
 
 /// Which Bot a session belongs to. Bot state itself lives in the desktop client that runs the Bot
@@ -1610,6 +1632,8 @@ pub mod methods {
     pub const GIT_WORKTREE_ADD: &str = "git.worktreeAdd";
     /// {path, force?, deleteBranch?}: remove a worktree made by git.worktreeAdd (must be under the worktree root)
     pub const GIT_WORKTREE_REMOVE: &str = "git.worktreeRemove";
+    /// Migrate an existing main-directory session in-place into a new managed Git worktree {sessionId, name?, branch?, base?} -> SessionInfo
+    pub const SESSION_ENTER_WORKTREE: &str = "session.enterWorktree";
     /// -> [{clientId, name}]: desktop apps registered on this machine (`client.hello` over local IPC), whose Bots a
     /// phone or yi-web can control through `client.call`
     pub const CLIENTS_LIST: &str = "clients.list";

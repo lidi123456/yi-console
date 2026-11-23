@@ -450,6 +450,7 @@ mod tests {
             account_label: None,
             checkpoints: vec![],
             review: None,
+            worktree: None,
             queued: vec![],
             queue_paused: None,
             restart_interrupted: false,

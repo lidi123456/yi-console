@@ -119,6 +119,94 @@ pub(crate) fn repo_root(cwd: &Path) -> Option<std::path::PathBuf> {
         .map(|s| std::path::PathBuf::from(s.trim()))
 }
 
+/// Main working tree root of the repository containing `cwd` (resolves linked worktrees back to the primary checkout)
+pub fn main_repo_root(cwd: &Path) -> Option<std::path::PathBuf> {
+    let root = repo_root(cwd)?;
+    if let Ok(out) = git_ok(&root, &["worktree", "list", "--porcelain"]) {
+        for line in out.lines() {
+            if let Some(raw) = line.strip_prefix("worktree ") {
+                let p = std::path::PathBuf::from(native_worktree_path(raw.trim()));
+                if p.is_dir() {
+                    return Some(p);
+                }
+                break;
+            }
+        }
+    }
+    Some(root)
+}
+
+/// Normalize a tool-reported file path (relative to `cwd` or absolute) into a repo-relative forward-slash path
+pub fn normalize_repo_rel(cwd: &str, raw: &str) -> Option<String> {
+    let dir = crate::paths::expand(cwd);
+    let root = repo_root(&dir)?;
+    let root_canon = root.canonicalize().unwrap_or_else(|_| root.clone());
+    let root_key = norm_path_key(&root_canon.to_string_lossy());
+    let raw_trimmed = raw.trim();
+    if raw_trimmed.is_empty() {
+        return None;
+    }
+    let p = Path::new(raw_trimmed);
+    let joined = if p.is_absolute() {
+        // Canonicalize the deepest existing ancestor so symlinked roots (e.g. /tmp -> /private/tmp) match `root_canon`.
+        let mut cur = p.to_path_buf();
+        let mut tail: Vec<std::ffi::OsString> = Vec::new();
+        while !cur.exists() {
+            let Some(name) = cur.file_name() else { break };
+            tail.push(name.to_os_string());
+            if !cur.pop() {
+                break;
+            }
+        }
+        let mut base = cur.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+        if cur.exists() {
+            for seg in tail.into_iter().rev() {
+                base.push(seg);
+            }
+            base
+        } else {
+            p.to_path_buf()
+        }
+    } else {
+        let dir_canon = dir.canonicalize().unwrap_or(dir);
+        dir_canon.join(p)
+    };
+    let mut comps: Vec<String> = Vec::new();
+    let s = joined.to_string_lossy();
+    let s = s.strip_prefix(r"\\?\").unwrap_or(&s).replace('\\', "/");
+    let has_leading_slash = s.starts_with('/');
+    for seg in s.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                if comps.pop().is_none() {
+                    return None;
+                }
+            }
+            other => comps.push(other.to_string()),
+        }
+    }
+    let cleaned = if has_leading_slash {
+        format!("/{}", comps.join("/"))
+    } else {
+        comps.join("/")
+    };
+    let cleaned_key = if cfg!(windows) {
+        cleaned.to_ascii_lowercase()
+    } else {
+        cleaned.clone()
+    };
+    let prefix = format!("{root_key}/");
+    if !cleaned_key.starts_with(&prefix) {
+        return None;
+    }
+    let rel = cleaned[prefix.len()..].to_string();
+    if rel.is_empty() || check_paths(std::slice::from_ref(&rel)).is_err() {
+        return None;
+    }
+    Some(rel)
+}
+
 /// Paths must stay inside the repo, so things like ../ can't escape it
 pub(crate) fn check_paths(paths: &[String]) -> Result<()> {
     for p in paths {
@@ -534,6 +622,29 @@ pub fn worktree_add(root: &Path, cwd: &str, name: &str, branch: Option<&str>, ba
     Ok(json!({ "path": path, "branch": branch, "repo": repo.to_string_lossy() }))
 }
 
+/// Unlink symlinked/junctioned dependency directories inside a worktree before removal so git never trips on them
+fn unlink_worktree_deps(wt_dir: &Path) {
+    for rel in ["node_modules", "app/node_modules", ".venv", "venv"] {
+        let p = wt_dir.join(rel);
+        let Ok(meta) = std::fs::symlink_metadata(&p) else {
+            continue;
+        };
+        if meta.file_type().is_symlink() {
+            let _ = std::fs::remove_dir(&p).or_else(|_| std::fs::remove_file(&p));
+        } else if cfg!(windows) && meta.is_dir() {
+            // On Windows, `cmd /C rmdir` or `fs::remove_dir` removes a directory junction without touching its target
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::MetadataExt;
+                const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+                if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                    let _ = std::fs::remove_dir(&p);
+                }
+            }
+        }
+    }
+}
+
 /// Remove a worktree made by `worktree_add`; only paths under the worktree root are accepted
 pub fn worktree_remove(root: &Path, path: &str, force: bool, delete_branch: bool) -> Result<()> {
     let dir = Path::new(path).canonicalize().map_err(|_| anyhow!("worktree 不存在: {path}"))?;
@@ -544,6 +655,7 @@ pub fn worktree_remove(root: &Path, path: &str, force: bool, delete_branch: bool
     let common = git_ok(&dir, &["rev-parse", "--path-format=absolute", "--git-common-dir"])?;
     let common = std::path::PathBuf::from(common.trim());
     let branch = git_ok(&dir, &["symbolic-ref", "--quiet", "--short", "HEAD"]).ok().map(|s| s.trim().to_string());
+    unlink_worktree_deps(&dir);
     // The path as given: git may not understand the verbatim (\\?\) form canonicalize returns on Windows
     let target = path.to_string();
     let mut args = vec!["worktree", "remove"];
@@ -557,6 +669,236 @@ pub fn worktree_remove(root: &Path, path: &str, force: bool, delete_branch: bool
         git_ok(&common, &["branch", "-D", &b])?;
     }
     Ok(())
+}
+
+/// Best-effort synchronous removal with brief retries for Windows file-handle release
+pub fn worktree_remove_best_effort(root: &Path, path: &str, force: bool, delete_branch: bool) -> bool {
+    if worktree_remove(root, path, force, delete_branch).is_ok() {
+        return true;
+    }
+    for ms in [150u64, 300, 600] {
+        std::thread::sleep(std::time::Duration::from_millis(ms));
+        if worktree_remove(root, path, force, delete_branch).is_ok() {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_git_ignored(repo: &Path, rel: &str) -> bool {
+    git(repo, &["check-ignore", "-q", "--", rel])
+        .is_ok_and(|o| o.status.success())
+}
+
+fn link_dir(src: &Path, dst: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(src, dst)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let dst_s = dst.to_string_lossy().to_string();
+        let src_s = src.to_string_lossy().to_string();
+        let st = Command::new("cmd")
+            .args(["/C", "mklink", "/J", &dst_s, &src_s])
+            .creation_flags(0x0800_0000)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()?;
+        if st.success() {
+            Ok(())
+        } else {
+            Err(std::io::Error::new(std::io::ErrorKind::Other, "mklink failed"))
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (src, dst);
+        Ok(())
+    }
+}
+
+/// Prepare a newly created worktree so tests and builds work immediately:
+/// copy gitignored `.env*` files (root + 1st-level subdirs) and symlink/junction heavy ignored dependency folders
+fn prepare_worktree_env(main_repo: &Path, wt_dir: &Path) {
+    const ENV_MAX_BYTES: u64 = 1024 * 1024;
+    let copy_env_in = |sub: Option<&str>| {
+        let src_dir = sub.map(|s| main_repo.join(s)).unwrap_or_else(|| main_repo.to_path_buf());
+        let Ok(entries) = std::fs::read_dir(&src_dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name_s = name.to_string_lossy();
+            if !name_s.starts_with(".env") {
+                continue;
+            }
+            let Ok(meta) = entry.metadata() else { continue };
+            if !meta.is_file() || meta.len() > ENV_MAX_BYTES {
+                continue;
+            }
+            let rel = match sub {
+                Some(s) => format!("{s}/{name_s}"),
+                None => name_s.to_string(),
+            };
+            let dst = wt_dir.join(&rel);
+            if dst.exists() || !is_git_ignored(main_repo, &rel) {
+                continue;
+            }
+            if let Some(p) = dst.parent() {
+                let _ = std::fs::create_dir_all(p);
+            }
+            let _ = std::fs::copy(entry.path(), &dst);
+        }
+    };
+    copy_env_in(None);
+    if let Ok(entries) = std::fs::read_dir(main_repo) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name_s = name.to_string_lossy();
+            if matches!(name_s.as_ref(), ".git" | "node_modules" | "target" | ".venv" | "venv") {
+                continue;
+            }
+            if entry.file_type().is_ok_and(|ft| ft.is_dir()) {
+                copy_env_in(Some(&name_s));
+            }
+        }
+    }
+    for rel in ["node_modules", "app/node_modules", ".venv", "venv"] {
+        let src = main_repo.join(rel);
+        let dst = wt_dir.join(rel);
+        if src.is_dir() && !dst.exists() && is_git_ignored(main_repo, rel) {
+            if let Some(p) = dst.parent() {
+                let _ = std::fs::create_dir_all(p);
+            }
+            let _ = link_dir(&src, &dst);
+        }
+    }
+}
+
+/// Create a managed Git worktree for a user session (`worktree_add` + `.env` / dependency linking)
+pub fn worktree_add_session(
+    root: &Path,
+    cwd: &str,
+    name: &str,
+    branch: Option<&str>,
+    base: Option<&str>,
+) -> Result<(String, yi_proto::SessionWorktree)> {
+    let dir = crate::paths::expand(cwd);
+    let main_repo = main_repo_root(&dir).ok_or_else(|| anyhow!("不是 git 仓库: {cwd}"))?;
+    let base_arg = base.map(str::trim).filter(|s| !s.is_empty());
+    if base_arg.is_some_and(|b| b.starts_with('-')) {
+        bail!("基准分支无效");
+    }
+    let base_branch = match base_arg {
+        Some(b) => {
+            if git(&main_repo, &["show-ref", "--verify", "-q", &format!("refs/heads/{b}")])
+                .is_ok_and(|o| o.status.success())
+            {
+                Some(b.to_string())
+            } else {
+                None
+            }
+        }
+        None => git_ok(&dir, &["symbolic-ref", "--quiet", "--short", "HEAD"])
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                git_ok(&main_repo, &["symbolic-ref", "--quiet", "--short", "HEAD"])
+                    .ok()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+            }),
+    };
+    let resolve_ref = base_arg.unwrap_or("HEAD");
+    let base_commit = git_ok(&dir, &["rev-parse", "--verify", "-q", &format!("{resolve_ref}^{{commit}}")])
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let base_for_add = base_arg.or(base_commit.as_deref());
+    let main_cwd = native_worktree_path(&main_repo.to_string_lossy());
+    let added = worktree_add(root, &main_cwd, name, branch, base_for_add)?;
+    let wt_path = added["path"]
+        .as_str()
+        .ok_or_else(|| anyhow!("worktree 创建结果缺少路径"))?
+        .to_string();
+    let wt_branch = added["branch"]
+        .as_str()
+        .ok_or_else(|| anyhow!("worktree 创建结果缺少分支"))?
+        .to_string();
+    prepare_worktree_env(&main_repo, Path::new(&wt_path));
+    Ok((
+        wt_path,
+        yi_proto::SessionWorktree {
+            repo_root: main_cwd,
+            branch: wt_branch,
+            base_branch,
+            base_commit,
+        },
+    ))
+}
+
+/// Detect whether `cwd` is an existing linked git worktree distinct from its primary repository checkout
+pub fn detect_existing_worktree(cwd: &str) -> Option<yi_proto::SessionWorktree> {
+    let dir = crate::paths::expand(cwd);
+    let wt_root = repo_root(&dir)?;
+    let main_repo = main_repo_root(&dir)?;
+    let wt_canon = wt_root.canonicalize().unwrap_or_else(|_| wt_root.clone());
+    let main_canon = main_repo.canonicalize().unwrap_or_else(|_| main_repo.clone());
+    if norm_path_key(&wt_canon.to_string_lossy()) == norm_path_key(&main_canon.to_string_lossy()) {
+        return None;
+    }
+    let branch = git_ok(&wt_root, &["symbolic-ref", "--quiet", "--short", "HEAD"])
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            git_ok(&wt_root, &["rev-parse", "--short", "HEAD"])
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
+        .unwrap_or_else(|| "HEAD".to_string());
+    let base_branch = git_ok(&main_repo, &["symbolic-ref", "--quiet", "--short", "HEAD"])
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| detect_default_branch(&main_repo));
+    let base_commit = base_branch
+        .as_deref()
+        .and_then(|b| git_ok(&wt_root, &["merge-base", b, "HEAD"]).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    Some(yi_proto::SessionWorktree {
+        repo_root: native_worktree_path(&main_repo.to_string_lossy()),
+        branch,
+        base_branch,
+        base_commit,
+    })
+}
+
+/// True only when a session-bound worktree has no uncommitted changes and 0 commits ahead of its base branch/commit
+pub fn worktree_is_clean_and_merged(wt_cwd: &str, wt: &yi_proto::SessionWorktree) -> bool {
+    let dir = crate::paths::expand(wt_cwd);
+    let Some(wt_root) = repo_root(&dir) else {
+        return false;
+    };
+    let Ok(st) = git_ok(&wt_root, &["status", "--porcelain"]) else {
+        return false;
+    };
+    if !st.trim().is_empty() {
+        return false;
+    }
+    let Some(base_ref) = wt.base_branch.as_deref().or(wt.base_commit.as_deref()) else {
+        return false;
+    };
+    git_ok(&wt_root, &["rev-list", "--count", &format!("{base_ref}..HEAD")])
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .is_some_and(|ahead| ahead == 0)
 }
 
 /// Normalize a path for equality checks across platforms (strip \\?\ verbatim prefix, unify separators, fold case on Windows)
@@ -1853,8 +2195,11 @@ pub fn capture_checkpoint(cwd: &str, ref_name: &str) -> Result<Option<String>> {
     Ok(Some(tree))
 }
 
-/// Exact `(files_changed, added_lines, deleted_lines)` between two checkpoint refs
-pub fn diff_stat_refs(cwd: &str, base_ref: &str, end_ref: &str) -> Result<(u32, u64, u64)> {
+/// Exact `(files_changed, added_lines, deleted_lines)` between two checkpoint refs, optionally restricted to `only` paths
+pub fn diff_stat_refs_filtered(cwd: &str, base_ref: &str, end_ref: &str, only: Option<&[String]>) -> Result<(u32, u64, u64)> {
+    if let Some(o) = only {
+        check_paths(o)?;
+    }
     if !is_valid_checkpoint_ref(base_ref) || !is_valid_checkpoint_ref(end_ref) {
         bail!("快照引用无效");
     }
@@ -1862,7 +2207,14 @@ pub fn diff_stat_refs(cwd: &str, base_ref: &str, end_ref: &str) -> Result<(u32, 
     let Some(root) = repo_root(&dir) else {
         return Ok((0, 0, 0));
     };
-    let out = git_ok(&root, &["diff", "--numstat", "-z", "--no-renames", base_ref, end_ref])?;
+    let mut args = vec!["diff", "--numstat", "-z", "--no-renames", base_ref, end_ref];
+    if let Some(paths) = only.filter(|p| !p.is_empty()) {
+        args.push("--");
+        for p in paths {
+            args.push(p.as_str());
+        }
+    }
+    let out = git_ok(&root, &args)?;
     let mut files = 0u32;
     let mut added = 0u64;
     let mut deleted = 0u64;
@@ -1875,6 +2227,11 @@ pub fn diff_stat_refs(cwd: &str, base_ref: &str, end_ref: &str) -> Result<(u32, 
         }
     }
     Ok((files, added, deleted))
+}
+
+/// Exact `(files_changed, added_lines, deleted_lines)` between two checkpoint refs
+pub fn diff_stat_refs(cwd: &str, base_ref: &str, end_ref: &str) -> Result<(u32, u64, u64)> {
+    diff_stat_refs_filtered(cwd, base_ref, end_ref, None)
 }
 
 /// Diff between two hidden checkpoint refs (`base_ref..end_ref`), used by the per-turn Diff view
@@ -2026,6 +2383,66 @@ mod tests {
         worktree_remove(&root, &path, false, true).unwrap();
         assert!(!Path::new(&path).exists());
         assert!(git_ok(&repo, &["branch", "--list", "yi/t1"]).unwrap().trim().is_empty());
+    }
+
+    #[test]
+    fn session_worktree_env_detect_and_clean_check() {
+        let d = tempfile::tempdir().unwrap();
+        let repo = d.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let run = |dir: &Path, a: &[&str]| assert!(git(dir, a).unwrap().status.success(), "{a:?}");
+        run(&repo, &["init", "-q", "-b", "main"]);
+        run(&repo, &["config", "user.email", "t@t"]);
+        run(&repo, &["config", "user.name", "t"]);
+        run(&repo, &["config", "core.autocrlf", "false"]);
+        std::fs::write(repo.join(".gitignore"), ".env*\nnode_modules/\n").unwrap();
+        std::fs::write(repo.join("src.txt"), "hello\n").unwrap();
+        run(&repo, &["add", "."]);
+        run(&repo, &["commit", "-qm", "init"]);
+
+        run(&repo, &["checkout", "-qb", "feat/v2"]);
+        std::fs::write(repo.join("v2.txt"), "v2\n").unwrap();
+        run(&repo, &["add", "."]);
+        run(&repo, &["commit", "-qm", "feat v2"]);
+        run(&repo, &["checkout", "-q", "main"]);
+
+        // Ignored .env and node_modules should carry over into the session worktree without dirtying git status
+        std::fs::write(repo.join(".env.local"), "TOKEN=abc\n").unwrap();
+        std::fs::create_dir_all(repo.join("node_modules/pkg")).unwrap();
+        std::fs::write(repo.join("node_modules/pkg/index.js"), "module.exports = 1;\n").unwrap();
+
+        let wt_root = d.path().join("wt");
+        let main_cwd = repo.to_string_lossy().to_string();
+        assert!(detect_existing_worktree(&main_cwd).is_none());
+
+        // Spawn from explicit base branch `feat/v2` (Method 1: always creates isolated `yi/*` branch)
+        let (wt_path, wt) = worktree_add_session(&wt_root, &main_cwd, "s1", None, Some("feat/v2")).unwrap();
+        assert_eq!(wt.branch, "yi/s1");
+        assert_eq!(wt.base_branch.as_deref(), Some("feat/v2"));
+        assert!(Path::new(&wt_path).join("v2.txt").exists());
+        assert!(Path::new(&wt_path).join(".env.local").exists());
+        assert!(Path::new(&wt_path).join("node_modules/pkg/index.js").exists());
+        assert!(git_ok(Path::new(&wt_path), &["status", "--porcelain"]).unwrap().trim().is_empty());
+        assert!(worktree_is_clean_and_merged(&wt_path, &wt));
+
+        let detected = detect_existing_worktree(&wt_path).unwrap();
+        assert_eq!(detected.branch, "yi/s1");
+        assert_eq!(detected.base_branch.as_deref(), Some("main"));
+
+        // Uncommitted changes must block automatic cleanup
+        std::fs::write(Path::new(&wt_path).join("src.txt"), "dirty\n").unwrap();
+        assert!(!worktree_is_clean_and_merged(&wt_path, &wt));
+
+        // Ahead commits with a clean working tree must ALSO block automatic cleanup
+        run(Path::new(&wt_path), &["add", "src.txt"]);
+        run(Path::new(&wt_path), &["commit", "-qm", "wt work"]);
+        assert!(!worktree_is_clean_and_merged(&wt_path, &wt));
+
+        // Explicit removal cleans directory + temp branch without touching main repo's node_modules
+        assert!(worktree_remove_best_effort(&wt_root, &wt_path, true, true));
+        assert!(!Path::new(&wt_path).exists());
+        assert!(git_ok(&repo, &["branch", "--list", "yi/s1"]).unwrap().trim().is_empty());
+        assert!(repo.join("node_modules/pkg/index.js").exists());
     }
 
     #[test]

@@ -779,7 +779,10 @@ export function FilePanel({
   }, [turnCheckpoints, selectedTurn]);
   const [turnDiff, setTurnDiff] = useState<{ baseRef: string; endRef: string; total?: number | null; files: Map<string, GitFile> } | null>(null);
   const [turnDiffLoading, setTurnDiffLoading] = useState(false);
-  const [branchBase, setBranchBase] = useState('');
+  const [branchBase, setBranchBase] = useState(() => sessInfo?.worktree?.baseBranch ?? '');
+  useEffect(() => {
+    setBranchBase(sessInfo?.worktree?.baseBranch ?? '');
+  }, [sessInfo?.worktree?.branch, sessInfo?.worktree?.baseBranch]);
   const [branchDiff, setBranchDiff] = useState<BranchDiffInfo | null>(null);
   const [branchDiffLoading, setBranchDiffLoading] = useState(false);
   const [branchesInfo, setBranchesInfo] = useState<BranchesResult | null>(null);
@@ -1004,7 +1007,7 @@ export function FilePanel({
   );
 
   const loadTurnDiff = useCallback(
-    (baseRef: string, endRef: string) => {
+    (baseRef: string, endRef: string, paths?: string[]) => {
       setTurnDiffLoading(true);
       rpc<{
         repo: string | null;
@@ -1012,7 +1015,7 @@ export function FilePanel({
         endRef?: string;
         total?: number | null;
         files: { path: string; status: string; diff: string; added?: number | null; deleted?: number | null }[];
-      }>(hostId, 'git.refDiff', { cwd, baseRef, endRef, diff: false })
+      }>(hostId, 'git.refDiff', { cwd, baseRef, endRef, diff: false, ...(paths?.length ? { paths } : {}) })
         .then((r) => {
           setTurnDiffLoading(false);
           if (!r.repo) {
@@ -1118,10 +1121,10 @@ export function FilePanel({
         setDiffScope('uncommitted');
         setTurnDiff(null);
       } else if (git) {
-        loadTurnDiff(activeTurnCkpt.baseRef, activeTurnCkpt.endRef);
+        loadTurnDiff(activeTurnCkpt.baseRef, activeTurnCkpt.endRef, activeTurnCkpt.paths);
       }
     }
-  }, [git, diffScope, activeTurnCkpt?.baseRef, activeTurnCkpt?.endRef, loadTurnDiff]);
+  }, [git, diffScope, activeTurnCkpt?.baseRef, activeTurnCkpt?.endRef, activeTurnCkpt?.paths, loadTurnDiff]);
   useEffect(() => {
     if (git && (commitOpen || reviewPreset !== null || view === 'changes')) void loadBranches();
   }, [git?.branch, commitOpen, reviewPreset, view, loadBranches]); // eslint-disable-line react-hooks/exhaustive-deps

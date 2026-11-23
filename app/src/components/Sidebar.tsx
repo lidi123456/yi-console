@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { getT, isEn } from '../i18n';
 import { hubCall, rpc } from '../transport';
 import { errorToast, navigate, openNewSession, setState, toast, useStore, type HostEntry } from '../store';
-import { isHostSession, type SessionInfo } from '../types';
+import { isHostSession, sessionProjectDir, type SessionInfo } from '../types';
 import { basename, clock, fuzzyScore, lsGet, lsSet } from '../util';
 import { openMenu, type MenuItem } from './Overlay';
 import { writeClipboard } from '../clipboard';
@@ -119,8 +119,14 @@ function SessionRow({ hostId, s, active, showDir }: { hostId: string; s: Session
         </span>
         <span className="session-title">
           {s.title || tx('newSession')}
-          {showDir && <span className="row-dir"> · {basename(s.cwd)}</span>}
+          {showDir && <span className="row-dir"> · {basename(sessionProjectDir(s))}</span>}
         </span>
+        {s.worktree && (
+          <span className="row-wt-badge" title={`${s.worktree.branch} · ${s.cwd}`}>
+            <Icon name="git-branch" size={10} />
+            <span>{s.worktree.branch.replace(/^yi\//, '')}</span>
+          </span>
+        )}
         {(s.queued?.length ?? 0) > 0 && <span className="pill" title={tx('queuedMessages')}>{s.queued!.length}</span>}
         <span className="row-end">{status}</span>
       </button>
@@ -296,7 +302,7 @@ function HostBlock({ h, filter }: { h: HostEntry; filter: string }) {
 
   const q = filter.trim();
   const { pinned, groups, flat, matched } = useMemo(() => {
-    const all = (sessions ?? []).filter((s) => listed(s) && (!q || fuzzyScore(`${s.title} ${s.cwd}`, q) >= 0));
+    const all = (sessions ?? []).filter((s) => listed(s) && (!q || fuzzyScore(`${s.title} ${sessionProjectDir(s)} ${s.worktree?.branch ?? ''}`, q) >= 0));
     const pinned = all.filter((s) => s.pinned);
     const rest = all.filter((s) => !s.pinned);
     // Only ended sessions idle past the threshold; never while searching
@@ -306,8 +312,9 @@ function HostBlock({ h, filter }: { h: HostEntry; filter: string }) {
     // Sessions arrive newest first, so directories with only old sessions naturally end up at the bottom
     const m = new Map<string, SessionInfo[]>();
     for (const s of rest) {
-      if (!m.has(s.cwd)) m.set(s.cwd, []);
-      m.get(s.cwd)!.push(s);
+      const dir = sessionProjectDir(s);
+      if (!m.has(dir)) m.set(dir, []);
+      m.get(dir)!.push(s);
     }
     const groups = [...m.entries()].map(([cwd, list]) => ({ cwd, list, ...split(list) }));
     return { pinned, groups, flat: split(rest), matched: all.length };
