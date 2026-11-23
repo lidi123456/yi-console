@@ -5878,6 +5878,7 @@ button.md-rimg-ph:hover {
   width: 1px;
   background: var(--border);
   position: relative;
+  z-index: 3;
   cursor: col-resize;
 }
 
@@ -5890,7 +5891,8 @@ button.md-rimg-ph:hover {
 
 .panel-resizer:hover,
 .wp-split:hover,
-body.resizing .panel-resizer {
+.panel-resizer.dragging,
+.wp-split.dragging {
   background: var(--border-2);
 }
 
@@ -6125,6 +6127,7 @@ button.wp-crumb:hover {
   width: 1px;
   background: var(--border);
   position: relative;
+  z-index: 3;
   cursor: col-resize;
 }
 
@@ -8234,10 +8237,10 @@ body.resizing .side-resizer::after {
     display: none;
   }
 }
-/* With a file open, the tree takes at most 38% of the panel so the editor isn't squeezed too narrow */
+/* With a file open, keep at least 220px for the editor when the panel narrows */
 @media (min-width: 761px) {
   .file-panel:not(.browse) .wp-side {
-    max-width: 38%;
+    max-width: calc(100% - 220px);
   }
 }
 

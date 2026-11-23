@@ -338,5 +338,6 @@
   "reviewScopeUncommittedStaged": "Uncommitted (staged)",
   "reviewScopeCommitSingle": "Commit {{short}}",
   "reviewScopeCommitsMulti": "{{n}} commits",
-  "reviewRangeReadOnly": "Commit range diff"
+  "reviewRangeReadOnly": "Commit range diff",
+  "dragToResizeDoubleClick": "Drag to resize, double-click to reset"
 }

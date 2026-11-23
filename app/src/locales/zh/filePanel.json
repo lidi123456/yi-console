@@ -338,5 +338,6 @@
   "reviewScopeUncommittedStaged": "未提交（仅已暂存）",
   "reviewScopeCommitSingle": "提交 {{short}}",
   "reviewScopeCommitsMulti": "{{n}} 个提交",
-  "reviewRangeReadOnly": "提交范围差异"
+  "reviewRangeReadOnly": "提交范围差异",
+  "dragToResizeDoubleClick": "拖动调整宽度，双击还原"
 }

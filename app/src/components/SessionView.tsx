@@ -13,7 +13,7 @@ import { openAccountManager } from './AccountManagerModal';
 import { openMenu } from './Overlay';
 import { exportSession, OPEN_CHANGES, OPEN_FILE, openFileInPanel, renameSession, sessionMenu, showTurnDiff } from './SessionActions';
 import { AI_PREFIX } from './AiBrowser';
-import { FilePanel } from './FilePanel';
+import { beginWidthDrag, FilePanel } from './FilePanel';
 import { sideChatTitle, sideChatTools, sideTabPath, startSideChat } from './SideChatTab';
 import { TermPanel } from './TermPanel';
 import { AsyncAskCard, ChatView, openAsyncAsk, PermissionCard, setChatStyle, useChatStyle } from './ChatView';
@@ -167,25 +167,22 @@ export function SessionView({ hostId, sessionId, seq }: { hostId: string; sessio
   const [memoryOpen, setMemoryOpen] = useState(false);
   const [recovering, setRecovering] = useState(false);
   const split = useRef<HTMLDivElement>(null);
-  const dragPanel = (e: React.PointerEvent) => {
-    e.preventDefault();
-    const x0 = e.clientX;
-    const w0 = panelW;
-    const max = (split.current?.clientWidth ?? 1200) - 420;
-    let w = w0;
-    const move = (ev: PointerEvent) => {
-      w = Math.max(420, Math.min(max, w0 - (ev.clientX - x0)));
-      setPanelW(w);
-    };
-    const up = () => {
-      window.removeEventListener('pointermove', move);
-      window.removeEventListener('pointerup', up);
-      document.body.classList.remove('resizing');
-      lsSet('file-panel-w', w);
-    };
-    document.body.classList.add('resizing');
-    window.addEventListener('pointermove', move);
-    window.addEventListener('pointerup', up);
+  const panelDragCleanupRef = useRef<(() => void) | null>(null);
+  useEffect(() => () => panelDragCleanupRef.current?.(), []);
+  const dragPanel = (e: React.PointerEvent<HTMLDivElement>) => {
+    const panelEl = e.currentTarget.nextElementSibling as HTMLElement | null;
+    const w0 = Math.round(panelEl?.getBoundingClientRect().width ?? panelW);
+    const minChat = window.innerWidth <= 1100 ? 380 : 420;
+    const max = Math.max(360, (split.current?.clientWidth ?? 1200) - minChat);
+    const min = Math.min(420, max);
+    beginWidthDrag(e, {
+      initialWidth: w0,
+      min,
+      max,
+      onMove: setPanelW,
+      onEnd: (w) => lsSet('file-panel-w', w),
+      cleanupRef: panelDragCleanupRef,
+    });
   };
 
   // When the session has exited, start the tool process as soon as the user starts typing (resuming takes 1–4 s), so it's mostly ready by send time

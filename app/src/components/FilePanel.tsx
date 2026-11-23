@@ -90,6 +90,84 @@ interface OpenFile {
 export const DRAG_REF = 'application/x-yi-console-ref';
 /** Per-file size limit for uploads dropped onto the file tree (same as yi-agentd) */
 const UPLOAD_MAX = 50 * 1024 * 1024;
+const TREE_DEFAULT = 300;
+const TREE_MIN = 200;
+const TREE_MAX = 600;
+const MAIN_MIN = 220;
+
+/** Pointer-capture horizontal resize helper for right-docked split panes (dragging left widens, right narrows). */
+export function beginWidthDrag(
+  e: React.PointerEvent<HTMLDivElement>,
+  {
+    initialWidth,
+    min,
+    max,
+    onMove,
+    onEnd,
+    cleanupRef,
+  }: {
+    initialWidth: number;
+    min: number;
+    max: number;
+    onMove: (width: number) => void;
+    onEnd: (width: number) => void;
+    cleanupRef: React.MutableRefObject<(() => void) | null>;
+  },
+) {
+  if (e.button !== 0) return;
+  e.preventDefault();
+  cleanupRef.current?.();
+
+  const handle = e.currentTarget;
+  const pointerId = e.pointerId;
+  const x0 = e.clientX;
+  const w0 = initialWidth;
+  let w = Math.round(Math.max(min, Math.min(max, w0)));
+  let captured = false;
+  try {
+    handle.setPointerCapture(pointerId);
+    captured = typeof handle.hasPointerCapture === 'function' ? handle.hasPointerCapture(pointerId) : true;
+  } catch {
+    captured = false;
+  }
+
+  const target: EventTarget = captured ? handle : window;
+  let done = false;
+
+  const move = (ev: Event) => {
+    const pe = ev as PointerEvent;
+    w = Math.round(Math.max(min, Math.min(max, w0 - (pe.clientX - x0))));
+    onMove(w);
+  };
+
+  const finish = () => {
+    if (done) return;
+    done = true;
+    target.removeEventListener('pointermove', move);
+    target.removeEventListener('pointerup', finish);
+    target.removeEventListener('pointercancel', finish);
+    if (captured) {
+      handle.removeEventListener('lostpointercapture', finish);
+      try {
+        if (handle.hasPointerCapture(pointerId)) handle.releasePointerCapture(pointerId);
+      } catch {
+        /* ignore */
+      }
+    }
+    handle.classList.remove('dragging');
+    document.body.classList.remove('resizing');
+    if (cleanupRef.current === finish) cleanupRef.current = null;
+    onEnd(w);
+  };
+
+  cleanupRef.current = finish;
+  handle.classList.add('dragging');
+  document.body.classList.add('resizing');
+  target.addEventListener('pointermove', move);
+  target.addEventListener('pointerup', finish);
+  target.addEventListener('pointercancel', finish);
+  if (captured) handle.addEventListener('lostpointercapture', finish);
+}
 
 /**
  * Files "copied" in the file panel: put the relative path on the clipboard (pasting elsewhere gives the path) and remember it;
@@ -623,7 +701,11 @@ export function FilePanel({
     },
     [treeOpenKey],
   );
-  const [treeW, setTreeW] = useState(() => lsGet('wp-tree-w', 300));
+  const [treeW, setTreeW] = useState(() => lsGet('wp-tree-w', TREE_DEFAULT));
+  const bodyRef = useRef<HTMLDivElement>(null);
+  const sideRef = useRef<HTMLDivElement>(null);
+  const dragCleanupRef = useRef<(() => void) | null>(null);
+  useEffect(() => () => dragCleanupRef.current?.(), []);
   const [filter, setFilter] = useState('');
   const [search, setSearch] = useState<{ q: string; paths: string[]; truncated: boolean; error?: boolean } | null>(null);
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
@@ -2232,24 +2314,19 @@ export function FilePanel({
   };
 
   // ---------- Drag to resize the file tree ----------
-  const dragTree = (e: React.PointerEvent) => {
-    e.preventDefault();
-    const x0 = e.clientX;
-    const w0 = treeW;
-    let w = w0;
-    const move = (ev: PointerEvent) => {
-      w = Math.max(240, Math.min(420, w0 - (ev.clientX - x0)));
-      setTreeW(w);
-    };
-    const up = () => {
-      window.removeEventListener('pointermove', move);
-      window.removeEventListener('pointerup', up);
-      document.body.classList.remove('resizing');
-      lsSet('wp-tree-w', w);
-    };
-    document.body.classList.add('resizing');
-    window.addEventListener('pointermove', move);
-    window.addEventListener('pointerup', up);
+  const dragTree = (e: React.PointerEvent<HTMLDivElement>) => {
+    const w0 = Math.round(sideRef.current?.getBoundingClientRect().width ?? treeW);
+    const bodyW = bodyRef.current?.clientWidth ?? 0;
+    const max = bodyW > 0 ? Math.min(TREE_MAX, Math.max(TREE_MIN, bodyW - MAIN_MIN)) : TREE_MAX;
+    const min = Math.min(TREE_MIN, max);
+    beginWidthDrag(e, {
+      initialWidth: w0,
+      min,
+      max,
+      onMove: setTreeW,
+      onEnd: (w) => lsSet('wp-tree-w', w),
+      cleanupRef: dragCleanupRef,
+    });
   };
 
   const rows = useMemo(() => (root ? flatten(root, 0, kids, expanded) : []), [root, kids, expanded, lang]);
@@ -2524,7 +2601,7 @@ export function FilePanel({
   // Changes view with nothing uncommitted: the commit history box below takes the remaining height
   const histGrow = view === 'changes' && !!git && gitReady && cRows.length === 0;
   const tree = (
-    <div className="wp-side" style={file || emptyPane ? { width: treeW } : undefined}>
+    <div className="wp-side" ref={sideRef} style={file || emptyPane ? { width: treeW } : undefined}>
       <div className="wp-side-head">
         <div className="wp-views" role="tablist" aria-label={tx('fileViews')}>
           {viewTab('all', tx('files'))}
@@ -3556,7 +3633,7 @@ export function FilePanel({
         </div>
       )}
 
-      <div className="wp-body">
+      <div className="wp-body" ref={bodyRef}>
         {file && (
           <div className="wp-main">
             {secondPane ? (
@@ -3584,7 +3661,17 @@ export function FilePanel({
         )}
         {showTree && (
           <>
-            {(file || emptyPane) && <div className="wp-split hide-mobile" onPointerDown={dragTree} />}
+            {(file || emptyPane) && (
+              <div
+                className="wp-split hide-mobile"
+                title={tx('dragToResizeDoubleClick')}
+                onPointerDown={dragTree}
+                onDoubleClick={() => {
+                  setTreeW(TREE_DEFAULT);
+                  lsSet('wp-tree-w', TREE_DEFAULT);
+                }}
+              />
+            )}
             {tree}
           </>
         )}
