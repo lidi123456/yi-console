@@ -480,6 +480,10 @@ impl Hub {
             // info; a resumed tool only sends task_notification for them, not another background_tasks_changed)
             info.pending = None;
             info.background_tasks.clear();
+            if let Ok(Some(repaired)) = self.store.repaired_updated_at(&info.id, info.created_at, info.updated_at) {
+                info.updated_at = repaired;
+                let _ = self.store.save_session(&info);
+            }
             let stopped = info.updated_at;
             if let Some(t) = &mut info.turn {
                 t.activity = None;
@@ -1119,6 +1123,20 @@ impl Hub {
                             }
                         }
                     }
+                }
+            }
+        }
+        if !info.side_chat
+            && info.mode == SessionMode::Structured
+            && info.tool.has_process()
+            && info.tool != ToolKind::Shell
+            && resume.is_none()
+            && info.account_id.is_some()
+        {
+            if let Ok(rt) = self.get(&info.id) {
+                let mut pending = rt.pending_handoff.lock().unwrap();
+                if pending.is_none() && self.store.count_user_messages(&info.id).unwrap_or(0) > 0 {
+                    *pending = self.handoff_digest(&info.id);
                 }
             }
         }
@@ -3377,6 +3395,9 @@ impl Hub {
                         notify = Some((title, snippet(&reply, 240)));
                     }
                 }
+                EventBody::AccountSwitched { .. } => {
+                    update_activity_time = false;
+                }
                 _ => {}
             }
             info.last_seq += 1;
@@ -3687,7 +3708,7 @@ impl Hub {
                 continue;
             }
             if let Some(acc) = &next_active {
-                self.apply_account_switch(&rt, acc, "account_deleted", true);
+                self.apply_account_switch(&rt, acc, "account_deleted", true, true);
             } else {
                 let (sid, is_term, busy) = {
                     let i = rt.info.lock().unwrap();
@@ -3799,7 +3820,7 @@ impl Hub {
                 }
                 continue;
             }
-            self.apply_account_switch(&rt, to_acc, reason, true);
+            self.apply_account_switch(&rt, to_acc, reason, true, true);
         }
     }
 
@@ -3916,7 +3937,13 @@ impl Hub {
 
         if iso == AccountIsolation::HostActive {
             let outcome = self.accounts.activate(info.tool, &to_acc.id)?;
-            let updated = self.apply_account_switch(&rt, &to_acc, reason.unwrap_or(if is_failover { "auto_failover" } else { "manual" }), true);
+            let updated = self.apply_account_switch(
+                &rt,
+                &to_acc,
+                reason.unwrap_or(if is_failover { "auto_failover" } else { "manual" }),
+                true,
+                false,
+            );
             if outcome.host_switched {
                 self.sync_other_host_sessions(info.tool, Some(sid), &to_acc, "host_switched");
             }
@@ -3929,6 +3956,7 @@ impl Hub {
             &to_acc,
             reason.unwrap_or(if is_failover { "auto_failover" } else { "manual" }),
             true,
+            false,
         );
         self.publish_accounts_updated(info.tool, None);
         Ok(updated)
@@ -3940,6 +3968,7 @@ impl Hub {
         to_acc: &crate::accounts::StoredAccount,
         reason: &str,
         retire_running: bool,
+        silent_if_inactive: bool,
     ) -> SessionInfo {
         let cur = rt.info.lock().unwrap().clone();
         let copied = if let Some(ext) = cur.external_id.as_deref() {
@@ -3955,6 +3984,33 @@ impl Hub {
         } else {
             false
         };
+        let is_terminal = cur.mode == SessionMode::Terminal;
+        // Passive host-wide syncs should not wake or append timeline markers on already-exited sessions;
+        // Level-2 handoff digests are built lazily on next launch in `spec_for`.
+        let silent = silent_if_inactive
+            && matches!(cur.status, SessionStatus::Exited | SessionStatus::Error)
+            && self.running_tx(rt).is_none()
+            && cur.background_tasks.is_empty()
+            && !rt.watch_active.load(std::sync::atomic::Ordering::Relaxed)
+            && (!is_terminal || !crate::tmux::alive(&crate::tmux::session_name(&cur.id)));
+        if silent {
+            {
+                let mut pending = rt.pending_handoff.lock().unwrap();
+                if copied || pending.as_deref().is_some_and(|h| h.starts_with("<yi-account-handoff>")) {
+                    *pending = None;
+                }
+            }
+            self.set_info_any(rt, |i| {
+                i.account_id = Some(to_acc.id.clone());
+                i.account_label = Some(to_acc.label.clone());
+                if !copied {
+                    i.external_id = None;
+                    i.synced_users = None;
+                }
+                true
+            });
+            return rt.info.lock().unwrap().clone();
+        }
         let has_history = cur.external_id.is_some()
             || self.store.count_user_messages(&cur.id).unwrap_or(0) > 0;
         let preserved_context = !has_history || copied;
@@ -6349,7 +6405,7 @@ mod tests {
                 unstoppable: true,
             }];
         }
-        hub.apply_account_switch(&rt, &stored_b, "host_switched", true);
+        hub.apply_account_switch(&rt, &stored_b, "host_switched", true, true);
         assert!(rx.try_recv().is_err(), "idle session with running background task must NOT be killed");
         assert!(*rt.restart_pending.lock().unwrap(), "account switch must defer via restart_pending");
         assert_eq!(hub.info("s-bg").unwrap().background_tasks.len(), 1, "background_tasks must stay intact");
@@ -6363,7 +6419,7 @@ mod tests {
             i.external_id = Some("ext-watch".into());
         }
         rt2.watch_active.store(true, std::sync::atomic::Ordering::Relaxed);
-        hub.apply_account_switch(&rt2, &stored_b, "host_switched", true);
+        hub.apply_account_switch(&rt2, &stored_b, "host_switched", true, true);
         assert!(rx2.try_recv().is_err(), "idle session with active wakeup watch must NOT be killed");
         assert!(*rt2.restart_pending.lock().unwrap(), "account switch must defer while watch_active");
     }
@@ -6916,6 +6972,295 @@ mod tests {
         assert_eq!(notices[1]["kind"], "turn_end");
         assert_eq!(notices[1]["parentId"], "parent");
         assert_eq!(notices[1]["sideChat"], true);
+    }
+
+    #[tokio::test]
+    async fn account_switch_preserves_session_updated_at() {
+        let tmp = tempfile::tempdir().unwrap();
+        let accounts = Arc::new(crate::accounts::AccountManager::with_dirs(
+            tmp.path().join("yi-base"),
+            tmp.path().join("home"),
+        ));
+        let hub = Hub::with_accounts(Store::open_memory().unwrap(), DaemonSettings::default(), accounts.clone());
+        let dir_a = tmp.path().join("codex-a");
+        let dir_b = tmp.path().join("codex-b");
+        std::fs::create_dir_all(&dir_a).unwrap();
+        std::fs::create_dir_all(&dir_b).unwrap();
+        std::fs::write(dir_a.join("auth.json"), r#"{"tokens":{"access_token":"tok-a"}}"#).unwrap();
+        std::fs::write(dir_b.join("auth.json"), r#"{"tokens":{"access_token":"tok-b"}}"#).unwrap();
+        let acc_a = accounts.save_oauth_from_dir(ToolKind::Codex, None, Some("Codex A"), Some(&dir_a), None, true).unwrap();
+        let acc_b = accounts.save_oauth_from_dir(ToolKind::Codex, None, Some("Codex B"), Some(&dir_b), None, false).unwrap();
+
+        let _rx = live(&hub, "s-upd", SessionMode::Structured, SessionStatus::Idle, 12345);
+        {
+            let rt = hub.get("s-upd").unwrap();
+            let mut i = rt.info.lock().unwrap();
+            i.tool = ToolKind::Codex;
+            i.account_id = Some(acc_a.id.clone());
+            i.account_label = Some(acc_a.label.clone());
+        }
+        let mut bus = hub.bus.subscribe();
+
+        // Switch twice in a row so any stale in-memory updated_at would surface on the second save/broadcast.
+        let s1 = hub.switch_session_account("s-upd", &acc_b.id, Some("manual"), false).unwrap();
+        let s2 = hub.switch_session_account("s-upd", &acc_a.id, Some("manual"), false).unwrap();
+
+        assert_eq!(s1.updated_at, 12345);
+        assert_eq!(s2.updated_at, 12345);
+        assert_eq!(hub.info("s-upd").unwrap().updated_at, 12345);
+        assert!(updates(&mut bus).iter().all(|i| i.updated_at == 12345));
+        assert_eq!(hub.store.load_sessions().unwrap().into_iter().find(|i| i.id == "s-upd").unwrap().updated_at, 12345);
+
+        let evs = hub.backlog("s-upd", 0).unwrap();
+        let sw_count = evs.iter().filter(|e| matches!(e.body, EventBody::AccountSwitched { .. })).count();
+        assert_eq!(sw_count, 2);
+    }
+
+    #[tokio::test]
+    async fn passive_host_sync_skips_exited_timeline_and_builds_handoff_lazily() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut settings = DaemonSettings::default();
+        settings.memory.enabled = false;
+        let fake_agy = tmp.path().join("agy");
+        std::fs::write(&fake_agy, "").unwrap();
+        settings.tools.insert(
+            "antigravity".into(),
+            yi_proto::ToolOverride {
+                command: fake_agy.display().to_string(),
+                ..Default::default()
+            },
+        );
+        let accounts = Arc::new(crate::accounts::AccountManager::with_dirs(
+            tmp.path().join("yi-base"),
+            tmp.path().join("home"),
+        ));
+        let hub = Hub::with_accounts(Store::open_memory().unwrap(), settings, accounts.clone());
+
+        let snap_a = crate::accounts::SnapshotBundle {
+            files: [(".gemini/antigravity-cli/antigravity-oauth-token".into(), "eyJ0b2tlbiI6ImEifQ==".into())]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        };
+        let snap_b = crate::accounts::SnapshotBundle {
+            files: [(".gemini/antigravity-cli/antigravity-oauth-token".into(), "eyJ0b2tlbiI6ImIifQ==".into())]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        };
+        let acc_a = accounts
+            .save_oauth_from_dir(ToolKind::Antigravity, None, Some("Google A"), None, Some(snap_a), true)
+            .unwrap();
+        let acc_b = accounts
+            .save_oauth_from_dir(ToolKind::Antigravity, None, Some("Google B"), None, Some(snap_b), false)
+            .unwrap();
+
+        // Exited Antigravity session with prior conversation
+        let _rx_exited = live(&hub, "s-exited", SessionMode::Structured, SessionStatus::Idle, 100);
+        {
+            let rt = hub.get("s-exited").unwrap();
+            let mut i = rt.info.lock().unwrap();
+            i.tool = ToolKind::Antigravity;
+            i.cwd = tmp.path().display().to_string();
+            i.account_id = Some(acc_a.id.clone());
+            i.account_label = Some(acc_a.label.clone());
+        }
+        hub.emit("s-exited", 0, EventBody::UserMessage { text: "old user task".into(), images: vec![], origin: None });
+        hub.emit("s-exited", 0, EventBody::AssistantText { id: "a1".into(), text: "old assistant reply".into() });
+        hub.emit("s-exited", 0, EventBody::TurnEnd { stop_reason: Some("end_turn".into()), model: None });
+        {
+            let rt = hub.get("s-exited").unwrap();
+            *rt.cmd.lock().unwrap() = None;
+            let mut i = rt.info.lock().unwrap();
+            i.status = SessionStatus::Exited;
+            i.external_id = Some("ext-old".into());
+            i.updated_at = 55555;
+            hub.store.save_session(&i).unwrap();
+        }
+        let exited_seq_before = hub.info("s-exited").unwrap().last_seq;
+
+        // Live idle Antigravity session
+        let mut rx_live = live(&hub, "s-live", SessionMode::Structured, SessionStatus::Idle, 77777);
+        {
+            let rt = hub.get("s-live").unwrap();
+            let mut i = rt.info.lock().unwrap();
+            i.tool = ToolKind::Antigravity;
+            i.cwd = tmp.path().display().to_string();
+            i.external_id = Some("ext-live".into());
+            i.account_id = Some(acc_a.id.clone());
+            i.account_label = Some(acc_a.label.clone());
+            i.updated_at = 77777;
+            hub.store.save_session(&i).unwrap();
+        }
+        hub.emit("s-live", 0, EventBody::UserMessage { text: "live task".into(), images: vec![], origin: None });
+        hub.emit("s-live", 0, EventBody::TurnEnd { stop_reason: Some("end_turn".into()), model: None });
+        {
+            let rt = hub.get("s-live").unwrap();
+            let mut i = rt.info.lock().unwrap();
+            i.updated_at = 77777;
+            hub.store.save_session(&i).unwrap();
+        }
+
+        // Trigger host-wide switch via on_host_account_activated (without touching host OS keyring in unit test)
+        hub.on_host_account_activated(ToolKind::Antigravity, &acc_b.id, Some("host_active"));
+
+        let exited_info = hub.info("s-exited").unwrap();
+        assert_eq!(exited_info.account_id.as_deref(), Some(acc_b.id.as_str()));
+        assert_eq!(exited_info.account_label.as_deref(), Some("Google B"));
+        assert_eq!(exited_info.external_id, None);
+        assert_eq!(exited_info.updated_at, 55555);
+        assert_eq!(exited_info.last_seq, exited_seq_before, "exited session must not get AccountSwitched event");
+        assert!(test_pending_handoff(&hub, "s-exited").is_none(), "handoff must stay lazy before launch");
+
+        let live_info = hub.info("s-live").unwrap();
+        assert_eq!(live_info.account_id.as_deref(), Some(acc_b.id.as_str()));
+        assert_eq!(live_info.updated_at, 77777);
+        assert!(matches!(rx_live.try_recv(), Ok(AdapterCmd::Kill)));
+        assert!(test_pending_handoff(&hub, "s-live").is_some());
+        assert!(hub
+            .backlog("s-live", 0)
+            .unwrap()
+            .iter()
+            .any(|e| matches!(&e.body, EventBody::AccountSwitched { reason, .. } if reason == "host_active")));
+
+        // Deleting acc_b falls back to acc_a via on_account_deleted: still silent on exited session
+        accounts.delete(ToolKind::Antigravity, &acc_b.id).unwrap();
+        hub.on_account_deleted(ToolKind::Antigravity, &acc_b.id);
+        let exited_after_del = hub.info("s-exited").unwrap();
+        assert_eq!(exited_after_del.account_id.as_deref(), Some(acc_a.id.as_str()));
+        assert_eq!(exited_after_del.updated_at, 55555);
+        assert_eq!(exited_after_del.last_seq, exited_seq_before);
+
+        // Next launch via spec_for lazily builds <yi-account-handoff>
+        let _spec = hub.spec_for(&exited_after_del, false, 120, 32).unwrap();
+        let handoff = test_pending_handoff(&hub, "s-exited").expect("spec_for must build lazy account handoff");
+        assert!(handoff.contains("<yi-account-handoff>"), "{handoff}");
+        assert!(handoff.contains("old user task"), "{handoff}");
+
+        // After /clear (no user messages), spec_for must NOT build a handoff
+        hub.clear("s-exited").await.unwrap();
+        let cleared_info = hub.info("s-exited").unwrap();
+        let _spec_cleared = hub.spec_for(&cleared_info, false, 120, 32).unwrap();
+        assert!(test_pending_handoff(&hub, "s-exited").is_none());
+    }
+
+    #[test]
+    fn restore_repairs_updated_at_polluted_by_account_switched() {
+        let store = Store::open_memory().unwrap();
+        let switch = EventBody::AccountSwitched {
+            from_id: Some("a1".into()),
+            from_label: Some("A".into()),
+            to_id: "a2".into(),
+            to_label: "B".into(),
+            reason: "host_active".into(),
+            context_carried: "summary_injected".into(),
+        };
+
+        let mut base = SessionInfo {
+            id: String::new(),
+            tool: ToolKind::Antigravity,
+            mode: SessionMode::Structured,
+            cwd: "/tmp".into(),
+            title: "t".into(),
+            status: SessionStatus::Exited,
+            external_id: None,
+            created_at: 100,
+            updated_at: 0,
+            last_process_error_at: None,
+            last_seq: 0,
+            pending_permissions: 0,
+            usage: Usage::default(),
+            model: None,
+            command: None,
+            context_percent: None,
+            permission_mode: None,
+            effort: None,
+            model_config_options: vec![],
+            model_config_pending: false,
+            pinned: false,
+            parent_id: None,
+            side_chat: false,
+            synced_users: None,
+            auto_resume: None,
+            limit_hits: 0,
+            computer_use: false,
+            browser_use: false,
+            pending: None,
+            turn: None,
+            bot: None,
+            client_mcp: vec![],
+            append_system_prompt: None,
+            account_id: None,
+            account_label: None,
+            checkpoints: vec![],
+            queued: vec![],
+            queue_paused: None,
+            restart_interrupted: false,
+            background_tasks: vec![],
+        };
+
+        // 1) Polluted exited session with prior turn
+        let mut s1 = base.clone();
+        s1.id = "s-polluted".into();
+        s1.created_at = 500;
+        s1.updated_at = 9000;
+        s1.last_seq = 3;
+        store.save_session(&s1).unwrap();
+        store
+            .append_event(
+                "s-polluted",
+                &Event {
+                    seq: 1,
+                    ts: 1500,
+                    body: EventBody::TurnEnd { stop_reason: Some("end_turn".into()), model: None },
+                },
+            )
+            .unwrap();
+        store
+            .append_event(
+                "s-polluted",
+                &Event { seq: 2, ts: 2500, body: EventBody::Status { status: SessionStatus::Exited, message: None } },
+            )
+            .unwrap();
+        store.append_event("s-polluted", &Event { seq: 3, ts: 9000, body: switch.clone() }).unwrap();
+
+        // 2) Polluted exited session with zero prior real events -> falls back to created_at
+        let mut s2 = base.clone();
+        s2.id = "s-empty".into();
+        s2.created_at = 400;
+        s2.updated_at = 9000;
+        s2.last_seq = 1;
+        store.save_session(&s2).unwrap();
+        store.append_event("s-empty", &Event { seq: 1, ts: 9000, body: switch.clone() }).unwrap();
+
+        // 3) Mid-history AccountSwitched followed by newer TurnEnd -> untouched
+        base.id = "s-clean".into();
+        base.created_at = 300;
+        base.updated_at = 8000;
+        base.last_seq = 2;
+        store.save_session(&base).unwrap();
+        store.append_event("s-clean", &Event { seq: 1, ts: 1000, body: switch }).unwrap();
+        store
+            .append_event(
+                "s-clean",
+                &Event {
+                    seq: 2,
+                    ts: 8000,
+                    body: EventBody::TurnEnd { stop_reason: Some("end_turn".into()), model: None },
+                },
+            )
+            .unwrap();
+
+        let hub = Hub::new(store, DaemonSettings::default());
+        assert_eq!(hub.info("s-polluted").unwrap().updated_at, 1500);
+        assert_eq!(hub.info("s-empty").unwrap().updated_at, 400);
+        assert_eq!(hub.info("s-clean").unwrap().updated_at, 8000);
+
+        let persisted = hub.store.load_sessions().unwrap();
+        let by_id: HashMap<String, SessionInfo> = persisted.into_iter().map(|s| (s.id.clone(), s)).collect();
+        assert_eq!(by_id["s-polluted"].updated_at, 1500);
+        assert_eq!(by_id["s-empty"].updated_at, 400);
+        assert_eq!(by_id["s-clean"].updated_at, 8000);
     }
 }
 

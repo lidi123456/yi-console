@@ -295,6 +295,58 @@ impl Store {
         Ok(v.unwrap_or(0))
     }
 
+    /// Recompute the real last activity timestamp when trailing `account_switched` events inflated `updated_at`.
+    pub fn repaired_updated_at(
+        &self,
+        session_id: &str,
+        created_at: i64,
+        current_updated_at: i64,
+    ) -> Result<Option<i64>> {
+        let c = self.conn.lock().unwrap();
+        let mut st = c.prepare("SELECT ts, body FROM events WHERE session_id = ?1 ORDER BY seq DESC")?;
+        let mut rows = st.query(params![session_id])?;
+        let mut saw_account_switch = false;
+        let mut saw_exit = false;
+        let mut exit_err_msg: Option<String> = None;
+        let mut last_real_ts: Option<i64> = None;
+
+        while let Some(row) = rows.next()? {
+            let ts: i64 = row.get(0)?;
+            let raw: String = row.get(1)?;
+            let Ok(body) = serde_json::from_str::<EventBody>(&raw) else {
+                continue;
+            };
+            match body {
+                EventBody::AccountSwitched { .. } => {
+                    saw_account_switch = true;
+                }
+                EventBody::Status {
+                    status: yi_proto::SessionStatus::Exited | yi_proto::SessionStatus::Error,
+                    message,
+                } => {
+                    saw_exit = true;
+                    if let Some(m) = message {
+                        exit_err_msg = Some(m);
+                    }
+                }
+                EventBody::Error { message } if exit_err_msg.as_deref() == Some(message.as_str()) => {
+                    exit_err_msg = None;
+                }
+                EventBody::PermissionResolved { option_id, .. } if saw_exit && option_id == "cancelled" => {}
+                EventBody::Interrupted { reason } if reason == "restart" => {}
+                _ => {
+                    last_real_ts = Some(ts);
+                    break;
+                }
+            }
+        }
+        if !saw_account_switch {
+            return Ok(None);
+        }
+        let restored = last_real_ts.unwrap_or(created_at);
+        Ok((current_updated_at > restored).then_some(restored))
+    }
+
     pub fn log_usage(&self, session_id: &str, tool: &str, ts: i64, u: &Usage) -> Result<()> {
         let c = self.conn.lock().unwrap();
         c.execute(
@@ -586,5 +638,92 @@ mod tests {
             }]
         );
         assert_eq!(s.user_messages("b").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn repaired_updated_at_restores_polluted_and_is_idempotent() {
+        let s = Store::open_memory().unwrap();
+        let switch = EventBody::AccountSwitched {
+            from_id: Some("a1".into()),
+            from_label: Some("A".into()),
+            to_id: "a2".into(),
+            to_label: "B".into(),
+            reason: "host_active".into(),
+            context_carried: "summary_injected".into(),
+        };
+
+        // 1) Trailing AccountSwitched after TurnEnd + Status::Exited restores TurnEnd ts
+        s.save_session(&info("polluted-turn")).unwrap();
+        s.append_event(
+            "polluted-turn",
+            &Event {
+                seq: 1,
+                ts: 1000,
+                body: EventBody::TurnEnd { stop_reason: Some("end_turn".into()), model: None },
+            },
+        )
+        .unwrap();
+        s.append_event(
+            "polluted-turn",
+            &Event { seq: 2, ts: 2000, body: EventBody::Status { status: SessionStatus::Exited, message: None } },
+        )
+        .unwrap();
+        s.append_event("polluted-turn", &Event { seq: 3, ts: 5000, body: switch.clone() }).unwrap();
+        assert_eq!(s.repaired_updated_at("polluted-turn", 500, 5000).unwrap(), Some(1000));
+        // Idempotent once already repaired
+        assert_eq!(s.repaired_updated_at("polluted-turn", 500, 1000).unwrap(), None);
+
+        // 2) Trailing AccountSwitched after Error + Status::Error (matching exit message) restores pre-exit ts
+        s.save_session(&info("polluted-err")).unwrap();
+        s.append_event(
+            "polluted-err",
+            &Event { seq: 1, ts: 1200, body: EventBody::AssistantText { id: "m1".into(), text: "hi".into() } },
+        )
+        .unwrap();
+        s.append_event(
+            "polluted-err",
+            &Event { seq: 2, ts: 1800, body: EventBody::Error { message: "boom".into() } },
+        )
+        .unwrap();
+        s.append_event(
+            "polluted-err",
+            &Event {
+                seq: 3,
+                ts: 1801,
+                body: EventBody::Status { status: SessionStatus::Error, message: Some("boom".into()) },
+            },
+        )
+        .unwrap();
+        s.append_event(
+            "polluted-err",
+            &Event { seq: 4, ts: 2500, body: EventBody::Interrupted { reason: "restart".into() } },
+        )
+        .unwrap();
+        s.append_event("polluted-err", &Event { seq: 5, ts: 6000, body: switch.clone() }).unwrap();
+        assert_eq!(s.repaired_updated_at("polluted-err", 500, 6000).unwrap(), Some(1200));
+
+        // 3) Trailing AccountSwitched with no prior real events falls back to created_at
+        s.save_session(&info("polluted-empty")).unwrap();
+        s.append_event(
+            "polluted-empty",
+            &Event { seq: 1, ts: 900, body: EventBody::Status { status: SessionStatus::Exited, message: None } },
+        )
+        .unwrap();
+        s.append_event("polluted-empty", &Event { seq: 2, ts: 7000, body: switch.clone() }).unwrap();
+        assert_eq!(s.repaired_updated_at("polluted-empty", 400, 7000).unwrap(), Some(400));
+
+        // 4) AccountSwitched in the middle followed by a newer TurnEnd returns None
+        s.save_session(&info("mid-switch")).unwrap();
+        s.append_event("mid-switch", &Event { seq: 1, ts: 1000, body: switch }).unwrap();
+        s.append_event(
+            "mid-switch",
+            &Event {
+                seq: 2,
+                ts: 3000,
+                body: EventBody::TurnEnd { stop_reason: Some("end_turn".into()), model: None },
+            },
+        )
+        .unwrap();
+        assert_eq!(s.repaired_updated_at("mid-switch", 500, 3000).unwrap(), None);
     }
 }
