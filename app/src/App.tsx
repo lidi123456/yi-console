@@ -18,7 +18,7 @@ import { BotEventsView } from './components/BotActivity';
 import { BotSource } from './bots';
 import { Palette, useShortcuts } from './components/Palette';
 import { SearchView } from './components/SearchView';
-import { setState, useStore } from './store';
+import { setState, skey, useStore } from './store';
 import { Overlays, useContextMenu } from './components/Overlay';
 import { customFrame, TitleBar } from './components/TitleBar';
 import { Lightbox } from './components/Lightbox';
@@ -58,7 +58,7 @@ function Main() {
   const view = useStore((s) => s.view);
   switch (view.kind) {
     case 'session':
-      return <SessionView key={view.hostId + view.sessionId} hostId={view.hostId} sessionId={view.sessionId} seq={view.seq} />;
+      return <SessionView key={skey(view.hostId, view.sessionId)} hostId={view.hostId} sessionId={view.sessionId} seq={view.seq} />;
     case 'hosts':
       return <HostsView editId={view.editId} />;
     case 'history':

@@ -917,7 +917,7 @@ export function SessionView({ hostId, sessionId, seq }: { hostId: string; sessio
       {!filesOnly && files && connected && !full && fileOpen && <div className="panel-resizer hide-mobile" onPointerDown={dragPanel} title={t('dragToResize')} />}
       {!filesOnly && files && connected && (
         <FilePanel
-          key={`${hostId}/${activeFileCwd}`}
+          key={`${hostId}/${sessionId}/${activeFileCwd}`}
           hostId={hostId}
           cwd={activeFileCwd}
           baseCwd={info.cwd}

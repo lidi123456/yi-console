@@ -27,20 +27,24 @@ export const takeOpenTurn = (hostId: string, sessionId: string): number | null =
 
 /** View changes: go to the session page and open the "Changes" view of the file panel on the right */
 export function showChanges(hostId: string, sessionId: string) {
-  lsSet(`file-panel-${skey(hostId, sessionId)}`, true);
-  lsSet('wp-view', 'changes');
-  pendingChanges.add(skey(hostId, sessionId));
-  pendingTurns.delete(skey(hostId, sessionId));
+  const k = skey(hostId, sessionId);
+  lsSet(`file-panel-${k}`, true);
+  lsSet(`wp-tree-${k}`, true);
+  lsSet(`wp-view-${k}`, 'changes');
+  pendingChanges.add(k);
+  pendingTurns.delete(k);
   navigate({ kind: 'session', hostId, sessionId });
   setTimeout(() => window.dispatchEvent(new CustomEvent(OPEN_CHANGES, { detail: { hostId, sessionId } })), 0);
 }
 
 /** Open the file panel on the "Changes" view scoped to a specific completed turn's checkpoint diff */
 export function showTurnDiff(hostId: string, sessionId: string, turn: number) {
-  lsSet(`file-panel-${skey(hostId, sessionId)}`, true);
-  lsSet('wp-view', 'changes');
-  pendingChanges.add(skey(hostId, sessionId));
-  pendingTurns.set(skey(hostId, sessionId), turn);
+  const k = skey(hostId, sessionId);
+  lsSet(`file-panel-${k}`, true);
+  lsSet(`wp-tree-${k}`, true);
+  lsSet(`wp-view-${k}`, 'changes');
+  pendingChanges.add(k);
+  pendingTurns.set(k, turn);
   setTimeout(() => window.dispatchEvent(new CustomEvent(OPEN_CHANGES, { detail: { hostId, sessionId, turn } })), 0);
 }
 

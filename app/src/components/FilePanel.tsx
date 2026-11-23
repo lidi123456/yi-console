@@ -610,7 +610,17 @@ export function FilePanel({
   const [mdGoto, setMdGoto] = useState<{ line: number; n: number } | null>(null);
   // Which side drives the scrolling in split view: follow the side the mouse / finger is on, so the two don't trigger each other
   const syncFrom = useRef<'editor' | 'preview'>('editor');
-  const [treeOpen, setTreeOpen] = useState(() => lsGet('wp-tree', true));
+  const sessionKey = skey(hostId, sessionId);
+  const treeKey = `wp-tree-${sessionKey}`;
+  const viewKey = `wp-view-${sessionKey}`;
+  const [treeOpen, setTreeOpen] = useState(() => lsGet(treeKey, true));
+  const setTree = useCallback(
+    (open: boolean) => {
+      lsSet(treeKey, open);
+      setTreeOpen(open);
+    },
+    [treeKey],
+  );
   const [treeW, setTreeW] = useState(() => lsGet('wp-tree-w', 300));
   const [filter, setFilter] = useState('');
   const [search, setSearch] = useState<{ q: string; paths: string[]; truncated: boolean; error?: boolean } | null>(null);
@@ -655,7 +665,7 @@ export function FilePanel({
   const [commitOpen, setCommitOpen] = useState(false);
   const [reviewOpen, setReviewOpen] = useState(false);
   const [pushing, setPushing] = useState(false);
-  const [view, setView] = useState<'all' | 'changes' | 'search'>(() => lsGet('wp-view', 'all'));
+  const [view, setView] = useState<'all' | 'changes' | 'search'>(() => lsGet(viewKey, 'all'));
   const [showDiff, setShowDiff] = useState(false);
   // Default to Cursor-style single-file inline diff with the full file expanded
   const [diffLayout, setDiffLayout] = useState<'split' | 'unified'>(() => lsGet('wp-diff-mode', 'unified'));
@@ -1169,8 +1179,8 @@ export function FilePanel({
     fileRef.current = f;
     setFile(f);
     setTabs((t) => (t.includes(path) ? t : [...t, path].slice(-30)));
-    // The live picture / side chat needs the room: hide the tree for it (not remembered)
-    if (isAiTab(path) || isSideTab(path)) setTreeOpen(false);
+    // The live picture / side chat needs the room: hide the tree for this session
+    if (isAiTab(path) || isSideTab(path)) setTree(false);
     setSaveState(null);
     previewFor(path, at);
     setCompare(null);
@@ -1217,7 +1227,7 @@ export function FilePanel({
     setExpanded((x) => new Set([...x, ...chain]));
     setFilter('');
     pickView('all');
-    setTreeOpen(true);
+    setTree(true);
     const target = chain[chain.length - 1];
     if (target) {
       setFocusKey(target);
@@ -1498,8 +1508,12 @@ export function FilePanel({
       setTabs(keep);
       setFile(f);
       previewFor(cur);
-      // On phones a restored file normally takes the screen; not when the panel was opened for "Changes"
-      if (!forChanges.current && window.matchMedia('(max-width: 760px)').matches) setTreeOpen(false);
+      // On phones a restored file normally takes the screen; not when the panel was opened for "Changes".
+      // On desktop, auto-hide the tree when restoring an AI browser / side chat tab unless explicitly toggled for this session.
+      if (!forChanges.current) {
+        if (window.matchMedia('(max-width: 760px)').matches) setTreeOpen(false);
+        else if ((isAiTab(cur) || isSideTab(cur)) && lsGet<boolean | null>(treeKey, null) === null) setTreeOpen(false);
+      }
     });
   }, [root]); // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => {
@@ -2286,7 +2300,7 @@ export function FilePanel({
       return n;
     });
   const pickView = (v: 'all' | 'changes' | 'search') => {
-    lsSet('wp-view', v);
+    lsSet(viewKey, v);
     setView(v);
     setCollapsed(new Set());
   };
@@ -2304,7 +2318,7 @@ export function FilePanel({
         setSelectedTurn(reqTurn);
         setDiffScope('turn');
       }
-      setTreeOpen(true);
+      setTree(true);
       loadGit();
     };
     take();
@@ -3347,7 +3361,7 @@ export function FilePanel({
           <button
             className={`icon-btn ${treeOpen ? 'active' : ''}`}
             title={treeOpen ? tx('hideFileTree') : tx('showFileTree')}
-            onClick={() => (lsSet('wp-tree', !treeOpen), setTreeOpen(!treeOpen))}
+            onClick={() => setTree(!treeOpen)}
           >
             <Icon name="fileTree" size={14} />
           </button>

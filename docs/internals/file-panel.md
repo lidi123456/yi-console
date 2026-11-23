@@ -5,6 +5,7 @@ The session page's "workspace files" (`FilePanel.tsx`), also used standalone by 
 ## Layout
 
 - With no file open it's a single tree column (`.file-panel.browse`, width `--tree-w`); opening a file widens it (`--panel-w`), with the editor on the left (tabs for opened files above it) and the tree on the right.
+- File tree visibility (`wp-tree-<host>::<session>`) and the active sidebar view (`wp-view-<host>::<session>`: Files / Changes / Search) are stored per session so toggling the tree or switching views in one session doesn't affect other sessions.
 - The chat area keeps at least 420px, and the session header and input box collapse their text when narrow via container queries on `.session-view`.
 - "View changes" is no longer a separate page: `SessionActions.showChanges` sends `OPEN_CHANGES`, and the session page opens the file panel on "Changes".
 - "Add to chat" sends an `INSERT_COMPOSER` event, and the Composer appends `@relative-path` to the draft.
