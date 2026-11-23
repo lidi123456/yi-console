@@ -10035,6 +10035,7 @@ button.wp-commit-title .chev {
 .ctx-menu {
   max-height: calc(100vh - 8px);
   overflow-y: auto;
+  overscroll-behavior: contain;
 }
 .ctx-menu button {
   flex: none;
@@ -15294,51 +15295,80 @@ button.wp-commit-title .chev {
   gap: 8px;
 }
 
-/* Worktree switcher & new-worktree banner in FilePanel sidebar */
-.wp-wt-bar {
+/* Git context bar (Branch / Worktree switcher) & new-worktree banner in FilePanel sidebar */
+.wp-ctx-bar {
   display: flex;
   align-items: center;
-  gap: 4px;
-  padding: 5px 8px;
+  gap: 6px;
+  height: 32px;
+  flex: none;
+  padding: 0 8px;
   border-bottom: 1px solid var(--border);
   background: var(--bg-2);
 }
-.wp-wt-bar.other {
+.wp-ctx-bar.other {
   background: color-mix(in srgb, var(--link) 8%, var(--bg-2));
   border-bottom-color: color-mix(in srgb, var(--link) 22%, var(--border));
 }
-.wp-wt-btn {
-  flex: 1;
-  min-width: 0;
+.wp-ctx-branch {
   display: inline-flex;
   align-items: center;
   gap: 5px;
-  height: 24px;
+  min-width: 0;
+  max-width: 100%;
+  height: 23px;
   padding: 0 7px;
   border-radius: 6px;
-  font-size: 12px;
-  color: var(--text);
-  background: var(--panel);
   border: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 11.5px;
+  font-weight: 500;
+  transition: border-color 0.12s, background 0.12s, color 0.12s;
 }
-.wp-wt-btn:hover {
+.wp-ctx-branch:hover {
   border-color: var(--border-2);
   background: var(--bg-3);
 }
-.wp-wt-cnt {
+.wp-ctx-branch.other {
+  border-color: color-mix(in srgb, var(--link) 32%, var(--border));
+  background: color-mix(in srgb, var(--link) 10%, var(--panel));
+  color: var(--link);
+}
+.wp-ctx-branch.open {
+  border-color: var(--link);
+  background: color-mix(in srgb, var(--link) 10%, var(--panel));
+  color: var(--link);
+}
+.wp-ctx-cnt {
   flex: none;
-  padding: 0 5px;
-  border-radius: 999px;
-  background: var(--bg-3);
-  color: var(--text-2);
+  color: var(--text-3);
   font-size: 10.5px;
+  font-weight: 400;
+}
+.wp-ctx-branch.other .wp-ctx-cnt,
+.wp-ctx-branch.open .wp-ctx-cnt {
+  color: color-mix(in srgb, var(--link) 75%, var(--text-3));
+}
+.wp-ctx-repo {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 110px;
+  padding: 1px 6px;
+  border-radius: 5px;
+  background: var(--bg-3);
+  color: var(--text-3);
+  font-family: var(--mono);
+  font-size: 10.5px;
+  line-height: 16px;
 }
 .wp-wt-back {
   flex: none;
   display: inline-flex;
   align-items: center;
   gap: 3px;
-  height: 24px;
+  height: 23px;
   padding: 0 7px;
   border-radius: 6px;
   font-size: 11.5px;
@@ -15375,7 +15405,186 @@ button.wp-commit-title .chev {
   opacity: 0.9;
 }
 
-/* Changes view: minimalist scope strip & Zed-style bottom Git action dock */
+/* Searchable Branch / Worktree switcher popover */
+.wp-bw-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 450;
+}
+.wp-bw-pop {
+  position: fixed;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: var(--shadow);
+  animation: fade-in 0.08s ease-out;
+}
+.wp-bw-search {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  height: 36px;
+  flex: none;
+  padding: 0 10px;
+  border-bottom: 1px solid var(--border);
+  color: var(--text-3);
+}
+.wp-bw-search input {
+  flex: 1;
+  min-width: 0;
+  border: none;
+  outline: none;
+  padding: 0;
+  background: transparent;
+  box-shadow: none !important;
+  color: var(--text);
+  font-size: 12.5px;
+}
+.wp-bw-search .icon-btn {
+  width: 20px;
+  height: 20px;
+}
+.wp-bw-list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 4px;
+}
+.wp-bw-sec {
+  padding: 6px 8px 3px;
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  color: var(--text-3);
+}
+.wp-bw-list > .wp-bw-sec ~ .wp-bw-sec {
+  margin-top: 4px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+}
+.wp-bw-item {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 30px;
+  padding: 4px 8px;
+  border-radius: 6px;
+  font-size: 12.5px;
+  color: var(--text);
+  text-align: left;
+}
+.wp-bw-item:hover,
+.wp-bw-item.sel {
+  background: var(--bg-3);
+}
+.wp-bw-item.active {
+  background: color-mix(in srgb, var(--link) 11%, transparent);
+  color: var(--link);
+}
+.wp-bw-item.active.sel,
+.wp-bw-item.active:hover {
+  background: color-mix(in srgb, var(--link) 16%, transparent);
+}
+.wp-bw-item > .icon {
+  flex: none;
+  color: var(--text-3);
+}
+.wp-bw-item.active > .icon {
+  color: var(--link);
+}
+.wp-bw-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 12px;
+}
+.wp-bw-tag {
+  flex: none;
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: var(--bg-3);
+  color: var(--text-2);
+  font-size: 10.5px;
+  font-weight: 500;
+}
+.wp-bw-meta {
+  flex: 0 1 auto;
+  max-width: 45%;
+  font-size: 11px;
+  color: var(--text-3);
+}
+.wp-bw-check {
+  flex: none;
+  display: inline-flex;
+  color: var(--link);
+}
+.wp-bw-empty,
+.wp-bw-loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 18px 12px;
+  font-size: 12px;
+  color: var(--text-3);
+}
+.wp-bw-foot {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  padding: 4px;
+  border-top: 1px solid var(--border);
+  background: var(--bg-2);
+}
+.wp-bw-foot-btn {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  height: 28px;
+  padding: 0 8px;
+  border-radius: 6px;
+  font-size: 12px;
+  color: var(--text-2);
+  text-align: left;
+}
+.wp-bw-foot-btn:hover {
+  background: var(--bg-3);
+  color: var(--text);
+}
+@media (max-width: 760px) {
+  .wp-bw-scrim {
+    background: rgba(10, 12, 16, 0.36);
+  }
+  .wp-bw-pop {
+    left: 0 !important;
+    right: 0 !important;
+    top: auto !important;
+    bottom: 0 !important;
+    width: auto !important;
+    max-height: 75vh !important;
+    border-radius: 14px 14px 0 0;
+    border-left: none;
+    border-right: none;
+    border-bottom: none;
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+  }
+  .wp-bw-item {
+    min-height: 36px;
+    padding: 6px 10px;
+  }
+  .wp-bw-foot-btn {
+    height: 34px;
+  }
+}
+
+/* Changes view: minimalist scope strip & slim single-row bottom Git action dock */
 .wp-scope-strip {
   display: flex;
   align-items: center;
@@ -15438,62 +15647,11 @@ button.wp-commit-title .chev {
   border-top: 1px solid var(--border);
   background: var(--panel);
 }
-.wp-git-dock-ctx {
-  display: flex;
-  align-items: center;
-  gap: 5px;
-  min-width: 0;
-}
-.wp-git-dock-branch {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  min-width: 0;
-  max-width: 100%;
-  height: 24px;
-  padding: 0 7px;
-  border-radius: 6px;
-  background: var(--bg-2);
-  color: var(--text);
-  font-family: var(--mono);
-  font-size: 11px;
-}
-.wp-git-dock-branch:hover {
-  background: var(--bg-3);
-}
-.wp-git-dock-branch.other {
-  background: color-mix(in srgb, var(--link) 10%, var(--bg-2));
-  color: var(--link);
-}
-.wp-dock-wt-cnt {
-  flex: none;
-  color: var(--text-3);
-  font-size: 10.5px;
-}
-.wp-git-dock-branch.other .wp-dock-wt-cnt {
-  color: color-mix(in srgb, var(--link) 75%, var(--text-3));
-}
-.wp-git-dock-back {
-  flex: none;
-  display: inline-flex;
-  align-items: center;
-  gap: 2px;
-  height: 24px;
-  padding: 0 6px;
-  border-radius: 6px;
-  font-size: 11px;
-  font-weight: 500;
-  color: var(--link);
-  background: color-mix(in srgb, var(--link) 10%, transparent);
-}
-.wp-git-dock-back:hover {
-  background: color-mix(in srgb, var(--link) 18%, transparent);
-}
 .wp-dock-icon {
   flex: none;
-  width: 24px;
-  height: 24px;
-  border-radius: 6px;
+  width: 29px;
+  height: 29px;
+  border-radius: 7px;
   border: 1px solid var(--border);
   background: var(--bg-2);
   color: var(--text-2);

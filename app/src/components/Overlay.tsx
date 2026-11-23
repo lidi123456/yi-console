@@ -177,6 +177,11 @@ function ContextMenu({ m }: { m: MenuReq }) {
   }, [m]);
   useEffect(() => {
     const off = () => closeMenu();
+    const onWheel = (e: WheelEvent) => {
+      // Allow wheel scrolling inside long context menus instead of closing them
+      if (ref.current && e.target instanceof Node && ref.current.contains(e.target)) return;
+      closeMenu();
+    };
     const key = (e: KeyboardEvent) => {
       if (e.key !== 'Escape' || e.isComposing) return;
       e.preventDefault();
@@ -186,12 +191,12 @@ function ContextMenu({ m }: { m: MenuReq }) {
     window.addEventListener('blur', off);
     window.addEventListener('resize', off);
     window.addEventListener('keydown', key, true);
-    window.addEventListener('wheel', off, { passive: true });
+    window.addEventListener('wheel', onWheel, { passive: true });
     return () => {
       window.removeEventListener('blur', off);
       window.removeEventListener('resize', off);
       window.removeEventListener('keydown', key, true);
-      window.removeEventListener('wheel', off);
+      window.removeEventListener('wheel', onWheel);
     };
   }, []);
   return (

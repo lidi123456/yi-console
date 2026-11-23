@@ -21,7 +21,7 @@ import { AI_PREFIX, aiTabSession, AiBrowserPane, isAiTab, useAiBrowserBusy } fro
 import { registerWebTabs } from './NativeWeb';
 import { canUseBrowser } from '../browserUse';
 import { CommitDetails, GitHistory, isCommitTab, parseCommitTab } from './GitHistory';
-import { CommitDialog, type BranchesResult, type WorktreeEntry, type WorktreesResult } from './GitOpsDialogs';
+import { BranchWorktreePopover, CommitDialog, type BranchesResult, type WorktreeEntry, type WorktreesResult } from './GitOpsDialogs';
 import {
   deleteReviewMeta,
   getReviewMeta,
@@ -649,6 +649,9 @@ export function FilePanel({
   const [branchDiff, setBranchDiff] = useState<BranchDiffInfo | null>(null);
   const [branchDiffLoading, setBranchDiffLoading] = useState(false);
   const [branchesInfo, setBranchesInfo] = useState<BranchesResult | null>(null);
+  const [branchesLoading, setBranchesLoading] = useState(false);
+  const [bwOpen, setBwOpen] = useState(false);
+  const bwBtnRef = useRef<HTMLButtonElement>(null);
   const [commitOpen, setCommitOpen] = useState(false);
   const [reviewOpen, setReviewOpen] = useState(false);
   const [pushing, setPushing] = useState(false);
@@ -1741,90 +1744,44 @@ export function FilePanel({
     }
   };
 
-  const openGitContextMenu = async (e: React.MouseEvent<HTMLElement>) => {
-    const r = e.currentTarget.getBoundingClientRect();
-    const info = (await loadBranches()) ?? branchesInfo;
-    const items: (MenuItem | '-')[] = [];
-    const curNorm = norm(cwd);
-    const hasMultiWt = !!onSwitchCwd && worktrees.length > 1;
-    const wtBranches = new Set<string>();
+  const toggleBwPopover = () => {
+    if (bwOpen) {
+      setBwOpen(false);
+      return;
+    }
+    setBwOpen(true);
+    setBranchesLoading(true);
+    loadWorktrees();
+    void loadBranches().finally(() => setBranchesLoading(false));
+  };
 
-    if (hasMultiWt) {
-      for (const w of worktrees) {
-        if (w.branch) wtBranches.add(w.branch);
-        const active = norm(w.path) === curNorm;
-        const label = w.branch ? w.branch : baseName(w.path);
-        const hint = w.isMain ? `${tx('mainWorktreeTag')} · ${baseName(w.path)}` : baseName(w.path);
-        items.push({
-          label,
-          icon: 'git-branch',
-          active,
-          hint,
-          run: () => {
-            setNewWorktree(null);
-            if (!active) onSwitchCwd!(w.path);
-          },
-        });
-      }
-      if (isOtherWorktree && baseCwd) {
-        items.push({
-          label: tx('backToSessionDir'),
-          icon: 'back',
-          run: () => {
-            setNewWorktree(null);
-            onSwitchCwd!(baseCwd);
-          },
-        });
-      }
-      items.push('-');
-    }
+  const switchWorktree = (targetPath: string) => {
+    setNewWorktree(null);
+    if (onSwitchCwd && norm(targetPath) !== norm(cwd)) onSwitchCwd(targetPath);
+  };
 
-    const extraBranches = (info?.branches ?? []).filter((b) => !hasMultiWt || !wtBranches.has(b.name));
-    for (const b of extraBranches) {
-      const hintParts = [b.ahead ? `↑${b.ahead}` : '', b.behind ? `↓${b.behind}` : ''].filter(Boolean);
-      items.push({
-        label: b.name,
-        icon: 'git-branch',
-        active: b.current,
-        hint: hintParts.join(' ') || undefined,
-        run: async () => {
-          if (b.current) return;
-          try {
-            await rpc(hostId, 'git.checkout', { cwd, branch: b.name });
-            toast(tx('switchedToBranch', { branch: b.name }));
-            refreshTree();
-            void loadBranches();
-          } catch (err) {
-            errorToast(err);
-          }
-        },
-      });
+  const checkoutBranch = async (name: string) => {
+    try {
+      await rpc(hostId, 'git.checkout', { cwd, branch: name });
+      toast(tx('switchedToBranch', { branch: name }));
+      refreshTree();
+      void loadBranches();
+    } catch (err) {
+      errorToast(err);
     }
-    if (extraBranches.length) items.push('-');
-    items.push({
-      label: tx('newBranch'),
-      icon: 'plus',
-      run: async () => {
-        const name = (await askText({ title: tx('newBranch'), placeholder: tx('newBranchPlaceholder') }))?.trim();
-        if (!name) return;
-        try {
-          await rpc(hostId, 'git.checkout', { cwd, branch: name, create: true });
-          toast(tx('switchedToBranch', { branch: name }));
-          refreshTree();
-          void loadBranches();
-        } catch (err) {
-          errorToast(err);
-        }
-      },
-    });
-    if (!standalone) {
-      items.push('-', {
-        label: tx('newSessionInCurrentWorktree'),
-        icon: 'plus',
-        run: () => openNewSession({ hostId, cwd }),
-      });
+  };
+
+  const createBranch = async () => {
+    const name = (await askText({ title: tx('newBranch'), placeholder: tx('newBranchPlaceholder') }))?.trim();
+    if (!name) return;
+    try {
+      await rpc(hostId, 'git.checkout', { cwd, branch: name, create: true });
+      toast(tx('switchedToBranch', { branch: name }));
+      refreshTree();
+      void loadBranches();
+    } catch (err) {
+      errorToast(err);
     }
-    openMenu({ clientX: r.left, clientY: r.top - 4 }, items);
   };
 
   const openBaseBranchMenu = async (e: React.MouseEvent<HTMLElement>) => {
@@ -1862,45 +1819,6 @@ export function FilePanel({
         },
       })),
     );
-  };
-
-  const openWorktreeMenu = (e: React.MouseEvent<HTMLElement>) => {
-    if (!onSwitchCwd) return;
-    const r = e.currentTarget.getBoundingClientRect();
-    const curNorm = norm(cwd);
-    const items: (MenuItem | '-')[] = worktrees.map((w) => {
-      const active = norm(w.path) === curNorm;
-      const label = w.branch ? w.branch : baseName(w.path);
-      const hint = w.isMain ? `${tx('mainWorktreeTag')} · ${baseName(w.path)}` : baseName(w.path);
-      return {
-        label,
-        icon: 'git-branch',
-        active,
-        hint,
-        run: () => {
-          setNewWorktree(null);
-          if (!active) onSwitchCwd(w.path);
-        },
-      };
-    });
-    if (isOtherWorktree && baseCwd) {
-      items.push('-', {
-        label: tx('backToSessionDir'),
-        icon: 'back',
-        run: () => {
-          setNewWorktree(null);
-          onSwitchCwd(baseCwd);
-        },
-      });
-    }
-    if (!standalone) {
-      items.push('-', {
-        label: tx('newSessionInCurrentWorktree'),
-        icon: 'plus',
-        run: () => openNewSession({ hostId, cwd }),
-      });
-    }
-    openMenu({ clientX: r.left, clientY: r.bottom + 4 }, items);
   };
 
   // ---------- Download, open in the system ----------
@@ -2610,27 +2528,37 @@ export function FilePanel({
           <Icon name="refresh" size={14} />
         </button>
       </div>
-      {view !== 'changes' && onSwitchCwd && isOtherWorktree && (
-        <div className="wp-wt-bar other">
-          <button type="button" className="wp-wt-btn truncate" onClick={openWorktreeMenu} title={cwd}>
+      {git && (
+        <div className={`wp-ctx-bar ${isOtherWorktree ? 'other' : ''}`}>
+          <button
+            ref={bwBtnRef}
+            type="button"
+            className={`wp-ctx-branch truncate ${isOtherWorktree ? 'other' : ''} ${bwOpen ? 'open' : ''}`}
+            aria-expanded={bwOpen}
+            aria-haspopup="dialog"
+            title={onSwitchCwd && worktrees.length > 1 ? tx('switchBranchOrWorktree') : tx('switchOrCreateBranch')}
+            onClick={toggleBwPopover}
+          >
             <Icon name="git-branch" size={12} />
-            <span className="truncate">{wtLabel}</span>
-            {worktrees.length > 1 && <span className="wp-wt-cnt">{worktrees.length}</span>}
-            <Icon name="down" size={11} />
+            <span className="truncate">{git.branch || wtLabel || 'HEAD'}</span>
+            {onSwitchCwd && worktrees.length > 1 && <span className="wp-ctx-cnt">· {worktrees.length}</span>}
+            <Icon name="down" size={10} />
           </button>
-          {baseCwd && (
+          <div className="grow" />
+          {onSwitchCwd && isOtherWorktree && baseCwd ? (
             <button
               type="button"
               className="wp-wt-back"
               title={tx('backToSessionDir')}
-              onClick={() => {
-                setNewWorktree(null);
-                onSwitchCwd(baseCwd);
-              }}
+              onClick={() => switchWorktree(baseCwd)}
             >
               <Icon name="back" size={11} />
               <span>{tx('mainDirShort')}</span>
             </button>
+          ) : (
+            <span className="wp-ctx-repo truncate" title={cwd}>
+              {baseName(cwd)}
+            </span>
           )}
         </div>
       )}
@@ -2872,45 +2800,6 @@ export function FilePanel({
           )}
           {view === 'changes' && git && (
             <div className="wp-git-dock">
-              <div className="wp-git-dock-ctx">
-                <button
-                  type="button"
-                  className={`wp-git-dock-branch truncate ${isOtherWorktree ? 'other' : ''}`}
-                  title={onSwitchCwd && worktrees.length > 1 ? tx('switchBranchOrWorktree') : tx('switchOrCreateBranch')}
-                  onClick={(e) => void openGitContextMenu(e)}
-                >
-                  <Icon name="git-branch" size={12} />
-                  <span className="truncate">{git.branch || 'HEAD'}</span>
-                  {onSwitchCwd && worktrees.length > 1 && <span className="wp-dock-wt-cnt">· {worktrees.length}</span>}
-                  <Icon name="down" size={10} />
-                </button>
-                {onSwitchCwd && isOtherWorktree && baseCwd && (
-                  <button
-                    type="button"
-                    className="wp-git-dock-back"
-                    title={tx('backToSessionDir')}
-                    onClick={() => {
-                      setNewWorktree(null);
-                      onSwitchCwd(baseCwd);
-                    }}
-                  >
-                    <Icon name="back" size={11} />
-                    <span>{tx('mainTiny')}</span>
-                  </button>
-                )}
-                <div className="grow" />
-                {commitFiles.length > 0 && (
-                  <button
-                    type="button"
-                    className="wp-dock-icon"
-                    disabled={pushing}
-                    title={tx('pushBranch')}
-                    onClick={() => void doPush()}
-                  >
-                    {pushing ? <span className="spinner mini" /> : <Icon name="upload" size={13} />}
-                  </button>
-                )}
-              </div>
               <div className="wp-git-dock-cta">
                 {commitFiles.length > 0 ? (
                   <>
@@ -2924,6 +2813,15 @@ export function FilePanel({
                         <span>{tx('reviewBtn')}</span>
                       </button>
                     )}
+                    <button
+                      type="button"
+                      className="wp-dock-icon"
+                      disabled={pushing}
+                      title={tx('pushBranch')}
+                      onClick={() => void doPush()}
+                    >
+                      {pushing ? <span className="spinner mini" /> : <Icon name="upload" size={13} />}
+                    </button>
                   </>
                 ) : (
                   <>
@@ -3175,11 +3073,6 @@ export function FilePanel({
           <span className="wp-title truncate" title={root ?? cwd}>
             {baseName(root ?? cwd) || root || cwd}
           </span>
-          {git?.branch && (
-            <span className="wp-branch truncate" title={tx('gitBranch', { branch: git.branch })}>
-              {git.branch}
-            </span>
-          )}
           <div className="grow" />
           <button
             className="icon-btn"
@@ -3678,6 +3571,23 @@ export function FilePanel({
             void openFile(REVIEW_PREFIX + rsid);
           }}
           onClose={() => setReviewOpen(false)}
+        />
+      )}
+      {bwOpen && bwBtnRef.current && git && (
+        <BranchWorktreePopover
+          anchor={bwBtnRef.current}
+          cwd={cwd}
+          baseCwd={baseCwd}
+          isOtherWorktree={isOtherWorktree}
+          standalone={standalone}
+          worktrees={worktrees}
+          branchesInfo={branchesInfo}
+          loadingBranches={branchesLoading}
+          onSwitchWorktree={onSwitchCwd ? switchWorktree : undefined}
+          onCheckoutBranch={checkoutBranch}
+          onCreateBranch={() => void createBranch()}
+          onNewSession={standalone ? undefined : () => openNewSession({ hostId, cwd })}
+          onClose={() => setBwOpen(false)}
         />
       )}
     </aside>
