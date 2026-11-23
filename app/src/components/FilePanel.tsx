@@ -613,15 +613,15 @@ export function FilePanel({
   // Which side drives the scrolling in split view: follow the side the mouse / finger is on, so the two don't trigger each other
   const syncFrom = useRef<'editor' | 'preview'>('editor');
   const sessionKey = skey(hostId, sessionId);
-  const treeKey = `wp-tree-${sessionKey}`;
+  const treeOpenKey = `wp-tree-${sessionKey}`;
   const viewKey = `wp-view-${sessionKey}`;
-  const [treeOpen, setTreeOpen] = useState(() => lsGet(treeKey, true));
+  const [treeOpen, setTreeOpen] = useState(() => lsGet(treeOpenKey, true));
   const setTree = useCallback(
     (open: boolean) => {
-      lsSet(treeKey, open);
+      lsSet(treeOpenKey, open);
       setTreeOpen(open);
     },
-    [treeKey],
+    [treeOpenKey],
   );
   const [treeW, setTreeW] = useState(() => lsGet('wp-tree-w', 300));
   const [filter, setFilter] = useState('');
@@ -1527,7 +1527,7 @@ export function FilePanel({
       // On desktop, auto-hide the tree when restoring an AI browser / side chat tab unless explicitly toggled for this session.
       if (!forChanges.current) {
         if (window.matchMedia('(max-width: 760px)').matches) setTreeOpen(false);
-        else if ((isAiTab(cur) || isSideTab(cur)) && lsGet<boolean | null>(treeKey, null) === null) setTreeOpen(false);
+        else if ((isAiTab(cur) || isSideTab(cur)) && lsGet<boolean | null>(treeOpenKey, null) === null) setTreeOpen(false);
       }
     });
   }, [root]); // eslint-disable-line react-hooks/exhaustive-deps
