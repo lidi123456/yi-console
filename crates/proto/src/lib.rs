@@ -1460,7 +1460,7 @@ pub mod methods {
     pub const GIT_DISCARD: &str = "git.discard";
     /// {cwd, paths, message}: commit these files
     pub const GIT_COMMIT: &str = "git.commit";
-    /// {cwd, skip?, limit?} -> {repo, commits:[{hash, short, parents, author, time, refs, subject}], more}: commit history of HEAD, newest first
+    /// {cwd, skip?, limit?, query?} -> {repo, commits:[{hash, short, parents, author, time, refs, subject}], more}: commit history of HEAD, newest first
     pub const GIT_LOG: &str = "git.log";
     /// {cwd, hash, paths?} -> {hash, parent, message, author, time, files:[{path, status, added, deleted, diff}]}:
     /// files a commit changed relative to its first parent; diffs only for the files in paths
@@ -1470,7 +1470,7 @@ pub mod methods {
     pub const GIT_BLOB: &str = "git.blob";
     /// {cwd} -> {repo, current, worktrees:[{path, head, branch, detached, isMain, isCurrent, bare, prunable}]}: list all worktrees of the repo
     pub const GIT_WORKTREES: &str = "git.worktrees";
-    /// {cwd} -> {repo, current, defaultBranch, branches:[{name, current, upstream?, ahead?, behind?}]}: list local branches
+    /// {cwd} -> {repo, current, defaultBranch, branches:[{name, current, upstream?, ahead?, behind?}], remoteBranches:[string]}: list local and remote branches
     pub const GIT_BRANCHES: &str = "git.branches";
     /// {cwd, branch, create?, base?} -> {branch}: switch to an existing branch or create and switch to a new one
     pub const GIT_CHECKOUT: &str = "git.checkout";
@@ -1479,6 +1479,11 @@ pub mod methods {
     /// {cwd, base?, diff?, paths?} -> {repo, branch, base, mergeBase, total?, files:[{path, status, diff, added, deleted}]}:
     /// working tree (including branch commits and untracked files) compared to merge-base(base, HEAD)
     pub const GIT_BRANCH_DIFF: &str = "git.branchDiff";
+    /// {cwd, mode, uncommittedFilter?, base?, target?, includeUncommitted?, commits?, range?, diff?, paths?} ->
+    /// {repo, mode, branch, base?, target?, targetIsHead?, includeUncommitted?, mergeBase?, baseRev?, endRev?,
+    ///  rangeExpr?, contiguous?, commitCount?, counts?, total?, files:[{path, status, diff, added, deleted, size?, binary?, untracked?, staged?}], commits?:[...], error?}:
+    /// resolve and list files/stats for a cross-tool code review scope
+    pub const GIT_REVIEW_SCOPE: &str = "git.reviewScope";
     /// Parts of the status line computed on the host {sessionId} → {git: {branch, ahead, behind, changed}?, command: {text, source}?, error?}
     pub const SESSION_STATUS_LINE: &str = "session.statusLine";
     /// Page back to older events: {sessionId, beforeSeq, limit} → {events, hasMore}

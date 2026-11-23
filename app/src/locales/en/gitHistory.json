@@ -14,5 +14,7 @@
   "noCommitsYet": "No commits yet.",
   "mergeCommitComparedWithIts": "Merge commit (compared with its first parent)",
   "failedToLoad": "Failed to load",
-  "thisCommitChangesNoFiles": "This commit changes no files."
+  "thisCommitChangesNoFiles": "This commit changes no files.",
+  "aiReviewThisCommit": "AI review this commit ({{short}})",
+  "reviewCommitToHead": "Review through HEAD ({{range}})"
 }

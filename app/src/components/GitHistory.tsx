@@ -7,18 +7,22 @@ import type { CommitFile, CommitInfo } from '../types';
 import { lsGet, lsSet, timeAgo } from '../util';
 import { FileIcon, gitMark, gitText, LineStat } from './FilePanel';
 import { Icon } from './Icon';
-import { openMenu } from './Overlay';
+import { openMenu, type MenuItem } from './Overlay';
+import type { ReviewLaunchPreset } from './ReviewTab';
 
 const t = getT('gitHistory');
 
 // "Commit history" box under the Changes view of the file panel: commits of HEAD, newest first, paged as you scroll;
 // clicking a commit lists the files it changed, clicking a file opens that file's diff in the commit as a read-only tab
 
-/** Tab key for a file in a commit: git:<hash>:<path relative to the repo root> */
+/** Tab key for a file in a commit or commit range: git:<hash>:<rel> or git:<base>..<end>:<rel> */
 export const COMMIT_PREFIX = 'git:';
 export const commitTab = (hash: string, rel: string) => `${COMMIT_PREFIX}${hash}:${rel}`;
-export const isCommitTab = (t: string) => t.startsWith(COMMIT_PREFIX) && /^git:[0-9a-f]{4,64}:/.test(t);
-export function parseCommitTab(t: string): { hash: string; rel: string } | null {
+export const commitRangeTab = (baseHash: string, endHash: string, rel: string) => `${COMMIT_PREFIX}${baseHash}..${endHash}:${rel}`;
+export const isCommitTab = (t: string) => t.startsWith(COMMIT_PREFIX) && /^git:[0-9a-f]{4,64}(?:\.\.[0-9a-f]{4,64})?:/.test(t);
+export function parseCommitTab(t: string): { hash: string; baseHash?: string; rel: string } | null {
+  const rm = /^git:([0-9a-f]{4,64})\.\.([0-9a-f]{4,64}):(.+)$/.exec(t);
+  if (rm) return { baseHash: rm[1], hash: rm[2], rel: rm[3] };
   const m = /^git:([0-9a-f]{4,64}):(.+)$/.exec(t);
   return m ? { hash: m[1], rel: m[2] } : null;
 }
@@ -83,6 +87,7 @@ export function GitHistory({
   selected,
   grow,
   onOpen,
+  onReviewCommit,
 }: {
   hostId: string;
   cwd: string;
@@ -93,6 +98,7 @@ export function GitHistory({
   /** Nothing above (no uncommitted changes): take all the remaining height until the user drags the top edge */
   grow?: boolean;
   onOpen: (tab: string) => void;
+  onReviewCommit?: (preset: ReviewLaunchPreset) => void;
 }) {
   useLang();
   const [open, setOpen] = useState(() => lsGet('wp-hist-open', false));
@@ -178,10 +184,28 @@ export function GitHistory({
   };
   const commitMenu = (e: React.MouseEvent, c: CommitInfo) => {
     e.preventDefault();
-    openMenu(e, [
+    const items: (MenuItem | '-')[] = [];
+    if (onReviewCommit) {
+      items.push({
+        label: t('aiReviewThisCommit', { short: c.short }),
+        icon: 'sparkles',
+        run: () => onReviewCommit({ scope: 'commits', commits: [c.hash], commitInfos: [c] }),
+      });
+      if (!head || c.hash !== head) {
+        const range = c.parents.length > 0 ? `${c.short}^..HEAD` : `${c.short}..HEAD`;
+        items.push({
+          label: t('reviewCommitToHead', { range }),
+          icon: 'compare',
+          run: () => onReviewCommit({ scope: 'range', range }),
+        });
+      }
+      items.push('-');
+    }
+    items.push(
       { label: t('copyCommitHash'), icon: 'copy', run: () => copy(c.hash) },
       { label: t('copyCommitMessage'), run: () => copy(messages[c.hash]?.trim() || c.subject) },
-    ]);
+    );
+    openMenu(e, items);
   };
 
   const onScroll = (e: React.UIEvent<HTMLDivElement>) => {
@@ -271,6 +295,20 @@ export function GitHistory({
                           {r.replace(/^tag: /, '')}
                         </span>
                       ))}
+                      {onReviewCommit && (
+                        <button
+                          type="button"
+                          className="wp-commit-review-btn"
+                          title={t('aiReviewThisCommit', { short: c.short })}
+                          aria-label={t('aiReviewThisCommit', { short: c.short })}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            onReviewCommit({ scope: 'commits', commits: [c.hash], commitInfos: [c] });
+                          }}
+                        >
+                          <Icon name="sparkles" size={12} />
+                        </button>
+                      )}
                       <span className="wp-commit-time">{timeAgo(c.time * 1000)}</span>
                     </div>
                     {isOpen && <CommitDetails hash={c.hash} author={c.author} time={c.time} message={messages[c.hash] ?? c.subject} />}

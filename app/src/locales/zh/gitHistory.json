@@ -14,5 +14,7 @@
   "noCommitsYet": "还没有提交。",
   "mergeCommitComparedWithIts": "合并提交（和第一个父提交比较）",
   "failedToLoad": "读取失败",
-  "thisCommitChangesNoFiles": "这个提交没有改动文件。"
+  "thisCommitChangesNoFiles": "这个提交没有改动文件。",
+  "aiReviewThisCommit": "AI 审阅此提交 ({{short}})",
+  "reviewCommitToHead": "审阅此提交至今 ({{range}})"
 }

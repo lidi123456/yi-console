@@ -268,22 +268,8 @@ fn count_lines(full: &Path) -> Option<u64> {
 const FS: char = '\x1f';
 const RS: char = '\x1e';
 
-/// Commit history of HEAD, newest first; skip/limit page through it, more says whether there are older commits
-pub fn log(cwd: &str, skip: usize, limit: usize) -> Result<Value> {
-    let dir = crate::paths::expand(cwd);
-    let Some(root) = repo_root(&dir) else {
-        return Ok(json!({ "repo": null, "commits": [], "more": false }));
-    };
-    let repo = root.display().to_string();
-    // New repo with no commits yet: no HEAD
-    if !git(&root, &["rev-parse", "--verify", "-q", "HEAD"])?.status.success() {
-        return Ok(json!({ "repo": repo, "commits": [], "more": false }));
-    }
-    let fmt = format!("--format=%H{FS}%h{FS}%P{FS}%an{FS}%at{FS}%D{FS}%s{RS}");
-    let (skip, n) = (format!("--skip={skip}"), format!("-n{}", limit + 1));
-    let out = git_ok(&root, &["log", &fmt, &skip, &n, "HEAD", "--"])?;
-    let mut commits: Vec<Value> = out
-        .split(RS)
+fn parse_log_records(out: &str) -> Vec<Value> {
+    out.split(RS)
         .map(|r| r.trim_start_matches('\n'))
         .filter(|r| !r.is_empty())
         .filter_map(|r| {
@@ -301,9 +287,68 @@ pub fn log(cwd: &str, skip: usize, limit: usize) -> Result<Value> {
                 "subject": subject,
             }))
         })
+        .collect()
+}
+
+/// Commit history of HEAD, newest first; skip/limit page through it, more says whether there are older commits
+pub fn log(cwd: &str, skip: usize, limit: usize) -> Result<Value> {
+    log_with(cwd, skip, limit, None)
+}
+
+/// Commit history of HEAD with optional case-insensitive search across subject, author, hash, and refs
+pub fn log_with(cwd: &str, skip: usize, limit: usize, query: Option<&str>) -> Result<Value> {
+    let dir = crate::paths::expand(cwd);
+    let Some(root) = repo_root(&dir) else {
+        return Ok(json!({ "repo": null, "commits": [], "more": false }));
+    };
+    let repo = root.display().to_string();
+    // New repo with no commits yet: no HEAD
+    if !git(&root, &["rev-parse", "--verify", "-q", "HEAD"])?.status.success() {
+        return Ok(json!({ "repo": repo, "commits": [], "more": false }));
+    }
+    let fmt = format!("--format=%H{FS}%h{FS}%P{FS}%an{FS}%at{FS}%D{FS}%s{RS}");
+    let q = query.map(str::trim).filter(|s| !s.is_empty());
+    let Some(q) = q else {
+        let (skip_arg, n_arg) = (format!("--skip={skip}"), format!("-n{}", limit + 1));
+        let out = git_ok(&root, &["log", &fmt, &skip_arg, &n_arg, "HEAD", "--"])?;
+        let mut commits = parse_log_records(&out);
+        let more = commits.len() > limit;
+        commits.truncate(limit);
+        return Ok(json!({ "repo": repo, "commits": commits, "more": more }));
+    };
+
+    let q_lower = q.to_lowercase();
+    let out = git_ok(&root, &["log", &fmt, "-n500", "HEAD", "--"])?;
+    let mut matched: Vec<Value> = parse_log_records(&out)
+        .into_iter()
+        .filter(|c| {
+            let hit = |k: &str| c[k].as_str().is_some_and(|s| s.to_lowercase().contains(&q_lower));
+            hit("subject")
+                || hit("author")
+                || hit("hash")
+                || hit("short")
+                || c["refs"]
+                    .as_array()
+                    .is_some_and(|arr| arr.iter().any(|r| r.as_str().is_some_and(|s| s.to_lowercase().contains(&q_lower))))
+        })
         .collect();
-    let more = commits.len() > limit;
-    commits.truncate(limit);
+
+    // If the user pasted a valid commit hash outside the latest 500 commits, resolve and prepend it
+    if q.len() >= 4 && q.len() <= 64 && q.bytes().all(|b| b.is_ascii_hexdigit()) {
+        if let Ok(full) = git_ok(&root, &["rev-parse", "--verify", "-q", &format!("{q}^{{commit}}")]) {
+            let full = full.trim();
+            if !full.is_empty() && !matched.iter().any(|c| c["hash"].as_str() == Some(full)) {
+                if let Ok(one) = git_ok(&root, &["log", "-1", &fmt, full, "--"]) {
+                    if let Some(item) = parse_log_records(&one).into_iter().next() {
+                        matched.insert(0, item);
+                    }
+                }
+            }
+        }
+    }
+
+    let more = matched.len() > skip.saturating_add(limit);
+    let commits: Vec<Value> = matched.into_iter().skip(skip).take(limit).collect();
     Ok(json!({ "repo": repo, "commits": commits, "more": more }))
 }
 
@@ -676,11 +721,11 @@ fn parse_track(track: &str) -> (Option<u64>, Option<u64>) {
     (ahead, behind)
 }
 
-/// List local branches, the current branch, and the detected default branch
+/// List local branches, remote branches, the current branch, and the detected default branch
 pub fn branches(cwd: &str) -> Result<Value> {
     let dir = crate::paths::expand(cwd);
     let Some(root) = repo_root(&dir) else {
-        return Ok(json!({ "repo": null, "current": null, "defaultBranch": null, "branches": [] }));
+        return Ok(json!({ "repo": null, "current": null, "defaultBranch": null, "branches": [], "remoteBranches": [] }));
     };
     let current = git_ok(&root, &["symbolic-ref", "--quiet", "--short", "HEAD"])
         .ok()
@@ -704,11 +749,22 @@ pub fn branches(cwd: &str) -> Result<Value> {
             "behind": behind,
         }));
     }
+    let remote_branches: Vec<String> = git_ok(
+        &root,
+        &["for-each-ref", "--sort=-committerdate", "--format=%(refname:short)", "refs/remotes"],
+    )
+    .unwrap_or_default()
+    .lines()
+    .map(str::trim)
+    .filter(|s| !s.is_empty() && s.contains('/') && !s.ends_with("/HEAD"))
+    .map(str::to_string)
+    .collect();
     Ok(json!({
         "repo": root.display().to_string(),
         "current": current,
         "defaultBranch": default_branch,
         "branches": list,
+        "remoteBranches": remote_branches,
     }))
 }
 
@@ -929,6 +985,790 @@ pub fn branch_diff(cwd: &str, base: Option<&str>, with_diff: bool, only: Option<
         "total": if only.is_none() && total > files.len() { Some(total) } else { None },
         "files": files,
     }))
+}
+
+fn is_safe_ref_token(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 200
+        && !s.starts_with('-')
+        && !s.contains("..")
+        && !s.bytes().any(|b| {
+            b < 0x20
+                || b == 0x7f
+                || b.is_ascii_whitespace()
+                || matches!(
+                    b,
+                    b':' | b';' | b'|' | b'&' | b'$' | b'`' | b'(' | b')' | b'<' | b'>' | b'\\' | b'\'' | b'"' | b'*' | b'?' | b'['
+                )
+        })
+}
+
+fn parse_numstat_with_binary(out: &str) -> std::collections::HashMap<String, (Option<u64>, Option<u64>, bool)> {
+    let mut m = std::collections::HashMap::new();
+    for rec in out.split('\0').filter(|s| !s.is_empty()) {
+        let mut it = rec.splitn(3, '\t');
+        let (Some(a), Some(d), Some(path)) = (it.next(), it.next(), it.next()) else {
+            continue;
+        };
+        if a == "-" && d == "-" {
+            m.insert(path.to_string(), (None, None, true));
+        } else {
+            m.insert(path.to_string(), (a.parse::<u64>().ok(), d.parse::<u64>().ok(), false));
+        }
+    }
+    m
+}
+
+fn inspect_untracked_file(full: &Path) -> (Option<u64>, Option<u64>, bool) {
+    use std::io::Read;
+    let Ok(meta) = std::fs::metadata(full) else {
+        return (None, None, false);
+    };
+    if !meta.is_file() {
+        return (None, None, false);
+    }
+    let size = meta.len();
+    if size as usize > DIFF_MAX {
+        let is_bin = std::fs::File::open(full)
+            .ok()
+            .map(|f| {
+                let mut buf = Vec::with_capacity(8000);
+                let _ = f.take(8000).read_to_end(&mut buf);
+                buf.contains(&0)
+            })
+            .unwrap_or(false);
+        return (None, Some(size), is_bin);
+    }
+    let Ok(b) = std::fs::read(full) else {
+        return (None, Some(size), false);
+    };
+    if b.iter().take(8000).any(|&c| c == 0) {
+        return (None, Some(size), true);
+    }
+    let n = b.iter().filter(|&&c| c == b'\n').count() + usize::from(b.last().is_some_and(|&c| c != b'\n'));
+    (Some(n as u64), Some(size), false)
+}
+
+fn empty_tree_oid(root: &Path) -> Result<String> {
+    Ok(git_ok(root, &["hash-object", "-t", "tree", "--stdin"])?.trim().to_string())
+}
+
+fn diff_two_revs(
+    root: &Path,
+    base_oid: &str,
+    end_oid: &str,
+    with_diff: bool,
+    only: Option<&[String]>,
+) -> Result<(Option<usize>, Vec<Value>)> {
+    let stats = git_ok(root, &["diff", "--numstat", "-z", "--no-renames", base_oid, end_oid])
+        .map(|out| parse_numstat_with_binary(&out))
+        .unwrap_or_default();
+    let names = git_ok(root, &["diff", "--name-status", "-z", "--no-renames", base_oid, end_oid])?;
+    let mut entries: Vec<(String, String)> = Vec::new();
+    let mut parts = names.split('\0').filter(|s| !s.is_empty());
+    while let (Some(code), Some(path)) = (parts.next(), parts.next()) {
+        entries.push((path.to_string(), code.to_string()));
+    }
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let total = entries.len();
+    let mut files = Vec::new();
+    for (path, code) in entries {
+        if only.is_some_and(|o| !o.iter().any(|x| x == &path)) || files.len() >= STATUS_MAX {
+            continue;
+        }
+        let diff = if !with_diff {
+            String::new()
+        } else {
+            let d = git_ok(root, &["diff", "--no-color", base_oid, end_oid, "--", &path]).unwrap_or_default();
+            if d.len() > DIFF_MAX { String::new() } else { d }
+        };
+        let (added, deleted, binary) = stats.get(&path).copied().unwrap_or((None, None, false));
+        files.push(json!({
+            "path": path,
+            "status": code,
+            "diff": diff,
+            "added": added,
+            "deleted": deleted,
+            "binary": binary,
+            "size": Value::Null,
+            "untracked": false,
+            "staged": false,
+        }));
+    }
+    let total_out = if only.is_none() && total > files.len() { Some(total) } else { None };
+    Ok((total_out, files))
+}
+
+fn rev_commit_count(root: &Path, base_oid: &str, end_oid: &str) -> Option<u64> {
+    git_ok(root, &["rev-list", "--count", &format!("{base_oid}..{end_oid}")])
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+}
+
+/// Resolve and list changed files/stats for cross-tool code review scopes (`uncommitted`, `branch`, `commits`, `range`)
+pub fn review_scope(cwd: &str, params: &Value) -> Result<Value> {
+    let only: Option<Vec<String>> = params["paths"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect());
+    if let Some(o) = only.as_deref() {
+        check_paths(o)?;
+    }
+    let with_diff = params["diff"].as_bool().unwrap_or(false);
+    let mode = params["mode"].as_str().unwrap_or("uncommitted");
+    let dir = crate::paths::expand(cwd);
+    let Some(root) = repo_root(&dir) else {
+        return Ok(json!({ "repo": null, "mode": mode, "files": [] }));
+    };
+    let repo = root.display().to_string();
+    let branch = git_ok(&root, &["rev-parse", "--abbrev-ref", "HEAD"])
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+
+    match mode {
+        "uncommitted" => {
+            let filter = match params["uncommittedFilter"].as_str().unwrap_or("all") {
+                "tracked" => "tracked",
+                "staged" => "staged",
+                _ => "all",
+            };
+            let status = git_ok(&root, &["status", "--porcelain=v1", "-z", "-uall"])?;
+            let mut all_count = 0usize;
+            let mut tracked_count = 0usize;
+            let mut staged_count = 0usize;
+            let mut entries: Vec<(String, String, bool, bool)> = Vec::new();
+
+            let mut it = status.split('\0').filter(|s| !s.is_empty());
+            while let Some(entry) = it.next() {
+                if entry.len() < 4 {
+                    continue;
+                }
+                let (xy, path) = entry.split_at(3);
+                let xy = &xy[..2];
+                if xy == "!!" {
+                    continue;
+                }
+                let xb = xy.as_bytes()[0];
+                let yb = xy.as_bytes()[1];
+                if matches!(xb, b'R' | b'C') || matches!(yb, b'R' | b'C') {
+                    it.next();
+                }
+                let is_untracked = xy == "??";
+                let is_staged = !is_untracked && xb != b' ';
+                all_count += 1;
+                if !is_untracked {
+                    tracked_count += 1;
+                }
+                if is_staged {
+                    staged_count += 1;
+                }
+                let keep = match filter {
+                    "tracked" => !is_untracked,
+                    "staged" => is_staged,
+                    _ => true,
+                };
+                if keep {
+                    let st = if is_untracked {
+                        "new".to_string()
+                    } else if filter == "staged" {
+                        xy[..1].trim().to_string()
+                    } else {
+                        xy.trim().to_string()
+                    };
+                    entries.push((path.to_string(), st, is_untracked, is_staged));
+                }
+            }
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+            let has_head = git(&root, &["rev-parse", "--verify", "-q", "HEAD"])?.status.success();
+            let stats_out = if filter == "staged" || !has_head {
+                git_ok(&root, &["diff", "--cached", "--numstat", "-z", "--no-renames"]).unwrap_or_default()
+            } else {
+                git_ok(&root, &["diff", "HEAD", "--numstat", "-z", "--no-renames"]).unwrap_or_default()
+            };
+            let stats = parse_numstat_with_binary(&stats_out);
+
+            let total = entries.len();
+            let mut files = Vec::new();
+            let mut counted = 0usize;
+            for (path, st, is_untracked, is_staged) in entries {
+                if only.as_deref().is_some_and(|o| !o.iter().any(|x| x == &path)) || files.len() >= STATUS_MAX {
+                    continue;
+                }
+                let diff = if !with_diff {
+                    String::new()
+                } else if is_untracked {
+                    untracked_diff(&root, &path)
+                } else {
+                    let mut args = vec!["diff"];
+                    if filter == "staged" || !has_head {
+                        args.push("--cached");
+                    } else {
+                        args.push("HEAD");
+                    }
+                    args.extend(["--no-color", "--", &path]);
+                    let d = git_ok(&root, &args).unwrap_or_default();
+                    if d.len() > DIFF_MAX { String::new() } else { d }
+                };
+                counted += 1;
+                let (added, deleted, size, binary) = if is_untracked {
+                    if counted <= COUNT_MAX {
+                        let (lines, sz, bin) = inspect_untracked_file(&root.join(&path));
+                        (lines, Some(0), sz, bin)
+                    } else {
+                        (None, Some(0), None, false)
+                    }
+                } else {
+                    let (a, d, bin) = stats.get(&path).copied().unwrap_or((None, None, false));
+                    let sz = if counted <= COUNT_MAX {
+                        std::fs::metadata(root.join(&path)).ok().filter(|m| m.is_file()).map(|m| m.len())
+                    } else {
+                        None
+                    };
+                    (a, d, sz, bin)
+                };
+                files.push(json!({
+                    "path": path,
+                    "status": st,
+                    "diff": diff,
+                    "added": added,
+                    "deleted": deleted,
+                    "size": size,
+                    "binary": binary,
+                    "untracked": is_untracked,
+                    "staged": is_staged,
+                }));
+            }
+
+            Ok(json!({
+                "repo": repo,
+                "mode": "uncommitted",
+                "uncommittedFilter": filter,
+                "branch": branch,
+                "counts": {
+                    "all": all_count,
+                    "tracked": tracked_count,
+                    "staged": staged_count,
+                },
+                "total": if only.is_none() && total > files.len() { Some(total) } else { None },
+                "files": files,
+            }))
+        }
+        "branch" => {
+            let chosen_base = match params["base"].as_str().map(str::trim).filter(|s| !s.is_empty()) {
+                Some(b) => b.to_string(),
+                None => match detect_default_branch(&root) {
+                    Some(b) => b,
+                    None => {
+                        return Ok(json!({
+                            "repo": repo,
+                            "mode": "branch",
+                            "branch": branch,
+                            "files": [],
+                            "error": "未找到可用的基准分支",
+                        }));
+                    }
+                },
+            };
+            let chosen_target = match params["target"].as_str().map(str::trim).filter(|s| !s.is_empty()) {
+                Some(t) => t.to_string(),
+                None if !branch.is_empty() && branch != "HEAD" => branch.clone(),
+                None => "HEAD".to_string(),
+            };
+            if !is_safe_ref_token(&chosen_base) {
+                return Ok(json!({
+                    "repo": repo,
+                    "mode": "branch",
+                    "branch": branch,
+                    "base": chosen_base,
+                    "target": chosen_target,
+                    "files": [],
+                    "error": format!("找不到分支或提交: {chosen_base}"),
+                }));
+            }
+            if !is_safe_ref_token(&chosen_target) {
+                return Ok(json!({
+                    "repo": repo,
+                    "mode": "branch",
+                    "branch": branch,
+                    "base": chosen_base,
+                    "target": chosen_target,
+                    "files": [],
+                    "error": format!("找不到分支或提交: {chosen_target}"),
+                }));
+            }
+            let Ok(base_oid) = git_ok(&root, &["rev-parse", "--verify", "-q", &format!("{chosen_base}^{{commit}}")]) else {
+                return Ok(json!({
+                    "repo": repo,
+                    "mode": "branch",
+                    "branch": branch,
+                    "base": chosen_base,
+                    "target": chosen_target,
+                    "files": [],
+                    "error": format!("找不到分支或提交: {chosen_base}"),
+                }));
+            };
+            let base_oid = base_oid.trim().to_string();
+            let Ok(target_oid) = git_ok(&root, &["rev-parse", "--verify", "-q", &format!("{chosen_target}^{{commit}}")]) else {
+                return Ok(json!({
+                    "repo": repo,
+                    "mode": "branch",
+                    "branch": branch,
+                    "base": chosen_base,
+                    "target": chosen_target,
+                    "files": [],
+                    "error": format!("找不到分支或提交: {chosen_target}"),
+                }));
+            };
+            let target_oid = target_oid.trim().to_string();
+            let target_is_head = chosen_target == "HEAD" || (!branch.is_empty() && branch != "HEAD" && chosen_target == branch);
+            let include_uncommitted = params["includeUncommitted"].as_bool().unwrap_or(false) && target_is_head;
+            let Ok(mb_raw) = git_ok(&root, &["merge-base", &base_oid, &target_oid]) else {
+                return Ok(json!({
+                    "repo": repo,
+                    "mode": "branch",
+                    "branch": branch,
+                    "base": chosen_base,
+                    "target": chosen_target,
+                    "targetIsHead": target_is_head,
+                    "includeUncommitted": include_uncommitted,
+                    "files": [],
+                    "error": "两个分支没有共同祖先",
+                }));
+            };
+            let merge_base = mb_raw.trim().to_string();
+            let commit_count = rev_commit_count(&root, &merge_base, &target_oid);
+
+            if !include_uncommitted {
+                let (total, files) = diff_two_revs(&root, &merge_base, &target_oid, with_diff, only.as_deref())?;
+                return Ok(json!({
+                    "repo": repo,
+                    "mode": "branch",
+                    "branch": branch,
+                    "base": chosen_base,
+                    "target": chosen_target,
+                    "targetIsHead": target_is_head,
+                    "includeUncommitted": false,
+                    "mergeBase": merge_base,
+                    "baseRev": merge_base,
+                    "endRev": target_oid,
+                    "commitCount": commit_count,
+                    "total": total,
+                    "files": files,
+                }));
+            }
+
+            let stats = git_ok(&root, &["diff", "--numstat", "-z", "--no-renames", &merge_base])
+                .map(|out| parse_numstat_with_binary(&out))
+                .unwrap_or_default();
+            let mut entries: Vec<(String, String, bool)> = Vec::new();
+            let mut seen = std::collections::HashSet::new();
+            let names = git_ok(&root, &["diff", "--name-status", "-z", "--no-renames", &merge_base])?;
+            let mut parts = names.split('\0').filter(|s| !s.is_empty());
+            while let (Some(code), Some(path)) = (parts.next(), parts.next()) {
+                if seen.insert(path.to_string()) {
+                    entries.push((path.to_string(), code.to_string(), false));
+                }
+            }
+            if let Ok(untracked) = git_ok(&root, &["ls-files", "--others", "--exclude-standard", "-z"]) {
+                for path in untracked.split('\0').filter(|s| !s.is_empty()) {
+                    if seen.insert(path.to_string()) {
+                        entries.push((path.to_string(), "new".to_string(), true));
+                    }
+                }
+            }
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+            let total = entries.len();
+            let mut files = Vec::new();
+            let mut counted = 0usize;
+            for (path, code, is_untracked) in entries {
+                if only.as_deref().is_some_and(|o| !o.iter().any(|x| x == &path)) || files.len() >= STATUS_MAX {
+                    continue;
+                }
+                let diff = if !with_diff {
+                    String::new()
+                } else if is_untracked {
+                    untracked_diff(&root, &path)
+                } else {
+                    let d = git_ok(&root, &["diff", &merge_base, "--no-color", "--", &path]).unwrap_or_default();
+                    if d.len() > DIFF_MAX { String::new() } else { d }
+                };
+                counted += 1;
+                let (added, deleted, size, binary) = if is_untracked {
+                    if counted <= COUNT_MAX {
+                        let (lines, sz, bin) = inspect_untracked_file(&root.join(&path));
+                        (lines, Some(0), sz, bin)
+                    } else {
+                        (None, Some(0), None, false)
+                    }
+                } else {
+                    let (a, d, bin) = stats.get(&path).copied().unwrap_or((None, None, false));
+                    let sz = if counted <= COUNT_MAX {
+                        std::fs::metadata(root.join(&path)).ok().filter(|m| m.is_file()).map(|m| m.len())
+                    } else {
+                        None
+                    };
+                    (a, d, sz, bin)
+                };
+                files.push(json!({
+                    "path": path,
+                    "status": code,
+                    "diff": diff,
+                    "added": added,
+                    "deleted": deleted,
+                    "size": size,
+                    "binary": binary,
+                    "untracked": is_untracked,
+                    "staged": false,
+                }));
+            }
+
+            Ok(json!({
+                "repo": repo,
+                "mode": "branch",
+                "branch": branch,
+                "base": chosen_base,
+                "target": chosen_target,
+                "targetIsHead": target_is_head,
+                "includeUncommitted": true,
+                "mergeBase": merge_base,
+                "baseRev": merge_base,
+                "endRev": Value::Null,
+                "commitCount": commit_count,
+                "total": if only.is_none() && total > files.len() { Some(total) } else { None },
+                "files": files,
+            }))
+        }
+        "commits" => {
+            struct Meta {
+                hash: String,
+                short: String,
+                parents: Vec<String>,
+                author: String,
+                time: i64,
+                subject: String,
+            }
+            let raw_list: Vec<String> = params["commits"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.trim().to_string())).filter(|s| !s.is_empty()).take(50).collect())
+                .unwrap_or_default();
+            if raw_list.is_empty() {
+                return Ok(json!({
+                    "repo": repo,
+                    "mode": "commits",
+                    "branch": branch,
+                    "commits": [],
+                    "contiguous": false,
+                    "files": [],
+                }));
+            }
+            let fmt = format!("--format=%H{FS}%h{FS}%P{FS}%an{FS}%at{FS}%s");
+            let mut metas: Vec<Meta> = Vec::new();
+            let mut seen_hashes = std::collections::HashSet::new();
+            for raw in raw_list {
+                if !is_safe_ref_token(&raw) {
+                    return Ok(json!({
+                        "repo": repo,
+                        "mode": "commits",
+                        "branch": branch,
+                        "commits": [],
+                        "files": [],
+                        "error": format!("找不到提交: {raw}"),
+                    }));
+                }
+                let Ok(full) = git_ok(&root, &["rev-parse", "--verify", "-q", &format!("{raw}^{{commit}}")]) else {
+                    return Ok(json!({
+                        "repo": repo,
+                        "mode": "commits",
+                        "branch": branch,
+                        "commits": [],
+                        "files": [],
+                        "error": format!("找不到提交: {raw}"),
+                    }));
+                };
+                let full = full.trim().to_string();
+                if !seen_hashes.insert(full.clone()) {
+                    continue;
+                }
+                let info = git_ok(&root, &["log", "-1", &fmt, &full, "--"])?;
+                let line = info.trim_end_matches(&['\n', '\r'][..]);
+                let f: Vec<&str> = line.splitn(6, FS).collect();
+                let [hash, short, parents, author, time, subject] = f[..] else {
+                    bail!("无法解析提交信息: {full}");
+                };
+                metas.push(Meta {
+                    hash: hash.to_string(),
+                    short: short.to_string(),
+                    parents: parents.split(' ').filter(|p| !p.is_empty()).map(str::to_string).collect(),
+                    author: author.to_string(),
+                    time: time.parse::<i64>().unwrap_or(0),
+                    subject: subject.to_string(),
+                });
+            }
+
+            let commits_json: Vec<Value> = metas
+                .iter()
+                .map(|m| {
+                    json!({
+                        "hash": m.hash,
+                        "short": m.short,
+                        "parents": m.parents,
+                        "author": m.author,
+                        "time": m.time,
+                        "refs": [],
+                        "subject": m.subject,
+                    })
+                })
+                .collect();
+
+            if metas.len() == 1 {
+                let c = &metas[0];
+                let base_oid = match c.parents.first() {
+                    Some(p) => p.clone(),
+                    None => empty_tree_oid(&root)?,
+                };
+                let (total, files) = diff_two_revs(&root, &base_oid, &c.hash, with_diff, only.as_deref())?;
+                return Ok(json!({
+                    "repo": repo,
+                    "mode": "commits",
+                    "branch": branch,
+                    "commits": commits_json,
+                    "contiguous": true,
+                    "baseRev": base_oid,
+                    "endRev": c.hash,
+                    "total": total,
+                    "files": files,
+                }));
+            }
+
+            let by_hash: std::collections::HashMap<&str, &Meta> = metas.iter().map(|m| (m.hash.as_str(), m)).collect();
+            let mut referenced_first_parents = std::collections::HashSet::new();
+            for m in &metas {
+                if let Some(p) = m.parents.first() {
+                    if by_hash.contains_key(p.as_str()) {
+                        referenced_first_parents.insert(p.as_str());
+                    }
+                }
+            }
+            let tips: Vec<&Meta> = metas.iter().filter(|m| !referenced_first_parents.contains(m.hash.as_str())).collect();
+            let mut contiguous_pair: Option<(String, String)> = None;
+            if tips.len() == 1 {
+                let newest = tips[0];
+                let mut visited = std::collections::HashSet::new();
+                let mut cur = newest;
+                loop {
+                    if !visited.insert(cur.hash.as_str()) {
+                        break;
+                    }
+                    let Some(fp) = cur.parents.first().and_then(|p| by_hash.get(p.as_str())).copied() else {
+                        break;
+                    };
+                    cur = fp;
+                }
+                if visited.len() == metas.len() {
+                    let base_oid = match cur.parents.first() {
+                        Some(p) => p.clone(),
+                        None => empty_tree_oid(&root)?,
+                    };
+                    contiguous_pair = Some((base_oid, newest.hash.clone()));
+                }
+            }
+
+            if let Some((base_oid, end_oid)) = contiguous_pair {
+                let (total, files) = diff_two_revs(&root, &base_oid, &end_oid, with_diff, only.as_deref())?;
+                return Ok(json!({
+                    "repo": repo,
+                    "mode": "commits",
+                    "branch": branch,
+                    "commits": commits_json,
+                    "contiguous": true,
+                    "baseRev": base_oid,
+                    "endRev": end_oid,
+                    "total": total,
+                    "files": files,
+                }));
+            }
+
+            // Non-contiguous commits: aggregate per-commit changes oldest-to-newest
+            let mut ordered: Vec<&Meta> = metas.iter().collect();
+            ordered.sort_by(|a, b| {
+                if a.time != b.time {
+                    return a.time.cmp(&b.time);
+                }
+                if git(&root, &["merge-base", "--is-ancestor", &a.hash, &b.hash]).is_ok_and(|o| o.status.success()) {
+                    std::cmp::Ordering::Less
+                } else if git(&root, &["merge-base", "--is-ancestor", &b.hash, &a.hash]).is_ok_and(|o| o.status.success()) {
+                    std::cmp::Ordering::Greater
+                } else {
+                    std::cmp::Ordering::Equal
+                }
+            });
+
+            #[derive(Default)]
+            struct Agg {
+                status: String,
+                added: Option<u64>,
+                deleted: Option<u64>,
+                binary: bool,
+                diff: String,
+            }
+            let empty_tree = if ordered.iter().any(|c| c.parents.is_empty()) {
+                Some(empty_tree_oid(&root)?)
+            } else {
+                None
+            };
+            let mut agg_map: std::collections::BTreeMap<String, Agg> = std::collections::BTreeMap::new();
+            for c in ordered {
+                let base_oid = c.parents.first().cloned().unwrap_or_else(|| empty_tree.clone().unwrap());
+                let (_, c_files) = diff_two_revs(&root, &base_oid, &c.hash, with_diff, only.as_deref())?;
+                for f in c_files {
+                    let Some(p) = f["path"].as_str().map(str::to_string) else {
+                        continue;
+                    };
+                    let st = f["status"].as_str().unwrap_or("M").to_string();
+                    let a = f["added"].as_u64();
+                    let d = f["deleted"].as_u64();
+                    let bin = f["binary"].as_bool().unwrap_or(false);
+                    let df = f["diff"].as_str().unwrap_or("");
+                    let entry = agg_map.entry(p).or_default();
+                    if entry.status.is_empty() {
+                        entry.status = st;
+                    } else if !(entry.status == "A" && st == "M") {
+                        entry.status = st;
+                    }
+                    entry.added = match (entry.added, a) {
+                        (Some(x), Some(y)) => Some(x.saturating_add(y)),
+                        (Some(x), None) | (None, Some(x)) => Some(x),
+                        (None, None) => None,
+                    };
+                    entry.deleted = match (entry.deleted, d) {
+                        (Some(x), Some(y)) => Some(x.saturating_add(y)),
+                        (Some(x), None) | (None, Some(x)) => Some(x),
+                        (None, None) => None,
+                    };
+                    entry.binary |= bin;
+                    if with_diff && !df.is_empty() && entry.diff.len() + df.len() <= DIFF_MAX {
+                        if !entry.diff.is_empty() {
+                            entry.diff.push('\n');
+                        }
+                        entry.diff.push_str(df);
+                    }
+                }
+            }
+            let total = agg_map.len();
+            let mut files = Vec::new();
+            for (path, agg) in agg_map.into_iter().take(STATUS_MAX) {
+                files.push(json!({
+                    "path": path,
+                    "status": agg.status,
+                    "diff": agg.diff,
+                    "added": agg.added,
+                    "deleted": agg.deleted,
+                    "binary": agg.binary,
+                    "size": Value::Null,
+                    "untracked": false,
+                    "staged": false,
+                }));
+            }
+
+            Ok(json!({
+                "repo": repo,
+                "mode": "commits",
+                "branch": branch,
+                "commits": commits_json,
+                "contiguous": false,
+                "baseRev": Value::Null,
+                "endRev": Value::Null,
+                "total": if only.is_none() && total > files.len() { Some(total) } else { None },
+                "files": files,
+            }))
+        }
+        "range" => {
+            let raw = params["range"].as_str().unwrap_or("").trim();
+            if raw.is_empty() {
+                return Ok(json!({
+                    "repo": repo,
+                    "mode": "range",
+                    "branch": branch,
+                    "rangeExpr": "",
+                    "files": [],
+                }));
+            }
+            let err_res = |msg: String| {
+                Ok(json!({
+                    "repo": repo,
+                    "mode": "range",
+                    "branch": branch,
+                    "rangeExpr": raw,
+                    "files": [],
+                    "error": msg,
+                }))
+            };
+            if raw.len() > 256 || raw.starts_with('-') {
+                return err_res(format!("范围表达式无效: {raw}"));
+            }
+            let (base_oid, end_oid) = if let Some((left, right)) = raw.split_once("...") {
+                let right = if right.is_empty() { "HEAD" } else { right };
+                if left.is_empty() || !is_safe_ref_token(left) || !is_safe_ref_token(right) {
+                    return err_res(format!("范围表达式无效: {raw}"));
+                }
+                let Ok(l_oid) = git_ok(&root, &["rev-parse", "--verify", "-q", &format!("{left}^{{commit}}")]) else {
+                    return err_res(format!("找不到分支或提交: {left}"));
+                };
+                let Ok(r_oid) = git_ok(&root, &["rev-parse", "--verify", "-q", &format!("{right}^{{commit}}")]) else {
+                    return err_res(format!("找不到分支或提交: {right}"));
+                };
+                let l_oid = l_oid.trim().to_string();
+                let r_oid = r_oid.trim().to_string();
+                let Ok(mb) = git_ok(&root, &["merge-base", &l_oid, &r_oid]) else {
+                    return err_res("两个分支没有共同祖先".to_string());
+                };
+                (mb.trim().to_string(), r_oid)
+            } else if let Some((left, right)) = raw.split_once("..") {
+                let right = if right.is_empty() { "HEAD" } else { right };
+                if left.is_empty() || right.contains("..") || !is_safe_ref_token(left) || !is_safe_ref_token(right) {
+                    return err_res(format!("范围表达式无效: {raw}"));
+                }
+                let Ok(l_oid) = git_ok(&root, &["rev-parse", "--verify", "-q", &format!("{left}^{{commit}}")]) else {
+                    return err_res(format!("找不到分支或提交: {left}"));
+                };
+                let Ok(r_oid) = git_ok(&root, &["rev-parse", "--verify", "-q", &format!("{right}^{{commit}}")]) else {
+                    return err_res(format!("找不到分支或提交: {right}"));
+                };
+                (l_oid.trim().to_string(), r_oid.trim().to_string())
+            } else {
+                if !is_safe_ref_token(raw) {
+                    return err_res(format!("范围表达式无效: {raw}"));
+                }
+                let Ok(end_oid) = git_ok(&root, &["rev-parse", "--verify", "-q", &format!("{raw}^{{commit}}")]) else {
+                    return err_res(format!("找不到提交: {raw}"));
+                };
+                let end_oid = end_oid.trim().to_string();
+                let base_oid = match git_ok(&root, &["rev-parse", "--verify", "-q", &format!("{end_oid}^1")]) {
+                    Ok(p) => p.trim().to_string(),
+                    Err(_) => empty_tree_oid(&root)?,
+                };
+                (base_oid, end_oid)
+            };
+
+            let (total, files) = diff_two_revs(&root, &base_oid, &end_oid, with_diff, only.as_deref())?;
+            let commit_count = rev_commit_count(&root, &base_oid, &end_oid);
+            Ok(json!({
+                "repo": repo,
+                "mode": "range",
+                "branch": branch,
+                "rangeExpr": raw,
+                "baseRev": base_oid,
+                "endRev": end_oid,
+                "commitCount": commit_count,
+                "total": total,
+                "files": files,
+            }))
+        }
+        _ => bail!("不支持的审阅范围模式: {mode}"),
+    }
 }
 
 /// RAII guard for a temporary `GIT_INDEX_FILE` so checkpoints never touch the repository's real `.git/index`
@@ -1511,5 +2351,206 @@ mod tests {
         delete_session_checkpoints(&cwd, "s1");
         assert!(!git(&repo, &["rev-parse", "--verify", "-q", r_base]).unwrap().status.success());
         assert!(!git(&repo, &["rev-parse", "--verify", "-q", r_end]).unwrap().status.success());
+    }
+
+    #[test]
+    fn branches_includes_remote_and_excludes_remote_head() {
+        let d = tempfile::tempdir().unwrap();
+        let remote = d.path().join("remote.git");
+        let repo = d.path().join("repo");
+        std::fs::create_dir_all(&remote).unwrap();
+        std::fs::create_dir_all(&repo).unwrap();
+        assert!(git(&remote, &["init", "--bare", "-q"]).unwrap().status.success());
+        let run = |a: &[&str]| assert!(git(&repo, a).unwrap().status.success(), "{a:?}");
+        run(&["init", "-q", "-b", "main"]);
+        run(&["config", "user.email", "t@t"]);
+        run(&["config", "user.name", "t"]);
+        run(&["remote", "add", "origin", &remote.to_string_lossy()]);
+        std::fs::write(repo.join("a.txt"), "1\n").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-qm", "init"]);
+        let cwd = repo.to_string_lossy().to_string();
+        push(&cwd, Some("origin"), Some("main"), true).unwrap();
+        run(&["checkout", "-qb", "release/1.0"]);
+        push(&cwd, Some("origin"), Some("release/1.0"), true).unwrap();
+        run(&["remote", "set-head", "origin", "main"]);
+
+        let br = branches(&cwd).unwrap();
+        let remotes: Vec<&str> = br["remoteBranches"].as_array().unwrap().iter().filter_map(|v| v.as_str()).collect();
+        assert!(remotes.contains(&"origin/main"), "{remotes:?}");
+        assert!(remotes.contains(&"origin/release/1.0"), "{remotes:?}");
+        assert!(!remotes.contains(&"origin/HEAD"), "{remotes:?}");
+    }
+
+    #[test]
+    fn log_with_searches_subject_author_and_hash() {
+        let d = tempfile::tempdir().unwrap();
+        let repo = d.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let run = |a: &[&str]| assert!(git(&repo, a).unwrap().status.success(), "{a:?}");
+        run(&["init", "-q", "-b", "main"]);
+        run(&["config", "user.email", "alice@example.com"]);
+        run(&["config", "user.name", "Alice"]);
+        std::fs::write(repo.join("a.txt"), "1\n").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-qm", "alpha init"]);
+        let first_hash = git_ok(&repo, &["rev-parse", "HEAD"]).unwrap().trim().to_string();
+
+        run(&["config", "user.name", "Bob"]);
+        std::fs::write(repo.join("a.txt"), "2\n").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-qm", "keepalive pool suffix"]);
+
+        let cwd = repo.to_string_lossy().to_string();
+        let by_subj = log_with(&cwd, 0, 20, Some("KEEPALIVE")).unwrap();
+        let c1 = by_subj["commits"].as_array().unwrap();
+        assert_eq!(c1.len(), 1);
+        assert_eq!(c1[0]["subject"], "keepalive pool suffix");
+
+        let by_author = log_with(&cwd, 0, 20, Some("alice")).unwrap();
+        let c2 = by_author["commits"].as_array().unwrap();
+        assert_eq!(c2.len(), 1);
+        assert_eq!(c2[0]["hash"], first_hash);
+
+        let by_hash = log_with(&cwd, 0, 20, Some(&first_hash[..7])).unwrap();
+        let c3 = by_hash["commits"].as_array().unwrap();
+        assert_eq!(c3.len(), 1);
+        assert_eq!(c3[0]["hash"], first_hash);
+    }
+
+    #[test]
+    fn review_scope_covers_all_modes_and_safety() {
+        let d = tempfile::tempdir().unwrap();
+        let repo = d.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let run = |a: &[&str]| assert!(git(&repo, a).unwrap().status.success(), "{a:?}");
+        run(&["init", "-q", "-b", "main"]);
+        run(&["config", "user.email", "t@t"]);
+        run(&["config", "user.name", "t"]);
+        run(&["config", "core.autocrlf", "false"]);
+
+        // c1 (root) on main
+        std::fs::write(repo.join("base.txt"), "v1\n").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-qm", "c1 root"]);
+        let c1 = git_ok(&repo, &["rev-parse", "HEAD"]).unwrap().trim().to_string();
+
+        // Branch feat from main with commits c2, c3, c4
+        run(&["checkout", "-qb", "feat"]);
+        std::fs::write(repo.join("f1.txt"), "line1\nline2\n").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-qm", "c2 add f1"]);
+        let c2 = git_ok(&repo, &["rev-parse", "HEAD"]).unwrap().trim().to_string();
+
+        std::fs::write(repo.join("f2.txt"), "hello\n").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-qm", "c3 add f2"]);
+        let c3 = git_ok(&repo, &["rev-parse", "HEAD"]).unwrap().trim().to_string();
+
+        std::fs::write(repo.join("f1.txt"), "line1\nline2\nline3\n").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-qm", "c4 edit f1"]);
+        let c4 = git_ok(&repo, &["rev-parse", "HEAD"]).unwrap().trim().to_string();
+
+        // Second non-HEAD branch other
+        run(&["checkout", "-qb", "other", "main"]);
+        std::fs::write(repo.join("other.txt"), "o1\n").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-qm", "other c"]);
+        run(&["checkout", "-q", "feat"]);
+
+        // Working tree uncommitted changes: staged edit, unstaged edit, untracked text & binary
+        std::fs::write(repo.join("base.txt"), "v1-staged\n").unwrap();
+        run(&["add", "base.txt"]);
+        std::fs::write(repo.join("f2.txt"), "hello-dirty\n").unwrap();
+        std::fs::write(repo.join("untracked.txt"), "u1\nu2\n").unwrap();
+        std::fs::write(repo.join("bin.dat"), [0u8, 1, 2, 3]).unwrap();
+
+        let cwd = repo.to_string_lossy().to_string();
+
+        // 1. Uncommitted: all vs tracked vs staged
+        let u_all = review_scope(&cwd, &json!({ "mode": "uncommitted", "uncommittedFilter": "all" })).unwrap();
+        assert_eq!(u_all["counts"], json!({ "all": 4, "tracked": 2, "staged": 1 }));
+        let af = u_all["files"].as_array().unwrap();
+        assert_eq!(af.len(), 4);
+        let bin = af.iter().find(|f| f["path"] == "bin.dat").unwrap();
+        assert_eq!(bin["binary"], true);
+        assert_eq!(bin["untracked"], true);
+        assert_eq!(bin["size"].as_u64(), Some(4));
+
+        let u_tracked = review_scope(&cwd, &json!({ "mode": "uncommitted", "uncommittedFilter": "tracked" })).unwrap();
+        assert_eq!(u_tracked["files"].as_array().unwrap().len(), 2);
+
+        let u_staged = review_scope(&cwd, &json!({ "mode": "uncommitted", "uncommittedFilter": "staged" })).unwrap();
+        let sf = u_staged["files"].as_array().unwrap();
+        assert_eq!(sf.len(), 1);
+        assert_eq!(sf[0]["path"], "base.txt");
+        assert_eq!(sf[0]["staged"], true);
+
+        // 2. Branch compare: pure (exclude uncommitted), includeUncommitted on HEAD, non-HEAD target
+        let b_pure = review_scope(&cwd, &json!({ "mode": "branch", "base": "main", "target": "feat", "includeUncommitted": false })).unwrap();
+        assert_eq!(b_pure["targetIsHead"], true);
+        assert_eq!(b_pure["includeUncommitted"], false);
+        assert_eq!(b_pure["baseRev"], c1);
+        assert_eq!(b_pure["endRev"], c4);
+        assert_eq!(b_pure["commitCount"], 3);
+        let bf_pure: Vec<&str> = b_pure["files"].as_array().unwrap().iter().filter_map(|f| f["path"].as_str()).collect();
+        assert_eq!(bf_pure, vec!["f1.txt", "f2.txt"]);
+
+        let b_dirty = review_scope(&cwd, &json!({ "mode": "branch", "base": "main", "target": "feat", "includeUncommitted": true })).unwrap();
+        assert_eq!(b_dirty["includeUncommitted"], true);
+        assert!(b_dirty["endRev"].is_null());
+        let bf_dirty: Vec<&str> = b_dirty["files"].as_array().unwrap().iter().filter_map(|f| f["path"].as_str()).collect();
+        assert_eq!(bf_dirty, vec!["base.txt", "bin.dat", "f1.txt", "f2.txt", "untracked.txt"]);
+
+        // Non-HEAD target ignores includeUncommitted
+        let b_other = review_scope(&cwd, &json!({ "mode": "branch", "base": "main", "target": "other", "includeUncommitted": true })).unwrap();
+        assert_eq!(b_other["targetIsHead"], false);
+        assert_eq!(b_other["includeUncommitted"], false);
+        let bf_other: Vec<&str> = b_other["files"].as_array().unwrap().iter().filter_map(|f| f["path"].as_str()).collect();
+        assert_eq!(bf_other, vec!["other.txt"]);
+
+        // 3. Commits: root commit, contiguous chain, non-contiguous, invalid
+        let cm_root = review_scope(&cwd, &json!({ "mode": "commits", "commits": [c1] })).unwrap();
+        assert_eq!(cm_root["contiguous"], true);
+        assert_eq!(cm_root["files"].as_array().unwrap()[0]["path"], "base.txt");
+
+        let cm_contig = review_scope(&cwd, &json!({ "mode": "commits", "commits": [c4, c3] })).unwrap();
+        assert_eq!(cm_contig["contiguous"], true);
+        assert_eq!(cm_contig["baseRev"], c2);
+        assert_eq!(cm_contig["endRev"], c4);
+        let cf_contig: Vec<&str> = cm_contig["files"].as_array().unwrap().iter().filter_map(|f| f["path"].as_str()).collect();
+        assert_eq!(cf_contig, vec!["f1.txt", "f2.txt"]);
+
+        let cm_gap = review_scope(&cwd, &json!({ "mode": "commits", "commits": [c4, c2] })).unwrap();
+        assert_eq!(cm_gap["contiguous"], false);
+        assert!(cm_gap["baseRev"].is_null());
+        let f1 = cm_gap["files"].as_array().unwrap().iter().find(|f| f["path"] == "f1.txt").unwrap();
+        assert_eq!(f1["status"], "A");
+        assert_eq!(f1["added"], 3);
+
+        let cm_bad = review_scope(&cwd, &json!({ "mode": "commits", "commits": ["deadbeef9999"] })).unwrap();
+        assert!(cm_bad["error"].as_str().is_some());
+
+        // 4. Range: A..B, A...B, single ref, diff=true with paths, injection safety
+        let r_dot2 = review_scope(&cwd, &json!({ "mode": "range", "range": format!("{c2}..{c4}"), "diff": true, "paths": ["f1.txt"] })).unwrap();
+        assert_eq!(r_dot2["baseRev"], c2);
+        assert_eq!(r_dot2["endRev"], c4);
+        assert_eq!(r_dot2["commitCount"], 2);
+        assert_eq!(r_dot2["files"].as_array().unwrap().len(), 1);
+        assert!(r_dot2["files"][0]["diff"].as_str().unwrap().contains("+line3"));
+
+        let r_dot3 = review_scope(&cwd, &json!({ "mode": "range", "range": "main...other" })).unwrap();
+        assert_eq!(r_dot3["baseRev"], c1);
+        assert_eq!(r_dot3["files"].as_array().unwrap()[0]["path"], "other.txt");
+
+        let r_single = review_scope(&cwd, &json!({ "mode": "range", "range": &c3 })).unwrap();
+        assert_eq!(r_single["baseRev"], c2);
+        assert_eq!(r_single["endRev"], c3);
+
+        let r_bad1 = review_scope(&cwd, &json!({ "mode": "range", "range": "--output=evil" })).unwrap();
+        assert!(r_bad1["error"].as_str().is_some());
+        let r_bad2 = review_scope(&cwd, &json!({ "mode": "range", "range": "HEAD; rm -rf" })).unwrap();
+        assert!(r_bad2["error"].as_str().is_some());
     }
 }

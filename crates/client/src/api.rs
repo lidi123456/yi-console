@@ -64,6 +64,7 @@ const BULK_METHODS: &[&str] = &[
     "git.blob",
     "git.branchDiff",
     "git.refDiff",
+    "git.reviewScope",
 ];
 
 /// The local host's id (the daemon on this machine)

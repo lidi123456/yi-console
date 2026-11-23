@@ -723,7 +723,8 @@ pub async fn dispatch(
             let cwd = s(&p, "cwd")?.to_string();
             let skip = p["skip"].as_u64().unwrap_or(0) as usize;
             let limit = p["limit"].as_u64().unwrap_or(50).clamp(1, 500) as usize;
-            tokio::task::spawn_blocking(move || crate::gitops::log(&cwd, skip, limit)).await??
+            let query = p["query"].as_str().map(str::to_string);
+            tokio::task::spawn_blocking(move || crate::gitops::log_with(&cwd, skip, limit, query.as_deref())).await??
         }
         GIT_SHOW => {
             let cwd = s(&p, "cwd")?.to_string();
@@ -773,6 +774,11 @@ pub async fn dispatch(
             let with_diff = p["diff"].as_bool().unwrap_or(true);
             let only: Option<Vec<String>> = p["paths"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect());
             tokio::task::spawn_blocking(move || crate::gitops::ref_diff(&cwd, &base_ref, &end_ref, with_diff, only.as_deref())).await??
+        }
+        GIT_REVIEW_SCOPE => {
+            let cwd = s(&p, "cwd")?.to_string();
+            let params = p.clone();
+            tokio::task::spawn_blocking(move || crate::gitops::review_scope(&cwd, &params)).await??
         }
         FS_SEARCH => {
             let root = s(&p, "root")?.to_string();

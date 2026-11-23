@@ -20,7 +20,7 @@ import { BrowserPane, isWebTab, WEB_PREFIX, webTabFile, webTabTitle } from './Br
 import { AI_PREFIX, aiTabSession, AiBrowserPane, isAiTab, useAiBrowserBusy } from './AiBrowser';
 import { registerWebTabs } from './NativeWeb';
 import { canUseBrowser } from '../browserUse';
-import { CommitDetails, GitHistory, isCommitTab, parseCommitTab } from './GitHistory';
+import { CommitDetails, commitRangeTab, commitTab, GitHistory, isCommitTab, parseCommitTab } from './GitHistory';
 import { BranchWorktreePopover, CommitDialog, type BranchesResult, type WorktreeEntry, type WorktreesResult } from './GitOpsDialogs';
 import {
   deleteReviewMeta,
@@ -28,6 +28,7 @@ import {
   isReviewTab,
   REVIEW_PREFIX,
   ReviewLaunchDialog,
+  type ReviewLaunchPreset,
   ReviewPane,
   reviewTabSession,
 } from './ReviewTab';
@@ -75,8 +76,8 @@ interface OpenFile {
   pdf?: string;
   /** Browser tab (path is web:url) */
   web?: boolean;
-  /** A file in a commit (path is git:<hash>:<rel>): read-only diff against the commit's first parent */
-  commit?: { hash: string; rel: string; subject: string; message: string; author: string; time: number; status: string; diff: string };
+  /** A file in a commit or commit range (path is git:<hash>:<rel> or git:<base>..<end>:<rel>): read-only diff */
+  commit?: { hash: string; baseHash?: string; rel: string; subject: string; message: string; author: string; time: number; status: string; diff: string };
   /** Untitled tab (path is untitled:Untitled-N): not on disk yet; saving asks for a path */
   untitled?: boolean;
   /** Cross-tool read-only code review tab (path is review:<sessionId>) */
@@ -227,10 +228,11 @@ const parentOf = (p: string) => {
 };
 const baseName = (p: string) => p.slice(Math.max(p.lastIndexOf('/'), p.lastIndexOf('\\')) + 1);
 const extOf = (name: string) => (name.includes('.') ? name.slice(name.lastIndexOf('.') + 1).toLowerCase() : '');
-/** Title of a commit file tab: "name @abc1234"; null if t isn't one */
+/** Title of a commit or commit-range file tab: "name @abc1234" or "name @abc1234..def5678"; null if t isn't one */
 const commitTabLabel = (t: string) => {
   const c = parseCommitTab(t);
-  return c ? `${baseName(c.rel)} @${c.hash.slice(0, 7)}` : null;
+  if (!c) return null;
+  return c.baseHash ? `${baseName(c.rel)} @${c.baseHash.slice(0, 7)}..${c.hash.slice(0, 7)}` : `${baseName(c.rel)} @${c.hash.slice(0, 7)}`;
 };
 
 const IMAGE_MIME: Record<string, string> = {
@@ -663,7 +665,7 @@ export function FilePanel({
   const [bwOpen, setBwOpen] = useState(false);
   const bwBtnRef = useRef<HTMLButtonElement>(null);
   const [commitOpen, setCommitOpen] = useState(false);
-  const [reviewOpen, setReviewOpen] = useState(false);
+  const [reviewPreset, setReviewPreset] = useState<ReviewLaunchPreset | null>(null);
   const [pushing, setPushing] = useState(false);
   const [view, setView] = useState<'all' | 'changes' | 'search'>(() => lsGet(viewKey, 'all'));
   const [showDiff, setShowDiff] = useState(false);
@@ -935,8 +937,8 @@ export function FilePanel({
   // With a cached status this is a background refresh: nothing changes on screen unless the status did
   useEffect(() => loadGit(gitCache.has(gitKey(hostId, cwd))), [loadGit]);
   useEffect(() => {
-    if (git && (diffScope === 'branch' || reviewOpen)) loadBranchDiff();
-  }, [git, diffScope, branchBase, reviewOpen, loadBranchDiff]);
+    if (git && (diffScope === 'branch' || reviewPreset !== null)) loadBranchDiff();
+  }, [git, diffScope, branchBase, reviewPreset, loadBranchDiff]);
   useEffect(() => {
     if (diffScope === 'turn') {
       if (!activeTurnCkpt?.endRef) {
@@ -948,8 +950,8 @@ export function FilePanel({
     }
   }, [git, diffScope, activeTurnCkpt?.baseRef, activeTurnCkpt?.endRef, loadTurnDiff]);
   useEffect(() => {
-    if (git && (commitOpen || view === 'changes')) void loadBranches();
-  }, [git?.branch, commitOpen, view, loadBranches]); // eslint-disable-line react-hooks/exhaustive-deps
+    if (git && (commitOpen || reviewPreset !== null || view === 'changes')) void loadBranches();
+  }, [git?.branch, commitOpen, reviewPreset, view, loadBranches]); // eslint-disable-line react-hooks/exhaustive-deps
   // Commits made by the AI in a terminal or files changed by other programs aren't caught by the end-of-turn refresh: check again when the window regains focus and every 10 s (while visible)
   useEffect(() => {
     const tick = () => document.visibilityState === 'visible' && loadGit(true);
@@ -1015,6 +1017,19 @@ export function FilePanel({
     const ct = parseCommitTab(path);
     if (ct) {
       try {
+        if (ct.baseHash) {
+          const r = await rpc<{ files: { path: string; status: string; diff: string }[] }>(hostId, 'git.reviewScope', {
+            cwd,
+            mode: 'range',
+            range: `${ct.baseHash}..${ct.hash}`,
+            diff: true,
+            paths: [ct.rel],
+          });
+          const f = r.files.find((x) => x.path === ct.rel);
+          const rangeLabel = `${ct.baseHash.slice(0, 7)}..${ct.hash.slice(0, 7)}`;
+          const commit = { hash: ct.hash, baseHash: ct.baseHash, rel: ct.rel, subject: rangeLabel, message: '', author: '', time: 0, status: f?.status ?? '', diff: f?.diff ?? '' };
+          return { path, content: '', draft: '', binary: true, truncated: false, size: 0, modified: 0, rev: Date.now(), commit };
+        }
         const r = await rpc<{ hash: string; author: string; time: number; message: string; files: { path: string; status: string; diff: string }[] }>(hostId, 'git.show', {
           cwd,
           hash: ct.hash,
@@ -2368,7 +2383,7 @@ export function FilePanel({
   const blobSpecs: [string, string][] = !file
     ? []
     : file.commit
-      ? [[`${file.commit.hash}^`, file.commit.rel], [file.commit.hash, file.commit.rel]]
+      ? [[file.commit.baseHash ?? `${file.commit.hash}^`, file.commit.rel], [file.commit.hash, file.commit.rel]]
       : viewing === 'diff' && curGit && isTurnSnapshot
         ? [[diffBaseRev, curGit.rel], [diffEndRev, curGit.rel]]
         : viewing === 'diff' && curGit && !file.truncated && (!file.binary || file.deleted)
@@ -2814,7 +2829,15 @@ export function FilePanel({
           </div>
           {/* Independent of git status: shows right away and loads on its own; hidden only once status says this isn't a repo */}
           {view === 'changes' && (!gitReady || git) && (
-            <GitHistory hostId={hostId} cwd={cwd} head={git?.head} selected={file?.path} grow={histGrow} onOpen={(t) => openFile(t)} />
+            <GitHistory
+              hostId={hostId}
+              cwd={cwd}
+              head={git?.head}
+              selected={file?.path}
+              grow={histGrow}
+              onOpen={(t) => openFile(t)}
+              onReviewCommit={standalone ? undefined : (preset) => setReviewPreset(preset)}
+            />
           )}
           {view === 'changes' && git && (
             <div className="wp-git-dock">
@@ -2826,7 +2849,7 @@ export function FilePanel({
                       <span>{tx('commitCount', { n: commitFiles.length })}</span>
                     </button>
                     {!standalone && (
-                      <button type="button" className="wp-dock-btn ai" title={tx('crossToolReviewTitle')} onClick={() => setReviewOpen(true)}>
+                      <button type="button" className="wp-dock-btn ai" title={tx('crossToolReviewTitle')} onClick={() => setReviewPreset({})}>
                         <Icon name="sparkles" size={13} />
                         <span>{tx('reviewBtn')}</span>
                       </button>
@@ -2844,7 +2867,7 @@ export function FilePanel({
                 ) : (
                   <>
                     {!standalone && (
-                      <button type="button" className="wp-dock-btn ai" title={tx('crossToolReviewTitle')} onClick={() => setReviewOpen(true)}>
+                      <button type="button" className="wp-dock-btn ai" title={tx('crossToolReviewTitle')} onClick={() => setReviewPreset({})}>
                         <Icon name="sparkles" size={13} />
                         <span>{tx('reviewBtn')}</span>
                       </button>
@@ -2922,7 +2945,23 @@ export function FilePanel({
       reviewSessionId={reviewTabSession(file.path)}
       parentSessionId={sessionId}
       onOpenFile={(relPath, line) => {
-        const abs = git ? join(git.repo, relPath.split('/').join(sepOf(git.repo))) : relOpen(relPath);
+        const cleanRel = relPath.replace(/\\/g, '/').replace(/^\.\//, '');
+        const rmeta = getReviewMeta(reviewTabSession(file.path));
+        if (rmeta?.scope === 'commits' && rmeta.commits?.length === 1) {
+          void openFile(commitTab(rmeta.commits[0], cleanRel), true, line ? { line } : undefined);
+          return;
+        }
+        if (rmeta?.baseRev && rmeta?.endRev) {
+          void openFile(commitRangeTab(rmeta.baseRev, rmeta.endRev, cleanRel), true, line ? { line } : undefined);
+          return;
+        }
+        if (rmeta?.scope === 'uncommitted') {
+          setDiffScope('uncommitted');
+        } else if (rmeta?.scope === 'branch' && rmeta.includeUncommitted && rmeta.base) {
+          setBranchBase(rmeta.base);
+          setDiffScope('branch');
+        }
+        const abs = git ? join(git.repo, cleanRel.split('/').join(sepOf(git.repo))) : relOpen(cleanRel);
         void openFile(abs, true, line ? { line } : undefined);
       }}
     />
@@ -3197,7 +3236,7 @@ export function FilePanel({
                     role="tab"
                     aria-selected={cur}
                     className={`wp-ftab ${cur ? 'active' : ''}`}
-                    title={`${ct.rel}\n${tx('commit')} ${ct.hash.slice(0, 10)}${cur && file.commit ? ` · ${file.commit.subject}` : ''}`}
+                    title={`${ct.rel}\n${ct.baseHash ? `${tx('reviewRangeReadOnly')} ${ct.baseHash.slice(0, 7)}..${ct.hash.slice(0, 7)}` : `${tx('commit')} ${ct.hash.slice(0, 10)}`}${cur && file.commit && !file.commit.baseHash ? ` · ${file.commit.subject}` : ''}`}
                     onClick={() => openFile(t)}
                     onAuxClick={(e) => e.button === 1 && closeTab(t)}
                     onContextMenu={(e) =>
@@ -3205,13 +3244,13 @@ export function FilePanel({
                         { label: tx('close'), icon: 'x', run: () => closeTab(t) },
                         ...closeItems(t),
                         '-',
-                        { label: tx('copyCommitHash'), icon: 'copy', run: () => copy(ct.hash, tx('commitHashCopied')) },
+                        { label: tx('copyCommitHash'), icon: 'copy', run: () => copy(ct.baseHash ? `${ct.baseHash}..${ct.hash}` : ct.hash, tx('commitHashCopied')) },
                       ])
                     }
                   >
                     <Icon name="diff" size={13} />
                     <span className="truncate">{baseName(ct.rel)}</span>
-                    <span className="wp-ftab-hash">{ct.hash.slice(0, 7)}</span>
+                    <span className="wp-ftab-hash">{ct.baseHash ? `${ct.baseHash.slice(0, 7)}..${ct.hash.slice(0, 7)}` : ct.hash.slice(0, 7)}</span>
                     <button
                       className="wp-ftab-x"
                       title={tx('close')}
@@ -3371,19 +3410,28 @@ export function FilePanel({
 
       {file?.commit && (
         <div className="wp-head">
-          <button
-            className="wp-commit-title truncate"
-            aria-expanded={commitInfo}
-            title={tx('showCommitDetails')}
-            onClick={() => setCommitInfo(!commitInfo)}
-          >
-            <span className="pd-tag">{file.commit.hash.slice(0, 7)}</span>
-            <span className="truncate">{file.commit.subject}</span>
-            <span className="muted truncate">{file.commit.rel}</span>
-            <span className={`chev ${commitInfo ? 'open' : ''}`}>
-              <Icon name="chevron" size={12} />
-            </span>
-          </button>
+          {file.commit.baseHash ? (
+            <div className="wp-commit-title truncate" title={tx('reviewRangeReadOnly')}>
+              <span className="pd-tag">
+                {`${file.commit.baseHash.slice(0, 7)}..${file.commit.hash.slice(0, 7)}`}
+              </span>
+              <span className="muted truncate">{file.commit.rel}</span>
+            </div>
+          ) : (
+            <button
+              className="wp-commit-title truncate"
+              aria-expanded={commitInfo}
+              title={tx('showCommitDetails')}
+              onClick={() => setCommitInfo(!commitInfo)}
+            >
+              <span className="pd-tag">{file.commit.hash.slice(0, 7)}</span>
+              <span className="truncate">{file.commit.subject}</span>
+              <span className="muted truncate">{file.commit.rel}</span>
+              <span className={`chev ${commitInfo ? 'open' : ''}`}>
+                <Icon name="chevron" size={12} />
+              </span>
+            </button>
+          )}
           <div className="wp-actions">
             <span className="hide-mobile">{tx('readOnly')}</span>
             {mergeBtns}
@@ -3404,7 +3452,7 @@ export function FilePanel({
           </div>
         </div>
       )}
-      {file?.commit && commitInfo && (
+      {file?.commit && !file.commit.baseHash && commitInfo && (
         <div className="wp-commit-detail">
           <CommitDetails hash={file.commit.hash} author={file.commit.author} time={file.commit.time} message={file.commit.message} />
         </div>
@@ -3576,21 +3624,24 @@ export function FilePanel({
           onClose={() => setCommitOpen(false)}
         />
       )}
-      {reviewOpen && !standalone && git && (
+      {reviewPreset && !standalone && git && (
         <ReviewLaunchDialog
           hostId={hostId}
           cwd={cwd}
           parentSessionId={sessionId}
           currentTool={sessInfo?.tool}
+          currentBranch={git.branch}
+          branchesInfo={branchesInfo}
           defaultScope={diffScope === 'branch' ? 'branch' : 'uncommitted'}
           branchBase={effBranchBase || undefined}
           branchMergeBase={branchDiff?.mergeBase || undefined}
           uncommittedCount={uncommittedKeys.length}
           branchCount={branchKeys.length}
+          preset={reviewPreset}
           onStarted={(rsid) => {
             void openFile(REVIEW_PREFIX + rsid);
           }}
-          onClose={() => setReviewOpen(false)}
+          onClose={() => setReviewPreset(null)}
         />
       )}
       {bwOpen && bwBtnRef.current && git && (

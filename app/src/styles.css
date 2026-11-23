@@ -9386,6 +9386,38 @@ body.resizing-y .wp-hist-split {
   color: var(--text-3);
   white-space: nowrap;
 }
+.wp-commit-review-btn {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 0;
+  height: 20px;
+  padding: 0;
+  margin-left: 0;
+  border: none;
+  border-radius: 5px;
+  background: color-mix(in srgb, var(--link) 12%, var(--panel));
+  color: var(--link);
+  opacity: 0;
+  overflow: hidden;
+  transition: opacity 0.12s ease;
+}
+.wp-commit:hover .wp-commit-review-btn,
+.wp-commit:focus-within .wp-commit-review-btn {
+  width: 22px;
+  margin-left: 4px;
+  border: 1px solid color-mix(in srgb, var(--link) 30%, transparent);
+  opacity: 1;
+}
+.wp-commit-review-btn:hover {
+  background: color-mix(in srgb, var(--link) 20%, var(--panel));
+}
+@media (hover: none) {
+  .wp-commit-review-btn {
+    display: none;
+  }
+}
 .wp-commit-file {
   padding-left: 22px;
 }
@@ -15722,7 +15754,8 @@ button.wp-commit-title .chev {
 /* Commit & Cross-tool Review modals */
 .wp-commit-modal,
 .wp-review-modal {
-  width: min(500px, calc(100vw - 24px));
+  width: min(520px, calc(100vw - 24px));
+  max-height: min(88vh, 760px);
   display: flex;
   flex-direction: column;
   gap: 12px;
@@ -15833,6 +15866,9 @@ button.wp-commit-title .chev {
   display: flex;
   flex-direction: column;
   gap: 12px;
+  min-height: 0;
+  overflow: auto;
+  padding-right: 2px;
 }
 .wp-review-readonly {
   display: flex;
@@ -15871,14 +15907,12 @@ button.wp-commit-title .chev {
   border-color: var(--link);
   box-shadow: 0 0 0 2px var(--focus);
 }
-.wp-review-tools,
-.wp-review-scopes {
+.wp-review-tools {
   display: flex;
   flex-wrap: wrap;
   gap: 6px;
 }
-.wp-review-tool,
-.wp-review-scope {
+.wp-review-tool {
   display: inline-flex;
   align-items: center;
   gap: 6px;
@@ -15889,18 +15923,12 @@ button.wp-commit-title .chev {
   color: var(--text);
   font-size: 12.5px;
 }
-.wp-review-tool:hover:not(:disabled),
-.wp-review-scope:hover:not(:disabled) {
+.wp-review-tool:hover:not(:disabled) {
   border-color: var(--border-2);
 }
-.wp-review-tool.active,
-.wp-review-scope.active {
+.wp-review-tool.active {
   border-color: var(--link);
   background: color-mix(in srgb, var(--link) 10%, var(--panel));
-}
-.wp-review-scope:disabled {
-  opacity: 0.45;
-  cursor: default;
 }
 .wp-review-badge {
   padding: 1px 5px;
@@ -15909,6 +15937,482 @@ button.wp-commit-title .chev {
   color: var(--link);
   font-size: 10.5px;
   font-weight: 500;
+}
+.wp-review-scope-box {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  padding: 10px;
+  border-radius: 9px;
+  border: 1px solid var(--border);
+  background: var(--bg-2);
+}
+.wp-review-scope-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 12.5px;
+}
+.wp-review-scope-top > span:first-child {
+  font-weight: 500;
+  color: var(--text-2);
+}
+.wp-review-mode-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+.wp-review-mode-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 5px 10px;
+  border-radius: 7px;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--text-2);
+  font-size: 12px;
+  font-weight: 500;
+}
+.wp-review-mode-tab:hover:not(:disabled) {
+  border-color: var(--border-2);
+  color: var(--text);
+}
+.wp-review-mode-tab.active {
+  border-color: var(--link);
+  background: color-mix(in srgb, var(--link) 12%, var(--panel));
+  color: var(--link);
+}
+.wp-review-mode-tab:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+.wp-review-count {
+  padding: 0 5px;
+  border-radius: 999px;
+  background: var(--bg-3);
+  color: var(--text-2);
+  font-size: 11px;
+  line-height: 16px;
+  font-weight: 500;
+}
+.wp-review-mode-tab.active .wp-review-count,
+.wp-review-chip.active .wp-review-count {
+  background: color-mix(in srgb, var(--link) 16%, transparent);
+  color: var(--link);
+}
+.wp-review-subfilters {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 5px;
+}
+.wp-review-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 9px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--text-2);
+  font-size: 11.5px;
+}
+.wp-review-chip:hover:not(:disabled) {
+  border-color: var(--border-2);
+  color: var(--text);
+}
+.wp-review-chip.active {
+  border-color: var(--link);
+  background: color-mix(in srgb, var(--link) 11%, var(--panel));
+  color: var(--link);
+}
+.wp-review-chip:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+.wp-review-compare-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.wp-review-ref-btn {
+  flex: 1 1 130px;
+  min-width: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 5px 8px;
+  border-radius: 7px;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--text);
+  font-size: 12px;
+}
+.wp-review-ref-btn:hover,
+.wp-review-ref-btn.active {
+  border-color: var(--link);
+}
+.wp-review-ref-btn > .muted {
+  flex: none;
+  font-size: 11px;
+}
+.wp-review-ref-btn > svg {
+  flex: none;
+  margin-left: auto;
+  color: var(--text-3);
+}
+.wp-review-swap-btn {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  border-radius: 7px;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--text-2);
+}
+.wp-review-swap-btn:hover:not(:disabled) {
+  border-color: var(--border-2);
+  color: var(--text);
+}
+.wp-review-swap-btn:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+.wp-review-uncomm-toggle {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 9px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--text-2);
+  font-size: 11.5px;
+  cursor: pointer;
+}
+.wp-review-uncomm-toggle input[type='checkbox'] {
+  width: 13px;
+  height: 13px;
+  margin: 0;
+  accent-color: var(--link);
+  cursor: pointer;
+}
+.wp-review-uncomm-toggle.active {
+  border-color: var(--link);
+  background: color-mix(in srgb, var(--link) 10%, var(--panel));
+  color: var(--link);
+}
+.wp-review-uncomm-toggle.disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+.wp-review-commit-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.wp-review-commit-sel {
+  flex: 1;
+  min-width: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 9px;
+  border-radius: 7px;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--text);
+  font-size: 12px;
+  text-align: left;
+}
+.wp-review-commit-sel:hover,
+.wp-review-commit-sel.active {
+  border-color: var(--link);
+}
+.wp-review-commit-sel > svg {
+  flex: none;
+  color: var(--text-3);
+}
+.wp-review-add-commit-btn {
+  flex: none;
+  padding: 5px 9px;
+  border-radius: 7px;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--text-2);
+  font-size: 11.5px;
+  white-space: nowrap;
+}
+.wp-review-add-commit-btn:hover,
+.wp-review-add-commit-btn.active {
+  border-color: var(--link);
+  color: var(--link);
+}
+.wp-review-hash-pill {
+  flex: none;
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--link) 14%, transparent);
+  color: var(--link);
+  font-size: 11px;
+}
+.wp-review-commit-chips {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 5px;
+}
+.wp-review-commit-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 6px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--text);
+  font-size: 11px;
+}
+.wp-review-commit-chip button {
+  display: inline-flex;
+  align-items: center;
+  padding: 0;
+  color: var(--text-3);
+}
+.wp-review-commit-chip button:hover {
+  color: var(--text);
+}
+.wp-review-picker {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--border-2);
+  border-radius: 8px;
+  background: var(--panel);
+  overflow: hidden;
+}
+.wp-review-picker-search {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--border);
+  color: var(--text-3);
+}
+.wp-review-picker-search input {
+  flex: 1;
+  min-width: 0;
+  border: none;
+  background: transparent;
+  color: var(--text);
+  font-size: 12px;
+  padding: 0;
+}
+.wp-review-picker-search input:focus {
+  outline: none;
+}
+.wp-review-picker-list {
+  max-height: 170px;
+  overflow: auto;
+  padding: 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.wp-review-picker-sec {
+  padding: 4px 6px 2px;
+  font-size: 10.5px;
+  font-weight: 600;
+  color: var(--text-3);
+}
+.wp-review-picker-row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  width: 100%;
+  padding: 5px 7px;
+  border-radius: 5px;
+  font-size: 12px;
+  color: var(--text);
+  text-align: left;
+}
+.wp-review-picker-row:hover {
+  background: var(--bg-3);
+}
+.wp-review-picker-row.active {
+  background: color-mix(in srgb, var(--link) 10%, var(--panel));
+  color: var(--link);
+}
+.wp-review-picker-time {
+  flex: none;
+  font-size: 11px;
+  color: var(--text-3);
+}
+.wp-review-picker-empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 14px 8px;
+  font-size: 12px;
+  color: var(--text-3);
+}
+.wp-review-picker-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 8px;
+  border-top: 1px solid var(--border);
+  background: var(--bg-2);
+}
+.wp-review-range-box {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.wp-review-range-box input {
+  width: 100%;
+  padding: 6px 9px;
+  border-radius: 7px;
+  border: 1px solid var(--border-2);
+  background: var(--panel);
+  color: var(--text);
+  font-size: 12px;
+}
+.wp-review-range-box input:focus {
+  outline: none;
+  border-color: var(--link);
+  box-shadow: 0 0 0 2px var(--focus);
+}
+.wp-review-range-hints {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+.wp-review-files-box {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 9px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--panel);
+}
+.wp-review-files-msg {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.wp-review-scope-err {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--err);
+  font-size: 12px;
+}
+.wp-review-files-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.wp-review-files-summary {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 12px;
+}
+.wp-review-files-count {
+  font-weight: 500;
+  color: var(--text);
+}
+.wp-review-files-acts {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.wp-review-files-acts .wp-review-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+}
+.wp-review-files-preview {
+  line-height: 1.35;
+}
+.wp-review-file-filter {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 7px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--bg-2);
+  color: var(--text-3);
+}
+.wp-review-file-filter input {
+  flex: 1;
+  min-width: 0;
+  border: none;
+  background: transparent;
+  color: var(--text);
+  font-size: 11.5px;
+  padding: 0;
+}
+.wp-review-file-filter input:focus {
+  outline: none;
+}
+.wp-review-file-list {
+  max-height: 185px;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding-top: 2px;
+}
+.wp-review-file-row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 4px 6px;
+  border-radius: 5px;
+  font-size: 11.5px;
+  cursor: pointer;
+}
+.wp-review-file-row:hover {
+  background: var(--bg-2);
+}
+.wp-review-file-row input[type='checkbox'] {
+  width: 13px;
+  height: 13px;
+  flex: none;
+  margin: 0;
+  accent-color: var(--link);
+  cursor: pointer;
+}
+.wp-review-file-row.excluded {
+  opacity: 0.52;
+}
+.wp-review-excluded-tag,
+.wp-review-bin-tag {
+  flex: none;
+  padding: 0 5px;
+  border-radius: 4px;
+  background: var(--bg-3);
+  color: var(--text-3);
+  font-size: 10.5px;
+  line-height: 16px;
+}
+.wp-review-more-files {
+  align-self: center;
+  margin-top: 3px;
 }
 .wp-review-pane {
   display: flex;

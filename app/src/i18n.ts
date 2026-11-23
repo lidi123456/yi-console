@@ -84,6 +84,12 @@ export function onLangChange(f: () => void): () => void {
 }
 
 const ERR_PATTERNS: [RegExp, string | ((...m: string[]) => string)][] = [
+  [/^未找到可用的基准分支$/, 'No available base branch found'],
+  [/^找不到分支或提交[:：]\s*(.+)$/, (_, r) => `Branch or commit not found: ${r}`],
+  [/^两个分支没有共同祖先$/, 'These two branches have no common ancestor'],
+  [/^找不到提交[:：]\s*(.+)$/, (_, r) => `Commit not found: ${r}`],
+  [/^范围表达式无效[:：]\s*(.+)$/, (_, r) => `Invalid range expression: ${r}`],
+  [/^不支持的审阅范围模式[:：]\s*(.+)$/, (_, m) => `Unsupported review scope mode: ${m}`],
   [/快照引用无效[:：]?\s*(.*)/, (_, r) => (r ? `Invalid checkpoint ref: ${r}` : 'Invalid checkpoint ref')],
   [/这个会话不支持调整模型参数/, 'This session does not support model parameters'],
   [/^ChatGPT 登录已失效（令牌过期且无法刷新），请点击「重新登录」$/, 'The ChatGPT login has expired and its token can no longer be refreshed. Click Re-authenticate'],

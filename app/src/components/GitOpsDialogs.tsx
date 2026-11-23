@@ -39,6 +39,7 @@ export interface BranchesResult {
   current: string | null;
   defaultBranch: string | null;
   branches: BranchEntry[];
+  remoteBranches?: string[];
 }
 
 export interface CommitFileItem {
