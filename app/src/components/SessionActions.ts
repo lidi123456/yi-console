@@ -92,7 +92,7 @@ export async function exportSession(hostId: string, info: SessionInfo, how: 'cop
 export async function handoffSession(hostId: string, info: SessionInfo, opts: { limit?: boolean } = {}) {
   try {
     // The daemon also says whether there's any user message: a session with no conversation yet has nothing to hand off
-    // (the menu already filters most by externalId; this catches ACP sessions created before anything was said, and after /clear).
+    // (the menu already filters most empty sessions; this catches ACP sessions created before anything was said, and after /clear).
     // Older daemons don't send hasUser; skip the check then
     let { path, hasUser } = await rpc<{ path: string | null; hasUser?: boolean }>(hostId, 'session.logFile', { sessionId: info.id });
     if (!path && info.mode === 'terminal') {
@@ -320,6 +320,24 @@ function filesMenu(hostId: string, info: SessionInfo, inSession?: boolean): (Men
   ];
 }
 
+/** Whether "Continue in Another Tool" should appear in the session menu.
+ *  Chat mode: a Level-2 / HostActive account switch or resume fallback clears `externalId` while keeping the session's
+ *  conversation history (`session.logFile` falls back to counting stored user messages and exporting Markdown), whereas a
+ *  fresh or `/clear`-ed session has none of `externalId`, `turn`, `usage` or `promptCount`.
+ *  Terminal mode: the daemon works out the tool session when asked (`session.logFile`); Cursor's and Antigravity's
+ *  sessions have no readable log, and the Markdown export needs our events, which a terminal session doesn't have. */
+export function canHandoffSession(info: SessionInfo, promptCount?: number): boolean {
+  if (info.tool === 'shell' || info.tool === 'files' || info.parentId) return false;
+  if (info.mode === 'structured') {
+    const u = info.usage;
+    const hasUsage =
+      !!u &&
+      (u.inputTokens > 0 || u.outputTokens > 0 || u.cacheReadTokens > 0 || u.cacheWriteTokens > 0 || u.costUsd > 0 || u.credits > 0);
+    return !!(info.externalId || info.turn || hasUsage || (promptCount ?? 0) > 0);
+  }
+  return info.mode === 'terminal' && info.tool !== 'cursor' && info.tool !== 'antigravity';
+}
+
 export function sessionMenu(
   hostId: string,
   info: SessionInfo,
@@ -390,12 +408,7 @@ export function sessionMenu(
           },
         ]
       : []),
-    // Chat mode: no tool session id means nothing has been said yet (or just /clear-ed), so there's nothing to hand off.
-    // Terminal mode: the daemon works out the tool session when asked (session.logFile); Cursor's and Antigravity's
-    // sessions have no readable log, and the Markdown export needs our events, which a terminal session doesn't have
-    ...(info.tool !== 'shell' &&
-    !info.parentId &&
-    (info.mode === 'structured' ? !!info.externalId : info.mode === 'terminal' && info.tool !== 'cursor' && info.tool !== 'antigravity')
+    ...(canHandoffSession(info, opts.promptCount)
       ? [{ label: tx('continueInAnotherTool'), icon: 'forward', run: () => handoffSession(hostId, info) }]
       : []),
     '-',
