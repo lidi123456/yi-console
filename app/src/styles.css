@@ -7994,6 +7994,7 @@ body.resizing .side-resizer::after {
   height: 36px;
   flex: none;
   padding: 0 6px 0 8px;
+  container-type: inline-size;
 }
 .wp-side-head .icon-btn {
   width: 24px;
@@ -8004,18 +8005,27 @@ body.resizing .side-resizer::after {
   color: var(--text);
 }
 .wp-views {
-  display: inline-flex;
+  display: flex;
+  align-items: center;
   gap: 2px;
+  min-width: 0;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+.wp-views::-webkit-scrollbar {
+  display: none;
 }
 .wp-views button {
   height: 24px;
-  padding: 0 8px;
+  padding: 0 7px;
   border-radius: 6px;
   font-size: 12px;
   color: var(--text-3);
   display: inline-flex;
   align-items: center;
-  gap: 5px;
+  gap: 4px;
+  flex: none;
+  white-space: nowrap;
 }
 .wp-views button:hover:not(:disabled) {
   color: var(--text);
@@ -8029,6 +8039,7 @@ body.resizing .side-resizer::after {
   opacity: 0.45;
 }
 .wp-count {
+  flex: none;
   min-width: 16px;
   height: 16px;
   padding: 0 4px;
@@ -8039,6 +8050,20 @@ body.resizing .side-resizer::after {
   background: var(--warn-soft);
   color: var(--warn);
   font-variant-numeric: tabular-nums;
+}
+/* Tighten view tabs & action buttons when the tree column is narrow so English labels and large change counts still fit on one line */
+@container (max-width: 285px) {
+  .wp-views {
+    gap: 1px;
+  }
+  .wp-views button {
+    padding: 0 5px;
+    gap: 3px;
+  }
+  .wp-side-head .icon-btn {
+    width: 22px;
+    height: 22px;
+  }
 }
 .wp-filter {
   height: 28px;
@@ -8216,9 +8241,6 @@ body.resizing .side-resizer::after {
   .file-panel:not(.full) {
     position: absolute;
   }
-}
-.wp-views button {
-  padding: 0 7px;
 }
 
 /* Content search */
@@ -9225,9 +9247,6 @@ body.resizing .wp-merge-sash {
   .file-panel.browse {
     width: auto;
     max-width: none;
-  }
-  .wp-views button {
-    white-space: nowrap;
   }
   .wp-side-head .icon-btn {
     width: 30px;
@@ -16169,7 +16188,7 @@ button.wp-commit-title .chev {
   flex-direction: column;
   background: var(--bg);
 }
-.wp-side-head {
+.wp-side-chat-head {
   gap: 8px;
   padding: 0 10px 0 12px;
 }

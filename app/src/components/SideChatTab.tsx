@@ -125,7 +125,7 @@ export function SideChatPane({
 
   return (
     <div className="wp-side-pane">
-      <div className="wp-head wp-side-head">
+      <div className="wp-head wp-side-chat-head">
         <div className="wp-side-head-left">
           <ToolBadge tool={info.tool} size={15} />
           <button
