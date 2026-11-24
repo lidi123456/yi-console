@@ -14,6 +14,19 @@ export interface Upload {
   total: number;
 }
 
+export interface DraftSnapshot {
+  text: string;
+  imgs: Attached[];
+  refs: ContextRef[];
+}
+
+export interface ReeditState {
+  nonce: number;
+  loadingImages: number;
+  stashedDraft: DraftSnapshot | null;
+  dirty: boolean;
+}
+
 export interface ComposerSnapshot {
   text: string;
   imgs: Attached[];
@@ -22,11 +35,13 @@ export interface ComposerSnapshot {
   uploads: Upload[];
   pendingUploads: number;
   waitSend: boolean;
+  reedit: ReeditState | null;
 }
 
 export interface ComposerHandlers {
   insertAtCaret: (s: string) => void;
   focus: () => void;
+  focusAtEnd?: () => void;
 }
 
 interface ComposerEntry {
@@ -39,12 +54,14 @@ interface ComposerEntry {
   waitSend: boolean;
   waitSendRunner: (() => void) | null;
   cancelledUploads: Set<number>;
+  reedit: ReeditState | null;
   snap: ComposerSnapshot;
 }
 
 const entries = new Map<string, ComposerEntry>();
 const subs = new Map<string, Set<() => void>>();
 const activeHandlers = new Map<string, ComposerHandlers>();
+let reeditNonce = 0;
 
 const draftTextKey = (key: string) => `draft-${key}`;
 const draftRefsKey = (key: string) => `draft-refs-${key}`;
@@ -101,6 +118,7 @@ const EMPTY_SNAPSHOT: ComposerSnapshot = {
   uploads: EMPTY_UPLOADS,
   pendingUploads: 0,
   waitSend: false,
+  reedit: null,
 };
 
 function makeSnapshot(e: ComposerEntry): ComposerSnapshot {
@@ -111,7 +129,8 @@ function makeSnapshot(e: ComposerEntry): ComposerSnapshot {
     !e.sending &&
     !e.uploads.length &&
     e.pendingUploads === 0 &&
-    !e.waitSend
+    !e.waitSend &&
+    !e.reedit
   ) {
     return EMPTY_SNAPSHOT;
   }
@@ -123,6 +142,7 @@ function makeSnapshot(e: ComposerEntry): ComposerSnapshot {
     uploads: e.uploads,
     pendingUploads: e.pendingUploads,
     waitSend: e.waitSend,
+    reedit: e.reedit,
   };
 }
 
@@ -136,7 +156,8 @@ function isEntryIdle(e: ComposerEntry): boolean {
     e.pendingUploads === 0 &&
     !e.waitSend &&
     !e.waitSendRunner &&
-    e.cancelledUploads.size === 0
+    e.cancelledUploads.size === 0 &&
+    !e.reedit
   );
 }
 
@@ -151,6 +172,7 @@ function createEntry(text: string, refs: ContextRef[]): ComposerEntry {
     waitSend: false,
     waitSendRunner: null,
     cancelledUploads: new Set(),
+    reedit: null,
     snap: EMPTY_SNAPSHOT,
   };
   e.snap = makeSnapshot(e);
@@ -203,11 +225,18 @@ export function subscribeComposer(key: string, fn: () => void): () => void {
   };
 }
 
+function markReeditDirty(e: ComposerEntry) {
+  if (e.reedit && !e.reedit.dirty) {
+    e.reedit = { ...e.reedit, dirty: true };
+  }
+}
+
 export function setComposerText(key: string, next: string | ((cur: string) => string)) {
   const e = ensureEntry(key);
   const val = typeof next === 'function' ? next(e.text) : next;
   if (val === e.text) return;
   e.text = val;
+  markReeditDirty(e);
   writeDraftText(key, val);
   notify(key, e);
 }
@@ -222,6 +251,7 @@ export function setComposerImages(key: string, next: Attached[] | ((cur: Attache
   const val = typeof next === 'function' ? next(e.imgs) : next;
   if (val === e.imgs) return;
   e.imgs = val;
+  markReeditDirty(e);
   notify(key, e);
 }
 
@@ -230,6 +260,7 @@ export function setComposerRefs(key: string, next: ContextRef[] | ((cur: Context
   const val = typeof next === 'function' ? next(e.refs) : next;
   if (val === e.refs) return;
   e.refs = val;
+  markReeditDirty(e);
   writeDraftRefs(key, val);
   notify(key, e);
 }
@@ -244,7 +275,7 @@ export function beginSend(key: string): boolean {
 
 export function completeSendSuccess(
   key: string,
-  sent: { sentText: string; sentImgs: readonly Attached[]; sentRefs: readonly ContextRef[] },
+  sent: { sentText: string; sentImgs: readonly Attached[]; sentRefs: readonly ContextRef[]; reeditNonce?: number },
 ) {
   const e = ensureEntry(key);
   if (e.text.trim() === sent.sentText) {
@@ -259,6 +290,9 @@ export function completeSendSuccess(
     const refIds = new Set(sent.sentRefs.map((r) => r.id));
     e.refs = e.refs.filter((r) => !refIds.has(r.id));
     writeDraftRefs(key, e.refs);
+  }
+  if (e.reedit && (sent.reeditNonce === undefined || e.reedit.nonce === sent.reeditNonce)) {
+    e.reedit = null;
   }
   e.sending = false;
   notify(key, e);
@@ -362,6 +396,83 @@ export function focusComposer(key: string) {
   activeHandlers.get(key)?.focus();
 }
 
+export function focusComposerAtEnd(key: string) {
+  const h = activeHandlers.get(key);
+  if (h?.focusAtEnd) h.focusAtEnd();
+  else h?.focus();
+}
+
+export function beginComposerReedit(
+  key: string,
+  payload: { text: string; refs: ContextRef[]; loadingImages?: number },
+): { nonce: number; hasStashedDraft: boolean } {
+  const e = ensureEntry(key);
+  const stashedDraft: DraftSnapshot | null =
+    e.reedit && !e.reedit.dirty
+      ? e.reedit.stashedDraft
+      : e.text.trim() || e.imgs.length > 0 || e.refs.length > 0
+        ? { text: e.text, imgs: [...e.imgs], refs: [...e.refs] }
+        : null;
+  const nonce = ++reeditNonce;
+  e.text = payload.text;
+  e.imgs = [];
+  e.refs = [...payload.refs];
+  e.reedit = {
+    nonce,
+    loadingImages: payload.loadingImages ?? 0,
+    stashedDraft,
+    dirty: false,
+  };
+  writeDraftText(key, e.text);
+  writeDraftRefs(key, e.refs);
+  notify(key, e);
+  return { nonce, hasStashedDraft: stashedDraft !== null };
+}
+
+export function finishReeditImages(key: string, nonce: number, imgs: Attached[]) {
+  const e = entries.get(key);
+  if (!e || !e.reedit || e.reedit.nonce !== nonce) return;
+  if (imgs.length > 0) {
+    e.imgs = [...imgs, ...e.imgs];
+  }
+  e.reedit = { ...e.reedit, loadingImages: 0 };
+  notify(key, e);
+}
+
+export function restoreReeditDraft(key: string, expectedNonce?: number): boolean {
+  const e = entries.get(key);
+  if (!e?.reedit?.stashedDraft) return false;
+  if (expectedNonce !== undefined && e.reedit.nonce !== expectedNonce) return false;
+  const { text, imgs, refs } = e.reedit.stashedDraft;
+  e.text = text;
+  e.imgs = [...imgs];
+  e.refs = [...refs];
+  e.reedit = null;
+  writeDraftText(key, e.text);
+  writeDraftRefs(key, e.refs);
+  notify(key, e);
+  return true;
+}
+
+export function cancelComposerReedit(key: string) {
+  const e = entries.get(key);
+  if (!e?.reedit) return;
+  e.text = '';
+  e.imgs = EMPTY_IMGS;
+  e.refs = EMPTY_REFS;
+  e.reedit = null;
+  writeDraftText(key, '');
+  writeDraftRefs(key, []);
+  notify(key, e);
+}
+
+export function dismissComposerReedit(key: string) {
+  const e = entries.get(key);
+  if (!e?.reedit) return;
+  e.reedit = null;
+  notify(key, e);
+}
+
 export function clearComposerState(key: string) {
   const e = entries.get(key);
   if (!e) {
@@ -371,11 +482,12 @@ export function clearComposerState(key: string) {
   }
   for (const u of e.uploads) e.cancelledUploads.add(u.id);
   e.text = '';
-  e.imgs = [];
-  e.refs = [];
-  e.uploads = [];
+  e.imgs = EMPTY_IMGS;
+  e.refs = EMPTY_REFS;
+  e.uploads = EMPTY_UPLOADS;
   e.waitSend = false;
   e.waitSendRunner = null;
+  e.reedit = null;
   writeDraftText(key, '');
   writeDraftRefs(key, []);
   notify(key, e);
@@ -385,4 +497,5 @@ export function _resetComposerStateForTests() {
   entries.clear();
   subs.clear();
   activeHandlers.clear();
+  reeditNonce = 0;
 }

@@ -5,7 +5,7 @@ import { errorToast, loadOlder, loadSession, registerVisibleChildSession, skey, 
 import { rpc } from '../transport';
 import { TOOL_LABEL, type QuestionAnswer } from '../types';
 import { AsyncAskCard, ChatView, openAsyncAsk, PermissionCard } from './ChatView';
-import { Composer } from './Composer';
+import { Composer, startReeditToComposer } from './Composer';
 import { Icon, ToolBadge } from './Icon';
 import { askConfirm, askText } from './Overlay';
 import { getReviewMeta, ReviewSidePane } from './ReviewTab';
@@ -214,6 +214,7 @@ function RegularSideChatPane({
             onLoadOlder={(targetSeq) => loadOlder(hostId, sideSessionId, targetSeq).catch(errorToast)}
             pendingOutside
             onBringBack={(replyText) => bringSideChatToMain(hostId, parentSessionId, info, replyText)}
+            onReedit={(msg) => startReeditToComposer(hostId, sideSessionId, msg)}
           />
         )}
       </div>

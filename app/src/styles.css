@@ -7331,6 +7331,19 @@ body.resizing .side-resizer::after {
 .msg-user:focus-within .msg-user-actions {
   opacity: 1;
 }
+.msg-user-actions.classic {
+  opacity: 1;
+}
+.msg-user-actions.classic .classic-act {
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.15s;
+}
+.msg-user:hover .msg-user-actions.classic .classic-act,
+.msg-user:focus-within .msg-user-actions.classic .classic-act {
+  opacity: 1;
+  pointer-events: auto;
+}
 .msg-user-actions .msg-time {
   margin: 0 2px 0 0;
   font-variant-numeric: tabular-nums;
@@ -7604,6 +7617,9 @@ body.resizing .side-resizer::after {
   background: var(--bg-3);
   color: var(--text);
 }
+.m-act-btn.copied {
+  color: var(--ok);
+}
 .m-act-meta {
   margin-left: 4px;
   font-variant-numeric: tabular-nums;
@@ -7621,8 +7637,10 @@ body.resizing .side-resizer::after {
 @media (hover: none) {
   .m-actions,
   .msg-user-actions,
+  .msg-user-actions.classic .classic-act,
   .m-act-time {
     opacity: 1;
+    pointer-events: auto;
   }
 }
 
@@ -15251,6 +15269,12 @@ button.wp-commit-title .chev {
   }
   .composer-wrap > .composer-sheets {
     margin: 0 6px -8px;
+  }
+  .chat.modern .msg-user-actions {
+    height: auto;
+    min-height: 28px;
+    margin-top: 4px;
+    margin-bottom: 0;
   }
   .composer {
     border-radius: 14px;

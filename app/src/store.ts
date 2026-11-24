@@ -1,5 +1,5 @@
 import { lsGet, lsSet } from './util';
-import { clearComposerState } from './composerState';
+import { clearComposerState, dismissComposerReedit } from './composerState';
 // Global state: hosts, session list and the current view live in one small store;
 // each session's event stream is stored separately (large, changes often) and subscribers are notified per session.
 
@@ -291,6 +291,7 @@ function addEvents(key: string, evs: HubEvent[]) {
       d.userMessagesLoaded = true;
       d.live.clear();
       d.liveThinking.clear();
+      dismissComposerReedit(key);
     }
     if (addedUsers.length > 0) {
       d.userMessages = mergeUserMessages(d.userMessages, addedUsers, d.clearSeq);
@@ -599,7 +600,7 @@ export function toast(text: string, kind: Toast['kind'] = 'info', action?: Toast
   const t: Toast = { id: toastId++, text, kind, action };
   setState((s) => ({ toasts: [...s.toasts.slice(-3), t] }));
   const close = () => setState((s) => ({ toasts: s.toasts.filter((x) => x.id !== t.id) }));
-  if (kind !== 'loading') setTimeout(close, kind === 'error' ? 8000 : 4000);
+  if (kind !== 'loading') setTimeout(close, kind === 'error' ? 8000 : action ? 6000 : 4000);
   return close;
 }
 

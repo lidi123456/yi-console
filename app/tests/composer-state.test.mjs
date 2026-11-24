@@ -4,18 +4,23 @@ import {
   _resetComposerStateForTests,
   addComposerUpload,
   armWaitSend,
+  beginComposerReedit,
   beginSend,
   beginUploadJob,
+  cancelComposerReedit,
   cancelComposerUpload,
   clearComposerState,
   completeSendSuccess,
+  dismissComposerReedit,
   endSend,
   endUploadJob,
+  finishReeditImages,
   getComposerSnapshot,
   insertOrAppendComposerText,
   isComposerUploadCancelled,
   registerActiveComposer,
   removeComposerUpload,
+  restoreReeditDraft,
   setComposerImages,
   setComposerRefs,
   setComposerText,
@@ -351,5 +356,233 @@ describe('composerState', () => {
     const clearedAfterUnsub = getComposerSnapshot(activeKey);
     assert.equal(clearedBeforeUnsub, clearedAfterUnsub);
     assert.equal(clearedAfterUnsub, snapIdle1);
+  });
+
+  test('re-edit on empty draft sets active state and cancel clears composer', () => {
+    const keyA = 'h1::s1';
+    const ref1 = makeRef('r1', 'ChatView.tsx');
+    const res = beginComposerReedit(keyA, {
+      text: 'fix button',
+      refs: [ref1],
+      loadingImages: 0,
+    });
+    assert.ok(res.nonce > 0);
+    assert.equal(res.hasStashedDraft, false);
+    const snap = getComposerSnapshot(keyA);
+    assert.equal(snap.text, 'fix button');
+    assert.deepEqual(snap.refs, [ref1]);
+    assert.equal(snap.reedit?.nonce, res.nonce);
+    assert.equal(snap.reedit?.stashedDraft, null);
+    assert.equal(storage.get(`draft-${keyA}`), 'fix button');
+
+    cancelComposerReedit(keyA);
+    const afterCancel = getComposerSnapshot(keyA);
+    assert.equal(afterCancel.text, '');
+    assert.deepEqual(afterCancel.imgs, []);
+    assert.deepEqual(afterCancel.refs, []);
+    assert.equal(afterCancel.reedit, null);
+    assert.equal(storage.has(`draft-${keyA}`), false);
+    assert.equal(storage.has(`draft-refs-${keyA}`), false);
+  });
+
+  test('re-edit stashes active draft, preserves it when switching messages, and restores intact', () => {
+    const keyA = 'h1::s1';
+    const draftImg = makeImg('draft.png');
+    const draftRef = makeRef('d1', 'Draft.tsx');
+    const msg1Ref = makeRef('m1', 'One.tsx');
+    const msg2Ref = makeRef('m2', 'Two.tsx');
+
+    setComposerText(keyA, 'unfinished draft');
+    setComposerImages(keyA, [draftImg]);
+    setComposerRefs(keyA, [draftRef]);
+
+    const first = beginComposerReedit(keyA, {
+      text: 'first prompt',
+      refs: [msg1Ref],
+    });
+    assert.equal(first.hasStashedDraft, true);
+    const duringFirst = getComposerSnapshot(keyA);
+    assert.equal(duringFirst.text, 'first prompt');
+    assert.deepEqual(duringFirst.imgs, []);
+    assert.deepEqual(duringFirst.refs, [msg1Ref]);
+    assert.equal(duringFirst.reedit?.stashedDraft?.text, 'unfinished draft');
+    assert.deepEqual(duringFirst.reedit?.stashedDraft?.imgs, [draftImg]);
+    assert.deepEqual(duringFirst.reedit?.stashedDraft?.refs, [draftRef]);
+
+    // Switching straight to another message must keep the original stashed draft
+    const second = beginComposerReedit(keyA, {
+      text: 'second prompt',
+      refs: [msg2Ref],
+    });
+    assert.equal(second.hasStashedDraft, true);
+    const duringSecond = getComposerSnapshot(keyA);
+    assert.equal(duringSecond.text, 'second prompt');
+    assert.equal(duringSecond.reedit?.nonce, second.nonce);
+    assert.equal(duringSecond.reedit?.stashedDraft?.text, 'unfinished draft');
+
+    // Stale toast nonce must not clobber newer re-edit
+    assert.equal(restoreReeditDraft(keyA, first.nonce), false);
+    assert.equal(getComposerSnapshot(keyA).text, 'second prompt');
+
+    assert.equal(restoreReeditDraft(keyA, second.nonce), true);
+    const restored = getComposerSnapshot(keyA);
+    assert.equal(restored.reedit, null);
+    assert.equal(restored.text, 'unfinished draft');
+    assert.deepEqual(restored.imgs, [draftImg]);
+    assert.deepEqual(restored.refs, [draftRef]);
+    assert.equal(storage.get(`draft-${keyA}`), 'unfinished draft');
+    assert.deepEqual(JSON.parse(storage.get(`draft-refs-${keyA}`)), [draftRef]);
+  });
+
+  test('dismissComposerReedit clears reedit state while preserving edited text and refs', () => {
+    const keyA = 'h1::s1';
+    const ref1 = makeRef('r1', 'App.tsx');
+    setComposerText(keyA, 'old draft');
+    beginComposerReedit(keyA, {
+      text: 'old prompt',
+      refs: [ref1],
+    });
+    setComposerText(keyA, 'edited prompt');
+    dismissComposerReedit(keyA);
+    const snap = getComposerSnapshot(keyA);
+    assert.equal(snap.reedit, null);
+    assert.equal(snap.text, 'edited prompt');
+    assert.deepEqual(snap.refs, [ref1]);
+    assert.equal(restoreReeditDraft(keyA), false);
+  });
+
+  test('finishReeditImages respects nonce and blocks stale hydration after cancel, switch, or send', () => {
+    const keyA = 'h1::s1';
+    const img1 = makeImg('hist1.png');
+    const img2 = makeImg('hist2.png');
+
+    const { nonce: n1 } = beginComposerReedit(keyA, {
+      text: 'with image',
+      refs: [],
+      loadingImages: 1,
+    });
+    assert.equal(getComposerSnapshot(keyA).reedit?.loadingImages, 1);
+
+    // Switch to another re-edit before image 1 finishes
+    const { nonce: n2 } = beginComposerReedit(keyA, {
+      text: 'newer prompt',
+      refs: [],
+      loadingImages: 1,
+    });
+    // Stale completion for n1 must be ignored
+    finishReeditImages(keyA, n1, [img1]);
+    assert.deepEqual(getComposerSnapshot(keyA).imgs, []);
+    assert.equal(getComposerSnapshot(keyA).reedit?.loadingImages, 1);
+
+    // Matching completion for n2 attaches image and clears loadingImages
+    finishReeditImages(keyA, n2, [img2]);
+    assert.deepEqual(getComposerSnapshot(keyA).imgs, [img2]);
+    assert.equal(getComposerSnapshot(keyA).reedit?.loadingImages, 0);
+
+    // Cancel clears everything and ignores any subsequent stale image load
+    const { nonce: n3 } = beginComposerReedit(keyA, {
+      text: 'cancelled prompt',
+      refs: [],
+      loadingImages: 1,
+    });
+    cancelComposerReedit(keyA);
+    finishReeditImages(keyA, n3, [img1]);
+    assert.deepEqual(getComposerSnapshot(keyA).imgs, []);
+    assert.equal(getComposerSnapshot(keyA).reedit, null);
+  });
+
+  test('completeSendSuccess clears matching reedit nonce and clearComposerState resets reedit', () => {
+    const keyA = 'h1::s1';
+    const { nonce: n1 } = beginComposerReedit(keyA, {
+      text: 'prompt 20',
+      refs: [],
+    });
+    assert.equal(beginSend(keyA), true);
+
+    // User opens a newer re-edit while previous send is still in flight
+    const { nonce: n2 } = beginComposerReedit(keyA, {
+      text: 'prompt 21',
+      refs: [],
+    });
+
+    completeSendSuccess(keyA, {
+      sentText: 'prompt 20',
+      sentImgs: [],
+      sentRefs: [],
+      reeditNonce: n1,
+    });
+    const afterFirstSend = getComposerSnapshot(keyA);
+    assert.equal(afterFirstSend.reedit?.nonce, n2);
+    assert.equal(afterFirstSend.text, 'prompt 21');
+
+    // Sending n2 clears reedit
+    assert.equal(beginSend(keyA), true);
+    completeSendSuccess(keyA, {
+      sentText: 'prompt 21',
+      sentImgs: [],
+      sentRefs: [],
+      reeditNonce: n2,
+    });
+    assert.equal(getComposerSnapshot(keyA).reedit, null);
+
+    // clearComposerState clears active reedit
+    beginComposerReedit(keyA, {
+      text: 'prompt 22',
+      refs: [],
+    });
+    clearComposerState(keyA);
+    assert.equal(getComposerSnapshot(keyA).reedit, null);
+  });
+
+  test('re-edit dirty tracking skips unchanged re-filled prompts and stashes user-edited content', () => {
+    const keyA = 'h1::s1';
+    const img1 = makeImg('hist.png');
+
+    // Empty composer -> msg #1 (+ async image hydration) -> immediate msg #2 must NOT stash msg #1
+    const res1 = beginComposerReedit(keyA, {
+      text: 'msg 1',
+      refs: [],
+      loadingImages: 1,
+    });
+    assert.equal(res1.hasStashedDraft, false);
+    finishReeditImages(keyA, res1.nonce, [img1]);
+    assert.equal(getComposerSnapshot(keyA).reedit?.dirty, false);
+
+    const res2 = beginComposerReedit(keyA, {
+      text: 'msg 2',
+      refs: [],
+    });
+    assert.equal(res2.hasStashedDraft, false);
+    assert.equal(getComposerSnapshot(keyA).reedit?.stashedDraft, null);
+
+    // User edits the refilled text -> triggering re-edit #3 stashes the edited text
+    setComposerText(keyA, 'edited draft');
+    assert.equal(getComposerSnapshot(keyA).reedit?.dirty, true);
+    const res3 = beginComposerReedit(keyA, {
+      text: 'msg 3',
+      refs: [],
+    });
+    assert.equal(res3.hasStashedDraft, true);
+    assert.equal(getComposerSnapshot(keyA).reedit?.stashedDraft?.text, 'edited draft');
+    assert.equal(restoreReeditDraft(keyA, res3.nonce), true);
+    assert.equal(getComposerSnapshot(keyA).text, 'edited draft');
+
+    // Starting from an existing draft, tweaking a refilled prompt still restores orig draft when undone directly,
+    // or stashes tweaked text if superseded by another re-edit
+    const keyB = 'h1::s2';
+    setComposerText(keyB, 'orig draft');
+    const b1 = beginComposerReedit(keyB, { text: 'prompt A', refs: [] });
+    assert.equal(b1.hasStashedDraft, true);
+    setComposerText(keyB, 'tweaked msg1');
+    assert.equal(restoreReeditDraft(keyB, b1.nonce), true);
+    assert.equal(getComposerSnapshot(keyB).text, 'orig draft');
+
+    const b2 = beginComposerReedit(keyB, { text: 'prompt B', refs: [] });
+    setComposerText(keyB, 'tweaked msg1');
+    const b3 = beginComposerReedit(keyB, { text: 'prompt C', refs: [] });
+    assert.equal(b3.hasStashedDraft, true);
+    assert.notEqual(b2.nonce, b3.nonce);
+    assert.equal(restoreReeditDraft(keyB, b3.nonce), true);
+    assert.equal(getComposerSnapshot(keyB).text, 'tweaked msg1');
   });
 });

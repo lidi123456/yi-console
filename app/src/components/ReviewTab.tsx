@@ -35,7 +35,7 @@ import {
 import { lsGet, lsSet, timeAgo } from '../util';
 import { ChatMarkdown } from './ChatMarkdown';
 import { AsyncAskCard, ChatView, openAsyncAsk, PermissionCard } from './ChatView';
-import { Composer } from './Composer';
+import { Composer, startReeditToComposer } from './Composer';
 import type { BranchesResult } from './GitOpsDialogs';
 import { Icon, ToolBadge } from './Icon';
 import { INSERT_COMPOSER } from './FilePanel';
@@ -1947,6 +1947,7 @@ export function ReviewSidePane({
             onLoadOlder={(targetSeq) => loadOlder(hostId, reviewSessionId, targetSeq).catch(errorToast)}
             pendingOutside
             onBringBack={(replyText) => bringSideChatToMain(hostId, parentSessionId, info, replyText)}
+            onReedit={(msg) => startReeditToComposer(hostId, reviewSessionId, msg)}
           />
         ) : (
           <div className="wp-review-body">

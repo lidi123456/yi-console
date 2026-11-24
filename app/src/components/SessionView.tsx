@@ -21,10 +21,10 @@ import { AsyncAskCard, ChatView, openAsyncAsk, PermissionCard, setChatStyle, use
 import { PlanDock } from './PlanDock';
 import { LimitDock } from './LimitDock';
 import { WorktreeDock } from './WorktreeDock';
-import { Composer, FILE_MAX, restoreToComposer, uploadChunked } from './Composer';
+import { Composer, FILE_MAX, startReeditToComposer, uploadChunked } from './Composer';
 import { extractDroppedEntries, hasExternalFiles, planChatDrop, resolveDroppedLocalPaths } from '../dropFiles';
 import { Icon, ToolBadge } from './Icon';
-import { PromptOutlinePanel, PromptOutlineSheet, PromptStickyBar, PromptTickRail, buildPromptEntries } from './PromptNav';
+import { PromptOutlinePanel, PromptOutlineSheet, PromptStickyBar, PromptTickRail, buildPromptEntries, type PromptEntry } from './PromptNav';
 import { TermTools, TerminalView } from './TerminalView';
 import { StatusLine } from './StatusLine';
 import { BgTasks } from './BgTasks';
@@ -452,9 +452,15 @@ export function SessionView({ hostId, sessionId, seq }: { hostId: string; sessio
 
   const showRail = isChatMode && !mobileViewport && !docked && !files && prompts.length >= 2;
   const outlineActive = docked || outlineMode !== 'none';
-  const refillPrompt = (rawText: string) => {
-    restoreToComposer(sessionId, rawText);
-    toast(tp('refilled'));
+  const refillPrompt = (entry: PromptEntry) => {
+    const ev = data.events.find((e) => e.kind === 'user_message' && e.seq === entry.seq);
+    const images = ev && ev.kind === 'user_message' ? (ev.images ?? []) : [];
+    startReeditToComposer(hostId, sessionId, {
+      seq: entry.seq,
+      ts: entry.ts,
+      rawText: entry.rawText,
+      images,
+    });
   };
 
   if (!info) {
@@ -949,6 +955,7 @@ export function SessionView({ hostId, sessionId, seq }: { hostId: string; sessio
                 pendingOutside
                 skippedAsks={skippedAsks}
                 onOpenTurnDiff={connected ? (turn) => showTurnDiff(hostId, sessionId, turn) : undefined}
+                onReedit={(msg) => startReeditToComposer(hostId, sessionId, msg)}
               />
             </div>
             <div className="composer-wrap">

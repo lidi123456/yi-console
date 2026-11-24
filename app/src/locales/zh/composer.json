@@ -99,5 +99,10 @@
   "aiReviewSourceLabel": "来自 {{source}} 的代码审阅",
   "openReviewSideChat": "打开 AI 审阅旁路",
   "reviewReadonlyModeLocked": "AI 审阅固定为只读模式，不可切换写入权限",
-  "readonlyLockedLabel": "只读已锁定"
+  "readonlyLockedLabel": "只读已锁定",
+  "reeditFilledToast": "已填入输入框",
+  "reeditStashedToast": "已填入输入框，原草稿已暂存",
+  "restoreStashedDraft": "恢复原草稿",
+  "draftRestored": "已恢复原草稿",
+  "waitingForReeditImages": "正在加载历史图片，请稍候"
 }

@@ -100,5 +100,10 @@
   "aiReviewSourceLabel": "Code review by {{source}}",
   "openReviewSideChat": "Open AI review side chat",
   "reviewReadonlyModeLocked": "AI review is locked to read-only mode",
-  "readonlyLockedLabel": "Read-only locked"
+  "readonlyLockedLabel": "Read-only locked",
+  "reeditFilledToast": "Refilled into input",
+  "reeditStashedToast": "Refilled into input; previous draft stashed",
+  "restoreStashedDraft": "Restore draft",
+  "draftRestored": "Draft restored",
+  "waitingForReeditImages": "Loading previous images…"
 }

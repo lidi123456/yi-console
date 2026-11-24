@@ -1283,6 +1283,26 @@ function loadImage(hostId: string, sessionId: string, img: ImageRef) {
   return p;
 }
 
+export interface UserReeditTarget {
+  seq: number;
+  ts: number;
+  rawText: string;
+  images: readonly ImageRef[];
+}
+
+export async function loadSessionImageData(
+  hostId: string,
+  sessionId: string,
+  img: ImageRef,
+): Promise<{ mimeType: string; data: string; url: string }> {
+  const url = await loadImage(hostId, sessionId, img);
+  const comma = url.indexOf(',');
+  const semi = url.indexOf(';');
+  const mimeType = semi > 5 ? url.slice(5, semi) : img.mimeType;
+  const data = comma >= 0 ? url.slice(comma + 1) : '';
+  return { mimeType, data, url };
+}
+
 function MsgImage({ hostId, sessionId, img }: { hostId: string; sessionId: string; img: ImageRef }) {
   const [src, setSrc] = useState<string | null>(null);
   const [failed, setFailed] = useState(false);
@@ -2030,6 +2050,7 @@ export function ChatView({
   skippedAsks,
   onOpenTurnDiff,
   onBringBack,
+  onReedit,
 }: {
   events: HubEvent[];
   live: Map<string, string>;
@@ -2061,9 +2082,27 @@ export function ChatView({
   onOpenTurnDiff?: (turn: number) => void;
   /** Optional "bring back to main chat" action on each completed assistant reply (used inside side chats) */
   onBringBack?: (text: string) => void;
+  /** Refill a past user message (text, context refs, and images) into the session composer for re-editing */
+  onReedit?: (msg: UserReeditTarget) => void;
 }) {
   const hideCompactCmd = info?.tool === 'claude' || info?.tool === 'codex' || info?.tool === 'cursor' || info?.tool === 'antigravity';
   const [, lang] = useLang();
+  const [copiedUserKey, setCopiedUserKey] = useState<string | null>(null);
+  const copyUserTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(
+    () => () => {
+      if (copyUserTimer.current) clearTimeout(copyUserTimer.current);
+    },
+    [],
+  );
+  const copyUserMsg = async (msgKey: string, text: string) => {
+    const ok = await writeClipboard(text);
+    toast(ok ? t('copied') : t('copyFailed'));
+    if (!ok) return;
+    setCopiedUserKey(msgKey);
+    if (copyUserTimer.current) clearTimeout(copyUserTimer.current);
+    copyUserTimer.current = setTimeout(() => setCopiedUserKey(null), 1500);
+  };
   const items = useMemo(() => buildItems(events, hideCompactCmd), [events, events.length, hideCompactCmd, lang]);
   const ckptByEndSeq = useMemo(() => {
     const byEnd = new Map<number, TurnCheckpoint>();
@@ -2414,6 +2453,45 @@ export function ChatView({
               const parsed = parseContextMessage(it.text);
               const followUp = parseFindingFollowUp(parsed.text);
               const shownText = followUp.text;
+              const canReedit = !!onReedit && !!(shownText.trim() || parsed.refs.length > 0 || it.images.length > 0);
+              const isUserCopied = copiedUserKey === it.key;
+              const userActionButtons = (extraCls = '') => (
+                <>
+                  {canReedit && (
+                    <button
+                      type="button"
+                      className={`m-act-btn ${extraCls}`.trim()}
+                      title={t('reeditMessage')}
+                      aria-label={t('reeditMessage')}
+                      onClick={() => onReedit!({ seq: it.seq, ts: it.ts, rawText: it.text, images: it.images })}
+                    >
+                      <Icon name="reply" size={13} />
+                    </button>
+                  )}
+                  {shownText.trim() && (
+                    <>
+                      <button
+                        type="button"
+                        className={`m-act-btn ${isUserCopied ? 'copied' : ''} ${extraCls}`.trim()}
+                        title={isUserCopied ? t('copied') : t('copyMessage')}
+                        aria-label={isUserCopied ? t('copied') : t('copyMessage')}
+                        onClick={() => void copyUserMsg(it.key, shownText)}
+                      >
+                        <Icon name={isUserCopied ? 'check' : 'copy'} size={13} />
+                      </button>
+                      <button
+                        type="button"
+                        className={`m-act-btn mobile-select-btn ${extraCls}`.trim()}
+                        title={t('selectText')}
+                        aria-label={t('selectText')}
+                        onClick={() => setSelectingText(shownText)}
+                      >
+                        <Icon name="text" size={13} />
+                      </button>
+                    </>
+                  )}
+                </>
+              );
               return (
                 <div key={it.key} data-key={it.key} data-prompt-seq={it.seq} className="msg-user">
                   {it.images.length > 0 && hostId && info && (
@@ -2442,30 +2520,13 @@ export function ChatView({
                   {modern ? (
                     <div className="msg-user-actions">
                       <span className="msg-time">{fullTime(it.ts)}</span>
-                      {shownText.trim() && (
-                        <>
-                          <button
-                            className="m-act-btn"
-                            title={t('copyMessage')}
-                            aria-label={t('copyMessage')}
-                            onClick={async () => toast((await writeClipboard(shownText)) ? t('copied') : t('copyFailed'))}
-                          >
-                            <Icon name="copy" size={13} />
-                          </button>
-                          <button
-                            type="button"
-                            className="m-act-btn mobile-select-btn"
-                            title={t('selectText')}
-                            aria-label={t('selectText')}
-                            onClick={() => setSelectingText(shownText)}
-                          >
-                            <Icon name="text" size={13} />
-                          </button>
-                        </>
-                      )}
+                      {userActionButtons()}
                     </div>
                   ) : (
-                    <div className="msg-time">{clock(it.ts)}</div>
+                    <div className="msg-user-actions classic">
+                      <span className="msg-time">{clock(it.ts)}</span>
+                      {userActionButtons('classic-act')}
+                    </div>
                   )}
                 </div>
               );

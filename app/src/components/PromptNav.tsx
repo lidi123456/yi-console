@@ -134,7 +134,7 @@ export function PromptStickyBar({
   onJump: (seq: number) => void;
   onStep: (delta: -1 | 1) => void;
   onToggleOutline: () => void;
-  onRefill: (rawText: string) => void;
+  onRefill: (entry: PromptEntry) => void;
 }) {
   useLang();
   const [expanded, setExpanded] = useState(false);
@@ -315,7 +315,7 @@ export function PromptStickyBar({
                   title={t('refillPrompt')}
                   onClick={() => {
                     setExpanded(false);
-                    onRefill(activePrompt.rawText);
+                    onRefill(activePrompt);
                   }}
                 >
                   <Icon name="reply" size={12} />
@@ -501,7 +501,7 @@ export function PromptOutlinePanel({
   pinned: boolean;
   onJump: (seq: number) => void;
   onStep: (delta: -1 | 1) => void;
-  onRefill: (rawText: string) => void;
+  onRefill: (entry: PromptEntry) => void;
   onTogglePin?: () => void;
   onClose: () => void;
   onLoadOlder?: () => void;
@@ -568,7 +568,7 @@ export function PromptOutlinePanel({
       onSelect={() => pick(p)}
       onCopy={() => copy(p.seq, p.displayText || p.rawText)}
       onRefill={() => {
-        onRefill(p.rawText);
+        onRefill(p);
         if (mode === 'sheet') onClose();
       }}
     />

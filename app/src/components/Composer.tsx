@@ -5,6 +5,7 @@ import { errorToast, hostSnippets, navigate, openNewSession, sessionInfo, toast,
 import {
   addComposerUpload,
   armWaitSend,
+  beginComposerReedit,
   beginSend,
   beginUploadJob,
   cancelComposerUpload,
@@ -12,12 +13,15 @@ import {
   completeSendSuccess,
   endSend,
   endUploadJob,
+  finishReeditImages,
   focusComposer,
+  focusComposerAtEnd,
   getComposerSnapshot,
   insertOrAppendComposerText,
   isComposerUploadCancelled,
   registerActiveComposer,
   removeComposerUpload,
+  restoreReeditDraft,
   setComposerImages,
   setComposerRefs,
   setComposerText,
@@ -28,7 +32,7 @@ import {
 } from '../composerState';
 import { clearSession, openFilesInPanel, showChanges } from './SessionActions';
 import { isTauri, rpc } from '../transport';
-import type { SessionInfo, SlashCommand, Snippet } from '../types';
+import type { ImageRef, SessionInfo, SlashCommand, Snippet } from '../types';
 import { fuzzyScore, isMobile, toB64 as toB64Str } from '../util';
 import { DRAG_REF, extractDroppedEntries, planComposerDrop, resolveDroppedLocalPaths } from '../dropFiles';
 import {
@@ -44,7 +48,8 @@ import {
   type ContextRefInput,
 } from '../contextRefs';
 import { ContextRefBar } from './ContextRefBar';
-import { unadoptFindingByRef } from '../reviewState';
+import { parseFindingFollowUp, unadoptFindingByRef } from '../reviewState';
+import { loadSessionImageData } from './ChatView';
 
 import { openImage } from './Lightbox';
 import { imageMenu } from './ImageMenu';
@@ -59,11 +64,80 @@ import { bringSideChatToMain, deriveSideTitle, sideChatTitle, startSideChat } fr
 import { noteOwnerMessage } from '../bots';
 
 const t = getT('composer');
+const tChat = getT('chatView');
+
+const reeditToastCloser = new Map<string, () => void>();
+function closeReeditToast(key: string) {
+  reeditToastCloser.get(key)?.();
+  reeditToastCloser.delete(key);
+}
 
 /** Refill a past user prompt (text + <yi-context> pills) into this session's input box */
 export const RESTORE_COMPOSER = 'yi-console:restore-composer';
 export function restoreToComposer(sessionId: string, text: string) {
   window.dispatchEvent(new CustomEvent(RESTORE_COMPOSER, { detail: { sessionId, text } }));
+}
+
+/** Start re-editing a past user message: stash any active draft (with a toast action to restore), load text/context refs, and fetch historical images */
+export function startReeditToComposer(
+  hostId: string,
+  sessionId: string,
+  msg: { seq?: number; ts?: number; rawText: string; images?: readonly ImageRef[] },
+) {
+  const key = `${hostId}::${sessionId}`;
+  const parsed = parseContextMessage(msg.rawText);
+  const cleanText = parseFindingFollowUp(parsed.text).text;
+  const refs = parsed.refs.map((r) => ({ ...r, id: nextContextRefId() }));
+  const images = msg.images ?? [];
+  const { nonce, hasStashedDraft } = beginComposerReedit(key, {
+    text: cleanText,
+    refs,
+    loadingImages: images.length,
+  });
+  focusComposerAtEnd(key);
+  closeReeditToast(key);
+  if (hasStashedDraft) {
+    reeditToastCloser.set(
+      key,
+      toast(t('reeditStashedToast'), 'info', {
+        label: t('restoreStashedDraft'),
+        run: () => {
+          reeditToastCloser.delete(key);
+          if (restoreReeditDraft(key, nonce)) {
+            toast(t('draftRestored'));
+            focusComposerAtEnd(key);
+          }
+        },
+      }),
+    );
+  } else {
+    reeditToastCloser.set(key, toast(t('reeditFilledToast')));
+  }
+  if (images.length === 0) return;
+  void Promise.allSettled(
+    images.map((img, idx) =>
+      loadSessionImageData(hostId, sessionId, img).then((d) => ({
+        ...d,
+        name: tChat('reeditImageName', { index: idx + 1 }),
+      })),
+    ),
+  ).then((results) => {
+    const loaded: Attached[] = [];
+    let failed = 0;
+    for (const r of results) {
+      if (r.status === 'fulfilled') loaded.push(r.value);
+      else failed += 1;
+    }
+    finishReeditImages(key, nonce, loaded);
+    if (failed > 0 && getComposerSnapshot(key).reedit?.nonce === nonce) {
+      toast(
+        loaded.length === 0
+          ? tChat('reeditImagesFailed')
+          : tChat('reeditImagesPartialFailed', { loaded: loaded.length, total: images.length }),
+        'error',
+      );
+    }
+  });
 }
 
 /** Matching for / commands: name prefix > word start in name > name contains > description contains > name subsequence; descriptions aren't fuzzy-matched, or everything would match */
@@ -238,7 +312,7 @@ export function Composer({
   const subscribe = useCallback((cb: () => void) => subscribeComposer(key, cb), [key]);
   const getSnap = useCallback(() => getComposerSnapshot(key), [key]);
   const snap = useSyncExternalStore(subscribe, getSnap);
-  const { text, imgs, refs, sending, uploads, waitSend } = snap;
+  const { text, imgs, refs, sending, uploads, waitSend, reedit } = snap;
   const setText = (next: string | ((cur: string) => string)) => setComposerText(key, next);
   const setImgs = (next: Attached[] | ((cur: Attached[]) => Attached[])) => setComposerImages(key, next);
   const setRefs = (next: ContextRef[] | ((cur: ContextRef[]) => ContextRef[])) => setComposerRefs(key, next);
@@ -555,6 +629,15 @@ export function Composer({
       registerActiveComposer(key, {
         insertAtCaret: (s) => insertAtCaret(s),
         focus: () => ta.current?.focus(),
+        focusAtEnd: () => {
+          requestAnimationFrame(() => {
+            const el = ta.current;
+            if (!el || !el.isConnected) return;
+            el.focus();
+            el.setSelectionRange(el.value.length, el.value.length);
+            setCaret(el.value.length);
+          });
+        },
       }),
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [key],
@@ -701,6 +784,7 @@ export function Composer({
     const trimmed = curSnap.text.trim();
     const curImgs = curSnap.imgs;
     const curRefs = curSnap.refs;
+    const sentReeditNonce = curSnap.reedit?.nonce ?? 0;
     if ((!trimmed && curImgs.length === 0 && curRefs.length === 0) || curSnap.sending) return;
     // Typing /clear and pressing Enter (without picking from the menu) also uses Yi Console's clear, not sent to the tool
     if (trimmed === '/clear' && curImgs.length === 0 && curRefs.length === 0 && curInfo.mode !== 'terminal') {
@@ -760,7 +844,8 @@ export function Composer({
       });
       afterSend?.();
       noteOwnerMessage(curInfo);
-      completeSendSuccess(from, { sentText: trimmed, sentImgs: curImgs, sentRefs: curRefs });
+      completeSendSuccess(from, { sentText: trimmed, sentImgs: curImgs, sentRefs: curRefs, reeditNonce: sentReeditNonce });
+      closeReeditToast(from);
       ok = true;
     } catch (e) {
       errorToast(e);
@@ -777,8 +862,10 @@ export function Composer({
     const fallbackInfo = info;
     const transform = transformSend;
     const afterSend = onAfterSend;
+    const cur = getComposerSnapshot(from);
+    if ((cur.reedit?.loadingImages ?? 0) > 0) return;
     // Files still uploading: spin for now; once done (and the references are in the input box) endUploadJob runs executeSend
-    if (getComposerSnapshot(from).pendingUploads > 0) {
+    if (cur.pendingUploads > 0) {
       armWaitSend(from, () => {
         void executeSend(from, hId, sid, fallbackInfo, transform, afterSend);
       });
@@ -863,6 +950,7 @@ export function Composer({
   }, [text]);
   const syncCaret = () => setCaret(ta.current?.selectionStart ?? 0);
   const hasText = !!text.trim() || imgs.length > 0 || refs.length > 0;
+  const loadingReeditImages = (reedit?.loadingImages ?? 0) > 0;
 
   return (
     <>
@@ -1125,22 +1213,24 @@ export function Composer({
             </button>
           ) : (
             <button
-              className={`send-btn ${busy && !steer ? 'queue-send' : ''} ${sending || waitSend ? 'loading' : ''}`}
-              disabled={(!hasText && !uploads.length) || sending || waitSend || !connected}
+              className={`send-btn ${busy && !steer ? 'queue-send' : ''} ${sending || waitSend || loadingReeditImages ? 'loading' : ''}`}
+              disabled={(!hasText && !uploads.length) || sending || waitSend || loadingReeditImages || !connected}
               onClick={send}
               title={
-                waitSend
-                  ? t('willSendAfterTheUpload')
-                  : sending
-                    ? t('sending')
-                    : busy
-                      ? steer
-                        ? t('sendToAiReadOn')
-                        : t('queueSendAfterCurrentTurn')
-                      : t('send')
+                loadingReeditImages
+                  ? t('waitingForReeditImages')
+                  : waitSend
+                    ? t('willSendAfterTheUpload')
+                    : sending
+                      ? t('sending')
+                      : busy
+                        ? steer
+                          ? t('sendToAiReadOn')
+                          : t('queueSendAfterCurrentTurn')
+                        : t('send')
               }
             >
-              {sending || waitSend ? <span className="spinner send-spin" /> : <Icon name={busy && !steer ? 'history' : 'arrowUp'} size={18} />}
+              {sending || waitSend || loadingReeditImages ? <span className="spinner send-spin" /> : <Icon name={busy && !steer ? 'history' : 'arrowUp'} size={18} />}
             </button>
           )}
         </div>
