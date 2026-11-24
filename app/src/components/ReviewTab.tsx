@@ -21,14 +21,25 @@ import {
 import { deriveSideTitle, sideChatTitle } from '../sideChat';
 import { errorToast, hostStatus, loadOlder, loadSession, registerVisibleChildSession, skey, toast, useSessionData, useStore } from '../store';
 import { rpc } from '../transport';
-import { TOOL_LABEL, type CommitInfo, type HubEvent, type QuestionAnswer, type ReviewSessionMeta, type SessionInfo, type ToolKind } from '../types';
-import { timeAgo } from '../util';
+import {
+  TOOL_LABEL,
+  type CommitInfo,
+  type HubEvent,
+  type ModelConfigOption,
+  type ModelOption,
+  type QuestionAnswer,
+  type ReviewSessionMeta,
+  type SessionInfo,
+  type ToolKind,
+} from '../types';
+import { lsGet, lsSet, timeAgo } from '../util';
 import { ChatMarkdown } from './ChatMarkdown';
 import { AsyncAskCard, ChatView, openAsyncAsk, PermissionCard } from './ChatView';
 import { Composer } from './Composer';
 import type { BranchesResult } from './GitOpsDialogs';
 import { Icon, ToolBadge } from './Icon';
 import { INSERT_COMPOSER } from './FilePanel';
+import { ModelMenu } from './ModelPicker';
 import { askConfirm, askText } from './Overlay';
 import { bringSideChatToMain } from '../sideChat';
 import { StatusLine } from './StatusLine';
@@ -39,8 +50,21 @@ export { parseReviewIssues };
 const PREFED_MAX_FILES = 25;
 const PREFED_MAX_LINES = 1200;
 const PREFED_MAX_CHARS = 55_000;
+const REVIEW_MODEL_PREFS_KEY = 'review-model-prefs';
+
+type ReviewModelPref = { model?: string; effort?: string; config?: Record<string, string> };
+
+function pickModelConfig(options: ModelConfigOption[] | null | undefined, config: Record<string, string> | undefined): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const o of options ?? []) {
+    const v = config?.[o.id];
+    if (v && o.options.some((c) => c.value === v)) out[o.id] = v;
+  }
+  return out;
+}
 
 const tx = getT('filePanel');
+const tn = getT('newSession');
 const GIT_HEAD_REF = 'HEAD';
 
 export const REVIEW_PREFIX = 'review:';
@@ -381,11 +405,25 @@ export function ReviewLaunchDialog({
 }) {
   const [, lang] = useLang();
   useBack(true, onClose);
+  const hostStatusObj = useStore((s) => s.hosts.find((h) => h.config.id === hostId)?.status);
+  const connected = hostStatusObj?.status === 'connected';
   const tools = useMemo(
-    () => (hostStatus(hostId).hello?.tools ?? []).filter((t) => t.available && t.kind !== 'shell' && t.kind !== 'files'),
-    [hostId],
+    () => (hostStatusObj?.hello?.tools ?? []).filter((t) => t.available && t.kind !== 'shell' && t.kind !== 'files'),
+    [hostStatusObj?.hello?.tools],
   );
-  const [tool, setTool] = useState<ToolKind>(() => pickReviewerTool(hostId, currentTool) ?? (tools[0]?.kind ?? 'claude'));
+  const [initialTool] = useState<ToolKind>(() => pickReviewerTool(hostId, currentTool) ?? (tools[0]?.kind ?? 'claude'));
+  const readSavedPref = (t: ToolKind): ReviewModelPref =>
+    lsGet<Record<string, ReviewModelPref>>(REVIEW_MODEL_PREFS_KEY, {})[`${hostId}::${t}`] ?? {};
+  const [tool, setTool] = useState<ToolKind>(initialTool);
+  const [model, setModel] = useState<string>(() => (readSavedPref(initialTool).model ?? '').split('[')[0]);
+  const [effort, setEffort] = useState<string>(() => readSavedPref(initialTool).effort ?? '');
+  const [config, setConfig] = useState<Record<string, string>>(() => readSavedPref(initialTool).config ?? {});
+  const [models, setModels] = useState<ModelOption[] | null>(null);
+  const [modelsRetry, setModelsRetry] = useState(0);
+  const [cfgOptions, setCfgOptions] = useState<ModelConfigOption[] | null>(null);
+  const draftPrefsRef = useRef<Record<string, ReviewModelPref>>({});
+  const cwdRef = useRef(cwd);
+  cwdRef.current = cwd;
   const [scope, setScope] = useState<ReviewScope>(() => preset?.scope ?? defaultScope);
   const [uncommittedFilter, setUncommittedFilter] = useState<UncommittedFilter>(() => preset?.uncommittedFilter ?? 'all');
   const headTarget = currentBranch && currentBranch !== 'HEAD' ? currentBranch : 'HEAD';
@@ -432,6 +470,65 @@ export function ReviewLaunchDialog({
       setBase(branchesInfo.defaultBranch);
     }
   }, [base, branchesInfo?.defaultBranch]);
+
+  const readModelPref = (t: ToolKind): ReviewModelPref =>
+    draftPrefsRef.current[t] ?? lsGet<Record<string, ReviewModelPref>>(REVIEW_MODEL_PREFS_KEY, {})[`${hostId}::${t}`] ?? {};
+
+  const selectTool = (nextTool: ToolKind) => {
+    if (nextTool === tool) return;
+    draftPrefsRef.current[tool] = { model, effort, config };
+    const next = readModelPref(nextTool);
+    setTool(nextTool);
+    setModel((next.model ?? '').split('[')[0]);
+    setEffort(next.effort ?? '');
+    setConfig(next.config ?? {});
+  };
+
+  // Load available models for the chosen reviewer tool
+  useEffect(() => {
+    setModels(null);
+    if (!hostId || !connected || !tools.length) return;
+    let alive = true;
+    rpc<ModelOption[]>(hostId, 'tools.models', { tool })
+      .then((m) => alive && setModels(m))
+      .catch(() => alive && setModels([]));
+    return () => {
+      alive = false;
+    };
+  }, [hostId, tool, connected, tools.length, modelsRetry]);
+
+  // Load Cursor model-specific parameters (reasoning effort, context window, fast mode)
+  const cursorModel = tool === 'cursor' && connected ? model : '';
+  useEffect(() => {
+    setCfgOptions(null);
+    if (!hostId || !cursorModel) return;
+    let alive = true;
+    rpc<ModelConfigOption[]>(hostId, 'tools.modelConfig', {
+      model: cursorModel,
+      cwd: cwdRef.current.trim(),
+    })
+      .then((o) => alive && setCfgOptions(o))
+      .catch(() => alive && setCfgOptions([]));
+    return () => {
+      alive = false;
+    };
+  }, [hostId, cursorModel]);
+
+  const shownConfig = useMemo(() => {
+    if (!cursorModel || !cfgOptions) return undefined;
+    const chosen = pickModelConfig(cfgOptions, config);
+    return cfgOptions.map((o) => (chosen[o.id] ? { ...o, currentValue: chosen[o.id] } : o));
+  }, [cursorModel, cfgOptions, config]);
+
+  const modelList = useMemo(() => {
+    if (!models) return null;
+    if (models.some((m) => m.id === 'default')) return models;
+    return [{ id: '', name: tn('toolDefault'), efforts: models[0]?.efforts, defaultEffort: models[0]?.defaultEffort }, ...models];
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [models, lang]);
+  const curModel = modelList?.find((x) => x.id === model) ?? (!model ? modelList?.[0] : undefined);
+  const effortList = curModel?.efforts ?? [];
+  const sendEffort = effort && (models === null || effortList.includes(effort)) ? effort : '';
 
   // Debounce custom range typing
   useEffect(() => {
@@ -776,6 +873,7 @@ export function ReviewLaunchDialog({
         ...(!legacyDaemon ? { totalFilesCount: scopeFiles.length } : {}),
       };
 
+      const chosenModelConfig = cursorModel ? pickModelConfig(cfgOptions, config) : undefined;
       const created = await rpc<SessionInfo>(hostId, 'session.create', {
         tool,
         cwd,
@@ -783,9 +881,20 @@ export function ReviewLaunchDialog({
         parentId: parentSessionId,
         sideChat: true,
         permissionMode: perm,
+        model: model || undefined,
+        effort: sendEffort || undefined,
+        modelConfig: chosenModelConfig,
         title: tx('reviewSessionTitle', { tool: TOOL_LABEL[tool], scope: scopeLabel }),
         review: reviewPayload,
       });
+
+      const savedPrefs = lsGet<Record<string, ReviewModelPref>>(REVIEW_MODEL_PREFS_KEY, {});
+      savedPrefs[`${hostId}::${tool}`] = {
+        model,
+        effort: sendEffort,
+        ...(cursorModel ? { config: cfgOptions ? chosenModelConfig : config } : {}),
+      };
+      lsSet(REVIEW_MODEL_PREFS_KEY, savedPrefs);
 
       setReviewMeta({
         sessionId: created.id,
@@ -874,13 +983,49 @@ export function ReviewLaunchDialog({
                   key={t.kind}
                   type="button"
                   className={`wp-review-tool ${tool === t.kind ? 'active' : ''}`}
-                  onClick={() => setTool(t.kind)}
+                  onClick={() => selectTool(t.kind)}
                 >
                   <ToolBadge tool={t.kind} size={15} />
                   <span>{TOOL_LABEL[t.kind]}</span>
                   {currentTool && t.kind !== currentTool && <span className="wp-review-badge">{tx('crossToolBadge')}</span>}
                 </button>
               ))}
+            </div>
+          </div>
+
+          <div className="wp-review-field">
+            <span>{tx('reviewModelLabel')}</span>
+            <div className="wp-review-model-row">
+              <ModelMenu
+                tool={tool}
+                model={model}
+                effort={sendEffort}
+                models={modelList}
+                resetKey={`${hostId}/${tool}`}
+                portal
+                onOpen={() => {
+                  if (models && models.length === 0) setModelsRetry((n) => n + 1);
+                }}
+                onModel={(id) => {
+                  setModel(id);
+                  const m = modelList?.find((x) => x.id === id);
+                  if (effort && m && !(m.efforts ?? []).includes(effort)) setEffort('');
+                }}
+                onEffort={setEffort}
+                configOptions={shownConfig}
+                configPending={!!cursorModel && cfgOptions === null}
+                onConfig={(id, value) => setConfig((c) => ({ ...c, [id]: value }))}
+                onCustom={async () => {
+                  const v = (await askText({ title: tn('model'), value: model, placeholder: tn('leaveEmptyForToolDefault') }))?.trim();
+                  if (v !== undefined) setModel(v);
+                }}
+              />
+              {models === null && connected && tools.length > 0 && (
+                <span className="wp-review-model-loading muted small">
+                  <span className="spinner mini" />
+                  <span>{tx('reviewLoadingModels')}</span>
+                </span>
+              )}
             </div>
           </div>
 

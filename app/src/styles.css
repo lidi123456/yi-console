@@ -2496,6 +2496,18 @@ textarea {
   width: 244px;
 }
 
+.menu.model-menu-portal {
+  position: fixed;
+  right: auto;
+  bottom: auto;
+  z-index: 70;
+  max-height: calc(100dvh - 24px);
+}
+
+.menu.model-menu-portal .model-list {
+  max-height: min(320px, calc(100dvh - 108px));
+}
+
 .menu.model-submenu {
   position: fixed;
   right: auto;
@@ -15984,6 +15996,33 @@ button.wp-commit-title .chev {
   color: var(--link);
   font-size: 10.5px;
   font-weight: 500;
+}
+.wp-review-model-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.wp-review-model-row .model-menu-wrap {
+  max-width: 100%;
+}
+.wp-review-model-row .model-btn {
+  max-width: 280px;
+  padding: 6px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--border-2);
+  background: var(--bg-2);
+  color: var(--text);
+  font-size: 12.5px;
+}
+.wp-review-model-row .model-btn:hover {
+  background: var(--bg-3);
+  border-color: var(--border-2);
+}
+.wp-review-model-loading {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
 }
 .wp-review-scope-box {
   display: flex;

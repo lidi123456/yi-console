@@ -234,6 +234,8 @@
   "crossToolReviewTitle": "Cross-tool AI Code Review",
   "reviewReadonlyNotice": "Runs in read-only planning mode and will not modify any files",
   "reviewToolLabel": "Reviewer tool",
+  "reviewModelLabel": "Reviewer model",
+  "reviewLoadingModels": "Loading models…",
   "crossToolBadge": "Cross-tool",
   "reviewScopeLabel": "Diff scope",
   "reviewFocusLabel": "Extra focus (optional)",

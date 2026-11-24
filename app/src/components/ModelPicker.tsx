@@ -116,6 +116,61 @@ function ModelSubmenu({ anchor, menuRef, label, children }: {
   );
 }
 
+/** A portaled desktop popover positioned relative to its trigger so overflow-clipped dialogs never clip it. */
+function ModelPopover({ anchor, menuRef, className, ariaBusy, label, children }: {
+  anchor: HTMLButtonElement;
+  menuRef: React.RefObject<HTMLDivElement | null>;
+  className: string;
+  ariaBusy: boolean;
+  label: string;
+  children: React.ReactNode;
+}) {
+  const [position, setPosition] = useState<{ left: number; top: number } | null>(null);
+  useLayoutEffect(() => {
+    const element = menuRef.current;
+    if (!element) return;
+    const place = () => {
+      const rect = anchor.getBoundingClientRect();
+      const size = element.getBoundingClientRect();
+      const pad = 12;
+      const gap = 6;
+      const vw = window.innerWidth;
+      const vh = window.innerHeight;
+      const rawLeft = rect.left + size.width <= vw - pad ? rect.left : rect.right - size.width;
+      const left = Math.max(pad, Math.min(rawLeft, Math.max(pad, vw - size.width - pad)));
+      const spaceBelow = vh - rect.bottom - gap - pad;
+      const spaceAbove = rect.top - gap - pad;
+      const rawTop = size.height <= spaceBelow || spaceBelow >= spaceAbove ? rect.bottom + gap : rect.top - size.height - gap;
+      const top = Math.max(pad, Math.min(rawTop, Math.max(pad, vh - size.height - pad)));
+      setPosition((old) => (old?.left === left && old?.top === top ? old : { left, top }));
+    };
+    place();
+    const observer = new ResizeObserver(place);
+    observer.observe(element);
+    window.addEventListener('resize', place);
+    window.addEventListener('scroll', place, true);
+    return () => {
+      observer.disconnect();
+      window.removeEventListener('resize', place);
+      window.removeEventListener('scroll', place, true);
+    };
+  }, [anchor, menuRef]);
+  return createPortal(
+    <div
+      ref={menuRef}
+      className={className}
+      role="dialog"
+      aria-busy={ariaBusy}
+      aria-label={label}
+      data-model-pane
+      style={{ left: position?.left ?? 0, top: position?.top ?? 0, visibility: position ? 'visible' : 'hidden' }}
+    >
+      {children}
+    </div>,
+    document.body,
+  );
+}
+
 /** The session's model button: reads the list from the session, changes go to the running tool */
 export function ModelPicker({ hostId, info }: { hostId: string; info: SessionInfo }) {
   const [models, setModels] = useState<ModelOption[] | null>(null);
@@ -165,6 +220,7 @@ export function ModelMenu({
   openEventSessionId,
   openEventIgnoreGeneric = false,
   resetKey,
+  portal = false,
   configOptions,
   configPending = false,
   onModel,
@@ -188,6 +244,8 @@ export function ModelMenu({
   openEventIgnoreGeneric?: boolean;
   /** Closes the submenus when this changes */
   resetKey?: string;
+  /** Portal the desktop menu to document.body so scrollable modal containers do not clip it */
+  portal?: boolean;
   configOptions?: ModelConfigOption[];
   configPending?: boolean;
   onModel: (id: string) => unknown;
@@ -418,7 +476,7 @@ export function ModelMenu({
   };
   return (
     <div className="menu-wrap model-menu-wrap" ref={wrapRef} onKeyDown={onKeyDown}>
-      <button ref={buttonRef} className="model-btn" title={t('switchModel')} aria-haspopup="dialog" aria-expanded={open}
+      <button ref={buttonRef} type="button" className="model-btn" title={t('switchModel')} aria-haspopup="dialog" aria-expanded={open}
         onClick={() => { if (open) close(); else { onOpen?.(); setOpen(true); } }}>
         <span className="truncate">{modelLabel(cur, models ?? [])}</span>
         {effort && <span className="model-effort">{effortLabel(effort)}</span>}
@@ -426,8 +484,18 @@ export function ModelMenu({
         <Icon name="down" size={12} />
       </button>
       {open && (sheet ? createPortal(
-        <div className="model-sheet-bg" onClick={() => close()}><div onClick={(event) => event.stopPropagation()}>{menuBody}</div></div>,
+        <div className="model-sheet-bg" onClick={(event) => { event.stopPropagation(); close(); }}><div onClick={(event) => event.stopPropagation()}>{menuBody}</div></div>,
         document.body,
+      ) : portal && buttonRef.current ? (
+        <ModelPopover
+          anchor={buttonRef.current}
+          menuRef={sheetRef}
+          className={`menu model-menu model-menu-portal${hasControls ? ' model-menu-compact' : ''}`}
+          ariaBusy={configPending}
+          label={t('modelSettings')}
+        >
+          {hasControls ? settings : modelList}
+        </ModelPopover>
       ) : menuBody)}
       {open && section && !sheet && anchorRef.current && (
         <ModelSubmenu anchor={anchorRef.current} menuRef={submenuRef} label={sectionLabel}>

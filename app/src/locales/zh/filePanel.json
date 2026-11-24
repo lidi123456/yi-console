@@ -234,6 +234,8 @@
   "crossToolReviewTitle": "跨工具 AI 代码审阅",
   "reviewReadonlyNotice": "将以只读规划模式运行审阅，不会修改任何代码文件",
   "reviewToolLabel": "选择审阅工具",
+  "reviewModelLabel": "审阅模型",
+  "reviewLoadingModels": "正在获取模型列表…",
   "crossToolBadge": "跨工具",
   "reviewScopeLabel": "审阅范围",
   "reviewFocusLabel": "额外关注点（可选）",
