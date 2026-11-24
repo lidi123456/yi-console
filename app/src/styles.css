@@ -10787,6 +10787,43 @@ button.wp-commit-title .chev {
 .limit-dock-when {
   font-variant-numeric: tabular-nums;
 }
+.limit-dock-actions {
+  display: contents;
+}
+.limit-dock .lbl-short {
+  display: none;
+}
+/* Narrow chat area (file panel open, phones): text on the first row, buttons on a second row aligned with the text.
+   Breakpoints fit the longer English labels; below 480px the buttons use their short labels. */
+@container (max-width: 800px) {
+  .limit-dock {
+    flex-wrap: wrap;
+    align-items: flex-start;
+    row-gap: 8px;
+    padding: 8px 8px 8px 12px;
+  }
+  .limit-dock > svg {
+    margin-top: 2px;
+  }
+  .limit-dock-text {
+    line-height: 18px;
+  }
+  .limit-dock-actions {
+    display: flex;
+    flex-basis: 100%;
+    flex-wrap: wrap;
+    gap: 6px;
+    padding-left: 22px;
+  }
+}
+@container (max-width: 480px) {
+  .limit-dock .lbl-long {
+    display: none;
+  }
+  .limit-dock .lbl-short {
+    display: inline;
+  }
+}
 .row-wait {
   display: inline-flex;
   align-items: center;
@@ -10802,16 +10839,6 @@ button.wp-commit-title .chev {
   }
   .limit-note > svg {
     margin-top: 3px;
-  }
-  .limit-dock {
-    gap: 6px;
-    padding-left: 10px;
-  }
-  .limit-dock-when {
-    min-width: 0;
-    overflow: hidden;
-    white-space: nowrap;
-    text-overflow: ellipsis;
   }
   /* Reply footer: wrap instead of squeezing "Error" into a vertical column */
   .m-actions {

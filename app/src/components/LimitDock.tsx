@@ -38,86 +38,88 @@ export function LimitDock({ hostId, info, connected }: { hostId: string; info: S
     <div className="limit-dock" role="status">
       <Icon name="clock" size={14} />
       <span className="limit-dock-text">
-        {/* On phones only the time is shown, so the bar stays one line */}
-        <span className="hide-mobile">{isEn() ? `Usage limit reached${name ? ` (${name})` : ''}` : `额度已用完${name ? `（${name}）` : ''}`}</span>
+        <span>{isEn() ? `Usage limit reached${name ? ` (${name})` : ''}` : `额度已用完${name ? `（${name}）` : ''}`}</span>
         <span className="limit-dock-when">
           {left > 0 ? (
             <>
-              <span className="hide-mobile">{t('continuesAtIn', { v: fmtAt(ar.at), v2: fmtLeft(left) })}</span>
-              <span className="show-mobile">{t('autoAt', { v: fmtAt(ar.at), v2: fmtLeft(left) })}</span>
+              <span className="lbl-long">{t('continuesAtIn', { v: fmtAt(ar.at), v2: fmtLeft(left) })}</span>
+              <span className="lbl-short">{t('autoAt', { v: fmtAt(ar.at), v2: fmtLeft(left) })}</span>
             </>
           ) : (
             t('continuing')
           )}
         </span>
       </span>
-      <button className="btn small" disabled={!connected || busy} onClick={() => act('now')} title={t('sendContinueRightAway')}>
-        <span className="hide-mobile">{t('continueNow')}</span>
-        <span className="show-mobile">{t('continue')}</span>
-      </button>
-      {supportsAccountsTool(info.tool) && (
-        <button
-          className="btn small"
-          disabled={!connected || busy}
-          onClick={async (e) => {
-            const coords = { clientX: e.clientX, clientY: e.clientY };
-            try {
-              const res = await rpc<{ tools: ToolAccountsSummary[] }>(hostId, 'tools.accounts.list', {
-                tool: info.tool,
-                checkNative: false,
-              });
-              const accounts = res.tools?.[0]?.accounts ?? [];
-              openMenu(coords, [
-                ...accounts.map((acc) => ({
-                  label: acc.label,
-                  hint: [acc.authKind === 'apiKey' ? 'API' : 'OAuth', acc.identity.email].filter(Boolean).join(' · '),
-                  active: acc.id === info.accountId,
-                  run: async () => {
-                    setBusy(true);
-                    try {
-                      const switching = acc.id !== info.accountId;
-                      const updated = await rpc<SessionInfo>(hostId, 'session.switchAccount', {
-                        sessionId: info.id,
-                        accountId: acc.id,
-                        ...(switching ? { autoContinue: true } : {}),
-                      });
-                      toast(
-                        switching && (updated.status === 'running' || updated.status === 'starting')
-                          ? t('switchedBackupAccountContinuing', { label: acc.label })
-                          : t('switchedBackupAccount', { label: acc.label }),
-                        'info',
-                      );
-                    } catch (err) {
-                      errorToast(err);
-                    } finally {
-                      setBusy(false);
-                    }
-                  },
-                })),
-                ...(accounts.length ? (['-'] as const) : []),
-                {
-                  label: t('manageAccounts'),
-                  icon: 'key',
-                  run: () => openAccountManager({ hostId, tool: info.tool, sessionId: info.id, accountId: info.accountId }),
-                },
-              ]);
-            } catch (err) {
-              errorToast(err);
-            }
-          }}
-          title={t('switchBackupAccountTitle')}
-        >
-          <span className="hide-mobile">{t('switchBackupAccount')}</span>
-          <span className="show-mobile">{t('switchAccountShort')}</span>
+      {/* Buttons move to their own row when the chat area is narrow (container queries in styles.css) */}
+      <div className="limit-dock-actions">
+        <button className="btn small" disabled={!connected || busy} onClick={() => act('now')} title={t('sendContinueRightAway')}>
+          <span className="lbl-long">{t('continueNow')}</span>
+          <span className="lbl-short">{t('continue')}</span>
         </button>
-      )}
-      <button className="btn small" disabled={!connected || busy} onClick={() => handoffSession(hostId, info, { limit: true })} title={t('handOffToAnotherToolTitle')}>
-        <span className="hide-mobile">{t('handOffToAnotherTool')}</span>
-        <span className="show-mobile">{t('switchTool')}</span>
-      </button>
-      <button className="btn small" disabled={!connected || busy} onClick={() => act('cancel')}>
-        {t('cancel')}
-      </button>
+        {supportsAccountsTool(info.tool) && (
+          <button
+            className="btn small"
+            disabled={!connected || busy}
+            onClick={async (e) => {
+              const coords = { clientX: e.clientX, clientY: e.clientY };
+              try {
+                const res = await rpc<{ tools: ToolAccountsSummary[] }>(hostId, 'tools.accounts.list', {
+                  tool: info.tool,
+                  checkNative: false,
+                });
+                const accounts = res.tools?.[0]?.accounts ?? [];
+                openMenu(coords, [
+                  ...accounts.map((acc) => ({
+                    label: acc.label,
+                    hint: [acc.authKind === 'apiKey' ? 'API' : 'OAuth', acc.identity.email].filter(Boolean).join(' · '),
+                    active: acc.id === info.accountId,
+                    run: async () => {
+                      setBusy(true);
+                      try {
+                        const switching = acc.id !== info.accountId;
+                        const updated = await rpc<SessionInfo>(hostId, 'session.switchAccount', {
+                          sessionId: info.id,
+                          accountId: acc.id,
+                          ...(switching ? { autoContinue: true } : {}),
+                        });
+                        toast(
+                          switching && (updated.status === 'running' || updated.status === 'starting')
+                            ? t('switchedBackupAccountContinuing', { label: acc.label })
+                            : t('switchedBackupAccount', { label: acc.label }),
+                          'info',
+                        );
+                      } catch (err) {
+                        errorToast(err);
+                      } finally {
+                        setBusy(false);
+                      }
+                    },
+                  })),
+                  ...(accounts.length ? (['-'] as const) : []),
+                  {
+                    label: t('manageAccounts'),
+                    icon: 'key',
+                    run: () => openAccountManager({ hostId, tool: info.tool, sessionId: info.id, accountId: info.accountId }),
+                  },
+                ]);
+              } catch (err) {
+                errorToast(err);
+              }
+            }}
+            title={t('switchBackupAccountTitle')}
+          >
+            <span className="lbl-long">{t('switchBackupAccount')}</span>
+            <span className="lbl-short">{t('switchAccountShort')}</span>
+          </button>
+        )}
+        <button className="btn small" disabled={!connected || busy} onClick={() => handoffSession(hostId, info, { limit: true })} title={t('handOffToAnotherToolTitle')}>
+          <span className="lbl-long">{t('handOffToAnotherTool')}</span>
+          <span className="lbl-short">{t('switchTool')}</span>
+        </button>
+        <button className="btn small" disabled={!connected || busy} onClick={() => act('cancel')}>
+          {t('cancel')}
+        </button>
+      </div>
     </div>
   );
 }
