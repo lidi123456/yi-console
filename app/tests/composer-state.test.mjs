@@ -330,4 +330,26 @@ describe('composerState', () => {
 
     unsub();
   });
+
+  test('idle snapshot keeps stable identity across unsubscribing last subscriber and clearing active draft', () => {
+    const idleKey = 'h1::idle';
+    const snapIdle1 = getComposerSnapshot(idleKey);
+    const unsubIdle = subscribeComposer(idleKey, () => {});
+    const snapIdle2 = getComposerSnapshot(idleKey);
+    unsubIdle();
+    const snapIdle3 = getComposerSnapshot(idleKey);
+    assert.equal(snapIdle1, snapIdle2);
+    assert.equal(snapIdle2, snapIdle3);
+
+    const activeKey = 'h1::active-then-idle';
+    const unsubActive = subscribeComposer(activeKey, () => {});
+    setComposerText(activeKey, 'temporary draft');
+    assert.equal(getComposerSnapshot(activeKey).text, 'temporary draft');
+    clearComposerState(activeKey);
+    const clearedBeforeUnsub = getComposerSnapshot(activeKey);
+    unsubActive();
+    const clearedAfterUnsub = getComposerSnapshot(activeKey);
+    assert.equal(clearedBeforeUnsub, clearedAfterUnsub);
+    assert.equal(clearedAfterUnsub, snapIdle1);
+  });
 });

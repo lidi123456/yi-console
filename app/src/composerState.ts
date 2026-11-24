@@ -90,7 +90,31 @@ function writeDraftRefs(key: string, list: ContextRef[]) {
   }
 }
 
+const EMPTY_IMGS: Attached[] = [];
+const EMPTY_REFS: ContextRef[] = [];
+const EMPTY_UPLOADS: Upload[] = [];
+const EMPTY_SNAPSHOT: ComposerSnapshot = {
+  text: '',
+  imgs: EMPTY_IMGS,
+  refs: EMPTY_REFS,
+  sending: false,
+  uploads: EMPTY_UPLOADS,
+  pendingUploads: 0,
+  waitSend: false,
+};
+
 function makeSnapshot(e: ComposerEntry): ComposerSnapshot {
+  if (
+    !e.text &&
+    !e.imgs.length &&
+    !e.refs.length &&
+    !e.sending &&
+    !e.uploads.length &&
+    e.pendingUploads === 0 &&
+    !e.waitSend
+  ) {
+    return EMPTY_SNAPSHOT;
+  }
   return {
     text: e.text,
     imgs: e.imgs,
@@ -116,22 +140,27 @@ function isEntryIdle(e: ComposerEntry): boolean {
   );
 }
 
+function createEntry(text: string, refs: ContextRef[]): ComposerEntry {
+  const e: ComposerEntry = {
+    text,
+    imgs: EMPTY_IMGS,
+    refs,
+    sending: false,
+    uploads: EMPTY_UPLOADS,
+    pendingUploads: 0,
+    waitSend: false,
+    waitSendRunner: null,
+    cancelledUploads: new Set(),
+    snap: EMPTY_SNAPSHOT,
+  };
+  e.snap = makeSnapshot(e);
+  return e;
+}
+
 function ensureEntry(key: string): ComposerEntry {
   let e = entries.get(key);
   if (!e) {
-    e = {
-      text: readDraftText(key),
-      imgs: [],
-      refs: readDraftRefs(key),
-      sending: false,
-      uploads: [],
-      pendingUploads: 0,
-      waitSend: false,
-      waitSendRunner: null,
-      cancelledUploads: new Set(),
-      snap: null as unknown as ComposerSnapshot,
-    };
-    e.snap = makeSnapshot(e);
+    e = createEntry(readDraftText(key), readDraftRefs(key));
     entries.set(key, e);
   }
   return e;
@@ -148,7 +177,14 @@ function notify(key: string, e: ComposerEntry) {
 }
 
 export function getComposerSnapshot(key: string): ComposerSnapshot {
-  return ensureEntry(key).snap;
+  const existing = entries.get(key);
+  if (existing) return existing.snap;
+  const text = readDraftText(key);
+  const refs = readDraftRefs(key);
+  if (!text && refs.length === 0) return EMPTY_SNAPSHOT;
+  const e = createEntry(text, refs);
+  entries.set(key, e);
+  return e.snap;
 }
 
 export function subscribeComposer(key: string, fn: () => void): () => void {
