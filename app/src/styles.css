@@ -10762,11 +10762,14 @@ button.wp-commit-title .chev {
 .handoff-note > svg {
   flex: none;
 }
+.limit-dock-box {
+  container: limit-dock / inline-size;
+  margin-bottom: 8px;
+}
 .limit-dock {
   display: flex;
   align-items: center;
   gap: 8px;
-  margin-bottom: 8px;
   padding: 6px 6px 6px 12px;
   border-radius: 8px;
   background: var(--warn-soft);
@@ -10793,9 +10796,10 @@ button.wp-commit-title .chev {
 .limit-dock .lbl-short {
   display: none;
 }
-/* Narrow chat area (file panel open, phones): text on the first row, buttons on a second row aligned with the text.
-   Breakpoints fit the longer English labels; below 480px the buttons use their short labels. */
-@container (max-width: 800px) {
+/* Narrow chat area (file panel or pinned prompt outline open, phones): text on the first row, buttons on a second row
+   aligned with the text. Breakpoints are on the dock's own width (at most 768px) and fit the longer English labels;
+   744px / 460px match the earlier 800px / 480px session widths minus the composer padding. */
+@container limit-dock (max-width: 744px) {
   .limit-dock {
     flex-wrap: wrap;
     align-items: flex-start;
@@ -10816,7 +10820,7 @@ button.wp-commit-title .chev {
     padding-left: 22px;
   }
 }
-@container (max-width: 480px) {
+@container limit-dock (max-width: 460px) {
   .limit-dock .lbl-long {
     display: none;
   }

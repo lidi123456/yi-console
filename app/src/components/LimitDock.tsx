@@ -35,6 +35,8 @@ export function LimitDock({ hostId, info, connected }: { hostId: string; info: S
   const name = limitName(ar.limit);
   const left = ar.at - now;
   return (
+    // Size container for the breakpoints in styles.css: they follow the dock's own width, which a pinned prompt outline also narrows
+    <div className="limit-dock-box">
     <div className="limit-dock" role="status">
       <Icon name="clock" size={14} />
       <span className="limit-dock-text">
@@ -120,6 +122,7 @@ export function LimitDock({ hostId, info, connected }: { hostId: string; info: S
           {t('cancel')}
         </button>
       </div>
+    </div>
     </div>
   );
 }
