@@ -1861,13 +1861,8 @@ export function ReviewSidePane({
               </span>
             )}
         </div>
-        <div className="wp-side-head-acts">
-          {busy && (
-            <button type="button" className="btn small" onClick={stop}>
-              <Icon name="stop" size={12} /> {tx('stopReview')}
-            </button>
-          )}
-          {onDeleted && (
+        {onDeleted && (
+          <div className="wp-side-head-acts">
             <button
               type="button"
               className="icon-btn"
@@ -1877,8 +1872,8 @@ export function ReviewSidePane({
             >
               <Icon name="trash" size={14} />
             </button>
-          )}
-        </div>
+          </div>
+        )}
       </div>
 
       <div className="wp-review-segbar">

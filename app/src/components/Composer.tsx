@@ -1,4 +1,4 @@
-import { type ReactNode, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
+import { type ReactNode, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import { useBack } from '../back';
 import { getT, isEn, useLang } from '../i18n';
 import { errorToast, hostSnippets, navigate, openNewSession, sessionInfo, toast, useStore } from '../store';
@@ -230,10 +230,11 @@ export function Composer({
 }) {
   const key = `${hostId}::${info.id}`;
   const [, lang] = useLang();
-  const snap = useSyncExternalStore(
-    (cb) => subscribeComposer(key, cb),
-    () => getComposerSnapshot(key),
-  );
+  // Stable callbacks: a fresh `subscribe` each render would resubscribe every commit, and dropping the last subscriber
+  // of an idle entry discards it, so the next snapshot would differ and re-render forever (React #185)
+  const subscribe = useCallback((cb: () => void) => subscribeComposer(key, cb), [key]);
+  const getSnap = useCallback(() => getComposerSnapshot(key), [key]);
+  const snap = useSyncExternalStore(subscribe, getSnap);
   const { text, imgs, refs, sending, uploads, waitSend } = snap;
   const setText = (next: string | ((cur: string) => string)) => setComposerText(key, next);
   const setImgs = (next: Attached[] | ((cur: Attached[]) => Attached[])) => setComposerImages(key, next);
