@@ -44,6 +44,13 @@ fn safe_sid(sid: &str) -> bool {
     !sid.is_empty() && sid.len() <= 64 && sid.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
 }
 
+/// Validate a session ID before using it as a ticket filename component (allows UUIDs and test IDs, blocks path traversal).
+pub(crate) fn is_safe_ticket_sid(sid: &str) -> bool {
+    !sid.is_empty()
+        && sid.len() <= 64
+        && sid.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+}
+
 /// Regular files pasted / dropped into the input box: saved to `uploads/<session>/files/`, with (1) (2) appended on name clashes, deleted with the session
 pub fn attach_file(sid: &str, name: &str, data: &str) -> Result<serde_json::Value> {
     let clean: String = std::path::Path::new(name)
@@ -165,6 +172,8 @@ struct SessionRt {
     worktree_busy: std::sync::atomic::AtomicBool,
     /// Guards in-flight background semantic branch auto-rename so at most one runs per session
     worktree_auto_renaming: std::sync::atomic::AtomicBool,
+    /// Serializes message delivery / queue dispatch with in-place worktree migration
+    delivery_lock: Mutex<()>,
 }
 
 struct WtBusyGuard<'a>(&'a std::sync::atomic::AtomicBool);
@@ -181,6 +190,7 @@ struct ActiveCheckpoint {
     user_seq: i64,
     base_ref: String,
     base_tree: String,
+    worktree_key: String,
     shared_concurrent: bool,
 }
 
@@ -882,6 +892,7 @@ impl Hub {
             .filter(|s| !s.is_empty())
             .or_else(|| p.prompt.as_deref().map(str::trim).filter(|s| !s.is_empty()))
             .map(str::to_string);
+        let created_worktree = p.worktree;
         let (cwd, session_worktree) = if p.worktree {
             let settings = self.settings.read().unwrap().clone();
             let wt_root = crate::gitops::worktree_root(&settings);
@@ -911,15 +922,15 @@ impl Hub {
             };
             (cwd, detected)
         };
-        let cleanup_new_wt = |wt: &Option<yi_proto::SessionWorktree>, wt_dir: &Path| {
-            if wt.is_some() {
+        let cleanup_new_wt = |created: bool, wt_dir: &Path| {
+            if created {
                 let wt_root = crate::gitops::worktree_root(&self.settings.read().unwrap());
                 crate::gitops::worktree_remove_best_effort(&wt_root, &wt_dir.to_string_lossy(), true, true);
             }
         };
         if p.computer_use {
             if let Err(e) = self.desktop.configure(&id) {
-                cleanup_new_wt(&session_worktree, &cwd);
+                cleanup_new_wt(created_worktree, &cwd);
                 return Err(e);
             }
         }
@@ -927,7 +938,7 @@ impl Hub {
             let settings = self.settings.read().unwrap().clone();
             if let Err(e) = self.browsers.configure(&id, &settings) {
                 let _ = self.desktop.change(&id, "stop");
-                cleanup_new_wt(&session_worktree, &cwd);
+                cleanup_new_wt(created_worktree, &cwd);
                 return Err(e);
             }
         }
@@ -991,10 +1002,13 @@ impl Hub {
             worktree: session_worktree.clone(),
         };
         if let Err(e) = self.store.save_session(&info) {
-            if session_worktree.is_some() {
-                let wt_root = crate::gitops::worktree_root(&self.settings.read().unwrap());
-                crate::gitops::worktree_remove_best_effort(&wt_root, &info.cwd, true, true);
+            if p.computer_use {
+                let _ = self.desktop.change(&info.id, "stop");
             }
+            if p.browser_use {
+                let _ = self.browsers.change(&info.id, "stop");
+            }
+            cleanup_new_wt(created_worktree, &cwd);
             return Err(e);
         }
         let rt = Arc::new(new_rt(info.clone()));
@@ -1411,22 +1425,43 @@ impl Hub {
         if rt.worktree_busy.load(std::sync::atomic::Ordering::Acquire) {
             bail!("会话正在切入 Worktree，请稍候再发送");
         }
+        {
+            let info = rt.info.lock().unwrap();
+            if !info.tool.has_process() {
+                bail!("文件会话不能发送消息");
+            }
+            if info.mode == SessionMode::Terminal && !images.is_empty() {
+                bail!("终端模式不支持发送图片");
+            }
+        }
+        // Validate and save images first, so a failure doesn't start the process
+        let (refs, prompt_images) = self.save_images(id, images)?;
+        let _delivery = rt.delivery_lock.lock().unwrap();
+        if rt.worktree_busy.load(std::sync::atomic::Ordering::Acquire) {
+            self.remove_images(id, &refs);
+            bail!("会话正在切入 Worktree，请稍候再发送");
+        }
+        let info = rt.info.lock().unwrap().clone();
+        if !info.tool.has_process() {
+            self.remove_images(id, &refs);
+            bail!("文件会话不能发送消息");
+        }
+        if info.mode == SessionMode::Terminal && !refs.is_empty() {
+            self.remove_images(id, &refs);
+            bail!("终端模式不支持发送图片");
+        }
         // The user carried on by hand: the automatic continue is no longer needed
         self.cancel_resume(id, "manual");
         self.desktop.resume_if_paused(id);
         self.browsers.resume_if_paused(id);
-        let info = rt.info.lock().unwrap().clone();
-        if !info.tool.has_process() {
-            bail!("文件会话不能发送消息");
-        }
-        if info.mode == SessionMode::Terminal && !images.is_empty() {
-            bail!("终端模式不支持发送图片");
-        }
         let busy = matches!(info.status, SessionStatus::Running | SessionStatus::WaitingPermission);
         if info.tool == ToolKind::Cursor {
             if let Some(res) = self.accounts.resolve(ToolKind::Cursor, info.account_id.as_deref()) {
                 if res.auth_kind == AccountAuthKind::Oauth {
-                    self.accounts.ensure_cursor_oauth_host_clean(&res.id)?;
+                    if let Err(e) = self.accounts.ensure_cursor_oauth_host_clean(&res.id) {
+                        self.remove_images(id, &refs);
+                        return Err(e);
+                    }
                 }
             }
         }
@@ -1435,14 +1470,18 @@ impl Hub {
             let desktop = info.computer_use && self.desktop.mcp_config(id).is_some();
             let resolved = self.accounts.resolve(info.tool, info.account_id.as_deref());
             let expected = self.session_launch_fingerprint(&self.settings.read().unwrap(), &info, desktop, resolved.as_ref());
-            if *rt.mcp_fingerprint.lock().unwrap() != expected { self.relaunch(&rt)?; }
+            if *rt.mcp_fingerprint.lock().unwrap() != expected {
+                if let Err(e) = self.relaunch(&rt) {
+                    self.remove_images(id, &refs);
+                    return Err(e);
+                }
+            }
         }
         // If the process must restart at turn end (permission mode change), messages the tool hasn't read would be lost with it, so queue in that case too
         let steer = matches!(info.tool, ToolKind::Claude | ToolKind::Codex)
             && rt.queue.lock().unwrap().is_empty()
             && !*rt.restart_pending.lock().unwrap();
         if queue && busy && !steer && info.mode == SessionMode::Structured && self.running_tx(&rt).is_some() {
-            let (refs, _) = self.save_images(id, images)?;
             rt.queue.lock().unwrap().push_back(Queued {
                 id: uuid::Uuid::new_v4().simple().to_string()[..12].to_string(),
                 text: text.to_string(),
@@ -1453,17 +1492,21 @@ impl Hub {
             self.sync_queue(&rt);
             return Ok(());
         }
-        // Validate and save images first, so a failure doesn't start the process
-        let (refs, prompt_images) = self.save_images(id, images)?;
         self.deliver(&rt, &info, text, refs, prompt_images, origin)
     }
 
     /// Send a message taken off the queue (its images are already saved)
     fn send_queued(self: &Arc<Self>, id: &str, item: Queued) -> Result<()> {
         let rt = self.get(id)?;
+        let prompt_images = self.load_images(id, &item.images)?;
+        let _delivery = rt.delivery_lock.lock().unwrap();
+        if rt.worktree_busy.load(std::sync::atomic::Ordering::Acquire) {
+            rt.queue.lock().unwrap().push_front(item);
+            self.sync_queue(&rt);
+            bail!("会话正在切入 Worktree，请稍候再发送");
+        }
         self.cancel_resume(id, "manual");
         let info = rt.info.lock().unwrap().clone();
-        let prompt_images = self.load_images(id, &item.images)?;
         self.deliver(&rt, &info, &item.text, item.images, prompt_images, item.origin)
     }
 
@@ -1486,11 +1529,13 @@ impl Hub {
                 self.launch_if_stopped(rt, spec)?
             }
         };
-        if info.mode == SessionMode::Structured {
+        let started_new_turn = if info.mode == SessionMode::Structured {
             // A turn starts with a message delivered to the tool (history imported on a mode switch starts none);
             // the UserMessage emitted next saves and broadcasts it
-            begin_turn(rt, &mut rt.info.lock().unwrap(), now_ms());
-        }
+            begin_turn(rt, &mut rt.info.lock().unwrap(), now_ms())
+        } else {
+            false
+        };
         if info.mode == SessionMode::Terminal {
             // Typed into the terminal by the pty adapter, held until the program has finished starting
             tx.send(AdapterCmd::Send(Prompt { text: text.to_string(), images: vec![] }))
@@ -1520,22 +1565,20 @@ impl Hub {
             _ => text.to_string(),
         };
 
-        // Capture a hidden pre-turn git snapshot so TurnEnd can compute an exact per-turn diff
+        // Capture a hidden pre-turn git snapshot so TurnEnd can compute an exact per-turn diff.
+        // Mid-turn appends/steers join the active turn and must preserve its original baseline.
         let track_ckpt = !slash
             && info.mode == SessionMode::Structured
             && info.tool.has_process()
             && info.tool != ToolKind::Shell
             && info.parent_id.is_none()
             && safe_sid(id);
-        let shared_concurrent = if track_ckpt {
-            self.mark_concurrent_checkpoints(id, &info.cwd)
-        } else {
-            false
-        };
-        let pre_ckpt = if track_ckpt {
+        let pre_ckpt = if track_ckpt && started_new_turn {
             if let Some(prev) = rt.active_checkpoint.lock().unwrap().take() {
                 crate::gitops::delete_ref(&info.cwd, &prev.base_ref);
             }
+            let wt_key = checkpoint_worktree_key(&info.cwd);
+            let shared_concurrent = self.mark_concurrent_checkpoints(id, &wt_key);
             let next_turn = rt
                 .info
                 .lock()
@@ -1546,7 +1589,7 @@ impl Hub {
                 .unwrap_or(1);
             let base_ref = format!("{}{id}/t{next_turn}-base", crate::gitops::CHECKPOINT_PREFIX);
             match crate::gitops::capture_checkpoint(&info.cwd, &base_ref) {
-                Ok(Some(base_tree)) => Some((next_turn, base_ref, base_tree)),
+                Ok(Some(base_tree)) => Some((next_turn, base_ref, base_tree, wt_key, shared_concurrent)),
                 _ => None,
             }
         } else {
@@ -1562,15 +1605,18 @@ impl Hub {
                 origin,
             },
         );
-        if let Some((turn, base_ref, base_tree)) = pre_ckpt {
+        let mut installed_ckpt = false;
+        if let Some((turn, base_ref, base_tree, worktree_key, shared_concurrent)) = pre_ckpt {
             if user_seq > 0 {
                 *rt.active_checkpoint.lock().unwrap() = Some(ActiveCheckpoint {
                     turn,
                     user_seq,
                     base_ref,
                     base_tree,
+                    worktree_key,
                     shared_concurrent,
                 });
+                installed_ckpt = true;
             } else {
                 crate::gitops::delete_ref(&info.cwd, &base_ref);
             }
@@ -1583,8 +1629,10 @@ impl Hub {
             .is_err()
         {
             *rt.pending_handoff.lock().unwrap() = handoff;
-            if let Some(aborted) = rt.active_checkpoint.lock().unwrap().take() {
-                crate::gitops::delete_ref(&info.cwd, &aborted.base_ref);
+            if installed_ckpt {
+                if let Some(aborted) = rt.active_checkpoint.lock().unwrap().take() {
+                    crate::gitops::delete_ref(&info.cwd, &aborted.base_ref);
+                }
             }
             bail!("会话已结束");
         }
@@ -2710,8 +2758,8 @@ impl Hub {
     }
 
     pub fn kill(&self, id: &str) -> Result<()> {
-        self.revoke_desktop(id);
         let rt = self.get(id)?;
+        self.revoke_desktop(id);
         if let Some(tx) = self.running_tx(&rt) {
             let _ = tx.send(AdapterCmd::Kill);
         }
@@ -2719,12 +2767,12 @@ impl Hub {
     }
 
     pub fn delete(&self, id: &str) -> Result<()> {
+        // The id comes from the client and is later used in ticket/upload paths and remove_dir_all: only handle sessions that really exist
+        let rt = self.get(id)?;
         self.revoke_desktop(id);
         self.memories.remove_session(id);
         self.session_mcp.remove_session(id);
         self.review_mcp.remove_session(id);
-        // The id comes from the client and is later used in a path for remove_dir_all: only handle sessions that really exist
-        let rt = self.get(id)?;
         let (bot_link, session_cwd, session_wt) = {
             let i = rt.info.lock().unwrap();
             (i.bot.clone(), i.cwd.clone(), i.worktree.clone())
@@ -2753,18 +2801,35 @@ impl Hub {
             let _ = std::fs::remove_dir_all(uploads_dir(id));
             crate::gitops::delete_session_checkpoints(&session_cwd, id);
         }
-        if let Some(wt) = session_wt {
+        if let Some(wt) = session_wt.filter(|w| !w.attached) {
             let wt_root = crate::gitops::worktree_root(&self.settings.read().unwrap());
-            let under_root = Path::new(&session_cwd)
-                .canonicalize()
-                .ok()
-                .zip(wt_root.canonicalize().ok())
-                .is_some_and(|(d, r)| d.starts_with(&r) && d != r);
-            if under_root && crate::gitops::worktree_is_clean_and_merged(&session_cwd, &wt) {
-                if crate::gitops::worktree_remove(&wt_root, &session_cwd, true, true).is_err() {
-                    let cwd_clone = session_cwd.clone();
+            let wt_dir = crate::gitops::repo_root(Path::new(&session_cwd))
+                .unwrap_or_else(|| PathBuf::from(&session_cwd));
+            let wt_canon = wt_dir.canonicalize().ok();
+            let root_canon = wt_root.canonicalize().ok();
+            let under_root = wt_canon
+                .as_ref()
+                .zip(root_canon.as_ref())
+                .is_some_and(|(d, r)| d.starts_with(r) && d != r);
+            let other_cwds: Vec<String> = self
+                .sessions
+                .lock()
+                .unwrap()
+                .values()
+                .map(|other| other.info.lock().unwrap().cwd.clone())
+                .collect();
+            let still_in_use = wt_canon.as_ref().is_some_and(|d| {
+                other_cwds.iter().any(|oc| {
+                    let op = crate::paths::expand(oc);
+                    let oc_canon = op.canonicalize().unwrap_or(op);
+                    oc_canon == *d || oc_canon.starts_with(d)
+                })
+            });
+            if under_root && !still_in_use && crate::gitops::worktree_is_clean_and_merged(&session_cwd, &wt) {
+                let wt_remove_path = wt_dir.to_string_lossy().into_owned();
+                if crate::gitops::worktree_remove(&wt_root, &wt_remove_path, true, true).is_err() {
                     std::thread::spawn(move || {
-                        let _ = crate::gitops::worktree_remove_best_effort(&wt_root, &cwd_clone, true, true);
+                        let _ = crate::gitops::worktree_remove_best_effort(&wt_root, &wt_remove_path, true, true);
                     });
                 }
             }
@@ -2864,66 +2929,71 @@ impl Hub {
         base: Option<&str>,
     ) -> Result<SessionInfo> {
         let rt = self.get(id)?;
-        if rt
-            .worktree_busy
-            .compare_exchange(
-                false,
-                true,
-                std::sync::atomic::Ordering::AcqRel,
-                std::sync::atomic::Ordering::Acquire,
-            )
-            .is_err()
-        {
-            bail!("Worktree 切换进行中，请稍候");
-        }
-        let _busy_guard = WtBusyGuard(&rt.worktree_busy);
-        let cur = rt.info.lock().unwrap().clone();
-        if cur.parent_id.is_some() || cur.side_chat || cur.review.is_some() || cur.mode != SessionMode::Structured || !cur.tool.has_process() || cur.tool == ToolKind::Shell {
-            bail!("只有顶层 AI 对话会话支持切入独立 Worktree");
-        }
-        if cur.worktree.is_some() {
-            bail!("当前会话已在独立 Worktree 中");
-        }
-        if matches!(cur.status, SessionStatus::Running | SessionStatus::WaitingPermission)
-            || !cur.background_tasks.is_empty()
-            || rt.watch_active.load(std::sync::atomic::Ordering::Relaxed)
-        {
-            bail!("会话正在回复中，请等当前轮次结束后再切入 Worktree");
-        }
+        let (cur, wt_root, folder_name, auto_slug, wt_prefix, wt_temp, auto_rename_seed, mut busy_guard) = {
+            let _delivery = rt.delivery_lock.lock().unwrap();
+            if rt
+                .worktree_busy
+                .compare_exchange(
+                    false,
+                    true,
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Acquire,
+                )
+                .is_err()
+            {
+                bail!("Worktree 切换进行中，请稍候");
+            }
+            let busy_guard = Some(WtBusyGuard(&rt.worktree_busy));
+            let cur = rt.info.lock().unwrap().clone();
+            if cur.parent_id.is_some() || cur.side_chat || cur.review.is_some() || cur.mode != SessionMode::Structured || !cur.tool.has_process() || cur.tool == ToolKind::Shell {
+                bail!("只有顶层 AI 对话会话支持切入独立 Worktree");
+            }
+            if cur.worktree.is_some() {
+                bail!("当前会话已在独立 Worktree 中");
+            }
+            if matches!(cur.status, SessionStatus::Running | SessionStatus::WaitingPermission)
+                || !cur.background_tasks.is_empty()
+                || rt.watch_active.load(std::sync::atomic::Ordering::Relaxed)
+            {
+                bail!("会话正在回复中，请等当前轮次结束后再切入 Worktree");
+            }
 
-        let settings = self.settings.read().unwrap().clone();
-        let wt_root = crate::gitops::worktree_root(&settings);
-        let explicit_name = name.map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
-        let first_msg = if explicit_name.is_none() {
-            self.store
-                .events_tail(id, None, 20)
-                .ok()
-                .and_then(|(evs, _)| {
-                    evs.into_iter().find_map(|e| match e.body {
-                        EventBody::UserMessage { text, .. } => {
-                            let clean = strip_handoff_prefix(&text).trim().to_string();
-                            (!clean.is_empty() && !clean.starts_with('/')).then_some(clean)
-                        }
-                        _ => None,
+            let settings = self.settings.read().unwrap().clone();
+            let wt_root = crate::gitops::worktree_root(&settings);
+            let explicit_name = name.map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
+            let first_msg = if explicit_name.is_none() {
+                self.store
+                    .events_tail(id, None, 20)
+                    .ok()
+                    .and_then(|(evs, _)| {
+                        evs.into_iter().find_map(|e| match e.body {
+                            EventBody::UserMessage { text, .. } => {
+                                let clean = strip_handoff_prefix(&text).trim().to_string();
+                                (!clean.is_empty() && !clean.starts_with('/')).then_some(clean)
+                            }
+                            _ => None,
+                        })
                     })
-                })
-        } else {
-            None
+            } else {
+                None
+            };
+            let auto_rename_seed = if explicit_name.is_some() {
+                None
+            } else {
+                let title_seed = Some(cur.title.as_str()).map(str::trim).filter(|s| !s.is_empty());
+                title_seed.or(first_msg.as_deref()).map(str::to_string)
+            };
+            let folder_name = explicit_name
+                .clone()
+                .unwrap_or_else(|| derive_worktree_name(id, Some(&cur.title), first_msg.as_deref()));
+            let (auto_slug, wt_prefix, wt_temp) = if let Some(n) = explicit_name {
+                (Some(n), crate::gitops::effective_worktree_branch_prefix(&settings), false)
+            } else {
+                plan_session_worktree_naming(id, &settings, branch, auto_rename_seed.as_deref())
+            };
+            (cur, wt_root, folder_name, auto_slug, wt_prefix, wt_temp, auto_rename_seed, busy_guard)
         };
-        let auto_rename_seed = if explicit_name.is_some() {
-            None
-        } else {
-            let title_seed = Some(cur.title.as_str()).map(str::trim).filter(|s| !s.is_empty());
-            title_seed.or(first_msg.as_deref()).map(str::to_string)
-        };
-        let folder_name = explicit_name
-            .clone()
-            .unwrap_or_else(|| derive_worktree_name(id, Some(&cur.title), first_msg.as_deref()));
-        let (auto_slug, wt_prefix, wt_temp) = if let Some(n) = explicit_name {
-            (Some(n), crate::gitops::effective_worktree_branch_prefix(&settings), false)
-        } else {
-            plan_session_worktree_naming(id, &settings, branch, auto_rename_seed.as_deref())
-        };
+
         let (wt_path, wt_meta) = crate::gitops::worktree_add_session(
             &wt_root,
             &cur.cwd,
@@ -2935,29 +3005,40 @@ impl Hub {
             wt_temp,
         )?;
 
-        let retired = self.retire_idle_process(id, &rt, cur.mode);
-        let has_history = cur.external_id.is_some() || self.store.count_user_messages(id).unwrap_or(0) > 0;
         let base_label = wt_meta.base_branch.as_deref().unwrap_or("HEAD").to_string();
-        if has_history {
-            let note = format!(
-                "This session moved in place from the main repository ({}) into an isolated Git worktree at {wt_path} on branch {} (based on {base_label}). Perform all further edits and commands inside this worktree directory.",
-                wt_meta.repo_root, wt_meta.branch
-            );
-            *rt.pending_handoff.lock().unwrap() = self.workspace_handoff_digest(id, &note);
-        }
-        *rt.restart_pending.lock().unwrap() = false;
         let updated = {
-            let mut i = rt.info.lock().unwrap();
-            i.cwd = wt_path;
-            i.worktree = Some(wt_meta.clone());
-            i.external_id = None;
-            i.synced_users = None;
-            if retired && matches!(i.status, SessionStatus::Idle | SessionStatus::Starting) {
-                i.status = SessionStatus::Exited;
+            let _delivery = rt.delivery_lock.lock().unwrap();
+            let retired = self.retire_idle_process(id, &rt, cur.mode);
+            let (prev_info, updated) = {
+                let mut i = rt.info.lock().unwrap();
+                let prev = i.clone();
+                i.cwd = wt_path.clone();
+                i.worktree = Some(wt_meta.clone());
+                i.external_id = None;
+                i.synced_users = None;
+                if retired && matches!(i.status, SessionStatus::Idle | SessionStatus::Starting) {
+                    i.status = SessionStatus::Exited;
+                }
+                (prev, i.clone())
+            };
+            if let Err(e) = self.store.save_session(&updated) {
+                *rt.info.lock().unwrap() = prev_info;
+                crate::gitops::worktree_remove_best_effort(&wt_root, &wt_path, true, true);
+                drop(busy_guard.take());
+                return Err(e);
             }
-            i.clone()
+            let has_history = cur.external_id.is_some() || self.store.count_user_messages(id).unwrap_or(0) > 0;
+            if has_history {
+                let note = format!(
+                    "This session moved in place from the main repository ({}) into an isolated Git worktree at {wt_path} on branch {} (based on {base_label}). Perform all further edits and commands inside this worktree directory.",
+                    wt_meta.repo_root, wt_meta.branch
+                );
+                *rt.pending_handoff.lock().unwrap() = self.workspace_handoff_digest(id, &note);
+            }
+            *rt.restart_pending.lock().unwrap() = false;
+            drop(busy_guard.take());
+            updated
         };
-        self.store.save_session(&updated)?;
         crate::statusline::invalidate_session(id);
         self.broadcast_updated(&updated);
         self.emit(
@@ -3142,35 +3223,35 @@ impl Hub {
         });
     }
 
-    /// Detect concurrent active turns sharing the exact same `cwd` and mark both checkpoints as concurrent so stats never mix
-    fn mark_concurrent_checkpoints(&self, sid: &str, cwd: &str) -> bool {
-        let target = norm_cwd(cwd);
+    /// Detect concurrent active turns sharing the same Git worktree root and mark both checkpoints as concurrent so stats never mix
+    fn mark_concurrent_checkpoints(&self, sid: &str, target_key: &str) -> bool {
         let list: Vec<Arc<SessionRt>> = self.sessions.lock().unwrap().values().cloned().collect();
         let mut hit = false;
         for other in list {
-            let same_busy_dir = {
+            let (eligible, other_cwd, is_busy) = {
                 let i = other.info.lock().unwrap();
-                i.id != sid
-                    && i.parent_id.is_none()
-                    && i.tool.has_process()
-                    && norm_cwd(&i.cwd) == target
-                    && (matches!(i.status, SessionStatus::Running | SessionStatus::WaitingPermission)
-                        || i.turn.as_ref().is_some_and(|t| t.ended_at.is_none()))
+                let eligible = i.id != sid && i.parent_id.is_none() && i.tool.has_process();
+                let is_busy = matches!(i.status, SessionStatus::Running | SessionStatus::WaitingPermission)
+                    || i.turn.as_ref().is_some_and(|t| t.ended_at.is_none());
+                (eligible, i.cwd.clone(), is_busy)
             };
-            if same_busy_dir {
+            if !eligible {
+                continue;
+            }
+            {
+                let mut ckpt_guard = other.active_checkpoint.lock().unwrap();
+                if let Some(ref mut ckpt) = *ckpt_guard {
+                    if ckpt.worktree_key == target_key {
+                        ckpt.shared_concurrent = true;
+                        hit = true;
+                    }
+                    continue;
+                }
+            }
+            if is_busy && checkpoint_worktree_key(&other_cwd) == target_key {
                 hit = true;
                 if let Some(ref mut ckpt) = *other.active_checkpoint.lock().unwrap() {
-                    ckpt.shared_concurrent = true;
-                }
-            } else {
-                let same_dir = {
-                    let i = other.info.lock().unwrap();
-                    i.id != sid && i.parent_id.is_none() && norm_cwd(&i.cwd) == target
-                };
-                if same_dir {
-                    let mut ckpt_guard = other.active_checkpoint.lock().unwrap();
-                    if let Some(ref mut ckpt) = *ckpt_guard {
-                        hit = true;
+                    if ckpt.worktree_key == target_key {
                         ckpt.shared_concurrent = true;
                     }
                 }
@@ -3179,19 +3260,23 @@ impl Hub {
         hit
     }
 
-    fn has_concurrent_turn_in_cwd(&self, sid: &str, cwd: &str) -> bool {
-        let target = norm_cwd(cwd);
+    fn has_concurrent_turn_in_cwd(&self, sid: &str, target_key: &str) -> bool {
         let list: Vec<Arc<SessionRt>> = self.sessions.lock().unwrap().values().cloned().collect();
         list.into_iter().any(|other| {
-            let active = other.active_checkpoint.lock().unwrap().is_some();
-            let i = other.info.lock().unwrap();
-            i.id != sid
-                && i.parent_id.is_none()
-                && i.tool.has_process()
-                && norm_cwd(&i.cwd) == target
-                && (active
-                    || matches!(i.status, SessionStatus::Running | SessionStatus::WaitingPermission)
-                    || i.turn.as_ref().is_some_and(|t| t.ended_at.is_none()))
+            let (eligible, other_cwd, is_busy) = {
+                let i = other.info.lock().unwrap();
+                let eligible = i.id != sid && i.parent_id.is_none() && i.tool.has_process();
+                let is_busy = matches!(i.status, SessionStatus::Running | SessionStatus::WaitingPermission)
+                    || i.turn.as_ref().is_some_and(|t| t.ended_at.is_none());
+                (eligible, i.cwd.clone(), is_busy)
+            };
+            if !eligible {
+                return false;
+            }
+            if let Some(ref ckpt) = *other.active_checkpoint.lock().unwrap() {
+                return ckpt.worktree_key == target_key;
+            }
+            is_busy && checkpoint_worktree_key(&other_cwd) == target_key
         })
     }
 
@@ -3968,7 +4053,7 @@ impl Hub {
             crate::gitops::delete_ref(&cwd, &active.base_ref);
             return;
         };
-        let concurrent = active.shared_concurrent || self.has_concurrent_turn_in_cwd(&sid, &cwd);
+        let concurrent = active.shared_concurrent || self.has_concurrent_turn_in_cwd(&sid, &active.worktree_key);
         let mut rel_paths: Vec<String> = Vec::new();
         let changed = if end_tree == active.base_tree {
             None
@@ -5091,11 +5176,14 @@ fn around(text: &str, q: &str, ctx: usize) -> String {
 /// Activity-only `session.updated` broadcasts go out at most this often per session
 const ACTIVITY_PUSH_MS: i64 = 5000;
 
-/// Start a new turn unless one is open (a message sent in the middle of a turn joins it)
-fn begin_turn(rt: &SessionRt, info: &mut SessionInfo, ts: i64) {
+/// Start a new turn unless one is open (returns true when a new turn was opened)
+fn begin_turn(rt: &SessionRt, info: &mut SessionInfo, ts: i64) -> bool {
     if info.turn.as_ref().map_or(true, |t| t.ended_at.is_some()) {
         rt.turn_files.lock().unwrap().clear();
         info.turn = Some(TurnInfo { started_at: ts, ..Default::default() });
+        true
+    } else {
+        false
     }
 }
 
@@ -5205,6 +5293,7 @@ fn new_rt(info: SessionInfo) -> SessionRt {
         active_checkpoint: Mutex::new(None),
         worktree_busy: std::sync::atomic::AtomicBool::new(false),
         worktree_auto_renaming: std::sync::atomic::AtomicBool::new(false),
+        delivery_lock: Mutex::new(()),
     }
 }
 
@@ -5241,6 +5330,31 @@ fn canonical_cwd_key(cwd: &str) -> String {
     norm_cwd(&canon.to_string_lossy())
 }
 
+fn checkpoint_worktree_key(cwd: &str) -> String {
+    let dir = crate::paths::expand(cwd);
+    let base = crate::gitops::repo_root(&dir).unwrap_or(dir);
+    let canon = base.canonicalize().unwrap_or(base);
+    norm_cwd(&canon.to_string_lossy())
+}
+
+/// Resolve the sole CLI target allowed for background branch naming: strictly the session's own tool
+/// (Claude or Codex only) and its own bound account. Returns `None` for other tools or when an explicit
+/// `account_id` cannot be resolved, so prompts are never sent to a different tool or account.
+fn resolve_branch_slug_cli_target(
+    hub: &Hub,
+    session_tool: ToolKind,
+    account_id: Option<&str>,
+) -> Option<(ToolKind, Option<crate::accounts::ResolvedAccount>)> {
+    if !matches!(session_tool, ToolKind::Claude | ToolKind::Codex) {
+        return None;
+    }
+    let resolved = hub.accounts.resolve(session_tool, account_id);
+    if account_id.is_some() && resolved.is_none() {
+        return None;
+    }
+    Some((session_tool, resolved))
+}
+
 #[cfg(test)]
 async fn generate_branch_slug_via_cli(
     _hub: &Arc<Hub>,
@@ -5260,87 +5374,67 @@ async fn generate_branch_slug_via_cli(
 ) -> Option<String> {
     use tokio::io::AsyncWriteExt;
 
+    let (kind, resolved) = resolve_branch_slug_cli_target(hub, session_tool, account_id)?;
+    let settings = hub.settings.read().unwrap().clone();
+    let program = crate::tools::resolve(kind, &settings)?;
     let snippet: String = source_text.chars().take(600).collect();
     let prompt = format!(
         "Generate a concise English git branch slug for this coding task. \
          Rules: 2 to 5 lowercase ASCII kebab-case words (a-z, 0-9, -), no slashes or prefixes like feat/ or yi/, output ONLY the slug and nothing else.\n\nTask:\n{snippet}"
     );
-    let mut candidates: Vec<(ToolKind, Option<&str>)> = Vec::new();
-    if matches!(session_tool, ToolKind::Claude | ToolKind::Codex) {
-        candidates.push((session_tool, account_id));
-    }
-    for kind in [ToolKind::Claude, ToolKind::Codex] {
-        if !candidates.iter().any(|(k, _)| *k == kind) {
-            candidates.push((kind, None));
+    let args: Vec<String> = match kind {
+        ToolKind::Claude => [
+            "-p",
+            "--output-format",
+            "text",
+            "--no-session-persistence",
+            "--tools",
+            "",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect(),
+        ToolKind::Codex => [
+            "exec",
+            "--skip-git-repo-check",
+            "--sandbox",
+            "read-only",
+            "--ephemeral",
+            "-",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect(),
+        _ => return None,
+    };
+    let mut cmd: tokio::process::Command = adapters::std_command(&program, &args).into();
+    if let Some(res) = &resolved {
+        for k in &res.env_unset {
+            cmd.env_remove(k);
+        }
+        for (k, v) in &res.env {
+            cmd.env(k, v);
         }
     }
-
-    for (kind, acc_id) in candidates {
-        let settings = hub.settings.read().unwrap().clone();
-        let Some(program) = crate::tools::resolve(kind, &settings) else {
-            continue;
-        };
-        let resolved = hub.accounts.resolve(kind, acc_id);
-        let args: Vec<String> = match kind {
-            ToolKind::Claude => [
-                "-p",
-                "--output-format",
-                "text",
-                "--no-session-persistence",
-                "--tools",
-                "",
-            ]
-            .into_iter()
-            .map(str::to_string)
-            .collect(),
-            ToolKind::Codex => [
-                "exec",
-                "--skip-git-repo-check",
-                "--sandbox",
-                "read-only",
-                "--ephemeral",
-                "-",
-            ]
-            .into_iter()
-            .map(str::to_string)
-            .collect(),
-            _ => continue,
-        };
-        let mut cmd: tokio::process::Command = adapters::std_command(&program, &args).into();
-        if let Some(res) = &resolved {
-            for k in &res.env_unset {
-                cmd.env_remove(k);
-            }
-            for (k, v) in &res.env {
-                cmd.env(k, v);
-            }
+    cmd.current_dir(std::env::temp_dir())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    #[cfg(windows)]
+    cmd.creation_flags(0x0800_0000);
+    let mut child = cmd.spawn().ok()?;
+    let prompt_bytes = prompt.as_bytes().to_vec();
+    let out = tokio::time::timeout(std::time::Duration::from_secs(15), async move {
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(&prompt_bytes).await;
         }
-        cmd.current_dir(std::env::temp_dir())
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .kill_on_drop(true);
-        #[cfg(windows)]
-        cmd.creation_flags(0x0800_0000);
-        let Ok(mut child) = cmd.spawn() else {
-            continue;
-        };
-        let prompt_bytes = prompt.as_bytes().to_vec();
-        let out = tokio::time::timeout(std::time::Duration::from_secs(15), async move {
-            if let Some(mut stdin) = child.stdin.take() {
-                let _ = stdin.write_all(&prompt_bytes).await;
-            }
-            child.wait_with_output().await
-        })
-        .await;
-        if let Ok(Ok(output)) = out {
-            if output.status.success() {
-                if let Some(slug) =
-                    crate::gitops::parse_generated_branch_slug(&String::from_utf8_lossy(&output.stdout))
-                {
-                    return Some(slug);
-                }
-            }
+        child.wait_with_output().await
+    })
+    .await;
+    if let Ok(Ok(output)) = out {
+        if output.status.success() {
+            return crate::gitops::parse_generated_branch_slug(&String::from_utf8_lossy(&output.stdout));
         }
     }
     None
@@ -6724,6 +6818,50 @@ mod tests {
     }
 
     #[test]
+    fn delete_and_gateways_never_remove_outside_or_unregistered_tickets() {
+        let tmp = tempfile::tempdir().unwrap();
+        let victim = tmp.path().join("victim.json");
+        std::fs::write(&victim, r#"{"keep":true}"#).unwrap();
+
+        let sess_dir = tmp.path().join("session-tickets");
+        let rev_dir = tmp.path().join("review-tickets");
+        let mem_dir = tmp.path().join("memory");
+        std::fs::create_dir_all(&sess_dir).unwrap();
+        std::fs::create_dir_all(&rev_dir).unwrap();
+        std::fs::create_dir_all(mem_dir.join("tickets")).unwrap();
+
+        let smcp = crate::session_mcp::SessionMcp::new(sess_dir.clone());
+        let rmcp = crate::review_mcp::ReviewMcp::new(rev_dir.clone());
+        let mem = crate::memory::Memories::new(crate::memory::store::MemoryStore::new(Some(mem_dir)));
+
+        for bad_id in ["../victim", "../../victim", "sub/victim", "sub\\victim", ""] {
+            assert!(smcp.ensure_session(bad_id).is_err());
+            assert!(rmcp.ensure_session(bad_id).is_err());
+            assert!(mem.ensure_session(bad_id, tmp.path(), false).is_err());
+            smcp.remove_session(bad_id);
+            rmcp.remove_session(bad_id);
+            mem.remove_session(bad_id);
+            assert!(victim.exists(), "traversal id {bad_id:?} must not remove outside file");
+        }
+
+        // Even a valid-looking ID that was never registered must not delete an unregistered file.
+        let orphan_sess = sess_dir.join("orphan.json");
+        let orphan_rev = rev_dir.join("orphan.json");
+        std::fs::write(&orphan_sess, r#"{"orphan":true}"#).unwrap();
+        std::fs::write(&orphan_rev, r#"{"orphan":true}"#).unwrap();
+        smcp.remove_session("orphan");
+        rmcp.remove_session("orphan");
+        assert!(orphan_sess.exists());
+        assert!(orphan_rev.exists());
+
+        // Hub::kill and Hub::delete reject unknown/traversal IDs before touching any gateway tickets.
+        let hub = Hub::new(crate::store::Store::open_memory().unwrap(), Default::default());
+        assert!(hub.kill("../victim").is_err());
+        assert!(hub.delete("../victim").is_err());
+        assert!(victim.exists());
+    }
+
+    #[test]
     fn create_rejects_computer_use_for_non_chat_tools() {
         let dir = tempfile::tempdir().unwrap();
         let hub = Hub::new(crate::store::Store::open_memory().unwrap(), Default::default());
@@ -7608,6 +7746,78 @@ mod tests {
         assert_eq!(rel_ids, vec!["parent", "side-1"]);
     }
 
+    #[test]
+    fn session_read_pagination_scans_past_invisible_events_in_both_directions() {
+        let hub = Hub::new(crate::store::Store::open_memory().unwrap(), DaemonSettings::default());
+        let _parent_rx = live(&hub, "parent", SessionMode::Structured, SessionStatus::Idle, 1);
+        let _side_rx = live(&hub, "side-1", SessionMode::Structured, SessionStatus::Running, 1);
+        {
+            let side = hub.get("side-1").unwrap();
+            let mut info = side.info.lock().unwrap();
+            info.parent_id = Some("parent".into());
+            info.side_chat = true;
+            hub.store.save_session(&info).unwrap();
+        }
+        let seq_user = hub.emit_returning_seq("parent", 0, EventBody::UserMessage {
+            text: "First user question".into(),
+            images: vec![],
+            origin: None,
+        });
+        for i in 0..500 {
+            hub.emit("parent", 0, EventBody::ToolCall {
+                id: format!("tc-{i}"),
+                name: "Read".into(),
+                title: format!("file-{i}.rs"),
+                input: json!({}),
+                diffs: vec![],
+            });
+        }
+        let seq_reply = hub.emit_returning_seq("parent", 0, EventBody::AssistantText {
+            id: "a-end".into(),
+            text: "Final summary".into(),
+        });
+
+        let tmp = tempfile::tempdir().unwrap();
+        let smcp = crate::session_mcp::SessionMcp::new(tmp.path().to_path_buf());
+        smcp.ensure_session("side-1").unwrap();
+        let ticket_val: Value =
+            serde_json::from_slice(&std::fs::read(tmp.path().join("side-1.json")).unwrap()).unwrap();
+        let ticket = ticket_val["ticket"].as_str().unwrap();
+
+        // Newest-first: limit=1 gets the reply with earlierSeq + hasMore=true, then paging scans past 500 ToolCalls to seq_user
+        let p1 = smcp.mcp(&hub, "side-1", ticket, json!({
+            "method": "tools/call",
+            "params": {"name": "session_read", "arguments": {"view": "messages", "limit": 1}}
+        })).unwrap();
+        assert_eq!(p1["structuredContent"]["items"][0]["seq"], seq_reply);
+        assert_eq!(p1["structuredContent"]["hasMore"], true);
+        let earlier = p1["structuredContent"]["earlierSeq"].as_i64().unwrap();
+
+        let p2 = smcp.mcp(&hub, "side-1", ticket, json!({
+            "method": "tools/call",
+            "params": {"name": "session_read", "arguments": {"view": "messages", "beforeSeq": earlier, "limit": 1}}
+        })).unwrap();
+        assert_eq!(p2["structuredContent"]["items"][0]["seq"], seq_user);
+        assert_eq!(p2["structuredContent"]["earlierSeq"], Value::Null);
+        assert_eq!(p2["structuredContent"]["hasMore"], false);
+
+        // Oldest-first: afterSeq=0 gets seq_user with nextSeq + hasMore=true, then paging scans past 500 ToolCalls to seq_reply
+        let f1 = smcp.mcp(&hub, "side-1", ticket, json!({
+            "method": "tools/call",
+            "params": {"name": "session_read", "arguments": {"view": "messages", "afterSeq": 0, "limit": 1}}
+        })).unwrap();
+        assert_eq!(f1["structuredContent"]["items"][0]["seq"], seq_user);
+        assert_eq!(f1["structuredContent"]["hasMore"], true);
+        let next_seq = f1["structuredContent"]["nextSeq"].as_i64().unwrap();
+
+        let f2 = smcp.mcp(&hub, "side-1", ticket, json!({
+            "method": "tools/call",
+            "params": {"name": "session_read", "arguments": {"view": "messages", "afterSeq": next_seq, "limit": 1}}
+        })).unwrap();
+        assert_eq!(f2["structuredContent"]["items"][0]["seq"], seq_reply);
+        assert_eq!(f2["structuredContent"]["hasMore"], false);
+    }
+
     #[tokio::test]
     async fn side_chat_excluded_from_search_and_notify_carries_parent_hints() {
         let hub = Hub::new(crate::store::Store::open_memory().unwrap(), DaemonSettings::default());
@@ -8305,6 +8515,306 @@ mod tests {
         run(Path::new(&wt4.cwd), &["push", "-qu", "origin", "s-77777777"]);
         assert!(!hub.apply_auto_worktree_branch_slug(sid4, "should-not-rename-pushed").unwrap());
         assert_eq!(hub.info(sid4).unwrap().worktree.as_ref().unwrap().branch, "s-77777777");
+    }
+
+    #[tokio::test]
+    async fn attached_or_shared_worktree_is_preserved_on_create_rollback_and_delete() {
+        let d = tempfile::tempdir().unwrap();
+        let wt_root = d.path().join("worktrees");
+        let repo = d.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let run = |a: &[&str]| {
+            let st = std::process::Command::new("git")
+                .args(a)
+                .current_dir(&repo)
+                .env("GIT_OPTIONAL_LOCKS", "0")
+                .status()
+                .unwrap();
+            assert!(st.success(), "{a:?}");
+        };
+        run(&["init", "-q", "-b", "main"]);
+        run(&["config", "user.email", "t@t"]);
+        run(&["config", "user.name", "t"]);
+        std::fs::write(repo.join("base.txt"), "base\n").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-qm", "init"]);
+
+        let mut settings = DaemonSettings {
+            worktree_root: Some(wt_root.to_string_lossy().to_string()),
+            ..Default::default()
+        };
+        settings.browser.executable_path = Some(d.path().join("nonexistent-browser").to_string_lossy().into());
+        let hub = Hub::new(Store::open_memory().unwrap(), settings);
+
+        // 1. Creator session creates a clean worktree under wt_root
+        let sid1 = "11111111-1111-1111-1111-111111111111";
+        let _rx1 = live(&hub, sid1, SessionMode::Structured, SessionStatus::Idle, 1);
+        hub.get(sid1).unwrap().info.lock().unwrap().cwd = repo.to_string_lossy().to_string();
+        let wt1 = hub.enter_worktree(sid1, Some("shared-wt"), None, None).unwrap();
+        let wt_path = wt1.cwd.clone();
+        assert!(Path::new(&wt_path).exists());
+
+        // 2. Failing create() on that existing worktree (worktree=false) must NOT delete it during rollback
+        let res = hub.create(CreateParams {
+            tool: "claude".into(),
+            cwd: wt_path.clone(),
+            mode: Some(SessionMode::Structured),
+            worktree: false,
+            browser_use: true,
+            ..Default::default()
+        });
+        assert!(res.is_err());
+        assert!(Path::new(&wt_path).exists(), "failed create on existing worktree must not delete it");
+
+        // 3. Attaching a second session marks attached=true; deleting sid1 while sid2 uses it keeps the worktree
+        let sid2 = "22222222-2222-2222-2222-222222222222";
+        let _rx2 = live(&hub, sid2, SessionMode::Structured, SessionStatus::Idle, 1);
+        let det = crate::gitops::detect_existing_worktree(&wt_path).unwrap();
+        assert!(det.attached);
+        {
+            let rt2 = hub.get(sid2).unwrap();
+            let mut info2 = rt2.info.lock().unwrap();
+            info2.cwd = wt_path.clone();
+            info2.worktree = Some(det);
+        }
+        hub.delete(sid1).unwrap();
+        assert!(Path::new(&wt_path).exists(), "worktree still used by sid2 must be preserved");
+
+        // 4. Deleting sid2 (attached=true) must also preserve the worktree it did not create
+        hub.delete(sid2).unwrap();
+        assert!(Path::new(&wt_path).exists(), "attached session delete must not remove worktree");
+    }
+
+    #[tokio::test]
+    async fn mid_turn_append_preserves_turn_checkpoint() {
+        let d = tempfile::tempdir().unwrap();
+        let repo = d.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let run = |a: &[&str]| {
+            let st = std::process::Command::new("git")
+                .args(a)
+                .current_dir(&repo)
+                .env("GIT_OPTIONAL_LOCKS", "0")
+                .status()
+                .unwrap();
+            assert!(st.success(), "{a:?}");
+        };
+        run(&["init", "-q", "-b", "main"]);
+        run(&["config", "user.email", "t@t"]);
+        run(&["config", "user.name", "t"]);
+        run(&["config", "core.autocrlf", "false"]);
+        std::fs::write(repo.join("a.txt"), "a0\n").unwrap();
+        std::fs::write(repo.join("b.txt"), "b0\n").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-qm", "init"]);
+        let cwd = repo.to_string_lossy().to_string();
+
+        let hub = Hub::new(Store::open_memory().unwrap(), DaemonSettings::default());
+        let sid = "cccccccc-0000-0000-0000-000000000001";
+        let mut rx = live(&hub, sid, SessionMode::Structured, SessionStatus::Idle, 1);
+        {
+            let rt = hub.get(sid).unwrap();
+            let mut i = rt.info.lock().unwrap();
+            i.tool = ToolKind::Codex;
+            i.cwd = cwd.clone();
+        }
+
+        hub.send(sid, "Start turn", vec![], false, None).unwrap();
+        assert!(matches!(rx.try_recv(), Ok(AdapterCmd::Send(_))));
+        std::fs::write(repo.join("a.txt"), "a1\n").unwrap();
+
+        // Mid-turn steer/append on Codex joins the open turn without resetting active_checkpoint
+        assert_eq!(hub.info(sid).unwrap().status, SessionStatus::Running);
+        hub.send(sid, "Also edit b.txt", vec![], true, None).unwrap();
+        assert!(matches!(rx.try_recv(), Ok(AdapterCmd::Send(_))));
+        std::fs::write(repo.join("b.txt"), "b1\n").unwrap();
+
+        hub.emit(sid, 0, EventBody::TurnEnd { stop_reason: Some("end_turn".into()), model: None });
+        let info = hub.info(sid).unwrap();
+        assert_eq!(info.checkpoints.len(), 1);
+        assert_eq!(info.checkpoints[0].files_changed, 2);
+    }
+
+    #[tokio::test]
+    async fn concurrent_subdir_same_worktree_marks_concurrent_while_other_worktree_isolated() {
+        let d = tempfile::tempdir().unwrap();
+        let repo = d.path().join("repo");
+        let sub = repo.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let run = |dir: &Path, a: &[&str]| {
+            let st = std::process::Command::new("git")
+                .args(a)
+                .current_dir(dir)
+                .env("GIT_OPTIONAL_LOCKS", "0")
+                .status()
+                .unwrap();
+            assert!(st.success(), "{a:?}");
+        };
+        run(&repo, &["init", "-q", "-b", "main"]);
+        run(&repo, &["config", "user.email", "t@t"]);
+        run(&repo, &["config", "user.name", "t"]);
+        run(&repo, &["config", "core.autocrlf", "false"]);
+        std::fs::write(repo.join("a.txt"), "a0\n").unwrap();
+        std::fs::write(sub.join("b.txt"), "b0\n").unwrap();
+        std::fs::write(repo.join("c.txt"), "c0\n").unwrap();
+        run(&repo, &["add", "."]);
+        run(&repo, &["commit", "-qm", "init"]);
+
+        let wt = d.path().join("linked-wt");
+        run(&repo, &["worktree", "add", "-qb", "feat/other", &wt.to_string_lossy(), "main"]);
+
+        let hub = Hub::new(Store::open_memory().unwrap(), DaemonSettings::default());
+        let sid_a = "dddddddd-0000-0000-0000-000000000001";
+        let sid_b = "dddddddd-0000-0000-0000-000000000002";
+        let sid_c = "dddddddd-0000-0000-0000-000000000003";
+        let mut rx_a = live(&hub, sid_a, SessionMode::Structured, SessionStatus::Idle, 1);
+        let mut rx_b = live(&hub, sid_b, SessionMode::Structured, SessionStatus::Idle, 1);
+        let mut rx_c = live(&hub, sid_c, SessionMode::Structured, SessionStatus::Idle, 1);
+        hub.get(sid_a).unwrap().info.lock().unwrap().cwd = repo.to_string_lossy().to_string();
+        hub.get(sid_b).unwrap().info.lock().unwrap().cwd = sub.to_string_lossy().to_string();
+        hub.get(sid_c).unwrap().info.lock().unwrap().cwd = wt.to_string_lossy().to_string();
+
+        // A in repo/ and B in repo/sub/ share the same git worktree root
+        hub.send(sid_a, "Edit a.txt", vec![], false, None).unwrap();
+        assert!(matches!(rx_a.try_recv(), Ok(AdapterCmd::Send(_))));
+        hub.emit(sid_a, 0, EventBody::ToolCall {
+            id: "ta".into(), name: "Edit".into(), title: "a.txt".into(), input: json!({}),
+            diffs: vec![FileDiff { path: "a.txt".into(), old_text: None, new_text: None, unified: None }],
+        });
+        std::fs::write(repo.join("a.txt"), "a1\n").unwrap();
+
+        hub.send(sid_b, "Edit b.txt", vec![], false, None).unwrap();
+        assert!(matches!(rx_b.try_recv(), Ok(AdapterCmd::Send(_))));
+        hub.emit(sid_b, 0, EventBody::ToolCall {
+            id: "tb".into(), name: "Edit".into(), title: "b.txt".into(), input: json!({}),
+            diffs: vec![FileDiff { path: "b.txt".into(), old_text: None, new_text: None, unified: None }],
+        });
+        std::fs::write(sub.join("b.txt"), "b1\n").unwrap();
+
+        hub.emit(sid_b, 0, EventBody::TurnEnd { stop_reason: Some("end_turn".into()), model: None });
+        hub.emit(sid_a, 0, EventBody::TurnEnd { stop_reason: Some("end_turn".into()), model: None });
+
+        let info_a = hub.info(sid_a).unwrap();
+        let info_b = hub.info(sid_b).unwrap();
+        assert_eq!(info_a.checkpoints[0].paths, vec!["a.txt".to_string()]);
+        assert_eq!(info_b.checkpoints[0].paths, vec!["sub/b.txt".to_string()]);
+
+        // A in repo/ and C in linked-wt/ are isolated worktrees -> NOT marked concurrent
+        hub.send(sid_a, "Edit a.txt again", vec![], false, None).unwrap();
+        assert!(matches!(rx_a.try_recv(), Ok(AdapterCmd::Send(_))));
+        std::fs::write(repo.join("a.txt"), "a2\n").unwrap();
+
+        hub.send(sid_c, "Edit c.txt", vec![], false, None).unwrap();
+        assert!(matches!(rx_c.try_recv(), Ok(AdapterCmd::Send(_))));
+        std::fs::write(wt.join("c.txt"), "c1\n").unwrap();
+
+        hub.emit(sid_c, 0, EventBody::TurnEnd { stop_reason: Some("end_turn".into()), model: None });
+        hub.emit(sid_a, 0, EventBody::TurnEnd { stop_reason: Some("end_turn".into()), model: None });
+
+        let info_a2 = hub.info(sid_a).unwrap();
+        assert_eq!(info_a2.checkpoints.len(), 2);
+        assert!(info_a2.checkpoints[1].paths.is_empty(), "separate worktree must not mark concurrent");
+        assert_eq!(info_a2.checkpoints[1].files_changed, 1);
+    }
+
+    #[test]
+    fn send_and_send_queued_reject_while_worktree_busy() {
+        let hub = Hub::new(Store::open_memory().unwrap(), DaemonSettings::default());
+        let sid = "eeeeeeee-0000-0000-0000-000000000001";
+        let _rx = live(&hub, sid, SessionMode::Structured, SessionStatus::Idle, 1);
+        let rt = hub.get(sid).unwrap();
+        rt.worktree_busy.store(true, std::sync::atomic::Ordering::Release);
+
+        assert!(hub.send(sid, "hello", vec![], false, None).is_err());
+
+        let item = Queued {
+            id: "q1".into(),
+            text: "queued msg".into(),
+            images: vec![],
+            now: false,
+            origin: None,
+        };
+        assert!(hub.send_queued(sid, item).is_err());
+        assert_eq!(rt.queue.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn branch_slug_cli_target_is_strictly_same_tool_and_account() {
+        let dir = tempfile::tempdir().unwrap();
+        let accounts = Arc::new(crate::accounts::AccountManager::with_dirs(
+            dir.path().to_path_buf(),
+            dir.path().to_path_buf(),
+        ));
+        let hub = Hub::with_accounts(Store::open_memory().unwrap(), DaemonSettings::default(), accounts.clone());
+        let claude_a = accounts
+            .save(crate::accounts::SaveAccountRequest {
+                tool: ToolKind::Claude,
+                id: None,
+                label: Some("Claude A".into()),
+                auth_kind: Some(AccountAuthKind::ApiKey),
+                allow_auto_failover: Some(false),
+                priority: Some(1),
+                api_config: Some(ApiKeyConfig { api_key: "sk-c-a".into(), ..Default::default() }),
+                verified_identity: None,
+                activate: true,
+            })
+            .unwrap();
+        let claude_b = accounts
+            .save(crate::accounts::SaveAccountRequest {
+                tool: ToolKind::Claude,
+                id: None,
+                label: Some("Claude B".into()),
+                auth_kind: Some(AccountAuthKind::ApiKey),
+                allow_auto_failover: Some(false),
+                priority: Some(2),
+                api_config: Some(ApiKeyConfig { api_key: "sk-c-b".into(), ..Default::default() }),
+                verified_identity: None,
+                activate: false,
+            })
+            .unwrap();
+        let codex_a = accounts
+            .save(crate::accounts::SaveAccountRequest {
+                tool: ToolKind::Codex,
+                id: None,
+                label: Some("Codex A".into()),
+                auth_kind: Some(AccountAuthKind::ApiKey),
+                allow_auto_failover: Some(false),
+                priority: Some(1),
+                api_config: Some(ApiKeyConfig { api_key: "sk-x-a".into(), ..Default::default() }),
+                verified_identity: None,
+                activate: true,
+            })
+            .unwrap();
+
+        // Non-Claude/Codex tools never fall back to Claude/Codex CLI naming
+        for other in [
+            ToolKind::Cursor,
+            ToolKind::Kiro,
+            ToolKind::Qoder,
+            ToolKind::Codebuddy,
+            ToolKind::Antigravity,
+            ToolKind::Shell,
+            ToolKind::Files,
+        ] {
+            assert!(resolve_branch_slug_cli_target(&hub, other, None).is_none());
+            assert!(resolve_branch_slug_cli_target(&hub, other, Some(&claude_a.id)).is_none());
+        }
+
+        // Explicit bound account selects strictly that account; unknown ID refuses fallback
+        let (t, res) = resolve_branch_slug_cli_target(&hub, ToolKind::Claude, Some(&claude_b.id)).unwrap();
+        assert_eq!(t, ToolKind::Claude);
+        assert_eq!(res.unwrap().id, claude_b.id);
+        assert!(resolve_branch_slug_cli_target(&hub, ToolKind::Claude, Some("missing-acc")).is_none());
+        assert!(resolve_branch_slug_cli_target(&hub, ToolKind::Codex, Some(&claude_a.id)).is_none());
+
+        // Unspecified account uses only that tool's own default resolution
+        let (t, res) = resolve_branch_slug_cli_target(&hub, ToolKind::Claude, None).unwrap();
+        assert_eq!(t, ToolKind::Claude);
+        assert_eq!(res.unwrap().id, claude_a.id);
+
+        let (t, res) = resolve_branch_slug_cli_target(&hub, ToolKind::Codex, None).unwrap();
+        assert_eq!(t, ToolKind::Codex);
+        assert_eq!(res.unwrap().id, codex_a.id);
     }
 }
 

@@ -251,8 +251,9 @@ pub fn changes_with(cwd: &str, with_diff: bool, only: Option<&[String]>) -> Resu
         if entry.len() < 4 {
             continue;
         }
-        let (code, path) = entry.split_at(3);
-        let code = code.trim().to_string();
+        let (xy_raw, path) = entry.split_at(3);
+        let xy = &xy_raw[..2];
+        let code = xy.trim().to_string();
         if code == "!!" {
             if ignored.len() < IGNORED_MAX {
                 ignored.push(path.to_string());
@@ -260,36 +261,37 @@ pub fn changes_with(cwd: &str, with_diff: bool, only: Option<&[String]>) -> Resu
             continue;
         }
         total += 1;
-        // Rename entries are followed by the original path
-        if code.starts_with('R') || code.starts_with('C') {
-            it.next();
-        }
-        if only.is_some_and(|o| !o.iter().any(|x| x == path)) || files.len() >= STATUS_MAX {
+        let xb = xy.as_bytes()[0];
+        let yb = xy.as_bytes()[1];
+        let is_rename = xb == b'R' || yb == b'R';
+        let is_copy = xb == b'C' || yb == b'C';
+        // Rename/copy entries are followed by the original path; only renames carry oldPath so copies never delete their source.
+        let old_path: Option<String> = if is_rename || is_copy {
+            let orig = it.next();
+            if is_rename {
+                orig.map(str::to_string)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if only.is_some_and(|o| !o.iter().any(|x| x == path || old_path.as_deref() == Some(x.as_str())))
+            || files.len() >= STATUS_MAX
+        {
             continue;
         }
         let untracked = code == "??";
         let diff = if !with_diff {
             String::new()
         } else if untracked {
-            let full = root.join(path);
-            match std::fs::read(&full) {
-                Ok(b) if b.len() > DIFF_MAX => String::new(),
-                Ok(b) if b.iter().take(8000).any(|&c| c == 0) => String::new(),
-                Ok(b) => {
-                    let text = String::from_utf8_lossy(&b);
-                    let n = text.lines().count();
-                    let mut d = format!("--- /dev/null\n+++ b/{path}\n@@ -0,0 +1,{n} @@\n");
-                    for l in text.lines() {
-                        d.push('+');
-                        d.push_str(l);
-                        d.push('\n');
-                    }
-                    d
-                }
-                Err(_) => String::new(),
-            }
+            untracked_diff(&root, path)
         } else {
-            let d = git_ok(&root, &["diff", "HEAD", "--no-color", "--", path]).unwrap_or_default();
+            let d = if let Some(ref old) = old_path {
+                git_ok(&root, &["diff", "HEAD", "-M", "--no-color", "--", old, path]).unwrap_or_default()
+            } else {
+                git_ok(&root, &["diff", "HEAD", "--no-color", "--", path]).unwrap_or_default()
+            };
             if d.len() > DIFF_MAX {
                 String::new()
             } else {
@@ -299,17 +301,21 @@ pub fn changes_with(cwd: &str, with_diff: bool, only: Option<&[String]>) -> Resu
         // Lines added / removed: null for binaries, files too large, and repos without HEAD
         let (added, deleted) = if untracked {
             counted += 1;
-            (if counted <= COUNT_MAX { count_lines(&root.join(path)) } else { None }, Some(0))
+            (if counted <= COUNT_MAX { count_lines(&root, path) } else { None }, Some(0))
         } else {
             stats.get(path).copied().unwrap_or((None, None))
         };
-        files.push(json!({
+        let mut item = json!({
             "path": path,
             "status": if untracked { "new".to_string() } else { code },
             "diff": diff,
             "added": added,
             "deleted": deleted,
-        }));
+        });
+        if let Some(old) = old_path {
+            item["oldPath"] = json!(old);
+        }
+        files.push(item);
     }
     Ok(json!({
         "repo": root.display().to_string(),
@@ -340,13 +346,22 @@ fn numstat(root: &Path) -> std::collections::HashMap<String, (Option<u64>, Optio
     m
 }
 
-/// Line count of a new file; not counted for files that are too large or binary
-fn count_lines(full: &Path) -> Option<u64> {
-    let meta = std::fs::metadata(full).ok()?;
+/// Line count of a new file; symlinks count as 1 without following; not counted for files too large, binary, or outside the repo
+fn count_lines(root: &Path, rel: &str) -> Option<u64> {
+    let full = root.join(rel);
+    let meta = std::fs::symlink_metadata(&full).ok()?;
+    if meta.file_type().is_symlink() {
+        return Some(1);
+    }
     if !meta.is_file() || meta.len() as usize > DIFF_MAX {
         return None;
     }
-    let b = std::fs::read(full).ok()?;
+    let can_root = root.canonicalize().ok()?;
+    let can_full = full.canonicalize().ok()?;
+    if !can_full.starts_with(&can_root) {
+        return None;
+    }
+    let b = std::fs::read(&can_full).ok()?;
     if b.iter().take(8000).any(|&c| c == 0) {
         return None;
     }
@@ -555,7 +570,7 @@ pub fn discard(cwd: &str, paths: &[String]) -> Result<()> {
                 git_ok(&root, &["rm", "--cached", "-q", "--", p])?;
             }
             let full = root.join(p);
-            if full.is_file() {
+            if std::fs::symlink_metadata(&full).is_ok_and(|m| m.is_file() || m.file_type().is_symlink()) {
                 std::fs::remove_file(&full)?;
             }
         }
@@ -574,9 +589,21 @@ pub fn commit(cwd: &str, paths: &[String], message: &str) -> Result<Value> {
     }
     let dir = crate::paths::expand(cwd);
     let root = repo_root(&dir).ok_or_else(|| anyhow!("不是 git 仓库"))?;
-    let mut add = vec!["add", "-A", "--"];
-    add.extend(paths.iter().map(String::as_str));
-    git_ok(&root, &add)?;
+    let mut to_add: Vec<&str> = Vec::new();
+    for p in paths {
+        // Staged deletions and rename `oldPath` entries are already removed from both disk and the index;
+        // passing them to `git add -A -- <path>` fails with `did not match any files`.
+        let exists = std::fs::symlink_metadata(root.join(p)).is_ok();
+        let in_index = !exists && git(&root, &["ls-files", "--error-unmatch", "--", p])?.status.success();
+        if exists || in_index {
+            to_add.push(p.as_str());
+        }
+    }
+    if !to_add.is_empty() {
+        let mut add = vec!["add", "-A", "--"];
+        add.extend(to_add);
+        git_ok(&root, &add)?;
+    }
     let mut c = vec!["commit", "-m", message.trim(), "--"];
     c.extend(paths.iter().map(String::as_str));
     git_ok(&root, &c)?;
@@ -1268,11 +1295,60 @@ fn ensure_worktree_link_ignored(wt_dir: &Path, rel: &str) {
     let _ = std::fs::write(&exclude, updated);
 }
 
+/// Validate that `rel` stays strictly inside `wt_dir` without traversing or overwriting symlinks.
+fn safe_worktree_dest(wt_dir: &Path, wt_canon: &Path, rel: &str) -> Option<std::path::PathBuf> {
+    let rel = rel.trim_matches('/');
+    if rel.is_empty() || Path::new(rel).is_absolute() {
+        return None;
+    }
+    let parts: Vec<&str> = rel.split('/').collect();
+    let mut cur = wt_dir.to_path_buf();
+    for seg in &parts[..parts.len().saturating_sub(1)] {
+        if seg.is_empty() || *seg == "." || *seg == ".." {
+            return None;
+        }
+        cur.push(seg);
+        if let Ok(meta) = std::fs::symlink_metadata(&cur) {
+            if meta.file_type().is_symlink() || !meta.is_dir() {
+                return None;
+            }
+        }
+    }
+    let leaf = parts.last()?;
+    if leaf.is_empty() || *leaf == "." || *leaf == ".." {
+        return None;
+    }
+    let dst = wt_dir.join(rel);
+    // Reject existing files and dangling symlinks at the destination path.
+    if std::fs::symlink_metadata(&dst).is_ok() {
+        return None;
+    }
+    if let Some(parent) = dst.parent() {
+        if !parent.exists() {
+            std::fs::create_dir_all(parent).ok()?;
+        }
+        let parent_canon = parent.canonicalize().ok()?;
+        if !parent_canon.starts_with(wt_canon) {
+            return None;
+        }
+    }
+    Some(dst)
+}
+
 /// Prepare a newly created worktree so tests and builds work immediately:
-/// copy gitignored `.env*` files (root + 1st-level subdirs) and symlink/junction heavy ignored dependency folders
+/// copy gitignored `.env*` files (root + 1st-level subdirs, only when ignored on both branches) and symlink/junction heavy ignored dependency folders
 fn prepare_worktree_env(main_repo: &Path, wt_dir: &Path) {
     const ENV_MAX_BYTES: u64 = 1024 * 1024;
+    let Ok(wt_canon) = wt_dir.canonicalize() else {
+        return;
+    };
     let copy_env_in = |sub: Option<&str>| {
+        if let Some(s) = sub {
+            let wt_sub = wt_dir.join(s);
+            if !std::fs::symlink_metadata(&wt_sub).is_ok_and(|m| !m.file_type().is_symlink() && m.is_dir()) {
+                return;
+            }
+        }
         let src_dir = sub.map(|s| main_repo.join(s)).unwrap_or_else(|| main_repo.to_path_buf());
         let Ok(entries) = std::fs::read_dir(&src_dir) else {
             return;
@@ -1283,21 +1359,23 @@ fn prepare_worktree_env(main_repo: &Path, wt_dir: &Path) {
             if !name_s.starts_with(".env") {
                 continue;
             }
+            if !entry.file_type().is_ok_and(|ft| ft.is_file()) {
+                continue;
+            }
             let Ok(meta) = entry.metadata() else { continue };
-            if !meta.is_file() || meta.len() > ENV_MAX_BYTES {
+            if meta.len() > ENV_MAX_BYTES {
                 continue;
             }
             let rel = match sub {
                 Some(s) => format!("{s}/{name_s}"),
                 None => name_s.to_string(),
             };
-            let dst = wt_dir.join(&rel);
-            if dst.exists() || !is_git_ignored(main_repo, &rel) {
+            if !is_git_ignored(main_repo, &rel) || !is_git_ignored(wt_dir, &rel) {
                 continue;
             }
-            if let Some(p) = dst.parent() {
-                let _ = std::fs::create_dir_all(p);
-            }
+            let Some(dst) = safe_worktree_dest(wt_dir, &wt_canon, &rel) else {
+                continue;
+            };
             let _ = std::fs::copy(entry.path(), &dst);
         }
     };
@@ -1316,14 +1394,20 @@ fn prepare_worktree_env(main_repo: &Path, wt_dir: &Path) {
     }
     for rel in ["node_modules", "app/node_modules", ".venv", "venv"] {
         let src = main_repo.join(rel);
-        let dst = wt_dir.join(rel);
-        if src.is_dir() && !dst.exists() && is_git_ignored(main_repo, rel) {
-            if let Some(p) = dst.parent() {
-                let _ = std::fs::create_dir_all(p);
+        if !src.is_dir() || !is_git_ignored(main_repo, rel) {
+            continue;
+        }
+        if let Some((parent, _)) = rel.split_once('/') {
+            let wt_parent = wt_dir.join(parent);
+            if !std::fs::symlink_metadata(&wt_parent).is_ok_and(|m| !m.file_type().is_symlink() && m.is_dir()) {
+                continue;
             }
-            if link_dir(&src, &dst).is_ok() {
-                ensure_worktree_link_ignored(wt_dir, rel);
-            }
+        }
+        let Some(dst) = safe_worktree_dest(wt_dir, &wt_canon, rel) else {
+            continue;
+        };
+        if link_dir(&src, &dst).is_ok() {
+            ensure_worktree_link_ignored(wt_dir, rel);
         }
     }
 }
@@ -1402,6 +1486,7 @@ pub fn worktree_add_session(
             base_branch,
             base_commit,
             temporary_branch: is_temporary,
+            attached: false,
         },
     ))
 }
@@ -1443,6 +1528,7 @@ pub fn detect_existing_worktree(cwd: &str) -> Option<yi_proto::SessionWorktree> 
         base_branch,
         base_commit,
         temporary_branch: false,
+        attached: true,
     })
 }
 
@@ -2167,10 +2253,32 @@ pub fn branch_delete(cwd: &str, branch: &str, force: bool) -> Result<Value> {
     Ok(json!({ "branch": branch }))
 }
 
-/// Build a unified diff for an untracked file on disk (empty for binaries or oversized files)
+/// Build a unified diff for an untracked file on disk (link target text for symlinks; empty for outside paths, binaries, or oversized files)
 fn untracked_diff(root: &Path, path: &str) -> String {
     let full = root.join(path);
-    match std::fs::read(&full) {
+    let Ok(meta) = std::fs::symlink_metadata(&full) else {
+        return String::new();
+    };
+    if meta.file_type().is_symlink() {
+        let Ok(target) = std::fs::read_link(&full) else {
+            return String::new();
+        };
+        let target = target.to_string_lossy();
+        if target.len() > DIFF_MAX {
+            return String::new();
+        }
+        return format!("--- /dev/null\n+++ b/{path}\n@@ -0,0 +1,1 @@\n+{target}\n");
+    }
+    if !meta.is_file() || meta.len() as usize > DIFF_MAX {
+        return String::new();
+    }
+    let (Ok(can_root), Ok(can_full)) = (root.canonicalize(), full.canonicalize()) else {
+        return String::new();
+    };
+    if !can_full.starts_with(&can_root) {
+        return String::new();
+    }
+    match std::fs::read(&can_full) {
         Ok(b) if b.len() > DIFF_MAX => String::new(),
         Ok(b) if b.iter().take(8000).any(|&c| c == 0) => String::new(),
         Ok(b) => {
@@ -2266,7 +2374,7 @@ pub fn branch_diff(cwd: &str, base: Option<&str>, with_diff: bool, only: Option<
         };
         let (added, deleted) = if is_untracked {
             counted += 1;
-            (if counted <= COUNT_MAX { count_lines(&root.join(&path)) } else { None }, Some(0))
+            (if counted <= COUNT_MAX { count_lines(&root, &path) } else { None }, Some(0))
         } else {
             stats.get(&path).copied().unwrap_or((None, None))
         };
@@ -2321,17 +2429,30 @@ fn parse_numstat_with_binary(out: &str) -> std::collections::HashMap<String, (Op
     m
 }
 
-fn inspect_untracked_file(full: &Path) -> (Option<u64>, Option<u64>, bool) {
+fn inspect_untracked_file(root: &Path, rel: &str) -> (Option<u64>, Option<u64>, bool) {
     use std::io::Read;
-    let Ok(meta) = std::fs::metadata(full) else {
+    let full = root.join(rel);
+    let Ok(meta) = std::fs::symlink_metadata(&full) else {
         return (None, None, false);
     };
+    if meta.file_type().is_symlink() {
+        let len = std::fs::read_link(&full)
+            .ok()
+            .map(|t| t.to_string_lossy().len() as u64);
+        return (Some(1), len, false);
+    }
     if !meta.is_file() {
+        return (None, None, false);
+    }
+    let (Ok(can_root), Ok(can_full)) = (root.canonicalize(), full.canonicalize()) else {
+        return (None, None, false);
+    };
+    if !can_full.starts_with(&can_root) {
         return (None, None, false);
     }
     let size = meta.len();
     if size as usize > DIFF_MAX {
-        let is_bin = std::fs::File::open(full)
+        let is_bin = std::fs::File::open(&can_full)
             .ok()
             .map(|f| {
                 let mut buf = Vec::with_capacity(8000);
@@ -2341,7 +2462,7 @@ fn inspect_untracked_file(full: &Path) -> (Option<u64>, Option<u64>, bool) {
             .unwrap_or(false);
         return (None, Some(size), is_bin);
     }
-    let Ok(b) = std::fs::read(full) else {
+    let Ok(b) = std::fs::read(&can_full) else {
         return (None, Some(size), false);
     };
     if b.iter().take(8000).any(|&c| c == 0) {
@@ -2439,7 +2560,7 @@ pub fn review_scope(cwd: &str, params: &Value) -> Result<Value> {
             let mut all_count = 0usize;
             let mut tracked_count = 0usize;
             let mut staged_count = 0usize;
-            let mut entries: Vec<(String, String, bool, bool)> = Vec::new();
+            let mut entries: Vec<(String, Option<String>, String, bool, bool)> = Vec::new();
 
             let mut it = status.split('\0').filter(|s| !s.is_empty());
             while let Some(entry) = it.next() {
@@ -2453,9 +2574,14 @@ pub fn review_scope(cwd: &str, params: &Value) -> Result<Value> {
                 }
                 let xb = xy.as_bytes()[0];
                 let yb = xy.as_bytes()[1];
-                if matches!(xb, b'R' | b'C') || matches!(yb, b'R' | b'C') {
-                    it.next();
-                }
+                let is_rename = xb == b'R' || yb == b'R';
+                let is_copy = xb == b'C' || yb == b'C';
+                let old_path = if is_rename || is_copy {
+                    let orig = it.next();
+                    if is_rename { orig.map(str::to_string) } else { None }
+                } else {
+                    None
+                };
                 let is_untracked = xy == "??";
                 let is_staged = !is_untracked && xb != b' ';
                 all_count += 1;
@@ -2478,7 +2604,7 @@ pub fn review_scope(cwd: &str, params: &Value) -> Result<Value> {
                     } else {
                         xy.trim().to_string()
                     };
-                    entries.push((path.to_string(), st, is_untracked, is_staged));
+                    entries.push((path.to_string(), old_path, st, is_untracked, is_staged));
                 }
             }
             entries.sort_by(|a, b| a.0.cmp(&b.0));
@@ -2494,8 +2620,11 @@ pub fn review_scope(cwd: &str, params: &Value) -> Result<Value> {
             let total = entries.len();
             let mut files = Vec::new();
             let mut counted = 0usize;
-            for (path, st, is_untracked, is_staged) in entries {
-                if only.as_deref().is_some_and(|o| !o.iter().any(|x| x == &path)) || files.len() >= STATUS_MAX {
+            for (path, old_path, st, is_untracked, is_staged) in entries {
+                if only.as_deref().is_some_and(|o| {
+                    !o.iter().any(|x| x == &path || old_path.as_deref() == Some(x.as_str()))
+                }) || files.len() >= STATUS_MAX
+                {
                     continue;
                 }
                 let diff = if !with_diff {
@@ -2509,14 +2638,18 @@ pub fn review_scope(cwd: &str, params: &Value) -> Result<Value> {
                     } else {
                         args.push("HEAD");
                     }
-                    args.extend(["--no-color", "--", &path]);
+                    if let Some(ref old) = old_path {
+                        args.extend(["-M", "--no-color", "--", old.as_str(), path.as_str()]);
+                    } else {
+                        args.extend(["--no-color", "--", path.as_str()]);
+                    }
                     let d = git_ok(&root, &args).unwrap_or_default();
                     if d.len() > DIFF_MAX { String::new() } else { d }
                 };
                 counted += 1;
                 let (added, deleted, size, binary) = if is_untracked {
                     if counted <= COUNT_MAX {
-                        let (lines, sz, bin) = inspect_untracked_file(&root.join(&path));
+                        let (lines, sz, bin) = inspect_untracked_file(&root, &path);
                         (lines, Some(0), sz, bin)
                     } else {
                         (None, Some(0), None, false)
@@ -2524,13 +2657,16 @@ pub fn review_scope(cwd: &str, params: &Value) -> Result<Value> {
                 } else {
                     let (a, d, bin) = stats.get(&path).copied().unwrap_or((None, None, false));
                     let sz = if counted <= COUNT_MAX {
-                        std::fs::metadata(root.join(&path)).ok().filter(|m| m.is_file()).map(|m| m.len())
+                        std::fs::symlink_metadata(root.join(&path))
+                            .ok()
+                            .filter(|m| !m.file_type().is_symlink() && m.is_file())
+                            .map(|m| m.len())
                     } else {
                         None
                     };
                     (a, d, sz, bin)
                 };
-                files.push(json!({
+                let mut item = json!({
                     "path": path,
                     "status": st,
                     "diff": diff,
@@ -2540,7 +2676,11 @@ pub fn review_scope(cwd: &str, params: &Value) -> Result<Value> {
                     "binary": binary,
                     "untracked": is_untracked,
                     "staged": is_staged,
-                }));
+                });
+                if let Some(old) = old_path {
+                    item["oldPath"] = json!(old);
+                }
+                files.push(item);
             }
 
             Ok(json!({
@@ -2700,7 +2840,7 @@ pub fn review_scope(cwd: &str, params: &Value) -> Result<Value> {
                 counted += 1;
                 let (added, deleted, size, binary) = if is_untracked {
                     if counted <= COUNT_MAX {
-                        let (lines, sz, bin) = inspect_untracked_file(&root.join(&path));
+                        let (lines, sz, bin) = inspect_untracked_file(&root, &path);
                         (lines, Some(0), sz, bin)
                     } else {
                         (None, Some(0), None, false)
@@ -2708,7 +2848,10 @@ pub fn review_scope(cwd: &str, params: &Value) -> Result<Value> {
                 } else {
                     let (a, d, bin) = stats.get(&path).copied().unwrap_or((None, None, false));
                     let sz = if counted <= COUNT_MAX {
-                        std::fs::metadata(root.join(&path)).ok().filter(|m| m.is_file()).map(|m| m.len())
+                        std::fs::symlink_metadata(root.join(&path))
+                            .ok()
+                            .filter(|m| !m.file_type().is_symlink() && m.is_file())
+                            .map(|m| m.len())
                     } else {
                         None
                     };
@@ -4176,5 +4319,121 @@ mod tests {
 
         // Clean checkout of remote tracking branch
         checkout(&cwd, "origin/main", false, None).unwrap();
+    }
+
+    #[test]
+    fn worktree_env_skips_unignored_env_on_target_branch_and_symlinks() {
+        let d = tempfile::tempdir().unwrap();
+        let repo = d.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let run = |dir: &Path, a: &[&str]| assert!(git(dir, a).unwrap().status.success(), "{a:?}");
+        run(&repo, &["init", "-q", "-b", "legacy"]);
+        run(&repo, &["config", "user.email", "t@t"]);
+        run(&repo, &["config", "user.name", "t"]);
+        std::fs::write(repo.join("README.md"), "legacy\n").unwrap();
+        run(&repo, &["add", "."]);
+        run(&repo, &["commit", "-qm", "legacy"]);
+
+        run(&repo, &["checkout", "-qb", "main"]);
+        std::fs::write(repo.join(".gitignore"), ".env*\n").unwrap();
+        run(&repo, &["add", "."]);
+        run(&repo, &["commit", "-qm", "ignore env"]);
+
+        std::fs::write(repo.join(".env.local"), "SECRET=123\n").unwrap();
+        let wt_root = d.path().join("wt");
+        let main_cwd = repo.to_string_lossy().to_string();
+        // Target branch `legacy` does not ignore .env.local, so prepare_worktree_env must skip it.
+        let (wt_path, _) = worktree_add_session(&wt_root, &main_cwd, "leg", None, None, Some("legacy"), "yi", false).unwrap();
+        assert!(!Path::new(&wt_path).join(".env.local").exists());
+        assert!(git_ok(Path::new(&wt_path), &["status", "--porcelain"]).unwrap().trim().is_empty());
+
+        #[cfg(unix)]
+        {
+            let outside = d.path().join("outside-target");
+            std::fs::create_dir_all(&outside).unwrap();
+            let sub_wt = wt_root.join("sym-wt");
+            std::fs::create_dir_all(&sub_wt).unwrap();
+            std::os::unix::fs::symlink(&outside, sub_wt.join("sub")).unwrap();
+            std::os::unix::fs::symlink(outside.join("leak.env"), sub_wt.join(".env.local")).unwrap();
+            let sub_canon = sub_wt.canonicalize().unwrap();
+            assert!(safe_worktree_dest(&sub_wt, &sub_canon, "sub/.env.local").is_none());
+            assert!(safe_worktree_dest(&sub_wt, &sub_canon, ".env.local").is_none());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn untracked_diff_does_not_follow_symlinks_outside_repo() {
+        let d = tempfile::tempdir().unwrap();
+        let outside = d.path().join("outside-secret.txt");
+        std::fs::write(&outside, "TOP_SECRET_VALUE\n").unwrap();
+
+        let repo = d.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let run = |dir: &Path, a: &[&str]| assert!(git(dir, a).unwrap().status.success(), "{a:?}");
+        run(&repo, &["init", "-q", "-b", "main"]);
+        run(&repo, &["config", "user.email", "t@t"]);
+        run(&repo, &["config", "user.name", "t"]);
+        std::fs::write(repo.join("base.txt"), "base\n").unwrap();
+        run(&repo, &["add", "."]);
+        run(&repo, &["commit", "-qm", "init"]);
+
+        std::os::unix::fs::symlink(&outside, repo.join("leak.txt")).unwrap();
+        let cwd = repo.to_string_lossy().to_string();
+
+        let ch = changes_with(&cwd, true, None).unwrap();
+        let leak_ch = ch["files"].as_array().unwrap().iter().find(|f| f["path"] == "leak.txt").unwrap();
+        let ch_diff = leak_ch["diff"].as_str().unwrap();
+        assert!(!ch_diff.contains("TOP_SECRET_VALUE"), "{ch_diff}");
+        assert!(ch_diff.contains("outside-secret.txt"), "{ch_diff}");
+
+        let bd = branch_diff(&cwd, Some("main"), true, None).unwrap();
+        let leak_bd = bd["files"].as_array().unwrap().iter().find(|f| f["path"] == "leak.txt").unwrap();
+        assert!(!leak_bd["diff"].as_str().unwrap().contains("TOP_SECRET_VALUE"));
+
+        let rs = review_scope(&cwd, &json!({"mode": "uncommitted", "diff": true})).unwrap();
+        let leak_rs = rs["files"].as_array().unwrap().iter().find(|f| f["path"] == "leak.txt").unwrap();
+        assert!(!leak_rs["diff"].as_str().unwrap().contains("TOP_SECRET_VALUE"));
+        assert!(leak_rs["diff"].as_str().unwrap().contains("outside-secret.txt"));
+    }
+
+    #[test]
+    fn staged_rename_preserves_old_path_and_commits_and_discards_cleanly() {
+        let d = tempfile::tempdir().unwrap();
+        let repo = d.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let run = |dir: &Path, a: &[&str]| assert!(git(dir, a).unwrap().status.success(), "{a:?}");
+        run(&repo, &["init", "-q", "-b", "main"]);
+        run(&repo, &["config", "user.email", "t@t"]);
+        run(&repo, &["config", "user.name", "t"]);
+        std::fs::write(repo.join("old.txt"), "line1\nline2\n").unwrap();
+        run(&repo, &["add", "."]);
+        run(&repo, &["commit", "-qm", "init"]);
+
+        run(&repo, &["mv", "old.txt", "new.txt"]);
+        let cwd = repo.to_string_lossy().to_string();
+
+        let ch = changes_with(&cwd, true, None).unwrap();
+        let item = ch["files"].as_array().unwrap().iter().find(|f| f["path"] == "new.txt").unwrap();
+        assert_eq!(item["oldPath"], "old.txt");
+        assert!(item["diff"].as_str().unwrap().contains("rename from old.txt"), "{}", item["diff"]);
+
+        let rs = review_scope(&cwd, &json!({"mode": "uncommitted", "diff": true})).unwrap();
+        let ritem = rs["files"].as_array().unwrap().iter().find(|f| f["path"] == "new.txt").unwrap();
+        assert_eq!(ritem["oldPath"], "old.txt");
+
+        // Discard with both new and old paths restores working tree cleanly
+        discard(&cwd, &["new.txt".into(), "old.txt".into()]).unwrap();
+        assert!(repo.join("old.txt").exists() && !repo.join("new.txt").exists());
+        assert!(git_ok(&repo, &["status", "--porcelain"]).unwrap().trim().is_empty());
+
+        // Rename again with another unrelated staged change and commit only the rename pair
+        std::fs::write(repo.join("other.txt"), "stay-staged\n").unwrap();
+        run(&repo, &["add", "other.txt"]);
+        run(&repo, &["mv", "old.txt", "new.txt"]);
+        commit(&cwd, &["new.txt".into(), "old.txt".into()], "rename old to new").unwrap();
+        let remain = git_ok(&repo, &["status", "--porcelain"]).unwrap();
+        assert_eq!(remain.trim(), "A  other.txt");
+        assert!(!repo.join("old.txt").exists() && repo.join("new.txt").exists());
     }
 }

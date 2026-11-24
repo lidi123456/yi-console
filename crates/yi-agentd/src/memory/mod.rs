@@ -74,6 +74,9 @@ impl Memories {
 
     /// Ensure a session has a ticket file and grant so its AI process can talk to `memory.mcp`.
     pub fn ensure_session(&self, sid: &str, cwd: &Path, readonly_session: bool) -> Result<()> {
+        if !crate::hub::is_safe_ticket_sid(sid) {
+            bail!("会话 ID 无效");
+        }
         let path = self.ticket_path(sid);
         let mut grants = self.grants.lock().unwrap();
         if let Some(g) = grants.get_mut(sid) {
@@ -109,8 +112,12 @@ impl Memories {
 
     /// Clean up session grant and ticket file when a session is deleted.
     pub fn remove_session(&self, sid: &str) {
-        self.grants.lock().unwrap().remove(sid);
-        let _ = std::fs::remove_file(self.ticket_path(sid));
+        if !crate::hub::is_safe_ticket_sid(sid) {
+            return;
+        }
+        if self.grants.lock().unwrap().remove(sid).is_some() {
+            let _ = std::fs::remove_file(self.ticket_path(sid));
+        }
     }
 
     pub fn mcp_config(&self, sid: &str) -> Option<Value> {

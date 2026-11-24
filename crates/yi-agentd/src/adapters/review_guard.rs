@@ -582,6 +582,110 @@ fn strip_env_prefix(tokens: &[String]) -> &[String] {
     &tokens[idx..]
 }
 
+fn has_sed_in_place_flag(rest: &[String]) -> bool {
+    let mut i = 0;
+    while i < rest.len() {
+        let a = rest[i].as_str();
+        if a == "--" {
+            break;
+        }
+        if a == "-e" || a == "-f" || a == "--expression" || a == "--file" {
+            i += 2;
+            continue;
+        }
+        if a == "-i"
+            || a.starts_with("-i")
+            || a == "--in-place"
+            || a.starts_with("--in-place=")
+            || (a.starts_with('-') && !a.starts_with("--") && a[1..].contains('i'))
+        {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+fn is_pure_sed_slice_expr(expr: &str) -> bool {
+    let mut saw_part = false;
+    for raw in expr.split([';', '\n']) {
+        let p = raw.trim();
+        if p.is_empty() {
+            continue;
+        }
+        saw_part = true;
+        if let Some(addr) = p.strip_suffix('q') {
+            if addr.is_empty() || !addr.bytes().all(|b| b.is_ascii_digit()) {
+                return false;
+            }
+            continue;
+        }
+        if let Some(addr) = p.strip_suffix('p') {
+            if !addr.is_empty() && addr.bytes().all(|b| b.is_ascii_digit()) {
+                continue;
+            }
+            if let Some((start, end)) = addr.split_once(',') {
+                let start_ok = !start.is_empty() && start.bytes().all(|b| b.is_ascii_digit());
+                let end_ok = end == "$" || (!end.is_empty() && end.bytes().all(|b| b.is_ascii_digit()));
+                if start_ok && end_ok {
+                    continue;
+                }
+            }
+        }
+        return false;
+    }
+    saw_part
+}
+
+/// Allow only pure `-n`/`--quiet`/`--silent` line-slice `sed` commands (`Np`, `N,Mp`, `N,$p`, `Nq`),
+/// rejecting `-f`, unknown flags, and arbitrary `sed` scripts (`w`, `e`, `s/.../w`, etc.).
+fn is_safe_sed_line_slice(rest: &[String]) -> bool {
+    let mut quiet = false;
+    let mut exprs: Vec<&str> = Vec::new();
+    let mut files_only = false;
+    let mut after_ddash = false;
+    let mut i = 0;
+    while i < rest.len() {
+        let a = rest[i].as_str();
+        if !after_ddash && a == "--" {
+            after_ddash = true;
+            i += 1;
+            continue;
+        }
+        if !after_ddash && a.starts_with('-') && a != "-" {
+            match a {
+                "-n" | "--quiet" | "--silent" => {
+                    quiet = true;
+                    i += 1;
+                }
+                "-e" => {
+                    let Some(expr) = rest.get(i + 1).map(String::as_str) else {
+                        return false;
+                    };
+                    exprs.push(expr);
+                    files_only = true;
+                    i += 2;
+                }
+                _ => return false,
+            }
+            continue;
+        }
+        if !files_only && exprs.is_empty() {
+            exprs.push(a);
+            files_only = true;
+        }
+        i += 1;
+    }
+    quiet && !exprs.is_empty() && exprs.into_iter().all(is_pure_sed_slice_expr)
+}
+
+fn is_safe_git_config(kv: &str) -> bool {
+    matches!(
+        kv,
+        "core.quotepath=false" | "color.ui=false" | "color.ui=never" | "core.pager=cat"
+    )
+}
+
 fn classify_segment(seg: &str) -> ReviewGuardDecision {
     let Some(raw_tokens) = tokenize(seg) else {
         return ReviewGuardDecision::Ask;
@@ -605,12 +709,12 @@ fn classify_segment(seg: &str) -> ReviewGuardDecision {
     match bin.as_str() {
         "git" => classify_git(rest),
         "sed" => {
-            if rest.iter().any(|a| a == "-i" || a.starts_with("-i") || a == "--in-place" || a.starts_with("--in-place=")) {
+            if has_sed_in_place_flag(rest) {
                 ReviewGuardDecision::Deny(READONLY_DENY_MSG)
-            } else if rest.iter().any(|a| a == "-f" || a == "-e") && rest.iter().any(|a| a.contains("w ")) {
-                ReviewGuardDecision::Ask
-            } else {
+            } else if is_safe_sed_line_slice(rest) {
                 ReviewGuardDecision::Allow
+            } else {
+                ReviewGuardDecision::Ask
             }
         }
         "perl" => {
@@ -628,7 +732,12 @@ fn classify_segment(seg: &str) -> ReviewGuardDecision {
             }
         }
         "find" => {
-            if rest.iter().any(|a| matches!(a.as_str(), "-delete" | "-exec" | "-execdir" | "-ok" | "-okdir")) {
+            if rest.iter().any(|a| {
+                matches!(
+                    a.as_str(),
+                    "-delete" | "-exec" | "-execdir" | "-ok" | "-okdir" | "-fls" | "-fprint" | "-fprint0" | "-fprintf"
+                )
+            }) {
                 ReviewGuardDecision::Deny(READONLY_DENY_MSG)
             } else {
                 ReviewGuardDecision::Allow
@@ -636,8 +745,28 @@ fn classify_segment(seg: &str) -> ReviewGuardDecision {
         }
         "awk" | "gawk" => {
             let joined = rest.join(" ");
-            if joined.contains("system(") || joined.contains('>') {
+            if joined.contains("system(")
+                || joined.contains('>')
+                || rest.iter().any(|a| {
+                    a == "-i"
+                        || a.starts_with("-i")
+                        || a == "--include"
+                        || a.starts_with("--include=")
+                        || a.contains("inplace")
+                })
+            {
                 ReviewGuardDecision::Deny(READONLY_DENY_MSG)
+            } else {
+                ReviewGuardDecision::Ask
+            }
+        }
+        "rg" => {
+            if rest.iter().any(|a| {
+                matches!(a.as_str(), "--pre" | "--pre-glob")
+                    || a.starts_with("--pre=")
+                    || a.starts_with("--pre-glob=")
+            }) {
+                ReviewGuardDecision::Ask
             } else {
                 ReviewGuardDecision::Allow
             }
@@ -674,16 +803,40 @@ fn classify_segment(seg: &str) -> ReviewGuardDecision {
 
 fn classify_git(args: &[String]) -> ReviewGuardDecision {
     let mut i = 0;
+    let mut unsafe_config = false;
     while i < args.len() {
         let a = args[i].as_str();
-        if matches!(a, "-C" | "-c" | "--git-dir" | "--work-tree" | "--namespace") {
+        if a == "-c" {
+            if !args.get(i + 1).is_some_and(|v| is_safe_git_config(v)) {
+                unsafe_config = true;
+            }
+            i += 2;
+            continue;
+        }
+        if a.starts_with("-c") {
+            if !is_safe_git_config(&a[2..]) {
+                unsafe_config = true;
+            }
+            i += 1;
+            continue;
+        }
+        if a == "--config-env" {
+            unsafe_config = true;
+            i += 2;
+            continue;
+        }
+        if a.starts_with("--config-env=") {
+            unsafe_config = true;
+            i += 1;
+            continue;
+        }
+        if matches!(a, "-C" | "--git-dir" | "--work-tree" | "--namespace") {
             i += 2;
             continue;
         }
         if a.starts_with("--git-dir=")
             || a.starts_with("--work-tree=")
             || a.starts_with("-C")
-            || a.starts_with("-c")
             || matches!(a, "--no-pager" | "-p" | "--paginate" | "--bare" | "--no-replace-objects" | "--literal-pathspecs")
         {
             i += 1;
@@ -703,17 +856,22 @@ fn classify_git(args: &[String]) -> ReviewGuardDecision {
     if GIT_WRITE_SUBCMDS.contains(&sub) {
         return ReviewGuardDecision::Deny(READONLY_DENY_MSG);
     }
+    let ext_diff = rest.iter().any(|a| a == "--ext-diff");
     if GIT_READ_SUBCMDS.contains(&sub) {
         if rest.iter().any(|a| a.starts_with("--output=")) {
             return ReviewGuardDecision::Deny(READONLY_DENY_MSG);
         }
-        return ReviewGuardDecision::Allow;
+        return if unsafe_config || ext_diff {
+            ReviewGuardDecision::Ask
+        } else {
+            ReviewGuardDecision::Allow
+        };
     }
     match sub {
         "branch" => {
             if rest.iter().any(|a| matches!(a.as_str(), "-d" | "-D" | "-m" | "-M" | "-c" | "-C" | "-f" | "--delete" | "--move" | "--copy")) {
                 ReviewGuardDecision::Deny(READONLY_DENY_MSG)
-            } else if rest.iter().all(|a| matches!(a.as_str(), "-a" | "--all" | "-r" | "--remotes" | "-v" | "-vv" | "--verbose" | "--list" | "--show-current" | "--merged" | "--no-merged" | "--contains")) {
+            } else if !unsafe_config && !ext_diff && rest.iter().all(|a| matches!(a.as_str(), "-a" | "--all" | "-r" | "--remotes" | "-v" | "-vv" | "--verbose" | "--list" | "--show-current" | "--merged" | "--no-merged" | "--contains")) {
                 ReviewGuardDecision::Allow
             } else {
                 ReviewGuardDecision::Ask
@@ -722,7 +880,7 @@ fn classify_git(args: &[String]) -> ReviewGuardDecision {
         "tag" => {
             if rest.iter().any(|a| matches!(a.as_str(), "-d" | "--delete" | "-f" | "--force" | "-a" | "-s")) {
                 ReviewGuardDecision::Deny(READONLY_DENY_MSG)
-            } else if rest.is_empty() || rest.iter().any(|a| matches!(a.as_str(), "-l" | "--list")) {
+            } else if !unsafe_config && !ext_diff && (rest.is_empty() || rest.iter().any(|a| matches!(a.as_str(), "-l" | "--list"))) {
                 ReviewGuardDecision::Allow
             } else {
                 ReviewGuardDecision::Ask
@@ -788,6 +946,53 @@ mod tests {
         assert_eq!(
             classify_review_action("unknown_mcp_tool", None, "Something", &json!({})),
             ReviewGuardDecision::Ask
+        );
+    }
+
+    #[test]
+    fn sed_awk_find_rg_and_git_configs_are_tightened() {
+        assert_eq!(
+            classify_review_action("Bash", None, "", &json!({"command": "sed -n '1,80p' src/lib.rs"})),
+            ReviewGuardDecision::Allow
+        );
+        assert_eq!(
+            classify_review_action("Bash", None, "", &json!({"command": "sed -n '1,80p;81q' src/lib.rs"})),
+            ReviewGuardDecision::Allow
+        );
+        for cmd in [
+            "sed 'w evil.txt' foo",
+            "sed 's/a/b/w evil.txt' foo",
+            "sed -n 's/a/b/w evil.txt' foo",
+            "sed '1e id' foo",
+            "sed -n '1e id' foo",
+            "sed -f script.sed foo",
+            "sed -n -f script.sed foo",
+            "awk 'BEGIN { print \"x\" | \"sh\" }'",
+            "rg --pre sh foo",
+            "git -c diff.external=sh diff",
+            "git diff --ext-diff",
+        ] {
+            assert_eq!(
+                classify_review_action("Bash", None, "", &json!({"command": cmd})),
+                ReviewGuardDecision::Ask,
+                "expected Ask for {cmd}"
+            );
+        }
+        for cmd in [
+            "sed -ni 's/a/b/' foo",
+            "find . -fprint out.txt",
+        ] {
+            assert!(
+                matches!(
+                    classify_review_action("Bash", None, "", &json!({"command": cmd})),
+                    ReviewGuardDecision::Deny(_)
+                ),
+                "expected Deny for {cmd}"
+            );
+        }
+        assert_eq!(
+            classify_review_action("Bash", None, "", &json!({"command": "git -c core.quotepath=false diff HEAD"})),
+            ReviewGuardDecision::Allow
         );
     }
 }

@@ -87,6 +87,7 @@ export interface ReviewLaunchPreset {
 
 export interface ReviewScopeFile {
   path: string;
+  oldPath?: string;
   status: string;
   added?: number | null;
   deleted?: number | null;
@@ -267,6 +268,7 @@ export function buildReviewPrompt(opts: {
   focus?: string;
   filesCount: number;
   prefedDiff?: string;
+  prefedOmittedFiles?: string[];
   legacyDaemon?: boolean;
   zh: boolean;
 }): string {
@@ -335,11 +337,23 @@ export function buildReviewPrompt(opts: {
     }
   }
 
-  const toolGuidance = opts.prefedDiff
-    ? 'The complete unified diff for this review is embedded below inside `<yi-review-diff>`. Start reviewing from it directly without re-running `git diff`. If you need surrounding file context or callers, prefer the pre-authorized read-only `yi_review` MCP tools (`review_read_file`, `review_grep`, `review_scope`, `review_diff`).'
-    : opts.legacyDaemon
-      ? `Inspect the changes using read-only commands such as \`${diffCmd}\` and read surrounding code as needed.`
-      : 'Inspect the changes using the pre-authorized read-only `yi_review` MCP tools (`review_scope`, `review_diff`, `review_read_file`, `review_grep`) instead of running interactive shell git commands.';
+  let toolGuidance: string;
+  if (opts.prefedDiff && opts.prefedOmittedFiles?.length) {
+    const omittedList = opts.prefedOmittedFiles
+      .slice(0, 25)
+      .map((p) => `\`${p}\``)
+      .join(', ');
+    const extra = opts.prefedOmittedFiles.length > 25 ? ` (+${opts.prefedOmittedFiles.length - 25} more)` : '';
+    toolGuidance = `A partial unified diff for this review is embedded below inside \`<yi-review-diff>\`. Diff content was omitted for ${opts.prefedOmittedFiles.length} selected file(s) (e.g. >200KB, empty, or mode-only): ${omittedList}${extra}. You MUST inspect those omitted files using the pre-authorized read-only \`yi_review\` MCP tools (\`review_read_file\`, \`review_diff\`, \`review_scope\`) in addition to reviewing the embedded diff.`;
+  } else if (opts.prefedDiff) {
+    toolGuidance =
+      'The complete unified diff for this review is embedded below inside `<yi-review-diff>`. Start reviewing from it directly without re-running `git diff`. If you need surrounding file context or callers, prefer the pre-authorized read-only `yi_review` MCP tools (`review_read_file`, `review_grep`, `review_scope`, `review_diff`).';
+  } else if (opts.legacyDaemon) {
+    toolGuidance = `Inspect the changes using read-only commands such as \`${diffCmd}\` and read surrounding code as needed.`;
+  } else {
+    toolGuidance =
+      'Inspect the changes using the pre-authorized read-only `yi_review` MCP tools (`review_scope`, `review_diff`, `review_read_file`, `review_grep`) instead of running interactive shell git commands.';
+  }
 
   const langRule = opts.zh ? 'Write all titles, summaries, and suggestions in concise Chinese.' : 'Write all titles, summaries, and suggestions in concise English.';
   const focusLine = opts.focus?.trim() ? `\nExtra review focus from the user: ${opts.focus.trim()}` : '';
@@ -810,6 +824,7 @@ export function ReviewLaunchDialog({
 
       // Pre-feed small diffs directly into the prompt so the reviewer doesn't even need a diff tool call.
       let prefedDiff: string | undefined;
+      let prefedOmittedFiles: string[] | undefined;
       const lineTotal = includedTotals.added + includedTotals.deleted;
       if (!legacyDaemon && includedFiles.length > 0 && includedFiles.length <= PREFED_MAX_FILES && lineTotal <= PREFED_MAX_LINES) {
         try {
@@ -826,11 +841,15 @@ export function ReviewLaunchDialog({
           }
           const diffRes = await rpc<ReviewScopeResult>(hostId, 'git.reviewScope', diffParams);
           const parts: string[] = [];
+          const omittedPaths: string[] = [];
+          const seenPaths = new Set<string>();
           let totalChars = 0;
           let overBudget = false;
           for (const f of diffRes.files ?? []) {
+            seenPaths.add(f.path);
+            const displayPath = f.oldPath ? `${f.oldPath} -> ${f.path}` : f.path;
             if (f.binary) {
-              const b = `=== [${f.status}] ${f.path} (binary file) ===\n`;
+              const b = `=== [${f.status}] ${displayPath} (binary file) ===\n`;
               totalChars += b.length;
               if (totalChars > PREFED_MAX_CHARS) {
                 overBudget = true;
@@ -840,8 +859,11 @@ export function ReviewLaunchDialog({
               continue;
             }
             const d = f.diff ?? '';
-            if (!d.trim()) continue;
-            const block = `=== [${f.status}] ${f.path} ===\n${d.endsWith('\n') ? d : d + '\n'}`;
+            if (!d.trim()) {
+              omittedPaths.push(f.path);
+              continue;
+            }
+            const block = `=== [${f.status}] ${displayPath} ===\n${d.endsWith('\n') ? d : d + '\n'}`;
             totalChars += block.length;
             if (totalChars > PREFED_MAX_CHARS) {
               overBudget = true;
@@ -849,9 +871,18 @@ export function ReviewLaunchDialog({
             }
             parts.push(block);
           }
-          if (!overBudget && parts.length > 0) prefedDiff = parts.join('\n');
+          if (!overBudget) {
+            for (const p of incPaths ?? []) {
+              if (!seenPaths.has(p)) omittedPaths.push(p);
+            }
+            if (parts.length > 0) {
+              prefedDiff = parts.join('\n');
+              if (omittedPaths.length > 0) prefedOmittedFiles = omittedPaths;
+            }
+          }
         } catch {
           prefedDiff = undefined;
+          prefedOmittedFiles = undefined;
         }
       }
 
@@ -937,6 +968,7 @@ export function ReviewLaunchDialog({
         focus,
         filesCount: effectiveFilesCount,
         prefedDiff,
+        prefedOmittedFiles,
         legacyDaemon,
         zh: !isEn(),
       });

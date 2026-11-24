@@ -333,6 +333,9 @@ pub struct SessionWorktree {
     /// True while the branch is still an auto-generated placeholder eligible for automatic semantic rename
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub temporary_branch: bool,
+    /// True when the session attached to an existing worktree rather than creating it
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub attached: bool,
 }
 
 /// One structured turn's hidden git checkpoint pair (pre-turn base and post-turn end when files changed)

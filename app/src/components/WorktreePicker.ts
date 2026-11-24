@@ -36,8 +36,11 @@ export function useWorktreeChoice({
   hostSessions: SessionInfo[];
 }) {
   const [, lang] = useLang();
-  const [branches, setBranches] = useState<BranchesResult | null>(null);
-  const [worktrees, setWorktrees] = useState<WorktreesResult | null>(null);
+  const [probe, setProbe] = useState<{
+    key: string;
+    branches: BranchesResult | null;
+    worktrees: WorktreesResult | null;
+  } | null>(null);
   const [manual, setManual] = useState<{ key: string; choice: WorktreeChoice } | null>(null);
 
   const dirKey = `${hostId}::${normDirPath(cwd)}`;
@@ -45,23 +48,30 @@ export function useWorktreeChoice({
   useEffect(() => {
     const trimmed = cwd.trim();
     if (!enabled || !hostId || !connected || !trimmed) {
-      setBranches(null);
-      setWorktrees(null);
+      setProbe(null);
       return;
     }
+    const reqKey = dirKey;
     let alive = true;
     Promise.all([
       rpc<BranchesResult>(hostId, 'git.branches', { cwd: trimmed }).catch(() => null),
       rpc<WorktreesResult>(hostId, 'git.worktrees', { cwd: trimmed }).catch(() => null),
     ]).then(([br, wt]) => {
       if (!alive) return;
-      setBranches(br && br.repo ? br : null);
-      setWorktrees(wt && wt.repo ? wt : null);
+      setProbe({
+        key: reqKey,
+        branches: br && br.repo ? br : null,
+        worktrees: wt && wt.repo ? wt : null,
+      });
     });
     return () => {
       alive = false;
     };
-  }, [hostId, connected, cwd, enabled]);
+  }, [hostId, connected, cwd, enabled, dirKey]);
+
+  const matched = probe && probe.key === dirKey ? probe : null;
+  const branches = matched?.branches ?? null;
+  const worktrees = matched?.worktrees ?? null;
 
   const repoRoot = worktrees?.repo || branches?.repo || '';
   const isGitRepo = enabled && !!repoRoot;

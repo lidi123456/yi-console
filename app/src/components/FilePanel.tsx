@@ -235,7 +235,7 @@ type GitBlob = { exists: boolean; text?: string; binary: boolean; tooLarge: bool
 const blobKey = (rev: string, rel: string) => `${rev}\n${rel}`;
 
 /** added / deleted: lines added/removed relative to HEAD; null when not computable (binary etc.); older yi-agentd doesn't send these fields */
-type GitFile = { status: string; diff: string; path: string; rel: string; added?: number | null; deleted?: number | null };
+type GitFile = { status: string; diff: string; path: string; rel: string; oldPath?: string; added?: number | null; deleted?: number | null };
 
 /** "+12 −3": shown only in the Changes view */
 export function LineStat({ a, d }: { a?: number | null; d?: number | null }) {
@@ -1107,14 +1107,14 @@ export function FilePanel({
       branch?: string;
       head?: string | null;
       total?: number | null;
-      files: { path: string; status: string; diff: string; added?: number | null; deleted?: number | null }[];
+      files: { path: string; oldPath?: string; status: string; diff: string; added?: number | null; deleted?: number | null }[];
       ignored?: string[];
     }>(hostId, 'git.changes', { cwd, diff: false })
       .then((r) => {
         setGitReady(true);
         if (r.repo) loadWorktrees();
         const rawIgnored = r.ignored ?? [];
-        const sig = `${r.repo}|${r.branch}|${r.head}|${r.files.map((f) => `${f.status} ${f.path} ${f.added ?? ''}/${f.deleted ?? ''}`).join('|')}`;
+        const sig = `${r.repo}|${r.branch}|${r.head}|${r.files.map((f) => `${f.status} ${f.oldPath ?? ''} ${f.path} ${f.added ?? ''}/${f.deleted ?? ''}`).join('|')}`;
         const ignSig = rawIgnored.join('\0');
         const filesChanged = !quiet || sig !== gitSig.current;
         const ignChanged = !quiet || ignSig !== gitIgnSig.current;
@@ -2628,7 +2628,7 @@ export function FilePanel({
       { label: tx('newFile'), icon: 'plus', run: () => create(dir, 'file') },
       { label: tx('newFolder'), icon: 'folder', run: () => create(dir, 'dir') },
       ...(rowGit
-        ? ['-' as const, { label: tx('discardFileChanges'), icon: 'rotate-l', danger: true, run: () => void doDiscard([rowGit.rel], baseName(r.path)) }]
+        ? ['-' as const, { label: tx('discardFileChanges'), icon: 'rotate-l', danger: true, run: () => void doDiscard(rowGit.oldPath ? [rowGit.rel, rowGit.oldPath] : [rowGit.rel], baseName(r.path)) }]
         : []),
       '-',
       { label: tx('rename'), icon: 'edit', run: () => rename(r.path) },
@@ -3057,7 +3057,7 @@ export function FilePanel({
       : viewing === 'diff' && curGit && isTurnSnapshot
         ? [[diffBaseRev, curGit.rel], [diffEndRev, curGit.rel]]
         : viewing === 'diff' && curGit && !file.truncated && (!file.binary || file.deleted)
-          ? [[diffBaseRev, curGit.rel]]
+          ? [[diffBaseRev, !isTurnSnapshot && diffBaseRev === 'HEAD' ? (curGit.oldPath ?? curGit.rel) : curGit.rel]]
           : [];
   const blobWant = blobSpecs.map(([r, p]) => blobKey(r, p)).join('|');
   useEffect(() => {
@@ -3304,7 +3304,7 @@ export function FilePanel({
       uncommittedKeys
         .map((k) => git?.files.get(k))
         .filter((f): f is GitFile => !!f)
-        .map((f) => ({ rel: f.rel, status: f.status, added: f.added, deleted: f.deleted })),
+        .map((f) => ({ rel: f.rel, oldPath: f.oldPath, status: f.status, added: f.added, deleted: f.deleted })),
     [uncommittedKeys, git],
   );
 

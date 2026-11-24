@@ -172,6 +172,9 @@ impl Desktop {
     }
 
     pub fn configure(&self, sid: &str) -> Result<()> {
+        if !crate::hub::is_safe_ticket_sid(sid) {
+            bail!("会话 ID 无效");
+        }
         if !SUPPORTED {
             bail!(UNSUPPORTED);
         }
@@ -240,8 +243,9 @@ impl Desktop {
         let had = control.grants.contains_key(sid);
         match action {
             "disable" | "stop" => {
-                control.grants.remove(sid);
-                let _ = std::fs::remove_file(Self::ticket_path(sid));
+                if control.grants.remove(sid).is_some() && crate::hub::is_safe_ticket_sid(sid) {
+                    let _ = std::fs::remove_file(Self::ticket_path(sid));
+                }
             }
             "pause" => {
                 let grant = control

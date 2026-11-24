@@ -69,6 +69,9 @@ impl SessionMcp {
 
     /// Ensure a structured AI session has a ticket file and grant so it can talk to `session.mcp`.
     pub fn ensure_session(&self, sid: &str) -> Result<()> {
+        if !crate::hub::is_safe_ticket_sid(sid) {
+            bail!("会话 ID 无效");
+        }
         let path = self.ticket_path(sid);
         let mut grants = self.grants.lock().unwrap();
         if let Some(g) = grants.get(sid) {
@@ -93,8 +96,12 @@ impl SessionMcp {
 
     /// Clean up session grant and ticket file when a session is deleted.
     pub fn remove_session(&self, sid: &str) {
-        self.grants.lock().unwrap().remove(sid);
-        let _ = std::fs::remove_file(self.ticket_path(sid));
+        if !crate::hub::is_safe_ticket_sid(sid) {
+            return;
+        }
+        if self.grants.lock().unwrap().remove(sid).is_some() {
+            let _ = std::fs::remove_file(self.ticket_path(sid));
+        }
     }
 
     pub fn mcp_config(&self, sid: &str) -> Option<Value> {
@@ -360,39 +367,68 @@ fn call_read(hub: &crate::hub::Hub, caller_sid: &str, args: &Value) -> Value {
     let after_seq = args["afterSeq"].as_i64();
     let newest_first = before_seq.is_some() || after_seq.is_none();
 
-    // Over-fetch raw rows so non-visible events (status, usage, etc.) don't starve the requested view
+    // Over-fetch and scan bounded batches so runs of non-visible events (tool calls, status, etc.) never stall pagination
     let scan_limit = (limit * 6).clamp(80, 400);
-    let (raw_events, db_more) = if newest_first {
-        hub.store
-            .events_tail(&target.id, before_seq, scan_limit)
-            .unwrap_or_default()
-    } else {
-        let since = after_seq.unwrap_or(0);
-        let mut evs = hub
-            .store
-            .events_since(&target.id, since, scan_limit + 1)
-            .unwrap_or_default();
-        let more = evs.len() > scan_limit;
-        evs.truncate(scan_limit);
-        (evs, more)
-    };
-
-    let filtered: Vec<(Event, &'static str, String)> = raw_events
-        .into_iter()
-        .filter_map(|ev| {
-            let (kind, full) = format_event_for_view(&ev, view)?;
-            Some((ev, kind, full))
-        })
-        .collect();
-
-    // Budgeted selection so total output stays well under Claude Code's MCP inline limit
+    const MAX_SCAN_BATCHES: usize = 20;
+    let mut cur_before = before_seq;
+    let mut cur_after = after_seq.unwrap_or(0);
+    let mut raw_min_seq: Option<i64> = None;
+    let mut raw_max_seq: Option<i64> = None;
+    let mut db_more = false;
+    let mut hit_budget_or_limit = false;
+    let mut selected: Vec<Value> = Vec::new();
     let header_reserve = 900 + live_text.chars().count().min(MAX_LIVE_TEXT_CHARS);
     let mut remaining = MAX_TOTAL_RESPONSE_CHARS.saturating_sub(header_reserve);
-    let mut selected: Vec<Value> = Vec::new();
-    let mut hit_budget_or_limit = false;
 
-    if newest_first {
-        for (ev, kind, full) in filtered.iter().rev() {
+    for _ in 0..MAX_SCAN_BATCHES {
+        let (raw_events, batch_db_more) = if newest_first {
+            hub.store
+                .events_tail(&target.id, cur_before, scan_limit)
+                .unwrap_or_default()
+        } else {
+            let mut evs = hub
+                .store
+                .events_since(&target.id, cur_after, scan_limit + 1)
+                .unwrap_or_default();
+            let more = evs.len() > scan_limit;
+            evs.truncate(scan_limit);
+            (evs, more)
+        };
+        if raw_events.is_empty() {
+            db_more = false;
+            break;
+        }
+        if newest_first {
+            cur_before = raw_events.first().map(|e| e.seq);
+            raw_min_seq = cur_before;
+            if raw_max_seq.is_none() {
+                raw_max_seq = raw_events.last().map(|e| e.seq);
+            }
+        } else {
+            if raw_min_seq.is_none() {
+                raw_min_seq = raw_events.first().map(|e| e.seq);
+            }
+            if let Some(last) = raw_events.last() {
+                cur_after = last.seq;
+                raw_max_seq = Some(last.seq);
+            }
+        }
+        db_more = batch_db_more;
+
+        let filtered: Vec<(Event, &'static str, String)> = raw_events
+            .into_iter()
+            .filter_map(|ev| {
+                let (kind, full) = format_event_for_view(&ev, view)?;
+                Some((ev, kind, full))
+            })
+            .collect();
+
+        let iter: Box<dyn Iterator<Item = &(Event, &'static str, String)>> = if newest_first {
+            Box::new(filtered.iter().rev())
+        } else {
+            Box::new(filtered.iter())
+        };
+        for (ev, kind, full) in iter {
             if selected.len() >= limit {
                 hit_budget_or_limit = true;
                 break;
@@ -414,40 +450,42 @@ fn call_read(hub: &crate::hub::Hub, caller_sid: &str, args: &Value) -> Value {
                 "nextTextOffset": next_offset,
             }));
         }
-        selected.reverse();
-    } else {
-        for (ev, kind, full) in &filtered {
-            if selected.len() >= limit {
-                hit_budget_or_limit = true;
-                break;
-            }
-            let (chunk, truncated) = slice_chars(full, 0, max_chars);
-            let cost = chunk.chars().count() + 48;
-            if !selected.is_empty() && cost > remaining {
-                hit_budget_or_limit = true;
-                break;
-            }
-            remaining = remaining.saturating_sub(cost);
-            let next_offset = truncated.then(|| chunk.chars().count());
-            selected.push(json!({
-                "seq": ev.seq,
-                "ts": ev.ts,
-                "kind": kind,
-                "text": chunk,
-                "truncated": truncated,
-                "nextTextOffset": next_offset,
-            }));
+        if hit_budget_or_limit || !db_more {
+            break;
         }
     }
+    if newest_first {
+        selected.reverse();
+    }
 
+    let more_remaining = db_more || hit_budget_or_limit;
     let first_seq = selected.first().and_then(|v| v["seq"].as_i64());
     let last_seq = selected.last().and_then(|v| v["seq"].as_i64());
-    let earlier_seq = if newest_first && (db_more || hit_budget_or_limit) {
-        first_seq
+    let earlier_seq = if newest_first && more_remaining {
+        if hit_budget_or_limit {
+            first_seq.or(raw_min_seq)
+        } else {
+            raw_min_seq.or(first_seq)
+        }
     } else {
         None
     };
-    let has_more = !newest_first && (db_more || hit_budget_or_limit);
+    let next_seq = if newest_first {
+        last_seq.or(raw_max_seq)
+    } else if more_remaining {
+        if hit_budget_or_limit {
+            last_seq.or(raw_max_seq)
+        } else {
+            raw_max_seq.or(last_seq)
+        }
+    } else {
+        last_seq.or(raw_max_seq)
+    };
+    let has_more = if newest_first {
+        earlier_seq.is_some()
+    } else {
+        more_remaining && next_seq.is_some()
+    };
 
     let text = render_page(
         &target,
@@ -457,7 +495,7 @@ fn call_read(hub: &crate::hub::Hub, caller_sid: &str, args: &Value) -> Value {
         &live_text,
         live_truncated,
         earlier_seq,
-        last_seq,
+        next_seq,
         has_more,
     );
 
@@ -467,7 +505,7 @@ fn call_read(hub: &crate::hub::Hub, caller_sid: &str, args: &Value) -> Value {
             "session": session_meta,
             "items": selected,
             "earlierSeq": earlier_seq,
-            "nextSeq": last_seq,
+            "nextSeq": next_seq,
             "hasMore": has_more,
         }),
     )

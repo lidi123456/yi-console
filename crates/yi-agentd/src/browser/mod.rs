@@ -216,6 +216,9 @@ impl Browsers {
 
     /// Turn the browser on for a session: a fresh ticket and an empty profile. The browser itself starts on first use
     pub fn configure(&self, sid: &str, settings: &DaemonSettings) -> Result<()> {
+        if !crate::hub::is_safe_ticket_sid(sid) {
+            bail!("会话 ID 无效");
+        }
         if find(settings).is_none() {
             bail!(MISSING);
         }
@@ -263,7 +266,9 @@ impl Browsers {
             "stop" | "disable" => {
                 let Some(g) = grants.remove(sid) else { return Ok(()) };
                 drop(grants);
-                let _ = std::fs::remove_file(ticket_path(sid));
+                if crate::hub::is_safe_ticket_sid(sid) {
+                    let _ = std::fs::remove_file(ticket_path(sid));
+                }
                 self.bump(sid);
                 g.slot.closed.store(true, Ordering::SeqCst);
                 g.slot.tick();

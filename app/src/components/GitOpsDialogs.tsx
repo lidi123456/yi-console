@@ -54,6 +54,7 @@ export interface BranchesResult {
 
 export interface CommitFileItem {
   rel: string;
+  oldPath?: string;
   status: string;
   added?: number | null;
   deleted?: number | null;
@@ -116,9 +117,15 @@ export function CommitDialog({
       if (createBranch && newBranch.trim()) {
         await rpc(hostId, 'git.checkout', { cwd, branch: newBranch.trim(), create: true });
       }
+      const commitPaths = new Set<string>();
+      for (const f of files) {
+        if (!selected.has(f.rel)) continue;
+        commitPaths.add(f.rel);
+        if (f.oldPath) commitPaths.add(f.oldPath);
+      }
       const res = await rpc<{ commit?: string }>(hostId, 'git.commit', {
         cwd,
-        paths: [...selected],
+        paths: [...commitPaths],
         message: message.trim(),
       });
       const hash = res?.commit ?? '';
@@ -194,21 +201,24 @@ export function CommitDialog({
           </div>
         </div>
         <div className="wp-commit-files">
-          {files.map((f) => (
-            <label key={f.rel} className="wp-commit-pick">
-              <input type="checkbox" checked={selected.has(f.rel)} onChange={() => toggle(f.rel)} />
-              <span className={`wp-commit-st st-${f.status.toLowerCase()}`}>{f.status === 'new' ? 'U' : f.status[0]}</span>
-              <span className="mono truncate grow" title={f.rel}>
-                {f.rel}
-              </span>
-              {(f.added != null || f.deleted != null) && (
-                <span className="wp-stat">
-                  {!!f.added && <span className="add">+{f.added}</span>}
-                  {!!f.deleted && <span className="del">−{f.deleted}</span>}
+          {files.map((f) => {
+            const label = f.oldPath ? `${f.oldPath} → ${f.rel}` : f.rel;
+            return (
+              <label key={f.rel} className="wp-commit-pick">
+                <input type="checkbox" checked={selected.has(f.rel)} onChange={() => toggle(f.rel)} />
+                <span className={`wp-commit-st st-${f.status.toLowerCase()}`}>{f.status === 'new' ? 'U' : f.status[0]}</span>
+                <span className="mono truncate grow" title={label}>
+                  {label}
                 </span>
-              )}
-            </label>
-          ))}
+                {(f.added != null || f.deleted != null) && (
+                  <span className="wp-stat">
+                    {!!f.added && <span className="add">+{f.added}</span>}
+                    {!!f.deleted && <span className="del">−{f.deleted}</span>}
+                  </span>
+                )}
+              </label>
+            );
+          })}
         </div>
 
         <label className="wp-review-field">

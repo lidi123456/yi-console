@@ -104,6 +104,7 @@ export interface SessionWorktree {
   baseBranch?: string | null;
   baseCommit?: string | null;
   temporaryBranch?: boolean;
+  attached?: boolean;
 }
 
 export interface TurnCheckpoint {

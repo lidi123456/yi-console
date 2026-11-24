@@ -649,7 +649,8 @@ private class InAppBrowserDialog(
   private lateinit var schemeDrawable: StrokeIconDrawable
   private lateinit var subtitleView: TextView
   private lateinit var progressBar: ProgressBar
-  private lateinit var webView: WebView
+  private lateinit var webWrap: FrameLayout
+  private var webView: WebView? = null
   private lateinit var errorOverlay: LinearLayout
   private lateinit var errorDetailView: TextView
   private lateinit var bottomDivider: View
@@ -723,16 +724,16 @@ private class InAppBrowserDialog(
 
     buildUi()
     setContentView(root)
-    setupWebView()
     updateUrlUi(currentUrl)
     updateNavButtons()
 
     onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
       override fun handleOnBackPressed() {
+        val wv = webView
         if (customView != null) {
           exitFullscreenVideo()
-        } else if (errorOverlay.visibility != View.VISIBLE && webView.canGoBack()) {
-          webView.goBack()
+        } else if (errorOverlay.visibility != View.VISIBLE && wv != null && wv.canGoBack()) {
+          wv.goBack()
         } else {
           dismissSafely()
         }
@@ -744,7 +745,7 @@ private class InAppBrowserDialog(
     }
 
     ViewCompat.requestApplyInsets(root)
-    webView.loadUrl(currentUrl)
+    webView?.loadUrl(currentUrl)
   }
 
   private fun buildUi() {
@@ -835,16 +836,12 @@ private class InAppBrowserDialog(
     mainCol.addView(progressWrap)
 
     // WebView + Error Overlay container
-    val webWrap = FrameLayout(activity).apply {
+    webWrap = FrameLayout(activity).apply {
       layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f)
     }
-    webView = WebView(activity).apply {
-      setBackgroundColor(palette.bg)
-      layoutParams = FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
-    }
-    webWrap.addView(webView)
     errorOverlay = buildErrorOverlay()
     webWrap.addView(errorOverlay)
+    createAndAttachWebView()
     mainCol.addView(webWrap)
 
     // Bottom divider + 44dp navigation bar
@@ -862,27 +859,29 @@ private class InAppBrowserDialog(
     }
 
     val (bBtn, bIcon) = makeIconButton(BrowserIcon.BACK, str.back, sizeDp = 20) {
-      if (webView.canGoBack()) {
+      val wv = webView ?: return@makeIconButton
+      if (wv.canGoBack()) {
         mainFrameError = false
         errorOverlay.visibility = View.GONE
-        webView.goBack()
+        wv.goBack()
       }
     }
     backBtn = bBtn
     backDrawable = bIcon
 
     val (fBtn, fIcon) = makeIconButton(BrowserIcon.FORWARD, str.forward, sizeDp = 20) {
-      if (webView.canGoForward()) {
+      val wv = webView ?: return@makeIconButton
+      if (wv.canGoForward()) {
         mainFrameError = false
         errorOverlay.visibility = View.GONE
-        webView.goForward()
+        wv.goForward()
       }
     }
     forwardBtn = fBtn
     forwardDrawable = fIcon
 
     val (rBtn, rIcon) = makeIconButton(BrowserIcon.REFRESH, str.reload, sizeDp = 19) {
-      if (isLoading) webView.stopLoading() else reloadPage()
+      if (isLoading) webView?.stopLoading() else reloadPage()
     }
     reloadBtn = rBtn
     reloadDrawable = rIcon
@@ -1008,8 +1007,40 @@ private class InAppBrowserDialog(
     return wrap
   }
 
-  private fun setupWebView() {
-    val s = webView.settings
+  private fun createAndAttachWebView(): WebView {
+    val wv = WebView(activity).apply {
+      setBackgroundColor(palette.bg)
+      layoutParams = FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+    }
+    webView = wv
+    webWrap.addView(wv, 0)
+    setupWebView(wv)
+    if (desktopMode && desktopUa.isNotEmpty()) {
+      wv.settings.userAgentString = desktopUa
+    }
+    return wv
+  }
+
+  private fun disposeWebView(renderGone: Boolean = false) {
+    val wv = webView ?: return
+    webView = null
+    (wv.parent as? ViewGroup)?.removeView(wv)
+    if (!renderGone) {
+      try {
+        wv.stopLoading()
+        wv.loadUrl("about:blank")
+        wv.clearHistory()
+        wv.onPause()
+        wv.removeAllViews()
+      } catch (_: Exception) {}
+    }
+    try {
+      wv.destroy()
+    } catch (_: Exception) {}
+  }
+
+  private fun setupWebView(wv: WebView) {
+    val s = wv.settings
     @Suppress("SetJavaScriptEnabled")
     s.javaScriptEnabled = true
     s.domStorageEnabled = true
@@ -1036,11 +1067,12 @@ private class InAppBrowserDialog(
 
     CookieManager.getInstance().apply {
       setAcceptCookie(true)
-      setAcceptThirdPartyCookies(webView, true)
+      setAcceptThirdPartyCookies(wv, true)
     }
 
-    webView.webViewClient = object : WebViewClient() {
+    wv.webViewClient = object : WebViewClient() {
       override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
+        if (destroyed || view !== this@InAppBrowserDialog.webView) return true
         val uri = request?.url ?: return false
         if (isAllowedNavigationUri(uri)) return false
         val scheme = uri.scheme?.lowercase() ?: ""
@@ -1057,7 +1089,7 @@ private class InAppBrowserDialog(
       }
 
       override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
-        if (destroyed) return
+        if (destroyed || view !== this@InAppBrowserDialog.webView) return
         if (!url.isNullOrBlank() && url != "about:blank") {
           currentUrl = url
         }
@@ -1073,7 +1105,7 @@ private class InAppBrowserDialog(
       }
 
       override fun onPageFinished(view: WebView?, url: String?) {
-        if (destroyed) return
+        if (destroyed || view !== this@InAppBrowserDialog.webView) return
         if (!url.isNullOrBlank() && url != "about:blank") {
           currentUrl = url
         }
@@ -1096,7 +1128,7 @@ private class InAppBrowserDialog(
       }
 
       override fun doUpdateVisitedHistory(view: WebView?, url: String?, isReload: Boolean) {
-        if (destroyed) return
+        if (destroyed || view !== this@InAppBrowserDialog.webView) return
         if (!url.isNullOrBlank() && url != "about:blank") {
           currentUrl = url
           updateUrlUi(currentUrl)
@@ -1105,7 +1137,7 @@ private class InAppBrowserDialog(
       }
 
       override fun onReceivedError(view: WebView?, request: WebResourceRequest?, error: WebResourceError?) {
-        if (destroyed || request?.isForMainFrame != true) return
+        if (destroyed || view !== this@InAppBrowserDialog.webView || request?.isForMainFrame != true) return
         val desc = error?.description?.toString().orEmpty()
         if (desc.contains("ERR_ABORTED", ignoreCase = true)) return
         val code = error?.errorCode ?: 0
@@ -1115,7 +1147,7 @@ private class InAppBrowserDialog(
 
       override fun onReceivedSslError(view: WebView?, handler: SslErrorHandler?, error: SslError?) {
         handler?.cancel()
-        if (destroyed) return
+        if (destroyed || view !== this@InAppBrowserDialog.webView) return
         val errHost = error?.url?.let { Uri.parse(it).host?.lowercase() }
         val curHost = Uri.parse(currentUrl).host?.lowercase()
         if (errHost == null || errHost == curHost) {
@@ -1125,14 +1157,21 @@ private class InAppBrowserDialog(
 
       override fun onRenderProcessGone(view: WebView?, detail: RenderProcessGoneDetail?): Boolean {
         if (destroyed) return true
+        if (view != null && view !== this@InAppBrowserDialog.webView) {
+          (view.parent as? ViewGroup)?.removeView(view)
+          try { view.destroy() } catch (_: Exception) {}
+          return true
+        }
+        exitFullscreenVideo()
+        disposeWebView(renderGone = true)
         showErrorState(str.renderGone)
         return true
       }
     }
 
-    webView.webChromeClient = object : WebChromeClient() {
+    wv.webChromeClient = object : WebChromeClient() {
       override fun onProgressChanged(view: WebView?, newProgress: Int) {
-        if (destroyed) return
+        if (destroyed || view !== this@InAppBrowserDialog.webView) return
         progressBar.progress = newProgress.coerceIn(0, 100)
         if (newProgress >= 100) {
           progressBar.visibility = View.GONE
@@ -1142,7 +1181,7 @@ private class InAppBrowserDialog(
       }
 
       override fun onReceivedTitle(view: WebView?, title: String?) {
-        if (destroyed || mainFrameError) return
+        if (destroyed || view !== this@InAppBrowserDialog.webView || mainFrameError) return
         val t = title?.trim().orEmpty()
         if (t.isNotEmpty() && !t.equals("about:blank", ignoreCase = true)) {
           pageTitle = t
@@ -1156,6 +1195,7 @@ private class InAppBrowserDialog(
         isUserGesture: Boolean,
         resultMsg: android.os.Message?,
       ): Boolean {
+        if (destroyed || view !== this@InAppBrowserDialog.webView) return false
         val transport = resultMsg?.obj as? WebView.WebViewTransport ?: return false
         val temp = WebView(activity)
         var cleaned = false
@@ -1170,7 +1210,7 @@ private class InAppBrowserDialog(
           override fun shouldOverrideUrlLoading(v: WebView?, req: WebResourceRequest?): Boolean {
             val u = req?.url
             if (!destroyed && isAllowedHttpUri(u)) {
-              webView.loadUrl(u.toString())
+              this@InAppBrowserDialog.webView?.loadUrl(u.toString())
             } else if (u != null && (u.scheme.equals("mailto", true) || u.scheme.equals("tel", true))) {
               try {
                 activity.startActivity(Intent(Intent.ACTION_VIEW, u).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
@@ -1211,13 +1251,13 @@ private class InAppBrowserDialog(
         filePathCallback: ValueCallback<Array<Uri>>?,
         fileChooserParams: FileChooserParams?,
       ): Boolean {
-        if (filePathCallback == null) return false
+        if (filePathCallback == null || destroyed || webView !== this@InAppBrowserDialog.webView) return false
         activity.launchBrowserFileChooser(filePathCallback, fileChooserParams)
         return true
       }
     }
 
-    webView.setDownloadListener(DownloadListener { url, _, contentDisposition, _, _ ->
+    wv.setDownloadListener(DownloadListener { url, _, contentDisposition, _, _ ->
       if (destroyed || !isAllowedBrowserUrl(url)) return@DownloadListener
       val fileName = guessDownloadName(url, contentDisposition)
       val themeRes = if (dark) androidx.appcompat.R.style.Theme_AppCompat_Dialog_Alert else androidx.appcompat.R.style.Theme_AppCompat_Light_Dialog_Alert
@@ -1286,8 +1326,9 @@ private class InAppBrowserDialog(
   }
 
   private fun updateNavButtons() {
-    val canBack = !destroyed && webView.canGoBack()
-    val canFwd = !destroyed && webView.canGoForward()
+    val wv = webView
+    val canBack = !destroyed && wv != null && wv.canGoBack()
+    val canFwd = !destroyed && wv != null && wv.canGoForward()
     backBtn.isEnabled = canBack
     forwardBtn.isEnabled = canFwd
     backDrawable.setTintColor(if (canBack) palette.text else palette.disabled)
@@ -1309,11 +1350,16 @@ private class InAppBrowserDialog(
     if (destroyed) return
     mainFrameError = false
     errorOverlay.visibility = View.GONE
+    val existing = webView
+    if (existing == null) {
+      createAndAttachWebView().loadUrl(currentUrl)
+      return
+    }
     val target = currentUrl
-    if (webView.url == null || webView.url == "about:blank") {
-      webView.loadUrl(target)
+    if (existing.url == null || existing.url == "about:blank") {
+      existing.loadUrl(target)
     } else {
-      webView.reload()
+      existing.reload()
     }
   }
 
@@ -1414,7 +1460,7 @@ private class InAppBrowserDialog(
     }
 
     addActionRow(if (isLoading) BrowserIcon.CLOSE else BrowserIcon.REFRESH, if (isLoading) str.stop else str.reload) {
-      if (isLoading) webView.stopLoading() else reloadPage()
+      if (isLoading) webView?.stopLoading() else reloadPage()
     }
     addActionRow(BrowserIcon.COPY, str.copyLink) { copyCurrentUrl() }
     addActionRow(BrowserIcon.SHARE, str.shareLink) { shareCurrentUrl() }
@@ -1445,11 +1491,12 @@ private class InAppBrowserDialog(
       setOnCheckedChangeListener { _, checked ->
         if (checked == desktopMode) return@setOnCheckedChangeListener
         desktopMode = checked
-        webView.settings.userAgentString = if (checked) desktopUa else mobileUa
+        val wv = webView ?: createAndAttachWebView()
+        wv.settings.userAgentString = if (checked) desktopUa else mobileUa
         sheet.dismiss()
         mainFrameError = false
         errorOverlay.visibility = View.GONE
-        webView.loadUrl(currentUrl)
+        wv.loadUrl(currentUrl)
       }
     }
     desktopRow.addView(desktopSwitch)
@@ -1486,14 +1533,14 @@ private class InAppBrowserDialog(
   }
 
   fun onHostPause() {
-    if (!destroyed && ::webView.isInitialized) {
-      webView.onPause()
+    if (!destroyed) {
+      webView?.onPause()
     }
   }
 
   fun onHostResume() {
-    if (!destroyed && ::webView.isInitialized) {
-      webView.onResume()
+    if (!destroyed) {
+      webView?.onResume()
     }
   }
 
@@ -1509,15 +1556,7 @@ private class InAppBrowserDialog(
     overflowSheet?.dismiss()
     overflowSheet = null
     exitFullscreenVideo()
-    if (::webView.isInitialized) {
-      (webView.parent as? ViewGroup)?.removeView(webView)
-      webView.stopLoading()
-      webView.loadUrl("about:blank")
-      webView.clearHistory()
-      webView.onPause()
-      webView.removeAllViews()
-      webView.destroy()
-    }
+    disposeWebView()
     onDismissed(this)
   }
 }

@@ -68,6 +68,9 @@ impl ReviewMcp {
     }
 
     pub fn ensure_session(&self, sid: &str) -> Result<()> {
+        if !crate::hub::is_safe_ticket_sid(sid) {
+            bail!("会话 ID 无效");
+        }
         let path = self.ticket_path(sid);
         let mut grants = self.grants.lock().unwrap();
         if let Some(g) = grants.get(sid) {
@@ -90,8 +93,12 @@ impl ReviewMcp {
     }
 
     pub fn remove_session(&self, sid: &str) {
-        self.grants.lock().unwrap().remove(sid);
-        let _ = std::fs::remove_file(self.ticket_path(sid));
+        if !crate::hub::is_safe_ticket_sid(sid) {
+            return;
+        }
+        if self.grants.lock().unwrap().remove(sid).is_some() {
+            let _ = std::fs::remove_file(self.ticket_path(sid));
+        }
     }
 
     pub fn mcp_config(&self, sid: &str) -> Option<Value> {
@@ -333,6 +340,10 @@ fn call_scope(caller: &SessionInfo) -> Value {
     let mut shown = 0usize;
     for f in &files {
         let path = f["path"].as_str().unwrap_or("");
+        let display_path = match f["oldPath"].as_str() {
+            Some(old) if !old.is_empty() => format!("{old} -> {path}"),
+            _ => path.to_string(),
+        };
         let st = f["status"].as_str().unwrap_or("M");
         let add = f["added"].as_u64();
         let del = f["deleted"].as_u64();
@@ -348,9 +359,9 @@ fn call_scope(caller: &SessionInfo) -> Value {
             }
         };
         let line = if stat.is_empty() {
-            format!("- [{st}] {path}\n")
+            format!("- [{st}] {display_path}\n")
         } else {
-            format!("- [{st}] {path} ({stat})\n")
+            format!("- [{st}] {display_path} ({stat})\n")
         };
         if out.chars().count() + line.chars().count() > MAX_READ_CHARS - 120 {
             out.push_str(&format!("\n... ({} more files omitted)\n", files.len() - shown));
@@ -416,6 +427,10 @@ fn call_diff(caller: &SessionInfo, args: &Value) -> Value {
     let mut combined = String::new();
     for f in &files {
         let p = f["path"].as_str().unwrap_or("");
+        let display_path = match f["oldPath"].as_str() {
+            Some(old) if !old.is_empty() => format!("{old} -> {p}"),
+            _ => p.to_string(),
+        };
         let st = f["status"].as_str().unwrap_or("M");
         let bin = f["binary"].as_bool().unwrap_or(false);
         let diff = f["diff"].as_str().unwrap_or("");
@@ -423,11 +438,11 @@ fn call_diff(caller: &SessionInfo, args: &Value) -> Value {
             combined.push('\n');
         }
         if bin {
-            combined.push_str(&format!("=== [{st}] {p} (binary file) ===\n"));
+            combined.push_str(&format!("=== [{st}] {display_path} (binary file) ===\n"));
         } else if diff.trim().is_empty() {
-            combined.push_str(&format!("=== [{st}] {p} (diff omitted: >200KB or empty; use review_read_file to inspect lines) ===\n"));
+            combined.push_str(&format!("=== [{st}] {display_path} (diff omitted: >200KB or empty; use review_read_file to inspect lines) ===\n"));
         } else {
-            combined.push_str(&format!("=== [{st}] {p} ===\n{diff}"));
+            combined.push_str(&format!("=== [{st}] {display_path} ===\n{diff}"));
             if !diff.ends_with('\n') {
                 combined.push('\n');
             }
@@ -612,6 +627,7 @@ fn call_grep(caller: &SessionInfo, args: &Value) -> Value {
         Err(e) => return tool_error(&e.to_string()),
     };
 
+    let can_root = std::fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
     let mut paths: Vec<String> = ls
         .split(|&b| b == 0)
         .filter(|s| !s.is_empty())
@@ -626,6 +642,11 @@ fn call_grep(caller: &SessionInfo, args: &Value) -> Value {
             }
         })
         .collect();
+    paths.retain(|rel| {
+        let full = root.join(rel);
+        std::fs::symlink_metadata(&full).is_ok_and(|m| m.is_file())
+            && std::fs::canonicalize(&full).is_ok_and(|c| c.starts_with(&can_root))
+    });
     paths.sort();
 
     let max_matches = args["maxMatches"]
@@ -985,5 +1006,39 @@ mod tests {
         assert!(rmcp.authorizes("s1", "mcp__yi_review__review_diff"));
         assert!(!rmcp.authorizes("s1", "mcp__yi_review__unknown"));
         assert!(!rmcp.authorizes("s2", "mcp__yi_review__review_diff"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn review_grep_skips_symlinks_pointing_outside_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().join("outside-secret.txt");
+        std::fs::write(&outside, "SECRET_MARKER_XYZ\n").unwrap();
+
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let run = |args: &[&str]| {
+            let st = Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .env("GIT_OPTIONAL_LOCKS", "0")
+                .status()
+                .unwrap();
+            assert!(st.success(), "git {args:?}");
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "t@example.com"]);
+        run(&["config", "user.name", "t"]);
+        std::fs::write(repo.join("ok.rs"), "const SEARCH_TOKEN: &str = \"SECRET_MARKER_XYZ\";\n").unwrap();
+        std::os::unix::fs::symlink(&outside, repo.join("leak.txt")).unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-qm", "init"]);
+
+        let sess = test_session(&repo, None);
+        let gr = call_with_session(&sess, "review_grep", &json!({ "pattern": "SECRET_MARKER_XYZ" }));
+        assert_eq!(gr["isError"], false);
+        let text = gr["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("ok.rs:1:"), "{text}");
+        assert!(!text.contains("leak.txt"), "symlink target must not be grepped: {text}");
     }
 }
