@@ -1615,6 +1615,7 @@ export function ReviewSidePane({
   const key = skey(hostId, reviewSessionId);
   const data = useSessionData(key);
   const info = useStore((s) => s.sessions[hostId]?.find((x) => x.id === reviewSessionId));
+  const hasInfo = !!info;
   const connected = useStore((s) => s.hosts.find((h) => h.config.id === hostId)?.status.status === 'connected');
   const inMemMeta = getReviewMeta(reviewSessionId);
   const meta = resolveReviewMeta(info, inMemMeta);
@@ -1625,8 +1626,8 @@ export function ReviewSidePane({
   const [focusedFinding, setFocusedFinding] = useState<ReviewIssue | null>(null);
 
   useEffect(() => {
-    if (connected) loadSession(hostId, reviewSessionId).catch(errorToast);
-  }, [hostId, reviewSessionId, connected, data.loaded]);
+    if (connected && hasInfo) loadSession(hostId, reviewSessionId).catch(errorToast);
+  }, [hostId, reviewSessionId, connected, hasInfo, data.loaded]);
 
   useEffect(() => {
     setActiveReviewId(hostId, parentSessionId, reviewSessionId);

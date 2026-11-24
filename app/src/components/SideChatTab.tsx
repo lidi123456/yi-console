@@ -9,7 +9,6 @@ import { Composer } from './Composer';
 import { Icon, ToolBadge } from './Icon';
 import { askConfirm, askText } from './Overlay';
 import { getReviewMeta, ReviewSidePane } from './ReviewTab';
-import { setActiveReviewId } from '../reviewState';
 import { StatusLine } from './StatusLine';
 
 export * from '../sideChat';
@@ -29,15 +28,8 @@ export function SideChatPane({
   onOpenFile?: (relPath: string, line?: number) => void;
   onDeleted: () => void;
 }) {
-  useLang();
-  const key = skey(hostId, sideSessionId);
-  const data = useSessionData(key);
   const info = useStore((s) => s.sessions[hostId]?.find((x) => x.id === sideSessionId));
   const isReviewSide = !!(info?.review || getReviewMeta(sideSessionId));
-
-  useEffect(() => {
-    if (isReviewSide) setActiveReviewId(hostId, parentSessionId, sideSessionId);
-  }, [isReviewSide, hostId, parentSessionId, sideSessionId]);
 
   if (isReviewSide) {
     return (
@@ -50,13 +42,40 @@ export function SideChatPane({
       />
     );
   }
+
+  return (
+    <RegularSideChatPane
+      hostId={hostId}
+      parentSessionId={parentSessionId}
+      sideSessionId={sideSessionId}
+      onDeleted={onDeleted}
+    />
+  );
+}
+
+function RegularSideChatPane({
+  hostId,
+  parentSessionId,
+  sideSessionId,
+  onDeleted,
+}: {
+  hostId: string;
+  parentSessionId: string;
+  sideSessionId: string;
+  onDeleted: () => void;
+}) {
+  useLang();
+  const key = skey(hostId, sideSessionId);
+  const data = useSessionData(key);
+  const info = useStore((s) => s.sessions[hostId]?.find((x) => x.id === sideSessionId));
+  const hasInfo = !!info;
   const connected = useStore((s) => s.hosts.find((h) => h.config.id === hostId)?.status.status === 'connected');
 
   useEffect(() => {
-    if (connected) loadSession(hostId, sideSessionId).catch(errorToast);
-  }, [hostId, sideSessionId, connected, data.loaded]);
+    if (connected && hasInfo) loadSession(hostId, sideSessionId).catch(errorToast);
+  }, [hostId, sideSessionId, connected, hasInfo, data.loaded]);
 
-  useEffect(() => registerVisibleChildSession(hostId, sideSessionId), [hostId, sideSessionId]);
+  useEffect(() => (hasInfo ? registerVisibleChildSession(hostId, sideSessionId) : undefined), [hostId, sideSessionId, hasInfo]);
 
   const pending = useMemo(() => {
     const open = new Map<string, any>();
