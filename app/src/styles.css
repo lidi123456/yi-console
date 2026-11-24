@@ -15094,41 +15094,64 @@ button.wp-commit-title .chev {
   background: linear-gradient(to bottom, transparent, var(--bg));
 }
 
-.composer-wrap > .queue {
+.composer-wrap > .composer-sheets {
   margin: 0 10px -8px;
-  gap: 0;
+  border: 1px solid var(--border);
+  border-bottom: none;
+  border-radius: 12px 12px 0 0;
+  overflow: hidden;
+  background: var(--chat-sheet-bg);
   position: relative;
   z-index: 1;
 }
 
-.composer-wrap > .queue .queue-item,
-.composer-wrap > .queue .queue-held {
+.composer-wrap > .composer-sheets:empty {
+  display: none;
+}
+
+.composer-wrap > .composer-sheets > * + * {
+  border-top: 1px solid var(--border);
+}
+
+.composer-wrap > .composer-sheets > .bg-tasks {
+  margin: 0;
+  border: none;
   border-radius: 0;
-  border-style: solid;
-  border-color: var(--border);
-  border-bottom: none;
+  background: var(--chat-sheet-bg);
+}
+
+.composer-wrap > .composer-sheets > .bg-tasks:last-child {
+  padding-bottom: 10px;
+}
+
+.composer-wrap > .composer-sheets > .queue {
+  margin: 0;
+  gap: 0;
+}
+
+.composer-wrap > .composer-sheets > .queue .queue-item,
+.composer-wrap > .composer-sheets > .queue .queue-held {
+  border: none;
+  border-radius: 0;
   background: var(--chat-sheet-bg);
   padding: 6px 10px 6px 12px;
   font-size: 12.5px;
 }
 
-.composer-wrap > .queue > :first-child {
-  border-top-left-radius: 12px;
-  border-top-right-radius: 12px;
+.composer-wrap > .composer-sheets > .queue .queue-held {
+  background: color-mix(in srgb, var(--warn, #d29922) 10%, var(--chat-sheet-bg));
 }
 
-.composer-wrap > .queue > :last-child {
-  padding-bottom: 12px;
+.composer-wrap > .composer-sheets > .queue > * + * {
+  border-top: 1px solid var(--border);
 }
 
-.composer-wrap > .bg-tasks {
-  margin: 0 10px -8px;
-  border-radius: 12px 12px 0 0;
-  border-bottom: none;
-  padding-bottom: 6px;
-  background: var(--chat-sheet-bg);
-  position: relative;
-  z-index: 1;
+.composer-wrap > .composer-sheets > .queue .queue-item.drop {
+  box-shadow: inset 0 2px 0 var(--accent);
+}
+
+.composer-wrap > .composer-sheets > .queue:last-child > :last-child {
+  padding-bottom: 14px;
 }
 
 .composer {
@@ -15226,8 +15249,7 @@ button.wp-commit-title .chev {
   .chat.modern .chat-inner > .msg-user:not(:first-child) {
     margin-top: 10px;
   }
-  .composer-wrap > .queue,
-  .composer-wrap > .bg-tasks {
+  .composer-wrap > .composer-sheets {
     margin: 0 6px -8px;
   }
   .composer {
@@ -17722,6 +17744,15 @@ button.wp-commit-title .chev {
   border-radius: 8px;
   font-size: 12.5px;
 }
+.composer-sheets > .wt-dock {
+  margin: 0;
+  border: none;
+  border-radius: 0;
+  padding: 6px 8px 6px 12px;
+}
+.composer-sheets > .wt-dock:last-child {
+  padding-bottom: 14px;
+}
 .wt-dock-main {
   display: flex;
   align-items: center;
@@ -17733,6 +17764,12 @@ button.wp-commit-title .chev {
   background: color-mix(in srgb, var(--warn) 10%, var(--panel));
   border: 1px solid color-mix(in srgb, var(--warn) 28%, transparent);
   color: var(--warn);
+}
+.composer-sheets > .wt-conflict-dock {
+  background: color-mix(in srgb, var(--warn-soft) 55%, var(--panel));
+}
+.composer-sheets > .wt-conflict-dock + * {
+  border-top-color: color-mix(in srgb, var(--warn) 18%, var(--border));
 }
 .wt-dock-toggle {
   flex: 1;
@@ -17762,10 +17799,26 @@ button.wp-commit-title .chev {
   flex: none;
 }
 .wt-dock-text {
+  flex: none;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  font-weight: 500;
+}
+.wt-dock-sub {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  color: color-mix(in srgb, var(--warn) 78%, var(--text-2));
+}
+.wt-dock-sub::before {
+  content: '·';
+  margin-right: 6px;
+  opacity: 0.7;
 }
 .wt-dock-chev {
   display: inline-flex;
@@ -17788,12 +17841,28 @@ button.wp-commit-title .chev {
   color: color-mix(in srgb, var(--warn) 90%, var(--text));
   word-break: break-word;
 }
+.wt-dock-detail-busy {
+  margin-top: 3px;
+  font-size: 11.5px;
+  color: color-mix(in srgb, var(--warn) 75%, var(--text-2));
+}
 .wt-dock .btn {
   display: inline-flex;
   align-items: center;
   gap: 4px;
   flex: none;
   white-space: nowrap;
+}
+.composer-sheets > .wt-dock .btn {
+  height: 24px;
+  padding: 0 8px;
+  border-radius: 6px;
+  font-size: 11.5px;
+}
+@media (max-width: 760px) {
+  .wt-dock-text {
+    flex: 0 1 auto;
+  }
 }
 .wt-dock-close {
   display: inline-flex;

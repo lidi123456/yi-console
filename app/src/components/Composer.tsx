@@ -204,6 +204,7 @@ export function Composer({
   placeholder,
   compact = false,
   openDroppedInPanel = false,
+  sheets,
   topSlot,
   transformSend,
   onAfterSend,
@@ -221,6 +222,8 @@ export function Composer({
   compact?: boolean;
   /** Open non-image files dropped onto this composer in the session's right-side file panel */
   openDroppedInPanel?: boolean;
+  /** Optional status strips rendered above queued messages inside the unified `.composer-sheets` tray */
+  sheets?: ReactNode;
   /** Optional chip/banner rendered above the textarea row (e.g. focused review finding tag) */
   topSlot?: ReactNode;
   /** Optional message body transformer executed right before sending (when no text-only bypass happens) */
@@ -863,11 +866,14 @@ export function Composer({
 
   return (
     <>
-      <QueueList
-        hostId={hostId}
-        info={info}
-        onRecall={restoreMessageToComposer}
-      />
+      <div className="composer-sheets">
+        {sheets}
+        <QueueList
+          hostId={hostId}
+          info={info}
+          onRecall={restoreMessageToComposer}
+        />
+      </div>
       <div
         className={`composer ${drag ? 'drag' : ''}`}
         onDragOver={(e) => {

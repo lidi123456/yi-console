@@ -2526,8 +2526,11 @@ export default interface Resources {
     "viewSessionUsageAndAccount": "查看这个会话的用量和账号额度",
     "workspaceFiles": "工作目录文件",
     "worktreeConflictNotice": "同目录有其他会话运行中",
+    "worktreeConflictSummary": "「{{title}}」正在运行",
+    "worktreeConflictSummaryBusy": "「{{title}}」正在运行（本轮结束后可切入）",
     "worktreeConflictTip": "「{{title}}」正在同一目录运行，继续改动可能会互相覆盖",
-    "worktreeHeadPillTip": "当前运行于 Worktree {{branch}}（{{cwd}}）\n点击查看文件改动，右键重命名分支"
+    "worktreeHeadPillTip": "当前运行于 Worktree {{branch}}（{{cwd}}）\n点击查看文件改动，右键重命名分支",
+    "worktreeSwitchBusyTip": "当前轮次运行中，本轮结束后可切入 Worktree"
   },
   "settingsView": {
     "aSessionKeepsATool": "会话发过消息后，背后会开着一个工具进程，各占 100～250MB 内存。闲置超过设定时间，或同时开着的进程超过上限时（先结束最久没用的），这个进程会被结束；聊天记录都在，下次发消息会自动接着原来的会话继续（要多等几秒启动）。正在回复的会话不会被结束。终端模式的会话不受这两项管理，不用时请在会话菜单里「停止进程」。",

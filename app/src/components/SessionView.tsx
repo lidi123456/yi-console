@@ -952,9 +952,6 @@ export function SessionView({ hostId, sessionId, seq }: { hostId: string; sessio
               />
             </div>
             <div className="composer-wrap">
-              <BgTasks hostId={hostId} info={info} />
-              <PlanDock events={data.events} busy={info.status === 'running' || info.status === 'starting'} alive={connected && alive} />
-              <WorktreeDock hostId={hostId} info={info} connected={connected} />
               <LimitDock hostId={hostId} info={info} connected={connected} />
               {info.status === 'error' && (
                 <div className="session-recover" role="status">
@@ -982,6 +979,13 @@ export function SessionView({ hostId, sessionId, seq }: { hostId: string; sessio
                 info={info}
                 connected={connected}
                 openDroppedInPanel
+                sheets={
+                  <>
+                    <WorktreeDock hostId={hostId} info={info} connected={connected} />
+                    <BgTasks hostId={hostId} info={info} />
+                    <PlanDock events={data.events} busy={info.status === 'running' || info.status === 'starting'} alive={connected && alive} />
+                  </>
+                }
                 desktopControls={
                   canUseComputer(hostStatus(hostId).hello, info) || canUseBrowser(hostStatus(hostId).hello, info) ? (
                     <>

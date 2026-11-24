@@ -78,7 +78,11 @@ export function WorktreeDock({
     }
   };
 
-  const conflictTip = t('worktreeConflictTip', { title: conflictingSession.title || t('newSession') });
+  const conflictTitle = conflictingSession.title || t('newSession');
+  const conflictTip = t('worktreeConflictTip', { title: conflictTitle });
+  const conflictSummary = busyTurn
+    ? t('worktreeConflictSummaryBusy', { title: conflictTitle })
+    : t('worktreeConflictSummary', { title: conflictTitle });
 
   return (
     <div className={`wt-dock wt-conflict-dock${detailsOpen ? ' expanded' : ''}`} role="status">
@@ -92,6 +96,7 @@ export function WorktreeDock({
         >
           <Icon name="alert" size={14} />
           <span className="wt-dock-text">{t('worktreeConflictNotice')}</span>
+          {!detailsOpen && <span className="wt-dock-sub hide-mobile">{conflictSummary}</span>}
           <span className="wt-dock-chev" aria-hidden="true">
             <Icon name="chevron" size={12} />
           </span>
@@ -100,6 +105,7 @@ export function WorktreeDock({
           type="button"
           className="btn small primary"
           disabled={!connected || busy || busyTurn}
+          title={busyTurn ? t('worktreeSwitchBusyTip') : undefined}
           onClick={() => void enterWorktree()}
         >
           {busy ? <span className="spinner mini" /> : <Icon name="git-branch" size={12} />}
@@ -116,7 +122,12 @@ export function WorktreeDock({
           <Icon name="x" size={14} />
         </button>
       </div>
-      {detailsOpen && <div className="wt-dock-detail">{conflictTip}</div>}
+      {detailsOpen && (
+        <div className="wt-dock-detail">
+          <div>{conflictTip}</div>
+          {busyTurn && <div className="wt-dock-detail-busy">{t('worktreeSwitchBusyTip')}</div>}
+        </div>
+      )}
     </div>
   );
 }
