@@ -81,6 +81,8 @@ function shortAgo(ms: number): string {
 
 function SessionRow({ hostId, s, active, showDir }: { hostId: string; s: SessionInfo; active: boolean; showDir?: boolean }) {
   const cls = sessionStatusClass(s);
+  const wt = s.worktree;
+  const wtBranch = wt ? wt.branch.replace(/^yi\//, '') : '';
   // Only show states that need attention: awaiting approval, running, error; otherwise show the time
   const status =
     s.pendingPermissions > 0 ? (
@@ -95,10 +97,28 @@ function SessionRow({ hostId, s, active, showDir }: { hostId: string; s: Session
     ) : (
       <span className="row-time">{shortAgo(s.updatedAt)}</span>
     );
+  const mainLine = (
+    <>
+      <span className="row-badge">
+        <ToolBadge tool={s.tool} size={16} />
+        {s.mode === 'terminal' && s.tool !== 'shell' && (
+          <span className="row-badge-term">
+            <Icon name="terminal" size={9} />
+          </span>
+        )}
+      </span>
+      <span className="session-title">
+        {s.title || tx('newSession')}
+        {showDir && <span className="row-dir"> · {basename(sessionProjectDir(s))}</span>}
+      </span>
+      {(s.queued?.length ?? 0) > 0 && <span className="pill" title={tx('queuedMessages')}>{s.queued!.length}</span>}
+      <span className="row-end">{status}</span>
+    </>
+  );
   return (
-    <div className={`session-row-wrap ${active ? 'active' : ''}`}>
+    <div className={`session-row-wrap ${active ? 'active' : ''} ${wt ? 'has-wt' : ''}`}>
       <button
-        className={`session-row s-${cls} ${active ? 'active' : ''}`}
+        className={`session-row s-${cls} ${active ? 'active' : ''} ${wt ? 'row-wt' : ''}`}
         onClick={() => navigate({ kind: 'session', hostId, sessionId: s.id })}
         onContextMenu={(e) => openMenu(e, sessionMenu(hostId, s))}
         onKeyDown={(e) => {
@@ -109,26 +129,22 @@ function SessionRow({ hostId, s, active, showDir }: { hostId: string; s: Session
         }}
         title={`${s.title || tx('newSession')}\n${s.cwd}\n${s.tool === 'files' ? tx('files') : s.autoResume ? tx('usageLimitReachedContinuesAt', { v: clock(s.autoResume.at) }) : statusText(cls)}${s.mode === 'terminal' ? tx('terminalMode') : ''}${s.mode === 'terminal' && cls !== 'off' && cls !== 'err' ? tx('notStoppedAutomaticallyStopThe') : ''}`}
       >
-        <span className="row-badge">
-          <ToolBadge tool={s.tool} size={16} />
-          {s.mode === 'terminal' && s.tool !== 'shell' && (
-            <span className="row-badge-term">
-              <Icon name="terminal" size={9} />
+        {wt ? (
+          <>
+            <span className="row-main">{mainLine}</span>
+            <span className="row-wt-line">
+              <span
+                className={`row-wt-sub ${wt.temporaryBranch ? 'is-temp' : ''}`}
+                title={`${wt.branch} · ${s.cwd}`}
+              >
+                <Icon name="git-branch" size={10} />
+                <span>{wt.temporaryBranch ? tx('worktreeTempBranch', { branch: wtBranch }) : wtBranch}</span>
+              </span>
             </span>
-          )}
-        </span>
-        <span className="session-title">
-          {s.title || tx('newSession')}
-          {showDir && <span className="row-dir"> · {basename(sessionProjectDir(s))}</span>}
-        </span>
-        {s.worktree && (
-          <span className="row-wt-badge" title={`${s.worktree.branch} · ${s.cwd}`}>
-            <Icon name="git-branch" size={10} />
-            <span>{s.worktree.branch.replace(/^yi\//, '')}</span>
-          </span>
+          </>
+        ) : (
+          mainLine
         )}
-        {(s.queued?.length ?? 0) > 0 && <span className="pill" title={tx('queuedMessages')}>{s.queued!.length}</span>}
-        <span className="row-end">{status}</span>
       </button>
       <div className="row-actions">
         <button className={`row-act ${s.pinned ? 'on' : ''}`} title={s.pinned ? tx('unpin') : tx('pin')} onClick={() => pin(hostId, s)}>

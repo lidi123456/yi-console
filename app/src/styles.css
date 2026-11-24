@@ -6969,25 +6969,61 @@ body.resizing .side-resizer::after {
   color: var(--text-3);
 }
 
-.row-wt-badge {
+/* Worktree sessions expand to two lines: Line 1 keeps full title width, Line 2 shows a borderless branch subtitle */
+.session-row.row-wt {
+  flex-direction: column;
+  align-items: stretch;
+  justify-content: center;
+  height: auto;
+  min-height: 45px;
+  padding-top: 5px;
+  padding-bottom: 5px;
+  gap: 2px;
+}
+
+.row-main {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  width: 100%;
+  height: 20px;
+}
+
+.row-wt-line {
+  display: flex;
+  align-items: center;
+  padding-left: 24px;
+  min-width: 0;
+  width: 100%;
+}
+
+.row-wt-sub {
   display: inline-flex;
   align-items: center;
-  flex: none;
-  gap: 3px;
-  padding: 0 5px;
-  height: 16px;
-  border-radius: 4px;
-  background: color-mix(in srgb, var(--ok) 12%, transparent);
-  border: 1px solid color-mix(in srgb, var(--ok) 25%, transparent);
-  color: var(--ok);
-  font-size: 10.5px;
+  gap: 4px;
+  min-width: 0;
+  max-width: 100%;
+  font-size: 11px;
+  line-height: 15px;
   font-family: var(--mono);
-  max-width: 92px;
+  color: color-mix(in srgb, var(--ok) 84%, var(--text-2));
 }
-.row-wt-badge > span {
+
+.row-wt-sub > svg {
+  flex: none;
+  opacity: 0.9;
+}
+
+.row-wt-sub > span {
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.row-wt-sub.is-temp {
+  color: var(--shell-muted);
 }
 
 /* Tool icons no longer grey out with status; terminal mode adds a small badge at the bottom right */
@@ -7040,6 +7076,10 @@ body.resizing .side-resizer::after {
   transform: translateY(-50%);
   display: none;
   gap: 1px;
+}
+
+.session-row-wrap.has-wt .row-actions {
+  top: 15px;
 }
 
 .row-act {
@@ -7136,6 +7176,12 @@ body.resizing .side-resizer::after {
   .sidebar {
     --side-row-h: 38px;
     background: var(--shell-gradient);
+  }
+  .session-row.row-wt {
+    min-height: 50px;
+    padding-top: 7px;
+    padding-bottom: 7px;
+    gap: 3px;
   }
   .host-head {
     height: 36px;

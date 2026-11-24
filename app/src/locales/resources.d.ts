@@ -2742,6 +2742,7 @@ export default interface Resources {
     "usageLimitReachedContinuesAt": "额度已用完，{{v}} 自动继续",
     "usageStats": "用量统计",
     "waitingForApproval": "等待审批",
+    "worktreeTempBranch": "{{branch}} · 临时分支",
     "yesterday": "昨天"
   },
   "statsView": {

@@ -64,5 +64,6 @@
   "offline": "离线",
   "hosts": "主机管理",
   "preferencesAppearanceLanguageNotificationsProxy": "系统设置（外观、语言、通知、网络代理）",
-  "sessionsNeedYou": "{{n}} 个会话需要你处理"
+  "sessionsNeedYou": "{{n}} 个会话需要你处理",
+  "worktreeTempBranch": "{{branch}} · 临时分支"
 }
