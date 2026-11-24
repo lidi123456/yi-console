@@ -920,15 +920,27 @@ pub fn rename_branch(
 /// Add a worktree for the repo at `cwd`: `<root>/<repo name>-<hash>/<name>` on a new branch (default `yi/<name>`)
 /// from `base` (default HEAD). The hash keeps repos with the same name apart
 pub fn worktree_add(root: &Path, cwd: &str, name: &str, branch: Option<&str>, base: Option<&str>) -> Result<Value> {
+    worktree_add_with(root, cwd, name, branch, base, false, false)
+}
+
+/// Add a worktree either on a new branch (`existing_branch = false`) or checking out an existing local/remote branch (`existing_branch = true`),
+/// optionally copying `.env*` and linking ignored dependencies (`prepare_env = true`).
+pub fn worktree_add_with(
+    root: &Path,
+    cwd: &str,
+    name: &str,
+    branch: Option<&str>,
+    base: Option<&str>,
+    existing_branch: bool,
+    prepare_env: bool,
+) -> Result<Value> {
     if !safe_name(name) {
         bail!("worktree 名称只能包含字母、数字、点、下划线和短横线: {name}");
     }
-    let repo = repo_root(Path::new(cwd)).ok_or_else(|| anyhow!("不是 git 仓库: {cwd}"))?;
-    let branch = branch.map(str::to_string).unwrap_or_else(|| format!("yi/{name}"));
-    let base = base.unwrap_or("HEAD");
-    if branch.starts_with('-') || base.starts_with('-') || git_ok(&repo, &["check-ref-format", "--branch", &branch]).is_err() {
-        bail!("分支名无效: {branch}");
-    }
+    let dir_input = crate::paths::expand(cwd);
+    let repo = main_repo_root(&dir_input)
+        .or_else(|| repo_root(&dir_input))
+        .ok_or_else(|| anyhow!("不是 git 仓库: {cwd}"))?;
     let repo_name = repo.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "repo".into());
     let repo_name: String = repo_name.chars().map(|c| if c.is_alphanumeric() || "._-".contains(c) { c } else { '_' }).collect();
     let hash = format!("{:x}", md5::compute(repo.to_string_lossy().as_bytes()));
@@ -938,8 +950,59 @@ pub fn worktree_add(root: &Path, cwd: &str, name: &str, branch: Option<&str>, ba
     }
     std::fs::create_dir_all(dir.parent().unwrap())?;
     let path = dir.to_string_lossy().to_string();
-    git_ok(&repo, &["worktree", "add", "-b", &branch, &path, base])?;
-    Ok(json!({ "path": path, "branch": branch, "repo": repo.to_string_lossy() }))
+
+    let created_branch = if existing_branch {
+        let raw_branch = branch
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| anyhow!("请指定分支名"))?;
+        if !is_safe_ref_token(raw_branch) {
+            bail!("分支名无效: {raw_branch}");
+        }
+        if git(&repo, &["show-ref", "--verify", "--quiet", &format!("refs/heads/{raw_branch}")])
+            .is_ok_and(|o| o.status.success())
+        {
+            git_ok(&repo, &["worktree", "add", &path, raw_branch])?;
+            raw_branch.to_string()
+        } else if git(&repo, &["show-ref", "--verify", "--quiet", &format!("refs/remotes/{raw_branch}")])
+            .is_ok_and(|o| o.status.success())
+        {
+            let local = raw_branch
+                .split_once('/')
+                .map(|(_, rest)| rest)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| anyhow!("远程分支名无效: {raw_branch}"))?;
+            if git_ok(&repo, &["check-ref-format", "--branch", local]).is_err() {
+                bail!("分支名无效: {local}");
+            }
+            if git(&repo, &["show-ref", "--verify", "--quiet", &format!("refs/heads/{local}")])
+                .is_ok_and(|o| o.status.success())
+            {
+                git_ok(&repo, &["worktree", "add", &path, local])?;
+            } else {
+                git_ok(&repo, &["worktree", "add", "--track", "-b", local, &path, raw_branch])?;
+            }
+            local.to_string()
+        } else {
+            bail!("找不到分支: {raw_branch}");
+        }
+    } else {
+        let branch_name = branch.map(str::to_string).unwrap_or_else(|| format!("yi/{name}"));
+        let base_ref = base.unwrap_or("HEAD");
+        if branch_name.starts_with('-')
+            || base_ref.starts_with('-')
+            || git_ok(&repo, &["check-ref-format", "--branch", &branch_name]).is_err()
+        {
+            bail!("分支名无效: {branch_name}");
+        }
+        git_ok(&repo, &["worktree", "add", "-b", &branch_name, &path, base_ref])?;
+        branch_name
+    };
+
+    if prepare_env {
+        prepare_worktree_env(&repo, &dir);
+    }
+    Ok(json!({ "path": path, "branch": created_branch, "repo": repo.to_string_lossy() }))
 }
 
 /// Unlink symlinked/junctioned dependency directories inside a worktree before removal so git never trips on them
@@ -989,6 +1052,144 @@ pub fn worktree_remove(root: &Path, path: &str, force: bool, delete_branch: bool
         git_ok(&common, &["branch", "-D", &b])?;
     }
     Ok(())
+}
+
+/// Remove any linked (non-main) worktree belonging to `cwd`'s repository, including sibling worktrees and prunable entries
+pub fn worktree_remove_in_repo(cwd: &str, path: &str, force: bool, delete_branch: bool) -> Result<()> {
+    let dir_input = crate::paths::expand(cwd);
+    let root = repo_root(&dir_input).ok_or_else(|| anyhow!("不是 git 仓库"))?;
+    let listed = worktrees_with(cwd, false)?;
+    let default_branch = listed["defaultBranch"].as_str().map(str::to_string);
+    let req_canon_key = Path::new(path)
+        .canonicalize()
+        .ok()
+        .map(|p| norm_path_key(&p.to_string_lossy()));
+    let req_raw_key = norm_path_key(path);
+
+    let entry = listed["worktrees"]
+        .as_array()
+        .and_then(|arr| {
+            arr.iter().find(|w| {
+                let Some(wp) = w["path"].as_str() else { return false };
+                let wp_raw = norm_path_key(wp);
+                if wp_raw == req_raw_key {
+                    return true;
+                }
+                if let Some(ref ck) = req_canon_key {
+                    let wp_canon = Path::new(wp)
+                        .canonicalize()
+                        .ok()
+                        .map(|p| norm_path_key(&p.to_string_lossy()));
+                    if wp_canon.as_deref() == Some(ck.as_str()) {
+                        return true;
+                    }
+                }
+                false
+            })
+        })
+        .ok_or_else(|| anyhow!("未找到对应的 worktree: {path}"))?
+        .clone();
+
+    if entry["isMain"].as_bool().unwrap_or(false) {
+        bail!("不能删除主仓库目录");
+    }
+    if entry["bare"].as_bool().unwrap_or(false) {
+        bail!("不能删除 bare 仓库");
+    }
+    let wt_path = entry["path"]
+        .as_str()
+        .ok_or_else(|| anyhow!("worktree 路径无效"))?
+        .to_string();
+    let branch = entry["branch"].as_str().map(str::to_string);
+    let prunable = entry["prunable"].as_bool().unwrap_or(false);
+
+    let common = git_ok(&root, &["rev-parse", "--path-format=absolute", "--git-common-dir"])?;
+    let common = std::path::PathBuf::from(common.trim());
+
+    if prunable || !Path::new(&wt_path).exists() {
+        git_ok(&common, &["worktree", "prune"])?;
+    } else {
+        unlink_worktree_deps(Path::new(&wt_path));
+        let mut args = vec!["worktree", "remove"];
+        if force {
+            args.push("--force");
+        }
+        args.push(&wt_path);
+        git_ok(&common, &args)?;
+    }
+
+    if delete_branch {
+        if let Some(b) = branch.filter(|b| !b.is_empty() && default_branch.as_deref() != Some(b.as_str())) {
+            if git(&common, &["show-ref", "--verify", "--quiet", &format!("refs/heads/{b}")])
+                .is_ok_and(|o| o.status.success())
+            {
+                let flag = if force { "-D" } else { "-d" };
+                git_ok(&common, &["branch", flag, &b])?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Safely remove clean, merged linked worktrees in the repository (skipping current, dirty, or unmerged ones)
+pub fn worktree_prune(cwd: &str, paths: Option<&[String]>, delete_branches: bool) -> Result<Value> {
+    let listed = worktrees_with(cwd, true)?;
+    let filter_keys: Option<std::collections::HashSet<String>> = paths.map(|ps| {
+        ps.iter()
+            .map(|p| {
+                Path::new(p)
+                    .canonicalize()
+                    .ok()
+                    .map(|c| norm_path_key(&c.to_string_lossy()))
+                    .unwrap_or_else(|| norm_path_key(p))
+            })
+            .collect()
+    });
+
+    let mut removed: Vec<String> = Vec::new();
+    let mut skipped: Vec<Value> = Vec::new();
+
+    if let Some(arr) = listed["worktrees"].as_array() {
+        for w in arr {
+            if w["isMain"].as_bool().unwrap_or(false) || w["bare"].as_bool().unwrap_or(false) {
+                continue;
+            }
+            let Some(wt_path) = w["path"].as_str() else { continue };
+            if let Some(ref keys) = filter_keys {
+                let canon_k = Path::new(wt_path)
+                    .canonicalize()
+                    .ok()
+                    .map(|c| norm_path_key(&c.to_string_lossy()));
+                let raw_k = norm_path_key(wt_path);
+                if !keys.contains(&raw_k) && !canon_k.as_ref().is_some_and(|ck| keys.contains(ck)) {
+                    continue;
+                }
+            }
+            let is_current = w["isCurrent"].as_bool().unwrap_or(false);
+            let prunable = w["prunable"].as_bool().unwrap_or(false);
+            let dirty_count = w["dirtyCount"].as_u64().unwrap_or(0);
+            let merged = w["merged"].as_bool().unwrap_or(false);
+
+            if is_current {
+                skipped.push(json!({ "path": wt_path, "reason": "当前正在浏览此 Worktree" }));
+                continue;
+            }
+            if !prunable && dirty_count > 0 {
+                skipped.push(json!({ "path": wt_path, "reason": "存在未提交改动" }));
+                continue;
+            }
+            if !prunable && !merged {
+                skipped.push(json!({ "path": wt_path, "reason": "尚未合并到默认分支" }));
+                continue;
+            }
+            match worktree_remove_in_repo(cwd, wt_path, false, delete_branches) {
+                Ok(()) => removed.push(wt_path.to_string()),
+                Err(e) => skipped.push(json!({ "path": wt_path, "reason": e.to_string() })),
+            }
+        }
+    }
+
+    Ok(json!({ "removed": removed, "skipped": skipped }))
 }
 
 /// Best-effort synchronous removal with brief retries for Windows file-handle release
@@ -1289,15 +1490,33 @@ fn native_worktree_path(raw: &str) -> String {
 
 /// List all worktrees belonging to the git repository containing `cwd` (including user- or AI-created worktrees anywhere on disk)
 pub fn worktrees(cwd: &str) -> Result<Value> {
+    worktrees_with(cwd, false)
+}
+
+/// List all worktrees of the repo, optionally enriching each with dirty count, ahead/behind, and merged status
+pub fn worktrees_with(cwd: &str, details: bool) -> Result<Value> {
     let dir = crate::paths::expand(cwd);
     let Some(root) = repo_root(&dir) else {
-        return Ok(json!({ "repo": null, "current": null, "worktrees": [] }));
+        return Ok(json!({ "repo": null, "current": null, "defaultBranch": null, "worktrees": [] }));
     };
     let current_canon = root.canonicalize().unwrap_or_else(|_| root.clone());
     let current_key = norm_path_key(&current_canon.to_string_lossy());
+    let default_branch = detect_default_branch(&root);
     let out = git_ok(&root, &["worktree", "list", "--porcelain"])?;
 
-    let mut items: Vec<Value> = Vec::new();
+    #[derive(Clone)]
+    struct RawWt {
+        path: String,
+        head: String,
+        branch: Option<String>,
+        detached: bool,
+        is_main: bool,
+        is_current: bool,
+        bare: bool,
+        prunable: bool,
+    }
+
+    let mut raw_items: Vec<RawWt> = Vec::new();
     let mut path: Option<String> = None;
     let mut head = String::new();
     let mut branch: Option<String> = None;
@@ -1305,7 +1524,7 @@ pub fn worktrees(cwd: &str) -> Result<Value> {
     let mut bare = false;
     let mut prunable = false;
 
-    let flush = |items: &mut Vec<Value>,
+    let flush = |raw_items: &mut Vec<RawWt>,
                  path: &mut Option<String>,
                  head: &mut String,
                  branch: &mut Option<String>,
@@ -1319,17 +1538,17 @@ pub fn worktrees(cwd: &str) -> Result<Value> {
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_else(|_| native.clone());
             let is_current = norm_path_key(&item_canon) == current_key;
-            let is_main = items.is_empty();
-            items.push(json!({
-                "path": native,
-                "head": head.clone(),
-                "branch": branch.take(),
-                "detached": *detached,
-                "isMain": is_main,
-                "isCurrent": is_current,
-                "bare": *bare,
-                "prunable": *prunable,
-            }));
+            let is_main = raw_items.is_empty();
+            raw_items.push(RawWt {
+                path: native,
+                head: head.clone(),
+                branch: branch.take(),
+                detached: *detached,
+                is_main,
+                is_current,
+                bare: *bare,
+                prunable: *prunable,
+            });
         }
         head.clear();
         *branch = None;
@@ -1341,11 +1560,11 @@ pub fn worktrees(cwd: &str) -> Result<Value> {
     for line in out.lines() {
         let line = line.trim_end_matches('\r');
         if line.is_empty() {
-            flush(&mut items, &mut path, &mut head, &mut branch, &mut detached, &mut bare, &mut prunable);
+            flush(&mut raw_items, &mut path, &mut head, &mut branch, &mut detached, &mut bare, &mut prunable);
             continue;
         }
         if let Some(v) = line.strip_prefix("worktree ") {
-            flush(&mut items, &mut path, &mut head, &mut branch, &mut detached, &mut bare, &mut prunable);
+            flush(&mut raw_items, &mut path, &mut head, &mut branch, &mut detached, &mut bare, &mut prunable);
             path = Some(v.to_string());
         } else if let Some(v) = line.strip_prefix("HEAD ") {
             head = v.to_string();
@@ -1359,7 +1578,115 @@ pub fn worktrees(cwd: &str) -> Result<Value> {
             prunable = true;
         }
     }
-    flush(&mut items, &mut path, &mut head, &mut branch, &mut detached, &mut bare, &mut prunable);
+    flush(&mut raw_items, &mut path, &mut head, &mut branch, &mut detached, &mut bare, &mut prunable);
+
+    let mut branch_track: std::collections::HashMap<String, (Option<String>, Option<u64>, Option<u64>)> =
+        std::collections::HashMap::new();
+    let mut merged_set: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    if details {
+        let fmt = format!("--format=%(refname:short){FS}%(upstream:short){FS}%(upstream:track){RS}");
+        if let Ok(br_out) = git_ok(&root, &["for-each-ref", &fmt, "refs/heads"]) {
+            for rec in br_out.split(RS).map(|r| r.trim_start_matches('\n')).filter(|r| !r.is_empty()) {
+                let f: Vec<&str> = rec.splitn(3, FS).collect();
+                if let [name, upstream, track] = f[..] {
+                    let (ahead, behind) = parse_track(track);
+                    branch_track.insert(
+                        name.to_string(),
+                        (if upstream.is_empty() { None } else { Some(upstream.to_string()) }, ahead, behind),
+                    );
+                }
+            }
+        }
+        if let Some(ref def) = default_branch {
+            if let Ok(m_out) = git_ok(&root, &["for-each-ref", &format!("--merged={def}"), "--format=%(refname:short)", "refs/heads"]) {
+                for line in m_out.lines().map(str::trim).filter(|s| !s.is_empty()) {
+                    merged_set.insert(line.to_string());
+                }
+            }
+        }
+    }
+
+    let mut detail_checked = 0usize;
+    let items: Vec<Value> = raw_items
+        .iter()
+        .map(|w| {
+            let mut obj = json!({
+                "path": w.path,
+                "head": w.head,
+                "branch": w.branch,
+                "detached": w.detached,
+                "isMain": w.is_main,
+                "isCurrent": w.is_current,
+                "bare": w.bare,
+                "prunable": w.prunable,
+            });
+            if details && !w.bare && detail_checked < 60 {
+                detail_checked += 1;
+                let (upstream, ahead, behind) = w
+                    .branch
+                    .as_deref()
+                    .and_then(|b| branch_track.get(b))
+                    .cloned()
+                    .unwrap_or((None, None, None));
+
+                let dirty_count = if !w.prunable && Path::new(&w.path).is_dir() {
+                    git_ok(Path::new(&w.path), &["status", "--porcelain"])
+                        .map(|s| s.lines().filter(|l| !l.trim().is_empty()).count() as u64)
+                        .unwrap_or(0)
+                } else {
+                    0
+                };
+
+                let is_default_branch = w.branch.as_deref().is_some_and(|b| {
+                    default_branch.as_deref() == Some(b)
+                        || default_branch
+                            .as_deref()
+                            .and_then(|d| d.strip_prefix("origin/"))
+                            == Some(b)
+                });
+                let merged = if w.is_main || w.prunable || is_default_branch {
+                    false
+                } else if let Some(ref br) = w.branch {
+                    merged_set.contains(br)
+                } else if !w.head.is_empty() {
+                    default_branch.as_deref().is_some_and(|def| {
+                        git(&root, &["merge-base", "--is-ancestor", &w.head, def])
+                            .is_ok_and(|o| o.status.success())
+                    })
+                } else {
+                    false
+                };
+
+                let ahead_base = if !w.is_main && !w.prunable && !is_default_branch {
+                    if merged {
+                        Some(0u64)
+                    } else if let Some(ref def) = default_branch {
+                        let rev = w.branch.as_deref().or(if !w.head.is_empty() { Some(w.head.as_str()) } else { None });
+                        rev.and_then(|r| {
+                            git_ok(&root, &["rev-list", "--count", &format!("{def}..{r}")])
+                                .ok()
+                                .and_then(|s| s.trim().parse::<u64>().ok())
+                        })
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                if let Some(map) = obj.as_object_mut() {
+                    map.insert("dirtyCount".into(), json!(dirty_count));
+                    map.insert("upstream".into(), json!(upstream));
+                    map.insert("ahead".into(), json!(ahead));
+                    map.insert("behind".into(), json!(behind));
+                    map.insert("aheadBase".into(), json!(ahead_base));
+                    map.insert("merged".into(), json!(merged));
+                }
+            }
+            obj
+        })
+        .collect();
 
     let main_path = items
         .first()
@@ -1370,6 +1697,7 @@ pub fn worktrees(cwd: &str) -> Result<Value> {
     Ok(json!({
         "repo": main_path,
         "current": native_worktree_path(&root.to_string_lossy()),
+        "defaultBranch": default_branch,
         "worktrees": items,
     }))
 }
@@ -1439,6 +1767,14 @@ pub fn branches(cwd: &str) -> Result<Value> {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
     let default_branch = detect_default_branch(&root);
+    let mut merged_set: std::collections::HashSet<String> = std::collections::HashSet::new();
+    if let Some(ref def) = default_branch {
+        if let Ok(m_out) = git_ok(&root, &["for-each-ref", &format!("--merged={def}"), "--format=%(refname:short)", "refs/heads"]) {
+            for line in m_out.lines().map(str::trim).filter(|s| !s.is_empty()) {
+                merged_set.insert(line.to_string());
+            }
+        }
+    }
     let fmt = format!("--format=%(HEAD){FS}%(refname:short){FS}%(upstream:short){FS}%(upstream:track){RS}");
     let out = git_ok(&root, &["for-each-ref", "--sort=-committerdate", &fmt, "refs/heads"])?;
     let mut list = Vec::new();
@@ -1448,12 +1784,14 @@ pub fn branches(cwd: &str) -> Result<Value> {
             continue;
         };
         let (ahead, behind) = parse_track(track);
+        let merged = default_branch.as_deref() != Some(name) && merged_set.contains(name);
         list.push(json!({
             "name": name,
             "current": head_mark == "*",
             "upstream": if upstream.is_empty() { Value::Null } else { json!(upstream) },
             "ahead": ahead,
             "behind": behind,
+            "merged": merged,
         }));
     }
     let remote_branches: Vec<String> = git_ok(
@@ -1475,7 +1813,7 @@ pub fn branches(cwd: &str) -> Result<Value> {
     }))
 }
 
-/// Switch to an existing branch or create and switch to a new branch
+/// Switch to an existing branch (or remote tracking branch) or create and switch to a new branch
 pub fn checkout(cwd: &str, branch: &str, create: bool, base: Option<&str>) -> Result<Value> {
     let branch = branch.trim();
     if branch.is_empty() || branch.starts_with('-') {
@@ -1495,10 +1833,35 @@ pub fn checkout(cwd: &str, branch: &str, create: bool, base: Option<&str>) -> Re
             args.push(b);
         }
         git_ok(&root, &args)?;
+        Ok(json!({ "branch": branch }))
+    } else if git(&root, &["show-ref", "--verify", "--quiet", &format!("refs/heads/{branch}")])
+        .is_ok_and(|o| o.status.success())
+    {
+        git_ok(&root, &["checkout", branch])?;
+        Ok(json!({ "branch": branch }))
+    } else if git(&root, &["show-ref", "--verify", "--quiet", &format!("refs/remotes/{branch}")])
+        .is_ok_and(|o| o.status.success())
+    {
+        let local = branch
+            .split_once('/')
+            .map(|(_, rest)| rest)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| anyhow!("远程分支名无效: {branch}"))?;
+        if git_ok(&root, &["check-ref-format", "--branch", local]).is_err() {
+            bail!("分支名无效: {local}");
+        }
+        if git(&root, &["show-ref", "--verify", "--quiet", &format!("refs/heads/{local}")])
+            .is_ok_and(|o| o.status.success())
+        {
+            git_ok(&root, &["checkout", local])?;
+        } else {
+            git_ok(&root, &["checkout", "--track", "-b", local, branch])?;
+        }
+        Ok(json!({ "branch": local }))
     } else {
         git_ok(&root, &["checkout", branch])?;
+        Ok(json!({ "branch": branch }))
     }
-    Ok(json!({ "branch": branch }))
 }
 
 /// Push the current branch to its upstream or to `remote` (setting upstream when absent)
@@ -1570,6 +1933,238 @@ pub fn push(cwd: &str, remote: Option<&str>, branch: Option<&str>, set_upstream:
         "remote": chosen_remote,
         "output": combined,
     }))
+}
+
+fn combine_git_output(out: &std::process::Output) -> String {
+    let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    [stdout, stderr].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join("\n")
+}
+
+/// Fetch updates from remote(s)
+pub fn fetch(cwd: &str, remote: Option<&str>, prune: bool) -> Result<Value> {
+    let dir = crate::paths::expand(cwd);
+    let root = repo_root(&dir).ok_or_else(|| anyhow!("不是 git 仓库"))?;
+    let explicit_remote = remote.map(str::trim).filter(|s| !s.is_empty());
+    if let Some(r) = explicit_remote {
+        if r.starts_with('-') || !is_safe_ref_token(r) {
+            bail!("远程仓库名无效: {r}");
+        }
+    }
+    let mut args = vec!["fetch"];
+    if prune {
+        args.push("--prune");
+    }
+    if let Some(r) = explicit_remote {
+        args.push(r);
+    } else {
+        args.push("--all");
+    }
+    let out = git(&root, &args)?;
+    let combined = combine_git_output(&out);
+    if !out.status.success() {
+        bail!("{}", if combined.is_empty() { "拉取远程更新失败".into() } else { combined });
+    }
+    Ok(json!({ "output": combined }))
+}
+
+/// Pull remote updates into the current branch
+pub fn pull(cwd: &str, rebase: bool) -> Result<Value> {
+    let dir = crate::paths::expand(cwd);
+    let root = repo_root(&dir).ok_or_else(|| anyhow!("不是 git 仓库"))?;
+    let current_branch = git_ok(&root, &["symbolic-ref", "--quiet", "--short", "HEAD"])
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| anyhow!("当前处于分离头指针状态，请先切换到分支再拉取"))?;
+    let mut args = vec!["pull"];
+    if rebase {
+        args.push("--rebase");
+    }
+    let out = git(&root, &args)?;
+    let combined = combine_git_output(&out);
+    if !out.status.success() {
+        if rebase {
+            let _ = git(&root, &["rebase", "--abort"]);
+        }
+        bail!("{}", if combined.is_empty() { "拉取更新失败".into() } else { combined });
+    }
+    Ok(json!({ "branch": current_branch, "output": combined }))
+}
+
+/// Merge `source` into `target` (or current HEAD branch when `target` is omitted).
+/// Automatically resolves the worktree directory holding `target` if it is checked out elsewhere, and aborts cleanly on conflicts.
+pub fn merge(cwd: &str, source: &str, target: Option<&str>, squash: bool, message: Option<&str>) -> Result<Value> {
+    let source = source.trim();
+    if source.is_empty() || !is_safe_ref_token(source) {
+        bail!("分支名无效: {source}");
+    }
+    let dir = crate::paths::expand(cwd);
+    let root = repo_root(&dir).ok_or_else(|| anyhow!("不是 git 仓库"))?;
+    if !git(&root, &["rev-parse", "--verify", "-q", &format!("{source}^{{commit}}")])
+        .is_ok_and(|o| o.status.success())
+    {
+        bail!("找不到分支或提交: {source}");
+    }
+
+    let (target_dir, target_branch) = match target.map(str::trim).filter(|s| !s.is_empty()) {
+        None => {
+            let cur = git_ok(&root, &["symbolic-ref", "--quiet", "--short", "HEAD"])
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| anyhow!("当前处于分离头指针状态，请先切换到分支再合并"))?;
+            (root.clone(), cur)
+        }
+        Some(t) => {
+            if !is_safe_ref_token(t) {
+                bail!("目标分支无效: {t}");
+            }
+            if !git(&root, &["show-ref", "--verify", "--quiet", &format!("refs/heads/{t}")])
+                .is_ok_and(|o| o.status.success())
+            {
+                bail!("找不到目标分支: {t}");
+            }
+            let listed = worktrees_with(cwd, false)?;
+            let matched_wt = listed["worktrees"]
+                .as_array()
+                .and_then(|arr| {
+                    arr.iter().find(|w| {
+                        !w["bare"].as_bool().unwrap_or(false)
+                            && !w["prunable"].as_bool().unwrap_or(false)
+                            && w["branch"].as_str() == Some(t)
+                    })
+                })
+                .and_then(|w| w["path"].as_str())
+                .map(std::path::PathBuf::from);
+            if let Some(wt_dir) = matched_wt {
+                (wt_dir, t.to_string())
+            } else {
+                let main_dir = main_repo_root(&dir).unwrap_or_else(|| root.clone());
+                let st = git_ok(&main_dir, &["status", "--porcelain"])?;
+                if !st.trim().is_empty() {
+                    bail!("目标分支未检出且主仓库有未提交改动，请先提交或清理");
+                }
+                git_ok(&main_dir, &["checkout", t])?;
+                (main_dir, t.to_string())
+            }
+        }
+    };
+
+    if source == target_branch {
+        bail!("源分支与目标分支相同");
+    }
+    let st = git_ok(&target_dir, &["status", "--porcelain"])?;
+    if !st.trim().is_empty() {
+        bail!("目标分支目录有未提交改动，请先提交或清理后再合并");
+    }
+
+    if squash {
+        let out = git(&target_dir, &["merge", "--squash", source])?;
+        if !out.status.success() {
+            let _ = git(&target_dir, &["reset", "--merge"]);
+            bail!("合并存在冲突，已自动中止，请在终端手动解决冲突");
+        }
+        let staged = git(&target_dir, &["diff", "--cached", "--quiet"])?;
+        if staged.status.success() {
+            return Ok(json!({
+                "source": source,
+                "target": target_branch,
+                "output": "已经是最新，无需合并",
+                "alreadyUpToDate": true,
+            }));
+        }
+        let msg = message
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("squash: merge {source} into {target_branch}"));
+        let commit_out = git(&target_dir, &["commit", "-m", &msg])?;
+        let combined = combine_git_output(&commit_out);
+        if !commit_out.status.success() {
+            let _ = git(&target_dir, &["reset", "--merge"]);
+            bail!("{}", if combined.is_empty() { "提交合并结果失败".into() } else { combined });
+        }
+        Ok(json!({
+            "source": source,
+            "target": target_branch,
+            "output": combined,
+        }))
+    } else {
+        let out = git(&target_dir, &["merge", "--no-edit", source])?;
+        let combined = combine_git_output(&out);
+        if !out.status.success() {
+            let _ = git(&target_dir, &["merge", "--abort"]);
+            bail!("合并存在冲突，已自动中止，请在终端手动解决冲突");
+        }
+        let lower = combined.to_ascii_lowercase();
+        let already_up_to_date =
+            lower.contains("already up to date") || lower.contains("already up-to-date");
+        Ok(json!({
+            "source": source,
+            "target": target_branch,
+            "output": combined,
+            "alreadyUpToDate": already_up_to_date,
+        }))
+    }
+}
+
+/// Rebase the current branch onto `onto`, aborting cleanly if conflicts occur
+pub fn rebase(cwd: &str, onto: &str) -> Result<Value> {
+    let onto = onto.trim();
+    if onto.is_empty() || !is_safe_ref_token(onto) {
+        bail!("基准分支无效: {onto}");
+    }
+    let dir = crate::paths::expand(cwd);
+    let root = repo_root(&dir).ok_or_else(|| anyhow!("不是 git 仓库"))?;
+    let current_branch = git_ok(&root, &["symbolic-ref", "--quiet", "--short", "HEAD"])
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| anyhow!("当前处于分离头指针状态，无法变基"))?;
+    if !git(&root, &["rev-parse", "--verify", "-q", &format!("{onto}^{{commit}}")])
+        .is_ok_and(|o| o.status.success())
+    {
+        bail!("找不到分支或提交: {onto}");
+    }
+    let st = git_ok(&root, &["status", "--porcelain"])?;
+    if !st.trim().is_empty() {
+        bail!("当前工作区有未提交改动，请先提交或放弃后再变基");
+    }
+    let out = git(&root, &["rebase", onto])?;
+    let combined = combine_git_output(&out);
+    if !out.status.success() {
+        let _ = git(&root, &["rebase", "--abort"]);
+        bail!("变基存在冲突，已自动中止，请在终端手动处理");
+    }
+    Ok(json!({
+        "branch": current_branch,
+        "onto": onto,
+        "output": combined,
+    }))
+}
+
+/// Delete a local branch (refusing if currently checked out in any worktree)
+pub fn branch_delete(cwd: &str, branch: &str, force: bool) -> Result<Value> {
+    let branch = branch.trim();
+    if branch.is_empty() || branch.starts_with('-') {
+        bail!("分支名无效: {branch}");
+    }
+    let dir = crate::paths::expand(cwd);
+    let root = repo_root(&dir).ok_or_else(|| anyhow!("不是 git 仓库"))?;
+    if git_ok(&root, &["check-ref-format", "--branch", branch]).is_err() {
+        bail!("分支名无效: {branch}");
+    }
+    let listed = worktrees_with(cwd, false)?;
+    if listed["worktrees"]
+        .as_array()
+        .is_some_and(|arr| arr.iter().any(|w| w["branch"].as_str() == Some(branch)))
+    {
+        bail!("分支 {branch} 正被 Worktree 占用，请先切换或删除对应 Worktree");
+    }
+    let flag = if force { "-D" } else { "-d" };
+    git_ok(&root, &["branch", flag, branch])?;
+    Ok(json!({ "branch": branch }))
 }
 
 /// Build a unified diff for an untracked file on disk (empty for binaries or oversized files)
@@ -3432,5 +4027,154 @@ mod tests {
         assert!(r_bad1["error"].as_str().is_some());
         let r_bad2 = review_scope(&cwd, &json!({ "mode": "range", "range": "HEAD; rm -rf" })).unwrap();
         assert!(r_bad2["error"].as_str().is_some());
+    }
+
+    #[test]
+    fn branch_lifecycle_fetch_pull_merge_rebase_and_worktree_prune() {
+        let d = tempfile::tempdir().unwrap();
+        let remote_bare = d.path().join("remote.git");
+        let repo = d.path().join("repo");
+        let wt_root = d.path().join("wt-root");
+        std::fs::create_dir_all(&remote_bare).unwrap();
+        std::fs::create_dir_all(&repo).unwrap();
+
+        let run = |dir: &Path, a: &[&str]| assert!(git(dir, a).unwrap().status.success(), "{dir:?} {a:?}");
+        run(&remote_bare, &["init", "--bare", "-q", "-b", "main"]);
+
+        run(&repo, &["init", "-q", "-b", "main"]);
+        run(&repo, &["config", "user.email", "t@t"]);
+        run(&repo, &["config", "user.name", "t"]);
+        run(&repo, &["config", "core.autocrlf", "false"]);
+        std::fs::write(repo.join("base.txt"), "v1\n").unwrap();
+        run(&repo, &["add", "."]);
+        run(&repo, &["commit", "-qm", "init"]);
+        run(&repo, &["remote", "add", "origin", &remote_bare.to_string_lossy()]);
+        run(&repo, &["push", "-u", "origin", "main"]);
+
+        // Create a second clone to push an upstream commit onto origin/main
+        let clone2 = d.path().join("clone2");
+        run(d.path(), &["clone", "-q", &remote_bare.to_string_lossy(), &clone2.to_string_lossy()]);
+        run(&clone2, &["config", "user.email", "t2@t"]);
+        run(&clone2, &["config", "user.name", "t2"]);
+        std::fs::write(clone2.join("remote.txt"), "from remote\n").unwrap();
+        run(&clone2, &["add", "."]);
+        run(&clone2, &["commit", "-qm", "remote commit"]);
+        run(&clone2, &["push", "-q", "origin", "main"]);
+
+        let cwd = repo.to_string_lossy().to_string();
+
+        // 1. fetch & pull
+        fetch(&cwd, None, true).unwrap();
+        let wt_before_pull = worktrees_with(&cwd, true).unwrap();
+        assert_eq!(wt_before_pull["defaultBranch"], "main");
+        assert_eq!(wt_before_pull["worktrees"][0]["behind"].as_u64(), Some(1));
+        pull(&cwd, false).unwrap();
+        assert!(repo.join("remote.txt").exists());
+
+        // 2. worktree_add_with (new branch + existing branch), details, merge back to main, prune
+        let added1 = worktree_add_with(&wt_root, &cwd, "feat-a", Some("feat/a"), Some("main"), false, false).unwrap();
+        let wt_a = added1["path"].as_str().unwrap().to_string();
+        std::fs::write(Path::new(&wt_a).join("a.txt"), "feature a\n").unwrap();
+        run(Path::new(&wt_a), &["add", "."]);
+        run(Path::new(&wt_a), &["commit", "-qm", "feat a"]);
+
+        let added2 = worktree_add_with(&wt_root, &cwd, "feat-dirty", Some("feat/dirty"), Some("main"), false, false).unwrap();
+        let wt_dirty = added2["path"].as_str().unwrap().to_string();
+        std::fs::write(Path::new(&wt_dirty).join("dirty.txt"), "wip\n").unwrap();
+
+        let det = worktrees_with(&cwd, true).unwrap();
+        let list = det["worktrees"].as_array().unwrap();
+        let info_a = list.iter().find(|w| w["branch"] == "feat/a").unwrap();
+        assert_eq!(info_a["dirtyCount"], 0);
+        assert_eq!(info_a["merged"], false);
+        assert_eq!(info_a["aheadBase"], 1);
+        let info_dirty = list.iter().find(|w| w["branch"] == "feat/dirty").unwrap();
+        assert_eq!(info_dirty["dirtyCount"], 1);
+
+        // Merge feat/a back into main while calling from inside wt_a!
+        merge(&wt_a, "feat/a", Some("main"), false, None).unwrap();
+        assert!(repo.join("a.txt").exists());
+        let det_after = worktrees_with(&cwd, true).unwrap();
+        let info_a2 = det_after["worktrees"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|w| w["branch"] == "feat/a")
+            .unwrap();
+        assert_eq!(info_a2["merged"], true);
+
+        // worktree_prune should remove clean merged wt_a and skip dirty wt_dirty
+        let pruned = worktree_prune(&cwd, None, true).unwrap();
+        assert_eq!(pruned["removed"].as_array().unwrap().len(), 1);
+        assert!(!Path::new(&wt_a).exists());
+        assert!(Path::new(&wt_dirty).exists());
+        assert!(git_ok(&repo, &["branch", "--list", "feat/a"]).unwrap().trim().is_empty());
+
+        // Cannot remove main; can remove dirty worktree with force
+        assert!(worktree_remove_in_repo(&cwd, &cwd, true, false).is_err());
+        worktree_remove_in_repo(&cwd, &wt_dirty, true, true).unwrap();
+        assert!(!Path::new(&wt_dirty).exists());
+
+        // 3. Rebase, squash merge, conflict abort, branch rename & delete
+        checkout(&cwd, "feat/squash", true, Some("main")).unwrap();
+        std::fs::write(repo.join("sq.txt"), "s1\n").unwrap();
+        run(&repo, &["add", "."]);
+        run(&repo, &["commit", "-qm", "sq 1"]);
+        std::fs::write(repo.join("sq.txt"), "s2\n").unwrap();
+        run(&repo, &["add", "."]);
+        run(&repo, &["commit", "-qm", "sq 2"]);
+
+        // Advance main while feat/squash is branched off earlier commit
+        checkout(&cwd, "main", false, None).unwrap();
+        std::fs::write(repo.join("main2.txt"), "m2\n").unwrap();
+        run(&repo, &["add", "."]);
+        run(&repo, &["commit", "-qm", "main advance"]);
+
+        // Rebase feat/squash onto main
+        checkout(&cwd, "feat/squash", false, None).unwrap();
+        rebase(&cwd, "main").unwrap();
+        assert!(repo.join("main2.txt").exists());
+
+        // Squash merge feat/squash back into main
+        merge(&cwd, "feat/squash", Some("main"), true, Some("feat: squashed")).unwrap();
+        checkout(&cwd, "main", false, None).unwrap();
+        assert!(repo.join("sq.txt").exists());
+        assert_eq!(std::fs::read_to_string(repo.join("sq.txt")).unwrap(), "s2\n");
+
+        // Conflict test for merge + squash merge + rebase (must abort cleanly)
+        checkout(&cwd, "conflict-b", true, Some("main")).unwrap();
+        std::fs::write(repo.join("base.txt"), "branch-b\n").unwrap();
+        run(&repo, &["add", "."]);
+        run(&repo, &["commit", "-qm", "edit base on b"]);
+        checkout(&cwd, "main", false, None).unwrap();
+        std::fs::write(repo.join("base.txt"), "main-edit\n").unwrap();
+        run(&repo, &["add", "."]);
+        run(&repo, &["commit", "-qm", "edit base on main"]);
+
+        assert!(merge(&cwd, "conflict-b", None, false, None).is_err());
+        assert!(git_ok(&repo, &["status", "--porcelain"]).unwrap().trim().is_empty());
+        assert!(merge(&cwd, "conflict-b", None, true, None).is_err());
+        assert!(git_ok(&repo, &["status", "--porcelain"]).unwrap().trim().is_empty());
+
+        checkout(&cwd, "conflict-b", false, None).unwrap();
+        assert!(rebase(&cwd, "main").is_err());
+        assert!(git_ok(&repo, &["status", "--porcelain"]).unwrap().trim().is_empty());
+
+        // Open existing branch in worktree & verify branch_delete refuses occupied branch
+        checkout(&cwd, "main", false, None).unwrap();
+        let existing_wt = worktree_add_with(&wt_root, &cwd, "cb-wt", Some("conflict-b"), None, true, false).unwrap();
+        let cb_path = existing_wt["path"].as_str().unwrap().to_string();
+        assert!(branch_delete(&cwd, "conflict-b", true).is_err());
+        worktree_remove_in_repo(&cwd, &cb_path, false, false).unwrap();
+
+        // Rename & delete (-d fails on unmerged, -D succeeds)
+        let renamed = rename_branch(&cwd, Some("conflict-b"), "conflict-renamed", false).unwrap();
+        assert_eq!(renamed["oldBranch"], "conflict-b");
+        assert_eq!(renamed["branch"], "conflict-renamed");
+        assert!(branch_delete(&cwd, "conflict-renamed", false).is_err());
+        branch_delete(&cwd, "conflict-renamed", true).unwrap();
+
+        // Clean checkout of remote tracking branch
+        checkout(&cwd, "origin/main", false, None).unwrap();
     }
 }

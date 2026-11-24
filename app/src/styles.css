@@ -15482,27 +15482,29 @@ button.wp-commit-title .chev {
   background: color-mix(in srgb, var(--link) 10%, var(--panel));
   color: var(--link);
 }
-.wp-ctx-cnt {
+.wp-ctx-sync {
   flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 23px;
+  padding: 0 6px;
+  border-radius: 6px;
+  font-size: 11px;
   color: var(--text-3);
-  font-size: 10.5px;
-  font-weight: 400;
+  transition: background 0.12s, color 0.12s;
 }
-.wp-ctx-branch.other .wp-ctx-cnt,
-.wp-ctx-branch.open .wp-ctx-cnt {
-  color: color-mix(in srgb, var(--link) 75%, var(--text-3));
-}
-.wp-ctx-repo {
-  flex: 0 1 auto;
-  min-width: 0;
-  max-width: 110px;
-  padding: 1px 6px;
-  border-radius: 5px;
+.wp-ctx-sync:hover:not(:disabled) {
   background: var(--bg-3);
-  color: var(--text-3);
-  font-family: var(--mono);
-  font-size: 10.5px;
-  line-height: 16px;
+  color: var(--text);
+}
+.wp-ctx-sync:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+.wp-ctx-sync.spinning .icon,
+.wp-bw-fetch.spinning .icon {
+  animation: spin 0.75s linear infinite;
 }
 .wp-wt-back {
   flex: none;
@@ -15546,7 +15548,7 @@ button.wp-commit-title .chev {
   opacity: 0.9;
 }
 
-/* Searchable Branch / Worktree switcher popover */
+/* Searchable Branch / Worktree switcher popover (minimalist 4-zone layout) */
 .wp-bw-scrim {
   position: fixed;
   inset: 0;
@@ -15569,7 +15571,7 @@ button.wp-commit-title .chev {
   gap: 7px;
   height: 36px;
   flex: none;
-  padding: 0 10px;
+  padding: 0 8px 0 11px;
   border-bottom: 1px solid var(--border);
   color: var(--text-3);
 }
@@ -15585,84 +15587,253 @@ button.wp-commit-title .chev {
   font-size: 12.5px;
 }
 .wp-bw-search .icon-btn {
-  width: 20px;
-  height: 20px;
+  width: 22px;
+  height: 22px;
+  color: var(--text-3);
+}
+.wp-bw-search .icon-btn:hover:not(:disabled) {
+  color: var(--text);
+}
+.wp-bw-tabs {
+  display: flex;
+  align-items: stretch;
+  gap: 14px;
+  height: 32px;
+  flex: none;
+  padding: 0 12px;
+  border-bottom: 1px solid var(--border);
+  background: var(--panel);
+}
+.wp-bw-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-3);
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+  padding: 0 1px;
+  transition: color 0.12s, border-color 0.12s;
+}
+.wp-bw-tab:hover {
+  color: var(--text);
+}
+.wp-bw-tab.active {
+  color: var(--text);
+  font-weight: 600;
+  border-bottom-color: var(--link);
+}
+.wp-bw-tab-cnt {
+  font-size: 11px;
+  font-weight: 400;
+  color: var(--text-3);
+}
+.wp-bw-tab.active .wp-bw-tab-cnt {
+  color: var(--text-2);
 }
 .wp-bw-list {
   flex: 1;
   min-height: 0;
   overflow-y: auto;
   overscroll-behavior: contain;
-  padding: 4px;
+  padding: 5px;
 }
-.wp-bw-sec {
-  padding: 6px 8px 3px;
-  font-size: 10.5px;
-  font-weight: 600;
-  letter-spacing: 0.03em;
-  text-transform: uppercase;
+.wp-bw-sep {
+  height: 1px;
+  margin: 4px 6px;
+  background: var(--border);
+}
+.wp-bw-hint-row {
+  padding: 3px 8px 5px;
+  font-size: 11px;
   color: var(--text-3);
-}
-.wp-bw-list > .wp-bw-sec ~ .wp-bw-sec {
-  margin-top: 4px;
-  padding-top: 8px;
-  border-top: 1px solid var(--border);
 }
 .wp-bw-item {
   width: 100%;
   display: flex;
   align-items: center;
-  gap: 7px;
-  min-height: 30px;
-  padding: 4px 8px;
-  border-radius: 6px;
-  font-size: 12.5px;
+  gap: 8px;
+  min-height: 31px;
+  padding: 5px 8px;
+  border-radius: 7px;
+  font-size: 12px;
   color: var(--text);
   text-align: left;
+  cursor: pointer;
 }
 .wp-bw-item:hover,
 .wp-bw-item.sel {
   background: var(--bg-3);
 }
-.wp-bw-item.active {
-  background: color-mix(in srgb, var(--link) 11%, transparent);
-  color: var(--link);
+.wp-bw-item.current-pin {
+  background: color-mix(in srgb, var(--link) 8%, transparent);
+  box-shadow: inset 2.5px 0 0 var(--link);
 }
-.wp-bw-item.active.sel,
-.wp-bw-item.active:hover {
-  background: color-mix(in srgb, var(--link) 16%, transparent);
+.wp-bw-item.current-pin:hover,
+.wp-bw-item.current-pin.sel {
+  background: color-mix(in srgb, var(--link) 13%, transparent);
+}
+.wp-bw-item.muted-row .wp-bw-name {
+  color: var(--text-2);
 }
 .wp-bw-item > .icon {
   flex: none;
   color: var(--text-3);
 }
-.wp-bw-item.active > .icon {
+.wp-bw-item.current-pin > .icon {
   color: var(--link);
 }
-.wp-bw-name {
+.wp-bw-main {
   flex: 1 1 auto;
   min-width: 0;
-  font-size: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
 }
-.wp-bw-tag {
-  flex: none;
-  padding: 1px 5px;
-  border-radius: 4px;
-  background: var(--bg-3);
-  color: var(--text-2);
-  font-size: 10.5px;
-  font-weight: 500;
+.wp-bw-line1 {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
 }
-.wp-bw-meta {
-  flex: 0 1 auto;
-  max-width: 45%;
+.wp-bw-sub {
+  display: flex;
+  align-items: center;
+  gap: 5px;
   font-size: 11px;
   color: var(--text-3);
 }
-.wp-bw-check {
+.wp-bw-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  flex: none;
+}
+.wp-bw-dot.running {
+  background: var(--ok);
+}
+.wp-bw-dot.idle {
+  background: var(--link);
+}
+.wp-bw-name {
+  min-width: 0;
+  flex: 0 1 auto;
+  font-size: 12px;
+  font-weight: 500;
+}
+.wp-bw-item.current-pin .wp-bw-name {
+  font-weight: 600;
+}
+.wp-bw-quiet-tag {
+  flex: none;
+  padding: 0 5px;
+  border-radius: 4px;
+  background: var(--bg-3);
+  color: var(--text-3);
+  font-size: 10.5px;
+  line-height: 16px;
+}
+.wp-bw-quiet-tag.ok {
+  background: color-mix(in srgb, var(--ok) 11%, transparent);
+  color: var(--ok);
+}
+.wp-bw-right {
   flex: none;
   display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: auto;
+}
+.wp-bw-stat {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--text-3);
+  white-space: nowrap;
+}
+.wp-bw-check {
+  display: inline-flex;
   color: var(--link);
+}
+.wp-bw-acts {
+  display: none;
+  align-items: center;
+  gap: 2px;
+}
+.wp-bw-item:hover .wp-bw-acts,
+.wp-bw-item:focus-within .wp-bw-acts {
+  display: inline-flex;
+}
+.wp-bw-item:hover .wp-bw-stat,
+.wp-bw-item:focus-within .wp-bw-stat {
+  display: none;
+}
+.wp-bw-act-btn {
+  width: 22px;
+  height: 22px;
+  border-radius: 5px;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--text-2);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.wp-bw-act-btn:hover {
+  border-color: var(--border-2);
+  background: var(--bg-2);
+  color: var(--text);
+}
+.wp-bw-act-btn.danger:hover {
+  color: var(--err);
+  border-color: color-mix(in srgb, var(--err) 35%, var(--border));
+}
+.wp-bw-merged-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  padding: 4px 8px;
+}
+.wp-bw-merged-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  font-size: 11.5px;
+  color: var(--text-3);
+}
+.wp-bw-merged-toggle:hover {
+  color: var(--text);
+}
+.wp-bw-merged-toggle .chev {
+  display: inline-flex;
+  transition: transform 0.12s;
+}
+.wp-bw-merged-toggle .chev.open {
+  transform: rotate(90deg);
+}
+.wp-bw-cleanup-btn {
+  flex: none;
+  font-size: 11.5px;
+  font-weight: 500;
+  color: var(--link);
+  padding: 2px 6px;
+  border-radius: 5px;
+}
+.wp-bw-cleanup-btn:hover {
+  background: color-mix(in srgb, var(--link) 10%, transparent);
+}
+.wp-bw-merged-tip {
+  margin: 4px 6px 2px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  background: var(--bg-2);
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--text-3);
 }
 .wp-bw-empty,
 .wp-bw-loading {
@@ -15670,34 +15841,52 @@ button.wp-commit-title .chev {
   align-items: center;
   justify-content: center;
   gap: 6px;
-  padding: 18px 12px;
+  padding: 20px 12px;
   font-size: 12px;
   color: var(--text-3);
 }
 .wp-bw-foot {
   flex: none;
   display: flex;
-  flex-direction: column;
-  gap: 1px;
+  align-items: center;
   padding: 4px;
   border-top: 1px solid var(--border);
   background: var(--bg-2);
 }
 .wp-bw-foot-btn {
-  width: 100%;
-  display: flex;
+  flex: 1;
+  min-width: 0;
+  display: inline-flex;
   align-items: center;
-  gap: 7px;
+  justify-content: center;
+  gap: 5px;
   height: 28px;
   padding: 0 8px;
   border-radius: 6px;
   font-size: 12px;
   color: var(--text-2);
-  text-align: left;
+  white-space: nowrap;
 }
 .wp-bw-foot-btn:hover {
   background: var(--bg-3);
   color: var(--text);
+}
+.wp-bw-foot-sep {
+  width: 1px;
+  height: 15px;
+  background: var(--border);
+  flex: none;
+}
+@media (hover: none) {
+  .wp-bw-item:hover .wp-bw-stat {
+    display: inline-flex;
+  }
+  .wp-bw-acts {
+    display: inline-flex;
+  }
+  .wp-bw-act-btn:not(.wp-bw-more-btn) {
+    display: none;
+  }
 }
 @media (max-width: 760px) {
   .wp-bw-scrim {
@@ -15717,7 +15906,7 @@ button.wp-commit-title .chev {
     padding-bottom: env(safe-area-inset-bottom, 0px);
   }
   .wp-bw-item {
-    min-height: 36px;
+    min-height: 38px;
     padding: 6px 10px;
   }
   .wp-bw-foot-btn {
@@ -15858,6 +16047,96 @@ button.wp-commit-title .chev {
 .wp-dock-btn.ai:hover:not(:disabled) {
   background: color-mix(in srgb, var(--link) 16%, var(--panel));
   border-color: color-mix(in srgb, var(--link) 35%, transparent);
+}
+.wp-dock-split {
+  flex: 1.4;
+  min-width: 0;
+  height: 29px;
+  display: inline-flex;
+  align-items: stretch;
+  border-radius: 7px;
+  border: 1px solid var(--border);
+  background: var(--bg-2);
+  color: var(--text);
+  overflow: hidden;
+}
+.wp-dock-split.primary {
+  border-color: transparent;
+  background: var(--link);
+  color: #fff;
+}
+.wp-dock-split-main {
+  flex: 1;
+  min-width: 0;
+  padding: 0 8px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  font-size: 12px;
+  font-weight: 500;
+  white-space: nowrap;
+  color: inherit;
+}
+.wp-dock-split.primary .wp-dock-split-main {
+  font-weight: 600;
+}
+.wp-dock-split-chev {
+  flex: none;
+  width: 24px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-left: 1px solid var(--border);
+  color: inherit;
+}
+.wp-dock-split.primary .wp-dock-split-chev {
+  border-left-color: rgba(255, 255, 255, 0.24);
+}
+.wp-dock-split-main:hover:not(:disabled),
+.wp-dock-split-chev:hover:not(:disabled) {
+  background: var(--bg-3);
+}
+.wp-dock-split.primary .wp-dock-split-main:hover:not(:disabled),
+.wp-dock-split.primary .wp-dock-split-chev:hover:not(:disabled) {
+  background: rgba(0, 0, 0, 0.12);
+}
+.wp-dock-split-main:disabled,
+.wp-dock-split-chev:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+.wp-commit-push-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 12.5px;
+  color: var(--text);
+  cursor: pointer;
+}
+.wp-commit-push-toggle input[type='checkbox'] {
+  width: 14px;
+  height: 14px;
+  flex: none;
+  margin: 0;
+  accent-color: var(--link);
+  cursor: pointer;
+}
+.wp-new-wt-modal {
+  width: min(400px, calc(100vw - 24px));
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.wp-new-wt-modal select {
+  width: 100%;
+  height: 32px;
+  padding: 0 8px;
+  border-radius: 7px;
+  border: 1px solid var(--border-2);
+  background: var(--bg-2);
+  color: var(--text);
+  font-size: 12.5px;
 }
 
 /* Commit & Cross-tool Review modals */

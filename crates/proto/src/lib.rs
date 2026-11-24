@@ -1538,16 +1538,28 @@ pub mod methods {
     /// {cwd, path, rev} -> {exists, text?, binary, tooLarge, notUtf8}: a file's full content at a revision, for the side-by-side diff.
     /// rev is "HEAD", a commit hash, or a hash followed by "^" (its first parent); path is relative to the repo root
     pub const GIT_BLOB: &str = "git.blob";
-    /// {cwd} -> {repo, current, worktrees:[{path, head, branch, detached, isMain, isCurrent, bare, prunable}]}: list all worktrees of the repo
+    /// {cwd, details?} -> {repo, current, defaultBranch?, worktrees:[{path, head, branch, detached, isMain, isCurrent, bare, prunable, dirtyCount?, upstream?, ahead?, behind?, aheadBase?, merged?}]}: list all worktrees of the repo
     pub const GIT_WORKTREES: &str = "git.worktrees";
-    /// {cwd} -> {repo, current, defaultBranch, branches:[{name, current, upstream?, ahead?, behind?}], remoteBranches:[string]}: list local and remote branches
+    /// {cwd} -> {repo, current, defaultBranch, branches:[{name, current, upstream?, ahead?, behind?, merged?}], remoteBranches:[string]}: list local and remote branches
     pub const GIT_BRANCHES: &str = "git.branches";
-    /// {cwd, branch, create?, base?} -> {branch}: switch to an existing branch or create and switch to a new one
+    /// {cwd, branch, create?, base?} -> {branch}: switch to an existing (local or remote tracking) branch or create and switch to a new one
     pub const GIT_CHECKOUT: &str = "git.checkout";
     /// {cwd, oldBranch?, newBranch} -> {oldBranch, branch, changed}: rename a local branch via `git branch -m`
     pub const GIT_RENAME_BRANCH: &str = "git.renameBranch";
     /// {cwd, remote?, branch?, setUpstream?} -> {branch, remote, output}: push the current branch to a remote
     pub const GIT_PUSH: &str = "git.push";
+    /// {cwd, remote?, prune?} -> {output}: fetch updates from remote(s)
+    pub const GIT_FETCH: &str = "git.fetch";
+    /// {cwd, rebase?} -> {branch, output}: pull remote changes into the current branch
+    pub const GIT_PULL: &str = "git.pull";
+    /// {cwd, source, target?, squash?, message?} -> {source, target, output, alreadyUpToDate?}: merge source branch into target (or current) branch
+    pub const GIT_MERGE: &str = "git.merge";
+    /// {cwd, onto} -> {branch, onto, output}: rebase the current branch onto another ref
+    pub const GIT_REBASE: &str = "git.rebase";
+    /// {cwd, branch, force?} -> {branch}: delete a local branch
+    pub const GIT_BRANCH_DELETE: &str = "git.branchDelete";
+    /// {cwd, paths?, deleteBranches?} -> {removed:[string], skipped:[{path, reason}]}: safely remove clean, merged worktrees
+    pub const GIT_WORKTREE_PRUNE: &str = "git.worktreePrune";
     /// {cwd, base?, diff?, paths?} -> {repo, branch, base, mergeBase, total?, files:[{path, status, diff, added, deleted}]}:
     /// working tree (including branch commits and untracked files) compared to merge-base(base, HEAD)
     pub const GIT_BRANCH_DIFF: &str = "git.branchDiff";
@@ -1638,10 +1650,10 @@ pub mod methods {
     pub const SESSION_SET_SYSTEM_PROMPT: &str = "session.setSystemPrompt";
     /// {sessionId, bot: BotLink | null}
     pub const SESSION_SET_BOT: &str = "session.setBot";
-    /// {cwd, name, branch?, base?} -> {path, branch, repo}: add a worktree for the repo at cwd under the worktree root
-    /// (`<root>/<repo name>-<hash>/<name>`), on a new branch (default `yi/<name>`) from base (default HEAD)
+    /// {cwd, name, branch?, base?, existingBranch?, prepareEnv?} -> {path, branch, repo}: add a worktree for the repo at cwd under the worktree root
+    /// (`<root>/<repo name>-<hash>/<name>`), on a new branch (default `yi/<name>`) from base (default HEAD), or checking out an existing branch
     pub const GIT_WORKTREE_ADD: &str = "git.worktreeAdd";
-    /// {path, force?, deleteBranch?}: remove a worktree made by git.worktreeAdd (must be under the worktree root)
+    /// {path, cwd?, force?, deleteBranch?}: remove a worktree made by git.worktreeAdd (under the worktree root) or any linked worktree of `cwd`'s repo
     pub const GIT_WORKTREE_REMOVE: &str = "git.worktreeRemove";
     /// Migrate an existing main-directory session in-place into a new managed Git worktree {sessionId, name?, branch?, base?} -> SessionInfo
     pub const SESSION_ENTER_WORKTREE: &str = "session.enterWorktree";

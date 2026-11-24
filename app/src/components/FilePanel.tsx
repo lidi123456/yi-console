@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { useBack } from '../back';
 import { getT, trErr, useLang } from '../i18n';
-import { errorToast, getState, hostStatus, loadSession, openNewSession, skey, toast, useSessionData, useStore } from '../store';
+import { errorToast, getState, hostStatus, loadSession, navigate, openNewSession, skey, toast, useSessionData, useStore } from '../store';
 import { isTauri, rpc } from '../transport';
-import { TOOL_LABEL, type DirEntry, type FileDiff, type HubEvent, type QuestionAnswer } from '../types';
+import { isHostSession, normDirPath, TOOL_LABEL, type DirEntry, type FileDiff, type HubEvent, type QuestionAnswer } from '../types';
 import { fmtSize, lsGet, lsSet } from '../util';
 import { writeClipboard } from '../clipboard';
 import { addContextRefToChat } from '../contextRefs';
@@ -38,7 +38,15 @@ import { AI_PREFIX, aiTabSession, AiBrowserPane, isAiTab, useAiBrowserBusy } fro
 import { registerWebTabs } from './NativeWeb';
 import { canUseBrowser } from '../browserUse';
 import { CommitDetails, commitRangeTab, commitTab, GitHistory, isCommitTab, parseCommitTab } from './GitHistory';
-import { BranchWorktreePopover, CommitDialog, type BranchesResult, type WorktreeEntry, type WorktreesResult } from './GitOpsDialogs';
+import {
+  BranchWorktreePopover,
+  CommitDialog,
+  NewWorktreeDialog,
+  worktreeSlug,
+  type BranchesResult,
+  type WorktreeEntry,
+  type WorktreesResult,
+} from './GitOpsDialogs';
 import {
   adoptReviewFindings,
   deleteReviewMeta,
@@ -759,6 +767,7 @@ export function FilePanel({
   useEffect(() => () => void setTimeout(() => registerWebTabs(panelId, null), 0), []); // eslint-disable-line react-hooks/exhaustive-deps
   const [git, setGit] = useState<GitInfo | null>(() => gitCache.get(gitKey(hostId, cwd))?.git ?? null);
   const [worktrees, setWorktrees] = useState<WorktreeEntry[]>([]);
+  const [wtDefaultBranch, setWtDefaultBranch] = useState<string | null>(null);
   const [newWorktree, setNewWorktree] = useState<WorktreeEntry | null>(null);
   const rawHostSessions = useStore((st) => st.sessions[hostId]);
   const hostSessions = useMemo(() => rawHostSessions ?? [], [rawHostSessions]);
@@ -789,10 +798,22 @@ export function FilePanel({
   const [branchesInfo, setBranchesInfo] = useState<BranchesResult | null>(null);
   const [branchesLoading, setBranchesLoading] = useState(false);
   const [bwOpen, setBwOpen] = useState(false);
+  const bwOpenRef = useRef(false);
+  bwOpenRef.current = bwOpen;
+  const wtScopeRef = useRef(`${hostId}\n${cwd}`);
+  wtScopeRef.current = `${hostId}\n${cwd}`;
+  const wtReqSeq = useRef(0);
+  const wtAppliedSeq = useRef(0);
   const bwBtnRef = useRef<HTMLButtonElement>(null);
   const [commitOpen, setCommitOpen] = useState(false);
+  const [commitDefaultPush, setCommitDefaultPush] = useState(false);
+  const [preferCommitPush, setPreferCommitPush] = useState(() => lsGet('wp-prefer-commit-push', true));
+  const [newWtOpen, setNewWtOpen] = useState(false);
+  const [newWtBase, setNewWtBase] = useState<string | null>(null);
   const [reviewPreset, setReviewPreset] = useState<ReviewLaunchPreset | null>(null);
   const [pushing, setPushing] = useState(false);
+  const [fetching, setFetching] = useState(false);
+  const [gitBusy, setGitBusy] = useState(false);
   const [view, setView] = useState<'all' | 'changes' | 'search'>(() => lsGet(viewKey, 'all'));
   const [showDiff, setShowDiff] = useState(false);
   // Default to Cursor-style single-file inline diff with the full file expanded
@@ -949,25 +970,57 @@ export function FilePanel({
   const gitSig = useRef(gitCache.get(gitKey(hostId, cwd))?.sig ?? '');
   const gitIgnSig = useRef(gitCache.get(gitKey(hostId, cwd))?.ignSig ?? '');
   /** quiet: background refresh (timer / window refocus); if the status didn't change, just quietly refetch the current file's diff */
-  const loadWorktrees = useCallback(() => {
-    rpc<WorktreesResult>(hostId, 'git.worktrees', { cwd })
-      .then((r) => {
-        const list = (r.worktrees ?? []).filter((w) => !w.bare);
-        setWorktrees(list);
-        if (!r.repo) return;
-        const rk = `${hostId}\n${norm(r.repo)}`;
-        const known = knownWorktreesByRepo.get(rk);
-        const curKeys = new Set(list.map((w) => norm(w.path)));
-        if (!known) {
-          knownWorktreesByRepo.set(rk, curKeys);
-        } else {
-          const added = list.find((w) => !w.isCurrent && !known.has(norm(w.path)));
-          for (const k of curKeys) known.add(k);
-          if (added && onSwitchCwd) setNewWorktree(added);
-        }
-      })
-      .catch(() => {});
-  }, [hostId, cwd, onSwitchCwd]);
+  const loadWorktrees = useCallback(
+    (details = false) => {
+      const wantDetails = details || bwOpenRef.current;
+      const scope = `${hostId}\n${cwd}`;
+      const seq = ++wtReqSeq.current;
+      rpc<WorktreesResult>(hostId, 'git.worktrees', { cwd, ...(wantDetails ? { details: true } : {}) })
+        .then((r) => {
+          if (wtScopeRef.current !== scope || seq < wtAppliedSeq.current || (!wantDetails && seq < wtReqSeq.current)) {
+            return;
+          }
+          wtAppliedSeq.current = seq;
+          const list = (r.worktrees ?? []).filter((w) => !w.bare);
+          if (wantDetails) {
+            setWorktrees(list);
+          } else {
+            setWorktrees((prev) => {
+              const prevByPath = new Map(prev.map((item) => [norm(item.path), item]));
+              return list.map((w) => {
+                const p = prevByPath.get(norm(w.path));
+                if (!p || p.head !== w.head || (p.branch ?? null) !== (w.branch ?? null) || p.prunable !== w.prunable) {
+                  return w;
+                }
+                return {
+                  ...w,
+                  ...(p.dirtyCount !== undefined ? { dirtyCount: p.dirtyCount } : {}),
+                  ...(p.upstream !== undefined ? { upstream: p.upstream } : {}),
+                  ...(p.ahead !== undefined ? { ahead: p.ahead } : {}),
+                  ...(p.behind !== undefined ? { behind: p.behind } : {}),
+                  ...(p.aheadBase !== undefined ? { aheadBase: p.aheadBase } : {}),
+                  ...(p.merged !== undefined ? { merged: p.merged } : {}),
+                };
+              });
+            });
+          }
+          if (r.defaultBranch !== undefined) setWtDefaultBranch(r.defaultBranch ?? null);
+          if (!r.repo) return;
+          const rk = `${hostId}\n${norm(r.repo)}`;
+          const known = knownWorktreesByRepo.get(rk);
+          const curKeys = new Set(list.map((w) => norm(w.path)));
+          if (!known) {
+            knownWorktreesByRepo.set(rk, curKeys);
+          } else {
+            const added = list.find((w) => !w.isCurrent && !known.has(norm(w.path)));
+            for (const k of curKeys) known.add(k);
+            if (added && onSwitchCwd) setNewWorktree(added);
+          }
+        })
+        .catch(() => {});
+    },
+    [hostId, cwd, onSwitchCwd],
+  );
 
   const loadBranchDiff = useCallback(
     (baseOverride?: string) => {
@@ -1127,7 +1180,7 @@ export function FilePanel({
     }
   }, [git, diffScope, activeTurnCkpt?.baseRef, activeTurnCkpt?.endRef, activeTurnCkpt?.paths, loadTurnDiff]);
   useEffect(() => {
-    if (git && (commitOpen || reviewPreset !== null || view === 'changes')) void loadBranches();
+    if (git) void loadBranches();
   }, [git?.branch, commitOpen, reviewPreset, view, loadBranches]); // eslint-disable-line react-hooks/exhaustive-deps
   // Commits made by the AI in a terminal or files changed by other programs aren't caught by the end-of-turn refresh: check again when the window regains focus and every 10 s (while visible)
   useEffect(() => {
@@ -1968,17 +2021,58 @@ export function FilePanel({
     }
   };
 
+  const refreshGitAll = (withDetails = true) => {
+    refreshTree();
+    loadWorktrees(withDetails);
+    void loadBranches();
+    if (diffScope === 'branch') loadBranchDiff();
+  };
+
+  const openCommit = (pushDefault = preferCommitPush) => {
+    setCommitDefaultPush(pushDefault);
+    setCommitOpen(true);
+  };
+
   const doPush = async () => {
-    if (pushing || !git) return;
+    if (pushing || gitBusy || !git) return;
     setPushing(true);
     try {
-      const r = await rpc<{ branch: string; remote: string }>(hostId, 'git.push', { cwd });
+      const r = await rpc<{ branch: string; remote: string }>(hostId, 'git.push', { cwd, setUpstream: true });
       toast(tx('pushedBranch', { branch: r.branch, remote: r.remote }));
-      void loadBranches();
+      refreshGitAll(bwOpen);
     } catch (e) {
       errorToast(e);
     } finally {
       setPushing(false);
+    }
+  };
+
+  const doFetch = async () => {
+    if (fetching || !git) return;
+    setFetching(true);
+    try {
+      await rpc(hostId, 'git.fetch', { cwd, prune: true });
+      toast(tx('fetchedRemotesToast'));
+      loadWorktrees(true);
+      void loadBranches();
+    } catch (e) {
+      errorToast(e);
+    } finally {
+      setFetching(false);
+    }
+  };
+
+  const doPull = async (rebase = false) => {
+    if (gitBusy || !git) return;
+    setGitBusy(true);
+    try {
+      const r = await rpc<{ branch: string }>(hostId, 'git.pull', { cwd, rebase });
+      toast(tx('pulledBranchToast', { branch: r?.branch || git.branch }));
+      refreshGitAll(true);
+    } catch (e) {
+      errorToast(e);
+    } finally {
+      setGitBusy(false);
     }
   };
 
@@ -1989,7 +2083,7 @@ export function FilePanel({
     }
     setBwOpen(true);
     setBranchesLoading(true);
-    loadWorktrees();
+    loadWorktrees(true);
     void loadBranches().finally(() => setBranchesLoading(false));
   };
 
@@ -2000,47 +2094,302 @@ export function FilePanel({
 
   const checkoutBranch = async (name: string) => {
     try {
-      await rpc(hostId, 'git.checkout', { cwd, branch: name });
-      toast(tx('switchedToBranch', { branch: name }));
-      refreshTree();
-      void loadBranches();
+      const r = await rpc<{ branch?: string }>(hostId, 'git.checkout', { cwd, branch: name });
+      toast(tx('switchedToBranch', { branch: r?.branch || name }));
+      refreshGitAll(true);
     } catch (err) {
       errorToast(err);
     }
   };
 
-  const createBranch = async () => {
-    const name = (await askText({ title: tx('newBranch'), placeholder: tx('newBranchPlaceholder') }))?.trim();
-    if (!name) return;
-    try {
-      await rpc(hostId, 'git.checkout', { cwd, branch: name, create: true });
-      toast(tx('switchedToBranch', { branch: name }));
-      refreshTree();
-      void loadBranches();
-    } catch (err) {
-      errorToast(err);
-    }
-  };
-
-  const renameCurrentBranch = async () => {
-    if (!git?.branch || git.branch === 'HEAD' || git.branch.includes('游离')) return;
+  const createBranch = async (base?: string) => {
     const name = (
       await askText({
-        title: tx('renameBranchTitle'),
-        value: git.branch,
+        title: base ? tx('newBranchFromTitle', { base }) : tx('newBranch'),
+        placeholder: tx('newBranchPlaceholder'),
+      })
+    )?.trim();
+    if (!name) return;
+    try {
+      await rpc(hostId, 'git.checkout', { cwd, branch: name, create: true, ...(base ? { base } : {}) });
+      toast(tx('switchedToBranch', { branch: name }));
+      refreshGitAll(true);
+    } catch (err) {
+      errorToast(err);
+    }
+  };
+
+  const openNewWorktree = (base?: string) => {
+    setNewWtBase(base ?? null);
+    setNewWtOpen(true);
+  };
+
+  const doOpenBranchInWorktree = async (branch: string) => {
+    const slug = worktreeSlug(branch, worktrees.map((w) => w.path));
+    setGitBusy(true);
+    try {
+      const res = await rpc<{ path: string; branch: string }>(hostId, 'git.worktreeAdd', {
+        cwd,
+        name: slug,
+        branch,
+        existingBranch: true,
+        prepareEnv: true,
+      });
+      toast(tx('createdWorktreeToast', { branch: res.branch || branch }));
+      loadWorktrees(true);
+      void loadBranches();
+      if (onSwitchCwd) switchWorktree(res.path);
+    } catch (err) {
+      errorToast(err);
+    } finally {
+      setGitBusy(false);
+    }
+  };
+
+  const effDefaultBranch = branchesInfo?.defaultBranch || wtDefaultBranch || '';
+
+  const doMergeToDefault = async (sourceBranch: string, squash: boolean) => {
+    const target = effDefaultBranch;
+    if (!target || gitBusy) return;
+    let message: string | undefined;
+    if (squash) {
+      const m = (
+        await askText({
+          title: tx('squashCommitMsgTitle', { source: sourceBranch, target }),
+          label: tx('squashCommitMsgLabel'),
+          value: `feat: ${sourceBranch}`,
+        })
+      )?.trim();
+      if (!m) return;
+      message = m;
+    } else {
+      const ok = await askConfirm({
+        title: tx('mergeBackConfirmTitle', { source: sourceBranch, target }),
+        message: tx('mergeBackConfirmMsg', { target }),
+        okText: tx('mergeBackIntoShort', { target }),
+      });
+      if (!ok) return;
+    }
+    setGitBusy(true);
+    try {
+      const r = await rpc<{ alreadyUpToDate?: boolean }>(hostId, 'git.merge', {
+        cwd,
+        source: sourceBranch,
+        target,
+        squash,
+        ...(message ? { message } : {}),
+      });
+      toast(r?.alreadyUpToDate ? tx('mergeAlreadyUpToDateToast', { source: sourceBranch, target }) : tx('mergedBranchToast', { source: sourceBranch, target }));
+      refreshGitAll(true);
+    } catch (err) {
+      errorToast(err);
+    } finally {
+      setGitBusy(false);
+    }
+  };
+
+  const doMergeIntoCurrent = async (sourceBranch: string) => {
+    if (!git || gitBusy) return;
+    const ok = await askConfirm({
+      title: tx('mergeIntoCurrentConfirm', { source: sourceBranch, target: git.branch || 'HEAD' }),
+      okText: tx('mergeIntoCurrentBranch'),
+    });
+    if (!ok) return;
+    setGitBusy(true);
+    try {
+      const r = await rpc<{ alreadyUpToDate?: boolean }>(hostId, 'git.merge', { cwd, source: sourceBranch });
+      toast(
+        r?.alreadyUpToDate
+          ? tx('mergeAlreadyUpToDateToast', { source: sourceBranch, target: git.branch || 'HEAD' })
+          : tx('mergedBranchToast', { source: sourceBranch, target: git.branch || 'HEAD' }),
+      );
+      refreshGitAll(true);
+    } catch (err) {
+      errorToast(err);
+    } finally {
+      setGitBusy(false);
+    }
+  };
+
+  const doRebaseOnto = async (onto: string) => {
+    if (!git || gitBusy) return;
+    const ok = await askConfirm({
+      title: tx('rebaseOntoConfirmTitle', { branch: git.branch || 'HEAD', onto }),
+      message: tx('rebaseOntoConfirmMsg', { onto }),
+      okText: tx('rebaseOntoBranch'),
+    });
+    if (!ok) return;
+    setGitBusy(true);
+    try {
+      await rpc(hostId, 'git.rebase', { cwd, onto });
+      toast(tx('rebasedBranchToast', { branch: git.branch || 'HEAD', onto }));
+      refreshGitAll(true);
+    } catch (err) {
+      errorToast(err);
+    } finally {
+      setGitBusy(false);
+    }
+  };
+
+  const doCompareBranch = (branch: string) => {
+    setView('changes');
+    lsSet(viewKey, 'changes');
+    setBranchBase(branch);
+    setDiffScope('branch');
+  };
+
+  const doRenameBranch = async (oldName: string) => {
+    const newName = (
+      await askText({
+        title: tx('renameBranchTitle', { branch: oldName }),
+        value: oldName,
         placeholder: tx('newBranchPlaceholder'),
         okText: tx('save'),
       })
     )?.trim();
-    if (!name || name === git.branch) return;
+    if (!newName || newName === oldName) return;
     try {
       const r = await rpc<{ oldBranch: string; branch: string; changed: boolean }>(hostId, 'git.renameBranch', {
         cwd,
-        newBranch: name,
+        oldBranch: oldName,
+        newBranch: newName,
       });
-      toast(tx('renamedBranch', { branch: r.branch || name }));
-      refreshTree();
-      loadWorktrees();
+      toast(tx('renamedBranchToast', { branch: r.branch || newName }));
+      refreshGitAll(true);
+    } catch (err) {
+      errorToast(err);
+    }
+  };
+
+  const doDeleteBranch = async (branch: string) => {
+    const ok = await askConfirm({
+      title: tx('deleteBranchConfirmTitle', { branch }),
+      message: tx('deleteBranchConfirmMsg'),
+      okText: tx('delete2'),
+      danger: true,
+    });
+    if (!ok) return;
+    try {
+      await rpc(hostId, 'git.branchDelete', { cwd, branch, force: false });
+      toast(tx('deletedBranchToast', { branch }));
+      loadWorktrees(true);
+      void loadBranches();
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (/not fully merged|git branch -D|未完全合并/i.test(msg)) {
+        const forceOk = await askConfirm({
+          title: tx('forceDeleteBranchTitle', { branch }),
+          message: tx('forceDeleteBranchMsg'),
+          okText: tx('delete2'),
+          danger: true,
+        });
+        if (!forceOk) return;
+        try {
+          await rpc(hostId, 'git.branchDelete', { cwd, branch, force: true });
+          toast(tx('deletedBranchToast', { branch }));
+          loadWorktrees(true);
+          void loadBranches();
+        } catch (err2) {
+          errorToast(err2);
+        }
+      } else {
+        errorToast(err);
+      }
+    }
+  };
+
+  const doDeleteWorktree = async (wt: WorktreeEntry) => {
+    const label = wt.branch || baseName(wt.path);
+    const hasRunning = hostSessions.some(
+      (s) =>
+        isHostSession(s) &&
+        !s.sideChat &&
+        !s.review &&
+        !s.parentId &&
+        norm(normDirPath(s.cwd)) === norm(wt.path) &&
+        (s.status === 'running' || s.status === 'starting' || s.status === 'waiting-permission'),
+    );
+    const dirtyCount = wt.dirtyCount ?? 0;
+    const warns: string[] = [];
+    if (hasRunning) warns.push(tx('deleteWorktreeRunningWarn'));
+    if (dirtyCount > 0) warns.push(tx('deleteWorktreeDirtyWarn', { n: dirtyCount }));
+    warns.push(wt.merged ? tx('deleteWorktreeMergedMsg') : tx('deleteWorktreeSafeMsg'));
+    const ok = await askConfirm({
+      title: tx('deleteWorktreeConfirmTitle', { name: label }),
+      message: warns.join('\n'),
+      okText: tx('delete2'),
+      danger: true,
+    });
+    if (!ok) return;
+    const isViewingTarget = norm(wt.path) === norm(cwd);
+    const mainWt = worktrees.find((w) => w.isMain);
+    const fallbackCwd = baseCwd && norm(baseCwd) !== norm(wt.path) ? baseCwd : mainWt && norm(mainWt.path) !== norm(wt.path) ? mainWt.path : cwd;
+    const force = dirtyCount > 0 || hasRunning;
+    try {
+      await rpc(hostId, 'git.worktreeRemove', {
+        cwd: fallbackCwd,
+        path: wt.path,
+        force,
+        deleteBranch: !!wt.merged,
+      });
+      toast(tx('deletedWorktreeToast', { name: label }));
+      if (isViewingTarget && onSwitchCwd && norm(fallbackCwd) !== norm(cwd)) {
+        switchWorktree(fallbackCwd);
+      } else {
+        loadWorktrees(true);
+        void loadBranches();
+      }
+    } catch (err) {
+      errorToast(err);
+    }
+  };
+
+  const doCleanupMergedWorktrees = async (candidates: WorktreeEntry[]) => {
+    const runningDirs = new Set(
+      hostSessions
+        .filter(
+          (s) =>
+            isHostSession(s) &&
+            !s.sideChat &&
+            !s.review &&
+            !s.parentId &&
+            (s.status === 'running' || s.status === 'starting' || s.status === 'waiting-permission'),
+        )
+        .map((s) => norm(normDirPath(s.cwd))),
+    );
+    const safe = candidates.filter(
+      (w) =>
+        !w.isMain &&
+        norm(w.path) !== norm(cwd) &&
+        !runningDirs.has(norm(w.path)) &&
+        (w.prunable || (!!w.merged && (w.dirtyCount ?? 0) === 0)),
+    );
+    const skippedCount = candidates.length - safe.length;
+    if (!safe.length) {
+      toast(tx('noSafeCleanupToast'), 'info');
+      return;
+    }
+    const ok = await askConfirm({
+      title: tx('cleanupMergedConfirmTitle', { n: safe.length }),
+      message: tx('cleanupMergedConfirmMsg', { n: safe.length, skipped: skippedCount }),
+      okText: tx('oneClickCleanup'),
+      danger: true,
+    });
+    if (!ok) return;
+    try {
+      const r = await rpc<{ removed: string[]; skipped: { path: string; reason: string }[] }>(hostId, 'git.worktreePrune', {
+        cwd,
+        paths: safe.map((w) => w.path),
+        deleteBranches: true,
+      });
+      const remN = r?.removed?.length ?? 0;
+      const skipN = (r?.skipped?.length ?? 0) + skippedCount;
+      toast(
+        skipN > 0
+          ? tx('cleanupMergedResultWithSkippedToast', { removed: remN, skipped: skipN })
+          : tx('cleanupMergedResultToast', { removed: remN }),
+      );
+      loadWorktrees(true);
       void loadBranches();
     } catch (err) {
       errorToast(err);
@@ -2999,40 +3348,55 @@ export function FilePanel({
           <Icon name="refresh" size={14} />
         </button>
       </div>
-      {git && (
-        <div className={`wp-ctx-bar ${isOtherWorktree ? 'other' : ''}`}>
-          <button
-            ref={bwBtnRef}
-            type="button"
-            className={`wp-ctx-branch truncate ${isOtherWorktree ? 'other' : ''} ${bwOpen ? 'open' : ''}`}
-            aria-expanded={bwOpen}
-            aria-haspopup="dialog"
-            title={onSwitchCwd && worktrees.length > 1 ? tx('switchBranchOrWorktree') : tx('switchOrCreateBranch')}
-            onClick={toggleBwPopover}
-          >
-            <Icon name="git-branch" size={12} />
-            <span className="truncate">{git.branch || wtLabel || 'HEAD'}</span>
-            {onSwitchCwd && worktrees.length > 1 && <span className="wp-ctx-cnt">· {worktrees.length}</span>}
-            <Icon name="down" size={10} />
-          </button>
-          <div className="grow" />
-          {onSwitchCwd && isOtherWorktree && baseCwd ? (
+      {git && (() => {
+        const curWt = worktrees.find((w) => w.isCurrent || norm(w.path) === norm(cwd));
+        const curBr = branchesInfo?.branches.find((b) => b.current || (!!git.branch && b.name === git.branch));
+        const aheadCount = curBr?.ahead ?? curWt?.ahead ?? 0;
+        const behindCount = curBr?.behind ?? curWt?.behind ?? 0;
+        const inLinkedWt = isOtherWorktree || (!!curWt && !curWt.isMain);
+        const pullOnly = behindCount > 0 && aheadCount === 0;
+        return (
+          <div className={`wp-ctx-bar ${isOtherWorktree ? 'other' : ''}`}>
+            <button
+              ref={bwBtnRef}
+              type="button"
+              className={`wp-ctx-branch truncate ${isOtherWorktree ? 'other' : ''} ${bwOpen ? 'open' : ''}`}
+              aria-expanded={bwOpen}
+              aria-haspopup="dialog"
+              title={onSwitchCwd && worktrees.length > 1 ? tx('switchBranchOrWorktree') : tx('switchOrCreateBranch')}
+              onClick={toggleBwPopover}
+            >
+              <Icon name={inLinkedWt ? 'git-worktree' : 'git-branch'} size={12} />
+              <span className="truncate">{git.branch || wtLabel || 'HEAD'}</span>
+              <Icon name="down" size={10} />
+            </button>
+            <div className="grow" />
+            {onSwitchCwd && isOtherWorktree && baseCwd && (
+              <button
+                type="button"
+                className="wp-wt-back"
+                title={tx('backToSessionDir')}
+                onClick={() => switchWorktree(baseCwd)}
+              >
+                <Icon name="back" size={11} />
+                <span>{tx('mainDirShort')}</span>
+              </button>
+            )}
             <button
               type="button"
-              className="wp-wt-back"
-              title={tx('backToSessionDir')}
-              onClick={() => switchWorktree(baseCwd)}
+              className={`wp-ctx-sync ${fetching || gitBusy ? 'spinning' : ''}`}
+              disabled={fetching || gitBusy}
+              title={pullOnly ? tx('pullSyncAction') : tx('fetchRemotesAction')}
+              aria-label={pullOnly ? tx('pullSyncAction') : tx('fetchRemotesAction')}
+              onClick={() => void (pullOnly ? doPull() : doFetch())}
             >
-              <Icon name="back" size={11} />
-              <span>{tx('mainDirShort')}</span>
+              <Icon name="refresh" size={11} />
+              {aheadCount > 0 && <span className="mono">↑{aheadCount}</span>}
+              {behindCount > 0 && <span className="mono">↓{behindCount}</span>}
             </button>
-          ) : (
-            <span className="wp-ctx-repo truncate" title={cwd}>
-              {baseName(cwd)}
-            </span>
-          )}
-        </div>
-      )}
+          </div>
+        );
+      })()}
       {onSwitchCwd && newWorktree && (
         <div className="wp-wt-notice">
           <span className="truncate" title={newWorktree.path}>
@@ -3350,48 +3714,153 @@ export function FilePanel({
               onReviewCommit={standalone ? undefined : (preset) => setReviewPreset(preset)}
             />
           )}
-          {view === 'changes' && git && (
-            <div className="wp-git-dock">
-              <div className="wp-git-dock-cta">
-                {commitFiles.length > 0 ? (
-                  <>
-                    <button type="button" className="wp-dock-btn primary" title={tx('commitChanges')} onClick={() => setCommitOpen(true)}>
-                      <Icon name="git-commit" size={13} />
-                      <span>{tx('commitCount', { n: commitFiles.length })}</span>
-                    </button>
-                    {!standalone && (
-                      <button type="button" className="wp-dock-btn ai" title={tx('crossToolReviewTitle')} onClick={() => setReviewPreset({})}>
-                        <Icon name="sparkles" size={13} />
-                        <span>{tx('reviewBtn')}</span>
-                      </button>
-                    )}
+          {view === 'changes' && git && (() => {
+            const curWt = worktrees.find((w) => w.isCurrent || norm(w.path) === norm(cwd));
+            const curBr = branchesInfo?.branches.find((b) => b.current || (!!git.branch && b.name === git.branch));
+            const aheadCount = curBr?.ahead ?? curWt?.ahead ?? 0;
+            const behindCount = curBr?.behind ?? curWt?.behind ?? 0;
+            const canMergeMain = !!effDefaultBranch && !!git.branch && git.branch !== effDefaultBranch && git.branch !== 'HEAD';
+            const busyDock = pushing || fetching || gitBusy;
+
+            let splitPrimary = false;
+            let splitIcon = 'refresh';
+            let splitLabel: string = tx('syncBtnShort');
+            let splitTitle: string = tx('fetchRemotesAction');
+            let splitRun: () => void = () => {
+              void doFetch();
+            };
+
+            if (commitFiles.length > 0) {
+              splitPrimary = true;
+              splitIcon = 'git-commit';
+              splitLabel = preferCommitPush
+                ? tx('commitAndPushCount', { n: commitFiles.length })
+                : tx('commitOnlyCount', { n: commitFiles.length });
+              splitTitle = tx('commitChanges');
+              splitRun = () => openCommit(preferCommitPush);
+            } else if (behindCount > 0 && aheadCount === 0) {
+              splitPrimary = true;
+              splitIcon = 'download';
+              splitLabel = tx('pullBehindBtn', { n: behindCount });
+              splitTitle = tx('pullSyncAction');
+              splitRun = () => void doPull();
+            } else if (aheadCount > 0) {
+              splitPrimary = true;
+              splitIcon = 'upload';
+              splitLabel = tx('pushAheadBtn', { n: aheadCount });
+              splitTitle = tx('pushBranch');
+              splitRun = () => void doPush();
+            } else if (canMergeMain) {
+              splitPrimary = false;
+              splitIcon = 'git-merge';
+              splitLabel = tx('mergeBackIntoShort', { target: effDefaultBranch });
+              splitTitle = tx('mergeBackInto', { target: effDefaultBranch });
+              splitRun = () => void doMergeToDefault(git.branch, false);
+            }
+
+            const openDockMenu = (e: React.MouseEvent<HTMLElement>) => {
+              const r = e.currentTarget.closest('.wp-dock-split')?.getBoundingClientRect() ?? e.currentTarget.getBoundingClientRect();
+              const items: (MenuItem | '-')[] = [
+                {
+                  label: tx('commitAndPushItem'),
+                  icon: 'upload',
+                  active: preferCommitPush,
+                  disabled: commitFiles.length === 0 || busyDock,
+                  run: () => {
+                    setPreferCommitPush(true);
+                    lsSet('wp-prefer-commit-push', true);
+                    openCommit(true);
+                  },
+                },
+                {
+                  label: tx('commitOnlyItem', { n: commitFiles.length }),
+                  icon: 'git-commit',
+                  active: !preferCommitPush,
+                  disabled: commitFiles.length === 0 || busyDock,
+                  run: () => {
+                    setPreferCommitPush(false);
+                    lsSet('wp-prefer-commit-push', false);
+                    openCommit(false);
+                  },
+                },
+                '-',
+                {
+                  label: tx('pushBranch'),
+                  icon: 'upload',
+                  hint: aheadCount > 0 ? `↑${aheadCount}` : undefined,
+                  disabled: busyDock,
+                  run: () => void doPush(),
+                },
+                {
+                  label: tx('pullSyncAction'),
+                  icon: 'download',
+                  hint: behindCount > 0 ? `↓${behindCount}` : undefined,
+                  disabled: busyDock,
+                  run: () => void doPull(),
+                },
+                ...(canMergeMain
+                  ? [
+                      '-' as const,
+                      {
+                        label: tx('mergeBackIntoItem', { target: effDefaultBranch }),
+                        icon: 'git-merge',
+                        disabled: busyDock,
+                        run: () => void doMergeToDefault(git.branch, false),
+                      },
+                      {
+                        label: tx('squashBackInto', { target: effDefaultBranch }),
+                        icon: 'git-commit',
+                        disabled: busyDock,
+                        run: () => void doMergeToDefault(git.branch, true),
+                      },
+                    ]
+                  : []),
+                '-',
+                {
+                  label: tx('fetchRemotesAction'),
+                  icon: 'refresh',
+                  disabled: busyDock,
+                  run: () => void doFetch(),
+                },
+              ];
+              openMenu({ clientX: r.left, clientY: Math.max(8, r.top - 220) }, items);
+            };
+
+            return (
+              <div className="wp-git-dock">
+                <div className="wp-git-dock-cta">
+                  <div className={`wp-dock-split ${splitPrimary ? 'primary' : ''}`}>
                     <button
                       type="button"
-                      className="wp-dock-icon"
-                      disabled={pushing}
-                      title={tx('pushBranch')}
-                      onClick={() => void doPush()}
+                      className="wp-dock-split-main"
+                      disabled={busyDock}
+                      title={splitTitle}
+                      onClick={splitRun}
                     >
-                      {pushing ? <span className="spinner mini" /> : <Icon name="upload" size={13} />}
+                      {busyDock ? <span className="spinner mini" /> : <Icon name={splitIcon} size={13} />}
+                      <span className="truncate">{splitLabel}</span>
                     </button>
-                  </>
-                ) : (
-                  <>
-                    {!standalone && (
-                      <button type="button" className="wp-dock-btn ai" title={tx('crossToolReviewTitle')} onClick={() => setReviewPreset({})}>
-                        <Icon name="sparkles" size={13} />
-                        <span>{tx('reviewBtn')}</span>
-                      </button>
-                    )}
-                    <button type="button" className="wp-dock-btn" disabled={pushing} title={tx('pushBranch')} onClick={() => void doPush()}>
-                      {pushing ? <span className="spinner mini" /> : <Icon name="upload" size={13} />}
-                      <span>{tx('pushBtn')}</span>
+                    <button
+                      type="button"
+                      className="wp-dock-split-chev"
+                      disabled={busyDock}
+                      title={tx('gitActionsMenuTip')}
+                      aria-label={tx('gitActionsMenuTip')}
+                      onClick={openDockMenu}
+                    >
+                      <Icon name="down" size={11} />
                     </button>
-                  </>
-                )}
+                  </div>
+                  {!standalone && (
+                    <button type="button" className="wp-dock-btn ai" title={tx('crossToolReviewTitle')} onClick={() => setReviewPreset({})}>
+                      <Icon name="sparkles" size={13} />
+                      <span>{tx('reviewBtn')}</span>
+                    </button>
+                  )}
+                </div>
               </div>
-            </div>
-          )}
+            );
+          })()}
           {(dropDir || uploading > 0) && (
             <div className="wp-dropbar">
               {uploading > 0 ? (
@@ -4139,14 +4608,28 @@ export function FilePanel({
           hostId={hostId}
           cwd={cwd}
           branch={git.branch}
-          defaultBranch={branchesInfo?.defaultBranch}
+          defaultBranch={branchesInfo?.defaultBranch ?? wtDefaultBranch}
+          defaultPush={commitDefaultPush}
           files={commitFiles}
-          onCommitted={() => {
-            refreshTree();
-            void loadBranches();
-            if (diffScope === 'branch') loadBranchDiff();
-          }}
+          onCommitted={() => refreshGitAll(true)}
           onClose={() => setCommitOpen(false)}
+        />
+      )}
+      {newWtOpen && git && (
+        <NewWorktreeDialog
+          hostId={hostId}
+          cwd={cwd}
+          defaultBase={newWtBase || git.branch || effDefaultBranch}
+          branchesInfo={branchesInfo}
+          worktrees={worktrees}
+          canOpenSession={!standalone}
+          onCreated={(wtPath, _branch, openSess) => {
+            loadWorktrees(true);
+            void loadBranches();
+            if (openSess && !standalone) openNewSession({ hostId, cwd: wtPath });
+            else if (onSwitchCwd) switchWorktree(wtPath);
+          }}
+          onClose={() => setNewWtOpen(false)}
         />
       )}
       {reviewPreset && !standalone && git && (
@@ -4173,22 +4656,33 @@ export function FilePanel({
         <BranchWorktreePopover
           anchor={bwBtnRef.current}
           cwd={cwd}
-          baseCwd={baseCwd}
-          isOtherWorktree={isOtherWorktree}
           standalone={standalone}
           worktrees={worktrees}
+          defaultBranch={wtDefaultBranch}
           branchesInfo={branchesInfo}
           loadingBranches={branchesLoading}
-          currentBranch={git.branch}
+          fetching={fetching}
+          hostSessions={hostSessions}
+          currentSessionId={sessionId}
           onSwitchWorktree={onSwitchCwd ? switchWorktree : undefined}
+          onJumpToSession={(sid) => navigate({ kind: 'session', hostId, sessionId: sid })}
+          onNewSessionAt={standalone ? undefined : (p) => openNewSession({ hostId, cwd: p })}
           onCheckoutBranch={checkoutBranch}
-          onCreateBranch={() => void createBranch()}
-          onRenameBranch={
-            git.branch && git.branch !== 'HEAD' && !git.branch.includes('游离')
-              ? () => void renameCurrentBranch()
-              : undefined
-          }
-          onNewSession={standalone ? undefined : () => openNewSession({ hostId, cwd })}
+          onCreateBranch={(base) => void createBranch(base)}
+          onCreateWorktree={(base) => openNewWorktree(base)}
+          onOpenBranchInWorktree={(br) => void doOpenBranchInWorktree(br)}
+          onMergeWorktreeToDefault={(wt, squash) => {
+            if (wt.branch) void doMergeToDefault(wt.branch, squash);
+          }}
+          onMergeBranchIntoCurrent={(br) => void doMergeIntoCurrent(br)}
+          onRebaseOnto={(br) => void doRebaseOnto(br)}
+          onCompareBranch={doCompareBranch}
+          onRenameBranch={(br) => void doRenameBranch(br)}
+          onDeleteBranch={(br) => void doDeleteBranch(br)}
+          onDeleteWorktree={(wt) => void doDeleteWorktree(wt)}
+          onCleanupMergedWorktrees={(candidates) => void doCleanupMergedWorktrees(candidates)}
+          onFetch={() => void doFetch()}
+          onCopyPath={(p) => void copy(p)}
           onClose={() => setBwOpen(false)}
         />
       )}

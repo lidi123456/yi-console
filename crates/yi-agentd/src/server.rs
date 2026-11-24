@@ -698,15 +698,37 @@ pub async fn dispatch(
             let name = s(&p, "name")?.to_string();
             let branch = p["branch"].as_str().map(str::to_string);
             let base = p["base"].as_str().map(str::to_string);
+            let existing_branch = p["existingBranch"].as_bool().unwrap_or(false);
+            let prepare_env = p["prepareEnv"].as_bool().unwrap_or(false);
             let root = crate::gitops::worktree_root(&hub.settings.read().unwrap());
-            tokio::task::spawn_blocking(move || crate::gitops::worktree_add(&root, &cwd, &name, branch.as_deref(), base.as_deref())).await??
+            tokio::task::spawn_blocking(move || {
+                crate::gitops::worktree_add_with(
+                    &root,
+                    &cwd,
+                    &name,
+                    branch.as_deref(),
+                    base.as_deref(),
+                    existing_branch,
+                    prepare_env,
+                )
+            })
+            .await??
         }
         GIT_WORKTREE_REMOVE => {
             let path = s(&p, "path")?.to_string();
+            let cwd = p["cwd"].as_str().map(str::to_string);
             let force = p["force"].as_bool().unwrap_or(false);
             let delete_branch = p["deleteBranch"].as_bool().unwrap_or(false);
             let root = crate::gitops::worktree_root(&hub.settings.read().unwrap());
-            tokio::task::spawn_blocking(move || crate::gitops::worktree_remove(&root, &path, force, delete_branch)).await??;
+            tokio::task::spawn_blocking(move || {
+                if let Some(repo_cwd) = cwd.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                    crate::gitops::worktree_remove_in_repo(repo_cwd, &path, force, delete_branch)
+                } else {
+                    crate::gitops::worktree_remove(&root, &path, force, delete_branch)
+                }
+            })
+            .await??;
+            crate::statusline::invalidate_all();
             Value::Null
         }
         SESSION_ENTER_WORKTREE => {
@@ -774,7 +796,8 @@ pub async fn dispatch(
         }
         GIT_WORKTREES => {
             let cwd = s(&p, "cwd")?.to_string();
-            let val = tokio::task::spawn_blocking(move || crate::gitops::worktrees(&cwd)).await??;
+            let details = p["details"].as_bool().unwrap_or(false);
+            let val = tokio::task::spawn_blocking(move || crate::gitops::worktrees_with(&cwd, details)).await??;
             if let Some(items) = val["worktrees"].as_array() {
                 for item in items {
                     if item["detached"].as_bool() != Some(true) {
@@ -809,13 +832,32 @@ pub async fn dispatch(
             let cwd = s(&p, "cwd")?.to_string();
             let cwd_sync = cwd.clone();
             let old_branch = p["oldBranch"].as_str().map(str::to_string);
+            let old_given = old_branch.as_deref().map(str::trim).is_some_and(|s| !s.is_empty());
             let new_branch = s(&p, "newBranch")?.to_string();
-            let val = tokio::task::spawn_blocking(move || {
-                crate::gitops::rename_branch(&cwd, old_branch.as_deref(), &new_branch, false)
+            let (val, worktrees_opt) = tokio::task::spawn_blocking(move || {
+                let val = crate::gitops::rename_branch(&cwd, old_branch.as_deref(), &new_branch, false)?;
+                let wts = if old_given {
+                    crate::gitops::worktrees_with(&cwd, false).ok()
+                } else {
+                    None
+                };
+                Ok::<_, anyhow::Error>((val, wts))
             })
             .await??;
             crate::statusline::invalidate_all();
-            if let Some(live) = val["branch"].as_str() {
+            if let Some(wts) = worktrees_opt {
+                if let Some(items) = wts["worktrees"].as_array() {
+                    for item in items {
+                        if item["detached"].as_bool() != Some(true) {
+                            if let (Some(wt_path), Some(wt_branch)) =
+                                (item["path"].as_str(), item["branch"].as_str())
+                            {
+                                hub.sync_worktree_branch_for_cwd(wt_path, wt_branch);
+                            }
+                        }
+                    }
+                }
+            } else if let Some(live) = val["branch"].as_str() {
                 hub.sync_worktree_branch_for_cwd(&cwd_sync, live);
             }
             val
@@ -826,6 +868,60 @@ pub async fn dispatch(
             let branch = p["branch"].as_str().map(str::to_string);
             let set_upstream = p["setUpstream"].as_bool().unwrap_or(true);
             tokio::task::spawn_blocking(move || crate::gitops::push(&cwd, remote.as_deref(), branch.as_deref(), set_upstream)).await??
+        }
+        GIT_FETCH => {
+            let cwd = s(&p, "cwd")?.to_string();
+            let remote = p["remote"].as_str().map(str::to_string);
+            let prune = p["prune"].as_bool().unwrap_or(true);
+            tokio::task::spawn_blocking(move || crate::gitops::fetch(&cwd, remote.as_deref(), prune)).await??
+        }
+        GIT_PULL => {
+            let cwd = s(&p, "cwd")?.to_string();
+            let rebase = p["rebase"].as_bool().unwrap_or(false);
+            let val = tokio::task::spawn_blocking(move || crate::gitops::pull(&cwd, rebase)).await??;
+            crate::statusline::invalidate_all();
+            val
+        }
+        GIT_MERGE => {
+            let cwd = s(&p, "cwd")?.to_string();
+            let source = s(&p, "source")?.to_string();
+            let target = p["target"].as_str().map(str::to_string);
+            let squash = p["squash"].as_bool().unwrap_or(false);
+            let message = p["message"].as_str().map(str::to_string);
+            let val = tokio::task::spawn_blocking(move || {
+                crate::gitops::merge(&cwd, &source, target.as_deref(), squash, message.as_deref())
+            })
+            .await??;
+            crate::statusline::invalidate_all();
+            val
+        }
+        GIT_REBASE => {
+            let cwd = s(&p, "cwd")?.to_string();
+            let onto = s(&p, "onto")?.to_string();
+            let val = tokio::task::spawn_blocking(move || crate::gitops::rebase(&cwd, &onto)).await??;
+            crate::statusline::invalidate_all();
+            val
+        }
+        GIT_BRANCH_DELETE => {
+            let cwd = s(&p, "cwd")?.to_string();
+            let branch = s(&p, "branch")?.to_string();
+            let force = p["force"].as_bool().unwrap_or(false);
+            let val = tokio::task::spawn_blocking(move || crate::gitops::branch_delete(&cwd, &branch, force)).await??;
+            crate::statusline::invalidate_all();
+            val
+        }
+        GIT_WORKTREE_PRUNE => {
+            let cwd = s(&p, "cwd")?.to_string();
+            let paths: Option<Vec<String>> = p["paths"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect());
+            let delete_branches = p["deleteBranches"].as_bool().unwrap_or(false);
+            let val = tokio::task::spawn_blocking(move || {
+                crate::gitops::worktree_prune(&cwd, paths.as_deref(), delete_branches)
+            })
+            .await??;
+            crate::statusline::invalidate_all();
+            val
         }
         GIT_BRANCH_DIFF => {
             let cwd = s(&p, "cwd")?.to_string();
