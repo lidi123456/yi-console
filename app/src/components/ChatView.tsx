@@ -2247,6 +2247,11 @@ export function ChatView({
   const onScroll = () => {
     const el = ref.current;
     if (!el) return;
+    // While older messages are loading, the layout effect restores keepFrom on every render
+    // (streaming deltas, prompt-state updates, `away` toggles). Track the user's own scrolling
+    // here, otherwise each render snaps the view back to where paging started until the
+    // history request returns (slow over SSH / relay), and scrolling down appears stuck.
+    if (keepFrom.current != null) keepFrom.current = el.scrollHeight - el.scrollTop;
     const gap = el.scrollHeight - el.scrollTop - el.clientHeight;
     stick.current = gap < 80;
     const far = gap > el.clientHeight * 0.6;
