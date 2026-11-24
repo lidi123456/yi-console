@@ -225,10 +225,6 @@ impl ClientHub {
             .is_some_and(|r| !r.is_closed())
     }
 
-    pub fn close_to_tray(&self) -> bool {
-        self.settings.lock().unwrap().close_to_tray.unwrap_or(true)
-    }
-
     /// Host id -> display name
     pub fn host_names(&self) -> HashMap<String, String> {
         self.store.lock().unwrap().hosts.iter().map(|h| (h.id.clone(), h.name.clone())).collect()

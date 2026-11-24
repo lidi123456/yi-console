@@ -48,13 +48,6 @@ pub fn start(hub: &Arc<ClientHub>, data_dir: &Path, device_name: &str, bundled_c
     Ok(bots)
 }
 
-impl Bots {
-    /// Whether any Bot is enabled (the app then keeps running in the tray when its window closes)
-    pub fn any_enabled(&self) -> bool {
-        self.engine.store.bots().map(|b| b.iter().any(|b| b.config.enabled)).unwrap_or(false)
-    }
-}
-
 impl Extension for Bots {
     fn identity(&self) -> Identity {
         self.engine.identity()

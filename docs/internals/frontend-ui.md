@@ -1,6 +1,6 @@
 # Frontend UI
 
-- Desktop startup registers the single-instance plugin before other plugins and before initializing `ClientHub` or Bots. Launching again restores and focuses the existing main window (including when hidden in the tray or minimized), then exits the duplicate process. The daemon retains its own separate instance lock.
+- Desktop startup registers the single-instance plugin before other plugins and before initializing `ClientHub` or Bots. Launching again restores and focuses the existing main window (including when minimized), then exits the duplicate process. The daemon retains its own separate instance lock.
 
 Look and behaviour of the frontend outside the file panel and terminal: chat timeline, theme, fonts, sidebar, links, overlays, i18n.
 

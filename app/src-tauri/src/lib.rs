@@ -5,8 +5,6 @@ mod clipfiles;
 #[cfg(windows)]
 mod dropfiles;
 #[cfg(desktop)]
-mod tray;
-#[cfg(desktop)]
 mod updater;
 #[cfg(windows)]
 mod webtab;
@@ -115,6 +113,16 @@ fn fit_to_screen(w: &tauri::WebviewWindow) {
     }
 }
 
+/// Bring the main window to the front (a second launch hands over to the running instance)
+#[cfg(desktop)]
+fn show_main(app: &tauri::AppHandle) {
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.show();
+        let _ = w.unminimize();
+        let _ = w.set_focus();
+    }
+}
+
 /// There's no local yi-agentd on mobile; it can only connect to SSH hosts or to computers via a relay
 const LOCAL_SUPPORTED: bool = cfg!(not(any(target_os = "android", target_os = "ios")));
 
@@ -124,7 +132,7 @@ pub fn run() {
     // Register first so duplicate launches exit before starting clients or Bots.
     #[cfg(desktop)]
     let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _, _| {
-        tray::show(app);
+        show_main(app);
     }));
     let builder = builder
         .plugin(tauri_plugin_notification::init())
@@ -187,30 +195,18 @@ pub fn run() {
                 let h = hub.clone();
                 // Feishu / GitHub ship with the app (scripts/bundle-connectors.py fills resources/connectors)
                 let bundled = app.path().resource_dir().ok().map(|d| d.join("connectors"));
+                // On success the ClientHub keeps the Bots alive as its extension
                 let bots = tauri::async_runtime::block_on(async move {
                     yi_bots::start(&h, &data_dir, &yi_client::api::device_name(), bundled.as_deref())
                 });
-                match bots {
-                    Ok(b) => {
-                        app.manage(tray::BotsState(Some(b)));
-                    }
-                    Err(e) => {
-                        eprintln!("Bots 启动失败: {e:#}");
-                        app.manage(tray::BotsState(None));
-                    }
+                if let Err(e) = bots {
+                    eprintln!("Bots 启动失败: {e:#}");
                 }
-                tray::setup(app)?;
             }
             #[cfg(mobile)]
             let _ = data_dir;
             app.manage(Hub(hub));
             Ok(())
-        })
-        .on_window_event(|window, event| {
-            #[cfg(desktop)]
-            tray::on_window_event(window, event);
-            #[cfg(mobile)]
-            let _ = (window, event);
         })
         .invoke_handler(tauri::generate_handler![
             hub_call,

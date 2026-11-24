@@ -403,21 +403,14 @@ function PrefRow({ title, desc, children }: { title: string; desc?: string; chil
   );
 }
 
-/** Bots (desktop app only): keep running in the tray, connectors */
+/** Bots (desktop app only): connectors */
 function BotsCard() {
   const available = useBots((b) => b.list !== null);
-  const client = useStore((s) => s.client);
   if (!available) return null;
-  const on = client?.closeToTray ?? true;
   return (
     <div className="card">
       <div className="card-title">{tx('bots')}</div>
       <div className="form">
-        <label className="check">
-          <input type="checkbox" checked={on} onChange={(e) => saveClientSettings({ closeToTray: e.target.checked }).catch(errorToast)} />
-          {tx('closeToTray')}
-        </label>
-        <p className="muted small">{tx('closeToTrayHint')}</p>
         <button className="btn small" onClick={() => navigate({ kind: 'connectors' })}>
           <Icon name="plug" size={13} /> {tx('managePlugins')}
         </button>

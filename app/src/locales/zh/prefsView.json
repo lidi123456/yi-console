@@ -85,7 +85,5 @@
   "catSessions": "会话",
   "catNetwork": "网络",
   "bots": "Bot",
-  "closeToTray": "关闭窗口时留在托盘里继续运行",
-  "closeToTrayHint": "有启用的 Bot 时，关闭主窗口只隐藏到托盘，Bot 和连接器继续工作；从托盘菜单退出才真正结束。没有启用的 Bot 时照常退出。",
   "managePlugins": "管理连接器"
 }

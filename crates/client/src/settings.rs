@@ -59,9 +59,6 @@ pub struct ClientSettings {
     pub proxy: ProxySettings,
     #[serde(default)]
     pub notify: NotifyPrefs,
-    /// Desktop: closing the window while a Bot is enabled keeps the app running in the tray (on if unset)
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub close_to_tray: Option<bool>,
 }
 
 fn file(dir: &Path) -> PathBuf {

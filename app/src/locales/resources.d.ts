@@ -2346,8 +2346,6 @@ export default interface Resources {
     "chooseTheDisplayLanguageFor": "切换应用的显示语言",
     "claudeCodeDotTimelineOn": "Claude Code：左侧一列圆点时间线，每次工具调用单独一行并带结果摘要",
     "claudeCodeReplyFinishedTest": "Claude Code 回复完成：测试通知",
-    "closeToTray": "关闭窗口时留在托盘里继续运行",
-    "closeToTrayHint": "有启用的 Bot 时，关闭主窗口只隐藏到托盘，Bot 和连接器继续工作；从托盘菜单退出才真正结束。没有启用的 Bot 时照常退出。",
     "colorScheme": "配色",
     "colorSchemeAndFontSize": "终端模式会话的配色和字号（配色取自 Windows Terminal）。终端右上角的按钮也可以随时切换。",
     "current": "当前：",

@@ -845,6 +845,4 @@ export interface NotifyPrefs {
 export interface ClientSettings {
   proxy: { mode: string; url: string };
   notify: NotifyPrefs;
-  /** Desktop: closing the window keeps the app in the tray while a Bot is enabled (on if unset) */
-  closeToTray?: boolean;
 }
