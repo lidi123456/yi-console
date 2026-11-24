@@ -26,10 +26,11 @@ import {
   type Attached,
   type Upload,
 } from '../composerState';
-import { clearSession, showChanges } from './SessionActions';
+import { clearSession, openFilesInPanel, showChanges } from './SessionActions';
 import { isTauri, rpc } from '../transport';
 import type { SessionInfo, SlashCommand, Snippet } from '../types';
 import { fuzzyScore, isMobile, toB64 as toB64Str } from '../util';
+import { DRAG_REF, extractDroppedEntries, planComposerDrop, resolveDroppedLocalPaths } from '../dropFiles';
 import {
   ADD_CONTEXT_REF,
   REMOVE_REVIEW_CONTEXT_REF,
@@ -49,7 +50,7 @@ import { openImage } from './Lightbox';
 import { imageMenu } from './ImageMenu';
 import { Icon } from './Icon';
 import { askText, openMenu } from './Overlay';
-import { copiedRef, DRAG_REF, INSERT_COMPOSER, toB64 } from './FilePanel';
+import { copiedRef, INSERT_COMPOSER, toB64 } from './FilePanel';
 import { permLabel, permModes } from '../perm';
 import { nextPerm, PermPicker } from './PermPicker';
 import { ModelPicker, OPEN_MODEL } from './ModelPicker';
@@ -202,6 +203,7 @@ export function Composer({
   desktopControls,
   placeholder,
   compact = false,
+  openDroppedInPanel = false,
   topSlot,
   transformSend,
   onAfterSend,
@@ -217,6 +219,8 @@ export function Composer({
   placeholder?: string;
   /** Compact variant used inside embedded side chats: keeps full composer UX while hiding full-page navigation commands */
   compact?: boolean;
+  /** Open non-image files dropped onto this composer in the session's right-side file panel */
+  openDroppedInPanel?: boolean;
   /** Optional chip/banner rendered above the textarea row (e.g. focused review finding tag) */
   topSlot?: ReactNode;
   /** Optional message body transformer executed right before sending (when no text-only bypass happens) */
@@ -583,13 +587,22 @@ export function Composer({
 
   const cancelUpload = (id: number) => cancelComposerUpload(key, id);
 
-  const attachNow = async (from: string, hId: string, sid: string, fs: File[], local?: (string | undefined)[]) => {
+  const attachNow = async (
+    from: string,
+    hId: string,
+    sid: string,
+    fs: File[],
+    local?: (string | undefined)[],
+    opts?: { openInPanel?: boolean; dirHints?: boolean[] },
+  ) => {
     const refs: string[] = [];
+    const opened: string[] = [];
     for (const [i, f] of fs.entries()) {
       // Local file: reference the original directly, no upload needed
       const at = local?.[i];
       if (at) {
         refs.push(refOf(at));
+        opened.push(at);
         continue;
       }
       const up = IMAGE_TYPES.includes(f.type) ? null : { id: ++uploadSeq, name: f.name, sent: 0, total: f.size };
@@ -599,12 +612,15 @@ export function Composer({
           setComposerImages(from, (cur) => [...cur, a]);
           continue;
         }
+        if (opts?.dirHints?.[i]) throw new Error(t('isAFolderOrEmpty', { name: f.name }));
         if (f.size > FILE_MAX) throw new Error(t('exceeds50mb', { name: f.name }));
         if (!f.size && !f.type) throw new Error(t('isAFolderOrEmpty', { name: f.name }));
         if (up) addComposerUpload(from, up);
         const path = await uploadFile(from, hId, sid, f, up!);
-        if (path) refs.push(refOf(path));
-        else clearWaitSend(from);
+        if (path) {
+          refs.push(refOf(path));
+          opened.push(path);
+        } else clearWaitSend(from);
       } catch (e) {
         clearWaitSend(from);
         errorToast(e);
@@ -612,8 +628,35 @@ export function Composer({
         if (up) removeComposerUpload(from, up.id);
       }
     }
-    if (!refs.length) return;
-    insertOrAppendComposerText(from, refs.join(''));
+    if (refs.length) insertOrAppendComposerText(from, refs.join(''));
+    if (opts?.openInPanel && opened.length) openFilesInPanel(hId, sid, opened);
+  };
+
+  /** Dropping external files onto the composer: attach/@reference as usual, and open non-image files in the file panel */
+  const dropFiles = (dt: DataTransfer) => {
+    const entries = extractDroppedEntries(dt);
+    if (!entries.length) return;
+    const from = key;
+    const hId = hostId;
+    const sid = info.id;
+    const isLocalHost = hostKind === 'local';
+    const openInPanel = !!openDroppedInPanel;
+    const fs = entries.map((e) => e.file);
+    const hints = entries.map((e) => e.isDirHint);
+    return runUploadJob(from, async () => {
+      const resolved = isLocalHost ? await resolveDroppedLocalPaths(fs) : null;
+      const plan = planComposerDrop(fs, {
+        isLocalHost,
+        resolved,
+        dirHints: hints,
+        imageTypes: IMAGE_TYPES,
+        openInPanel,
+      });
+      await attachNow(from, hId, sid, fs, plan.localPaths, {
+        openInPanel: plan.shouldOpenInPanel,
+        dirHints: plan.dirHints,
+      });
+    });
   };
 
   /** Pasting files: in a local session, non-image local files on the clipboard are referenced by path; everything else is handled as usual */
@@ -829,20 +872,26 @@ export function Composer({
         onDragOver={(e) => {
           if (e.dataTransfer.types.includes('Files') || e.dataTransfer.types.includes(DRAG_REF)) {
             e.preventDefault();
-            setDrag(true);
+            e.dataTransfer.dropEffect = 'copy';
+            if (connected) setDrag(true);
           }
         }}
-        onDragLeave={() => setDrag(false)}
+        onDragLeave={(e) => {
+          if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setDrag(false);
+        }}
         onDrop={(e) => {
+          const ref = e.dataTransfer.getData(DRAG_REF);
+          const hasFiles = e.dataTransfer.types.includes('Files') || e.dataTransfer.files.length > 0;
+          if (!ref && !hasFiles) return;
           e.preventDefault();
           setDrag(false);
+          if (!connected) return;
           // Dragged in from the file panel: insert @relative-path
-          const ref = e.dataTransfer.getData(DRAG_REF);
           if (ref) {
             window.dispatchEvent(new CustomEvent(INSERT_COMPOSER, { detail: { sessionId: info.id, text: ref } }));
             return;
           }
-          attach(e.dataTransfer.files);
+          void dropFiles(e.dataTransfer);
         }}
       >
         {popOpen && (items.length > 0 || (at && files === null)) && (

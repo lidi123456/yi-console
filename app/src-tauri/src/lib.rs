@@ -2,6 +2,8 @@
 //! Browser mode (yi-web) goes through the same ClientHub.call, so both behave the same.
 
 mod clipfiles;
+#[cfg(windows)]
+mod dropfiles;
 #[cfg(desktop)]
 mod tray;
 #[cfg(desktop)]
@@ -160,6 +162,8 @@ pub fn run() {
             #[cfg(desktop)]
             if let Some(w) = app.get_webview_window("main") {
                 fit_to_screen(&w);
+                #[cfg(windows)]
+                dropfiles::setup(app.handle(), &w);
             }
             let data_dir = app.path().app_data_dir()?;
             // yi-agentd builds for every platform bundled in the installer, for automatic deployment to SSH hosts; not shipped on mobile

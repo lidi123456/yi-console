@@ -31,7 +31,8 @@ import { MergeDiff, oneSided, type MergeDiffHandle } from './MergeDiff';
 import { CsvView, ImageView, MdPreview, PdfView } from './FilePreview';
 import { GrepPanel } from './GrepPanel';
 import { QuickOpen, type QuickMode } from './QuickOpen';
-import { OPEN_CHANGES, OPEN_FILE, takeOpenChanges, takeOpenFile, takeOpenTurn } from './SessionActions';
+import { OPEN_CHANGES, OPEN_FILE, takeOpenChanges, takeOpenFiles, takeOpenTurn } from './SessionActions';
+import { DRAG_REF, isOtherSessionUpload } from '../dropFiles';
 import { BrowserPane, isWebTab, WEB_PREFIX, webTabFile, webTabTitle } from './Browser';
 import { AI_PREFIX, aiTabSession, AiBrowserPane, isAiTab, useAiBrowserBusy } from './AiBrowser';
 import { registerWebTabs } from './NativeWeb';
@@ -105,7 +106,7 @@ interface OpenFile {
 }
 
 /** Dragging a file from the file panel to the input box: the value is "@relative-path " */
-export const DRAG_REF = 'application/x-yi-console-ref';
+export { DRAG_REF };
 /** Per-file size limit for uploads dropped onto the file tree (same as yi-agentd) */
 const UPLOAD_MAX = 50 * 1024 * 1024;
 const TREE_DEFAULT = 300;
@@ -1237,14 +1238,16 @@ export function FilePanel({
     }
   };
 
-  const confirmDiscard = async () =>
-    !dirty ||
-    (await askConfirm({
-      title: tx('discardChangesTo', { v: nameOf(file!.path) }),
+  const confirmDiscard = async () => {
+    const cur = fileRef.current;
+    if (!cur || cur.draft === cur.content) return true;
+    return askConfirm({
+      title: tx('discardChangesTo', { v: nameOf(cur.path) }),
       message: tx('unsavedEditsWillBeDiscarded'),
       okText: tx('discard'),
       danger: true,
-    }));
+    });
+  };
 
   const gitOf = (path: string) => git?.files.get(norm(path));
   /** Active diff map for the current Changes scope: uncommitted vs HEAD, branch vs merge-base, or per-turn checkpoint */
@@ -1340,12 +1343,14 @@ export function FilePanel({
     setPreview(m === 'preview');
   };
 
-  /** diff: files opened from the changes list show the diff by default; line: jump to this line after opening */
-  const openFile = async (path0: string, diff = false, at?: { line: number; endLine?: number; col?: number; len?: number }) => {
+  /** diff: files opened from the changes list show the diff by default; line: jump to this line after opening.
+   *  Returns false only when the user cancelled discarding unsaved edits. */
+  const openFile = async (path0: string, diff = false, at?: { line: number; endLine?: number; col?: number; len?: number }): Promise<boolean> => {
     const path = unverbatim(path0);
     const jump = () => at && setGoto({ ...at, n: Date.now() });
-    if (file?.path === path) {
-      const canDiff = !!file.commit || !!file.deleted || hasChange(path);
+    const cur = fileRef.current;
+    if (cur?.path === path) {
+      const canDiff = !!cur.commit || !!cur.deleted || hasChange(path);
       if (diff && canDiff) setShowDiff(true);
       if (at) {
         if (!diff || !canDiff) setShowDiff(false);
@@ -1354,10 +1359,10 @@ export function FilePanel({
         jump();
       }
       if (window.matchMedia('(max-width: 760px)').matches) setTreeOpen(false);
-      return;
+      return true;
     }
     // An untitled tab keeps its text in memory when you switch away (it's written to untitled on every edit)
-    if (!file?.untitled && !(await confirmDiscard())) return;
+    if (!cur?.untitled && !(await confirmDiscard())) return false;
     const g = diffGitOf(path);
     const f: OpenFile | null =
       g && gitMark(g.status)[0] === 'D'
@@ -1366,7 +1371,7 @@ export function FilePanel({
           (diffScope === 'turn' && g
             ? { path, content: '', draft: '', binary: false, truncated: false, size: 0, modified: 0, rev: Date.now(), deleted: true }
             : null);
-    if (!f) return;
+    if (!f) return true;
     fileRef.current = f;
     setFile(f);
     setTabs((t) => (t.includes(path) ? t : [...t, path].slice(-30)));
@@ -1378,6 +1383,7 @@ export function FilePanel({
     setGoto(at ? { ...at, n: Date.now() } : null);
     setShowDiff(!!f.deleted || (diff && hasChange(path)));
     if (window.matchMedia('(max-width: 760px)').matches) setTreeOpen(false);
+    return true;
   };
   // A file link or context pill in chat (SessionActions.openFileInPanel): taken on mount too, since a closed panel mounts after the event.
   // Through a ref, so the listener always calls the openFile of the latest render
@@ -1430,23 +1436,36 @@ export function FilePanel({
   };
   const revealRef = useRef(revealDir);
   revealRef.current = revealDir;
+  const openQueueRef = useRef(Promise.resolve());
   useEffect(() => {
-    const take = async () => {
-      const r = takeOpenFile(hostId, sessionId);
-      if (!r) return;
-      const isVirtual =
-        isWebTab(r.path) || isAiTab(r.path) || isSideTab(r.path) || isReviewTab(r.path) || isUntitled(r.path) || isCommitTab(r.path);
-      // A folder link: show it in the tree instead of trying to read it as a file
-      if (!r.line && !r.diff && !isVirtual && (await revealRef.current(r.path))) return;
-      openFileRef.current(r.path, !!r.diff, r.line ? { line: r.line, endLine: r.endLine } : undefined);
+    let active = true;
+    const drain = () => {
+      const reqs = takeOpenFiles(hostId, sessionId);
+      if (!reqs.length) return;
+      openQueueRef.current = openQueueRef.current
+        .catch(() => {})
+        .then(async () => {
+          for (const r of reqs) {
+            if (!active) return;
+            const isVirtual =
+              isWebTab(r.path) || isAiTab(r.path) || isSideTab(r.path) || isReviewTab(r.path) || isUntitled(r.path) || isCommitTab(r.path);
+            // A folder link: show it in the tree instead of trying to read it as a file
+            if (!r.line && !r.diff && !isVirtual && (await revealRef.current(r.path))) continue;
+            const ok = await openFileRef.current(r.path, !!r.diff, r.line ? { line: r.line, endLine: r.endLine } : undefined);
+            if (!ok) break;
+          }
+        });
     };
-    take();
+    drain();
     const on = (e: Event) => {
       const d = (e as CustomEvent<{ hostId: string; sessionId: string }>).detail;
-      if (d.hostId === hostId && d.sessionId === sessionId) take();
+      if (d.hostId === hostId && d.sessionId === sessionId) drain();
     };
     window.addEventListener(OPEN_FILE, on);
-    return () => window.removeEventListener(OPEN_FILE, on);
+    return () => {
+      active = false;
+      window.removeEventListener(OPEN_FILE, on);
+    };
   }, [hostId, sessionId]);
 
   // ---------- When the tab bar overflows: scroll the current tab into view and add a dropdown on the right listing all tabs (like VS Code) ----------
@@ -1686,7 +1705,7 @@ export function FilePanel({
             ? aiTabSession(t) === sessionId
             : isWebTab(t)
               ? !webTabFile(t) || inRoot(webTabFile(t)!)
-              : inRoot(t),
+              : inRoot(t) || (isAbsPath(t) && !isCommitTab(t) && !isReviewTab(t) && !isOtherSessionUpload(t, sessionId)),
     );
     const cur = saved.current && keep.includes(saved.current) ? saved.current : keep[keep.length - 1];
     if (!cur) return;
@@ -1895,7 +1914,14 @@ export function FilePanel({
     }
   };
 
-  const rel = (p: string) => (root && p.startsWith(root) ? p.slice(root.length).replace(/^[\\/]/, '').replace(/\\/g, '/') || '.' : p);
+  const rel = (p: string) => {
+    if (!root) return p;
+    const nr = norm(root);
+    const np = norm(p);
+    if (np === nr) return '.';
+    if (np.startsWith(nr + '/')) return p.slice(root.replace(/[\\/]+$/, '').length).replace(/^[\\/]/, '').replace(/\\/g, '/') || '.';
+    return p;
+  };
   const copy = async (text: string, ok: string = tx('pathCopied')) => toast((await writeClipboard(text)) ? ok : tx('couldNotCopy'));
   const copyRef = async (path: string, isDir: boolean) => {
     const r = rel(path) + (isDir ? '/' : '');
@@ -4192,8 +4218,11 @@ function Breadcrumbs({
   const box = useRef<HTMLDivElement>(null);
   const [pop, setPop] = useState<{ dir: string; x: number; y: number } | null>(null);
   useBack(!!pop, () => setPop(null));
-  const inRoot = path.startsWith(root);
-  const segs = (inRoot ? path.slice(root.length) : path).split(/[\\/]/).filter(Boolean);
+  const nr = norm(root);
+  const np = norm(path);
+  const inRoot = np === nr || np.startsWith(nr + '/');
+  const rootClean = root.replace(/[\\/]+$/, '');
+  const segs = (inRoot ? path.slice(rootClean.length) : path).split(/[\\/]/).filter(Boolean);
   const rootLabel = inRoot ? baseName(root) || root : '';
   // When the path is too long, scroll to the far right so the file name stays visible
   useLayoutEffect(() => {

@@ -14045,6 +14045,34 @@ button.wp-commit-title .chev {
   min-height: 0;
 }
 
+.chat-drop-overlay {
+  position: absolute;
+  inset: 8px 12px;
+  z-index: 25;
+  pointer-events: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 14px;
+  border: 1.5px dashed var(--link);
+  background: color-mix(in srgb, var(--link) 7%, var(--panel));
+  backdrop-filter: blur(2px);
+}
+
+.chat-drop-card {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 16px;
+  border-radius: 999px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 500;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.12);
+}
+
 .prompt-sticky-wrap {
   position: absolute;
   top: 0;

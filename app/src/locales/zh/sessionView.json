@@ -34,5 +34,7 @@
   "worktreeConflictTip": "「{{title}}」正在同一目录运行，继续改动可能会互相覆盖",
   "forkWorktreeAndContinue": "切入 Worktree",
   "keepSharedDirectory": "忽略，仍共用主目录",
-  "worktreeHeadPillTip": "当前运行于 Worktree {{branch}}（{{cwd}}）\n点击查看文件改动，右键重命名分支"
+  "worktreeHeadPillTip": "当前运行于 Worktree {{branch}}（{{cwd}}）\n点击查看文件改动，右键重命名分支",
+  "dropToOpenInFilePanel": "松开以在右侧文件面板打开",
+  "openingDroppedFile": "正在打开 {{name}}…"
 }

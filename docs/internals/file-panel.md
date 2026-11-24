@@ -60,7 +60,8 @@ The session page's "workspace files" (`FilePanel.tsx`), also used standalone by 
 
 - Uploads use `fs.upload`, downloads and PDFs use `fs.read` with `raw: true` (all limited to 50MB).
 - `fs.open` (open with the system program / reveal in file manager) only accepts local connections, and the frontend only offers it for the local host.
-- The Tauri window has `dragDropEnabled` off so HTML drag-and-drop gets system files.
+- The Tauri window has `dragDropEnabled` off so HTML drag-and-drop gets system files (and internal HTML5 `draggable` rows/tabs stay unbroken). On Windows Desktop (WebView2), `app/src-tauri/src/dropfiles.rs` resolves dropped files' real disk paths via `chrome.webview.postMessageWithAdditionalObjects` (`ICoreWebView2File::Path`) and emits them over `drop-paths`.
+- External file drops on a session's chat area (`.chat-stage`) open the dropped files (including images and local directories) sequentially in `FilePanel` via `openFilesInPanel` (`takeOpenFiles` FIFO queue in `store.ts`) without touching `Composer`. Non-image external files dropped on the main session's `Composer` both insert `@path` references and open in `FilePanel`, whereas images dropped on `Composer` remain inline chat attachments only. On local hosts with resolved paths, the original disk files are opened directly (HTML preview remains scoped to workspace `root`); on remote hosts, macOS/Linux, or `yi-web`, dropped files upload via `session.attachFile` first. Saved tab restoration keeps external absolute file paths open (filtering out other sessions' temporary `uploads/<sid>/files/`).
 
 ## Browser tabs and HTML preview
 

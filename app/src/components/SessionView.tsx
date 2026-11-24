@@ -12,7 +12,7 @@ import { fmtUsage, isMobile, lsGet, lsSet, shortPath, STATUS_LABEL } from '../ut
 import { openAccountManager } from './AccountManagerModal';
 import { openMenu } from './Overlay';
 import { writeClipboard } from '../clipboard';
-import { exportSession, OPEN_CHANGES, OPEN_FILE, openFileInPanel, renameSession, renameWorktreeBranch, sessionMenu, showChanges, showTurnDiff } from './SessionActions';
+import { exportSession, OPEN_CHANGES, OPEN_FILE, openFileInPanel, openFilesInPanel, renameSession, renameWorktreeBranch, sessionMenu, showChanges, showTurnDiff } from './SessionActions';
 import { AI_PREFIX } from './AiBrowser';
 import { beginWidthDrag, FilePanel } from './FilePanel';
 import { sideChatTitle, sideChatTools, sideTabPath, startSideChat } from './SideChatTab';
@@ -21,7 +21,8 @@ import { AsyncAskCard, ChatView, openAsyncAsk, PermissionCard, setChatStyle, use
 import { PlanDock } from './PlanDock';
 import { LimitDock } from './LimitDock';
 import { WorktreeDock } from './WorktreeDock';
-import { Composer, restoreToComposer } from './Composer';
+import { Composer, FILE_MAX, restoreToComposer, uploadChunked } from './Composer';
+import { extractDroppedEntries, hasExternalFiles, planChatDrop, resolveDroppedLocalPaths } from '../dropFiles';
 import { Icon, ToolBadge } from './Icon';
 import { PromptOutlinePanel, PromptOutlineSheet, PromptStickyBar, PromptTickRail, buildPromptEntries } from './PromptNav';
 import { TermTools, TerminalView } from './TerminalView';
@@ -32,6 +33,7 @@ import { SessionMemoryDrawer } from './MemoryView';
 import { SessionBotBar } from './BotsSection';
 
 const t = getT('sessionView');
+const tc = getT('composer');
 const tp = getT('promptNav');
 /** Sessions whose AI browser view was opened automatically in this window */
 const autoOpened = new Set<string>();
@@ -79,6 +81,11 @@ export function SessionView({ hostId, sessionId, seq }: { hostId: string; sessio
   const liveSideCount = sideChats.filter((x) => x.status === 'running' || x.status === 'starting').length;
   const attnSideCount = sideChats.filter((x) => x.pendingPermissions > 0 || x.status === 'waiting-permission').length;
   const connected = useStore((s) => s.hosts.find((h) => h.config.id === hostId)?.status.status === 'connected');
+  const hostKind = useStore((s) => s.hosts.find((h) => h.config.id === hostId)?.config.kind);
+  const [chatDrag, setChatDrag] = useState(false);
+  useEffect(() => {
+    setChatDrag(false);
+  }, [key, connected]);
   const attn = useStore((s) =>
     Object.values(s.sessions).reduce((n, l) => n + l.filter((x) => isHostSession(x) && x.pendingPermissions > 0).length, 0),
   );
@@ -493,6 +500,46 @@ export function SessionView({ hostId, sessionId, seq }: { hostId: string; sessio
 
   const rename = () => renameSession(hostId, info);
 
+  const handleChatDrop = async (dt: DataTransfer) => {
+    const entries = extractDroppedEntries(dt);
+    if (!entries.length) return;
+    if (!connected) {
+      toast(t('hostNotConnected'), 'error');
+      return;
+    }
+    const dropFiles = entries.map((e) => e.file);
+    const hints = entries.map((e) => e.isDirHint);
+    const isLocalHost = hostKind === 'local';
+    const resolved = isLocalHost ? await resolveDroppedLocalPaths(dropFiles) : null;
+    const plan = planChatDrop(dropFiles, { isLocalHost, resolved, dirHints: hints });
+    const opened: string[] = [];
+    for (const item of plan) {
+      if (item.kind === 'open-local') {
+        opened.push(item.path);
+        continue;
+      }
+      if (item.kind === 'error-dir') {
+        errorToast(new Error(tc('isAFolderOrEmpty', { name: item.name })));
+        continue;
+      }
+      const f = item.file;
+      try {
+        if (f.size > FILE_MAX) throw new Error(tc('exceeds50mb', { name: f.name }));
+        if (!f.size && !f.type) throw new Error(tc('isAFolderOrEmpty', { name: f.name }));
+        const done = toast(t('openingDroppedFile', { name: f.name }), 'loading');
+        try {
+          const uploadedPath = await uploadChunked(hostId, sessionId, f, () => {});
+          if (uploadedPath) opened.push(uploadedPath);
+        } finally {
+          done();
+        }
+      } catch (err) {
+        errorToast(err);
+      }
+    }
+    if (opened.length) openFilesInPanel(hostId, sessionId, opened);
+  };
+
   // Manual recovery after the tool process exited abnormally (killed, crashed): restart it on the original tool session without sending a message
   const recover = async () => {
     setRecovering(true);
@@ -791,7 +838,32 @@ export function SessionView({ hostId, sessionId, seq }: { hostId: string; sessio
       ) : (
         <div className="session-body-split">
           <div className="session-chat-col">
-            <div className="chat-stage">
+            <div
+              className={`chat-stage${chatDrag ? ' drop-active' : ''}`}
+              onDragOver={(e) => {
+                if (!hasExternalFiles(e.dataTransfer)) return;
+                e.preventDefault();
+                e.dataTransfer.dropEffect = 'copy';
+                if (connected && !chatDrag) setChatDrag(true);
+              }}
+              onDragLeave={(e) => {
+                if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setChatDrag(false);
+              }}
+              onDrop={(e) => {
+                if (!hasExternalFiles(e.dataTransfer)) return;
+                e.preventDefault();
+                setChatDrag(false);
+                void handleChatDrop(e.dataTransfer);
+              }}
+            >
+              {chatDrag && (
+                <div className="chat-drop-overlay" aria-hidden="true">
+                  <div className="chat-drop-card">
+                    <Icon name="panelRight" size={18} />
+                    <span>{t('dropToOpenInFilePanel')}</span>
+                  </div>
+                </div>
+              )}
               <PromptStickyBar
                 prompts={prompts}
                 activeSeq={promptScroll.activeSeq}
@@ -909,6 +981,7 @@ export function SessionView({ hostId, sessionId, seq }: { hostId: string; sessio
                 hostId={hostId}
                 info={info}
                 connected={connected}
+                openDroppedInPanel
                 desktopControls={
                   canUseComputer(hostStatus(hostId).hello, info) || canUseBrowser(hostStatus(hostId).hello, info) ? (
                     <>

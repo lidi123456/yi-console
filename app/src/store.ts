@@ -672,13 +672,35 @@ export interface OpenFileReq {
   endLine?: number;
   diff?: boolean;
 }
-/** Same reason as pendingChanges: a closed panel mounts after the event and takes the request then */
-const pendingFiles = new Map<string, OpenFileReq>();
-export function takeOpenFile(hostId: string, sessionId: string) {
+/** Same reason as pendingChanges: a closed panel mounts after the event and takes the queued requests then */
+const pendingFiles = new Map<string, OpenFileReq[]>();
+export function takeOpenFiles(hostId: string, sessionId: string): OpenFileReq[] {
   const k = skey(hostId, sessionId);
-  const r = pendingFiles.get(k);
+  const list = pendingFiles.get(k) ?? [];
   pendingFiles.delete(k);
-  return r;
+  return list;
+}
+export function takeOpenFile(hostId: string, sessionId: string): OpenFileReq | undefined {
+  const k = skey(hostId, sessionId);
+  const list = pendingFiles.get(k);
+  if (!list?.length) return undefined;
+  const next = list.shift();
+  if (list.length === 0) pendingFiles.delete(k);
+  return next;
+}
+
+function enqueueOpenFiles(hostId: string, sessionId: string, reqs: OpenFileReq[]) {
+  if (!reqs.length) return;
+  const k = skey(hostId, sessionId);
+  lsSet(`file-panel-${k}`, true);
+  const q = pendingFiles.get(k) ?? [];
+  for (const r of reqs) {
+    const idx = q.findIndex((x) => x.path === r.path);
+    if (idx >= 0) q.splice(idx, 1);
+    q.push(r);
+  }
+  pendingFiles.set(k, q);
+  setTimeout(() => window.dispatchEvent(new CustomEvent(OPEN_FILE, { detail: { hostId, sessionId } })), 0);
 }
 
 /** Open a file (a link or context pill in chat) in the session's file panel, optionally at a line/range or diff view */
@@ -688,11 +710,20 @@ export function openFileInPanel(
   path: string,
   opts?: number | { line?: number; endLine?: number; diff?: boolean },
 ) {
-  lsSet(`file-panel-${skey(hostId, sessionId)}`, true);
   const req: OpenFileReq =
     typeof opts === 'number' ? { path, line: opts } : { path, line: opts?.line, endLine: opts?.endLine, diff: opts?.diff };
-  pendingFiles.set(skey(hostId, sessionId), req);
-  setTimeout(() => window.dispatchEvent(new CustomEvent(OPEN_FILE, { detail: { hostId, sessionId } })), 0);
+  enqueueOpenFiles(hostId, sessionId, [req]);
+}
+
+/** Open multiple files sequentially in the session's file panel (last one becomes active) */
+export function openFilesInPanel(hostId: string, sessionId: string, paths: string[]) {
+  const unique = [...new Set(paths.filter(Boolean))];
+  if (!unique.length) return;
+  enqueueOpenFiles(
+    hostId,
+    sessionId,
+    unique.map((path) => ({ path })),
+  );
 }
 
 /** Embedded child panes (side chat / review tabs) currently mounted and visible inside their parent session's right panel */

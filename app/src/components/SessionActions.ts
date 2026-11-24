@@ -48,7 +48,7 @@ export function showTurnDiff(hostId: string, sessionId: string, turn: number) {
   setTimeout(() => window.dispatchEvent(new CustomEvent(OPEN_CHANGES, { detail: { hostId, sessionId, turn } })), 0);
 }
 
-export { OPEN_FILE, openFileInPanel, takeOpenFile, type OpenFileReq } from '../store';
+export { OPEN_FILE, openFileInPanel, openFilesInPanel, takeOpenFile, takeOpenFiles, type OpenFileReq } from '../store';
 
 // Session actions: shared by the menu at the top right of the session page and the sidebar context menu
 
