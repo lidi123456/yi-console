@@ -235,9 +235,11 @@ export function BranchWorktreePopover({
   worktrees,
   branchesInfo,
   loadingBranches,
+  currentBranch,
   onSwitchWorktree,
   onCheckoutBranch,
   onCreateBranch,
+  onRenameBranch,
   onNewSession,
   onClose,
 }: {
@@ -249,9 +251,11 @@ export function BranchWorktreePopover({
   worktrees: WorktreeEntry[];
   branchesInfo: BranchesResult | null;
   loadingBranches?: boolean;
+  currentBranch?: string;
   onSwitchWorktree?: (path: string) => void;
   onCheckoutBranch: (branch: string) => Promise<void> | void;
   onCreateBranch: () => void;
+  onRenameBranch?: () => void;
   onNewSession?: () => void;
   onClose: () => void;
 }) {
@@ -553,6 +557,19 @@ export function BranchWorktreePopover({
             <Icon name="plus" size={12} />
             <span>{tx('newBranch')}</span>
           </button>
+          {onRenameBranch && currentBranch && currentBranch !== 'HEAD' && !currentBranch.includes('游离') && (
+            <button
+              type="button"
+              className="wp-bw-foot-btn"
+              onClick={() => {
+                onClose();
+                onRenameBranch();
+              }}
+            >
+              <Icon name="edit" size={12} />
+              <span>{tx('renameBranch')}</span>
+            </button>
+          )}
           {!standalone && onNewSession && (
             <button
               type="button"

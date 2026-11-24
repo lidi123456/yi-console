@@ -288,6 +288,10 @@ export function StatusLine({
 
   useEffect(() => {
     if (!cfg || (!wantGit && !wantCmd)) return;
+    if (wantGit && info.worktree?.branch) {
+      const wb = info.worktree.branch;
+      setGit((g) => (g && g.branch !== wb ? { ...g, branch: wb } : g));
+    }
     let alive = true;
     rpc<{ git?: Git; command?: { text: string; source: string }; error?: string }>(hostId, 'session.statusLine', {
       sessionId: info.id,

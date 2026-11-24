@@ -43,10 +43,15 @@
   "worktreeChipTip": "Run in the main directory, create an isolated worktree from a branch, or attach an existing worktree",
   "worktreeAutoSelectedHint": "Another session is active in the main directory; auto-selected isolated worktree (click chip to change)",
   "worktreeChipNew": "Worktree · {{base}}",
+  "worktreeChipNewNamed": "Worktree · {{branch}}",
   "worktreeChipExisting": "Attach · {{branch}}",
   "menuMainDir": "Main directory (current {{branch}})",
   "menuMainBusyHint": "running",
   "menuNewFromBranch": "New worktree from {{branch}}",
+  "menuNewCustomBranch": "New worktree (custom branch name)…",
+  "menuEditCustomBranch": "Set custom branch name…",
+  "customWorktreeBranchTitle": "Custom Worktree Branch Name",
+  "customWorktreeBranchPlaceholder": "Leave empty to auto-name, e.g. feat/my-feature",
   "menuRecommended": "recommended",
   "menuAttachExisting": "Attach existing: {{branch}}"
 }

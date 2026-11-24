@@ -120,6 +120,41 @@ export function SettingsView({ hostId }: { hostId: string }) {
             />
           </label>
           <p className="muted small">{t('worktreeRootHint')}</p>
+          <label>
+            {t('worktreeBranchPrefix')}
+            <input
+              value={s.worktreeBranchPrefix ?? 'yi'}
+              placeholder="yi"
+              onChange={(e) => setS({ ...s, worktreeBranchPrefix: e.target.value })}
+            />
+          </label>
+          <p className="muted small">
+            {t('worktreeBranchPrefixHint', {
+              example: (() => {
+                const raw = s.worktreeBranchPrefix === undefined ? 'yi' : s.worktreeBranchPrefix;
+                const clean = raw
+                  .split(/[/\\]/)
+                  .map((seg) =>
+                    seg
+                      .trim()
+                      .replace(/[^A-Za-z0-9_]+/g, '-')
+                      .replace(/^[.-]+|[.-]+$/g, ''),
+                  )
+                  .filter(Boolean)
+                  .join('/');
+                return clean ? `${clean}/fix-login` : 'fix-login';
+              })(),
+            })}
+          </p>
+          <label className="check">
+            <input
+              type="checkbox"
+              checked={s.worktreeAutoRename ?? true}
+              onChange={(e) => setS({ ...s, worktreeAutoRename: e.target.checked })}
+            />
+            {t('worktreeAutoRename')}
+          </label>
+          <p className="muted small">{t('worktreeAutoRenameHint')}</p>
         </div>
       </div>
       <div className="card">

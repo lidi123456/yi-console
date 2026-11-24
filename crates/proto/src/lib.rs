@@ -330,6 +330,9 @@ pub struct SessionWorktree {
     /// Base commit OID when the worktree was created
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_commit: Option<String>,
+    /// True while the branch is still an auto-generated placeholder eligible for automatic semantic rename
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub temporary_branch: bool,
 }
 
 /// One structured turn's hidden git checkpoint pair (pre-turn base and post-turn end when files changed)
@@ -1136,6 +1139,12 @@ pub struct DaemonSettings {
     /// Where `git.worktreeAdd` puts new worktrees (`~` allowed); `~/.yi-console/worktrees` if unset
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree_root: Option<String>,
+    /// Branch prefix for new session worktrees (e.g. `yi`, `feat`, or `""` for no prefix); defaults to `yi` when unset
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_branch_prefix: Option<String>,
+    /// Automatically rename temporary worktree branches from the first prompt or session title; on when unset
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_auto_rename: Option<bool>,
     /// The AI browser (`yi_browser`)
     #[serde(default, skip_serializing_if = "BrowserSettings::is_default")]
     pub browser: BrowserSettings,
@@ -1535,6 +1544,8 @@ pub mod methods {
     pub const GIT_BRANCHES: &str = "git.branches";
     /// {cwd, branch, create?, base?} -> {branch}: switch to an existing branch or create and switch to a new one
     pub const GIT_CHECKOUT: &str = "git.checkout";
+    /// {cwd, oldBranch?, newBranch} -> {oldBranch, branch, changed}: rename a local branch via `git branch -m`
+    pub const GIT_RENAME_BRANCH: &str = "git.renameBranch";
     /// {cwd, remote?, branch?, setUpstream?} -> {branch, remote, output}: push the current branch to a remote
     pub const GIT_PUSH: &str = "git.push";
     /// {cwd, base?, diff?, paths?} -> {repo, branch, base, mergeBase, total?, files:[{path, status, diff, added, deleted}]}:
@@ -1634,6 +1645,8 @@ pub mod methods {
     pub const GIT_WORKTREE_REMOVE: &str = "git.worktreeRemove";
     /// Migrate an existing main-directory session in-place into a new managed Git worktree {sessionId, name?, branch?, base?} -> SessionInfo
     pub const SESSION_ENTER_WORKTREE: &str = "session.enterWorktree";
+    /// Rename the Git branch of a session's bound worktree in-place {sessionId, branch} -> SessionInfo
+    pub const SESSION_RENAME_WORKTREE: &str = "session.renameWorktree";
     /// -> [{clientId, name}]: desktop apps registered on this machine (`client.hello` over local IPC), whose Bots a
     /// phone or yi-web can control through `client.call`
     pub const CLIENTS_LIST: &str = "clients.list";

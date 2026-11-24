@@ -61,5 +61,11 @@
   "newSideChat": "新建旁路对话",
   "enterIsolatedWorktree": "切入独立 Worktree",
   "enteredWorktreeToast": "已切入独立 Worktree（{{branch}}）",
+  "renameWorktreeBranch": "重命名 Worktree 分支…",
+  "renameWorktreeBranchTitle": "重命名 Worktree 分支",
+  "worktreeBranchPlaceholder": "例如 feat/my-feature",
+  "worktreeBranchRenamed": "已重命名分支为 {{branch}}",
+  "copyBranchName": "复制分支名",
+  "branchNameCopied": "已复制分支名",
   "deleteSessionWithWorktreeNote": "这只是从 Yi Console 里删掉记录，工具本身保留在机器上的文件不动；如果绑定的 Worktree（{{branch}}）还有未提交或未合并的改动，目录和分支也会为你保留。"
 }

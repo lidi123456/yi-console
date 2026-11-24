@@ -163,6 +163,8 @@ struct SessionRt {
     active_checkpoint: Mutex<Option<ActiveCheckpoint>>,
     /// Guards in-flight worktree migration against concurrent sends or duplicate enter_worktree calls
     worktree_busy: std::sync::atomic::AtomicBool,
+    /// Guards in-flight background semantic branch auto-rename so at most one runs per session
+    worktree_auto_renaming: std::sync::atomic::AtomicBool,
 }
 
 struct WtBusyGuard<'a>(&'a std::sync::atomic::AtomicBool);
@@ -873,15 +875,32 @@ impl Hub {
             }
         }
         let id = uuid::Uuid::new_v4().to_string();
+        let auto_rename_seed: Option<String> = p
+            .title
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .or_else(|| p.prompt.as_deref().map(str::trim).filter(|s| !s.is_empty()))
+            .map(str::to_string);
         let (cwd, session_worktree) = if p.worktree {
-            let wt_root = crate::gitops::worktree_root(&self.settings.read().unwrap());
-            let wt_name = derive_worktree_name(&id, p.title.as_deref(), p.prompt.as_deref());
+            let settings = self.settings.read().unwrap().clone();
+            let wt_root = crate::gitops::worktree_root(&settings);
+            let folder_name = derive_worktree_name(&id, p.title.as_deref(), p.prompt.as_deref());
+            let (auto_slug, wt_prefix, wt_temp) = plan_session_worktree_naming(
+                &id,
+                &settings,
+                p.worktree_branch.as_deref(),
+                auto_rename_seed.as_deref(),
+            );
             let (wt_path, wt_meta) = crate::gitops::worktree_add_session(
                 &wt_root,
                 &cwd.to_string_lossy(),
-                &wt_name,
+                &folder_name,
                 p.worktree_branch.as_deref(),
+                auto_slug.as_deref(),
                 p.worktree_base.as_deref(),
+                &wt_prefix,
+                wt_temp,
             )?;
             (PathBuf::from(wt_path), Some(wt_meta))
         } else {
@@ -983,6 +1002,11 @@ impl Hub {
             .lock()
             .unwrap()
             .insert(info.id.clone(), rt.clone());
+        if info.worktree.as_ref().is_some_and(|w| w.temporary_branch) {
+            if let Some(seed) = auto_rename_seed.as_deref() {
+                self.maybe_auto_rename_worktree(&info.id, seed);
+            }
+        }
         if !tool.has_process() {
             self.broadcast_updated(&info);
             return Ok(info);
@@ -1563,6 +1587,12 @@ impl Hub {
                 crate::gitops::delete_ref(&info.cwd, &aborted.base_ref);
             }
             bail!("会话已结束");
+        }
+        if info.worktree.as_ref().is_some_and(|w| w.temporary_branch) && !slash {
+            let clean = strip_handoff_prefix(text);
+            if !clean.is_empty() {
+                self.maybe_auto_rename_worktree(id, clean);
+            }
         }
         Ok(())
     }
@@ -2861,25 +2891,49 @@ impl Hub {
             bail!("会话正在回复中，请等当前轮次结束后再切入 Worktree");
         }
 
-        let wt_root = crate::gitops::worktree_root(&self.settings.read().unwrap());
-        let wt_name = name
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
-            .unwrap_or_else(|| {
-                let first_msg = self
-                    .store
-                    .events_tail(id, None, 20)
-                    .ok()
-                    .and_then(|(evs, _)| {
-                        evs.into_iter().find_map(|e| match e.body {
-                            EventBody::UserMessage { text, .. } => Some(text),
-                            _ => None,
-                        })
-                    });
-                derive_worktree_name(id, Some(&cur.title), first_msg.as_deref())
-            });
-        let (wt_path, wt_meta) = crate::gitops::worktree_add_session(&wt_root, &cur.cwd, &wt_name, branch, base)?;
+        let settings = self.settings.read().unwrap().clone();
+        let wt_root = crate::gitops::worktree_root(&settings);
+        let explicit_name = name.map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
+        let first_msg = if explicit_name.is_none() {
+            self.store
+                .events_tail(id, None, 20)
+                .ok()
+                .and_then(|(evs, _)| {
+                    evs.into_iter().find_map(|e| match e.body {
+                        EventBody::UserMessage { text, .. } => {
+                            let clean = strip_handoff_prefix(&text).trim().to_string();
+                            (!clean.is_empty() && !clean.starts_with('/')).then_some(clean)
+                        }
+                        _ => None,
+                    })
+                })
+        } else {
+            None
+        };
+        let auto_rename_seed = if explicit_name.is_some() {
+            None
+        } else {
+            let title_seed = Some(cur.title.as_str()).map(str::trim).filter(|s| !s.is_empty());
+            title_seed.or(first_msg.as_deref()).map(str::to_string)
+        };
+        let folder_name = explicit_name
+            .clone()
+            .unwrap_or_else(|| derive_worktree_name(id, Some(&cur.title), first_msg.as_deref()));
+        let (auto_slug, wt_prefix, wt_temp) = if let Some(n) = explicit_name {
+            (Some(n), crate::gitops::effective_worktree_branch_prefix(&settings), false)
+        } else {
+            plan_session_worktree_naming(id, &settings, branch, auto_rename_seed.as_deref())
+        };
+        let (wt_path, wt_meta) = crate::gitops::worktree_add_session(
+            &wt_root,
+            &cur.cwd,
+            &folder_name,
+            branch,
+            auto_slug.as_deref(),
+            base,
+            &wt_prefix,
+            wt_temp,
+        )?;
 
         let retired = self.retire_idle_process(id, &rt, cur.mode);
         let has_history = cur.external_id.is_some() || self.store.count_user_messages(id).unwrap_or(0) > 0;
@@ -2904,6 +2958,7 @@ impl Hub {
             i.clone()
         };
         self.store.save_session(&updated)?;
+        crate::statusline::invalidate_session(id);
         self.broadcast_updated(&updated);
         self.emit(
             id,
@@ -2912,7 +2967,179 @@ impl Hub {
                 text: format!("已切入独立 Worktree：{}（基于 {}）", wt_meta.branch, base_label),
             },
         );
+        if wt_meta.temporary_branch {
+            if let Some(seed) = auto_rename_seed.as_deref() {
+                self.maybe_auto_rename_worktree(id, seed);
+            }
+        }
         Ok(updated)
+    }
+
+    /// Rename the Git branch bound to this session's worktree (`git branch -m`), keeping its directory intact
+    pub fn rename_worktree_branch(self: &Arc<Self>, id: &str, new_branch: &str) -> Result<SessionInfo> {
+        let rt = self.get(id)?;
+        let cur = rt.info.lock().unwrap().clone();
+        if cur.worktree.is_none() {
+            bail!("当前会话没有绑定独立 Worktree");
+        }
+        let res = crate::gitops::rename_branch(&cur.cwd, None, new_branch, false)?;
+        let old_branch = res["oldBranch"].as_str().unwrap_or("");
+        let final_branch = res["branch"].as_str().unwrap_or(new_branch);
+        let changed = res["changed"].as_bool().unwrap_or(false);
+        self.sync_worktree_branch_for_cwd(&cur.cwd, final_branch);
+        if changed {
+            self.emit(
+                id,
+                0,
+                EventBody::System {
+                    text: format!("Worktree 分支已重命名：{old_branch} → {final_branch}"),
+                },
+            );
+        }
+        self.info(id)
+    }
+
+    /// Reconcile `SessionInfo.worktree.branch` for every session bound to the worktree checkout at `cwd`
+    pub fn sync_worktree_branch_for_cwd(&self, cwd: &str, live_branch: &str) {
+        let branch = live_branch.trim();
+        if branch.is_empty() || branch == "HEAD" || branch == "HEAD（游离）" {
+            return;
+        }
+        let raw_key = norm_cwd(cwd);
+        let canon_key = canonical_cwd_key(cwd);
+        let list: Vec<Arc<SessionRt>> = self.sessions.lock().unwrap().values().cloned().collect();
+        for rt in list {
+            let mut updated = None;
+            {
+                let mut i = rt.info.lock().unwrap();
+                let matches_cwd = i.worktree.as_ref().is_some_and(|w| w.branch != branch)
+                    && (norm_cwd(&i.cwd) == raw_key || canonical_cwd_key(&i.cwd) == canon_key);
+                if matches_cwd {
+                    if let Some(wt) = i.worktree.as_mut() {
+                        wt.branch = branch.to_string();
+                        wt.temporary_branch = false;
+                        updated = Some(i.clone());
+                    }
+                }
+            }
+            if let Some(info) = updated {
+                let _ = self.store.save_session(&info);
+                crate::statusline::invalidate_session(&info.id);
+                self.broadcast_updated(&info);
+            }
+        }
+    }
+
+    /// Background check of current git branch for a worktree session after an agent turn finishes
+    pub(crate) fn sync_worktree_branch_async(self: &Arc<Self>, id: &str) {
+        let Ok(info) = self.info(id) else {
+            return;
+        };
+        if info.worktree.is_none() {
+            return;
+        }
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let hub = self.clone();
+        let cwd = info.cwd;
+        handle.spawn(async move {
+            let cwd_bg = cwd.clone();
+            if let Ok(Some(branch)) =
+                tokio::task::spawn_blocking(move || crate::gitops::current_branch(Path::new(&cwd_bg))).await
+            {
+                hub.sync_worktree_branch_for_cwd(&cwd, &branch);
+            }
+        });
+    }
+
+    /// Apply a resolved slug to a temporary session worktree branch unless manually renamed or pushed already
+    pub fn apply_auto_worktree_branch_slug(&self, id: &str, slug: &str) -> Result<bool> {
+        let rt = self.get(id)?;
+        let cur = rt.info.lock().unwrap().clone();
+        let Some(wt) = cur.worktree else {
+            return Ok(false);
+        };
+        if !wt.temporary_branch {
+            return Ok(false);
+        }
+        let work_dir = Path::new(&cur.cwd);
+        if crate::gitops::current_branch(work_dir).as_deref() != Some(wt.branch.as_str()) {
+            return Ok(false);
+        }
+        if crate::gitops::has_upstream(work_dir) {
+            return Ok(false);
+        }
+        let prefix = crate::gitops::effective_worktree_branch_prefix(&self.settings.read().unwrap());
+        let desired = crate::gitops::format_worktree_branch(&prefix, slug);
+        let res = crate::gitops::rename_branch(&cur.cwd, Some(&wt.branch), &desired, true)?;
+        let final_branch = res["branch"].as_str().unwrap_or(&desired);
+        self.sync_worktree_branch_for_cwd(&cur.cwd, final_branch);
+        Ok(res["changed"].as_bool().unwrap_or(false))
+    }
+
+    /// Automatically rename a temporary session worktree branch into a semantic English branch in the background
+    pub(crate) fn maybe_auto_rename_worktree(self: &Arc<Self>, id: &str, source_text: &str) {
+        let settings = self.settings.read().unwrap().clone();
+        if !settings.worktree_auto_rename.unwrap_or(true) {
+            return;
+        }
+        let source = strip_handoff_prefix(source_text).trim().to_string();
+        if source.is_empty() {
+            return;
+        }
+        let Ok(rt) = self.get(id) else {
+            return;
+        };
+        let (tool, account_id, temp) = {
+            let i = rt.info.lock().unwrap();
+            (
+                i.tool,
+                i.account_id.clone(),
+                i.worktree.as_ref().is_some_and(|w| w.temporary_branch),
+            )
+        };
+        if !temp {
+            return;
+        }
+        if rt
+            .worktree_auto_renaming
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return;
+        }
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            rt.worktree_auto_renaming.store(false, std::sync::atomic::Ordering::Release);
+            return;
+        };
+        let hub = self.clone();
+        let sid = id.to_string();
+        handle.spawn(async move {
+            let _busy_guard = WtBusyGuard(&rt.worktree_auto_renaming);
+            let det = crate::gitops::derive_semantic_slug(&source);
+            let slug = if let Some(ref s) = det {
+                if crate::gitops::is_strong_ascii_slug(&source, s) {
+                    Some(s.clone())
+                } else {
+                    generate_branch_slug_via_cli(&hub, tool, account_id.as_deref(), &source)
+                        .await
+                        .or(det)
+                }
+            } else {
+                generate_branch_slug_via_cli(&hub, tool, account_id.as_deref(), &source).await
+            };
+            if let Some(slug) = slug {
+                let hub2 = hub.clone();
+                let sid2 = sid.clone();
+                let _ = tokio::task::spawn_blocking(move || hub2.apply_auto_worktree_branch_slug(&sid2, &slug)).await;
+            }
+        });
     }
 
     /// Detect concurrent active turns sharing the exact same `cwd` and mark both checkpoints as concurrent so stats never mix
@@ -3086,7 +3313,7 @@ impl Hub {
         }
     }
 
-    pub fn rename(&self, id: &str, title: &str) -> Result<()> {
+    pub fn rename(self: &Arc<Self>, id: &str, title: &str) -> Result<()> {
         let rt = self.get(id)?;
         let info = {
             let mut i = rt.info.lock().unwrap();
@@ -3095,6 +3322,9 @@ impl Hub {
         };
         self.store.save_session(&info)?;
         self.broadcast_updated(&info);
+        if info.worktree.as_ref().is_some_and(|w| w.temporary_branch) && !title.trim().is_empty() {
+            self.maybe_auto_rename_worktree(id, title);
+        }
         Ok(())
     }
 
@@ -4974,7 +5204,146 @@ fn new_rt(info: SessionInfo) -> SessionRt {
         qoder_plan: Mutex::new(None),
         active_checkpoint: Mutex::new(None),
         worktree_busy: std::sync::atomic::AtomicBool::new(false),
+        worktree_auto_renaming: std::sync::atomic::AtomicBool::new(false),
     }
+}
+
+fn short_worktree_id(id: &str) -> String {
+    let short_id: String = id.chars().filter(|c| c.is_ascii_alphanumeric()).take(8).collect();
+    if short_id.is_empty() { "wt".to_string() } else { short_id }
+}
+
+/// Choose worktree branch planning: `(auto_slug, prefix, temporary_branch)`
+fn plan_session_worktree_naming(
+    id: &str,
+    settings: &DaemonSettings,
+    explicit_branch: Option<&str>,
+    seed_text: Option<&str>,
+) -> (Option<String>, String, bool) {
+    let prefix = crate::gitops::effective_worktree_branch_prefix(settings);
+    if explicit_branch.map(str::trim).is_some_and(|s| !s.is_empty()) {
+        return (None, prefix, false);
+    }
+    let seed = seed_text.map(str::trim).filter(|s| !s.is_empty());
+    let semantic = seed.and_then(crate::gitops::derive_semantic_slug);
+    if let (Some(src), Some(sl)) = (seed, semantic.as_deref()) {
+        if crate::gitops::is_strong_ascii_slug(src, sl) {
+            return (Some(sl.to_string()), prefix, false);
+        }
+    }
+    let temp_slug = format!("s-{}", short_worktree_id(id));
+    (Some(temp_slug), prefix, true)
+}
+
+fn canonical_cwd_key(cwd: &str) -> String {
+    let expanded = crate::paths::expand(cwd);
+    let canon = expanded.canonicalize().unwrap_or(expanded);
+    norm_cwd(&canon.to_string_lossy())
+}
+
+#[cfg(test)]
+async fn generate_branch_slug_via_cli(
+    _hub: &Arc<Hub>,
+    _session_tool: ToolKind,
+    _account_id: Option<&str>,
+    _source_text: &str,
+) -> Option<String> {
+    None
+}
+
+#[cfg(not(test))]
+async fn generate_branch_slug_via_cli(
+    hub: &Arc<Hub>,
+    session_tool: ToolKind,
+    account_id: Option<&str>,
+    source_text: &str,
+) -> Option<String> {
+    use tokio::io::AsyncWriteExt;
+
+    let snippet: String = source_text.chars().take(600).collect();
+    let prompt = format!(
+        "Generate a concise English git branch slug for this coding task. \
+         Rules: 2 to 5 lowercase ASCII kebab-case words (a-z, 0-9, -), no slashes or prefixes like feat/ or yi/, output ONLY the slug and nothing else.\n\nTask:\n{snippet}"
+    );
+    let mut candidates: Vec<(ToolKind, Option<&str>)> = Vec::new();
+    if matches!(session_tool, ToolKind::Claude | ToolKind::Codex) {
+        candidates.push((session_tool, account_id));
+    }
+    for kind in [ToolKind::Claude, ToolKind::Codex] {
+        if !candidates.iter().any(|(k, _)| *k == kind) {
+            candidates.push((kind, None));
+        }
+    }
+
+    for (kind, acc_id) in candidates {
+        let settings = hub.settings.read().unwrap().clone();
+        let Some(program) = crate::tools::resolve(kind, &settings) else {
+            continue;
+        };
+        let resolved = hub.accounts.resolve(kind, acc_id);
+        let args: Vec<String> = match kind {
+            ToolKind::Claude => [
+                "-p",
+                "--output-format",
+                "text",
+                "--no-session-persistence",
+                "--tools",
+                "",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+            ToolKind::Codex => [
+                "exec",
+                "--skip-git-repo-check",
+                "--sandbox",
+                "read-only",
+                "--ephemeral",
+                "-",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+            _ => continue,
+        };
+        let mut cmd: tokio::process::Command = adapters::std_command(&program, &args).into();
+        if let Some(res) = &resolved {
+            for k in &res.env_unset {
+                cmd.env_remove(k);
+            }
+            for (k, v) in &res.env {
+                cmd.env(k, v);
+            }
+        }
+        cmd.current_dir(std::env::temp_dir())
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true);
+        #[cfg(windows)]
+        cmd.creation_flags(0x0800_0000);
+        let Ok(mut child) = cmd.spawn() else {
+            continue;
+        };
+        let prompt_bytes = prompt.as_bytes().to_vec();
+        let out = tokio::time::timeout(std::time::Duration::from_secs(15), async move {
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = stdin.write_all(&prompt_bytes).await;
+            }
+            child.wait_with_output().await
+        })
+        .await;
+        if let Ok(Ok(output)) = out {
+            if output.status.success() {
+                if let Some(slug) =
+                    crate::gitops::parse_generated_branch_slug(&String::from_utf8_lossy(&output.stdout))
+                {
+                    return Some(slug);
+                }
+            }
+        }
+    }
+    None
 }
 
 fn truncate_for_side(text: &str, max_chars: usize, parent_id: &str, seq: i64) -> String {
@@ -4997,8 +5366,7 @@ pub(crate) fn strip_handoff_prefix(text: &str) -> &str {
 
 /// Derive a short, safe worktree folder/branch suffix from session title/prompt + id
 fn derive_worktree_name(id: &str, title: Option<&str>, prompt: Option<&str>) -> String {
-    let short_id: String = id.chars().filter(|c| c.is_ascii_alphanumeric()).take(8).collect();
-    let short_id = if short_id.is_empty() { "wt".to_string() } else { short_id };
+    let short_id = short_worktree_id(id);
     let source = title
         .map(str::trim)
         .filter(|s| !s.is_empty())
@@ -5245,6 +5613,7 @@ impl Emitter {
             self.hub.limit_hit(&self.sid, self.gen, resets_at, limit);
         }
         if let Some(r) = end {
+            self.hub.sync_worktree_branch_async(&self.sid);
             self.hub.after_turn(&self.sid, self.gen, r.as_deref());
         }
     }
@@ -5418,13 +5787,18 @@ impl Emitter {
 
     pub fn title_if_empty(&self, title: &str) {
         let t = truncate(title, 80);
+        let mut rename_wt = false;
         self.hub.set_info(&self.sid, self.gen, |i| {
             if !i.title.trim().is_empty() || t.trim().is_empty() {
                 return false;
             }
-            i.title = t;
+            i.title = t.clone();
+            rename_wt = i.worktree.as_ref().is_some_and(|w| w.temporary_branch);
             true
         });
+        if rename_wt {
+            self.hub.maybe_auto_rename_worktree(&self.sid, title);
+        }
     }
 
     pub fn pty_output(&self, data: &[u8]) {
@@ -7825,6 +8199,112 @@ mod tests {
         assert_eq!(info_a.checkpoints[0].paths, vec!["a.txt".to_string()]);
         assert_eq!(info_b.checkpoints[0].files_changed, 1);
         assert_eq!(info_b.checkpoints[0].paths, vec!["b.txt".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn worktree_rename_sync_prefix_and_auto_rename() {
+        let d = tempfile::tempdir().unwrap();
+        let wt_root = d.path().join("worktrees");
+        let repo = d.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let run = |dir: &Path, a: &[&str]| {
+            let st = std::process::Command::new("git")
+                .args(a)
+                .current_dir(dir)
+                .env("GIT_OPTIONAL_LOCKS", "0")
+                .status()
+                .unwrap();
+            assert!(st.success(), "{a:?}");
+        };
+        run(&repo, &["init", "-q", "-b", "main"]);
+        run(&repo, &["config", "user.email", "t@t"]);
+        run(&repo, &["config", "user.name", "t"]);
+        run(&repo, &["config", "core.autocrlf", "false"]);
+        std::fs::write(repo.join("app.txt"), "base\n").unwrap();
+        run(&repo, &["add", "."]);
+        run(&repo, &["commit", "-qm", "init"]);
+
+        let settings = DaemonSettings {
+            worktree_root: Some(wt_root.to_string_lossy().to_string()),
+            worktree_branch_prefix: Some("feat/".into()),
+            worktree_auto_rename: Some(true),
+            ..Default::default()
+        };
+        let hub = Hub::new(Store::open_memory().unwrap(), settings);
+
+        // 1. Live rename via rename_worktree_branch keeps directory intact and updates all sharing sessions
+        let sid1 = "44444444-4444-4444-4444-444444444444";
+        let _rx1 = live(&hub, sid1, SessionMode::Structured, SessionStatus::Idle, 1);
+        hub.get(sid1).unwrap().info.lock().unwrap().cwd = repo.to_string_lossy().to_string();
+        let wt_info = hub.enter_worktree(sid1, None, None, None).unwrap();
+        let orig_dir = wt_info.cwd.clone();
+        let orig_branch = wt_info.worktree.as_ref().unwrap().branch.clone();
+        assert!(orig_branch.starts_with("feat/"), "{orig_branch}");
+        assert!(wt_info.worktree.as_ref().unwrap().temporary_branch);
+
+        let sid2 = "55555555-5555-5555-5555-555555555555";
+        let _rx2 = live(&hub, sid2, SessionMode::Structured, SessionStatus::Idle, 1);
+        {
+            let rt2 = hub.get(sid2).unwrap();
+            let mut info2 = rt2.info.lock().unwrap();
+            info2.cwd = orig_dir.clone();
+            info2.worktree = crate::gitops::detect_existing_worktree(&orig_dir);
+            hub.store.save_session(&info2).unwrap();
+        }
+
+        let renamed = hub.rename_worktree_branch(sid1, "feat/custom-live").unwrap();
+        assert_eq!(renamed.cwd, orig_dir);
+        assert_eq!(renamed.worktree.as_ref().unwrap().branch, "feat/custom-live");
+        assert!(!renamed.worktree.as_ref().unwrap().temporary_branch);
+        assert_eq!(
+            hub.info(sid2).unwrap().worktree.as_ref().unwrap().branch,
+            "feat/custom-live"
+        );
+
+        // 2. Passive sync reconciles external `git branch -m`
+        run(Path::new(&orig_dir), &["branch", "-m", "feat/external-cli"]);
+        hub.sync_worktree_branch_for_cwd(&orig_dir, "feat/external-cli");
+        assert_eq!(
+            hub.info(sid1).unwrap().worktree.as_ref().unwrap().branch,
+            "feat/external-cli"
+        );
+        assert_eq!(
+            hub.info(sid2).unwrap().worktree.as_ref().unwrap().branch,
+            "feat/external-cli"
+        );
+
+        // 3. Auto-rename skips manually renamed (non-temporary) branches, works on temporary ones, and respects prefix=""
+        assert!(!hub.apply_auto_worktree_branch_slug(sid1, "should-skip").unwrap());
+        {
+            *hub.settings.write().unwrap() = DaemonSettings {
+                worktree_root: Some(wt_root.to_string_lossy().to_string()),
+                worktree_branch_prefix: Some(String::new()),
+                worktree_auto_rename: Some(true),
+                ..Default::default()
+            };
+        }
+        let sid3 = "66666666-6666-6666-6666-666666666666";
+        let _rx3 = live(&hub, sid3, SessionMode::Structured, SessionStatus::Idle, 1);
+        hub.get(sid3).unwrap().info.lock().unwrap().cwd = repo.to_string_lossy().to_string();
+        let wt3 = hub.enter_worktree(sid3, None, None, None).unwrap();
+        assert_eq!(wt3.worktree.as_ref().unwrap().branch, "s-66666666");
+        assert!(wt3.worktree.as_ref().unwrap().temporary_branch);
+        assert!(hub.apply_auto_worktree_branch_slug(sid3, "fix-review-panel").unwrap());
+        let wt3_after = hub.info(sid3).unwrap();
+        assert_eq!(wt3_after.worktree.as_ref().unwrap().branch, "fix-review-panel");
+        assert!(!wt3_after.worktree.as_ref().unwrap().temporary_branch);
+
+        // 4. Auto-rename skips branches that already have a remote upstream (pushed)
+        let remote = d.path().join("remote.git");
+        run(d.path(), &["init", "--bare", "-q", &remote.to_string_lossy()]);
+        run(&repo, &["remote", "add", "origin", &remote.to_string_lossy()]);
+        let sid4 = "77777777-7777-7777-7777-777777777777";
+        let _rx4 = live(&hub, sid4, SessionMode::Structured, SessionStatus::Idle, 1);
+        hub.get(sid4).unwrap().info.lock().unwrap().cwd = repo.to_string_lossy().to_string();
+        let wt4 = hub.enter_worktree(sid4, None, None, None).unwrap();
+        run(Path::new(&wt4.cwd), &["push", "-qu", "origin", "s-77777777"]);
+        assert!(!hub.apply_auto_worktree_branch_slug(sid4, "should-not-rename-pushed").unwrap());
+        assert_eq!(hub.info(sid4).unwrap().worktree.as_ref().unwrap().branch, "s-77777777");
     }
 }
 

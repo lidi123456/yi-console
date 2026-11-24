@@ -1220,7 +1220,10 @@ export default interface Resources {
     "reloadedFromDisk": "已读取磁盘上的 {{v}}",
     "remoteBranchesSection": "远端分支 ({{count}})",
     "rename": "重命名",
+    "renameBranch": "重命名当前分支…",
+    "renameBranchTitle": "重命名分支",
     "renamed": "改名",
+    "renamedBranch": "已将分支重命名为 {{branch}}",
     "replace": "替换",
     "replaceAll": "全部替换",
     "replaceWith": "替换为…",
@@ -2094,6 +2097,8 @@ export default interface Resources {
     "continueInAnotherTool": "换个工具继续",
     "create": "创建",
     "creating": "创建中…",
+    "customWorktreeBranchPlaceholder": "留空则自动命名，例如 feat/my-feature",
+    "customWorktreeBranchTitle": "自定义 Worktree 分支名",
     "defaultAccount": "默认账号",
     "describeTask": "描述你的需求…",
     "drive": "盘符",
@@ -2108,8 +2113,10 @@ export default interface Resources {
     "mainDirectory": "主目录",
     "manageAccounts": "管理账号…",
     "menuAttachExisting": "接入已有：{{branch}}",
+    "menuEditCustomBranch": "自定义分支名…",
     "menuMainBusyHint": "运行中",
     "menuMainDir": "主目录（当前 {{branch}}）",
+    "menuNewCustomBranch": "新建 Worktree（自定义分支名）…",
     "menuNewFromBranch": "基于 {{branch}} 新建 Worktree",
     "menuRecommended": "推荐",
     "model": "模型",
@@ -2135,6 +2142,7 @@ export default interface Resources {
     "worktreeAutoSelectedHint": "检测到主目录正有会话运行，已自动选「独立 Worktree」（点芯片可切回）",
     "worktreeChipExisting": "接入 · {{branch}}",
     "worktreeChipNew": "Worktree · {{base}}",
+    "worktreeChipNewNamed": "Worktree · {{branch}}",
     "worktreeChipTip": "选择在主目录运行、基于某个分支新建独立 Worktree，或直接接入已有 Worktree"
   },
   "overlay": {
@@ -2412,6 +2420,7 @@ export default interface Resources {
   },
   "sessionActions": {
     "aiIsReplyingSwitchingModes": "AI 正在回复，切换会中断这一轮。",
+    "branchNameCopied": "已复制分支名",
     "browseWorkingDirectory": "浏览工作目录",
     "clear": "清空",
     "clearConversation": "清空对话",
@@ -2423,6 +2432,7 @@ export default interface Resources {
     "copiedSessionId": "已复制 {{tool}} 会话 ID",
     "copiedYiConsoleSessionId": "已复制 Yi Console 会话 ID",
     "copyAsMarkdown": "复制为 Markdown",
+    "copyBranchName": "复制分支名",
     "copyDirectoryPath": "复制工作目录路径",
     "copyResumeCommand": "复制恢复命令",
     "copySessionId": "复制 {{tool}} 会话 ID",
@@ -2459,6 +2469,8 @@ export default interface Resources {
     "reload": "重新加载",
     "rename": "重命名",
     "renameSession": "重命名会话",
+    "renameWorktreeBranch": "重命名 Worktree 分支…",
+    "renameWorktreeBranchTitle": "重命名 Worktree 分支",
     "replyStyleSwitchToMinimal": "回复风格：切换到简约",
     "replyStyleSwitchToTimeline": "回复风格：切换到时间线",
     "save": "保存",
@@ -2473,7 +2485,9 @@ export default interface Resources {
     "terminal": "终端",
     "thisSessionHasNoConversation": "这个会话还没有对话内容",
     "unpin": "取消置顶",
-    "viewChanges": "查看改动"
+    "viewChanges": "查看改动",
+    "worktreeBranchPlaceholder": "例如 feat/my-feature",
+    "worktreeBranchRenamed": "已重命名分支为 {{branch}}"
   },
   "sessionView": {
     "addSideChat": "新增旁路",
@@ -2511,7 +2525,7 @@ export default interface Resources {
     "workspaceFiles": "工作目录文件",
     "worktreeConflictNotice": "同目录有其他会话运行中",
     "worktreeConflictTip": "「{{title}}」正在同一目录运行，继续改动可能会互相覆盖",
-    "worktreeHeadPillTip": "当前运行于 Worktree {{branch}}（{{cwd}}）\n点击查看文件改动"
+    "worktreeHeadPillTip": "当前运行于 Worktree {{branch}}（{{cwd}}）\n点击查看文件改动，右键重命名分支"
   },
   "settingsView": {
     "aSessionKeepsATool": "会话发过消息后，背后会开着一个工具进程，各占 100～250MB 内存。闲置超过设定时间，或同时开着的进程超过上限时（先结束最久没用的），这个进程会被结束；聊天记录都在，下次发消息会自动接着原来的会话继续（要多等几秒启动）。正在回复的会话不会被结束。终端模式的会话不受这两项管理，不用时请在会话菜单里「停止进程」。",
@@ -2558,6 +2572,10 @@ export default interface Resources {
     "unlimited": "不限",
     "variables": "可用变量：",
     "whenNoCommandIsSet": "没填命令时，Claude Code 会话沿用 ~/.claude/settings.json 里的 statusLine（Windows 上用 Git Bash 执行）",
+    "worktreeAutoRename": "根据首条消息自动重命名 Worktree 分支",
+    "worktreeAutoRenameHint": "未指定分支名时先创建临时分支，发消息后自动改为语义化英文分支名；不会覆盖手动改名或已推送的分支。",
+    "worktreeBranchPrefix": "Worktree 分支前缀",
+    "worktreeBranchPrefixHint": "新建会话 Worktree 时的默认分支前缀（留空则不加前缀）。当前示例：{{example}}",
     "worktreeRoot": "worktree 根目录",
     "worktreeRootHint": "Bot 派出的任务默认各用一个 git worktree，放在这个目录下（按仓库分子目录）。留空使用 ~/.yi-console/worktrees；修改后只影响新任务。"
   },

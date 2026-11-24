@@ -4,13 +4,13 @@ import { rpc } from '../transport';
 import { isHostSession, normDirPath, sessionProjectDir, type SessionInfo } from '../types';
 import { basename, shortPath } from '../util';
 import type { BranchesResult, WorktreesResult } from './GitOpsDialogs';
-import type { MenuItem } from './Overlay';
+import { askText, type MenuItem } from './Overlay';
 
 const tx = getT('newSession');
 
 export type WorktreeChoice =
   | { kind: 'main' }
-  | { kind: 'new'; base: string }
+  | { kind: 'new'; base: string; branch?: string }
   | { kind: 'existing'; path: string; branch: string };
 
 /** Max local base branches listed directly in the Scheme A worktree dropdown */
@@ -110,7 +110,11 @@ export function useWorktreeChoice({
   const autoSelected = isGitRepo && !userPick && !curLinkedWt && busyInMain && choice.kind === 'new';
 
   const chipLabel = useMemo(() => {
-    if (choice.kind === 'new') return tx('worktreeChipNew', { base: choice.base || 'HEAD' });
+    if (choice.kind === 'new') {
+      return choice.branch
+        ? tx('worktreeChipNewNamed', { branch: choice.branch })
+        : tx('worktreeChipNew', { base: choice.base || 'HEAD' });
+    }
     if (choice.kind === 'existing') return tx('worktreeChipExisting', { branch: choice.branch });
     return tx('mainDirectory');
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -141,8 +145,29 @@ export function useWorktreeChoice({
         hint: br === currentBranch && busyInMain ? tx('menuRecommended') : undefined,
         icon: 'git-branch' as const,
         active: choice.kind === 'new' && choice.base === br,
-        run: () => pick({ kind: 'new', base: br }),
+        run: () => pick({ kind: 'new', base: br, branch: choice.kind === 'new' ? choice.branch : undefined }),
       })),
+      {
+        label: choice.kind === 'new' ? tx('menuEditCustomBranch') : tx('menuNewCustomBranch'),
+        hint: choice.kind === 'new' ? choice.branch : undefined,
+        icon: 'edit',
+        run: () =>
+          void (async () => {
+            const res = await askText({
+              title: tx('customWorktreeBranchTitle'),
+              value: choice.kind === 'new' ? (choice.branch ?? '') : '',
+              placeholder: tx('customWorktreeBranchPlaceholder'),
+              okText: getT('sessionActions')('save'),
+            });
+            if (res === null) return;
+            const b = res.trim();
+            if (choice.kind === 'new') {
+              pick({ kind: 'new', base: choice.base, branch: b || undefined });
+            } else if (b) {
+              pick({ kind: 'new', base: currentBranch, branch: b });
+            }
+          })(),
+      },
     ];
     if (existingWorktrees.length > 0) {
       items.push('-');

@@ -2,8 +2,10 @@
 
 use anyhow::{anyhow, bail, Result};
 use serde_json::{json, Value};
+use std::collections::HashSet;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::{Mutex, OnceLock};
 
 /// Size limit for a single file's diff; larger ones just get a notice
 const DIFF_MAX: usize = 200 * 1024;
@@ -597,6 +599,324 @@ fn safe_name(s: &str) -> bool {
         && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
 }
 
+/// Process-wide lock serializing `git branch -m` writes to shared `.git/config` across worktrees
+static GIT_BRANCH_RENAME_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+/// Sanitize a user-configured branch prefix (e.g. `"yi/"` -> `"yi"`, `"feat/team/"` -> `"feat/team"`, `""` -> `""`)
+pub fn sanitize_branch_prefix(raw: &str) -> String {
+    raw.split(['/', '\\'])
+        .filter_map(|seg| {
+            let mut out = String::new();
+            let mut last_dash = false;
+            for ch in seg.trim().chars() {
+                if ch.is_ascii_alphanumeric() || ch == '_' {
+                    out.push(ch);
+                    last_dash = false;
+                } else if !out.is_empty() && !last_dash {
+                    out.push('-');
+                    last_dash = true;
+                }
+            }
+            let trimmed = out.trim_matches(['-', '.']);
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// Effective branch prefix from `DaemonSettings` (`None` -> `"yi"`, `Some("")` -> `""`)
+pub fn effective_worktree_branch_prefix(settings: &yi_proto::DaemonSettings) -> String {
+    match settings.worktree_branch_prefix.as_deref() {
+        None => "yi".to_string(),
+        Some(raw) => sanitize_branch_prefix(raw),
+    }
+}
+
+/// Combine an optional sanitized prefix and a branch slug without duplicating an existing prefix
+pub fn format_worktree_branch(prefix: &str, slug: &str) -> String {
+    let clean_prefix = sanitize_branch_prefix(prefix);
+    let clean_slug = slug.trim().trim_matches('/');
+    if clean_prefix.is_empty() || clean_slug.starts_with(&format!("{clean_prefix}/")) {
+        clean_slug.to_string()
+    } else if clean_slug.is_empty() {
+        clean_prefix
+    } else {
+        format!("{clean_prefix}/{clean_slug}")
+    }
+}
+
+fn is_cjk_char(c: char) -> bool {
+    matches!(c, '\u{4e00}'..='\u{9fff}' | '\u{3040}'..='\u{30ff}' | '\u{ac00}'..='\u{d7af}')
+}
+
+fn join_slug_tokens(tokens: &[String], max_tokens: usize, max_len: usize) -> Option<String> {
+    let mut out = String::new();
+    for tok in tokens.iter().take(max_tokens) {
+        if out.is_empty() {
+            if tok.len() > max_len {
+                out.push_str(&tok[..max_len]);
+                break;
+            }
+            out.push_str(tok);
+        } else if out.len() + 1 + tok.len() <= max_len {
+            out.push('-');
+            out.push_str(tok);
+        } else {
+            break;
+        }
+    }
+    let out = out.trim_matches('-').to_string();
+    (out.len() >= 3).then_some(out)
+}
+
+/// Normalize free text or an LLM branch candidate into a concise lowercase ASCII kebab-case slug
+pub fn sanitize_branch_slug(raw: &str) -> Option<String> {
+    const FILLERS: &[&str] = &[
+        "a", "an", "the", "in", "on", "at", "to", "for", "of", "by", "with", "and", "or", "is",
+        "are", "be", "this", "that", "it", "when", "after", "before", "from", "into", "please",
+        "can", "you", "help", "me", "my", "our", "we", "i",
+    ];
+    const STOP_SINGLE: &[&str] = &[
+        "the", "fix", "add", "test", "tests", "new", "ok", "hi", "hello", "ai", "pr", "help",
+        "please", "update", "check", "bug", "code", "file", "files", "issue",
+    ];
+
+    let line = raw
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty() && !l.starts_with("```"))?;
+    let mut tokens: Vec<String> = Vec::new();
+    for word in line.split_whitespace() {
+        let low_raw = word.trim_matches(|c: char| "`'\"()[]{}<>,:;!?".contains(c));
+        if low_raw.starts_with("http://") || low_raw.starts_with("https://") {
+            continue;
+        }
+        let mut cur = String::new();
+        for ch in low_raw.chars() {
+            if ch.is_ascii_alphanumeric() {
+                cur.push(ch.to_ascii_lowercase());
+            } else if !cur.is_empty() {
+                tokens.push(std::mem::take(&mut cur));
+            }
+        }
+        if !cur.is_empty() {
+            tokens.push(cur);
+        }
+    }
+    if tokens.len() > 3 {
+        let filtered: Vec<String> = tokens
+            .iter()
+            .filter(|t| !FILLERS.contains(&t.as_str()))
+            .cloned()
+            .collect();
+        if filtered.len() >= 2 {
+            tokens = filtered;
+        }
+    }
+    let slug = join_slug_tokens(&tokens, 5, 36)?;
+    if !slug.contains('-') && STOP_SINGLE.contains(&slug.as_str()) {
+        return None;
+    }
+    Some(slug)
+}
+
+/// Deterministic semantic slug extraction from an initial prompt or session title
+pub fn derive_semantic_slug(text: &str) -> Option<String> {
+    let base = sanitize_branch_slug(text)?;
+    let has_action = base.starts_with("fix-") || base.starts_with("feat-") || base.starts_with("refactor-");
+    if has_action {
+        return Some(base);
+    }
+    let action = if ["修复", "排查", "解决", "崩溃", "白屏", "报错", "异常"]
+        .iter()
+        .any(|k| text.contains(k))
+    {
+        Some("fix")
+    } else if ["新增", "添加", "支持", "实现", "增加"].iter().any(|k| text.contains(k)) {
+        Some("feat")
+    } else if ["重构", "优化", "改进"].iter().any(|k| text.contains(k)) {
+        Some("refactor")
+    } else {
+        None
+    };
+    if let Some(act) = action {
+        if base != act {
+            let parts: Vec<String> = std::iter::once(act.to_string())
+                .chain(base.split('-').map(str::to_string))
+                .collect();
+            if let Some(combined) = join_slug_tokens(&parts, 5, 36) {
+                return Some(combined);
+            }
+        }
+    }
+    Some(base)
+}
+
+/// True when the prompt/title is primarily non-CJK and yielded an informative slug without needing an LLM call
+pub fn is_strong_ascii_slug(source: &str, slug: &str) -> bool {
+    let cjk_count = source.chars().filter(|&c| is_cjk_char(c)).count();
+    if cjk_count >= 2 {
+        return false;
+    }
+    slug.contains('-') || slug.len() >= 6
+}
+
+/// Extract a clean lowercase branch slug from CLI text generation output (stripping fences and accidental prefixes)
+pub fn parse_generated_branch_slug(raw: &str) -> Option<String> {
+    let candidate = raw
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with("```"))
+        .last()?;
+    let cleaned = candidate
+        .trim_matches(|c: char| "`'\"()[]{}.,:;!?".contains(c))
+        .trim();
+    let tail = cleaned.rsplit('/').next().unwrap_or(cleaned).trim();
+    sanitize_branch_slug(tail)
+}
+
+/// Read the checked-out short branch name for `cwd`, or None when detached / not a git repo
+pub fn current_branch(cwd: &Path) -> Option<String> {
+    let root = repo_root(cwd)?;
+    git_ok(&root, &["symbolic-ref", "--quiet", "--short", "HEAD"])
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// True when the checked-out branch in `cwd` tracks a remote upstream branch
+pub fn has_upstream(cwd: &Path) -> bool {
+    let Some(root) = repo_root(cwd) else {
+        return false;
+    };
+    git(&root, &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"])
+        .is_ok_and(|o| o.status.success())
+}
+
+fn list_local_branches(repo: &Path) -> Result<Vec<String>> {
+    let out = git_ok(repo, &["for-each-ref", "--format=%(refname:short)", "refs/heads"])?;
+    Ok(out
+        .lines()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+fn resolve_available_branch_name_excluding(
+    repo: &Path,
+    desired: &str,
+    exclude_exact: Option<&str>,
+) -> Result<String> {
+    let all = list_local_branches(repo)?;
+    let existing: HashSet<String> = all
+        .into_iter()
+        .filter(|b| exclude_exact != Some(b.as_str()))
+        .map(|b| b.to_ascii_lowercase())
+        .collect();
+    let mut blocked = existing.clone();
+    for br in &existing {
+        let segs: Vec<&str> = br.split('/').collect();
+        for idx in 1..segs.len() {
+            blocked.insert(segs[..idx].join("/"));
+        }
+    }
+    let segs: Vec<&str> = desired.split('/').collect();
+    let blocked_by_parent = (1..segs.len()).any(|idx| existing.contains(&segs[..idx].join("/").to_ascii_lowercase()));
+    let base = if blocked_by_parent { segs.join("-") } else { desired.to_string() };
+    if !blocked.contains(&base.to_ascii_lowercase()) {
+        return Ok(base);
+    }
+    for n in 2..=100 {
+        let cand = format!("{base}-{n}");
+        if !blocked.contains(&cand.to_ascii_lowercase()) {
+            return Ok(cand);
+        }
+    }
+    bail!("无法为分支找到可用名称: {desired}")
+}
+
+/// Pick `desired` if unused (and free of slash-ref hierarchy conflicts), else append `-2`..`-100`
+pub fn resolve_available_branch_name(repo: &Path, desired: &str) -> Result<String> {
+    resolve_available_branch_name_excluding(repo, desired, None)
+}
+
+/// Rename a local branch via `git branch -m` (optionally resolving collisions for background auto-renames)
+pub fn rename_branch(
+    cwd: &str,
+    old_branch: Option<&str>,
+    new_branch: &str,
+    resolve_collision: bool,
+) -> Result<Value> {
+    let dir = crate::paths::expand(cwd);
+    let root = repo_root(&dir).ok_or_else(|| anyhow!("不是 git 仓库"))?;
+    let new_branch = new_branch.trim();
+    if new_branch.is_empty()
+        || new_branch.starts_with('-')
+        || git_ok(&root, &["check-ref-format", "--branch", new_branch]).is_err()
+    {
+        bail!("分支名无效: {new_branch}");
+    }
+    let old = match old_branch.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(o) => {
+            if o.starts_with('-') {
+                bail!("分支名无效: {o}");
+            }
+            if !git(&root, &["show-ref", "--verify", "-q", &format!("refs/heads/{o}")])
+                .is_ok_and(|out| out.status.success())
+            {
+                bail!("找不到分支: {o}");
+            }
+            o.to_string()
+        }
+        None => current_branch(&root)
+            .ok_or_else(|| anyhow!("当前处于分离头指针状态，无法重命名分支"))?,
+    };
+    if old == new_branch {
+        return Ok(json!({ "oldBranch": old, "branch": new_branch, "changed": false }));
+    }
+
+    let _guard = GIT_BRANCH_RENAME_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+    let target = if resolve_collision {
+        resolve_available_branch_name_excluding(&root, new_branch, Some(&old))?
+    } else {
+        let branches = list_local_branches(&root)?;
+        let others: Vec<&str> = branches
+            .iter()
+            .map(String::as_str)
+            .filter(|b| *b != old)
+            .collect();
+        let new_low = new_branch.to_ascii_lowercase();
+        let same_ci_self = old.eq_ignore_ascii_case(new_branch);
+        if others
+            .iter()
+            .any(|b| *b == new_branch || (!same_ci_self && b.eq_ignore_ascii_case(new_branch)))
+        {
+            bail!("目标分支已存在: {new_branch}");
+        }
+        let new_slash = format!("{new_low}/");
+        if others.iter().any(|b| {
+            let b_low = b.to_ascii_lowercase();
+            b_low.starts_with(&new_slash) || new_low.starts_with(&format!("{b_low}/"))
+        }) {
+            bail!("分支名与已有分支层级冲突: {new_branch}");
+        }
+        new_branch.to_string()
+    };
+
+    if let Err(err) = git_ok(&root, &["branch", "-m", "--", &old, &target]) {
+        // Git can move the ref before failing on a locked `.git/config`; confirm actual ref state
+        let old_exists = git(&root, &["show-ref", "--verify", "-q", &format!("refs/heads/{old}")])
+            .is_ok_and(|o| o.status.success());
+        let new_exists = git(&root, &["show-ref", "--verify", "-q", &format!("refs/heads/{target}")])
+            .is_ok_and(|o| o.status.success());
+        if old_exists || !new_exists {
+            return Err(err);
+        }
+    }
+    Ok(json!({ "oldBranch": old, "branch": target, "changed": true }))
+}
+
 /// Add a worktree for the repo at `cwd`: `<root>/<repo name>-<hash>/<name>` on a new branch (default `yi/<name>`)
 /// from `base` (default HEAD). The hash keeps repos with the same name apart
 pub fn worktree_add(root: &Path, cwd: &str, name: &str, branch: Option<&str>, base: Option<&str>) -> Result<Value> {
@@ -720,6 +1040,33 @@ fn link_dir(src: &Path, dst: &Path) -> std::io::Result<()> {
     }
 }
 
+/// Trailing-slash rules like `node_modules/` ignore directories in the main repo but do not match
+/// Unix symlinks; add `/<rel>` to shared `.git/info/exclude` when a linked dependency is unignored
+fn ensure_worktree_link_ignored(wt_dir: &Path, rel: &str) {
+    if is_git_ignored(wt_dir, rel) {
+        return;
+    }
+    let Ok(common) = git_ok(wt_dir, &["rev-parse", "--path-format=absolute", "--git-common-dir"]) else {
+        return;
+    };
+    let exclude = Path::new(common.trim()).join("info").join("exclude");
+    if let Some(parent) = exclude.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let entry = format!("/{rel}");
+    let existing = std::fs::read_to_string(&exclude).unwrap_or_default();
+    if existing.lines().any(|l| l.trim() == entry) {
+        return;
+    }
+    let mut updated = existing;
+    if !updated.is_empty() && !updated.ends_with('\n') {
+        updated.push('\n');
+    }
+    updated.push_str(&entry);
+    updated.push('\n');
+    let _ = std::fs::write(&exclude, updated);
+}
+
 /// Prepare a newly created worktree so tests and builds work immediately:
 /// copy gitignored `.env*` files (root + 1st-level subdirs) and symlink/junction heavy ignored dependency folders
 fn prepare_worktree_env(main_repo: &Path, wt_dir: &Path) {
@@ -773,7 +1120,9 @@ fn prepare_worktree_env(main_repo: &Path, wt_dir: &Path) {
             if let Some(p) = dst.parent() {
                 let _ = std::fs::create_dir_all(p);
             }
-            let _ = link_dir(&src, &dst);
+            if link_dir(&src, &dst).is_ok() {
+                ensure_worktree_link_ignored(wt_dir, rel);
+            }
         }
     }
 }
@@ -782,9 +1131,12 @@ fn prepare_worktree_env(main_repo: &Path, wt_dir: &Path) {
 pub fn worktree_add_session(
     root: &Path,
     cwd: &str,
-    name: &str,
+    folder_name: &str,
     branch: Option<&str>,
+    auto_slug: Option<&str>,
     base: Option<&str>,
+    default_prefix: &str,
+    temporary_branch: bool,
 ) -> Result<(String, yi_proto::SessionWorktree)> {
     let dir = crate::paths::expand(cwd);
     let main_repo = main_repo_root(&dir).ok_or_else(|| anyhow!("不是 git 仓库: {cwd}"))?;
@@ -820,7 +1172,18 @@ pub fn worktree_add_session(
         .filter(|s| !s.is_empty());
     let base_for_add = base_arg.or(base_commit.as_deref());
     let main_cwd = native_worktree_path(&main_repo.to_string_lossy());
-    let added = worktree_add(root, &main_cwd, name, branch, base_for_add)?;
+    let (chosen_branch, is_temporary) = match branch.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(explicit) => (explicit.to_string(), false),
+        None => {
+            let raw_slug = auto_slug
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or(folder_name);
+            let desired = format_worktree_branch(default_prefix, raw_slug);
+            (resolve_available_branch_name(&main_repo, &desired)?, temporary_branch)
+        }
+    };
+    let added = worktree_add(root, &main_cwd, folder_name, Some(&chosen_branch), base_for_add)?;
     let wt_path = added["path"]
         .as_str()
         .ok_or_else(|| anyhow!("worktree 创建结果缺少路径"))?
@@ -837,6 +1200,7 @@ pub fn worktree_add_session(
             branch: wt_branch,
             base_branch,
             base_commit,
+            temporary_branch: is_temporary,
         },
     ))
 }
@@ -877,6 +1241,7 @@ pub fn detect_existing_worktree(cwd: &str) -> Option<yi_proto::SessionWorktree> 
         branch,
         base_branch,
         base_commit,
+        temporary_branch: false,
     })
 }
 
@@ -2416,7 +2781,7 @@ mod tests {
         assert!(detect_existing_worktree(&main_cwd).is_none());
 
         // Spawn from explicit base branch `feat/v2` (Method 1: always creates isolated `yi/*` branch)
-        let (wt_path, wt) = worktree_add_session(&wt_root, &main_cwd, "s1", None, Some("feat/v2")).unwrap();
+        let (wt_path, wt) = worktree_add_session(&wt_root, &main_cwd, "s1", None, None, Some("feat/v2"), "yi", false).unwrap();
         assert_eq!(wt.branch, "yi/s1");
         assert_eq!(wt.base_branch.as_deref(), Some("feat/v2"));
         assert!(Path::new(&wt_path).join("v2.txt").exists());
@@ -2443,6 +2808,104 @@ mod tests {
         assert!(!Path::new(&wt_path).exists());
         assert!(git_ok(&repo, &["branch", "--list", "yi/s1"]).unwrap().trim().is_empty());
         assert!(repo.join("node_modules/pkg/index.js").exists());
+    }
+
+    #[test]
+    fn branch_naming_prefix_slug_and_parse_helpers() {
+        assert_eq!(sanitize_branch_prefix("yi/"), "yi");
+        assert_eq!(sanitize_branch_prefix("/feat/team//"), "feat/team");
+        assert_eq!(sanitize_branch_prefix(""), "");
+        assert_eq!(sanitize_branch_prefix(" / "), "");
+        assert_eq!(sanitize_branch_prefix("my feat@1"), "my-feat-1");
+
+        let def = yi_proto::DaemonSettings::default();
+        assert_eq!(effective_worktree_branch_prefix(&def), "yi");
+        let empty = yi_proto::DaemonSettings { worktree_branch_prefix: Some(String::new()), ..Default::default() };
+        assert_eq!(effective_worktree_branch_prefix(&empty), "");
+        let custom = yi_proto::DaemonSettings { worktree_branch_prefix: Some("feat/".into()), ..Default::default() };
+        assert_eq!(effective_worktree_branch_prefix(&custom), "feat");
+
+        assert_eq!(format_worktree_branch("yi", "fix-login"), "yi/fix-login");
+        assert_eq!(format_worktree_branch("yi", "yi/fix-login"), "yi/fix-login");
+        assert_eq!(format_worktree_branch("", "fix-login"), "fix-login");
+
+        let en_prompt = "Fix white screen when deleting AI review side chat";
+        let en_slug = derive_semantic_slug(en_prompt).unwrap();
+        assert!(en_slug.starts_with("fix-white-screen"), "{en_slug}");
+        assert!(is_strong_ascii_slug(en_prompt, &en_slug));
+
+        let zh_prompt = "排查删除 ai 审阅旁路后白屏的问题";
+        if let Some(zh_slug) = derive_semantic_slug(zh_prompt) {
+            assert!(!is_strong_ascii_slug(zh_prompt, &zh_slug));
+        }
+        let zh_mixed = "新增 SideChatTab 分支重命名功能";
+        let zh_mixed_slug = derive_semantic_slug(zh_mixed).unwrap();
+        assert!(zh_mixed_slug.starts_with("feat-sidechattab"), "{zh_mixed_slug}");
+        assert!(!is_strong_ascii_slug(zh_mixed, &zh_mixed_slug));
+
+        assert_eq!(
+            parse_generated_branch_slug("```text\nfeat/fix-worktree-rename\n```"),
+            Some("fix-worktree-rename".to_string())
+        );
+        assert_eq!(parse_generated_branch_slug("`add-dark-mode`"), Some("add-dark-mode".to_string()));
+        assert_eq!(parse_generated_branch_slug("ok"), None);
+    }
+
+    #[test]
+    fn rename_branch_and_collision_resolution_in_worktree() {
+        let d = tempfile::tempdir().unwrap();
+        let repo = d.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let run = |dir: &Path, a: &[&str]| assert!(git(dir, a).unwrap().status.success(), "{a:?}");
+        run(&repo, &["init", "-q", "-b", "main"]);
+        run(&repo, &["config", "user.email", "t@t"]);
+        run(&repo, &["config", "user.name", "t"]);
+        std::fs::write(repo.join("a.txt"), "1\n").unwrap();
+        run(&repo, &["add", "."]);
+        run(&repo, &["commit", "-qm", "init"]);
+
+        run(&repo, &["branch", "yi/taken"]);
+        run(&repo, &["branch", "yi/nested/child"]);
+        assert_eq!(resolve_available_branch_name(&repo, "yi/taken").unwrap(), "yi/taken-2");
+        assert_eq!(resolve_available_branch_name(&repo, "yi/nested").unwrap(), "yi/nested-2");
+
+        // Parent ref blocks nested child -> flattens `/` to `-`
+        run(&repo, &["branch", "topic"]);
+        assert_eq!(resolve_available_branch_name(&repo, "topic/sub").unwrap(), "topic-sub");
+
+        let wt_root = d.path().join("wt");
+        let (wt_path, wt) = worktree_add_session(&wt_root, &repo.to_string_lossy(), "s1", None, Some("s-1111"), None, "yi", true).unwrap();
+        assert_eq!(wt.branch, "yi/s-1111");
+        assert!(wt.temporary_branch);
+
+        // Invalid branch name rejected
+        assert!(rename_branch(&wt_path, None, "--bad", false).is_err());
+        assert!(rename_branch(&wt_path, None, "bad branch", false).is_err());
+        // Manual collision / hierarchy conflicts rejected when resolve_collision = false
+        assert!(rename_branch(&wt_path, None, "yi/taken", false).is_err());
+        assert!(rename_branch(&wt_path, None, "yi/nested", false).is_err());
+        assert!(rename_branch(&wt_path, None, "topic/sub", false).is_err());
+
+        // No-op same name returns changed: false
+        let same = rename_branch(&wt_path, None, "yi/s-1111", false).unwrap();
+        assert_eq!(same["changed"], false);
+
+        // Collision-resolving auto-rename picks suffixed branch
+        let auto = rename_branch(&wt_path, Some("yi/s-1111"), "yi/taken", true).unwrap();
+        assert_eq!(auto["oldBranch"], "yi/s-1111");
+        assert_eq!(auto["branch"], "yi/taken-2");
+        assert_eq!(auto["changed"], true);
+        assert_eq!(current_branch(Path::new(&wt_path)).as_deref(), Some("yi/taken-2"));
+
+        // Manual rename moves to custom branch cleanly without changing directory
+        let manual = rename_branch(&wt_path, None, "feat/custom-name", false).unwrap();
+        assert_eq!(manual["oldBranch"], "yi/taken-2");
+        assert_eq!(manual["branch"], "feat/custom-name");
+        assert_eq!(current_branch(Path::new(&wt_path)).as_deref(), Some("feat/custom-name"));
+
+        // Detached HEAD refuses implicit rename
+        run(Path::new(&wt_path), &["checkout", "--detach", "HEAD"]);
+        assert!(rename_branch(&wt_path, None, "feat/any", false).is_err());
     }
 
     #[test]

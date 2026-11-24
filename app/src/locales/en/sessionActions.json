@@ -61,5 +61,11 @@
   "newSideChat": "New Side Chat",
   "enterIsolatedWorktree": "Move to Isolated Worktree",
   "enteredWorktreeToast": "Moved to isolated worktree ({{branch}})",
+  "renameWorktreeBranch": "Rename worktree branch…",
+  "renameWorktreeBranchTitle": "Rename Worktree Branch",
+  "worktreeBranchPlaceholder": "e.g. feat/my-feature",
+  "worktreeBranchRenamed": "Branch renamed to {{branch}}",
+  "copyBranchName": "Copy branch name",
+  "branchNameCopied": "Branch name copied",
   "deleteSessionWithWorktreeNote": "This only removes the record from Yi Console; tool files on the machine stay untouched. If the bound worktree ({{branch}}) still has uncommitted or unmerged work, its directory and branch are also preserved."
 }

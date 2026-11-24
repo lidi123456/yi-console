@@ -43,10 +43,15 @@
   "worktreeChipTip": "选择在主目录运行、基于某个分支新建独立 Worktree，或直接接入已有 Worktree",
   "worktreeAutoSelectedHint": "检测到主目录正有会话运行，已自动选「独立 Worktree」（点芯片可切回）",
   "worktreeChipNew": "Worktree · {{base}}",
+  "worktreeChipNewNamed": "Worktree · {{branch}}",
   "worktreeChipExisting": "接入 · {{branch}}",
   "menuMainDir": "主目录（当前 {{branch}}）",
   "menuMainBusyHint": "运行中",
   "menuNewFromBranch": "基于 {{branch}} 新建 Worktree",
+  "menuNewCustomBranch": "新建 Worktree（自定义分支名）…",
+  "menuEditCustomBranch": "自定义分支名…",
+  "customWorktreeBranchTitle": "自定义 Worktree 分支名",
+  "customWorktreeBranchPlaceholder": "留空则自动命名，例如 feat/my-feature",
   "menuRecommended": "推荐",
   "menuAttachExisting": "接入已有：{{branch}}"
 }

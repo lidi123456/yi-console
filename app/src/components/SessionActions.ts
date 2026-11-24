@@ -207,6 +207,28 @@ export async function enterWorktree(hostId: string, info: SessionInfo) {
   }
 }
 
+/** Rename the Git branch of a session's bound worktree in-place (`git branch -m`) */
+export async function renameWorktreeBranch(hostId: string, info: SessionInfo) {
+  if (!info.worktree) return;
+  const v = await askText({
+    title: tx('renameWorktreeBranchTitle'),
+    value: info.worktree.branch,
+    placeholder: tx('worktreeBranchPlaceholder'),
+    okText: tx('save'),
+  });
+  const next = v?.trim();
+  if (!next || next === info.worktree.branch) return;
+  try {
+    const updated = await rpc<SessionInfo>(hostId, 'session.renameWorktree', {
+      sessionId: info.id,
+      branch: next,
+    });
+    toast(tx('worktreeBranchRenamed', { branch: updated.worktree?.branch ?? next }));
+  } catch (e) {
+    errorToast(e);
+  }
+}
+
 /** Switch the same session between chat mode and terminal mode; the tool continues its original session */
 export async function switchMode(hostId: string, info: SessionInfo) {
   const to = info.mode === 'terminal' ? 'structured' : 'terminal';
@@ -431,6 +453,15 @@ export function sessionMenu(
             icon: 'git-branch',
             disabled: info.status === 'running' || info.status === 'starting' || info.status === 'waiting-permission',
             run: () => void enterWorktree(hostId, info),
+          },
+        ]
+      : []),
+    ...(isHostSession(info) && info.worktree
+      ? [
+          {
+            label: tx('renameWorktreeBranch'),
+            icon: 'git-branch',
+            run: () => void renameWorktreeBranch(hostId, info),
           },
         ]
       : []),

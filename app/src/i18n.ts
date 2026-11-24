@@ -285,6 +285,13 @@ const ERR_PATTERNS: [RegExp, string | ((...m: string[]) => string)][] = [
   [/^会话正在切入 Worktree，请稍候再发送$/, 'Moving session into worktree, please try again shortly'],
   [/^Worktree 切换进行中，请稍候$/, 'Worktree migration is already in progress'],
   [/^已切入独立 Worktree：(.+?)（基于 (.+?)）$/, (_, br, base) => `Moved to isolated worktree: ${br} (from ${base})`],
+  [/^当前会话没有绑定独立 Worktree$/, 'This session is not bound to an isolated worktree'],
+  [/^当前处于分离头指针状态，无法重命名分支$/, 'Cannot rename branch while HEAD is detached'],
+  [/^目标分支已存在[:：]\s*(.+)$/, (_, b) => `Target branch already exists: ${b}`],
+  [/^分支名与已有分支层级冲突[:：]\s*(.+)$/, (_, b) => `Branch name conflicts with an existing branch hierarchy: ${b}`],
+  [/^找不到分支[:：]\s*(.+)$/, (_, b) => `Branch not found: ${b}`],
+  [/^无法为分支找到可用名称[:：]\s*(.+)$/, (_, b) => `Could not find an available branch name for: ${b}`],
+  [/^Worktree 分支已重命名：(.+?) → (.+)$/, (_, a, b) => `Worktree branch renamed: ${a} → ${b}`],
 ];
 
 /** Translate Chinese error messages from the backend or runtime (applies in the English UI) */

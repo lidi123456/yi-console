@@ -84,7 +84,7 @@ type Progress = { name: string; sent: number; total: number } | null;
 
 /** Start a chat session with a first message; the board shows it, so the page stays where it is */
 async function startSession(
-  d: Pick<Draft, 'text' | 'hostId' | 'cwd' | 'tool' | 'perm'> & { worktree?: boolean; worktreeBase?: string },
+  d: Pick<Draft, 'text' | 'hostId' | 'cwd' | 'tool' | 'perm'> & { worktree?: boolean; worktreeBranch?: string; worktreeBase?: string },
   items: Pending[] = [],
   setProgress: (p: Progress | ((p: Progress) => Progress)) => void = () => {},
 ): Promise<boolean> {
@@ -109,6 +109,7 @@ async function startSession(
       // Cursor parameters chosen there; the host drops the ones the model lacks
       modelConfig: d.tool === 'cursor' && prefModel(prefs) ? prefs.config : undefined,
       worktree: d.worktree ? true : undefined,
+      worktreeBranch: d.worktree && d.worktreeBranch ? d.worktreeBranch : undefined,
       worktreeBase: d.worktree && d.worktreeBase ? d.worktreeBase : undefined,
       cols: 120,
       rows: 32,
@@ -229,6 +230,7 @@ export function QuickStart({ hosts, sessions }: { hosts: HostEntry[]; sessions: 
           tool,
           perm,
           worktree: wt.choice.kind === 'new',
+          worktreeBranch: wt.choice.kind === 'new' ? wt.choice.branch : undefined,
           worktreeBase: wt.choice.kind === 'new' ? wt.choice.base : undefined,
         },
         items,

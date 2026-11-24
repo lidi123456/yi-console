@@ -11,7 +11,8 @@ import { isHostSession, TOOL_LABEL, supportsAccountsTool, type QuestionAnswer, t
 import { fmtUsage, isMobile, lsGet, lsSet, shortPath, STATUS_LABEL } from '../util';
 import { openAccountManager } from './AccountManagerModal';
 import { openMenu } from './Overlay';
-import { exportSession, OPEN_CHANGES, OPEN_FILE, openFileInPanel, renameSession, sessionMenu, showChanges, showTurnDiff } from './SessionActions';
+import { writeClipboard } from '../clipboard';
+import { exportSession, OPEN_CHANGES, OPEN_FILE, openFileInPanel, renameSession, renameWorktreeBranch, sessionMenu, showChanges, showTurnDiff } from './SessionActions';
 import { AI_PREFIX } from './AiBrowser';
 import { beginWidthDrag, FilePanel } from './FilePanel';
 import { sideChatTitle, sideChatTools, sideTabPath, startSideChat } from './SideChatTab';
@@ -532,6 +533,20 @@ export function SessionView({ hostId, sessionId, seq }: { hostId: string; sessio
                 className="wt-head-pill"
                 title={t('worktreeHeadPillTip', { branch: info.worktree.branch, cwd: info.cwd })}
                 onClick={() => showChanges(hostId, sessionId)}
+                onContextMenu={(e) => {
+                  e.preventDefault();
+                  const sa = getT('sessionActions');
+                  openMenu({ clientX: e.clientX, clientY: e.clientY }, [
+                    { label: sa('renameWorktreeBranch'), icon: 'edit', run: () => void renameWorktreeBranch(hostId, info) },
+                    {
+                      label: sa('copyBranchName'),
+                      icon: 'copy',
+                      run: () => void writeClipboard(info.worktree!.branch).then(() => toast(sa('branchNameCopied'))),
+                    },
+                    '-',
+                    { label: sa('viewChanges'), icon: 'diff', run: () => showChanges(hostId, sessionId) },
+                  ]);
+                }}
               >
                 <Icon name="git-branch" size={11} />
                 <span>{info.worktree.branch}</span>

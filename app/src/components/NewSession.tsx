@@ -487,6 +487,7 @@ export function NewSessionPage({ params }: { params: NewSessionParams }) {
         handoffFrom: ns.handoff?.fromId,
         title: ns.title,
         worktree: wtEnabled && wt.choice.kind === 'new' ? true : undefined,
+        worktreeBranch: wtEnabled && wt.choice.kind === 'new' && wt.choice.branch ? wt.choice.branch : undefined,
         worktreeBase: wtEnabled && wt.choice.kind === 'new' && wt.choice.base ? wt.choice.base : undefined,
         cols: 120,
         rows: 32,

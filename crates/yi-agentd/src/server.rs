@@ -685,7 +685,14 @@ pub async fn dispatch(
             let only: Option<Vec<String>> = p["paths"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect());
             tokio::task::spawn_blocking(move || crate::gitops::changes_with(&cwd, with_diff, only.as_deref())).await??
         }
-        GIT_STATUS => crate::statusline::git_info(s(&p, "cwd")?).await.unwrap_or(Value::Null),
+        GIT_STATUS => {
+            let cwd = s(&p, "cwd")?;
+            let val = crate::statusline::git_info(cwd).await.unwrap_or(Value::Null);
+            if let Some(branch) = val["branch"].as_str() {
+                hub.sync_worktree_branch_for_cwd(cwd, branch);
+            }
+            val
+        }
         GIT_WORKTREE_ADD => {
             let cwd = s(&p, "cwd")?.to_string();
             let name = s(&p, "name")?.to_string();
@@ -712,6 +719,13 @@ pub async fn dispatch(
                 hub2.enter_worktree(&sid, name.as_deref(), branch.as_deref(), base.as_deref())
             })
             .await??;
+            serde_json::to_value(info)?
+        }
+        SESSION_RENAME_WORKTREE => {
+            let sid = s(&p, "sessionId")?.to_string();
+            let branch = s(&p, "branch")?.to_string();
+            let hub2 = hub.clone();
+            let info = tokio::task::spawn_blocking(move || hub2.rename_worktree_branch(&sid, &branch)).await??;
             serde_json::to_value(info)?
         }
         SESSION_SET_CLIENT_MCP => {
@@ -760,7 +774,19 @@ pub async fn dispatch(
         }
         GIT_WORKTREES => {
             let cwd = s(&p, "cwd")?.to_string();
-            tokio::task::spawn_blocking(move || crate::gitops::worktrees(&cwd)).await??
+            let val = tokio::task::spawn_blocking(move || crate::gitops::worktrees(&cwd)).await??;
+            if let Some(items) = val["worktrees"].as_array() {
+                for item in items {
+                    if item["detached"].as_bool() != Some(true) {
+                        if let (Some(wt_path), Some(wt_branch)) =
+                            (item["path"].as_str(), item["branch"].as_str())
+                        {
+                            hub.sync_worktree_branch_for_cwd(wt_path, wt_branch);
+                        }
+                    }
+                }
+            }
+            val
         }
         GIT_BRANCHES => {
             let cwd = s(&p, "cwd")?.to_string();
@@ -768,10 +794,31 @@ pub async fn dispatch(
         }
         GIT_CHECKOUT => {
             let cwd = s(&p, "cwd")?.to_string();
+            let cwd_sync = cwd.clone();
             let branch = s(&p, "branch")?.to_string();
             let create = p["create"].as_bool().unwrap_or(false);
             let base = p["base"].as_str().map(str::to_string);
-            tokio::task::spawn_blocking(move || crate::gitops::checkout(&cwd, &branch, create, base.as_deref())).await??
+            let val = tokio::task::spawn_blocking(move || crate::gitops::checkout(&cwd, &branch, create, base.as_deref())).await??;
+            crate::statusline::invalidate_all();
+            if let Some(live) = val["branch"].as_str() {
+                hub.sync_worktree_branch_for_cwd(&cwd_sync, live);
+            }
+            val
+        }
+        GIT_RENAME_BRANCH => {
+            let cwd = s(&p, "cwd")?.to_string();
+            let cwd_sync = cwd.clone();
+            let old_branch = p["oldBranch"].as_str().map(str::to_string);
+            let new_branch = s(&p, "newBranch")?.to_string();
+            let val = tokio::task::spawn_blocking(move || {
+                crate::gitops::rename_branch(&cwd, old_branch.as_deref(), &new_branch, false)
+            })
+            .await??;
+            crate::statusline::invalidate_all();
+            if let Some(live) = val["branch"].as_str() {
+                hub.sync_worktree_branch_for_cwd(&cwd_sync, live);
+            }
+            val
         }
         GIT_PUSH => {
             let cwd = s(&p, "cwd")?.to_string();

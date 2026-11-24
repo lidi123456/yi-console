@@ -26,6 +26,21 @@ static CACHE: Mutex<Option<HashMap<String, (Instant, Value)>>> = Mutex::new(None
 /// Max status line commands running at once, so many sessions refreshing together don't bog down the machine
 static SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
 
+/// Drop cached status-line entries for one session (called whenever its cwd or git branch changes)
+pub fn invalidate_session(sid: &str) {
+    if let Some(map) = CACHE.lock().unwrap().as_mut() {
+        map.remove(&format!("{sid}:true"));
+        map.remove(&format!("{sid}:false"));
+    }
+}
+
+/// Drop all cached status-line entries (called after repo-wide git branch checkout/rename RPCs)
+pub fn invalidate_all() {
+    if let Some(map) = CACHE.lock().unwrap().as_mut() {
+        map.clear();
+    }
+}
+
 pub async fn query(hub: &Arc<Hub>, sid: &str, want_git: bool) -> Result<Value> {
     let key = format!("{sid}:{want_git}");
     if let Some((t, v)) = CACHE.lock().unwrap().get_or_insert_with(HashMap::new).get(&key) {
@@ -36,6 +51,11 @@ pub async fn query(hub: &Arc<Hub>, sid: &str, want_git: bool) -> Result<Value> {
     let info = hub.info(sid)?;
     let st = hub.settings.read().unwrap().status_line.clone();
     let git = if want_git { git_info(&info.cwd).await } else { None };
+    if info.worktree.is_some() {
+        if let Some(b) = git.as_ref().and_then(|g| g["branch"].as_str()) {
+            hub.sync_worktree_branch_for_cwd(&info.cwd, b);
+        }
+    }
 
     let mut out = json!({});
     if let Some(g) = &git {
@@ -306,5 +326,28 @@ mod tests {
         assert!(!trusted_in(&cfg, "/data/git/okay"));
         assert!(!trusted_in(&cfg, "/tmp/evil"));
         assert!(!trusted_in(&json!({}), "/data/git/ok"));
+    }
+
+    #[test]
+    fn cache_invalidation_targets_session_and_all() {
+        let mut guard = CACHE.lock().unwrap();
+        let map = guard.get_or_insert_with(HashMap::new);
+        map.insert("s1:true".into(), (Instant::now(), json!({"git": {"branch": "a"}})));
+        map.insert("s1:false".into(), (Instant::now(), json!({})));
+        map.insert("s2:true".into(), (Instant::now(), json!({"git": {"branch": "b"}})));
+        drop(guard);
+
+        invalidate_session("s1");
+        {
+            let guard = CACHE.lock().unwrap();
+            let map = guard.as_ref().unwrap();
+            assert!(!map.contains_key("s1:true"));
+            assert!(!map.contains_key("s1:false"));
+            assert!(map.contains_key("s2:true"));
+        }
+
+        invalidate_all();
+        let guard = CACHE.lock().unwrap();
+        assert!(guard.as_ref().unwrap().is_empty());
     }
 }

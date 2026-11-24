@@ -1996,6 +1996,31 @@ export function FilePanel({
     }
   };
 
+  const renameCurrentBranch = async () => {
+    if (!git?.branch || git.branch === 'HEAD' || git.branch.includes('游离')) return;
+    const name = (
+      await askText({
+        title: tx('renameBranchTitle'),
+        value: git.branch,
+        placeholder: tx('newBranchPlaceholder'),
+        okText: tx('save'),
+      })
+    )?.trim();
+    if (!name || name === git.branch) return;
+    try {
+      const r = await rpc<{ oldBranch: string; branch: string; changed: boolean }>(hostId, 'git.renameBranch', {
+        cwd,
+        newBranch: name,
+      });
+      toast(tx('renamedBranch', { branch: r.branch || name }));
+      refreshTree();
+      loadWorktrees();
+      void loadBranches();
+    } catch (err) {
+      errorToast(err);
+    }
+  };
+
   const openBaseBranchMenu = async (e: React.MouseEvent<HTMLElement>) => {
     const r = e.currentTarget.getBoundingClientRect();
     const info = (await loadBranches()) ?? branchesInfo;
@@ -4128,9 +4153,15 @@ export function FilePanel({
           worktrees={worktrees}
           branchesInfo={branchesInfo}
           loadingBranches={branchesLoading}
+          currentBranch={git.branch}
           onSwitchWorktree={onSwitchCwd ? switchWorktree : undefined}
           onCheckoutBranch={checkoutBranch}
           onCreateBranch={() => void createBranch()}
+          onRenameBranch={
+            git.branch && git.branch !== 'HEAD' && !git.branch.includes('游离')
+              ? () => void renameCurrentBranch()
+              : undefined
+          }
           onNewSession={standalone ? undefined : () => openNewSession({ hostId, cwd })}
           onClose={() => setBwOpen(false)}
         />

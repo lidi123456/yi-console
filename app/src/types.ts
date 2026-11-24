@@ -103,6 +103,7 @@ export interface SessionWorktree {
   branch: string;
   baseBranch?: string | null;
   baseCommit?: string | null;
+  temporaryBranch?: boolean;
 }
 
 export interface TurnCheckpoint {
@@ -685,6 +686,10 @@ export interface DaemonSettings {
   uiLang?: string;
   /** Where `git.worktreeAdd` puts worktrees (Bot tasks); `~/.yi-console/worktrees` if unset */
   worktreeRoot?: string;
+  /** Branch prefix for new session worktrees (e.g. `yi`, `feat`, or `""` for no prefix); defaults to `yi` */
+  worktreeBranchPrefix?: string;
+  /** Automatically rename temporary worktree branches from the first prompt or session title; on if unset */
+  worktreeAutoRename?: boolean;
   /** The AI browser (`yi_browser`) */
   browser?: BrowserSettings;
   /** Host personal long-term memory (`yi_memory`) */
