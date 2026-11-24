@@ -3,6 +3,7 @@ import { useBack } from '../back';
 import { getT, useLang } from '../i18n';
 import { permModes } from '../perm';
 import { errorToast, hostStatus, onAccountsUpdated, redetectTools, replaceView, useStore, type NewSessionParams } from '../store';
+import { setComposerText } from '../composerState';
 import { rpc } from '../transport';
 import { botCall, unmapHost } from '../bots';
 import { localHost } from './BotsSection';
@@ -516,11 +517,7 @@ export function NewSessionPage({ params }: { params: NewSessionParams }) {
       setProgress(null);
       if (info) {
         // The session exists but the first message didn't go out: open it with the message in its input box
-        try {
-          if (message) sessionStorage.setItem(`draft-${hostId}::${info.id}`, message);
-        } catch {
-          /* storage unavailable */
-        }
+        if (message) setComposerText(`${hostId}::${info.id}`, message);
         replaceView({ kind: 'session', hostId, sessionId: info.id });
       }
     } finally {

@@ -1,4 +1,5 @@
 import { lsGet, lsSet } from './util';
+import { clearComposerState } from './composerState';
 // Global state: hosts, session list and the current view live in one small store;
 // each session's event stream is stored separately (large, changes often) and subscribers are notified per session.
 
@@ -1084,6 +1085,7 @@ function onNotification(hostId: string, method: string, p: any) {
       upsertSession(hostId, p);
       break;
     case 'session.removed':
+      clearComposerState(skey(hostId, p.sessionId));
       setState((s) => ({
         sessions: { ...s.sessions, [hostId]: (s.sessions[hostId] ?? []).filter((x) => x.id !== p.sessionId) },
       }));

@@ -51,6 +51,7 @@
   "referenceFile": "引用文件",
   "stopEsc": "中断（Esc）",
   "willSendAfterTheUpload": "文件传完后自动发送",
+  "sending": "正在发送…",
   "sendToAiReadOn": "发给 AI：它会在下一步读到",
   "queueSendAfterCurrentTurn": "排队：本轮结束后发送",
   "send": "发送",

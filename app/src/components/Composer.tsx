@@ -1,7 +1,31 @@
-import { type ReactNode, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { type ReactNode, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import { useBack } from '../back';
 import { getT, isEn, useLang } from '../i18n';
-import { errorToast, hostSnippets, navigate, openNewSession, toast, useStore } from '../store';
+import { errorToast, hostSnippets, navigate, openNewSession, sessionInfo, toast, useStore } from '../store';
+import {
+  addComposerUpload,
+  armWaitSend,
+  beginSend,
+  beginUploadJob,
+  cancelComposerUpload,
+  clearWaitSend,
+  completeSendSuccess,
+  endSend,
+  endUploadJob,
+  focusComposer,
+  getComposerSnapshot,
+  insertOrAppendComposerText,
+  isComposerUploadCancelled,
+  registerActiveComposer,
+  removeComposerUpload,
+  setComposerImages,
+  setComposerRefs,
+  setComposerText,
+  subscribeComposer,
+  updateComposerUpload,
+  type Attached,
+  type Upload,
+} from '../composerState';
 import { clearSession, showChanges } from './SessionActions';
 import { isTauri, rpc } from '../transport';
 import type { SessionInfo, SlashCommand, Snippet } from '../types';
@@ -56,26 +80,7 @@ function cmdScore(label: string, desc: string, q: string) {
 const IMAGE_MAX = 5 * 1024 * 1024;
 export const IMAGE_TYPES = ['image/png', 'image/jpeg', 'image/gif', 'image/webp'];
 
-export interface Attached {
-  mimeType: string;
-  data: string;
-  url: string;
-  name: string;
-}
-
-/** Draft images kept in memory per session (`${hostId}::${sessionId}`), since screenshots can exceed sessionStorage's quota */
-const draftImgs = new Map<string, Attached[]>();
-const draftImgSubs = new Map<string, Set<(list: Attached[]) => void>>();
-
-function imgsOf(k: string): Attached[] {
-  return draftImgs.get(k) ?? [];
-}
-
-function setImgsOf(k: string, list: Attached[]) {
-  if (list.length) draftImgs.set(k, list);
-  else draftImgs.delete(k);
-  draftImgSubs.get(k)?.forEach((fn) => fn(list));
-}
+export type { Attached };
 
 /** Size limit for pasted / dropped regular files (same as yi-agentd's fs.upload) */
 export const FILE_MAX = 50 * 1024 * 1024;
@@ -112,13 +117,6 @@ export async function uploadChunked(
     if (e === CANCELLED) return null;
     throw e;
   }
-}
-
-interface Upload {
-  id: number;
-  name: string;
-  sent: number;
-  total: number;
 }
 
 /** @-reference: quote paths that contain spaces */
@@ -228,22 +226,15 @@ export function Composer({
 }) {
   const key = `${hostId}::${info.id}`;
   const [, lang] = useLang();
-  const [text, setText] = useState('');
-  /** Which session's message is being sent: if we switch sessions mid-send, the other input box shouldn't spin, and coming back must still handle the result */
-  const [sendingKey, setSendingKey] = useState<string | null>(null);
-  const sending = sendingKey === key;
-  /** Files being sent to the host (session.attachFile hasn't returned); progress is shown above the input box and sending waits for them */
-  const [uploads, setUploads] = useState<Upload[]>([]);
-  const pendingUploads = useRef(new Set<Promise<void>>());
-  /** Uploads that were cancelled: stop after the current chunk and delete what was already uploaded to the host */
-  const cancelledUploads = useRef(new Set<number>());
-  /** Incremented when an upload task (including cancelled ones still cleaning up) finishes, so the effect waiting to send re-checks */
-  const [uploadsDone, setUploadsDone] = useState(0);
+  const snap = useSyncExternalStore(
+    (cb) => subscribeComposer(key, cb),
+    () => getComposerSnapshot(key),
+  );
+  const { text, imgs, refs, sending, uploads, waitSend } = snap;
+  const setText = (next: string | ((cur: string) => string)) => setComposerText(key, next);
+  const setImgs = (next: Attached[] | ((cur: Attached[]) => Attached[])) => setComposerImages(key, next);
+  const setRefs = (next: ContextRef[] | ((cur: ContextRef[]) => ContextRef[])) => setComposerRefs(key, next);
   const hostKind = useStore((s) => s.hosts.find((h) => h.config.id === hostId)?.config.kind);
-  /** Send was pressed during upload: send automatically once uploads finish */
-  const [waitSend, setWaitSend] = useState(false);
-  const [imgs, setImgs] = useState<Attached[]>(() => imgsOf(key));
-  const [refs, setRefs] = useState<ContextRef[]>([]);
   const [drag, setDrag] = useState(false);
   const [permOpen, setPermOpen] = useState(false);
   const [caret, setCaret] = useState(0);
@@ -264,85 +255,13 @@ export function Composer({
   const steer = (info.tool === 'claude' || info.tool === 'codex') && queued.length === 0;
 
   useEffect(() => {
-    setImgs(imgsOf(key));
-    setWaitSend(false);
-    const subs = draftImgSubs.get(key) ?? new Set<(list: Attached[]) => void>();
-    draftImgSubs.set(key, subs);
-    subs.add(setImgs);
-    return () => {
-      subs.delete(setImgs);
-      if (!subs.size) draftImgSubs.delete(key);
-    };
+    setDismissed('');
+    setDrag(false);
+    setPermOpen(false);
+    setCaret(0);
+    setSel(0);
+    setFiles(null);
   }, [key]);
-  /** Which session is currently shown (lets async callbacks tell whether the user has switched away) */
-  const keyRef = useRef<string | null>(key);
-  keyRef.current = key;
-  // Switching sessions may remount the whole session page: callbacks from the unmounted instance also need to know they're "no longer on this session"
-  useEffect(() => {
-    keyRef.current = key;
-    return () => {
-      keyRef.current = null;
-    };
-  }, [key]);
-  const draftOf = (k: string) => {
-    try {
-      return sessionStorage.getItem(`draft-${k}`) ?? '';
-    } catch {
-      return '';
-    }
-  };
-  const setDraftOf = (k: string, v: string) => {
-    try {
-      if (v) sessionStorage.setItem(`draft-${k}`, v);
-      else sessionStorage.removeItem(`draft-${k}`);
-    } catch {
-      /* ignore */
-    }
-  };
-
-  // Drafts and referenced snippets are saved per session
-  const draftKey = `draft-${key}`;
-  const refsKey = `draft-refs-${key}`;
-  const setRefsOf = (k: string, list: ContextRef[]) => {
-    try {
-      if (list.length) sessionStorage.setItem(`draft-refs-${k}`, JSON.stringify(list));
-      else sessionStorage.removeItem(`draft-refs-${k}`);
-    } catch {
-      /* ignore */
-    }
-  };
-  useEffect(() => {
-    try {
-      setText(sessionStorage.getItem(draftKey) ?? '');
-    } catch {
-      setText('');
-    }
-    try {
-      const raw = sessionStorage.getItem(refsKey);
-      setRefs(raw ? (JSON.parse(raw) as ContextRef[]) : []);
-    } catch {
-      setRefs([]);
-    }
-  }, [draftKey, refsKey]);
-  // Right after switching sessions, text still belongs to the previous session and mustn't be saved under the new one; save from the render that loaded the new draft
-  const savedFor = useRef(draftKey);
-  useEffect(() => {
-    if (savedFor.current !== draftKey) {
-      savedFor.current = draftKey;
-      return;
-    }
-    setDraftOf(key, text);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [text, draftKey]);
-  const savedRefsFor = useRef(refsKey);
-  useEffect(() => {
-    if (savedRefsFor.current !== refsKey) {
-      savedRefsFor.current = refsKey;
-      return;
-    }
-    setRefsOf(key, refs);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [refs, refsKey]);
 
   // "Add to chat" from the workspace files: append @path to the end of the draft
   useEffect(() => {
@@ -605,53 +524,66 @@ export function Composer({
   // ---------- Sending ----------
   /** Insert text at the cursor (padding with spaces on both sides) */
   const insertAtCaret = (s: string) => {
-    // Called after an upload finishes, from a closure made before it started: `text` here may be stale (the user
-    // typed meanwhile), so take the current value from the textarea, falling back to the state
+    const cur = getComposerSnapshot(key).text;
     const el = ta.current;
-    const cur = el ? el.value : text;
-    const a = Math.min(el?.selectionStart ?? cur.length, cur.length);
-    const b = Math.min(el?.selectionEnd ?? cur.length, cur.length);
+    const useSel = !!el && el.value === cur;
+    const a = useSel ? Math.min(el.selectionStart ?? cur.length, cur.length) : cur.length;
+    const b = useSel ? Math.min(el.selectionEnd ?? cur.length, cur.length) : cur.length;
     const pre = cur.slice(0, a);
     const ins = (pre && !/\s$/.test(pre) ? ' ' : '') + s;
-    setText(pre + ins + cur.slice(b));
+    setComposerText(key, pre + ins + cur.slice(b));
     const pos = a + ins.length;
     requestAnimationFrame(() => {
-      el?.focus();
-      el?.setSelectionRange(pos, pos);
+      const curEl = ta.current;
+      if (!curEl || !curEl.isConnected) return;
+      curEl.focus();
+      curEl.setSelectionRange(pos, pos);
       setCaret(pos);
     });
   };
-  /** Images are sent as images; other files are saved to this session's upload directory on the host and inserted as an @absolute-path reference */
-  const attach = (fs: Iterable<File>) => {
-    const job = attachNow(Array.from(fs));
-    pendingUploads.current.add(job);
-    return job.finally(() => {
-      pendingUploads.current.delete(job);
-      setUploadsDone((n) => n + 1);
+
+  useEffect(
+    () =>
+      registerActiveComposer(key, {
+        insertAtCaret: (s) => insertAtCaret(s),
+        focus: () => ta.current?.focus(),
+      }),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [key],
+  );
+
+  const runUploadJob = (from: string, fn: () => Promise<void>) => {
+    beginUploadJob(from);
+    return fn().finally(() => {
+      const runner = endUploadJob(from);
+      if (runner) void runner();
     });
   };
+
+  /** Images are sent as images; other files are saved to this session's upload directory on the host and inserted as an @absolute-path reference */
+  const attach = (fs: Iterable<File>) => {
+    const from = key;
+    return runUploadJob(from, () => attachNow(from, hostId, info.id, Array.from(fs)));
+  };
+
   /** Upload one file in chunks and return its path on the host; returns null if cancelled. On cancel or error, delete whatever was already uploaded */
-  const uploadFile = async (f: File, up: Upload): Promise<string | null> => {
+  const uploadFile = async (from: string, hId: string, sid: string, f: File, up: Upload): Promise<string | null> => {
     try {
       return await uploadChunked(
-        hostId,
-        info.id,
+        hId,
+        sid,
         f,
-        (sent) => setUploads((l) => l.map((x) => (x.id === up.id ? { ...x, sent } : x))),
-        () => cancelledUploads.current.has(up.id),
+        (sent) => updateComposerUpload(from, up.id, sent),
+        () => isComposerUploadCancelled(from, up.id),
       );
     } finally {
-      cancelledUploads.current.delete(up.id);
+      removeComposerUpload(from, up.id);
     }
   };
-  const cancelUpload = (id: number) => {
-    cancelledUploads.current.add(id);
-    setUploads((l) => l.filter((x) => x.id !== id));
-    // Send was pressed earlier and is waiting for uploads: after a cancel, don't send automatically; let the user decide about what's left
-    setWaitSend(false);
-  };
-  const attachNow = async (fs: File[], local?: (string | undefined)[]) => {
-    const from = key;
+
+  const cancelUpload = (id: number) => cancelComposerUpload(key, id);
+
+  const attachNow = async (from: string, hId: string, sid: string, fs: File[], local?: (string | undefined)[]) => {
     const refs: string[] = [];
     for (const [i, f] of fs.entries()) {
       // Local file: reference the original directly, no upload needed
@@ -664,40 +596,37 @@ export function Composer({
       try {
         if (IMAGE_TYPES.includes(f.type)) {
           const a = await readImage(f);
-          setImgsOf(from, [...imgsOf(from), a]);
+          setComposerImages(from, (cur) => [...cur, a]);
           continue;
         }
         if (f.size > FILE_MAX) throw new Error(t('exceeds50mb', { name: f.name }));
         if (!f.size && !f.type) throw new Error(t('isAFolderOrEmpty', { name: f.name }));
-        if (up) setUploads((l) => [...l, up]);
-        const path = await uploadFile(f, up!);
+        if (up) addComposerUpload(from, up);
+        const path = await uploadFile(from, hId, sid, f, up!);
         if (path) refs.push(refOf(path));
+        else clearWaitSend(from);
       } catch (e) {
+        clearWaitSend(from);
         errorToast(e);
       } finally {
-        if (up) setUploads((l) => l.filter((x) => x.id !== up.id));
+        if (up) removeComposerUpload(from, up.id);
       }
     }
     if (!refs.length) return;
-    if (keyRef.current === from) insertAtCaret(refs.join(''));
-    else {
-      // Switched to another session during upload: append the reference to the original session's draft
-      const d = draftOf(from);
-      setDraftOf(from, d + (d && !/\s$/.test(d) ? ' ' : '') + refs.join(''));
-    }
+    insertOrAppendComposerText(from, refs.join(''));
   };
+
   /** Pasting files: in a local session, non-image local files on the clipboard are referenced by path; everything else is handled as usual */
   const pasteFiles = (fs: File[]) => {
-    const job = (async () => {
+    const from = key;
+    const hId = hostId;
+    const sid = info.id;
+    const isLocalHost = hostKind === 'local';
+    return runUploadJob(from, async () => {
       const others = fs.filter((f) => !IMAGE_TYPES.includes(f.type));
-      const paths = hostKind === 'local' ? await localPaths(others) : null;
+      const paths = isLocalHost ? await localPaths(others) : null;
       const local = fs.map((f) => (paths ? paths[others.indexOf(f)] : undefined));
-      await attachNow(fs, local);
-    })();
-    pendingUploads.current.add(job);
-    return job.finally(() => {
-      pendingUploads.current.delete(job);
-      setUploadsDone((n) => n + 1);
+      await attachNow(from, hId, sid, fs, local);
     });
   };
 
@@ -711,52 +640,58 @@ export function Composer({
     ta.current?.focus();
   };
 
-  const send = async () => {
-    // Files still uploading: spin for now; once done (and the references are in the input box) the effect below calls send again
-    if (pendingUploads.current.size) {
-      setWaitSend(true);
-      return;
-    }
-    const t = text.trim();
-    const curImgs = imgs;
-    const curRefs = refs;
-    if ((!t && curImgs.length === 0 && curRefs.length === 0) || sending) return;
+  const executeSend = async (
+    from: string,
+    hId: string,
+    sid: string,
+    fallbackInfo: SessionInfo,
+    transform?: (text: string) => string,
+    afterSend?: () => void,
+  ) => {
+    const curSnap = getComposerSnapshot(from);
+    const curInfo = sessionInfo(hId, sid) ?? fallbackInfo;
+    const canSide = curInfo.mode === 'structured' && curInfo.tool !== 'shell' && curInfo.tool !== 'files' && !curInfo.sideChat;
+    const trimmed = curSnap.text.trim();
+    const curImgs = curSnap.imgs;
+    const curRefs = curSnap.refs;
+    if ((!trimmed && curImgs.length === 0 && curRefs.length === 0) || curSnap.sending) return;
     // Typing /clear and pressing Enter (without picking from the menu) also uses Yi Console's clear, not sent to the tool
-    if (t === '/clear' && curImgs.length === 0 && curRefs.length === 0 && info.mode !== 'terminal') {
-      setText('');
-      clearSession(hostId, info);
+    if (trimmed === '/clear' && curImgs.length === 0 && curRefs.length === 0 && curInfo.mode !== 'terminal') {
+      setComposerText(from, '');
+      clearSession(hId, curInfo);
       return;
     }
     // /side [question] or /btw [question]: open a hidden read-only side chat in the right panel without interrupting the main turn
-    const sideMatch = canSideChat && curImgs.length === 0 && curRefs.length === 0 ? /^\/(?:side|btw)(?:\s+([\s\S]*))?$/i.exec(t) : null;
+    const sideMatch = canSide && curImgs.length === 0 && curRefs.length === 0 ? /^\/(?:side|btw)(?:\s+([\s\S]*))?$/i.exec(trimmed) : null;
     if (sideMatch) {
-      const from = key;
-      setSendingKey(from);
+      if (!beginSend(from)) return;
+      let ok = false;
       try {
-        await startSideChat({ hostId, parent: info, prompt: sideMatch[1]?.trim() });
-        if (keyRef.current === from) setText((cur) => (cur.trim() === t ? '' : cur));
-        if (draftOf(from).trim() === t) setDraftOf(from, '');
+        await startSideChat({ hostId: hId, parent: curInfo, prompt: sideMatch[1]?.trim() });
+        completeSendSuccess(from, { sentText: trimmed, sentImgs: [], sentRefs: [] });
+        ok = true;
       } catch (e) {
         errorToast(e);
       } finally {
-        setSendingKey((k) => (k === from ? null : k));
+        if (!ok) endSend(from);
+        focusComposer(from);
       }
       return;
     }
-    const from = key;
-    setSendingKey(from);
+    if (!beginSend(from)) return;
+    let ok = false;
     try {
-      const transformed = transformSend ? transformSend(t) : t;
+      const transformed = transform ? transform(trimmed) : trimmed;
       let payload = transformed;
       if (curRefs.length > 0) {
-        if (info.mode === 'terminal') {
+        if (curInfo.mode === 'terminal') {
           // Terminal PTY has no chat UI to collapse <yi-context>: save snippets as files and pass @path references
           const atRefs: string[] = [];
           for (const r of curRefs) {
             const ext = r.kind === 'diff' || r.kind === 'review' ? 'diff' : 'txt';
             const name = `${baseName(r.path)}.L${formatLineRange(r.fromLine, r.toLine)}.${ext}`;
             const body = r.kind === 'review' && r.comment ? `# Review comment: ${r.comment}\n\n${r.content}` : r.content;
-            const up = await rpc<{ path: string }>(hostId, 'session.attachFile', { sessionId: info.id, name, data: toB64Str(body) });
+            const up = await rpc<{ path: string }>(hId, 'session.attachFile', { sessionId: sid, name, data: toB64Str(body) });
             atRefs.push(refOf(up.path));
           }
           payload = `${transformed ? transformed + ' ' : ''}${atRefs.join('')}`.trim();
@@ -765,45 +700,45 @@ export function Composer({
         }
       }
       // Auto-name an untitled side chat from its first sent question so the tab label stays readable
-      if (info.sideChat && !info.title?.trim() && t) {
-        const autoTitle = deriveSideTitle(t);
-        if (autoTitle) rpc(hostId, 'session.rename', { sessionId: info.id, title: autoTitle }).catch(() => {});
+      if (curInfo.sideChat && !curInfo.title?.trim() && trimmed) {
+        const autoTitle = deriveSideTitle(trimmed);
+        if (autoTitle) rpc(hId, 'session.rename', { sessionId: sid, title: autoTitle }).catch(() => {});
       }
-      await rpc(hostId, 'session.send', {
-        sessionId: info.id,
+      await rpc(hId, 'session.send', {
+        sessionId: sid,
         text: payload,
         images: curImgs.map((i) => ({ mimeType: i.mimeType, data: i.data })),
         // Turn still running: Claude and Codex read it at their next step; other tools queue it until the turn ends
         queue: true,
       });
-      onAfterSend?.();
-      noteOwnerMessage(info);
-      // Only clear once sent. If we switched sessions mid-send, only clear the original session's draft and leave the current input box alone
-      if (keyRef.current === from) {
-        setText((cur) => (cur.trim() === t ? '' : cur));
-        setRefs([]);
-      }
-      if (draftOf(from).trim() === t) setDraftOf(from, '');
-      setRefsOf(from, []);
-      setImgsOf(from, imgsOf(from).filter((x) => !curImgs.includes(x)));
+      afterSend?.();
+      noteOwnerMessage(curInfo);
+      completeSendSuccess(from, { sentText: trimmed, sentImgs: curImgs, sentRefs: curRefs });
+      ok = true;
     } catch (e) {
       errorToast(e);
     } finally {
-      setSendingKey((k) => (k === from ? null : k));
-      if (keyRef.current === from) ta.current?.focus();
+      if (!ok) endSend(from);
+      focusComposer(from);
     }
   };
 
-  useEffect(() => {
-    if (!waitSend || uploads.length || pendingUploads.current.size) return;
-    // Send in the render after attach has inserted the references into text
-    const h = requestAnimationFrame(() => {
-      setWaitSend(false);
-      send();
-    });
-    return () => cancelAnimationFrame(h);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [waitSend, uploads.length, uploadsDone, text]);
+  const send = () => {
+    const from = key;
+    const hId = hostId;
+    const sid = info.id;
+    const fallbackInfo = info;
+    const transform = transformSend;
+    const afterSend = onAfterSend;
+    // Files still uploading: spin for now; once done (and the references are in the input box) endUploadJob runs executeSend
+    if (getComposerSnapshot(from).pendingUploads > 0) {
+      armWaitSend(from, () => {
+        void executeSend(from, hId, sid, fallbackInfo, transform, afterSend);
+      });
+      return;
+    }
+    return executeSend(from, hId, sid, fallbackInfo, transform, afterSend);
+  };
 
   /** Recall a queued message into the input box (↑ in an empty input box) */
   const recallQueued = async (id: string) => {
@@ -952,7 +887,7 @@ export function Composer({
             {imgs.map((im, i) => (
               <div key={i} className="attach" title={t('doubleClickToZoom', { name: im.name })}>
                 <img src={im.url} alt="" onDoubleClick={() => openImage(im.url)} onContextMenu={(e) => imageMenu(e, im.url)} />
-                <button className="attach-x" title={t('remove')} onClick={() => setImgsOf(key, imgs.filter((_, j) => j !== i))}>
+                <button className="attach-x" title={t('remove')} onClick={() => setImgs((cur) => cur.filter((x) => x !== im))}>
                   <Icon name="x" size={12} />
                 </button>
               </div>
@@ -1128,7 +1063,7 @@ export function Composer({
           {desktopControls}
           <span className="composer-spacer" />
           <ModelPicker hostId={hostId} info={info} />
-          {running && !hasText ? (
+          {running && !hasText && !sending && !waitSend ? (
             <button className="send-btn stop" onClick={onInterrupt} title={t('stopEsc')}>
               <Icon name="stop" size={16} />
             </button>
@@ -1140,11 +1075,13 @@ export function Composer({
               title={
                 waitSend
                   ? t('willSendAfterTheUpload')
-                  : busy
-                  ? steer
-                    ? t('sendToAiReadOn')
-                    : t('queueSendAfterCurrentTurn')
-                  : t('send')
+                  : sending
+                    ? t('sending')
+                    : busy
+                      ? steer
+                        ? t('sendToAiReadOn')
+                        : t('queueSendAfterCurrentTurn')
+                      : t('send')
               }
             >
               {sending || waitSend ? <span className="spinner send-spin" /> : <Icon name={busy && !steer ? 'history' : 'arrowUp'} size={18} />}

@@ -8,6 +8,7 @@ import { getT, useLang } from '../i18n';
 import { addDraft, projKey, removeDraft, useDrafts, useFeed, usePageVisible, type Draft, type FeedItem } from '../overview';
 import { permLabel, permModes } from '../perm';
 import { errorToast, navigate, openNewSession, toast, useStore, type HostEntry } from '../store';
+import { setComposerText } from '../composerState';
 import { rpc } from '../transport';
 import { isHostSession, sessionProjectDir, TOOL_LABEL, type GitStatus, type SessionInfo, type ToolKind, type Usage } from '../types';
 import { basename, clock, fmtTokens, isMobile, lsGet, lsSet, shortPath, timeAgo } from '../util';
@@ -133,11 +134,7 @@ async function startSession(
     setProgress(null);
     if (!info) return false;
     // The session exists but the first message didn't go out: open it with the message in its input box
-    try {
-      sessionStorage.setItem(`draft-${d.hostId}::${info.id}`, message);
-    } catch {
-      /* storage unavailable */
-    }
+    if (message) setComposerText(`${d.hostId}::${info.id}`, message);
     navigate({ kind: 'session', hostId: d.hostId, sessionId: info.id });
     return true;
   }

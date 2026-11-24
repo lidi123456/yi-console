@@ -51,6 +51,7 @@
   "referenceFile": "Reference file",
   "stopEsc": "Stop (Esc)",
   "willSendAfterTheUpload": "Will send after the upload finishes",
+  "sending": "Sending…",
   "sendToAiReadOn": "Send to AI (read on next step)",
   "queueSendAfterCurrentTurn": "Queue (send after current turn)",
   "send": "Send",

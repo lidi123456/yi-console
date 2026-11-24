@@ -953,6 +953,7 @@ export default interface Resources {
     "sendReviewComments": "发给 AI 修改 ({{n}})",
     "sendTheNextQueuedMessage": "会话空闲时马上发出下一条，之后每轮结束发一条",
     "sendToAiReadOn": "发给 AI：它会在下一步读到",
+    "sending": "正在发送…",
     "sessionExitedSendAMessage": "会话已结束，发送消息会自动恢复",
     "sideChatBtwDesc": "同 /side：开启右侧旁路快问，不写入主会话历史",
     "sideChatMentionHint": "旁路对话 · 点击引用结论",
