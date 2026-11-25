@@ -22,6 +22,13 @@ import { Icon } from './Icon';
 import { asyncAnswer, asyncAnswers, QuestionCard } from './QuestionCard';
 import { isPlanTool, PlanTracker, viewEntries, type PlanState } from '../plan';
 import { limitHead, limitOutcome, type LimitEvent } from '../limit';
+import {
+  applyGatewayEvent,
+  browserToolName,
+  claimEarlyGatewayForTool,
+  type GatewayEvent,
+  type PendingGateway,
+} from '../gatewayFold';
 
 const t = getT('chatView');
 
@@ -78,20 +85,6 @@ type Item =
       text: string;
     };
 
-const DESKTOP_SERVER = 'yi_computer_use';
-const BROWSER_SERVER = 'yi_browser';
-
-/** A gateway's record of an AI tool's MCP call: the desktop (`yi_computer_use`) or the AI browser (`yi_browser`) */
-type GatewayEvent = HubEvent & { kind: 'computer_use' | 'browser_use' };
-
-/** The tool row is a call of the gateway's MCP server (Claude/Qoder mcp__yi_computer_use__x, Codex yi_computer_use.x, ACP titles) */
-function isDesktopTool(it: Item & { k: 'tool' }, ev: GatewayEvent) {
-  // CodeBuddy calls MCP tools through DeferExecuteTool, whose input names the real tool
-  const wrapped = (it.input as { toolName?: unknown } | null)?.toolName;
-  const id = `${it.name} ${it.title} ${typeof wrapped === 'string' ? wrapped : ''}`;
-  return id.includes(ev.kind === 'browser_use' ? BROWSER_SERVER : DESKTOP_SERVER) ? id.includes(ev.tool) : false;
-}
-
 /** Texts of a gateway event, from the namespace of its gateway (literal calls, so i18n:check sees every key) */
 function gatewayText(ev: GatewayEvent) {
   const seconds = (ev.durationMs / 1000).toFixed(1);
@@ -141,10 +134,14 @@ function buildItems(events: HubEvent[], hideCompactCmd = false): Item[] {
   const items: Item[] = [];
   const tools = new Map<string, Item & { k: 'tool' }>();
   const desktopTools = new Map<string, Item & { k: 'tool' }>();
-  // Gateway actions that started before their tool row arrived (Codex reports the MCP call after it began)
-  const earlyRuns: GatewayEvent[] = [];
+  // Gateway actions that started or settled before their tool row arrived (preserving first-seen order within a turn)
+  const earlyGateways: PendingGateway[] = [];
   const perms = new Map<string, Item & { k: 'perm' }>();
   let planIdx = -1;
+  const adjustPlanIdx = (removedIdx: number) => {
+    if (planIdx > removedIdx) planIdx--;
+    else if (planIdx === removedIdx) planIdx = -1;
+  };
   const planner = new PlanTracker();
   // The current turn: starts at the first user message after the previous turn ended
   let turnStart: number | null = null;
@@ -164,39 +161,16 @@ function buildItems(events: HubEvent[], hideCompactCmd = false): Item[] {
     switch (e.kind) {
       case 'computer_use':
       case 'browser_use': {
-        // A desktop action is the AI tool's own MCP call seen from the gateway: fold it into that tool row
-        // (OpenBot shows them as ordinary tool steps). Match by server and tool name first; otherwise take the
-        // latest call of this turn still waiting for its result, since the gateway action runs inside it
-        // (CodeBuddy calls MCP tools through a DeferExecuteTool wrapper whose name and input don't say which).
-        // Unmatched ones are control changes or manual captures.
-        let tool = desktopTools.get(e.actionId);
-        if (!tool && e.status !== 'control') {
-          let pending: (Item & { k: 'tool' }) | undefined;
-          for (let i = items.length - 1; i >= 0; i--) {
-            const it = items[i];
-            if (it.k === 'user') break;
-            if (it.k !== 'tool' || it.desktop) continue;
-            if (isDesktopTool(it, e)) {
-              tool = it;
-              break;
-            }
-            if (!it.result) pending ??= it;
-          }
-          tool ??= pending;
-        }
-        if (tool) {
-          tool.desktop = e;
-          desktopTools.set(e.actionId, tool);
-          break;
-        }
         if (e.status === 'control') {
           items.push({ k: 'note', key: `desktop-${e.actionId}`, tone: 'muted', text: desktopControlText(e) });
           break;
         }
-        const old = items.findIndex((item) => item.k === 'desktop' && item.ev.actionId === e.actionId);
-        const next: Item = { k: 'desktop', key: `desktop-${e.actionId}`, ev: e };
-        if (old >= 0) items[old] = next; else if (e.images?.length || e.status !== 'running') items.push(next);
-        else earlyRuns.push(e);
+        // A desktop action is the AI tool's own MCP call seen from the gateway: fold it into that tool row
+        // (OpenBot shows them as ordinary tool steps). Match by server and tool name first; otherwise take the
+        // latest call of this turn still waiting for its result, since the gateway action runs inside it
+        // (CodeBuddy calls MCP tools through a DeferExecuteTool wrapper whose name and input don't say which).
+        // Unmatched ones wait in earlyGateways (and render standalone once settled/with screenshots) until a matching tool_call arrives.
+        applyGatewayEvent<Item & { k: 'tool' }>(items, earlyGateways, desktopTools, e, adjustPlanIdx);
         break;
       }
       case 'user_message':
@@ -236,6 +210,7 @@ function buildItems(events: HubEvent[], hideCompactCmd = false): Item[] {
           old.title = e.title || old.title;
           old.input = e.input ?? old.input;
           if (e.diffs?.length) old.diffs = e.diffs;
+          if (!old.desktop) claimEarlyGatewayForTool(items, earlyGateways, desktopTools, old, adjustPlanIdx);
         } else {
           const it: Item & { k: 'tool' } = {
             k: 'tool',
@@ -250,12 +225,7 @@ function buildItems(events: HubEvent[], hideCompactCmd = false): Item[] {
           tools.set(e.id, it);
           items.push(it);
           turnTools++;
-          const early = earlyRuns.findIndex((r) => desktopTools.get(r.actionId) === undefined && isDesktopTool(it, r));
-          if (early >= 0) {
-            it.desktop = earlyRuns[early];
-            desktopTools.set(earlyRuns[early].actionId, it);
-            earlyRuns.splice(early, 1);
-          }
+          claimEarlyGatewayForTool(items, earlyGateways, desktopTools, it, adjustPlanIdx);
         }
         break;
       }
@@ -1735,17 +1705,6 @@ function memoryToolArg(it: Item & { k: 'tool' }): string {
   if (typeof inner.query === 'string' && inner.query) return inner.query;
   if (typeof inner.scope === 'string' && inner.scope) return inner.scope;
   return '';
-}
-
-/** The yi_browser tool a row calls, from the forms the AI tools use: mcp__yi_browser__x (Claude), yi_browser.x
- *  (Codex), "x (yi_browser)" (Qoder), DeferExecuteTool with toolName (CodeBuddy) */
-function browserToolName(it: Item & { k: 'tool' }): string | null {
-  const wrapped = (it.input as { toolName?: unknown } | null)?.toolName;
-  for (const s of [it.name, typeof wrapped === 'string' ? wrapped : '', it.title]) {
-    const m = /^(?:mcp__yi_browser__|yi_browser\.)(browser_[a-z_]+)$/.exec(s ?? '') ?? /^(browser_[a-z_]+) \(yi_browser\)$/.exec(s ?? '');
-    if (m) return m[1];
-  }
-  return null;
 }
 
 function fmtDur(ms: number) {

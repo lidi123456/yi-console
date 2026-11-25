@@ -38,6 +38,7 @@ enum Seg {
 #[derive(Default, Clone)]
 struct ToolState {
     name: String,
+    kind: String,
     title: String,
     input: Value,
     diffs: Vec<FileDiff>,
@@ -191,6 +192,8 @@ struct State {
     agy_seen_checkpoints: HashSet<usize>,
     /// First possible wakeup step after the prompt or the last finished wakeup
     agy_wake_from: usize,
+    /// Finished prompt metadata awaiting its late-flushed PLANNER_RESPONSE on disk
+    agy_pending_flush: Option<AgyPendingPromptFlush>,
     /// Parent transcript step count known to be at or past agy's own ACP stream cursor
     agy_last_streamed_steps: usize,
     agy_pending_calls: HashMap<String, AgyPendingCall>,
@@ -374,6 +377,8 @@ pub async fn run(spec: StartSpec, em: Emitter, mut rx: mpsc::UnboundedReceiver<A
     let mut fatal: Option<String> = None;
     let mut agy_tick = tokio::time::interval(std::time::Duration::from_millis(250));
     agy_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut agy_idle_tick = tokio::time::interval(std::time::Duration::from_millis(500));
+    agy_idle_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut qoder_tick = tokio::time::interval(std::time::Duration::from_secs(1));
     qoder_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let startup_timeout = tokio::time::sleep(std::time::Duration::from_secs(60));
@@ -413,6 +418,11 @@ pub async fn run(spec: StartSpec, em: Emitter, mut rx: mpsc::UnboundedReceiver<A
                     let next = st.queue.remove(0);
                     em.status(SessionStatus::Running, None);
                     let m = prompt(&mut st, &em, &next);
+                    let _ = p.send(&m).await;
+                }
+            }
+            _ = agy_idle_tick.tick(), if st.is_antigravity && st.session_id.is_some() && !st.loading && !st.prompting && st.agy_watch.is_none() && st.queue.is_empty() => {
+                if let Some(m) = poll_agy_idle_transcript(&mut st, &spec, &em, agy_brain_dir) {
                     let _ = p.send(&m).await;
                 }
             }
@@ -495,8 +505,11 @@ pub async fn run(spec: StartSpec, em: Emitter, mut rx: mpsc::UnboundedReceiver<A
                     if st.agy_watch.as_ref().is_some_and(|w| w.reopened) {
                         carry_agy_watch(&mut st, &em);
                         if let Some(sid) = st.session_id.as_deref() {
-                            st.agy_wake_from = count_agy_transcript_steps(&agy_brain_dir(), sid);
+                            let dir = agy_brain_dir();
+                            st.agy_parent_transcript.seed_stamp(&dir, sid);
+                            st.agy_wake_from = count_agy_transcript_steps(&dir, sid);
                         }
+                        st.agy_pending_flush = None;
                         st.prompting = false;
                         st.end_subagents();
                         let keep_watch = !st.agy_carry.is_empty() && st.session_id.is_some();
@@ -725,6 +738,7 @@ fn prompt_with_brain_dir(st: &mut State, em: &Emitter, p: &Prompt, brain_dir: Op
     };
     st.agy_pre_turn_steps = pre_steps.len();
     st.agy_wake_from = st.agy_pre_turn_steps;
+    st.agy_pending_flush = None;
     st.agy_replay = if st.is_antigravity {
         let history = if st.agy_last_streamed_steps < pre_steps.len() {
             extract_agy_history(&pre_steps[st.agy_last_streamed_steps..])
@@ -1363,6 +1377,7 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Result<V
                     flush(st, em);
                     st.agy_replay = None;
                     st.agy_replay_hidden.clear();
+                    mark_agy_prompt_error(st, &agy_brain_dir());
                     if let Some(m) = st.agy_compact.take() {
                         st.compact_manual = false;
                         let duration_ms = u64::try_from((now_ms() - m.started).max(0)).ok();
@@ -1472,8 +1487,11 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Result<V
                 st.loading = false;
                 if st.is_antigravity {
                     if let Some(sid) = st.session_id.as_deref() {
-                        st.agy_wake_from = count_agy_transcript_steps(&agy_brain_dir(), sid);
+                        let dir = agy_brain_dir();
+                        st.agy_parent_transcript.seed_stamp(&dir, sid);
+                        st.agy_wake_from = count_agy_transcript_steps(&dir, sid);
                     }
+                    st.agy_pending_flush = None;
                     if matches!(kind, Pending::Load | Pending::Resume) {
                         // Guard the first prompt after resume against any pre-turn history agy may still replay.
                         st.agy_last_streamed_steps = 0;
@@ -1639,8 +1657,7 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Result<V
                     settle_agy_prompt_bg(st, em);
                     let steps = st.agy_parent_transcript.steps.clone();
                     settle_agy_compactions(st, spec, em, &steps);
-                    st.agy_wake_from = agy_prompt_boundary(&steps, st.agy_pre_turn_steps, &st.last_reply);
-                    st.agy_last_streamed_steps = st.agy_wake_from;
+                    record_agy_prompt_end(st, &steps);
                     steps.iter().skip(st.agy_wake_from).any(is_agy_wakeup)
                 } else {
                     false
@@ -1670,7 +1687,8 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Result<V
                             std::mem::take(&mut st.agy_send_baselines),
                             st.perm != "bypass",
                         )
-                        .with_open_bg_calls(std::mem::take(&mut st.agy_open_bg_calls));
+                        .with_open_bg_calls(std::mem::take(&mut st.agy_open_bg_calls))
+                        .with_pending_flush(st.agy_pending_flush.take());
                         watch.adopt(std::mem::take(&mut st.agy_carry));
                         watch.adopt_bg(std::mem::take(&mut st.agy_bg_tasks), std::mem::take(&mut st.agy_seen_system_steps));
                         // The turn ends now; subagents and background tasks go on in the background
@@ -1688,6 +1706,7 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Result<V
                         match step {
                             AgyStep::Done(req) => {
                                 remember_agy_wake_progress(st, &watch);
+                                st.agy_parent_transcript.stamp = watch.parent.stamp;
                                 st.agy_carry.unresumed_items.append(&mut watch.unresumed_items);
                                 out.extend(req);
                                 if reopened {
@@ -1781,6 +1800,14 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Result<V
             let tc = &params["toolCall"];
             let tc_id = tc["toolCallId"].as_str().unwrap_or("");
             let known = st.tools.get(tc_id).cloned().unwrap_or_default();
+            let req_kind = tc["kind"]
+                .as_str()
+                .filter(|k| !k.is_empty())
+                .or((!known.kind.is_empty()).then_some(known.kind.as_str()));
+            let req_name = meta_tool_name(tc)
+                .or(tc["name"].as_str())
+                .filter(|n| !n.is_empty() && !matches!(*n, "tool" | "other"))
+                .unwrap_or(known.name.as_str());
             let title = tc["title"]
                 .as_str()
                 .map(str::to_string)
@@ -1796,7 +1823,7 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Result<V
                 })
                 .collect();
             // Allow everything, or accept-edits mode and this is a file edit
-            let is_edit = tc["kind"] == "edit" || known.name == "edit" || !known.diffs.is_empty();
+            let is_edit = req_kind == Some("edit") || req_name == "edit" || !known.diffs.is_empty();
             // Antigravity asks the user questions through request_permission with an `interaction_` id; the options are answers
             let question = tc_id.starts_with("interaction_");
             if !question && (st.perm == "bypass" || (st.perm == "acceptEdits" && is_edit)) {
@@ -1809,8 +1836,8 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Result<V
                 }
             }
             // A yi_browser, yi_memory, yi_session or yi_review call: the gateway enforces plan mode, write policy, family scope and secret checks
-            if !question {
-                if let Some(name) = gateway_tool(&known.name, &title, &tc["rawInput"]) {
+            if !question && known.diffs.is_empty() {
+                if let Some(name) = gateway_tool(req_name, req_kind, &title, &tc["rawInput"]) {
                     if em.browser_tool_allowed(&name)
                         || em.memory_tool_allowed(&name)
                         || em.session_tool_allowed(&name)
@@ -1826,8 +1853,8 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Result<V
             }
             if !question && st.read_only_review {
                 match super::review_guard::classify_review_action(
-                    &known.name,
-                    tc["kind"].as_str(),
+                    req_name,
+                    req_kind,
                     &title,
                     &tc["rawInput"],
                 ) {
@@ -1857,10 +1884,10 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Result<V
             }
             em.event(EventBody::PermissionRequest {
                 request_id: rid,
-                tool_name: if known.name.is_empty() {
+                tool_name: if req_name.is_empty() {
                     "tool".into()
                 } else {
-                    known.name
+                    req_name.to_string()
                 },
                 title,
                 input: tc["rawInput"].clone(),
@@ -2285,24 +2312,45 @@ fn elicit_response(el: &PendingElicit, option_id: &str, answers: &[QuestionAnswe
     json!({"jsonrpc":"2.0","id":el.rpc_id,"result":result})
 }
 
-/// The `mcp__<server>__<tool>` name of a permission request for a built-in gateway tool (`yi_browser` or `yi_memory`).
-/// Exact forms only, never a substring of free input (a shell command mentioning the name must not be approved):
-/// Qoder names the call `mcp__<server>__<tool>` and titles it `<tool> (<server>)`; CodeBuddy wraps it in
-/// `DeferExecuteTool` with `toolName` in the input
-fn gateway_tool(name: &str, title: &str, input: &Value) -> Option<String> {
+/// The `mcp__<server>__<tool>` name of a permission request for a built-in gateway tool (`yi_browser`, `yi_memory`,
+/// `yi_session`, `yi_review`). Exact forms only, never a substring of free input or a display title on a non-MCP tool:
+/// Claude/Qoder/CodeBuddy use `mcp__<server>__<tool>`, Antigravity uses `mcp_<server>_<tool>`, Qoder titles
+/// `<tool> (<server>)`, and CodeBuddy wraps calls in `DeferExecuteTool` with `toolName` in the input.
+fn gateway_tool(name: &str, kind: Option<&str>, title: &str, input: &Value) -> Option<String> {
+    let kind_low = kind.unwrap_or("").trim().to_ascii_lowercase();
+    if matches!(kind_low.as_str(), "execute" | "edit" | "delete" | "move") {
+        return None;
+    }
+    let trimmed_name = name.trim();
+    let generic_name = trimmed_name.is_empty()
+        || trimmed_name.eq_ignore_ascii_case("tool")
+        || trimmed_name.eq_ignore_ascii_case("other");
+    let allow_title_fallback = generic_name && (kind_low.is_empty() || kind_low == "other");
     let check_server = |server: &str, is_known: &dyn Fn(&str) -> bool| -> Option<String> {
-        let prefix = format!("mcp__{server}__");
-        let known = |n: &str| n.strip_prefix(&prefix).filter(|t| is_known(t)).map(|_| n.to_string());
-        if let Some(n) = known(name) {
+        let double_prefix = format!("mcp__{server}__");
+        let single_prefix = format!("mcp_{server}_");
+        let known = |n: &str| {
+            n.strip_prefix(&double_prefix)
+                .or_else(|| n.strip_prefix(&single_prefix))
+                .filter(|t| is_known(t))
+                .map(|t| format!("{double_prefix}{t}"))
+        };
+        if let Some(n) = known(trimmed_name) {
             return Some(n);
         }
-        if name == "DeferExecuteTool" {
+        if trimmed_name == "DeferExecuteTool" {
             if let Some(n) = input["toolName"].as_str().and_then(known) {
                 return Some(n);
             }
         }
+        if !allow_title_fallback {
+            return None;
+        }
+        if let Some(n) = known(title) {
+            return Some(n);
+        }
         let suffix = format!(" ({server})");
-        title.strip_suffix(&suffix).filter(|t| is_known(t)).map(|t| format!("{prefix}{t}"))
+        title.strip_suffix(&suffix).filter(|t| is_known(t)).map(|t| format!("{double_prefix}{t}"))
     };
     check_server(crate::mcp::BROWSER_SERVER, &|t| yi_browser::tool_names().any(|x| x == t))
         .or_else(|| check_server(crate::mcp::MEMORY_SERVER, &|t| crate::memory::tool_names().any(|x| x == t)))
@@ -2897,6 +2945,9 @@ fn update(st: &mut State, em: &Emitter, u: &Value) {
             if let Some(title) = u["title"].as_str() {
                 t.title = title.to_string();
             }
+            if let Some(kind) = u["kind"].as_str().filter(|k| !k.is_empty()) {
+                t.kind = kind.to_string();
+            }
             if t.name.is_empty() {
                 // Antigravity puts its tool name (run_command, write_file…) at the top level
                 t.name = meta_tool_name(u)
@@ -3206,6 +3257,13 @@ fn count_agy_transcript_steps(brain_dir: &std::path::Path, conv_id: &str) -> usi
         .unwrap_or(0)
 }
 
+fn agy_transcript_stamp(brain_dir: &std::path::Path, conv_id: &str) -> Option<(u64, std::time::SystemTime)> {
+    let path = agy_transcript_path(brain_dir, conv_id)?;
+    std::fs::metadata(&path)
+        .ok()
+        .map(|m| (m.len(), m.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH)))
+}
+
 /// One transcript, parsed again only when its size or mtime changes (the watch polls every 250 ms)
 #[derive(Debug, Default)]
 struct AgyTranscript {
@@ -3216,15 +3274,22 @@ struct AgyTranscript {
 }
 
 impl AgyTranscript {
+    fn seed_stamp(&mut self, brain_dir: &std::path::Path, conv_id: &str) {
+        self.stamp = agy_transcript_stamp(brain_dir, conv_id);
+    }
+
+    fn has_changed(&self, brain_dir: &std::path::Path, conv_id: &str) -> bool {
+        let stamp = agy_transcript_stamp(brain_dir, conv_id);
+        stamp.is_some() && stamp != self.stamp
+    }
+
     fn refresh(&mut self, brain_dir: &std::path::Path, conv_id: &str) -> std::sync::Arc<Vec<Value>> {
         let now = tokio::time::Instant::now();
         let Some(path) = agy_transcript_path(brain_dir, conv_id) else {
             self.changed_at.get_or_insert(now);
             return self.steps.clone();
         };
-        let stamp = std::fs::metadata(&path)
-            .ok()
-            .map(|m| (m.len(), m.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH)));
+        let stamp = agy_transcript_stamp(brain_dir, conv_id);
         if stamp.is_some() && stamp != self.stamp {
             if let Ok(raw) = std::fs::read_to_string(&path) {
                 self.steps = std::sync::Arc::new(parse_agy_steps(&raw));
@@ -3235,6 +3300,17 @@ impl AgyTranscript {
         self.changed_at.get_or_insert(now);
         self.steps.clone()
     }
+}
+
+fn mark_agy_prompt_error(st: &mut State, brain_dir: &std::path::Path) {
+    if !st.is_antigravity {
+        return;
+    }
+    if let Some(sid) = st.session_id.as_deref() {
+        st.agy_parent_transcript.seed_stamp(brain_dir, sid);
+        st.agy_wake_from = st.agy_wake_from.max(count_agy_transcript_steps(brain_dir, sid));
+    }
+    st.agy_pending_flush = None;
 }
 
 fn agy_recipient(v: &Value) -> Option<&str> {
@@ -3266,22 +3342,45 @@ fn is_agy_wakeup(step: &Value) -> bool {
     }
 }
 
+fn is_agy_low_priority_system(step: &Value) -> bool {
+    step["content"].as_str().is_some_and(|c| c.contains("priority=MESSAGE_PRIORITY_LOW"))
+}
+
 fn is_agy_final_reply(step: &Value) -> bool {
     step["type"].as_str() == Some("PLANNER_RESPONSE")
         && step["status"].as_str() == Some("DONE")
         && step["tool_calls"].as_array().is_none_or(|a| a.is_empty())
 }
 
+const AGY_PROMPT_FLUSH_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+
+#[derive(Debug, Clone)]
+struct AgyPendingPromptFlush {
+    pre_turn_steps: usize,
+    reply: String,
+    finished_at: tokio::time::Instant,
+}
+
+fn find_agy_prompt_reply(steps: &[Value], pre_prompt: usize, reply: &str) -> Option<usize> {
+    let reply = reply.trim();
+    if reply.is_empty() {
+        return None;
+    }
+    steps
+        .iter()
+        .enumerate()
+        .skip(pre_prompt)
+        .find(|(_, step)| {
+            is_agy_final_reply(step) && step["content"].as_str().is_some_and(|text| text.trim() == reply)
+        })
+        .map(|(index, _)| index + 1)
+}
+
 fn agy_prompt_boundary(steps: &[Value], pre_prompt: usize, reply: &str) -> usize {
     // A wakeup can already be on disk when the prompt RPC returns. Anchor to the reply actually
     // streamed by the prompt whenever it is present, rather than skipping that wakeup.
-    let reply = reply.trim();
-    if !reply.is_empty() {
-        if let Some((index, _)) = steps.iter().enumerate().skip(pre_prompt).find(|(_, step)| {
-            is_agy_final_reply(step) && step["content"].as_str().is_some_and(|text| text.trim() == reply)
-        }) {
-            return index + 1;
-        }
+    if let Some(boundary) = find_agy_prompt_reply(steps, pre_prompt, reply) {
+        return boundary;
     }
     // For tool-only turns (empty reply), preserve any trailing wakeup SYSTEM_MESSAGE(s) already on disk.
     if let Some(first_trailing_wake) = steps
@@ -3296,6 +3395,114 @@ fn agy_prompt_boundary(steps: &[Value], pre_prompt: usize, reply: &str) -> usize
         return first_trailing_wake;
     }
     steps.len().max(pre_prompt)
+}
+
+fn record_agy_prompt_end(st: &mut State, steps: &[Value]) {
+    let reply_trimmed = st.last_reply.trim();
+    if !reply_trimmed.is_empty() {
+        if let Some(boundary) = find_agy_prompt_reply(steps, st.agy_pre_turn_steps, reply_trimmed) {
+            st.agy_wake_from = boundary;
+            st.agy_pending_flush = None;
+        } else {
+            st.agy_wake_from = agy_prompt_boundary(steps, st.agy_pre_turn_steps, reply_trimmed);
+            st.agy_pending_flush = Some(AgyPendingPromptFlush {
+                pre_turn_steps: st.agy_pre_turn_steps,
+                reply: reply_trimmed.to_string(),
+                finished_at: tokio::time::Instant::now(),
+            });
+        }
+    } else {
+        st.agy_wake_from = agy_prompt_boundary(steps, st.agy_pre_turn_steps, "");
+        if steps.len() <= st.agy_pre_turn_steps {
+            st.agy_pending_flush = Some(AgyPendingPromptFlush {
+                pre_turn_steps: st.agy_pre_turn_steps,
+                reply: String::new(),
+                finished_at: tokio::time::Instant::now(),
+            });
+        } else {
+            st.agy_pending_flush = None;
+        }
+    }
+    st.agy_last_streamed_steps = st.agy_wake_from;
+}
+
+/// Reconcile a finished prompt whose transcript steps flushed after `session/prompt` returned.
+/// Returns `true` while still waiting for the prompt's own steps to finish flushing so idle/watch
+/// polling does not treat them as a detached wakeup and replay them.
+fn reconcile_agy_prompt_flush(
+    pending: &mut Option<AgyPendingPromptFlush>,
+    steps: &[Value],
+    wake_from: &mut usize,
+    mut last_streamed: Option<&mut usize>,
+) -> bool {
+    let Some(pf) = pending.as_ref().cloned() else {
+        return false;
+    };
+    let mut commit = |idx: usize| {
+        *wake_from = (*wake_from).max(idx);
+        if let Some(ls) = last_streamed.as_deref_mut() {
+            *ls = (*ls).max(idx);
+        }
+        *pending = None;
+        false
+    };
+
+    if !pf.reply.is_empty() {
+        if let Some(boundary) = find_agy_prompt_reply(steps, pf.pre_turn_steps, &pf.reply) {
+            return commit(boundary);
+        }
+        if let Some((u_idx, _)) = steps
+            .iter()
+            .enumerate()
+            .skip(pf.pre_turn_steps)
+            .find(|(_, s)| s["type"].as_str() == Some("USER_INPUT"))
+        {
+            let wakeup_limit = steps
+                .iter()
+                .enumerate()
+                .skip(u_idx + 1)
+                .find(|(_, s)| is_agy_wakeup(s))
+                .map(|(idx, _)| idx)
+                .unwrap_or(steps.len());
+            if let Some((f_idx, _)) = steps[..wakeup_limit]
+                .iter()
+                .enumerate()
+                .skip(u_idx + 1)
+                .find(|(_, s)| is_agy_final_reply(s))
+            {
+                return commit(f_idx + 1);
+            }
+        }
+    } else if let Some((u_idx, _)) = steps
+        .iter()
+        .enumerate()
+        .skip(pf.pre_turn_steps)
+        .find(|(_, s)| s["type"].as_str() == Some("USER_INPUT"))
+    {
+        if let Some((w_idx, _)) = steps
+            .iter()
+            .enumerate()
+            .skip(u_idx + 1)
+            .find(|(_, s)| is_agy_wakeup(s))
+        {
+            return commit(w_idx);
+        }
+        if steps.len() > u_idx + 1
+            && steps[u_idx..].iter().all(agy_step_settled)
+            && !steps.last().is_some_and(|s| {
+                s["type"].as_str() == Some("PLANNER_RESPONSE")
+                    && s["tool_calls"].as_array().is_some_and(|a| !a.is_empty())
+            })
+        {
+            return commit(steps.len());
+        }
+    }
+
+    if pf.finished_at.elapsed() >= AGY_PROMPT_FLUSH_GRACE {
+        *pending = None;
+        return false;
+    }
+    true
 }
 
 /// Newer agy sends parent updates outside session/prompt too. Use them to start or keep
@@ -3331,10 +3538,14 @@ fn agy_detached_update(st: &mut State, params: &Value, brain_dir: impl FnOnce() 
             if let Some(title) = update["title"].as_str() {
                 tool.title = title.to_string();
             }
+            if let Some(kind) = update["kind"].as_str().filter(|k| !k.is_empty()) {
+                tool.kind = kind.to_string();
+            }
             if tool.name.is_empty() {
                 tool.name = meta_tool_name(update)
                     .or(update["name"].as_str())
-                    .unwrap_or(&tool.title)
+                    .or(update["kind"].as_str())
+                    .unwrap_or("tool")
                     .to_string();
             }
             if !update["rawInput"].is_null() {
@@ -3365,7 +3576,9 @@ fn note_agy_detached_activity(st: &mut State, brain_dir: impl FnOnce() -> PathBu
             sid.to_string(), brain_dir(), st.agy_wake_from, st.agy_wake_from, None,
             std::mem::take(&mut st.agy_pending_calls), std::mem::take(&mut st.agy_send_baselines),
             st.perm != "bypass",
-        ).with_open_bg_calls(std::mem::take(&mut st.agy_open_bg_calls));
+        )
+        .with_open_bg_calls(std::mem::take(&mut st.agy_open_bg_calls))
+        .with_pending_flush(st.agy_pending_flush.take());
         watch.adopt(std::mem::take(&mut st.agy_carry));
         watch.adopt_bg(std::mem::take(&mut st.agy_bg_tasks), std::mem::take(&mut st.agy_seen_system_steps));
         watch.detached = true;
@@ -3901,6 +4114,7 @@ struct AgyWatch {
     /// Steps in the parent's transcript when the prompt returned: everything before was streamed, so only a
     /// SYSTEM_MESSAGE after them can be the wakeup
     wake_from: usize,
+    pending_flush: Option<AgyPendingPromptFlush>,
     next_parent_discover_step: usize,
     discover_open: VecDeque<(String, Value)>,
     stop_reason: Option<String>,
@@ -3910,8 +4124,14 @@ struct AgyWatch {
     subagent_order: Vec<String>,
     bg_tasks: Vec<AgyBgTask>,
     seen_system_steps: HashSet<usize>,
+    /// First step index of the current wakeup cycle to stream/emit
+    cycle_start: Option<usize>,
     wakeup_msg_idx: Option<usize>,
+    /// When `wakeup_msg_idx` last advanced to a newer SYSTEM_MESSAGE
+    wakeup_seen_at: Option<tokio::time::Instant>,
     next_parent_emit_step: usize,
+    /// Highest parent step index + 1 where a step was actually emitted
+    emitted_until: usize,
     parent_lane: AgyToolLane,
     parent: AgyTranscript,
     wakeup_stable_ticks: usize,
@@ -3920,6 +4140,8 @@ struct AgyWatch {
     /// Text already previewed from the current in-progress planner step
     preview: Option<(usize, String)>,
     all_subagents_done_at: Option<tokio::time::Instant>,
+    /// True when the watch exits via grace/idle timeout rather than a completed planner reply
+    grace_expired: bool,
     /// Allow-all launches agy with --dangerously-skip-permissions, so subagents never wait for approval there
     stall_check: bool,
     /// The turn already ended (TurnEnd sent); the parent's wakeup reopens it with a Running status first
@@ -3951,6 +4173,7 @@ impl AgyWatch {
             brain_dir,
             pre_turn_steps,
             wake_from: wake_from.max(pre_turn_steps),
+            pending_flush: None,
             next_parent_discover_step: pre_turn_steps,
             discover_open: VecDeque::new(),
             stop_reason,
@@ -3960,8 +4183,11 @@ impl AgyWatch {
             subagent_order: vec![],
             bg_tasks: vec![],
             seen_system_steps: HashSet::new(),
+            cycle_start: None,
             wakeup_msg_idx: None,
+            wakeup_seen_at: None,
             next_parent_emit_step: pre_turn_steps,
+            emitted_until: 0,
             parent_lane: AgyToolLane::default(),
             parent: AgyTranscript::default(),
             wakeup_stable_ticks: 0,
@@ -3969,6 +4195,7 @@ impl AgyWatch {
             last_acp_activity: None,
             preview: None,
             all_subagents_done_at: None,
+            grace_expired: false,
             stall_check,
             detached: false,
             reopened: false,
@@ -3988,6 +4215,11 @@ impl AgyWatch {
 
     fn with_open_bg_calls(mut self, calls: VecDeque<(String, String)>) -> Self {
         self.open_bg_calls = calls;
+        self
+    }
+
+    fn with_pending_flush(mut self, pending_flush: Option<AgyPendingPromptFlush>) -> Self {
+        self.pending_flush = pending_flush;
         self
     }
 
@@ -4483,9 +4715,12 @@ fn agy_resume_req(watch: &AgyWatch, spec: &StartSpec, next_id: &mut u64, pending
 }
 
 fn remember_agy_wake_progress(st: &mut State, watch: &AgyWatch) {
-    st.agy_wake_from = st.agy_wake_from.max(watch.wake_from);
-    if watch.wake && watch.wakeup_msg_idx.is_some_and(|idx| watch.next_parent_emit_step > idx + 1) {
-        st.agy_wake_from = st.agy_wake_from.max(watch.next_parent_emit_step);
+    st.agy_wake_from = st.agy_wake_from.max(watch.wake_from).max(watch.emitted_until);
+    st.agy_pending_flush = watch.pending_flush.clone();
+    if watch.grace_expired {
+        if let Some(wi) = watch.wakeup_msg_idx {
+            st.agy_wake_from = st.agy_wake_from.max(wi + 1);
+        }
     }
 }
 
@@ -4499,6 +4734,9 @@ fn poll_agy_watch(st: &mut State, spec: &StartSpec, em: &Emitter) -> Option<Valu
     if !st.perms.is_empty() || !st.asks.is_empty() || !st.elicits.is_empty() {
         watch.started_at = tokio::time::Instant::now();
         watch.all_subagents_done_at = None;
+        if watch.wakeup_seen_at.is_some() {
+            watch.wakeup_seen_at = Some(tokio::time::Instant::now());
+        }
         watch.reopened |= watch.detached;
     }
     let step = step_agy_watch(&mut watch, spec, em, &mut st.next_id, &mut st.pending);
@@ -4522,6 +4760,7 @@ fn poll_agy_watch(st: &mut State, spec: &StartSpec, em: &Emitter) -> Option<Valu
         }
         AgyStep::Done(req) => {
             remember_agy_wake_progress(st, &watch);
+            st.agy_parent_transcript.stamp = watch.parent.stamp;
             // A queued prompt can start before the resume RPC is acknowledged or after it fails.
             st.agy_carry.unresumed_items.append(&mut watch.unresumed_items);
             if !watch.detached {
@@ -4535,6 +4774,81 @@ fn poll_agy_watch(st: &mut State, spec: &StartSpec, em: &Emitter) -> Option<Valu
             req
         }
     }
+}
+
+/// Passive metadata-only poll when agy is idle (no active watch or watch_active lock), catching
+/// detached cron wakeups, late daemon exit wakeups, or delayed replies on agy 1.5.7.
+fn poll_agy_idle_transcript(
+    st: &mut State,
+    spec: &StartSpec,
+    em: &Emitter,
+    brain_dir: impl FnOnce() -> PathBuf,
+) -> Option<Value> {
+    if !st.is_antigravity
+        || st.prompting
+        || st.loading
+        || st.agy_watch.is_some()
+        || !st.queue.is_empty()
+        || st.pending.values().any(|p| {
+            matches!(
+                p,
+                Pending::AgyResume | Pending::Session | Pending::Load | Pending::Resume | Pending::Prompt
+            )
+        })
+    {
+        return None;
+    }
+    let sid = st.session_id.as_deref()?;
+    let dir = brain_dir();
+    let changed = st.agy_parent_transcript.has_changed(&dir, sid);
+    let flush_expired = st
+        .agy_pending_flush
+        .as_ref()
+        .is_some_and(|pf| pf.finished_at.elapsed() >= AGY_PROMPT_FLUSH_GRACE);
+    if !changed && !flush_expired {
+        return None;
+    }
+    let steps = if changed {
+        st.agy_parent_transcript.refresh(&dir, sid)
+    } else {
+        st.agy_parent_transcript.steps.clone()
+    };
+    if reconcile_agy_prompt_flush(
+        &mut st.agy_pending_flush,
+        &steps,
+        &mut st.agy_wake_from,
+        Some(&mut st.agy_last_streamed_steps),
+    ) {
+        return None;
+    }
+    let tail = steps.get(st.agy_wake_from..)?;
+    let has_activity = tail.iter().any(|s| {
+        s["type"].as_str() == Some("PLANNER_RESPONSE")
+            || (is_agy_wakeup(s) && s["status"].as_str() == Some("DONE") && !is_agy_low_priority_system(s))
+    });
+    if !has_activity {
+        return None;
+    }
+    let mut watch = AgyWatch::new(
+        sid.to_string(),
+        dir,
+        st.agy_wake_from,
+        st.agy_wake_from,
+        None,
+        std::mem::take(&mut st.agy_pending_calls),
+        std::mem::take(&mut st.agy_send_baselines),
+        st.perm != "bypass",
+    )
+    .with_open_bg_calls(std::mem::take(&mut st.agy_open_bg_calls))
+    .with_pending_flush(st.agy_pending_flush.take());
+    watch.adopt(std::mem::take(&mut st.agy_carry));
+    watch.adopt_bg(
+        std::mem::take(&mut st.agy_bg_tasks),
+        std::mem::take(&mut st.agy_seen_system_steps),
+    );
+    watch.detached = true;
+    st.agy_watch = Some(watch);
+    poll_agy_watch(st, spec, em)
 }
 
 /// Advance the Antigravity subagent + background-task + parent-wakeup watch by one tick
@@ -4572,6 +4886,9 @@ fn step_agy_watch_inner(watch: &mut AgyWatch, spec: &StartSpec, next_id: &mut u6
     const STALL: Duration = Duration::from_secs(30);
 
     let parent_steps = watch.parent.refresh(&watch.brain_dir, &watch.parent_sid);
+    let waiting_prompt_flush =
+        reconcile_agy_prompt_flush(&mut watch.pending_flush, &parent_steps, &mut watch.wake_from, None);
+    watch.next_parent_emit_step = watch.next_parent_emit_step.max(watch.wake_from);
     let idle_for = || {
         watch
             .subagents
@@ -4713,6 +5030,7 @@ fn step_agy_watch_inner(watch: &mut AgyWatch, spec: &StartSpec, next_id: &mut u6
     }
 
     // 3. Check parent transcript for SYSTEM_MESSAGE notifications from finished subagent(s) and background tasks
+    let mut first_wakeup: Option<usize> = None;
     for (idx, step) in parent_steps.iter().enumerate().skip(watch.pre_turn_steps) {
         if !is_agy_system(step) || step["status"].as_str() != Some("DONE") {
             continue;
@@ -4732,11 +5050,13 @@ fn step_agy_watch_inner(watch: &mut AgyWatch, spec: &StartSpec, next_id: &mut u6
         if watch.seen_system_steps.insert(idx) {
             settle_bg_tasks_with_system(&mut watch.bg_tasks, step, &mut watch.out, true);
         }
-        if idx >= watch.wake_from && is_agy_wakeup(step) && watch.wakeup_msg_idx.is_none_or(|prev| idx >= prev) {
-            if watch.wakeup_msg_idx.is_none() {
-                watch.next_parent_emit_step = idx + 1;
+        if idx >= watch.wake_from && is_agy_wakeup(step) {
+            first_wakeup.get_or_insert(idx);
+            if watch.wakeup_msg_idx.is_none_or(|prev| idx > prev) {
+                watch.wakeup_msg_idx = Some(idx);
+                watch.wakeup_seen_at = Some(tokio::time::Instant::now());
+                watch.wakeup_stable_ticks = 0;
             }
-            watch.wakeup_msg_idx = Some(idx);
         }
     }
 
@@ -4752,13 +5072,46 @@ fn step_agy_watch_inner(watch: &mut AgyWatch, spec: &StartSpec, next_id: &mut u6
 
     flush_ready_pending_calls(watch, false);
 
-    // 4. Stream & capture parent's reactive wakeup turn once SYSTEM_MESSAGE arrives (even while other tasks still run)
-    let mut has_planner_after_wakeup = false;
-    if let Some(after_wakeup) = watch.wakeup_msg_idx.and_then(|idx| parent_steps.get(idx + 1..)) {
-        has_planner_after_wakeup = after_wakeup.iter().any(|s| s["type"] == "PLANNER_RESPONSE");
+    if watch.cycle_start.is_none() {
+        let first_planner = if waiting_prompt_flush {
+            None
+        } else {
+            parent_steps
+                .iter()
+                .enumerate()
+                .skip(watch.wake_from)
+                .find(|(_, s)| s["type"].as_str() == Some("PLANNER_RESPONSE"))
+                .map(|(idx, _)| idx)
+        };
+        let start = match (first_planner, first_wakeup) {
+            (Some(p), Some(w)) => Some(if p < w { p } else { w + 1 }),
+            (Some(p), None) => Some(p),
+            (None, Some(w)) => Some(w + 1),
+            (None, None) => None,
+        };
+        if let Some(start) = start {
+            watch.cycle_start = Some(start);
+            watch.next_parent_emit_step = watch.next_parent_emit_step.max(start);
+        }
+    }
+
+    let is_terminal_planner = |s: &Value| {
+        is_agy_final_reply(s)
+            || (s["type"] == "PLANNER_RESPONSE"
+                && matches!(s["status"].as_str(), Some("ERROR" | "INVALID"))
+                && s["tool_calls"].as_array().is_none_or(|a| a.is_empty()))
+    };
+
+    // 4. Stream & capture parent's reactive wakeup turn once SYSTEM_MESSAGE or detached PLANNER_RESPONSE arrives
+    let mut has_planner_after_latest = false;
+    let mut mid_turn = false;
+    let mut pending_wakeups_all_low = false;
+    if let Some(cycle_start) = watch.cycle_start {
+        let cycle_steps = parent_steps.get(cycle_start..).unwrap_or(&[]);
+        let has_planner_in_cycle = cycle_steps.iter().any(|s| s["type"] == "PLANNER_RESPONSE");
         // Only reopen for a new parent wakeup. Delayed ACP chunks from a completed step can
         // re-arm the watch, but cannot reopen that step or create an unmatched live buffer.
-        watch.wake |= has_planner_after_wakeup || watch.last_acp_activity.is_some();
+        watch.wake |= has_planner_in_cycle || watch.last_acp_activity.is_some();
         while watch.next_parent_emit_step < parent_steps.len() {
             let step_idx = watch.next_parent_emit_step;
             let step = &parent_steps[step_idx];
@@ -4877,18 +5230,39 @@ fn step_agy_watch_inner(watch: &mut AgyWatch, spec: &StartSpec, next_id: &mut u6
             watch.wakeup_stable_ticks = 0;
             if emitted {
                 watch.wake = true;
+                watch.emitted_until = watch.emitted_until.max(step_idx + 1);
             }
         }
 
+        let after_latest_wakeup = match watch.wakeup_msg_idx {
+            Some(wi) if wi + 1 >= cycle_start => parent_steps.get(wi + 1..).unwrap_or(&[]),
+            _ => cycle_steps,
+        };
+        has_planner_after_latest = after_latest_wakeup.iter().any(|s| s["type"] == "PLANNER_RESPONSE");
+        let last_in_cycle = cycle_steps.iter().rev().find(|step| !is_agy_system(step));
+        mid_turn = has_planner_in_cycle && !last_in_cycle.is_some_and(is_terminal_planner);
+        let pending_start = if has_planner_in_cycle {
+            cycle_start + cycle_steps.iter().rposition(|s| s["type"] == "PLANNER_RESPONSE").unwrap() + 1
+        } else {
+            watch.wake_from
+        };
+        let mut pending_wakeups = parent_steps
+            .get(pending_start..)
+            .unwrap_or(&[])
+            .iter()
+            .filter(|s| is_agy_wakeup(s) && s["status"].as_str() == Some("DONE"))
+            .peekable();
+        pending_wakeups_all_low = pending_wakeups.peek().is_some() && pending_wakeups.all(is_agy_low_priority_system);
+
         let all_done = watch.subagents.values().all(|t| t.done) && watch.bg_tasks.iter().all(|b| b.done);
-        let last = after_wakeup.iter().rev().find(|step| !is_agy_system(step));
-        let failed = last.is_some_and(|s| {
+        let last_after_latest = after_latest_wakeup.iter().rev().find(|step| !is_agy_system(step));
+        let failed = last_after_latest.is_some_and(|s| {
             s["type"] == "PLANNER_RESPONSE"
                 && matches!(s["status"].as_str(), Some("ERROR" | "INVALID"))
                 && s["tool_calls"].as_array().is_none_or(|a| a.is_empty())
         });
-        let last_is_final_planner = failed || last.is_some_and(is_agy_final_reply);
-        if has_planner_after_wakeup && last_is_final_planner && !watch.parent_lane.busy() && watch.next_parent_emit_step == parent_steps.len() {
+        let last_is_final_planner = failed || last_after_latest.is_some_and(is_agy_final_reply);
+        if has_planner_after_latest && last_is_final_planner && !watch.parent_lane.busy() && watch.next_parent_emit_step == parent_steps.len() {
             watch.wakeup_stable_ticks += 1;
             if watch.wakeup_stable_ticks >= 2 {
                 watch.wake_failed = failed;
@@ -4898,7 +5272,9 @@ fn step_agy_watch_inner(watch: &mut AgyWatch, spec: &StartSpec, next_id: &mut u6
                 }
                 // Another background task or subagent is still running: close this intermediate wakeup cycle and keep watching
                 watch.wake_from = parent_steps.len();
+                watch.cycle_start = None;
                 watch.wakeup_msg_idx = None;
+                watch.wakeup_seen_at = None;
                 watch.next_parent_emit_step = parent_steps.len();
                 watch.wakeup_stable_ticks = 0;
                 watch.all_subagents_done_at = None;
@@ -4910,7 +5286,7 @@ fn step_agy_watch_inner(watch: &mut AgyWatch, spec: &StartSpec, next_id: &mut u6
         }
     }
 
-    if watch.subagents.is_empty() && watch.bg_tasks.is_empty() && watch.wakeup_msg_idx.is_none() && !watch.reopened {
+    if watch.subagents.is_empty() && watch.bg_tasks.is_empty() && watch.cycle_start.is_none() && !watch.reopened {
         let expired = match watch.last_acp_activity {
             Some(activity) => activity.elapsed() >= WAKEUP_GRACE,
             None => watch.started_at.elapsed() >= DISCOVER_GRACE,
@@ -4936,20 +5312,29 @@ fn step_agy_watch_inner(watch: &mut AgyWatch, spec: &StartSpec, next_id: &mut u6
     let done_at = *watch.all_subagents_done_at.get_or_insert_with(tokio::time::Instant::now);
 
     // A real wakeup message can precede the first model step by more than WAKEUP_GRACE (e.g. a slow model call).
-    // Wait up to WAKEUP_START_TIMEOUT before concluding no reply will arrive, instead of stalling for IDLE_TIMEOUT.
+    // Wait up to WAKEUP_START_TIMEOUT from when the latest wakeup arrived before concluding no reply will come;
+    // low-priority trailing notices use WAKEUP_GRACE, and active mid-turn loops never trip WAKEUP_START_TIMEOUT.
     let no_unsettled = !parent_steps.get(watch.wake_from..).is_some_and(|tail| tail.iter().any(|s| !agy_step_settled(s)));
     let acp_quiet = watch.last_acp_activity.is_none_or(|t| t.elapsed() >= WAKEUP_GRACE);
-    let grace_exceeded = no_unsettled
-        && ((watch.wakeup_msg_idx.is_none() && done_at.elapsed() >= WAKEUP_GRACE)
-            || (watch.wakeup_msg_idx.is_some()
-                && !has_planner_after_wakeup
-                && acp_quiet
-                && done_at.elapsed() >= WAKEUP_START_TIMEOUT));
+    let grace_exceeded = if !no_unsettled {
+        false
+    } else if watch.cycle_start.is_none() {
+        acp_quiet && done_at.elapsed() >= WAKEUP_GRACE
+    } else if mid_turn {
+        false
+    } else if !has_planner_after_latest {
+        let wait_since = watch.wakeup_seen_at.map_or(done_at, |seen| seen.max(done_at));
+        let limit = if pending_wakeups_all_low { WAKEUP_GRACE } else { WAKEUP_START_TIMEOUT };
+        acp_quiet && wait_since.elapsed() >= limit
+    } else {
+        false
+    };
 
     if grace_exceeded || timed_out {
+        watch.grace_expired = true;
         let emitted_wakeup_text = watch.emitted_wake_text
-            || watch.wakeup_msg_idx.is_some_and(|wi| {
-                parent_steps[wi + 1..watch.next_parent_emit_step.min(parent_steps.len())]
+            || watch.cycle_start.is_some_and(|cs| {
+                parent_steps[cs..watch.next_parent_emit_step.min(parent_steps.len())]
                     .iter()
                     .any(|s| s["type"].as_str() == Some("PLANNER_RESPONSE") && !s["content"].as_str().unwrap_or("").trim().is_empty())
             });
@@ -5035,41 +5420,62 @@ mod tests {
     fn gateway_permissions_are_recognized_only_in_exact_forms() {
         use super::*;
         let none = Value::Null;
-        assert_eq!(gateway_tool("mcp__yi_browser__browser_click", "", &none).as_deref(), Some("mcp__yi_browser__browser_click"));
-        assert_eq!(gateway_tool("tool", "browser_snapshot (yi_browser)", &none).as_deref(), Some("mcp__yi_browser__browser_snapshot"));
+        assert_eq!(gateway_tool("mcp__yi_browser__browser_click", None, "", &none).as_deref(), Some("mcp__yi_browser__browser_click"));
+        assert_eq!(gateway_tool("tool", None, "browser_snapshot (yi_browser)", &none).as_deref(), Some("mcp__yi_browser__browser_snapshot"));
+        assert_eq!(gateway_tool("other", Some("other"), "browser_snapshot (yi_browser)", &none).as_deref(), Some("mcp__yi_browser__browser_snapshot"));
         let wrapped = json!({"toolName": "mcp__yi_browser__browser_open", "params": {"url": "x"}});
-        assert_eq!(gateway_tool("DeferExecuteTool", "DeferExecuteTool", &wrapped).as_deref(), Some("mcp__yi_browser__browser_open"));
+        assert_eq!(gateway_tool("DeferExecuteTool", None, "DeferExecuteTool", &wrapped).as_deref(), Some("mcp__yi_browser__browser_open"));
         // Unknown tools, other servers, and anything that only mentions the name are left to the user
-        assert_eq!(gateway_tool("mcp__yi_browser__browser_nope", "", &none), None);
-        assert_eq!(gateway_tool("mcp__yi_computer_use__click", "", &none), None);
-        assert_eq!(gateway_tool("Bash", "echo browser_click (yi_browser) && rm -rf x", &json!({"command": "mcp__yi_browser__browser_click"})), None);
-        assert_eq!(gateway_tool("Bash", "Bash", &json!({"toolName": "mcp__yi_browser__browser_click"})), None);
+        assert_eq!(gateway_tool("mcp__yi_browser__browser_nope", None, "", &none), None);
+        assert_eq!(gateway_tool("mcp__yi_computer_use__click", None, "", &none), None);
+        assert_eq!(gateway_tool("Bash", Some("execute"), "echo browser_click (yi_browser) && rm -rf x", &json!({"command": "mcp__yi_browser__browser_click"})), None);
+        assert_eq!(gateway_tool("Bash", None, "Bash", &json!({"toolName": "mcp__yi_browser__browser_click"})), None);
+        // Display title must never match when structured identity indicates a non-MCP / built-in tool or mutating kind
+        assert_eq!(gateway_tool("run_command", Some("execute"), "mcp_yi_browser_browser_open", &json!({"CommandLine": "rm -rf ."})), None);
+        assert_eq!(gateway_tool("run_command", Some("other"), "mcp_yi_browser_browser_open", &json!({"CommandLine": "rm -rf ."})), None);
+        assert_eq!(gateway_tool("run_command", None, "browser_click (yi_browser)", &none), None);
+        assert_eq!(gateway_tool("", Some("execute"), "mcp_yi_browser_browser_open", &none), None);
+        assert_eq!(gateway_tool("tool", Some("edit"), "browser_snapshot (yi_browser)", &none), None);
         // yi_memory exact forms
-        assert_eq!(gateway_tool("mcp__yi_memory__memory_read", "", &none).as_deref(), Some("mcp__yi_memory__memory_read"));
-        assert_eq!(gateway_tool("tool", "memory_search (yi_memory)", &none).as_deref(), Some("mcp__yi_memory__memory_search"));
+        assert_eq!(gateway_tool("mcp__yi_memory__memory_read", None, "", &none).as_deref(), Some("mcp__yi_memory__memory_read"));
+        assert_eq!(gateway_tool("tool", None, "memory_search (yi_memory)", &none).as_deref(), Some("mcp__yi_memory__memory_search"));
         let mem_wrapped = json!({"toolName": "mcp__yi_memory__memory_save", "params": {"id": "x"}});
-        assert_eq!(gateway_tool("DeferExecuteTool", "DeferExecuteTool", &mem_wrapped).as_deref(), Some("mcp__yi_memory__memory_save"));
-        assert_eq!(gateway_tool("mcp__yi_memory__memory_nope", "", &none), None);
-        assert_eq!(gateway_tool("Bash", "echo memory_read (yi_memory)", &json!({"command": "mcp__yi_memory__memory_read"})), None);
+        assert_eq!(gateway_tool("DeferExecuteTool", None, "DeferExecuteTool", &mem_wrapped).as_deref(), Some("mcp__yi_memory__memory_save"));
+        assert_eq!(gateway_tool("mcp__yi_memory__memory_nope", None, "", &none), None);
+        assert_eq!(gateway_tool("Bash", None, "echo memory_read (yi_memory)", &json!({"command": "mcp__yi_memory__memory_read"})), None);
         // yi_session exact forms
-        assert_eq!(gateway_tool("mcp__yi_session__session_read", "", &none).as_deref(), Some("mcp__yi_session__session_read"));
-        assert_eq!(gateway_tool("tool", "session_list_related (yi_session)", &none).as_deref(), Some("mcp__yi_session__session_list_related"));
+        assert_eq!(gateway_tool("mcp__yi_session__session_read", None, "", &none).as_deref(), Some("mcp__yi_session__session_read"));
+        assert_eq!(gateway_tool("tool", None, "session_list_related (yi_session)", &none).as_deref(), Some("mcp__yi_session__session_list_related"));
         let sess_wrapped = json!({"toolName": "mcp__yi_session__session_read", "params": {"sessionId": "p"}});
-        assert_eq!(gateway_tool("DeferExecuteTool", "DeferExecuteTool", &sess_wrapped).as_deref(), Some("mcp__yi_session__session_read"));
-        assert_eq!(gateway_tool("mcp__yi_session__session_write", "", &none), None);
-        assert_eq!(gateway_tool("Bash", "echo session_read (yi_session)", &json!({"command": "mcp__yi_session__session_read"})), None);
+        assert_eq!(gateway_tool("DeferExecuteTool", None, "DeferExecuteTool", &sess_wrapped).as_deref(), Some("mcp__yi_session__session_read"));
+        assert_eq!(gateway_tool("mcp__yi_session__session_write", None, "", &none), None);
+        assert_eq!(gateway_tool("Bash", None, "echo session_read (yi_session)", &json!({"command": "mcp__yi_session__session_read"})), None);
         // yi_review exact forms
-        assert_eq!(gateway_tool("mcp__yi_review__review_diff", "", &none).as_deref(), Some("mcp__yi_review__review_diff"));
-        assert_eq!(gateway_tool("tool", "review_scope (yi_review)", &none).as_deref(), Some("mcp__yi_review__review_scope"));
+        assert_eq!(gateway_tool("mcp__yi_review__review_diff", None, "", &none).as_deref(), Some("mcp__yi_review__review_diff"));
+        assert_eq!(gateway_tool("tool", None, "review_scope (yi_review)", &none).as_deref(), Some("mcp__yi_review__review_scope"));
         let rev_wrapped = json!({"toolName": "mcp__yi_review__review_read_file", "params": {"path": "a.rs"}});
-        assert_eq!(gateway_tool("DeferExecuteTool", "DeferExecuteTool", &rev_wrapped).as_deref(), Some("mcp__yi_review__review_read_file"));
-        assert_eq!(gateway_tool("mcp__yi_review__review_write", "", &none), None);
+        assert_eq!(gateway_tool("DeferExecuteTool", None, "DeferExecuteTool", &rev_wrapped).as_deref(), Some("mcp__yi_review__review_read_file"));
+        assert_eq!(gateway_tool("mcp__yi_review__review_write", None, "", &none), None);
+        // Antigravity single-underscore mcp_<server>_<tool> exact forms
+        assert_eq!(gateway_tool("mcp_yi_browser_browser_open", None, "", &none).as_deref(), Some("mcp__yi_browser__browser_open"));
+        assert_eq!(gateway_tool("tool", None, "mcp_yi_browser_browser_open", &none).as_deref(), Some("mcp__yi_browser__browser_open"));
+        assert_eq!(gateway_tool("mcp_yi_memory_memory_read", None, "", &none).as_deref(), Some("mcp__yi_memory__memory_read"));
+        assert_eq!(gateway_tool("mcp_yi_session_session_read", None, "", &none).as_deref(), Some("mcp__yi_session__session_read"));
+        let agy_wrapped = json!({"toolName": "mcp_yi_browser_browser_click", "params": {"ref": "e1"}});
+        assert_eq!(gateway_tool("DeferExecuteTool", None, "DeferExecuteTool", &agy_wrapped).as_deref(), Some("mcp__yi_browser__browser_click"));
+        assert_eq!(gateway_tool("mcp_yi_browser_browser_nope", None, "", &none), None);
+        assert_eq!(gateway_tool("Bash", None, "echo mcp_yi_browser_browser_open", &json!({"command": "mcp_yi_browser_browser_open"})), None);
     }
 
     #[test]
     fn read_only_review_guard_in_acp_adapter() {
         use super::*;
+        if std::env::var_os("YI_CONSOLE_HOME").is_none() {
+            std::env::set_var("YI_CONSOLE_HOME", std::env::temp_dir().join(format!("yi-acp-rev-test-{}", std::process::id())));
+        }
         let (hub, em, _rx) = crate::hub::test_emitter();
+        hub.review_mcp.ensure_session("s").unwrap();
+        hub.memories.ensure_session("s", std::path::Path::new("."), false).unwrap();
         let mut st = State { perm: "default".into(), read_only_review: true, ..Default::default() };
         let opts = json!([
             {"optionId": "once", "name": "Allow", "kind": "allow_once"},
@@ -5088,13 +5494,54 @@ mod tests {
         let out_write = handle(&mut st, &super::model_config_tests::agy_test_spec(), &write_req, &em).unwrap();
         assert_eq!(out_write[0]["result"]["outcome"]["optionId"], "no");
 
+        // A run_command whose display title matches an authorized gateway tool name must still hit read-only review guard and be denied
+        update(&mut st, &em, &json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": "spoof-cmd",
+            "name": "run_command",
+            "kind": "execute",
+            "title": "mcp_yi_review_review_diff",
+            "rawInput": {"CommandLine": "rm -rf ."}
+        }));
+        let spoof_cmd_req = json!({"jsonrpc": "2.0", "id": 13, "method": "session/request_permission", "params": {
+            "toolCall": {"toolCallId": "spoof-cmd", "title": "mcp_yi_review_review_diff", "rawInput": {"CommandLine": "rm -rf ."}},
+            "options": opts}});
+        let out_spoof_cmd = handle(&mut st, &super::model_config_tests::agy_test_spec(), &spoof_cmd_req, &em).unwrap();
+        assert_eq!(out_spoof_cmd[0]["result"]["outcome"]["optionId"], "no");
+
+        // Even without prior tool_call metadata, `kind: "execute"` with gateway title must be denied, not auto-approved
+        let direct_spoof_req = json!({"jsonrpc": "2.0", "id": 14, "method": "session/request_permission", "params": {
+            "toolCall": {"toolCallId": "spoof-direct", "kind": "execute", "title": "review_diff (yi_review)", "rawInput": {"command": "rm -rf ."}},
+            "options": opts}});
+        let out_direct_spoof = handle(&mut st, &super::model_config_tests::agy_test_spec(), &direct_spoof_req, &em).unwrap();
+        assert_eq!(out_direct_spoof[0]["result"]["outcome"]["optionId"], "no");
+
+        // In normal default mode (not read-only review), `run_command` with gateway title must also ask the user rather than auto-approve
+        let mut normal_st = State { perm: "default".into(), read_only_review: false, ..Default::default() };
+        update(&mut normal_st, &em, &json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": "spoof-mem",
+            "name": "run_command",
+            "kind": "other",
+            "title": "mcp_yi_memory_memory_read",
+            "rawInput": {"CommandLine": "rm -rf ."}
+        }));
+        let spoof_mem_req = json!({"jsonrpc": "2.0", "id": 15, "method": "session/request_permission", "params": {
+            "toolCall": {"toolCallId": "spoof-mem", "title": "mcp_yi_memory_memory_read", "rawInput": {"CommandLine": "rm -rf ."}},
+            "options": opts}});
+        let out_spoof_mem = handle(&mut normal_st, &super::model_config_tests::agy_test_spec(), &spoof_mem_req, &em).unwrap();
+        assert!(out_spoof_mem.is_empty());
+        assert!(normal_st.perms.contains_key("15"));
+
         let ask_req = json!({"jsonrpc": "2.0", "id": 12, "method": "session/request_permission", "params": {
             "toolCall": {"toolCallId": "a1", "kind": "execute", "title": "Run", "rawInput": {"command": "npm test"}},
             "options": opts}});
         let out_ask = handle(&mut st, &super::model_config_tests::agy_test_spec(), &ask_req, &em).unwrap();
         assert!(out_ask.is_empty());
         assert!(st.perms.contains_key("12"));
-        assert_eq!(hub.store.events_since("s", 0, 20).unwrap().len(), 1);
+        assert!(hub.store.events_since("s", 0, 20).unwrap().iter().any(|e| matches!(&e.body, EventBody::PermissionRequest { request_id, .. } if request_id == "12")));
+        hub.review_mcp.remove_session("s");
+        hub.memories.remove_session("s");
     }
 
     #[test]
@@ -7311,5 +7758,375 @@ mod model_config_tests {
             _ => None,
         }).collect();
         assert_eq!(compacts, vec![("done".into(), Some("auto".into()), Some(150100), Some(22000))]);
+    }
+
+    #[test]
+    fn antigravity_long_wakeup_survives_mid_turn_daemon_cancel_system_message() {
+        use super::*;
+        let root = tempfile::tempdir().unwrap();
+        let parent_id = "p-daemon-kill";
+        let (hub, em, _rx) = crate::hub::test_emitter();
+        let mut steps = vec![
+            json!({"step_index":0,"type":"USER_INPUT","status":"DONE","content":"build and test"}),
+            json!({"step_index":1,"type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"run_command","args":{"CommandLine":"mvn package","toolSummary":"Package jar"}}]}),
+            json!({"step_index":2,"type":"GENERIC","status":"RUNNING","content":"Created At: x\nTool is running as a background task with task id: p-daemon-kill/task-1\nTask Description: mvn package\nTask logs are available at: file:///tmp/t1.log"}),
+            json!({"step_index":3,"type":"PLANNER_RESPONSE","status":"DONE","content":"Packaging in background."}),
+            // Task 1 finishes -> wakeup starts; parent starts a daemon (not tracked in bg_tasks) and kills it mid-turn
+            json!({"step_index":4,"type":"SYSTEM_MESSAGE","status":"DONE","content":"<SYSTEM_MESSAGE>\n[Message] timestamp=x sender=p-daemon-kill/task-1 priority=MESSAGE_PRIORITY_HIGH content=Task id \"p-daemon-kill/task-1\" finished with result:\nCommand exited with code 0.\n\nCommand output:\nBUILD OK\nLog: file:///tmp/t1.log\n</SYSTEM_MESSAGE>"}),
+            json!({"step_index":5,"type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"run_command","args":{"CommandLine":"java -jar app.jar","IsDaemon":true}}]}),
+            json!({"step_index":6,"type":"GENERIC","status":"RUNNING","content":"Created At: x\nTool is running as a background task with task id: p-daemon-kill/task-2\nTask Description: java -jar app.jar"}),
+            json!({"step_index":7,"type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"manage_task","args":{"Action":"kill","TaskId":"p-daemon-kill/task-2"}}]}),
+            json!({"step_index":8,"type":"GENERIC","status":"DONE","content":"Task \"p-daemon-kill/task-2\" cancelled."}),
+            json!({"step_index":9,"type":"SYSTEM_MESSAGE","status":"DONE","content":"<SYSTEM_MESSAGE>\n[Message] timestamp=x sender=p-daemon-kill/task-2 priority=MESSAGE_PRIORITY_LOW content=Task id \"p-daemon-kill/task-2\" was canceled with result:\nTool execution was canceled\n</SYSTEM_MESSAGE>"}),
+        ];
+        write_agy_steps(root.path(), parent_id, &steps);
+
+        let mut st = State { is_antigravity: true, session_id: Some(parent_id.into()), ..Default::default() };
+        let mut watch = AgyWatch::new(parent_id.into(), root.path().to_path_buf(), 0, 4, Some("end_turn".into()), HashMap::new(), HashMap::new(), true);
+        watch.detached = true;
+        watch.add_bg_task(AgyBgTask { id: "p-daemon-kill/task-1".into(), kind: "local_bash".into(), description: "Package jar".into(), started_at: 1, output_file: None, tc_id: Some("tc-1".into()), is_daemon: false, timer_cond: None, done: false, announced: false, result: None });
+        st.agy_watch = Some(watch);
+
+        // First poll discovers task-1 completion and streams steps 5..8 before step 10 arrives
+        assert!(poll_agy_watch(&mut st, &agy_test_spec(), &em).is_none());
+        // Simulate > 300s having elapsed since task-1 finished while the daemon was running
+        st.agy_watch.as_mut().unwrap().all_subagents_done_at = Some(tokio::time::Instant::now() - std::time::Duration::from_secs(360));
+        assert!(poll_agy_watch(&mut st, &agy_test_spec(), &em).is_none());
+        assert!(st.agy_watch.is_some(), "mid-turn daemon cancel SYSTEM_MESSAGE must not abort active wakeup");
+        assert!(!hub.store.events_since("s", 0, 100).unwrap().iter().any(|e| matches!(e.body, EventBody::TurnEnd { .. })));
+
+        // Parent continues in the same wakeup: starts a schedule timer and settles an intermediate reply
+        steps.push(json!({"step_index":10,"type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"schedule","args":{"DurationSeconds":"15","Prompt":"\"Check readiness\""}}]}));
+        steps.push(json!({"step_index":11,"type":"GENERIC","status":"RUNNING","content":"Created At: x\nTool is running as a background task with task id: p-daemon-kill/task-3\nTask Description: Timer: 15s, Prompt: Check readiness\nTask logs are available at: file:///tmp/t3.log"}));
+        steps.push(json!({"step_index":12,"type":"PLANNER_RESPONSE","status":"DONE","content":"Restarting backend with export disabled."}));
+        write_agy_steps(root.path(), parent_id, &steps);
+
+        assert!(poll_agy_watch(&mut st, &agy_test_spec(), &em).is_none());
+        assert!(poll_agy_watch(&mut st, &agy_test_spec(), &em).is_none());
+        assert_eq!(hub.info("s").unwrap().background_tasks.len(), 1);
+        assert!(!st.agy_watch.as_ref().unwrap().reopened);
+
+        // Timer wakes parent -> parent calls mcp_yi_browser_* tools and finishes
+        steps.push(json!({"step_index":13,"type":"SYSTEM_MESSAGE","status":"DONE","content":"<SYSTEM_MESSAGE>\n[Message] timestamp=x sender=p-daemon-kill/task-3 priority=MESSAGE_PRIORITY_HIGH content=Check readiness\n</SYSTEM_MESSAGE>"}));
+        steps.push(json!({"step_index":14,"type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"mcp_yi_browser_browser_open","args":{"action":"reload"}},{"name":"mcp_yi_browser_browser_screenshot","args":{}}]}));
+        steps.push(json!({"step_index":15,"type":"GENERIC","status":"DONE","content":"reloaded"}));
+        steps.push(json!({"step_index":16,"type":"GENERIC","status":"DONE","content":"screenshot saved"}));
+        steps.push(json!({"step_index":17,"type":"PLANNER_RESPONSE","status":"DONE","content":"All E2E verified."}));
+        write_agy_steps(root.path(), parent_id, &steps);
+
+        assert!(poll_agy_watch(&mut st, &agy_test_spec(), &em).is_none());
+        let sync = poll_agy_watch(&mut st, &agy_test_spec(), &em).expect("final wakeup should send session/resume");
+        assert_eq!(sync["method"], "session/resume");
+
+        let evs = hub.store.events_since("s", 0, 200).unwrap();
+        assert!(evs.iter().any(|e| matches!(&e.body, EventBody::ToolCall { name, .. } if name == "mcp_yi_browser_browser_open")));
+        assert!(evs.iter().any(|e| matches!(&e.body, EventBody::ToolCall { name, .. } if name == "mcp_yi_browser_browser_screenshot")));
+        assert!(evs.iter().any(|e| matches!(&e.body, EventBody::AssistantText { text, .. } if text == "All E2E verified.")));
+    }
+
+    #[test]
+    fn antigravity_trailing_low_priority_notice_after_final_reply_uses_short_grace() {
+        use super::*;
+        let root = tempfile::tempdir().unwrap();
+        let parent_id = "p-low-trail";
+        let (hub, em, _rx) = crate::hub::test_emitter();
+        let mut steps = vec![
+            json!({"step_index":0,"type":"USER_INPUT","status":"DONE","content":"go"}),
+            json!({"step_index":1,"type":"PLANNER_RESPONSE","status":"DONE","content":"Working."}),
+            json!({"step_index":2,"type":"SYSTEM_MESSAGE","status":"DONE","content":"<SYSTEM_MESSAGE>\n[Message] timestamp=x sender=p-low-trail/task-1 priority=MESSAGE_PRIORITY_HIGH content=Task id \"p-low-trail/task-1\" finished with result:\nok\n</SYSTEM_MESSAGE>"}),
+            json!({"step_index":3,"type":"PLANNER_RESPONSE","status":"DONE","content":"Done."}),
+        ];
+        write_agy_steps(root.path(), parent_id, &steps);
+
+        let mut st = State { is_antigravity: true, session_id: Some(parent_id.into()), ..Default::default() };
+        let mut watch = AgyWatch::new(parent_id.into(), root.path().to_path_buf(), 0, 2, Some("end_turn".into()), HashMap::new(), HashMap::new(), true);
+        watch.detached = true;
+        st.agy_watch = Some(watch);
+
+        // Tick 1 sees step 3 final reply
+        assert!(poll_agy_watch(&mut st, &agy_test_spec(), &em).is_none());
+
+        // Trailing low-priority notice arrives after final reply without waking parent
+        steps.push(json!({"step_index":4,"type":"SYSTEM_MESSAGE","status":"DONE","content":"<SYSTEM_MESSAGE>\n[Message] timestamp=x sender=p-low-trail/task-daemon priority=MESSAGE_PRIORITY_LOW content=Task id \"p-low-trail/task-daemon\" was canceled with result:\nTool execution was canceled\n</SYSTEM_MESSAGE>"}));
+        write_agy_steps(root.path(), parent_id, &steps);
+
+        assert!(poll_agy_watch(&mut st, &agy_test_spec(), &em).is_none());
+        // Even with stale all_subagents_done_at (>300s), fresh wakeup_seen_at keeps it alive until WAKEUP_GRACE (20s)
+        st.agy_watch.as_mut().unwrap().all_subagents_done_at = Some(tokio::time::Instant::now() - std::time::Duration::from_secs(360));
+        assert!(poll_agy_watch(&mut st, &agy_test_spec(), &em).is_none());
+        assert!(st.agy_watch.is_some());
+
+        // Past WAKEUP_GRACE (25s < 300s), low-priority trailing notice settles cleanly without waiting 300s
+        st.agy_watch.as_mut().unwrap().wakeup_seen_at = Some(tokio::time::Instant::now() - std::time::Duration::from_secs(25));
+        let sync = poll_agy_watch(&mut st, &agy_test_spec(), &em).expect("low-priority trailing notice should exit on short grace");
+        assert_eq!(sync["method"], "session/resume");
+        assert_eq!(st.agy_wake_from, 5);
+        assert!(poll_agy_idle_transcript(&mut st, &agy_test_spec(), &em, || root.path().to_path_buf()).is_none());
+
+        let replies: Vec<_> = hub.store.events_since("s", 0, 100).unwrap().into_iter().filter_map(|e| match e.body {
+            EventBody::AssistantText { text, .. } => Some(text),
+            _ => None,
+        }).collect();
+        assert_eq!(replies, vec!["Done."]);
+    }
+
+    #[test]
+    fn antigravity_high_priority_wakeup_after_final_reply_gets_fresh_timeout() {
+        use super::*;
+        let root = tempfile::tempdir().unwrap();
+        let parent_id = "p-high-trail";
+        let (hub, em, _rx) = crate::hub::test_emitter();
+        let mut steps = vec![
+            json!({"step_index":0,"type":"USER_INPUT","status":"DONE","content":"go"}),
+            json!({"step_index":1,"type":"PLANNER_RESPONSE","status":"DONE","content":"Working."}),
+            json!({"step_index":2,"type":"SYSTEM_MESSAGE","status":"DONE","content":"<SYSTEM_MESSAGE>\n[Message] timestamp=x sender=p-high-trail/task-1 priority=MESSAGE_PRIORITY_HIGH content=Task id \"p-high-trail/task-1\" finished with result:\nok\n</SYSTEM_MESSAGE>"}),
+            json!({"step_index":3,"type":"PLANNER_RESPONSE","status":"DONE","content":"Stage 1 done."}),
+        ];
+        write_agy_steps(root.path(), parent_id, &steps);
+
+        let mut st = State { is_antigravity: true, session_id: Some(parent_id.into()), ..Default::default() };
+        let mut watch = AgyWatch::new(parent_id.into(), root.path().to_path_buf(), 0, 2, Some("end_turn".into()), HashMap::new(), HashMap::new(), true);
+        watch.detached = true;
+        st.agy_watch = Some(watch);
+
+        assert!(poll_agy_watch(&mut st, &agy_test_spec(), &em).is_none());
+
+        // High-priority wakeup arrives after step 3 while all_subagents_done_at is already > 300s old
+        steps.push(json!({"step_index":4,"type":"SYSTEM_MESSAGE","status":"DONE","content":"<SYSTEM_MESSAGE>\n[Message] timestamp=x sender=p-high-trail/task-2 priority=MESSAGE_PRIORITY_HIGH content=Task id \"p-high-trail/task-2\" finished with result:\nstage 2 ok\n</SYSTEM_MESSAGE>"}));
+        write_agy_steps(root.path(), parent_id, &steps);
+
+        assert!(poll_agy_watch(&mut st, &agy_test_spec(), &em).is_none());
+        st.agy_watch.as_mut().unwrap().all_subagents_done_at = Some(tokio::time::Instant::now() - std::time::Duration::from_secs(360));
+        st.agy_watch.as_mut().unwrap().wakeup_seen_at = Some(tokio::time::Instant::now() - std::time::Duration::from_secs(25));
+        assert!(poll_agy_watch(&mut st, &agy_test_spec(), &em).is_none());
+        assert!(st.agy_watch.is_some(), "high-priority wakeup must keep WAKEUP_START_TIMEOUT from fresh wakeup_seen_at");
+
+        steps.push(json!({"step_index":5,"type":"PLANNER_RESPONSE","status":"DONE","content":"Stage 2 done."}));
+        write_agy_steps(root.path(), parent_id, &steps);
+
+        assert!(poll_agy_watch(&mut st, &agy_test_spec(), &em).is_none());
+        let sync = poll_agy_watch(&mut st, &agy_test_spec(), &em).expect("stage 2 should finish with session/resume");
+        assert_eq!(sync["method"], "session/resume");
+
+        let replies: Vec<_> = hub.store.events_since("s", 0, 100).unwrap().into_iter().filter_map(|e| match e.body {
+            EventBody::AssistantText { text, .. } => Some(text),
+            _ => None,
+        }).collect();
+        assert_eq!(replies, vec!["Stage 1 done.", "Stage 2 done."]);
+    }
+
+    #[test]
+    fn antigravity_passive_idle_transcript_poll_catches_cron_and_bare_planner_wakeup() {
+        use super::*;
+        let root = tempfile::tempdir().unwrap();
+        let parent_id = "p-idle-poll";
+        let (hub, em, _rx) = crate::hub::test_emitter();
+        let spec = agy_test_spec();
+        let mut steps = vec![
+            json!({"step_index":0,"type":"USER_INPUT","status":"DONE","content":"set cron"}),
+            json!({"step_index":1,"type":"PLANNER_RESPONSE","status":"DONE","content":"Cron scheduled."}),
+        ];
+        write_agy_steps(root.path(), parent_id, &steps);
+
+        let mut st = State { is_antigravity: true, session_id: Some(parent_id.into()), agy_wake_from: 2, ..Default::default() };
+        st.agy_parent_transcript.seed_stamp(root.path(), parent_id);
+        assert!(poll_agy_idle_transcript(&mut st, &spec, &em, || root.path().to_path_buf()).is_none());
+        assert!(st.agy_watch.is_none());
+
+        // Internal sender=system and MESSAGE_PRIORITY_LOW notices without a PLANNER_RESPONSE do not arm the watch
+        steps.push(json!({"step_index":2,"type":"SYSTEM_MESSAGE","status":"DONE","content":"<SYSTEM_MESSAGE>\n[Message] timestamp=x sender=system priority=MESSAGE_PRIORITY_HIGH content=internal\n</SYSTEM_MESSAGE>"}));
+        steps.push(json!({"step_index":3,"type":"SYSTEM_MESSAGE","status":"DONE","content":"<SYSTEM_MESSAGE>\n[Message] timestamp=x sender=p-idle-poll/task-9 priority=MESSAGE_PRIORITY_LOW content=Task id \"p-idle-poll/task-9\" was canceled\n</SYSTEM_MESSAGE>"}));
+        write_agy_steps(root.path(), parent_id, &steps);
+        assert!(poll_agy_idle_transcript(&mut st, &spec, &em, || root.path().to_path_buf()).is_none());
+        assert!(st.agy_watch.is_none());
+
+        // 1. Cron HIGH wakeup arrives while idle -> passive poll arms AgyWatch and streams reply
+        steps.push(json!({"step_index":4,"type":"SYSTEM_MESSAGE","status":"DONE","content":"<SYSTEM_MESSAGE>\n[Message] timestamp=x sender=p-idle-poll/cron-1 priority=MESSAGE_PRIORITY_HIGH content=Cron tick\n</SYSTEM_MESSAGE>"}));
+        write_agy_steps(root.path(), parent_id, &steps);
+        assert!(poll_agy_idle_transcript(&mut st, &spec, &em, || root.path().to_path_buf()).is_none());
+        assert!(st.agy_watch.is_some());
+        assert!(!st.agy_watch.as_ref().unwrap().reopened);
+
+        steps.push(json!({"step_index":5,"type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"mcp_yi_browser_browser_open","args":{"url":"http://127.0.0.1:3000"}}]}));
+        steps.push(json!({"step_index":6,"type":"GENERIC","status":"DONE","content":"opened"}));
+        steps.push(json!({"step_index":7,"type":"PLANNER_RESPONSE","status":"DONE","content":"Cron ran."}));
+        write_agy_steps(root.path(), parent_id, &steps);
+
+        assert!(poll_agy_watch(&mut st, &spec, &em).is_none());
+        let sync = poll_agy_watch(&mut st, &spec, &em).expect("cron wakeup should send session/resume");
+        assert_eq!(sync["method"], "session/resume");
+        assert_eq!(st.agy_wake_from, 8);
+        let sync_id = sync["id"].as_u64().unwrap();
+        let _ = handle(&mut st, &spec, &json!({"jsonrpc":"2.0","id":sync_id,"result":{}}), &em).unwrap();
+
+        // 2. Bare detached PLANNER_RESPONSE (no preceding SYSTEM_MESSAGE at >= agy_wake_from) also streams cleanly
+        steps.push(json!({"step_index":8,"type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"mcp_yi_browser_browser_snapshot","args":{}}]}));
+        steps.push(json!({"step_index":9,"type":"GENERIC","status":"DONE","content":"snap"}));
+        steps.push(json!({"step_index":10,"type":"PLANNER_RESPONSE","status":"DONE","content":"Bare wakeup done."}));
+        write_agy_steps(root.path(), parent_id, &steps);
+
+        assert!(poll_agy_idle_transcript(&mut st, &spec, &em, || root.path().to_path_buf()).is_none());
+        assert!(st.agy_watch.is_some());
+        let sync2 = poll_agy_watch(&mut st, &spec, &em).expect("bare planner wakeup should send session/resume");
+        assert_eq!(sync2["method"], "session/resume");
+        assert_eq!(st.agy_wake_from, 11);
+        let sync2_id = sync2["id"].as_u64().unwrap();
+        let _ = handle(&mut st, &spec, &json!({"jsonrpc":"2.0","id":sync2_id,"result":{}}), &em).unwrap();
+
+        // 3. Prompt error helper advances agy_wake_from and stamp so failed prompt steps aren't re-emitted
+        steps.push(json!({"step_index":11,"type":"USER_INPUT","status":"DONE","content":"fail me"}));
+        steps.push(json!({"step_index":12,"type":"PLANNER_RESPONSE","status":"ERROR","content":""}));
+        write_agy_steps(root.path(), parent_id, &steps);
+        mark_agy_prompt_error(&mut st, root.path());
+        assert_eq!(st.agy_wake_from, 13);
+        assert!(poll_agy_idle_transcript(&mut st, &spec, &em, || root.path().to_path_buf()).is_none());
+
+        let evs = hub.store.events_since("s", 0, 200).unwrap();
+        assert!(evs.iter().any(|e| matches!(&e.body, EventBody::ToolCall { name, .. } if name == "mcp_yi_browser_browser_open")));
+        assert!(evs.iter().any(|e| matches!(&e.body, EventBody::ToolCall { name, .. } if name == "mcp_yi_browser_browser_snapshot")));
+        assert!(evs.iter().any(|e| matches!(&e.body, EventBody::AssistantText { text, .. } if text == "Cron ran.")));
+        assert!(evs.iter().any(|e| matches!(&e.body, EventBody::AssistantText { text, .. } if text == "Bare wakeup done.")));
+    }
+
+    #[test]
+    fn antigravity_idle_poll_skips_late_flushed_prompt_reply() {
+        use super::*;
+        let root = tempfile::tempdir().unwrap();
+        let parent_id = "p-late-flush";
+        let (hub, em, _rx) = crate::hub::test_emitter();
+        crate::hub::test_set_tool(&hub, "s", ToolKind::Antigravity);
+        let spec = agy_test_spec();
+
+        let pre = vec![
+            json!({"step_index":0,"type":"USER_INPUT","status":"DONE","content":"first"}),
+            json!({"step_index":1,"type":"PLANNER_RESPONSE","status":"DONE","content":"First answer."}),
+        ];
+        write_agy_steps(root.path(), parent_id, &pre);
+
+        // Case 1: session/prompt finishes while disk still lacks step 2..5 (multi-step turn with tool call)
+        let mut st = State { is_antigravity: true, session_id: Some(parent_id.into()), ..Default::default() };
+        let req = prompt_with_brain_dir(&mut st, &em, &Prompt { text: "check status".into(), images: vec![] }, Some(root.path()));
+        update(&mut st, &em, &json!({"sessionUpdate":"tool_call","toolCallId":"t1","name":"read_file","kind":"read","title":"Read a.txt"}));
+        update(&mut st, &em, &json!({"sessionUpdate":"tool_call_update","toolCallId":"t1","status":"completed"}));
+        update(&mut st, &em, &json!({"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Prompt answer."}}));
+        handle(&mut st, &spec, &json!({"id":req["id"],"result":{"stopReason":"end_turn"}}), &em).unwrap();
+        assert_eq!(st.agy_wake_from, 2);
+        assert!(st.agy_pending_flush.is_some());
+
+        // Partial disk flush arrives first (USER_INPUT + intermediate tool PLANNER_RESPONSE + GENERIC): must wait, not replay
+        let mut partial = pre.clone();
+        partial.push(json!({"step_index":2,"type":"USER_INPUT","status":"DONE","content":"check status"}));
+        partial.push(json!({"step_index":3,"type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"read_file","args":{"Path":"a.txt"}}]}));
+        partial.push(json!({"step_index":4,"type":"GENERIC","status":"DONE","content":"ok"}));
+        write_agy_steps(root.path(), parent_id, &partial);
+        assert!(poll_agy_idle_transcript(&mut st, &spec, &em, || root.path().to_path_buf()).is_none());
+        assert!(st.agy_watch.is_none(), "partial late prompt flush must not arm detached wakeup watch");
+        assert!(st.agy_pending_flush.is_some());
+
+        // Final PLANNER_RESPONSE flushes afterwards -> boundary advances past step 5 with zero replay or extra TurnEnd
+        let mut full = partial;
+        full.push(json!({"step_index":5,"type":"PLANNER_RESPONSE","status":"DONE","content":"Prompt answer."}));
+        write_agy_steps(root.path(), parent_id, &full);
+        assert!(poll_agy_idle_transcript(&mut st, &spec, &em, || root.path().to_path_buf()).is_none());
+        assert!(st.agy_watch.is_none());
+        assert!(st.agy_pending_flush.is_none());
+        assert_eq!(st.agy_wake_from, 6);
+
+        // Case 2: Late prompt reply + real detached wakeup flush together -> skip prompt reply and emit only the wakeup
+        let req2 = prompt_with_brain_dir(&mut st, &em, &Prompt { text: "second".into(), images: vec![] }, Some(root.path()));
+        update(&mut st, &em, &json!({"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Second prompt reply."}}));
+        handle(&mut st, &spec, &json!({"id":req2["id"],"result":{"stopReason":"end_turn"}}), &em).unwrap();
+        assert_eq!(st.agy_wake_from, 6);
+
+        let mut with_wake = full;
+        with_wake.push(json!({"step_index":6,"type":"USER_INPUT","status":"DONE","content":"second"}));
+        with_wake.push(json!({"step_index":7,"type":"PLANNER_RESPONSE","status":"DONE","content":"Second prompt reply."}));
+        with_wake.push(json!({"step_index":8,"type":"SYSTEM_MESSAGE","status":"DONE","content":"<SYSTEM_MESSAGE>\n[Message] timestamp=x sender=p-late-flush/cron-1 priority=MESSAGE_PRIORITY_HIGH content=Cron wake\n</SYSTEM_MESSAGE>"}));
+        with_wake.push(json!({"step_index":9,"type":"PLANNER_RESPONSE","status":"DONE","content":"Genuine wakeup reply."}));
+        write_agy_steps(root.path(), parent_id, &with_wake);
+
+        assert!(poll_agy_idle_transcript(&mut st, &spec, &em, || root.path().to_path_buf()).is_none());
+        assert!(st.agy_watch.is_some(), "real wakeup after late prompt flush must still run");
+        let sync = poll_agy_watch(&mut st, &spec, &em).expect("wakeup should settle with session/resume");
+        assert_eq!(sync["method"], "session/resume");
+        assert_eq!(st.agy_wake_from, 10);
+
+        let evs = hub.store.events_since("s", 0, 100).unwrap();
+        let replies: Vec<_> = evs.iter().filter_map(|e| match &e.body {
+            EventBody::AssistantText { text, .. } => Some(text.as_str()),
+            _ => None,
+        }).collect();
+        assert_eq!(replies, vec!["Prompt answer.", "Second prompt reply.", "Genuine wakeup reply."]);
+        assert_eq!(evs.iter().filter(|e| matches!(e.body, EventBody::TurnEnd { .. })).count(), 3);
+    }
+
+    #[test]
+    fn antigravity_same_tick_bare_planner_and_system_message_keeps_planner_order() {
+        use super::*;
+        let root = tempfile::tempdir().unwrap();
+        let parent_id = "p-same-tick";
+        let (hub, em, _rx) = crate::hub::test_emitter();
+        let spec = agy_test_spec();
+
+        // 1. Bare PLANNER_RESPONSE followed by a trailing LOW-priority SYSTEM_MESSAGE arriving in the same poll
+        let steps_low = vec![
+            json!({"step_index":0,"type":"USER_INPUT","status":"DONE","content":"go"}),
+            json!({"step_index":1,"type":"PLANNER_RESPONSE","status":"DONE","content":"Initial."}),
+            json!({"step_index":2,"type":"PLANNER_RESPONSE","status":"DONE","content":"Bare wakeup before notice."}),
+            json!({"step_index":3,"type":"SYSTEM_MESSAGE","status":"DONE","content":"<SYSTEM_MESSAGE>\n[Message] timestamp=x sender=p-same-tick/daemon-1 priority=MESSAGE_PRIORITY_LOW content=Task id \"p-same-tick/daemon-1\" was canceled\n</SYSTEM_MESSAGE>"}),
+        ];
+        write_agy_steps(root.path(), parent_id, &steps_low);
+
+        let mut st = State { is_antigravity: true, session_id: Some(parent_id.into()), ..Default::default() };
+        let mut watch = AgyWatch::new(parent_id.into(), root.path().to_path_buf(), 2, 2, Some("end_turn".into()), HashMap::new(), HashMap::new(), true);
+        watch.detached = true;
+        st.agy_watch = Some(watch);
+
+        assert!(poll_agy_watch(&mut st, &spec, &em).is_none());
+        let w = st.agy_watch.as_mut().unwrap();
+        assert_eq!(w.cycle_start, Some(2), "cycle_start must pick earliest PLANNER_RESPONSE before later SYSTEM_MESSAGE");
+        // Grace expires on trailing low-priority notice without dropping step 2
+        w.all_subagents_done_at = Some(tokio::time::Instant::now() - std::time::Duration::from_secs(25));
+        w.wakeup_seen_at = Some(tokio::time::Instant::now() - std::time::Duration::from_secs(25));
+        let sync = poll_agy_watch(&mut st, &spec, &em).expect("grace expiry should send session/resume");
+        assert_eq!(sync["method"], "session/resume");
+        assert_eq!(st.agy_wake_from, 4);
+
+        let replies: Vec<_> = hub.store.events_since("s", 0, 100).unwrap().into_iter().filter_map(|e| match e.body {
+            EventBody::AssistantText { text, .. } => Some(text),
+            _ => None,
+        }).collect();
+        assert_eq!(replies, vec!["Bare wakeup before notice."]);
+
+        // 2. Bare PLANNER_RESPONSE + HIGH SYSTEM_MESSAGE together, followed later by another PLANNER_RESPONSE
+        let (hub2, em2, _rx2) = crate::hub::test_emitter();
+        let parent_id2 = "p-same-tick-high";
+        let mut steps_high = vec![
+            json!({"step_index":0,"type":"USER_INPUT","status":"DONE","content":"go"}),
+            json!({"step_index":1,"type":"PLANNER_RESPONSE","status":"DONE","content":"Initial."}),
+            json!({"step_index":2,"type":"PLANNER_RESPONSE","status":"DONE","content":"First bare reply."}),
+            json!({"step_index":3,"type":"SYSTEM_MESSAGE","status":"DONE","content":"<SYSTEM_MESSAGE>\n[Message] timestamp=x sender=p-same-tick-high/task-1 priority=MESSAGE_PRIORITY_HIGH content=Task finished\n</SYSTEM_MESSAGE>"}),
+        ];
+        write_agy_steps(root.path(), parent_id2, &steps_high);
+
+        let mut st2 = State { is_antigravity: true, session_id: Some(parent_id2.into()), agy_wake_from: 2, ..Default::default() };
+        st2.agy_parent_transcript.seed_stamp(root.path(), parent_id2);
+        // Modify file so has_changed sees it (stamp was seeded at same write; clear stamp to simulate unseen tick)
+        st2.agy_parent_transcript.stamp = None;
+        assert!(poll_agy_idle_transcript(&mut st2, &spec, &em2, || root.path().to_path_buf()).is_none());
+        assert_eq!(st2.agy_watch.as_ref().unwrap().cycle_start, Some(2));
+
+        steps_high.push(json!({"step_index":4,"type":"PLANNER_RESPONSE","status":"DONE","content":"Reply to notice."}));
+        write_agy_steps(root.path(), parent_id2, &steps_high);
+        assert!(poll_agy_watch(&mut st2, &spec, &em2).is_none());
+        let sync2 = poll_agy_watch(&mut st2, &spec, &em2).expect("followup reply should complete watch");
+        assert_eq!(sync2["method"], "session/resume");
+        assert_eq!(st2.agy_wake_from, 5);
+
+        let replies2: Vec<_> = hub2.store.events_since("s", 0, 100).unwrap().into_iter().filter_map(|e| match e.body {
+            EventBody::AssistantText { text, .. } => Some(text),
+            _ => None,
+        }).collect();
+        assert_eq!(replies2, vec!["First bare reply.", "Reply to notice."]);
     }
 }

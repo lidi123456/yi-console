@@ -203,20 +203,30 @@ pub fn classify_review_action(
     let raw_name = unwrap_tool_name(tool_name, input);
     let low_name = raw_name.trim().to_ascii_lowercase();
     let kind_low = kind.unwrap_or("").trim().to_ascii_lowercase();
+    let non_mcp_mutating_kind = matches!(kind_low.as_str(), "execute" | "edit" | "delete" | "move");
+    let allow_title_fallback = (low_name.is_empty() || matches!(low_name.as_str(), "tool" | "other"))
+        && (kind_low.is_empty() || kind_low == "other");
 
-    // 1. Built-in MCP gateways
-    if low_name.starts_with("mcp__yi_review__") || low_name.starts_with("mcp__yi_session__") {
-        return ReviewGuardDecision::Allow;
+    // 1. Built-in MCP gateways (structured tool identity wins; title fallback is only for generic ACP metadata)
+    if !non_mcp_mutating_kind {
+        if low_name.starts_with("mcp__yi_review__")
+            || low_name.starts_with("mcp_yi_review_")
+            || low_name.starts_with("mcp__yi_session__")
+            || low_name.starts_with("mcp_yi_session_")
+        {
+            return ReviewGuardDecision::Allow;
+        }
+        if let Some(mem_tool) = low_name
+            .strip_prefix("mcp__yi_memory__")
+            .or_else(|| low_name.strip_prefix("mcp_yi_memory_"))
+        {
+            return match mem_tool {
+                "memory_list" | "memory_read" | "memory_search" => ReviewGuardDecision::Allow,
+                _ => ReviewGuardDecision::Deny(READONLY_DENY_MSG),
+            };
+        }
     }
-    if let Some(mem_tool) = low_name.strip_prefix("mcp__yi_memory__") {
-        return match mem_tool {
-            "memory_list" | "memory_read" | "memory_search" => ReviewGuardDecision::Allow,
-            _ => ReviewGuardDecision::Deny(READONLY_DENY_MSG),
-        };
-    }
-    if low_name.starts_with("mcp__yi_memory__")
-        || title.ends_with(" (yi_memory)")
-    {
+    if allow_title_fallback && title.ends_with(" (yi_memory)") {
         if title.starts_with("memory_save ") || title.starts_with("memory_delete ") {
             return ReviewGuardDecision::Deny(READONLY_DENY_MSG);
         }
@@ -227,7 +237,7 @@ pub fn classify_review_action(
             return ReviewGuardDecision::Allow;
         }
     }
-    if title.ends_with(" (yi_review)") || title.ends_with(" (yi_session)") {
+    if allow_title_fallback && (title.ends_with(" (yi_review)") || title.ends_with(" (yi_session)")) {
         return ReviewGuardDecision::Allow;
     }
 
@@ -994,5 +1004,62 @@ mod tests {
             classify_review_action("Bash", None, "", &json!({"command": "git -c core.quotepath=false diff HEAD"})),
             ReviewGuardDecision::Allow
         );
+    }
+
+    #[test]
+    fn title_spoofing_cannot_bypass_structured_tool_identity() {
+        assert!(matches!(
+            classify_review_action(
+                "run_command",
+                Some("execute"),
+                "mcp_yi_review_review_diff",
+                &json!({"CommandLine": "rm -rf ."}),
+            ),
+            ReviewGuardDecision::Deny(_)
+        ));
+        assert!(matches!(
+            classify_review_action(
+                "Bash",
+                Some("other"),
+                "review_diff (yi_review)",
+                &json!({"command": "rm -rf ."}),
+            ),
+            ReviewGuardDecision::Deny(_)
+        ));
+        assert!(matches!(
+            classify_review_action(
+                "tool",
+                Some("edit"),
+                "memory_read (yi_memory)",
+                &json!({}),
+            ),
+            ReviewGuardDecision::Deny(_)
+        ));
+        assert_eq!(
+            classify_review_action(
+                "run_command",
+                Some("execute"),
+                "memory_read (yi_memory)",
+                &json!({"CommandLine": "cargo test"}),
+            ),
+            ReviewGuardDecision::Ask
+        );
+        // Generic ACP names / structured Antigravity gateway names continue to work
+        assert_eq!(
+            classify_review_action("tool", Some("other"), "review_diff (yi_review)", &json!({})),
+            ReviewGuardDecision::Allow
+        );
+        assert_eq!(
+            classify_review_action("mcp_yi_review_review_diff", None, "", &json!({})),
+            ReviewGuardDecision::Allow
+        );
+        assert_eq!(
+            classify_review_action("mcp_yi_memory_memory_read", None, "", &json!({})),
+            ReviewGuardDecision::Allow
+        );
+        assert!(matches!(
+            classify_review_action("mcp_yi_memory_memory_save", None, "", &json!({})),
+            ReviewGuardDecision::Deny(_)
+        ));
     }
 }
