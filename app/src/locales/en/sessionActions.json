@@ -67,5 +67,15 @@
   "worktreeBranchRenamed": "Branch renamed to {{branch}}",
   "copyBranchName": "Copy branch name",
   "branchNameCopied": "Branch name copied",
-  "deleteSessionWithWorktreeNote": "This only removes the record from Yi Console; tool files on the machine stay untouched. If the bound worktree ({{branch}}) still has uncommitted or unmerged work, its directory and branch are also preserved."
+  "deleteSessionWithWorktreeNote": "This only removes the record from Yi Console; tool files on the machine stay untouched. If the bound worktree ({{branch}}) still has uncommitted or unmerged work, its directory and branch are also preserved.",
+  "readableSessions": "Readable sessions",
+  "noReadableSessions": "This session can't read any other session yet. @ a session in the input box to grant access.",
+  "untitledSession": "Untitled session",
+  "grantInheritedFromParent": "Inherited from the main session",
+  "clickToRevokeReadAccess": "Click to revoke",
+  "revokeReadAccessTitle": "Revoke read access",
+  "revokeReadAccessMessage": "After revoking, the AI in this session can no longer read \"{{title}}\". Anything it has already read stays in its context.",
+  "revoke": "Revoke",
+  "readAccessRevoked": "Read access revoked",
+  "readAccessStillInherited": "This session's own grant is revoked, but its main session also granted access, so it can still read it. Revoke it in the main session to remove access."
 }

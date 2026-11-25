@@ -212,6 +212,9 @@ where
             {
                 // AI tools and their subprocesses must go through the `yi_memory` MCP gateway, never direct admin RPCs
                 Err(anyhow!("AI 工具启动的进程不能直接调用 {}", req.method))
+            } else if local && grants_session_read(&req.method, &req.params) && from_tool(peer_pid) {
+                // Same rule as the memory admin RPCs: read grants come from user actions in the client, never from a tool
+                Err(anyhow!("AI 工具启动的进程不能授权或读取其他会话（{}）", req.method))
             } else if req.method == methods::BROWSER_VIEW_ATTACH {
                 // Frames go only to this connection, never through the hub's broadcast
                 match s(&req.params, "sessionId") {
@@ -301,6 +304,30 @@ where
     drop(out_tx);
     let _ = writer.await;
     crate::info!("client disconnected ({peer})");
+}
+
+/// `session.send` `readSessions`: ids of sessions the user referenced with `@` (bounded, deduplicated)
+fn read_sessions(p: &Value) -> Vec<String> {
+    let mut out: Vec<String> = vec![];
+    for v in p["readSessions"].as_array().into_iter().flatten().take(16) {
+        if let Some(id) = v.as_str().map(str::trim).filter(|id| !id.is_empty() && id.len() <= 64) {
+            if !out.iter().any(|x| x == id) {
+                out.push(id.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// Requests that give a session read access to another one, or read another session's content outside `yi_session`:
+/// only the user's client may make them, never an AI tool (or its subprocesses) talking to the socket directly
+fn grants_session_read(method: &str, p: &Value) -> bool {
+    match method {
+        methods::SESSION_DIGEST => true,
+        methods::SESSION_SEND => !read_sessions(p).is_empty(),
+        methods::SESSION_CREATE => p["handoffFrom"].as_str().is_some_and(|f| !f.is_empty()),
+        _ => false,
+    }
 }
 
 fn s<'a>(p: &'a Value, k: &str) -> Result<&'a str> {
@@ -631,8 +658,9 @@ pub async fn dispatch(
             }
             let queue = p["queue"].as_bool().unwrap_or(false);
             let origin = p["origin"].as_str().filter(|o| !o.is_empty()).map(|o| o.chars().take(32).collect::<String>());
+            let reads = read_sessions(&p);
             let hub2 = hub.clone();
-            tokio::task::spawn_blocking(move || hub2.send(&sid, &text, images, queue, origin)).await??;
+            tokio::task::spawn_blocking(move || hub2.send_with_reads(&sid, &text, images, queue, origin, reads)).await??;
             Value::Null
         }
         SESSION_QUEUE => {
@@ -1020,6 +1048,18 @@ pub async fn dispatch(
                 None => (None, logged > 0),
             };
             json!({ "path": path.map(|p| p.display().to_string()), "hasUser": has_user })
+        }
+        SESSION_REVOKE_READ => {
+            crate::session_mcp::revoke(&hub, s(&p, "sessionId")?, s(&p, "targetId")?)?;
+            Value::Null
+        }
+        SESSION_READ_GRANTS => crate::session_mcp::list_grants(&hub, s(&p, "sessionId")?)?,
+        SESSION_DIGEST => {
+            let sid = s(&p, "sessionId")?.to_string();
+            hub.guess_terminal_session(&sid).await;
+            let h = hub.clone();
+            let text = tokio::task::spawn_blocking(move || crate::session_mcp::reference_digest(&h, &sid)).await??;
+            json!({ "text": text })
         }
         SESSION_MODELS => hub.session_models(s(&p, "sessionId")?)?,
         SESSION_SET_MODEL => {
@@ -1589,6 +1629,21 @@ fn grep_opts(p: &Value) -> crate::fsapi::GrepOpts {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_read_granting_requests_are_classified() {
+        assert!(grants_session_read(methods::SESSION_DIGEST, &json!({"sessionId": "a"})));
+        assert!(grants_session_read(methods::SESSION_SEND, &json!({"sessionId": "a", "readSessions": ["b"]})));
+        assert!(!grants_session_read(methods::SESSION_SEND, &json!({"sessionId": "a", "readSessions": []})));
+        assert!(!grants_session_read(methods::SESSION_SEND, &json!({"sessionId": "a", "text": "hi"})));
+        assert!(grants_session_read(methods::SESSION_CREATE, &json!({"handoffFrom": "a"})));
+        assert!(!grants_session_read(methods::SESSION_CREATE, &json!({"tool": "codex"})));
+        assert!(!grants_session_read(methods::SESSION_READ_GRANTS, &json!({"sessionId": "a"})));
+        // Bounded and deduplicated
+        let many: Vec<String> = (0..40).map(|i| format!("s{}", i % 20)).collect();
+        assert_eq!(read_sessions(&json!({"readSessions": many})).len(), 16);
+        assert_eq!(read_sessions(&json!({"readSessions": ["x", "x", " ", "y"]})), ["x", "y"]);
+    }
 
     #[tokio::test]
     async fn desktop_proxy_rejects_remote_peers_and_forwarded_local_connections() {

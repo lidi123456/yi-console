@@ -105,5 +105,13 @@
   "reeditStashedToast": "Refilled into input; previous draft stashed",
   "restoreStashedDraft": "Restore draft",
   "draftRestored": "Draft restored",
-  "waitingForReeditImages": "Loading previous images…"
+  "waitingForReeditImages": "Loading previous images…",
+  "sessionsGroup": "Other sessions",
+  "sessionMentionHint": "{{tool}} · the AI gets read-only access to this session",
+  "sessionMentionHintCwd": "{{tool}} · {{cwd}}",
+  "untitledSessionRef": "Untitled session",
+  "openReferencedSession": "Open this session",
+  "sessionRefLoc": "Session · {{tool}} · {{title}}",
+  "sessionRefBadge": "Session",
+  "sessionRefUnsupported": "The background service on this host is too old to reference sessions. Try again after it upgrades."
 }

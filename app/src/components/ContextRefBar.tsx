@@ -2,7 +2,7 @@ import { filePath } from '../chatImages';
 import { writeClipboard } from '../clipboard';
 import { formatLineRange, type ContextRef } from '../contextRefs';
 import { getT, useLang } from '../i18n';
-import { toast } from '../store';
+import { navigate, toast } from '../store';
 import { basename } from '../util';
 import { FileIcon } from './FilePanel';
 import { commitTab } from './GitHistory';
@@ -16,6 +16,10 @@ function openRef(r: ContextRef, hostId?: string, sessionId?: string, cwd?: strin
   if (!hostId || !sessionId || r.untitled || r.kind === 'terminal') return;
   if (r.kind === 'side') {
     if (r.sideSessionId) openFileInPanel(hostId, sessionId, `side:${r.sideSessionId}`);
+    return;
+  }
+  if (r.kind === 'session') {
+    if (r.sideSessionId) navigate({ kind: 'session', hostId, sessionId: r.sideSessionId });
     return;
   }
   if (r.commit) {
@@ -87,8 +91,14 @@ export function ContextRefBar({
     e.stopPropagation();
     const lines = formatLineRange(r.fromLine, r.toLine);
     const items: (MenuItem | '-')[] = [
-      ...(canOpen && !r.untitled && r.kind !== 'terminal' && (r.kind !== 'side' || !!r.sideSessionId)
-        ? [{ label: r.kind === 'side' ? t('openSideChat') : t('openInFilePanel'), icon: r.kind === 'side' ? 'sideChat' : 'file', run: () => openRef(r, hostId, sessionId, cwd) }]
+      ...(canOpen && !r.untitled && r.kind !== 'terminal' && ((r.kind !== 'side' && r.kind !== 'session') || !!r.sideSessionId)
+        ? [
+            {
+              label: r.kind === 'side' ? t('openSideChat') : r.kind === 'session' ? t('openReferencedSession') : t('openInFilePanel'),
+              icon: r.kind === 'side' ? 'sideChat' : r.kind === 'session' ? 'chat' : 'file',
+              run: () => openRef(r, hostId, sessionId, cwd),
+            },
+          ]
         : []),
       ...(canOpen && r.kind === 'review' && r.sideSessionId
         ? [{ label: t('openReviewSideChat'), icon: 'sparkles', run: () => openFileInPanel(hostId, sessionId, `side:${r.sideSessionId}`) }]
@@ -101,7 +111,7 @@ export function ContextRefBar({
         icon: 'copy',
         run: async () => toast((await writeClipboard(r.content)) ? t('snippetCopied') : t('copyFailed')),
       },
-      ...(r.kind !== 'terminal' && r.kind !== 'side'
+      ...(r.kind !== 'terminal' && r.kind !== 'side' && r.kind !== 'session'
         ? [
             {
               label: t('copyPathWithLine'),
@@ -141,18 +151,21 @@ export function ContextRefBar({
           const isTerm = r.kind === 'terminal';
           const isReview = r.kind === 'review';
           const isSide = r.kind === 'side';
-          const name = isTerm || isSide ? r.path : basename(r.path);
-          const clickable = canOpen && !r.untitled && !isTerm && (!isSide || !!r.sideSessionId);
+          const isSession = r.kind === 'session';
+          const name = isTerm || isSide || isSession ? r.path : basename(r.path);
+          const clickable = canOpen && !r.untitled && !isTerm && ((!isSide && !isSession) || !!r.sideSessionId);
           const lineCount = Math.max(1, r.toLine - r.fromLine + 1);
           const fullLoc = isSide
             ? `${t('sideChatRefBadge')} · ${r.path}`
-            : isTerm
+            : isSession
+              ? t('sessionRefLoc', { tool: r.comment ?? '', title: r.path })
+              : isTerm
               ? `${r.path} · ${t('terminalLines', { n: lineCount })}${r.exitCode !== undefined ? ` · exit ${r.exitCode}` : ''}`
               : `${r.reviewSource ? `${r.reviewSource} · ` : ''}${r.path}:${lines}${r.commit ? ` @${r.commit.slice(0, 7)}` : ''}`;
           return (
             <div
               key={r.id}
-              className={`cref-chip ${clickable ? 'clickable' : ''} ${onRemove ? 'removable' : ''} ${isReview ? 'review' : ''} ${r.reviewSource ? 'ai-review' : ''} ${isTerm ? 'terminal' : ''} ${isSide ? 'side' : ''}`}
+              className={`cref-chip ${clickable ? 'clickable' : ''} ${onRemove ? 'removable' : ''} ${isReview ? 'review' : ''} ${r.reviewSource ? 'ai-review' : ''} ${isTerm ? 'terminal' : ''} ${isSide || isSession ? 'side' : ''}`}
               role={clickable ? 'button' : undefined}
               tabIndex={clickable ? 0 : undefined}
               aria-label={fullLoc}
@@ -167,6 +180,8 @@ export function ContextRefBar({
             >
               {isSide ? (
                 <Icon name="sideChat" size={13} />
+              ) : isSession ? (
+                <Icon name="chat" size={13} />
               ) : isTerm ? (
                 <Icon name="terminal" size={13} />
               ) : isReview && r.reviewSource ? (
@@ -179,6 +194,8 @@ export function ContextRefBar({
               <span className="cref-name truncate">{name}</span>
               {isSide ? (
                 r.comment ? <span className="cref-comment truncate">{r.comment}</span> : <span className="cref-lines">{t('sideChatRefBadge')}</span>
+              ) : isSession ? (
+                <span className="cref-lines">{r.comment || t('sessionRefBadge')}</span>
               ) : isTerm ? (
                 <span className="cref-lines">{t('terminalLines', { n: lineCount })}</span>
               ) : (

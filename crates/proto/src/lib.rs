@@ -1595,6 +1595,13 @@ pub mod methods {
     /// Continue with another tool: the tool's own session log file {sessionId} -> {path: string | null, hasUser: bool}
     /// (path null when there's no readable file; hasUser: the session has at least one user message)
     pub const SESSION_LOG_FILE: &str = "session.logFile";
+    /// Revoke a read grant written by an `@` session reference (`session.send` `readSessions`) or a hand-off
+    /// {sessionId, targetId} -> null
+    pub const SESSION_REVOKE_READ: &str = "session.revokeRead";
+    /// {sessionId} -> [{sessionId, title, tool, status, grantedAt, inherited}]
+    pub const SESSION_READ_GRANTS: &str = "session.readGrants";
+    /// Budgeted summary of a session for an `@` reference or a hand-off message {sessionId} -> {text}
+    pub const SESSION_DIGEST: &str = "session.digest";
     /// Models a tool offers (for new sessions) {tool} -> [ModelOption]
     pub const TOOLS_MODELS: &str = "tools.models";
     /// Cursor model parameters for the new session page {model, cwd?} -> [ModelConfigOption]: cached, else read from a

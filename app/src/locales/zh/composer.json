@@ -104,5 +104,13 @@
   "reeditStashedToast": "已填入输入框，原草稿已暂存",
   "restoreStashedDraft": "恢复原草稿",
   "draftRestored": "已恢复原草稿",
-  "waitingForReeditImages": "正在加载历史图片，请稍候"
+  "waitingForReeditImages": "正在加载历史图片，请稍候",
+  "sessionsGroup": "其他会话",
+  "sessionMentionHint": "{{tool}} · 引用后 AI 可以只读查看这个会话",
+  "sessionMentionHintCwd": "{{tool}} · {{cwd}}",
+  "untitledSessionRef": "未命名会话",
+  "openReferencedSession": "打开这个会话",
+  "sessionRefLoc": "会话 · {{tool}} · {{title}}",
+  "sessionRefBadge": "会话",
+  "sessionRefUnsupported": "这台主机上的后台服务版本较旧，还不支持引用会话，升级后再试。"
 }

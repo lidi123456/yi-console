@@ -220,6 +220,10 @@ struct Queued {
     /// `UserMessage.origin` once it is sent
     #[serde(default, skip_serializing_if = "Option::is_none")]
     origin: Option<String>,
+    /// Sessions the user referenced with `@` in this message: read grants written when it is delivered (and only then),
+    /// to whichever session delivers it, so they follow the message through a hand-off
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    reads: Vec<String>,
 }
 
 impl Queued {
@@ -1074,6 +1078,11 @@ impl Hub {
         if let Some((fid, frt)) = &from {
             let tool = frt.info.lock().unwrap().tool;
             self.emit(&info.id, 0, EventBody::Handoff { session_id: fid.clone(), tool, to: false });
+            // The new tool reads the original conversation through yi_session; the hand-off itself is the user's grant.
+            // Written before the first message is sent, so the first turn can already call session_read
+            if let Err(e) = crate::session_mcp::grant(self, &info.id, fid) {
+                crate::warn!("转交会话读取授权失败 {fid} -> {}: {e}", info.id);
+            }
         }
         if info.side_chat && info.review.is_none() {
             *rt.side_context_pending.lock().unwrap() = true;
@@ -1421,6 +1430,19 @@ impl Hub {
     /// With `queue` true and the turn still running: Claude and Codex get it directly and read it after their next tool call
     /// (anything that misses that is handled by the tool after the turn ends); other tools queue it and send in order after the turn
     pub fn send(self: &Arc<Self>, id: &str, text: &str, images: Vec<IncomingImage>, queue: bool, origin: Option<String>) -> Result<()> {
+        self.send_with_reads(id, text, images, queue, origin, vec![])
+    }
+
+    /// `send` with the sessions the message references (`readSessions`): see `Queued::reads`
+    pub fn send_with_reads(
+        self: &Arc<Self>,
+        id: &str,
+        text: &str,
+        images: Vec<IncomingImage>,
+        queue: bool,
+        origin: Option<String>,
+        reads: Vec<String>,
+    ) -> Result<()> {
         let rt = self.get(id)?;
         if rt.worktree_busy.load(std::sync::atomic::Ordering::Acquire) {
             bail!("会话正在切入 Worktree，请稍候再发送");
@@ -1488,11 +1510,44 @@ impl Hub {
                 images: refs,
                 now: false,
                 origin,
+                reads,
             });
             self.sync_queue(&rt);
             return Ok(());
         }
-        self.deliver(&rt, &info, text, refs, prompt_images, origin)
+        self.deliver_with_reads(&rt, &info, text, refs, prompt_images, origin, &reads)
+    }
+
+    /// Grant the referenced sessions, deliver, and take back only the grants this call added if delivery fails.
+    /// A target that no longer exists (or can't be granted) is skipped; the message still goes out
+    #[allow(clippy::too_many_arguments)]
+    fn deliver_with_reads(
+        self: &Arc<Self>,
+        rt: &Arc<SessionRt>,
+        info: &SessionInfo,
+        text: &str,
+        refs: Vec<ImageRef>,
+        prompt_images: Vec<PromptImage>,
+        origin: Option<String>,
+        reads: &[String],
+    ) -> Result<()> {
+        let mut added = vec![];
+        for t in reads {
+            if self.store.has_session_read(&info.id, t).unwrap_or(false) {
+                continue;
+            }
+            match crate::session_mcp::grant(self, &info.id, t) {
+                Ok(()) => added.push(t.clone()),
+                Err(e) => crate::warn!("会话读取授权失败 {} -> {t}: {e}", info.id),
+            }
+        }
+        let r = self.deliver(rt, info, text, refs, prompt_images, origin);
+        if r.is_err() {
+            for t in &added {
+                let _ = self.store.revoke_session_read(&info.id, t);
+            }
+        }
+        r
     }
 
     /// Send a message taken off the queue (its images are already saved)
@@ -1507,7 +1562,7 @@ impl Hub {
         }
         self.cancel_resume(id, "manual");
         let info = rt.info.lock().unwrap().clone();
-        self.deliver(&rt, &info, &item.text, item.images, prompt_images, item.origin)
+        self.deliver_with_reads(&rt, &info, &item.text, item.images, prompt_images, item.origin, &item.reads)
     }
 
     /// Hand a message to the tool, starting its process if it has exited
@@ -6603,6 +6658,31 @@ mod tests {
         assert!(matches!(last, EventBody::Handoff { session_id, to: true, .. } if session_id == "b"));
     }
 
+    #[tokio::test]
+    async fn read_grants_follow_queued_messages_through_hand_over() {
+        let hub = Hub::new(crate::store::Store::open_memory().unwrap(), DaemonSettings::default());
+        let _ra = live(&hub, "a", SessionMode::Structured, SessionStatus::Running, 0);
+        let _rb = live(&hub, "b", SessionMode::Structured, SessionStatus::Idle, 0);
+        let _rt = live(&hub, "t", SessionMode::Structured, SessionStatus::Idle, 0);
+        // Kiro mid-turn: the message is queued, and no grant exists until it is delivered
+        hub.send_with_reads("a", "see the referenced session", vec![], true, None, vec!["t".into()]).unwrap();
+        assert_eq!(queue_texts(&hub, "a"), ["see the referenced session"]);
+        assert!(!hub.store.has_session_read("a", "t").unwrap());
+
+        let to = hub.info("b").unwrap();
+        hub.hand_over("a", &hub.get("a").unwrap(), &to);
+        let item = hub.get("b").unwrap().queue.lock().unwrap().pop_front().unwrap();
+        assert_eq!(item.reads, ["t"]);
+        hub.send_queued("b", item).unwrap();
+        // Granted to the session that delivered it, never to the original one
+        assert!(hub.store.has_session_read("b", "t").unwrap());
+        assert!(!hub.store.has_session_read("a", "t").unwrap());
+
+        // Delivered at once when idle; a deleted target is skipped without failing the message
+        hub.send_with_reads("t", "hello", vec![], true, None, vec!["gone".into()]).unwrap();
+        assert!(!hub.store.has_session_read("t", "gone").unwrap());
+    }
+
     fn limit_phases(hub: &Hub, id: &str) -> Vec<String> {
         hub.store
             .events_since(id, 0, 1000)
@@ -6620,7 +6700,7 @@ mod tests {
         let hub = Hub::new(crate::store::Store::open_memory().unwrap(), DaemonSettings::default());
         let mut rx = live(&hub, "s", SessionMode::Structured, SessionStatus::Running, 0);
         let em = Emitter { hub: hub.clone(), sid: "s".into(), gen: 0 };
-        hub.get("s").unwrap().queue.lock().unwrap().push_back(Queued { id: "q".into(), text: "later".into(), images: vec![], now: false, origin: None });
+        hub.get("s").unwrap().queue.lock().unwrap().push_back(Queued { id: "q".into(), text: "later".into(), images: vec![], now: false, origin: None, reads: vec![] });
 
         // The turn fails on the limit: scheduled, the queue is held
         let resets = now_ms() + 3_600_000;
@@ -6784,6 +6864,7 @@ mod tests {
             images: vec![],
             now: false,
             origin: None,
+            reads: vec![],
         });
         hub.release_idle();
         assert!(killed(&mut idle) && killed(&mut asking) && killed(&mut err));
@@ -7744,6 +7825,83 @@ mod tests {
             .filter_map(|v| v["sessionId"].as_str())
             .collect();
         assert_eq!(rel_ids, vec!["parent", "side-1"]);
+    }
+
+    #[test]
+    fn session_read_grants_open_only_user_granted_sessions() {
+        let hub = Hub::new(crate::store::Store::open_memory().unwrap(), DaemonSettings::default());
+        let _a = live(&hub, "caller", SessionMode::Structured, SessionStatus::Idle, 1);
+        let _s = live(&hub, "caller-side", SessionMode::Structured, SessionStatus::Idle, 1);
+        let _t = live(&hub, "target", SessionMode::Structured, SessionStatus::Idle, 1);
+        let _ts = live(&hub, "target-side", SessionMode::Structured, SessionStatus::Idle, 1);
+        let _o = live(&hub, "other", SessionMode::Structured, SessionStatus::Idle, 1);
+        for (kid, parent) in [("caller-side", "caller"), ("target-side", "target")] {
+            let rt = hub.get(kid).unwrap();
+            let mut info = rt.info.lock().unwrap();
+            info.parent_id = Some(parent.into());
+            info.side_chat = true;
+            hub.store.save_session(&info).unwrap();
+        }
+        hub.emit("target", 0, EventBody::UserMessage { text: "Plan the DB migration".into(), images: vec![], origin: None });
+        hub.emit("target", 0, EventBody::AssistantText { id: "a1".into(), text: "MIGRATION_PLAN_V2".into() });
+        hub.emit("other", 0, EventBody::UserMessage { text: "TOP_SECRET_OTHER".into(), images: vec![], origin: None });
+
+        let tmp = tempfile::tempdir().unwrap();
+        let smcp = crate::session_mcp::SessionMcp::new(tmp.path().to_path_buf());
+        let ticket_of = |sid: &str| {
+            smcp.ensure_session(sid).unwrap();
+            let v: Value = serde_json::from_slice(&std::fs::read(tmp.path().join(format!("{sid}.json"))).unwrap()).unwrap();
+            v["ticket"].as_str().unwrap().to_string()
+        };
+        let read = |sid: &str, target: &str| {
+            smcp.mcp(&hub, sid, &ticket_of(sid), json!({"method": "tools/call", "params": {"name": "session_read", "arguments": {"sessionId": target}}}))
+                .unwrap()
+        };
+
+        // Before any grant: refused
+        assert_eq!(read("caller", "target")["isError"], true);
+
+        crate::session_mcp::grant(&hub, "caller", "target").unwrap();
+        let ok = read("caller", "target");
+        assert_eq!(ok["isError"], false);
+        assert!(ok["content"][0]["text"].as_str().unwrap().contains("MIGRATION_PLAN_V2"));
+        // The grant covers the target's side chats and is inherited by the caller's side chats
+        assert_eq!(read("caller", "target-side")["isError"], false);
+        assert_eq!(read("caller-side", "target")["isError"], false);
+        // Unrelated sessions stay closed, and grants are one-way
+        let denied = read("caller", "other");
+        assert_eq!(denied["isError"], true);
+        assert!(!denied["content"][0]["text"].as_str().unwrap().contains("TOP_SECRET"));
+        assert_eq!(read("target", "caller")["isError"], true);
+
+        // Listed in session_list_related and session.readGrants
+        let rel = smcp
+            .mcp(&hub, "caller", &ticket_of("caller"), json!({"method": "tools/call", "params": {"name": "session_list_related", "arguments": {}}}))
+            .unwrap();
+        assert!(rel["structuredContent"]["sessions"].as_array().unwrap().iter().any(|r| r["sessionId"] == "target" && r["role"] == "granted"));
+        let side_grants = crate::session_mcp::list_grants(&hub, "caller-side").unwrap();
+        assert_eq!(side_grants[0]["sessionId"], "target");
+        assert_eq!(side_grants[0]["inherited"], true);
+        // Granted both directly and through the parent: both rows are listed
+        crate::session_mcp::grant(&hub, "caller-side", "target").unwrap();
+        let both = crate::session_mcp::list_grants(&hub, "caller-side").unwrap();
+        assert_eq!(both.as_array().unwrap().len(), 2);
+        crate::session_mcp::revoke(&hub, "caller-side", "target").unwrap();
+
+        // Digest carries the latest reply
+        assert!(crate::session_mcp::reference_digest(&hub, "target").unwrap().contains("MIGRATION_PLAN_V2"));
+
+        // Bot sessions can't be granted anything
+        hub.get("other").unwrap().info.lock().unwrap().bot =
+            Some(BotLink { bot_id: "b".into(), bot_name: "b".into(), role: "bot".into(), task_id: None, client_id: "c".into() });
+        assert!(crate::session_mcp::grant(&hub, "other", "target").is_err());
+
+        // Revoke, then deleting a session clears its grants
+        crate::session_mcp::revoke(&hub, "caller", "target").unwrap();
+        assert_eq!(read("caller", "target")["isError"], true);
+        crate::session_mcp::grant(&hub, "caller", "target").unwrap();
+        hub.store.delete_session("target").unwrap();
+        assert!(!hub.store.has_session_read("caller", "target").unwrap());
     }
 
     #[test]
@@ -8733,6 +8891,7 @@ mod tests {
             images: vec![],
             now: false,
             origin: None,
+            reads: vec![],
         };
         assert!(hub.send_queued(sid, item).is_err());
         assert_eq!(rt.queue.lock().unwrap().len(), 1);

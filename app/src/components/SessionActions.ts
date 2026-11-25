@@ -3,10 +3,11 @@ import { errorToast, getState, loadSession, navigate, openNewSession, panelSessi
 import { rpc } from '../transport';
 import { isHostSession, sessionProjectDir, TOOL_LABEL, supportsAccountsTool, type HubEvent, type SessionInfo } from '../types';
 import { downloadText, isMobile, lsSet, safeFileName, sessionMarkdown, toB64 } from '../util';
-import { handoffPrompt } from '../handoff';
+import { handoffPrompt, handoffTemplate, handoffViaSessionRead, templateNeedsPath } from '../handoff';
+import { canReferenceSessions, sessionDigest } from '../sessionRefs';
 import { writeClipboard } from '../clipboard';
 import { openAccountManager } from './AccountManagerModal';
-import { askConfirm, askText, type MenuItem } from './Overlay';
+import { askConfirm, askText, openMenu, type MenuItem } from './Overlay';
 
 const tx = getT('sessionActions');
 
@@ -88,15 +89,29 @@ export async function exportSession(hostId: string, info: SessionInfo, how: 'cop
   }
 }
 
-/** Continue with another tool: find the original session's log file (for tools like Cursor with no readable file, export to Markdown into the session's upload directory),
- *  open the new session dialog, and have the first message ask the new tool to read the log and report back */
+/** Continue with another tool: open the new session dialog with a first message that asks the new tool to read the original
+ *  session and report back. The new session gets yi_session read access to the original one, so the default message only
+ *  carries a digest and the session id. The log file (for Cursor, a Markdown export into the upload directory) is only
+ *  looked up when the template uses {path} / {format}, or for terminal sessions session_read can't fully see */
 export async function handoffSession(hostId: string, info: SessionInfo, opts: { limit?: boolean } = {}) {
   try {
     // The daemon also says whether there's any user message: a session with no conversation yet has nothing to hand off
     // (the menu already filters most empty sessions; this catches ACP sessions created before anything was said, and after /clear).
     // Older daemons don't send hasUser; skip the check then
     let { path, hasUser } = await rpc<{ path: string | null; hasUser?: boolean }>(hostId, 'session.logFile', { sessionId: info.id });
-    if (!path && info.mode === 'terminal') {
+    // The digest doubles as a capability check: a daemon without it doesn't grant the new session read access either,
+    // so the hand-off falls back to the log file (or a Markdown export) as before
+    let digest = '';
+    let supported = true;
+    try {
+      digest = await sessionDigest(hostId, info.id);
+    } catch (e) {
+      if (!/未知方法|unknown method/i.test(String(e))) throw e;
+      supported = false;
+    }
+    const tpl = handoffTemplate(info, supported);
+    const needPath = templateNeedsPath(tpl) || !supported || !handoffViaSessionRead(info);
+    if (!path && needPath && info.mode === 'terminal') {
       // Exporting needs our event log, which has no messages for a terminal session
       toast(tx('noReadableLogForThisTerminalSession'));
       return;
@@ -105,8 +120,8 @@ export async function handoffSession(hostId: string, info: SessionInfo, opts: { 
       toast(tx('thisSessionHasNoConversation'));
       return;
     }
-    const exported = !path;
-    if (!path) {
+    const exported = needPath && !path;
+    if (exported) {
       // No readable log file (Cursor): export the whole conversation as Markdown, which needs all events
       const done = toast(tx('loadingConversation'), 'loading');
       let events: HubEvent[];
@@ -126,11 +141,62 @@ export async function handoffSession(hostId: string, info: SessionInfo, opts: { 
     openNewSession({
       hostId,
       cwd: info.cwd,
-      handoff: { from: info.tool, prompt: handoffPrompt(info, path, exported), fromId: info.id, perm: info.permissionMode, avoid },
+      handoff: { from: info.tool, prompt: handoffPrompt(info, { path: path ?? '', exported, digest, supported }), fromId: info.id, perm: info.permissionMode, avoid },
     });
   } catch (e) {
     errorToast(e);
   }
+}
+
+interface ReadGrant {
+  sessionId: string;
+  title: string;
+  tool: string;
+  grantedAt: number;
+  inherited: boolean;
+}
+
+/** Sessions this session's AI may read through yi_session (granted by @ references and hand-offs); clicking one revokes it.
+ *  Grants inherited from a side chat's parent are listed but revoked from the parent */
+async function readableSessionsMenu(hostId: string, info: SessionInfo) {
+  let grants: ReadGrant[];
+  try {
+    grants = await rpc<ReadGrant[]>(hostId, 'session.readGrants', { sessionId: info.id });
+  } catch (e) {
+    errorToast(e);
+    return;
+  }
+  if (!grants.length) {
+    toast(tx('noReadableSessions'));
+    return;
+  }
+  const at = { clientX: window.innerWidth / 2, clientY: Math.min(160, window.innerHeight / 3) };
+  openMenu(
+    at,
+    grants.map((g) => ({
+      label: g.title?.trim() || tx('untitledSession'),
+      tool: g.tool,
+      hint: g.inherited ? tx('grantInheritedFromParent') : tx('clickToRevokeReadAccess'),
+      disabled: g.inherited,
+      run: async () => {
+        const ok = await askConfirm({
+          title: tx('revokeReadAccessTitle'),
+          message: tx('revokeReadAccessMessage', { title: g.title?.trim() || tx('untitledSession') }),
+          okText: tx('revoke'),
+          danger: true,
+        });
+        if (!ok) return;
+        try {
+          await rpc(hostId, 'session.revokeRead', { sessionId: info.id, targetId: g.sessionId });
+          // A side chat may still read the target through its main session's grant
+          const left = await rpc<ReadGrant[]>(hostId, 'session.readGrants', { sessionId: info.id });
+          toast(left.some((x) => x.sessionId === g.sessionId) ? tx('readAccessStillInherited') : tx('readAccessRevoked'));
+        } catch (e) {
+          errorToast(e);
+        }
+      },
+    })),
+  );
 }
 
 /** Delete every session in one working directory (the sidebar's directory row). Bottom-panel terminals go with their chat in Hub::delete */
@@ -473,6 +539,7 @@ export function sessionMenu(
       : []),
     { label: tx('viewChanges'), icon: 'diff', run: () => showChanges(hostId, sid) },
     ...(opts.onMemory && info.tool !== 'shell' && info.mode === 'structured' ? [{ label: tx('memory'), icon: 'book', run: opts.onMemory }] : []),
+    ...(canReferenceSessions(info) ? [{ label: tx('readableSessions'), icon: 'eye', run: () => void readableSessionsMenu(hostId, info) }] : []),
     ...(opts.onPromptOutline && info.tool !== 'shell' && info.mode === 'structured'
       ? [
           {

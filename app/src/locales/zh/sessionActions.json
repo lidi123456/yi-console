@@ -67,5 +67,15 @@
   "worktreeBranchRenamed": "已重命名分支为 {{branch}}",
   "copyBranchName": "复制分支名",
   "branchNameCopied": "已复制分支名",
-  "deleteSessionWithWorktreeNote": "这只是从 Yi Console 里删掉记录，工具本身保留在机器上的文件不动；如果绑定的 Worktree（{{branch}}）还有未提交或未合并的改动，目录和分支也会为你保留。"
+  "deleteSessionWithWorktreeNote": "这只是从 Yi Console 里删掉记录，工具本身保留在机器上的文件不动；如果绑定的 Worktree（{{branch}}）还有未提交或未合并的改动，目录和分支也会为你保留。",
+  "readableSessions": "可读取的会话",
+  "noReadableSessions": "这个会话还没有获准读取其他会话。在输入框里 @ 一个会话即可授权。",
+  "untitledSession": "未命名会话",
+  "grantInheritedFromParent": "继承自主会话",
+  "clickToRevokeReadAccess": "点击撤销",
+  "revokeReadAccessTitle": "撤销读取权限",
+  "revokeReadAccessMessage": "撤销后，这个会话的 AI 不能再读取「{{title}}」。之前已经读到的内容不会从它的上下文里消失。",
+  "revoke": "撤销",
+  "readAccessRevoked": "已撤销读取权限",
+  "readAccessStillInherited": "已撤销这个会话自己的授权，但主会话也授权过这个会话，所以仍然可以读取。要完全撤销，请在主会话里撤销。"
 }

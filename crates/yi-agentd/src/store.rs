@@ -55,7 +55,14 @@ impl Store {
              CREATE TABLE IF NOT EXISTS queues (
                  session_id TEXT PRIMARY KEY,
                  items TEXT NOT NULL
-             );",
+             );
+             CREATE TABLE IF NOT EXISTS session_read_grants (
+                 caller TEXT NOT NULL,
+                 target TEXT NOT NULL,
+                 granted_at INTEGER NOT NULL,
+                 PRIMARY KEY (caller, target)
+             );
+             CREATE INDEX IF NOT EXISTS session_read_grants_target ON session_read_grants(target);",
         )?;
         Ok(Store {
             conn: Mutex::new(conn),
@@ -142,7 +149,48 @@ impl Store {
         c.execute("DELETE FROM sessions WHERE id = ?1", params![id])?;
         c.execute("DELETE FROM events WHERE session_id = ?1", params![id])?;
         c.execute("DELETE FROM queues WHERE session_id = ?1", params![id])?;
+        c.execute(
+            "DELETE FROM session_read_grants WHERE caller = ?1 OR target = ?1",
+            params![id],
+        )?;
         Ok(())
+    }
+
+    /// Record that the user allowed `caller` (and its side chats) to read `target` through `yi_session`
+    pub fn grant_session_read(&self, caller: &str, target: &str, ts: i64) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "INSERT INTO session_read_grants(caller, target, granted_at) VALUES(?1, ?2, ?3)
+             ON CONFLICT(caller, target) DO UPDATE SET granted_at = excluded.granted_at",
+            params![caller, target, ts],
+        )?;
+        Ok(())
+    }
+
+    pub fn revoke_session_read(&self, caller: &str, target: &str) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "DELETE FROM session_read_grants WHERE caller = ?1 AND target = ?2",
+            params![caller, target],
+        )?;
+        Ok(())
+    }
+
+    pub fn has_session_read(&self, caller: &str, target: &str) -> Result<bool> {
+        let n: i64 = self.conn.lock().unwrap().query_row(
+            "SELECT COUNT(*) FROM session_read_grants WHERE caller = ?1 AND target = ?2",
+            params![caller, target],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Sessions `caller` may read: (target id, granted_at), newest grant first
+    pub fn session_read_grants(&self, caller: &str) -> Result<Vec<(String, i64)>> {
+        let c = self.conn.lock().unwrap();
+        let mut st = c.prepare(
+            "SELECT target, granted_at FROM session_read_grants WHERE caller = ?1 ORDER BY granted_at DESC",
+        )?;
+        let rows = st.query_map(params![caller], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
     /// A session's queued messages (JSON array, written whole on every change); an empty queue removes the row

@@ -32,7 +32,7 @@ import {
 } from '../composerState';
 import { clearSession, openFilesInPanel, showChanges } from './SessionActions';
 import { isTauri, rpc } from '../transport';
-import type { ImageRef, SessionInfo, SlashCommand, Snippet } from '../types';
+import { TOOL_LABEL, type ImageRef, type SessionInfo, type SlashCommand, type Snippet } from '../types';
 import { fuzzyScore, isMobile, toB64 as toB64Str } from '../util';
 import { DRAG_REF, extractDroppedEntries, planComposerDrop, resolveDroppedLocalPaths } from '../dropFiles';
 import {
@@ -61,6 +61,7 @@ import { nextPerm, PermPicker } from './PermPicker';
 import { ModelPicker, OPEN_MODEL } from './ModelPicker';
 import { QueueList } from './QueueList';
 import { bringSideChatToMain, deriveSideTitle, sideChatTitle, startSideChat } from '../sideChat';
+import { canReferenceSessions, referenceableSessions, referenceSession, sessionRefIds, settleSessionRefs } from '../sessionRefs';
 import { noteOwnerMessage } from '../bots';
 
 const t = getT('composer');
@@ -463,6 +464,12 @@ export function Composer({
     () => (hostSessions ? hostSessions.filter((x) => x.parentId === info.id && x.sideChat) : []),
     [hostSessions, info.id],
   );
+  const canRefSessions = canReferenceSessions(info);
+  const refSessions = useMemo(
+    () => (canRefSessions ? referenceableSessions(hostSessions, info) : []),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [canRefSessions, hostSessions, info.id, info.parentId, info.cwd],
+  );
 
   const items: PopItem[] = useMemo(() => {
     if (!popOpen) return [];
@@ -486,6 +493,21 @@ export function Composer({
               },
             }))
         : [];
+      // Other sessions on this host: no query shows a few recent ones from the same directory, a query matches title / tool
+      const sessionItems: PopItem[] = refSessions
+        .filter((rs) => (q ? (rs.title || '').toLowerCase().includes(q) || TOOL_LABEL[rs.tool].toLowerCase().includes(q) : rs.cwd === info.cwd))
+        .slice(0, q ? 8 : 5)
+        .map((rs) => ({
+          key: `session-${rs.id}`,
+          label: rs.title?.trim() || t('untitledSessionRef'),
+          desc: rs.cwd === info.cwd ? t('sessionMentionHint', { tool: TOOL_LABEL[rs.tool] }) : t('sessionMentionHintCwd', { tool: TOOL_LABEL[rs.tool], cwd: rs.cwd }),
+          group: t('sessionsGroup'),
+          icon: 'chat',
+          apply: () => {
+            replaceTrigger('');
+            referenceSession(hostId, info.id, rs);
+          },
+        }));
       const fileItems: PopItem[] = (files ?? []).map((f) => ({
         key: f.path,
         label: f.path + (f.isDir ? '/' : ''),
@@ -493,7 +515,7 @@ export function Composer({
         icon: f.isDir ? 'folder' : 'file',
         apply: () => (f.isDir ? replaceTrigger(`@${f.path}/`, true) : replaceTrigger(`@${f.path} `)),
       }));
-      return [...sideItems, ...fileItems];
+      return [...sideItems, ...sessionItems, ...fileItems];
     }
     const q = slash![1];
     const builtin: PopItem[] = [
@@ -595,7 +617,7 @@ export function Composer({
       .sort((a, b) => b.s - a.s)
       .map((x) => x.it);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [popOpen, trigger, files, commands, snippets, info.permissionMode, running, lang, canSideChat, sideChats]);
+  }, [popOpen, trigger, files, commands, snippets, info.permissionMode, running, lang, canSideChat, sideChats, refSessions]);
 
   useEffect(() => setSel(0), [trigger]);
   const listRef = useRef<HTMLDivElement>(null);
@@ -783,7 +805,7 @@ export function Composer({
     const canSide = curInfo.mode === 'structured' && curInfo.tool !== 'shell' && curInfo.tool !== 'files' && !curInfo.sideChat;
     const trimmed = curSnap.text.trim();
     const curImgs = curSnap.imgs;
-    const curRefs = curSnap.refs;
+    let curRefs = curSnap.refs;
     const sentReeditNonce = curSnap.reedit?.nonce ?? 0;
     if ((!trimmed && curImgs.length === 0 && curRefs.length === 0) || curSnap.sending) return;
     // Typing /clear and pressing Enter (without picking from the menu) also uses Yi Console's clear, not sent to the tool
@@ -812,6 +834,12 @@ export function Composer({
     if (!beginSend(from)) return;
     let ok = false;
     try {
+      // Session pills picked a moment ago may still be fetching their digest: wait, then use the filled-in refs
+      if (curRefs.some((r) => r.kind === 'session')) {
+        await settleSessionRefs(curRefs);
+        const ids = new Set(curRefs.map((r) => r.id));
+        curRefs = getComposerSnapshot(from).refs.filter((r) => ids.has(r.id));
+      }
       const transformed = transform ? transform(trimmed) : trimmed;
       let payload = transformed;
       if (curRefs.length > 0) {
@@ -839,6 +867,8 @@ export function Composer({
         sessionId: sid,
         text: payload,
         images: curImgs.map((i) => ({ mimeType: i.mimeType, data: i.data })),
+        // Referenced sessions: the daemon grants yi_session read access when this message is delivered
+        readSessions: sessionRefIds(curRefs),
         // Turn still running: Claude and Codex read it at their next step; other tools queue it until the turn ends
         queue: true,
       });
