@@ -100,9 +100,10 @@ impl State {
 fn policy(mode: &str) -> (&'static str, &'static str) {
     match mode {
         "bypass" => ("never", "danger-full-access"),
-        // Approve on request like default, but hand it to Codex's automatic reviewer (see reviewer)
-        "plan" => ("untrusted", "read-only"),
+        // Read-only sandbox blocks writes while on-request avoids prompting on read-only commands inside it
+        "plan" => ("on-request", "read-only"),
         "strict" => ("untrusted", "workspace-write"),
+        // Approve on request like default, and hand auto mode to Codex's automatic reviewer (see reviewer)
         _ => ("on-request", "workspace-write"),
     }
 }
@@ -123,6 +124,107 @@ fn reviewer(mode: &str) -> &'static str {
     } else {
         "user"
     }
+}
+
+fn effective_perm<'a>(st: &'a State, spec: &'a StartSpec) -> &'a str {
+    st.perm.as_deref().unwrap_or(&spec.permission_mode)
+}
+
+fn approval_thread_id(params: &Value) -> Option<&str> {
+    params["threadId"]
+        .as_str()
+        .or_else(|| params["conversationId"].as_str())
+}
+
+fn approval_matches_thread(a: &PendingApproval, target_sub: Option<&str>, main_thread: Option<&str>) -> bool {
+    match (target_sub, main_thread, approval_thread_id(&a.params)) {
+        (Some(sub), _, t) => t == Some(sub),
+        (None, Some(main), Some(t)) => t == main,
+        (None, _, _) => true,
+    }
+}
+
+fn resolve_stale_approvals(
+    st: &mut State,
+    target_sub: Option<&str>,
+    send_cancel: bool,
+    em: &Emitter,
+) -> Vec<Value> {
+    let main_thread = st.thread_id.as_deref();
+    let mut rids: Vec<String> = st
+        .approvals
+        .iter()
+        .filter(|(_, a)| approval_matches_thread(a, target_sub, main_thread))
+        .map(|(k, _)| k.clone())
+        .collect();
+    rids.sort();
+    let mut out = vec![];
+    for rid in rids {
+        let Some(a) = st.approvals.remove(&rid) else { continue };
+        if send_cancel {
+            let res = if a.method == "item/tool/requestUserInput" {
+                user_input_result(&a, "skip", &[])
+            } else {
+                approval_result(&a, "cancel")
+            };
+            out.push(json!({"id": a.rpc_id, "result": res}));
+        }
+        em.event(EventBody::PermissionResolved {
+            request_id: rid,
+            option_id: "cancelled".into(),
+            answers: vec![],
+        });
+    }
+    out
+}
+
+fn apply_permission_mode(st: &mut State, mode: String, em: &Emitter) -> Vec<Value> {
+    let is_bypass = !st.read_only_review && mode == "bypass";
+    let is_accept_edits = !st.read_only_review && mode == "acceptEdits";
+    st.perm = Some(mode);
+    if !is_bypass && !is_accept_edits {
+        return vec![];
+    }
+    let mut rids: Vec<String> = st
+        .approvals
+        .iter()
+        .filter(|(_, a)| {
+            if a.method == "item/tool/requestUserInput" {
+                return false;
+            }
+            if matches!(
+                a.method.as_str(),
+                "item/fileChange/requestApproval" | "applyPatchApproval"
+            ) {
+                is_bypass || is_accept_edits
+            } else {
+                is_bypass
+            }
+        })
+        .map(|(k, _)| k.clone())
+        .collect();
+    rids.sort();
+    let mut out = vec![];
+    for rid in rids {
+        let Some(a) = st.approvals.remove(&rid) else { continue };
+        out.push(json!({"id": a.rpc_id, "result": approval_result(&a, "accept")}));
+        em.event(EventBody::PermissionResolved {
+            request_id: rid,
+            option_id: "accept".into(),
+            answers: vec![],
+        });
+    }
+    out
+}
+
+fn quick_approval(v: &Value, method: &str, params: &Value, decision: &str) -> Value {
+    let a = PendingApproval {
+        rpc_id: v["id"].clone(),
+        method: method.to_string(),
+        params: params.clone(),
+        questions: vec![],
+    };
+    json!({"id": v["id"], "result": approval_result(&a, decision)})
 }
 
 /// thread/start sandbox value -> turn/start sandboxPolicy.type
@@ -203,20 +305,31 @@ pub async fn run(spec: StartSpec, em: Emitter, mut rx: mpsc::UnboundedReceiver<A
                     drop_unsupported_effort(&mut st, None);
                 }
                 Some(AdapterCmd::SetPermissionMode(mode)) => {
-                    st.perm = Some(mode);
+                    for m in apply_permission_mode(&mut st, mode, &em) {
+                        let _ = p.send(&m).await;
+                    }
                 }
                 Some(AdapterCmd::SetEffort(e)) => {
                     st.effort = Some(e).filter(|e| !e.is_empty());
                 }
                 Some(AdapterCmd::Interrupt) => {
-                    if let (Some(t), Some(turn)) = (st.thread_id.clone(), st.turn_id.clone()) {
+                    if let (Some(t), Some(turn)) = (
+                        st.thread_id.clone(),
+                        st.turn_id.clone().filter(|t| !t.is_empty()),
+                    ) {
                         let m = st.req(Pending::Other, "turn/interrupt", json!({"threadId":t,"turnId":turn}));
+                        let _ = p.send(&m).await;
+                    }
+                    for m in resolve_stale_approvals(&mut st, None, true, &em) {
                         let _ = p.send(&m).await;
                     }
                 }
                 Some(AdapterCmd::StopTask(task)) => {
                     // Background task ids are subagent thread ids
                     if let Some(m) = stop_sub(&mut st, &task) {
+                        let _ = p.send(&m).await;
+                    }
+                    for m in resolve_stale_approvals(&mut st, Some(&task), true, &em) {
                         let _ = p.send(&m).await;
                     }
                 }
@@ -538,7 +651,8 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Vec<Valu
             Pending::Init => {
                 out.push(json!({"method":"initialized"}));
                 out.push(st.req(Pending::Models, "model/list", json!({})));
-                let (approval, sandbox) = policy_for(&spec.permission_mode, st.read_only_review || spec.read_only_review);
+                let mode = effective_perm(st, spec);
+                let (approval, sandbox) = policy_for(mode, st.read_only_review || spec.read_only_review);
                 let mut params = json!({
                     "cwd": spec.cwd.display().to_string(),
                     "approvalPolicy": approval,
@@ -550,7 +664,7 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Vec<Valu
                 // Overrides developer_instructions in config.toml
                 params["developerInstructions"] = json!(super::system_text(spec));
                 // Only sent for auto; older Codex versions don't have this field
-                if spec.permission_mode == "auto" {
+                if mode == "auto" {
                     params["approvalsReviewer"] = json!("auto_review");
                 }
                 st.thread_params = params.clone();
@@ -630,6 +744,9 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Vec<Valu
     // 2) Requests from the server (with an id)
     if !v["id"].is_null() {
         let rid = v["id"].to_string();
+        let read_only_review = st.read_only_review || spec.read_only_review;
+        let perm = effective_perm(st, spec);
+        let auto_accept_all = !read_only_review && perm == "bypass";
         match method {
             "item/commandExecution/requestApproval" | "execCommandApproval" => {
                 let cmd = params["command"]
@@ -644,7 +761,7 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Vec<Valu
                         })
                     })
                     .unwrap_or_default();
-                if st.read_only_review {
+                if read_only_review {
                     match super::review_guard::classify_review_action(
                         "shell",
                         Some("execute"),
@@ -652,27 +769,19 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Vec<Valu
                         &json!({ "command": cmd }),
                     ) {
                         super::review_guard::ReviewGuardDecision::Allow => {
-                            let a = PendingApproval {
-                                rpc_id: v["id"].clone(),
-                                method: method.to_string(),
-                                params: params.clone(),
-                                questions: vec![],
-                            };
-                            out.push(json!({"id": v["id"], "result": approval_result(&a, "accept")}));
+                            out.push(quick_approval(v, method, params, "accept"));
                             return out;
                         }
                         super::review_guard::ReviewGuardDecision::Deny(_) => {
-                            let a = PendingApproval {
-                                rpc_id: v["id"].clone(),
-                                method: method.to_string(),
-                                params: params.clone(),
-                                questions: vec![],
-                            };
-                            out.push(json!({"id": v["id"], "result": approval_result(&a, "decline")}));
+                            out.push(quick_approval(v, method, params, "decline"));
                             return out;
                         }
                         super::review_guard::ReviewGuardDecision::Ask => {}
                     }
+                }
+                if auto_accept_all {
+                    out.push(quick_approval(v, method, params, "accept"));
+                    return out;
                 }
                 let reason = params["reason"].as_str().unwrap_or("");
                 let title = if reason.is_empty() {
@@ -683,27 +792,15 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Vec<Valu
                 ask(st, em, v, method, rid, "shell", title, codex_options(true));
             }
             "item/fileChange/requestApproval" | "applyPatchApproval"
-                if st.read_only_review =>
+                if read_only_review =>
             {
-                let a = PendingApproval {
-                    rpc_id: v["id"].clone(),
-                    method: method.to_string(),
-                    params: params.clone(),
-                    questions: vec![],
-                };
-                out.push(json!({"id": v["id"], "result": approval_result(&a, "decline")}));
+                out.push(quick_approval(v, method, params, "decline"));
             }
             "item/fileChange/requestApproval" | "applyPatchApproval"
-                if st.perm.as_deref().unwrap_or(&spec.permission_mode) == "acceptEdits" =>
+                if auto_accept_all || perm == "acceptEdits" =>
             {
-                // Accept-edits mode: file edits are allowed right away
-                let a = PendingApproval {
-                    rpc_id: v["id"].clone(),
-                    method: method.to_string(),
-                    params: params.clone(),
-                    questions: vec![],
-                };
-                out.push(json!({"id": v["id"], "result": approval_result(&a, "accept")}));
+                // Bypass or accept-edits mode: file edits are allowed right away
+                out.push(quick_approval(v, method, params, "accept"));
             }
             "item/fileChange/requestApproval" | "applyPatchApproval" => {
                 let reason = params["reason"].as_str().unwrap_or("");
@@ -718,14 +815,11 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Vec<Valu
                     codex_options(true),
                 );
             }
-            "item/permissions/requestApproval" if st.read_only_review => {
-                let a = PendingApproval {
-                    rpc_id: v["id"].clone(),
-                    method: method.to_string(),
-                    params: params.clone(),
-                    questions: vec![],
-                };
-                out.push(json!({"id": v["id"], "result": approval_result(&a, "decline")}));
+            "item/permissions/requestApproval" if read_only_review => {
+                out.push(quick_approval(v, method, params, "decline"));
+            }
+            "item/permissions/requestApproval" if auto_accept_all => {
+                out.push(quick_approval(v, method, params, "accept"));
             }
             "item/permissions/requestApproval" => {
                 let reason = params["reason"].as_str().unwrap_or("申请额外权限");
@@ -771,6 +865,17 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Vec<Valu
     }
 
     // 3) Notifications
+    if method == "serverRequest/resolved" {
+        let rid = params["requestId"].to_string();
+        if st.approvals.remove(&rid).is_some() {
+            em.event(EventBody::PermissionResolved {
+                request_id: rid,
+                option_id: "cancelled".into(),
+                answers: vec![],
+            });
+        }
+        return out;
+    }
     if let Some(sub) = sub_thread(st, params) {
         sub_notification(st, &sub, method, params, em);
         return out;
@@ -849,6 +954,7 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Vec<Valu
                     em.event(super::limit_hit(limit_reset(&st.rate_limits), None));
                 }
             }
+            resolve_stale_approvals(st, None, false, em);
             // Subagents still running carry on as background tasks
             em.event(EventBody::TurnEnd {
                 stop_reason: turn["status"].as_str().map(str::to_string),
@@ -979,6 +1085,7 @@ fn sub_notification(st: &mut State, sub: &str, method: &str, params: &Value, em:
             publish_tasks(st, em);
         }
         "turn/completed" => {
+            resolve_stale_approvals(st, Some(sub), false, em);
             let s = st.subs.entry(sub.to_string()).or_default();
             s.turn = None;
             let turn = &params["turn"];
@@ -1699,5 +1806,225 @@ mod tests {
         // Fallback must be silent (no Error event emitted to user)
         let evs = hub.store.events_since("s", 0, 100).unwrap();
         assert!(!evs.iter().any(|e| matches!(&e.body, EventBody::Error { .. })));
+    }
+
+    #[test]
+    fn plan_mode_uses_on_request_and_read_only() {
+        assert_eq!(policy("plan"), ("on-request", "read-only"));
+        assert_eq!(policy_for("plan", false), ("on-request", "read-only"));
+        assert_eq!(policy("bypass"), ("never", "danger-full-access"));
+        assert_eq!(policy("strict"), ("untrusted", "workspace-write"));
+
+        let (_hub, em, _rx) = crate::hub::test_emitter();
+        let mut sp = spec();
+        sp.permission_mode = "plan".into();
+        let mut st = State {
+            perm: Some("bypass".into()),
+            ..Default::default()
+        };
+        let init = st.req(Pending::Init, "initialize", json!({}));
+        let out = handle(&mut st, &sp, &json!({"id": init["id"], "result": {}}), &em);
+        assert_eq!(out[2]["method"], "thread/start");
+        assert_eq!(out[2]["params"]["approvalPolicy"], "never");
+        assert_eq!(out[2]["params"]["sandbox"], "danger-full-access");
+    }
+
+    #[test]
+    fn mid_turn_bypass_approves_pending_and_incoming_but_keeps_questions() {
+        let (hub, em, _rx) = crate::hub::test_emitter();
+        let mut sp = spec();
+        sp.permission_mode = "plan".into();
+        let mut st = State {
+            thread_id: Some("main".into()),
+            turn_id: Some("turn-1".into()),
+            ..Default::default()
+        };
+
+        let reqs = [
+            json!({"id": 1, "method": "item/commandExecution/requestApproval", "params": {"threadId": "main", "command": "ls"}}),
+            json!({"id": 2, "method": "item/fileChange/requestApproval", "params": {"threadId": "main", "reason": "edit"}}),
+            json!({"id": 3, "method": "item/permissions/requestApproval", "params": {"threadId": "main", "permissions": {"network": true}}}),
+            json!({"id": 4, "method": "item/tool/requestUserInput", "params": {"threadId": "main", "questions": [{"id": "q1", "question": "Continue?", "options": [{"label": "Yes"}]}]}}),
+        ];
+        for r in &reqs {
+            assert!(handle(&mut st, &sp, r, &em).is_empty());
+        }
+        assert_eq!(hub.info("s").unwrap().pending_permissions, 4);
+
+        let switch_out = apply_permission_mode(&mut st, "bypass".into(), &em);
+        assert_eq!(switch_out.len(), 3);
+        assert_eq!(switch_out[0]["id"], 1);
+        assert_eq!(switch_out[0]["result"]["decision"], "accept");
+        assert_eq!(switch_out[1]["id"], 2);
+        assert_eq!(switch_out[1]["result"]["decision"], "accept");
+        assert_eq!(switch_out[2]["id"], 3);
+        assert_eq!(switch_out[2]["result"]["scope"], "turn");
+        assert_eq!(st.approvals.len(), 1);
+        assert!(st.approvals.contains_key("4"));
+        assert_eq!(hub.info("s").unwrap().pending_permissions, 1);
+
+        let evs = hub.store.events_since("s", 0, 50).unwrap();
+        let resolved: Vec<&EventBody> = evs
+            .iter()
+            .filter_map(|e| matches!(e.body, EventBody::PermissionResolved { .. }).then_some(&e.body))
+            .collect();
+        assert_eq!(resolved.len(), 3);
+        assert!(resolved.iter().all(|b| matches!(b, EventBody::PermissionResolved { option_id, .. } if option_id == "accept")));
+
+        // Incoming approvals during the rest of the turn are auto-accepted silently
+        let cmd_out = handle(
+            &mut st,
+            &sp,
+            &json!({"id": 5, "method": "item/commandExecution/requestApproval", "params": {"threadId": "main", "command": "cat a.txt"}}),
+            &em,
+        );
+        assert_eq!(cmd_out[0]["result"]["decision"], "accept");
+        let patch_out = handle(
+            &mut st,
+            &sp,
+            &json!({"id": 6, "method": "item/fileChange/requestApproval", "params": {"threadId": "main", "reason": "write"}}),
+            &em,
+        );
+        assert_eq!(patch_out[0]["result"]["decision"], "accept");
+        let perm_out = handle(
+            &mut st,
+            &sp,
+            &json!({"id": 7, "method": "item/permissions/requestApproval", "params": {"threadId": "main", "permissions": {"fs": "write"}}}),
+            &em,
+        );
+        assert_eq!(perm_out[0]["result"]["scope"], "turn");
+
+        // User questions are still surfaced even in bypass
+        let ask_out = handle(
+            &mut st,
+            &sp,
+            &json!({"id": 8, "method": "item/tool/requestUserInput", "params": {"threadId": "main", "questions": [{"id": "q2", "question": "Pick one", "options": [{"label": "A"}]}]}}),
+            &em,
+        );
+        assert!(ask_out.is_empty());
+        assert_eq!(st.approvals.len(), 2);
+
+        // Read-only review guard cannot be bypassed
+        let mut rev_st = State {
+            read_only_review: true,
+            ..Default::default()
+        };
+        assert!(handle(
+            &mut rev_st,
+            &sp,
+            &json!({"id": 9, "method": "item/commandExecution/requestApproval", "params": {"command": "cargo test"}}),
+            &em,
+        ).is_empty());
+        assert!(apply_permission_mode(&mut rev_st, "bypass".into(), &em).is_empty());
+        assert_eq!(rev_st.approvals.len(), 1);
+        let rev_write = handle(
+            &mut rev_st,
+            &sp,
+            &json!({"id": 10, "method": "item/fileChange/requestApproval", "params": {"reason": "edit"}}),
+            &em,
+        );
+        assert_eq!(rev_write[0]["result"]["decision"], "decline");
+    }
+
+    #[test]
+    fn stale_approvals_cleared_on_interrupt_turn_end_and_server_resolved() {
+        let (hub, em, _rx) = crate::hub::test_emitter();
+        let sp = spec();
+        let mut st = State {
+            thread_id: Some("main".into()),
+            turn_id: Some("turn-1".into()),
+            ..Default::default()
+        };
+        st.subs.insert("sub-1".into(), SubThread::default());
+
+        // 1) serverRequest/resolved clears matching approval (both main and subagent) and ignores duplicates
+        assert!(handle(
+            &mut st,
+            &sp,
+            &json!({"id": 1, "method": "item/commandExecution/requestApproval", "params": {"threadId": "main", "command": "pwd"}}),
+            &em,
+        ).is_empty());
+        assert!(handle(
+            &mut st,
+            &sp,
+            &json!({"id": "sub-req", "method": "item/commandExecution/requestApproval", "params": {"threadId": "sub-1", "command": "ls"}}),
+            &em,
+        ).is_empty());
+        assert_eq!(hub.info("s").unwrap().pending_permissions, 2);
+
+        assert!(handle(
+            &mut st,
+            &sp,
+            &json!({"method": "serverRequest/resolved", "params": {"threadId": "sub-1", "requestId": "sub-req"}}),
+            &em,
+        ).is_empty());
+        assert!(handle(
+            &mut st,
+            &sp,
+            &json!({"method": "serverRequest/resolved", "params": {"threadId": "main", "requestId": 1}}),
+            &em,
+        ).is_empty());
+        assert!(handle(
+            &mut st,
+            &sp,
+            &json!({"method": "serverRequest/resolved", "params": {"threadId": "main", "requestId": 1}}),
+            &em,
+        ).is_empty());
+        assert!(st.approvals.is_empty());
+        assert_eq!(hub.info("s").unwrap().pending_permissions, 0);
+
+        // 2) Interrupt clears main-thread approvals (with RPC cancel/empty-answer responses) while keeping subagent approvals
+        assert!(handle(
+            &mut st,
+            &sp,
+            &json!({"id": 2, "method": "item/commandExecution/requestApproval", "params": {"threadId": "main", "command": "sleep 10"}}),
+            &em,
+        ).is_empty());
+        assert!(handle(
+            &mut st,
+            &sp,
+            &json!({"id": 3, "method": "item/tool/requestUserInput", "params": {"threadId": "main", "questions": [{"id": "q1", "question": "Proceed?", "options": [{"label": "Yes"}]}]}}),
+            &em,
+        ).is_empty());
+        assert!(handle(
+            &mut st,
+            &sp,
+            &json!({"id": 4, "method": "item/commandExecution/requestApproval", "params": {"threadId": "sub-1", "command": "rg foo"}}),
+            &em,
+        ).is_empty());
+        let cancel_out = resolve_stale_approvals(&mut st, None, true, &em);
+        assert_eq!(cancel_out.len(), 2);
+        assert_eq!(cancel_out[0]["id"], 2);
+        assert_eq!(cancel_out[0]["result"]["decision"], "cancel");
+        assert_eq!(cancel_out[1]["id"], 3);
+        assert_eq!(cancel_out[1]["result"]["answers"], json!({}));
+        assert_eq!(st.approvals.len(), 1);
+        assert!(st.approvals.contains_key("4"));
+        assert_eq!(hub.info("s").unwrap().pending_permissions, 1);
+
+        // 3) Main turn/completed clears remaining main approvals before TurnEnd while preserving sub-1,
+        // and sub-1 turn/completed clears sub-1's approval
+        assert!(handle(
+            &mut st,
+            &sp,
+            &json!({"id": 5, "method": "item/commandExecution/requestApproval", "params": {"threadId": "main", "command": "echo hi"}}),
+            &em,
+        ).is_empty());
+        assert!(handle(&mut st, &sp, &note("turn/completed", "main", json!({"turn": {"id": "turn-1", "status": "interrupted"}})), &em).is_empty());
+        assert_eq!(st.approvals.len(), 1);
+        assert!(st.approvals.contains_key("4"));
+        assert_eq!(hub.info("s").unwrap().pending_permissions, 1);
+
+        assert!(handle(&mut st, &sp, &note("turn/completed", "sub-1", json!({"turn": {"id": "st1", "status": "completed"}})), &em).is_empty());
+        assert!(st.approvals.is_empty());
+        assert_eq!(hub.info("s").unwrap().pending_permissions, 0);
+
+        let evs = hub.store.events_since("s", 0, 100).unwrap();
+        let main_end_idx = evs.iter().position(|e| matches!(e.body, EventBody::TurnEnd { .. })).unwrap();
+        let resolved_5_idx = evs
+            .iter()
+            .position(|e| matches!(&e.body, EventBody::PermissionResolved { request_id, option_id, .. } if request_id == "5" && option_id == "cancelled"))
+            .unwrap();
+        assert!(resolved_5_idx < main_end_idx);
     }
 }

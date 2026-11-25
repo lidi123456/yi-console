@@ -86,7 +86,7 @@ pub fn interactive_args(spec: &StartSpec) -> Vec<String> {
             match spec.permission_mode.as_str() {
                 "bypass" => a.push("--dangerously-bypass-approvals-and-sandbox".into()),
                 "auto" => a.push("--approve-for-me".into()),
-                "plan" => a.extend(["--sandbox".into(), "read-only".into(), "--ask-for-approval".into(), "untrusted".into()]),
+                "plan" => a.extend(["--sandbox".into(), "read-only".into(), "--ask-for-approval".into(), "on-request".into()]),
                 _ => {}
             }
             if let Some(e) = spec.effort.as_ref().filter(|e| !e.is_empty()) {
@@ -436,5 +436,47 @@ mod tests {
         assert_eq!(strip_first_dsr(b"\x1b[6n"), Some(vec![]));
         assert_eq!(strip_first_dsr(b"a\x1b[6nb\x1b[6n").as_deref(), Some(&b"ab\x1b[6n"[..]));
         assert_eq!(strip_first_dsr(b"plain"), None);
+    }
+
+    #[test]
+    fn codex_plan_args_use_on_request() {
+        let spec = super::StartSpec {
+            tool: super::ToolKind::Codex,
+            mode: yi_proto::SessionMode::Terminal,
+            cwd: "/tmp".into(),
+            resume: None,
+            replay: false,
+            replay_skip: 0,
+            model: None,
+            effort: None,
+            model_config_options: vec![],
+            permission_mode: "plan".into(),
+            command: None,
+            program: "codex".into(),
+            extra_args: vec![],
+            mcp_servers: vec![],
+            mcp_fingerprint: String::new(),
+            allow_mcp: vec![],
+            system_prompt: None,
+            system_notice: false,
+            memory_prompt: None,
+            memory_notice: false,
+            cols: 80,
+            rows: 24,
+            tmux: None,
+            session_id: None,
+            env: Default::default(),
+            env_unset: vec![],
+            data_dir: None,
+            auth_method: None,
+            account_handoff: None,
+            fork_session: false,
+            fork_fallback_handoff: None,
+            read_only_review: false,
+        };
+        assert_eq!(
+            super::interactive_args(&spec),
+            vec!["--sandbox", "read-only", "--ask-for-approval", "on-request"]
+        );
     }
 }
