@@ -60,7 +60,7 @@ A ref is tied to a DOM node `(session, backendNodeId)`. A new snapshot of a node
 - Adapters:
   - Claude: `mcp__yi_browser__*` is added to `--allowedTools`, and `can_use_tool` is answered by `Browsers::authorizes`;
   - Codex: `display_result` strips the image bytes;
-  - Kiro: `--trust-tools @yi_browser/<tool>`;
+  - Kiro: `--trust-tools @yi_browser/<tool>`. Its plan agent (`kiro_planner`, used for plan mode and read-only review) ignores `--trust-tools` and asks with a bare tool name, so `session/request_permission` is matched by `_meta.mcpToolIdentity {serverName, toolName}` (`acp::kiro_mcp_identity`), which also covers yi_memory / yi_session / yi_review;
   - other ACP tools (Qoder, CodeBuddy, Cursor, Antigravity): `session/request_permission` for a yi_browser tool is answered with allow-once while the browser is on and not paused (`acp::gateway_tool`). Only exact forms with matching structured tool identity are recognized: the structured call name `mcp__yi_browser__<tool>` / `mcp_yi_browser_<tool>` (Antigravity), CodeBuddy's `DeferExecuteTool` with `toolName` in its input, or (only when the tool name and ACP kind are absent/generic, never on commands or edits) the display title `mcp__yi_browser__<tool>` / `mcp_yi_browser_<tool>` / `<tool> (yi_browser)`. A shell command or file edit whose title mentions those names still goes through read-only review / user approval;
   - Claude / Codex system prompts get `browser::model_hint`;
   - ACP tools get `browser::acp_notice` once per launch.

@@ -1812,6 +1812,10 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Result<V
                 .as_str()
                 .map(str::to_string)
                 .unwrap_or(known.title.clone());
+            // Kiro names MCP tools bare (`review_scope`, title `Running: @yi_review/review_scope`) but attaches the
+            // structured identity; its plan agent ignores `--trust-tools`, so gateway calls must be recognized here
+            let mcp_name = kiro_mcp_identity(params);
+            let guard_name = mcp_name.as_deref().unwrap_or(req_name);
             let options: Vec<PermissionOption> = params["options"]
                 .as_array()
                 .into_iter()
@@ -1837,7 +1841,7 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Result<V
             }
             // A yi_browser, yi_memory, yi_session or yi_review call: the gateway enforces plan mode, write policy, family scope and secret checks
             if !question && known.diffs.is_empty() {
-                if let Some(name) = gateway_tool(req_name, req_kind, &title, &tc["rawInput"]) {
+                if let Some(name) = gateway_tool(guard_name, req_kind, &title, &tc["rawInput"]) {
                     if em.browser_tool_allowed(&name)
                         || em.memory_tool_allowed(&name)
                         || em.session_tool_allowed(&name)
@@ -1853,7 +1857,7 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Result<V
             }
             if !question && st.read_only_review {
                 match super::review_guard::classify_review_action(
-                    req_name,
+                    guard_name,
                     req_kind,
                     &title,
                     &tc["rawInput"],
@@ -2828,6 +2832,14 @@ fn meta_error(r: &Value) -> Option<String> {
 }
 
 /// The tool's original tool name (Bash, Write…): Kiro and Qoder put it in `_meta.<tool>.toolName`
+/// Kiro's `session/request_permission` `_meta.mcpToolIdentity {serverName, toolName}` as `mcp__{server}__{tool}`
+fn kiro_mcp_identity(params: &Value) -> Option<String> {
+    let id = &params["_meta"]["mcpToolIdentity"];
+    let server = id["serverName"].as_str().filter(|s| !s.is_empty())?;
+    let tool = id["toolName"].as_str().filter(|s| !s.is_empty())?;
+    Some(format!("mcp__{server}__{tool}"))
+}
+
 fn meta_tool_name(u: &Value) -> Option<&str> {
     let m = u["_meta"].as_object()?;
     m.values().find_map(|v| v["toolName"].as_str()).or_else(|| {
@@ -5540,6 +5552,21 @@ mod tests {
         assert!(out_ask.is_empty());
         assert!(st.perms.contains_key("12"));
         assert!(hub.store.events_since("s", 0, 20).unwrap().iter().any(|e| matches!(&e.body, EventBody::PermissionRequest { request_id, .. } if request_id == "12")));
+
+        // Kiro's plan agent ignores --trust-tools and asks with a bare tool name plus `_meta.mcpToolIdentity`
+        update(&mut st, &em, &json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": "k1",
+            "title": "Running: @yi_review/review_scope",
+            "rawInput": {},
+            "_meta": {"kiro": {"toolName": "review_scope", "mcpServerName": "yi_review"}}
+        }));
+        let kiro_req = json!({"jsonrpc": "2.0", "id": "kiro-1", "method": "session/request_permission", "params": {
+            "toolCall": {"toolCallId": "k1", "title": "Running: @yi_review/review_scope", "rawInput": {}},
+            "options": opts,
+            "_meta": {"mcpToolIdentity": {"serverName": "yi_review", "toolName": "review_scope"}, "mcpAnnotations": {"readOnlyHint": true}}}});
+        let out_kiro = handle(&mut st, &super::model_config_tests::agy_test_spec(), &kiro_req, &em).unwrap();
+        assert_eq!(out_kiro[0]["result"]["outcome"]["optionId"], "once");
         hub.review_mcp.remove_session("s");
         hub.memories.remove_session("s");
     }
