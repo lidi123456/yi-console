@@ -29,19 +29,24 @@ fn git_cmd(cwd: &Path, args: &[&str]) -> Command {
     // agent's git commit landing at the same moment would fail with "index.lock exists" (VS Code sets the same)
     cmd.env("GIT_OPTIONAL_LOCKS", "0");
     cmd.env("GIT_TERMINAL_PROMPT", "0");
-    // Treat paths after `--` as exact filenames rather than pathspec globs or magic signatures
-    // (`git check-ignore` does not support the literal pathspec magic).
-    if args.first() != Some(&"check-ignore") {
-        cmd.env("GIT_LITERAL_PATHSPECS", "1");
-    } else {
-        cmd.env_remove("GIT_LITERAL_PATHSPECS");
-    }
+    // Clear inherited pathspec env vars so per-path `:(literal)` stays exact and case-sensitive,
+    // commands that reject pathspec magic (`ls-tree`, `check-ignore`) never fail, and hooks never inherit them.
+    cmd.env_remove("GIT_LITERAL_PATHSPECS");
+    cmd.env_remove("GIT_ICASE_PATHSPECS");
+    cmd.env_remove("GIT_GLOB_PATHSPECS");
+    cmd.env_remove("GIT_NOGLOB_PATHSPECS");
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(0x0800_0000);
     }
     cmd
+}
+
+/// Prefix a repo-relative path with `:(literal)` so Git treats glob characters (`*`, `?`, `[...]`)
+/// and leading `:` literally without leaking `GIT_LITERAL_PATHSPECS=1` into git hooks.
+fn literal_pathspec(path: &str) -> String {
+    format!(":(literal){path}")
 }
 
 pub(crate) fn git(cwd: &Path, args: &[&str]) -> Result<std::process::Output> {
@@ -81,12 +86,31 @@ fn git_stdin(cwd: &Path, args: &[&str], envs: &[(&str, &str)], input: &[u8]) -> 
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| anyhow!("运行 git 失败（这台机器装了 git 吗）: {e}"))?;
-    if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(input);
+    // Write stdin on a scoped thread while wait_with_output drains stdout/stderr so large payloads cannot deadlock.
+    let stdin = child.stdin.take();
+    std::thread::scope(|s| {
+        let writer = s.spawn(move || {
+            if let Some(mut stdin) = stdin {
+                let _ = stdin.write_all(input);
+            }
+        });
+        let out = child
+            .wait_with_output()
+            .map_err(|e| anyhow!("等待 git 执行失败: {e}"));
+        let _ = writer.join();
+        out
+    })
+}
+
+fn git_stdin_ok(cwd: &Path, args: &[&str], envs: &[(&str, &str)], input: &[u8]) -> Result<String> {
+    let out = git_stdin(cwd, args, envs, input)?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let msg = if !stderr.is_empty() { stderr } else { stdout };
+        bail!("{msg}");
     }
-    child
-        .wait_with_output()
-        .map_err(|e| anyhow!("等待 git 执行失败: {e}"))
+    Ok(String::from_utf8_lossy(&out.stdout).to_string())
 }
 
 /// Validate a hidden checkpoint ref name (`refs/yi/checkpoints/<sid>/<name>`)
@@ -217,7 +241,7 @@ pub fn normalize_repo_rel(cwd: &str, raw: &str) -> Option<String> {
 }
 
 /// Paths must stay inside the repo, so things like ../ or absolute paths can't escape it.
-/// Leading `-` filenames (e.g. `-draft.txt`) are allowed and always passed after `--` with GIT_LITERAL_PATHSPECS=1.
+/// Leading `-` filenames (e.g. `-draft.txt`) are allowed and always passed after `--` with `:(literal)` pathspecs.
 pub(crate) fn check_paths(paths: &[String]) -> Result<()> {
     use std::path::Component;
     for p in paths {
@@ -297,8 +321,9 @@ pub fn changes_with(cwd: &str, with_diff: bool, only: Option<&[String]>) -> Resu
         None => git_ok(&root, &["status", "--porcelain=v1", "-b", "-z", "-uall", "--ignored=matching"])
             .or_else(|_| git_ok(&root, &["status", "--porcelain=v1", "-b", "-z", "-uall"]))?,
         Some(paths) => {
+            let lit: Vec<String> = paths.iter().map(|p| literal_pathspec(p)).collect();
             let mut args = vec!["status", "--porcelain=v1", "-z", "-uall", "--"];
-            args.extend(paths.iter().map(String::as_str));
+            args.extend(lit.iter().map(String::as_str));
             git_ok(&root, &args)?
         }
     };
@@ -357,9 +382,12 @@ pub fn changes_with(cwd: &str, with_diff: bool, only: Option<&[String]>) -> Resu
             untracked_diff(&root, root_canon.as_deref(), path)
         } else {
             let d = if let Some(ref old) = old_path {
-                git_ok(&root, &["diff", "HEAD", "-M", "--no-color", "--", old, path]).unwrap_or_default()
+                let lit_old = literal_pathspec(old);
+                let lit_path = literal_pathspec(path);
+                git_ok(&root, &["diff", "HEAD", "-M", "--no-color", "--", &lit_old, &lit_path]).unwrap_or_default()
             } else {
-                git_ok(&root, &["diff", "HEAD", "--no-color", "--", path]).unwrap_or_default()
+                let lit_path = literal_pathspec(path);
+                git_ok(&root, &["diff", "HEAD", "--no-color", "--", &lit_path]).unwrap_or_default()
             };
             if d.len() > DIFF_MAX {
                 String::new()
@@ -408,9 +436,13 @@ pub fn changes_with(cwd: &str, with_diff: bool, only: Option<&[String]>) -> Resu
 fn numstat(root: &Path, only: Option<&[String]>) -> std::collections::HashMap<String, (Option<u64>, Option<u64>)> {
     let mut m = std::collections::HashMap::new();
     let mut args = vec!["diff", "HEAD", "--numstat", "-z", "--no-renames"];
-    if let Some(paths) = only.filter(|p| !p.is_empty()) {
+    let lit: Vec<String> = only
+        .filter(|p| !p.is_empty())
+        .map(|paths| paths.iter().map(|p| literal_pathspec(p)).collect())
+        .unwrap_or_default();
+    if !lit.is_empty() {
         args.push("--");
-        args.extend(paths.iter().map(String::as_str));
+        args.extend(lit.iter().map(String::as_str));
     }
     let Ok(out) = git_ok(root, &args) else {
         return m;
@@ -569,11 +601,15 @@ pub fn show(cwd: &str, hash: &str, only: Option<&[String]>) -> Result<Value> {
     if !only.is_some_and(|o| o.is_empty()) {
         let mut num_args = vec!["diff", "--numstat", "-z", "--no-renames", &base, &full];
         let mut name_args = vec!["diff", "--name-status", "-z", "--no-renames", &base, &full];
-        if let Some(paths) = only.filter(|p| !p.is_empty()) {
+        let lit: Vec<String> = only
+            .filter(|p| !p.is_empty())
+            .map(|paths| paths.iter().map(|p| literal_pathspec(p)).collect())
+            .unwrap_or_default();
+        if !lit.is_empty() {
             num_args.push("--");
-            num_args.extend(paths.iter().map(String::as_str));
+            num_args.extend(lit.iter().map(String::as_str));
             name_args.push("--");
-            name_args.extend(paths.iter().map(String::as_str));
+            name_args.extend(lit.iter().map(String::as_str));
         }
         let mut stats = std::collections::HashMap::new();
         for rec in git_ok(&root, &num_args)?.split('\0').filter(|s| !s.is_empty()) {
@@ -589,7 +625,8 @@ pub fn show(cwd: &str, hash: &str, only: Option<&[String]>) -> Result<Value> {
                 continue;
             }
             let diff = if only.is_some() {
-                let d = git_ok(&root, &["diff", "--no-color", &base, &full, "--", path]).unwrap_or_default();
+                let lit_path = literal_pathspec(path);
+                let d = git_ok(&root, &["diff", "--no-color", &base, &full, "--", &lit_path]).unwrap_or_default();
                 if d.len() > DIFF_MAX {
                     String::new()
                 } else {
@@ -729,7 +766,8 @@ pub fn discard(cwd: &str, paths: &[String]) -> Result<()> {
     if norm_paths.is_empty() {
         return Ok(());
     }
-    let refs: Vec<&str> = norm_paths.iter().map(String::as_str).collect();
+    let lit_paths: Vec<String> = norm_paths.iter().map(|p| literal_pathspec(p)).collect();
+    let refs: Vec<&str> = lit_paths.iter().map(String::as_str).collect();
     let has_head = git(&root, &["rev-parse", "--verify", "-q", "HEAD"])?.status.success();
 
     let mut in_head = HashSet::new();
@@ -757,12 +795,12 @@ pub fn discard(cwd: &str, paths: &[String]) -> Result<()> {
     let mut restore_head: Vec<&str> = Vec::new();
     let mut unstage_new: Vec<&str> = Vec::new();
     let mut remove_disk: Vec<&str> = Vec::new();
-    for p in &norm_paths {
+    for (p, lit) in norm_paths.iter().zip(lit_paths.iter()) {
         if in_head.contains(p) {
-            restore_head.push(p.as_str());
+            restore_head.push(lit.as_str());
         } else {
             if tracked.contains(p) {
-                unstage_new.push(p.as_str());
+                unstage_new.push(lit.as_str());
             }
             remove_disk.push(p.as_str());
         }
@@ -837,35 +875,137 @@ pub fn discard(cwd: &str, paths: &[String]) -> Result<()> {
     Ok(())
 }
 
+const WINDOWS_CMDLINE_MAX: usize = 32_767;
+
+fn parse_git_version(raw: &str) -> Option<(u32, u32)> {
+    let token = raw
+        .split_whitespace()
+        .find(|t| t.as_bytes().first().is_some_and(u8::is_ascii_digit))?;
+    let mut parts = token.split('.');
+    let major: u32 = parts.next()?.parse().ok()?;
+    let minor: u32 = parts.next()?.parse().ok()?;
+    Some((major, minor))
+}
+
+fn supports_pathspec_from_file(cwd: &Path) -> bool {
+    static SUPPORTED: OnceLock<bool> = OnceLock::new();
+    *SUPPORTED.get_or_init(|| {
+        git_ok(cwd, &["--version"])
+            .ok()
+            .and_then(|s| parse_git_version(&s))
+            .is_some_and(|v| v >= (2, 26))
+    })
+}
+
+fn nul_pathspec_payload(lit_pathspecs: &[&str]) -> Vec<u8> {
+    let cap: usize = lit_pathspecs.iter().map(|p| p.len() + 1).sum();
+    let mut out = Vec::with_capacity(cap);
+    for p in lit_pathspecs {
+        out.extend_from_slice(p.as_bytes());
+        out.push(0);
+    }
+    out
+}
+
+fn estimate_cmdline_utf16(args: &[&str]) -> usize {
+    // Headroom for `"git" -c core.quotepath=false ` and trailing NUL in Windows CreateProcessW.
+    let mut total = 64usize;
+    for arg in args {
+        total = total.saturating_add(
+            arg.encode_utf16()
+                .count()
+                .saturating_add(arg.bytes().filter(|&b| b == b'"' || b == b'\\').count())
+                .saturating_add(3),
+        );
+    }
+    total
+}
+
+fn check_commit_cmdline_limits(add_args: Option<&[&str]>, commit_args: &[&str], limit: usize) -> Result<()> {
+    let add_over = add_args.is_some_and(|args| estimate_cmdline_utf16(args) > limit);
+    let commit_over = estimate_cmdline_utf16(commit_args) > limit;
+    if add_over || commit_over {
+        bail!("选中文件过多，超出当前 Git 版本的命令行长度限制，请分批提交或升级 Git");
+    }
+    Ok(())
+}
+
 /// Commit only the selected files (leaving everything else in the index alone)
 pub fn commit(cwd: &str, paths: &[String], message: &str) -> Result<Value> {
+    commit_with_options(
+        cwd,
+        paths,
+        message,
+        None,
+        if cfg!(windows) { Some(WINDOWS_CMDLINE_MAX) } else { None },
+    )
+}
+
+fn commit_with_options(
+    cwd: &str,
+    paths: &[String],
+    message: &str,
+    force_pathspec_from_file: Option<bool>,
+    fallback_cmdline_limit: Option<usize>,
+) -> Result<Value> {
     check_paths(paths)?;
     if paths.is_empty() {
         bail!("没有选文件");
     }
-    if message.trim().is_empty() {
+    let msg = message.trim();
+    if msg.is_empty() {
         bail!("提交说明不能为空");
     }
     let dir = crate::paths::expand(cwd);
     let root = repo_root(&dir).ok_or_else(|| anyhow!("不是 git 仓库"))?;
+    let lit_paths: Vec<String> = paths.iter().map(|p| literal_pathspec(p)).collect();
+    let lit_refs: Vec<&str> = lit_paths.iter().map(String::as_str).collect();
     let mut to_add: Vec<&str> = Vec::new();
-    for p in paths {
+    for (p, lit) in paths.iter().zip(lit_refs.iter().copied()) {
         // Staged deletions and rename `oldPath` entries are already removed from both disk and the index;
         // passing them to `git add -A -- <path>` fails with `did not match any files`.
         let exists = std::fs::symlink_metadata(root.join(p)).is_ok();
-        let in_index = !exists && git(&root, &["ls-files", "--error-unmatch", "--", p])?.status.success();
+        let in_index = !exists && git(&root, &["ls-files", "--error-unmatch", "--", lit])?.status.success();
         if exists || in_index {
-            to_add.push(p.as_str());
+            to_add.push(lit);
         }
     }
-    if !to_add.is_empty() {
-        let mut add = vec!["add", "-A", "--"];
-        add.extend(to_add);
-        git_ok(&root, &add)?;
+    let use_from_file = force_pathspec_from_file.unwrap_or_else(|| supports_pathspec_from_file(&root));
+    if use_from_file {
+        if !to_add.is_empty() {
+            let payload = nul_pathspec_payload(&to_add);
+            git_stdin_ok(
+                &root,
+                &["add", "-A", "--pathspec-from-file=-", "--pathspec-file-nul"],
+                &[],
+                &payload,
+            )?;
+        }
+        let payload = nul_pathspec_payload(&lit_refs);
+        git_stdin_ok(
+            &root,
+            &["commit", "-m", msg, "--pathspec-from-file=-", "--pathspec-file-nul"],
+            &[],
+            &payload,
+        )?;
+    } else {
+        let add_args = if to_add.is_empty() {
+            None
+        } else {
+            let mut args = vec!["add", "-A", "--"];
+            args.extend_from_slice(&to_add);
+            Some(args)
+        };
+        let mut commit_args = vec!["commit", "-m", msg, "--"];
+        commit_args.extend_from_slice(&lit_refs);
+        if let Some(limit) = fallback_cmdline_limit {
+            check_commit_cmdline_limits(add_args.as_deref(), &commit_args, limit)?;
+        }
+        if let Some(args) = add_args {
+            git_ok(&root, &args)?;
+        }
+        git_ok(&root, &commit_args)?;
     }
-    let mut c = vec!["commit", "-m", message.trim(), "--"];
-    c.extend(paths.iter().map(String::as_str));
-    git_ok(&root, &c)?;
     let head = git_ok(&root, &["rev-parse", "--short", "HEAD"])?;
     Ok(json!({ "commit": head.trim() }))
 }
@@ -2635,13 +2775,17 @@ pub fn branch_diff(cwd: &str, base: Option<&str>, with_diff: bool, only: Option<
     let mut num_args = vec!["diff", "--numstat", "-z", "--no-renames", &merge_base];
     let mut name_args = vec!["diff", "--name-status", "-z", "--no-renames", &merge_base];
     let mut ls_args = vec!["ls-files", "--others", "--exclude-standard", "-z"];
-    if let Some(paths) = only.filter(|p| !p.is_empty()) {
+    let lit: Vec<String> = only
+        .filter(|p| !p.is_empty())
+        .map(|paths| paths.iter().map(|p| literal_pathspec(p)).collect())
+        .unwrap_or_default();
+    if !lit.is_empty() {
         num_args.push("--");
-        num_args.extend(paths.iter().map(String::as_str));
+        num_args.extend(lit.iter().map(String::as_str));
         name_args.push("--");
-        name_args.extend(paths.iter().map(String::as_str));
+        name_args.extend(lit.iter().map(String::as_str));
         ls_args.push("--");
-        ls_args.extend(paths.iter().map(String::as_str));
+        ls_args.extend(lit.iter().map(String::as_str));
     }
 
     let mut stats = std::collections::HashMap::new();
@@ -2685,7 +2829,8 @@ pub fn branch_diff(cwd: &str, base: Option<&str>, with_diff: bool, only: Option<
         } else if is_untracked {
             untracked_diff(&root, root_canon.as_deref(), &path)
         } else {
-            let d = git_ok(&root, &["diff", &merge_base, "--no-color", "--", &path]).unwrap_or_default();
+            let lit_path = literal_pathspec(&path);
+            let d = git_ok(&root, &["diff", &merge_base, "--no-color", "--", &lit_path]).unwrap_or_default();
             if d.len() > DIFF_MAX { String::new() } else { d }
         };
         let (added, deleted) = if is_untracked {
@@ -2819,7 +2964,8 @@ fn diff_two_revs(
         let diff = if !with_diff {
             String::new()
         } else {
-            let d = git_ok(root, &["diff", "--no-color", base_oid, end_oid, "--", &path]).unwrap_or_default();
+            let lit_path = literal_pathspec(&path);
+            let d = git_ok(root, &["diff", "--no-color", base_oid, end_oid, "--", &lit_path]).unwrap_or_default();
             if d.len() > DIFF_MAX { String::new() } else { d }
         };
         let (added, deleted, binary) = stats.get(&path).copied().unwrap_or((None, None, false));
@@ -2955,10 +3101,12 @@ pub fn review_scope(cwd: &str, params: &Value) -> Result<Value> {
                     } else {
                         args.push("HEAD");
                     }
-                    if let Some(ref old) = old_path {
-                        args.extend(["-M", "--no-color", "--", old.as_str(), path.as_str()]);
+                    let lit_path = literal_pathspec(&path);
+                    let lit_old = old_path.as_deref().map(literal_pathspec);
+                    if let Some(ref old) = lit_old {
+                        args.extend(["-M", "--no-color", "--", old.as_str(), lit_path.as_str()]);
                     } else {
-                        args.extend(["--no-color", "--", path.as_str()]);
+                        args.extend(["--no-color", "--", lit_path.as_str()]);
                     }
                     let d = git_ok(&root, &args).unwrap_or_default();
                     if d.len() > DIFF_MAX { String::new() } else { d }
@@ -3152,7 +3300,8 @@ pub fn review_scope(cwd: &str, params: &Value) -> Result<Value> {
                 } else if is_untracked {
                     untracked_diff(&root, root_canon.as_deref(), &path)
                 } else {
-                    let d = git_ok(&root, &["diff", &merge_base, "--no-color", "--", &path]).unwrap_or_default();
+                    let lit_path = literal_pathspec(&path);
+                    let d = git_ok(&root, &["diff", &merge_base, "--no-color", "--", &lit_path]).unwrap_or_default();
                     if d.len() > DIFF_MAX { String::new() } else { d }
                 };
                 counted += 1;
@@ -3629,11 +3778,13 @@ pub fn diff_stat_refs_filtered(cwd: &str, base_ref: &str, end_ref: &str, only: O
         return Ok((0, 0, 0));
     };
     let mut args = vec!["diff", "--numstat", "-z", "--no-renames", base_ref, end_ref];
-    if let Some(paths) = only.filter(|p| !p.is_empty()) {
+    let lit: Vec<String> = only
+        .filter(|p| !p.is_empty())
+        .map(|paths| paths.iter().map(|p| literal_pathspec(p)).collect())
+        .unwrap_or_default();
+    if !lit.is_empty() {
         args.push("--");
-        for p in paths {
-            args.push(p.as_str());
-        }
+        args.extend(lit.iter().map(String::as_str));
     }
     let out = git_ok(&root, &args)?;
     let mut files = 0u32;
@@ -3685,11 +3836,15 @@ pub fn ref_diff(cwd: &str, base_ref: &str, end_ref: &str, with_diff: bool, only:
 
     let mut num_args = vec!["diff", "--numstat", "-z", "--no-renames", base_ref, end_ref];
     let mut name_args = vec!["diff", "--name-status", "-z", "--no-renames", base_ref, end_ref];
-    if let Some(paths) = only.filter(|p| !p.is_empty()) {
+    let lit: Vec<String> = only
+        .filter(|p| !p.is_empty())
+        .map(|paths| paths.iter().map(|p| literal_pathspec(p)).collect())
+        .unwrap_or_default();
+    if !lit.is_empty() {
         num_args.push("--");
-        num_args.extend(paths.iter().map(String::as_str));
+        num_args.extend(lit.iter().map(String::as_str));
         name_args.push("--");
-        name_args.extend(paths.iter().map(String::as_str));
+        name_args.extend(lit.iter().map(String::as_str));
     }
 
     let mut stats = std::collections::HashMap::new();
@@ -3720,7 +3875,8 @@ pub fn ref_diff(cwd: &str, base_ref: &str, end_ref: &str, with_diff: bool, only:
         let diff = if !with_diff {
             String::new()
         } else {
-            let d = git_ok(&root, &["diff", base_ref, end_ref, "--no-color", "--", &path]).unwrap_or_default();
+            let lit_path = literal_pathspec(&path);
+            let d = git_ok(&root, &["diff", base_ref, end_ref, "--no-color", "--", &lit_path]).unwrap_or_default();
             if d.len() > DIFF_MAX { String::new() } else { d }
         };
         let (added, deleted) = stats.get(&path).copied().unwrap_or((None, None));
@@ -4931,13 +5087,16 @@ mod tests {
         run(&["config", "core.autocrlf", "false"]);
         std::fs::write(repo.join("-draft.txt"), "v1\n").unwrap();
         std::fs::write(repo.join("dir/[id].txt"), "glob-like v1\n").unwrap();
-        run(&["add", "--", "-draft.txt", "dir/[id].txt"]);
+        std::fs::write(repo.join("dir/i.txt"), "sibling v1\n").unwrap();
+        let lit_dash = literal_pathspec("-draft.txt");
+        let lit_bracket = literal_pathspec("dir/[id].txt");
+        run(&["add", "--", &lit_dash, &lit_bracket, "dir/i.txt"]);
         run(&["commit", "-qm", "init special filenames"]);
 
         run(&["checkout", "-qb", "feat"]);
         std::fs::write(repo.join("-draft.txt"), "v2\n").unwrap();
         std::fs::write(repo.join("dir/[id].txt"), "glob-like v2\n").unwrap();
-        run(&["add", "--", "-draft.txt", "dir/[id].txt"]);
+        run(&["add", "--", &lit_dash, &lit_bracket]);
         run(&["commit", "-qm", "feat update"]);
         let hash = git_ok(&repo, &["rev-parse", "HEAD"]).unwrap().trim().to_string();
 
@@ -4977,6 +5136,228 @@ mod tests {
 
         discard(&cwd, &["-draft.txt".into()]).unwrap();
         assert_eq!(std::fs::read_to_string(repo.join("-draft.txt")).unwrap(), "v2\n");
+
+        // Bracket-like filenames must remain literal without matching sibling files like `dir/i.txt`
+        std::fs::write(repo.join("dir/[id].txt"), "glob-like v3\n").unwrap();
+        std::fs::write(repo.join("dir/i.txt"), "sibling modified\n").unwrap();
+
+        let ch_br = changes_with(&cwd, true, Some(&["dir/[id].txt".into()])).unwrap();
+        let ch_br_files = ch_br["files"].as_array().unwrap();
+        assert_eq!(ch_br_files.len(), 1);
+        assert_eq!(ch_br_files[0]["path"], "dir/[id].txt");
+        assert!(ch_br_files[0]["diff"].as_str().unwrap().contains("+glob-like v3"));
+
+        commit(&cwd, &["dir/[id].txt".into()], "commit literal bracket").unwrap();
+        assert_eq!(blob(&cwd, "dir/[id].txt", "HEAD").unwrap()["text"], "glob-like v3\n");
+        assert_eq!(std::fs::read_to_string(repo.join("dir/i.txt")).unwrap(), "sibling modified\n");
+        assert_eq!(git_ok(&repo, &["status", "--porcelain"]).unwrap().trim(), "M dir/i.txt");
+
+        std::fs::write(repo.join("dir/[id].txt"), "glob-like v4\n").unwrap();
+        discard(&cwd, &["dir/[id].txt".into()]).unwrap();
+        assert_eq!(std::fs::read_to_string(repo.join("dir/[id].txt")).unwrap(), "glob-like v3\n");
+        assert_eq!(std::fs::read_to_string(repo.join("dir/i.txt")).unwrap(), "sibling modified\n");
+    }
+
+    #[test]
+    fn hooks_do_not_inherit_git_literal_pathspecs() {
+        let d = tempfile::tempdir().unwrap();
+        let repo = d.path().join("repo");
+        let hooks_dir = d.path().join("hooks");
+        let wt_root = d.path().join("wt");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+
+        let write_hook = |name: &str, body: &str| {
+            let p = hooks_dir.join(name);
+            std::fs::write(&p, body).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut perms = std::fs::metadata(&p).unwrap().permissions();
+                perms.set_mode(0o755);
+                std::fs::set_permissions(&p, perms).unwrap();
+            }
+        };
+
+        write_hook(
+            "pre-commit",
+            "#!/bin/sh\nif [ -n \"${GIT_LITERAL_PATHSPECS:-}\" ] || [ -n \"${GIT_ICASE_PATHSPECS:-}\" ]; then\n  echo \"pathspec env leaked: literal=${GIT_LITERAL_PATHSPECS:-} icase=${GIT_ICASE_PATHSPECS:-}\" >&2\n  exit 1\nfi\ngit_dir=\"$(git rev-parse --git-dir)\" || exit 1\nmatched=\"$(git diff --cached --name-only -- '*.ts')\" || exit 1\nprintf '%s\\n' \"$matched\" > \"$git_dir/pre-commit-matched.txt\"\ntest -n \"$matched\"\n",
+        );
+        write_hook(
+            "post-checkout",
+            "#!/bin/sh\nif [ -n \"${GIT_LITERAL_PATHSPECS:-}\" ] || [ -n \"${GIT_ICASE_PATHSPECS:-}\" ]; then\n  echo \"pathspec env leaked: literal=${GIT_LITERAL_PATHSPECS:-} icase=${GIT_ICASE_PATHSPECS:-}\" >&2\n  exit 1\nfi\ngit_dir=\"$(git rev-parse --git-dir)\" || exit 1\nprintf '%s:%s' \"${GIT_LITERAL_PATHSPECS:-}\" \"${GIT_ICASE_PATHSPECS:-}\" > \"$git_dir/post-checkout-env.txt\"\ngit ls-files -- '*.ts' > \"$git_dir/post-checkout-matched.txt\"\n",
+        );
+
+        let run = |a: &[&str]| assert!(git(&repo, a).unwrap().status.success(), "{a:?}");
+        run(&["init", "-q", "-b", "main"]);
+        run(&["config", "user.email", "t@t"]);
+        run(&["config", "user.name", "t"]);
+        run(&["config", "core.autocrlf", "false"]);
+        std::fs::write(repo.join("README.md"), "init\n").unwrap();
+        run(&["add", "README.md"]);
+        run(&["commit", "-qm", "init"]);
+
+        let hooks_fwd = hooks_dir.to_string_lossy().replace('\\', "/");
+        run(&["config", "core.hooksPath", &hooks_fwd]);
+
+        std::fs::write(repo.join("[id].ts"), "export const id = 1;\n").unwrap();
+        std::fs::write(repo.join("i.ts"), "export const i = 2;\n").unwrap();
+        let cwd = repo.to_string_lossy().to_string();
+
+        commit(&cwd, &["[id].ts".into()], "commit with pre-commit hook").unwrap();
+        let pre_matched = std::fs::read_to_string(repo.join(".git/pre-commit-matched.txt")).unwrap();
+        assert_eq!(pre_matched.lines().collect::<Vec<_>>(), vec!["[id].ts"]);
+        assert_eq!(git_ok(&repo, &["status", "--porcelain"]).unwrap().trim(), "?? i.ts");
+
+        checkout(&cwd, "feat", true, None).unwrap();
+        assert_eq!(std::fs::read_to_string(repo.join(".git/post-checkout-env.txt")).unwrap(), ":");
+        let co_matched = std::fs::read_to_string(repo.join(".git/post-checkout-matched.txt")).unwrap();
+        assert!(co_matched.lines().any(|l| l == "[id].ts"), "co_matched={co_matched:?}");
+
+        let wt = worktree_add(&wt_root, &cwd, "wt1", None, None).unwrap();
+        let wt_path = wt["path"].as_str().unwrap();
+        let wt_git_raw = git_ok(Path::new(wt_path), &["rev-parse", "--git-dir"]).unwrap();
+        let wt_git_p = Path::new(wt_git_raw.trim());
+        let wt_git_dir = if wt_git_p.is_absolute() {
+            wt_git_p.to_path_buf()
+        } else {
+            Path::new(wt_path).join(wt_git_p)
+        };
+        assert_eq!(std::fs::read_to_string(wt_git_dir.join("post-checkout-env.txt")).unwrap(), ":");
+        let wt_matched = std::fs::read_to_string(wt_git_dir.join("post-checkout-matched.txt")).unwrap();
+        assert!(wt_matched.lines().any(|l| l == "[id].ts"), "wt_matched={wt_matched:?}");
+    }
+
+    #[test]
+    fn git_cmd_clears_pathspec_env_vars_and_isolates_case_differing_files() {
+        let d = tempfile::tempdir().unwrap();
+        let repo = d.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+
+        let cmd = git_cmd(&repo, &["commit", "-m", "x", "--", ":(literal)Foo.ts"]);
+        let envs: std::collections::HashMap<_, _> = cmd.get_envs().collect();
+        for key in [
+            "GIT_LITERAL_PATHSPECS",
+            "GIT_ICASE_PATHSPECS",
+            "GIT_GLOB_PATHSPECS",
+            "GIT_NOGLOB_PATHSPECS",
+        ] {
+            assert_eq!(
+                envs.get(std::ffi::OsStr::new(key)),
+                Some(&None),
+                "{key} should be cleared on git child processes"
+            );
+        }
+
+        // Case-insensitive filesystems cannot hold both `Foo.ts` and `foo.ts` simultaneously.
+        std::fs::write(repo.join("Foo.ts"), "upper v1\n").unwrap();
+        if repo.join("foo.ts").exists() {
+            return;
+        }
+
+        let run = |a: &[&str]| assert!(git(&repo, a).unwrap().status.success(), "{a:?}");
+        run(&["init", "-q", "-b", "main"]);
+        run(&["config", "user.email", "t@t"]);
+        run(&["config", "user.name", "t"]);
+        run(&["config", "core.autocrlf", "false"]);
+        std::fs::write(repo.join("foo.ts"), "lower v1\n").unwrap();
+        run(&["add", "--", ":(literal)Foo.ts", ":(literal)foo.ts"]);
+        run(&["commit", "-qm", "init"]);
+
+        std::fs::write(repo.join("Foo.ts"), "upper v2\n").unwrap();
+        std::fs::write(repo.join("foo.ts"), "lower v2\n").unwrap();
+
+        let cwd = repo.to_string_lossy().to_string();
+        commit(&cwd, &["Foo.ts".into()], "commit upper only").unwrap();
+        assert_eq!(blob(&cwd, "Foo.ts", "HEAD").unwrap()["text"], "upper v2\n");
+        assert_eq!(blob(&cwd, "foo.ts", "HEAD").unwrap()["text"], "lower v1\n");
+        assert_eq!(git_ok(&repo, &["status", "--porcelain"]).unwrap().trim(), "M foo.ts");
+
+        std::fs::write(repo.join("Foo.ts"), "upper v3\n").unwrap();
+        discard(&cwd, &["Foo.ts".into()]).unwrap();
+        assert_eq!(std::fs::read_to_string(repo.join("Foo.ts")).unwrap(), "upper v2\n");
+        assert_eq!(std::fs::read_to_string(repo.join("foo.ts")).unwrap(), "lower v2\n");
+    }
+
+    #[test]
+    fn commit_handles_large_batches_and_validates_fallback_cmdline_limit() {
+        assert_eq!(parse_git_version("git version 2.25.1"), Some((2, 25)));
+        assert_eq!(parse_git_version("git version 2.26.0"), Some((2, 26)));
+        assert_eq!(parse_git_version("git version 2.39.5"), Some((2, 39)));
+        assert_eq!(parse_git_version("git version 2.54.0.windows.1"), Some((2, 54)));
+        assert_eq!(parse_git_version("git version 2.39.3 (Apple Git-146)"), Some((2, 39)));
+        assert_eq!(parse_git_version("not-a-version"), None);
+
+        let d = tempfile::tempdir().unwrap();
+        let repo = d.path().join("repo");
+        std::fs::create_dir_all(repo.join("batch")).unwrap();
+        let run = |a: &[&str]| assert!(git(&repo, a).unwrap().status.success(), "{a:?}");
+        run(&["init", "-q", "-b", "main"]);
+        run(&["config", "user.email", "t@t"]);
+        run(&["config", "user.name", "t"]);
+        run(&["config", "core.autocrlf", "false"]);
+        std::fs::write(repo.join("staged-del.txt"), "del\n").unwrap();
+        std::fs::write(repo.join("untouched.txt"), "keep v1\n").unwrap();
+        std::fs::write(repo.join("small.txt"), "small v1\n").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-qm", "init"]);
+
+        std::fs::write(repo.join("untouched.txt"), "keep v2\n").unwrap();
+        std::fs::write(repo.join("small.txt"), "small v2\n").unwrap();
+        run(&["rm", "-q", "staged-del.txt"]);
+
+        let pad = "a".repeat(80);
+        let mut batch_paths: Vec<String> = Vec::with_capacity(360);
+        for i in 0..360 {
+            let rel = format!("batch/file_{i:04}_{pad}.txt");
+            std::fs::write(repo.join(&rel), format!("{i}\n")).unwrap();
+            batch_paths.push(rel);
+        }
+
+        let lit_batch: Vec<String> = batch_paths.iter().map(|p| literal_pathspec(p)).collect();
+        let mut oversized_args = vec!["commit", "-m", "too long", "--"];
+        oversized_args.extend(lit_batch.iter().map(String::as_str));
+        assert!(estimate_cmdline_utf16(&oversized_args) > WINDOWS_CMDLINE_MAX);
+
+        let cwd = repo.to_string_lossy().to_string();
+        let too_long = commit_with_options(&cwd, &batch_paths, "too long", Some(false), Some(WINDOWS_CMDLINE_MAX));
+        assert!(too_long.is_err());
+        assert_eq!(git_ok(&repo, &["diff", "--cached", "--name-only"]).unwrap().trim(), "staged-del.txt");
+
+        // Asymmetric case: `git add` fits when staged deletions are omitted, while `git commit` exceeds the limit.
+        let lit_small = literal_pathspec("small.txt");
+        let lit_del = literal_pathspec("staged-del.txt");
+        let add_est = estimate_cmdline_utf16(&["add", "-A", "--", &lit_small]);
+        let commit_est = estimate_cmdline_utf16(&["commit", "-m", "asymmetric", "--", &lit_small, &lit_del]);
+        assert!(add_est < commit_est);
+        let asym_err = commit_with_options(
+            &cwd,
+            &["small.txt".into(), "staged-del.txt".into()],
+            "asymmetric",
+            Some(false),
+            Some(add_est),
+        );
+        assert!(asym_err.is_err());
+        assert_eq!(git_ok(&repo, &["diff", "--cached", "--name-only"]).unwrap().trim(), "staged-del.txt");
+
+        // Primary path on Git >= 2.26 streams all paths (and staged deletions) through stdin.
+        let mut all_paths = batch_paths.clone();
+        all_paths.push("staged-del.txt".into());
+        commit(&cwd, &all_paths, "batch commit via stdin").unwrap();
+
+        let head_tree = git_ok(&repo, &["ls-tree", "-r", "--name-only", "HEAD"]).unwrap();
+        let committed: std::collections::HashSet<&str> = head_tree.lines().collect();
+        assert_eq!(committed.len(), 362);
+        assert!(!committed.contains("staged-del.txt"));
+        for p in &batch_paths {
+            assert!(committed.contains(p.as_str()), "missing committed path {p}");
+        }
+        let st_lines: Vec<String> = git_ok(&repo, &["status", "--porcelain"])
+            .unwrap()
+            .lines()
+            .map(|l| l.trim().to_string())
+            .collect();
+        assert_eq!(st_lines, vec!["M small.txt", "M untouched.txt"]);
     }
 
     #[test]
