@@ -831,17 +831,111 @@ pub fn rename(from: &str, to: &str) -> Result<Value> {
     Ok(json!({ "path": b.display().to_string() }))
 }
 
-/// Delete a file or empty folder; non-empty folders are refused, so a slip can't wipe out a whole tree
-pub fn delete(path: &str) -> Result<Value> {
+fn is_symlink_or_reparse(m: &std::fs::Metadata) -> bool {
+    if m.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        if m.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return true;
+        }
+    }
+    false
+}
+
+fn clear_readonly(p: &Path, m: &std::fs::Metadata) {
+    let mut perms = m.permissions();
+    if perms.readonly() {
+        perms.set_readonly(false);
+        let _ = std::fs::set_permissions(p, perms);
+    }
+}
+
+fn refuse_protected_dir(p: &Path) -> Result<()> {
+    let canon = p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    if p.parent().is_none() || canon.parent().is_none() {
+        bail!("不能删除系统根目录或主目录");
+    }
+    if let Some(home) = dirs::home_dir() {
+        if home.canonicalize().unwrap_or(home) == canon {
+            bail!("不能删除系统根目录或主目录");
+        }
+    }
+    let paths_home = crate::paths::home();
+    if paths_home.canonicalize().unwrap_or(paths_home) == canon {
+        bail!("不能删除系统根目录或主目录");
+    }
+    let yi_dir = crate::paths::base_dir();
+    if yi_dir.canonicalize().unwrap_or(yi_dir) == canon {
+        bail!("不能删除 Yi Console 数据目录");
+    }
+    Ok(())
+}
+
+fn remove_dir_all_safe(dir: &Path) -> std::io::Result<()> {
+    match std::fs::remove_dir_all(dir) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            if let Ok(m) = std::fs::symlink_metadata(dir) {
+                if !is_symlink_or_reparse(&m) {
+                    clear_readonly(dir, &m);
+                }
+            }
+            let mut stack = vec![dir.to_path_buf()];
+            while let Some(cur) = stack.pop() {
+                let Ok(rd) = std::fs::read_dir(&cur) else {
+                    continue;
+                };
+                for entry in rd.flatten() {
+                    let ep = entry.path();
+                    let Ok(em) = std::fs::symlink_metadata(&ep) else {
+                        continue;
+                    };
+                    if is_symlink_or_reparse(&em) {
+                        continue;
+                    }
+                    clear_readonly(&ep, &em);
+                    if em.is_dir() {
+                        stack.push(ep);
+                    }
+                }
+            }
+            std::fs::remove_dir_all(dir)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Delete a file, symlink, empty folder, or (when `recursive` is true) a folder and all of its contents
+pub fn delete(path: &str, recursive: bool) -> Result<Value> {
     let p = crate::paths::expand(path);
     let m = std::fs::symlink_metadata(&p)?;
+    if is_symlink_or_reparse(&m) {
+        std::fs::remove_file(&p).or_else(|_| std::fs::remove_dir(&p))?;
+        return Ok(Value::Null);
+    }
     if m.is_dir() {
-        if std::fs::read_dir(&p)?.next().is_some() {
-            bail!("文件夹不是空的，请先删除里面的内容");
+        refuse_protected_dir(&p)?;
+        if recursive {
+            remove_dir_all_safe(&p)?;
+        } else {
+            if std::fs::read_dir(&p)?.next().is_some() {
+                bail!("文件夹不是空的，请先删除里面的内容");
+            }
+            std::fs::remove_dir(&p)?;
         }
-        std::fs::remove_dir(&p)?;
     } else {
-        std::fs::remove_file(&p)?;
+        match std::fs::remove_file(&p) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                clear_readonly(&p, &m);
+                std::fs::remove_file(&p)?;
+            }
+            Err(e) => return Err(e.into()),
+        }
     }
     Ok(Value::Null)
 }
@@ -1226,6 +1320,50 @@ mod tests {
         let r = search(&d.path().display().to_string(), "main", 10).unwrap();
         let paths: Vec<&str> = r.as_array().unwrap().iter().map(|v| v["path"].as_str().unwrap()).collect();
         assert_eq!(paths, vec!["src/a/main.rs"]);
+    }
+
+    #[test]
+    fn delete_file_and_dirs() {
+        let d = tempfile::tempdir().unwrap();
+        let f1 = d.path().join("f1.txt");
+        let f2 = d.path().join("f2.txt");
+        std::fs::write(&f1, "1").unwrap();
+        std::fs::write(&f2, "2").unwrap();
+        delete(&f1.display().to_string(), false).unwrap();
+        delete(&f2.display().to_string(), true).unwrap();
+        assert!(!f1.exists() && !f2.exists());
+
+        let empty = d.path().join("empty");
+        std::fs::create_dir(&empty).unwrap();
+        delete(&empty.display().to_string(), false).unwrap();
+        assert!(!empty.exists());
+
+        let nested = d.path().join("nested/sub");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("a.txt"), "a").unwrap();
+        let err = delete(&d.path().join("nested").display().to_string(), false).unwrap_err();
+        assert!(err.to_string().contains("文件夹不是空的"), "{err}");
+        assert!(nested.join("a.txt").exists());
+
+        delete(&d.path().join("nested").display().to_string(), true).unwrap();
+        assert!(!d.path().join("nested").exists());
+
+        #[cfg(unix)]
+        assert!(delete("/", true).is_err());
+        #[cfg(windows)]
+        assert!(delete(r"C:\", true).is_err());
+
+        #[cfg(unix)]
+        {
+            let target = d.path().join("real-target");
+            std::fs::create_dir_all(&target).unwrap();
+            std::fs::write(target.join("keep.txt"), "keep").unwrap();
+            let link = d.path().join("link-dir");
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+            delete(&link.display().to_string(), true).unwrap();
+            assert!(std::fs::symlink_metadata(&link).is_err());
+            assert!(target.join("keep.txt").exists());
+        }
     }
 }
 

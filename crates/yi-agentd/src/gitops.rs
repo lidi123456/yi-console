@@ -555,25 +555,188 @@ pub fn blob(cwd: &str, path: &str, rev: &str) -> Result<Value> {
     Ok(json!({ "exists": true, "text": text, "binary": false, "tooLarge": false, "notUtf8": not_utf8, "size": size }))
 }
 
-/// Discard changes: tracked files are restored to HEAD, new files are deleted
+fn is_symlink_or_reparse(m: &std::fs::Metadata) -> bool {
+    if m.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        if m.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return true;
+        }
+    }
+    false
+}
+
+fn remove_file_readonly_retry(p: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(p) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            if let Ok(m) = std::fs::symlink_metadata(p) {
+                let mut perms = m.permissions();
+                if perms.readonly() {
+                    perms.set_readonly(false);
+                    let _ = std::fs::set_permissions(p, perms);
+                    return std::fs::remove_file(p);
+                }
+            }
+            Err(e)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Split path lists by both item count and byte length so git never hits Windows CreateProcess command-line limits
+fn chunk_paths<'a>(paths: &'a [&'a str]) -> Vec<&'a [&'a str]> {
+    const MAX_COUNT: usize = 200;
+    const MAX_BYTES: usize = 16_000;
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    let mut bytes = 0usize;
+    for (i, p) in paths.iter().enumerate() {
+        let cost = p.len() + 3;
+        if i > start && (i - start >= MAX_COUNT || bytes + cost > MAX_BYTES) {
+            chunks.push(&paths[start..i]);
+            start = i;
+            bytes = 0;
+        }
+        bytes += cost;
+    }
+    if start < paths.len() {
+        chunks.push(&paths[start..]);
+    }
+    chunks
+}
+
+/// Discard changes: tracked files are restored to HEAD, new files are deleted and emptied untracked dirs are pruned
 pub fn discard(cwd: &str, paths: &[String]) -> Result<()> {
     check_paths(paths)?;
+    let mut seen = HashSet::new();
+    let mut norm_paths = Vec::with_capacity(paths.len());
+    for raw in paths {
+        let p = raw.replace('\\', "/");
+        let p = p.trim_end_matches('/').to_string();
+        if p.is_empty() {
+            continue;
+        }
+        if p.split('/').any(|seg| seg == ".git") {
+            bail!("路径无效: {raw}");
+        }
+        if seen.insert(p.clone()) {
+            norm_paths.push(p);
+        }
+    }
     let dir = crate::paths::expand(cwd);
     let root = repo_root(&dir).ok_or_else(|| anyhow!("不是 git 仓库"))?;
-    for p in paths {
-        let tracked = git(&root, &["ls-files", "--error-unmatch", "--", p])?.status.success();
-        let in_head = git(&root, &["cat-file", "-e", &format!("HEAD:{p}")])?.status.success();
-        if in_head {
-            git_ok(&root, &["checkout", "HEAD", "--", p])?;
-        } else {
-            if tracked {
-                git_ok(&root, &["rm", "--cached", "-q", "--", p])?;
-            }
-            let full = root.join(p);
-            if std::fs::symlink_metadata(&full).is_ok_and(|m| m.is_file() || m.file_type().is_symlink()) {
-                std::fs::remove_file(&full)?;
+    if norm_paths.is_empty() {
+        return Ok(());
+    }
+    let refs: Vec<&str> = norm_paths.iter().map(String::as_str).collect();
+    let has_head = git(&root, &["rev-parse", "--verify", "-q", "HEAD"])?.status.success();
+
+    let mut in_head = HashSet::new();
+    if has_head {
+        for chunk in chunk_paths(&refs) {
+            let mut args = vec!["ls-tree", "-r", "--name-only", "-z", "HEAD", "--"];
+            args.extend_from_slice(chunk);
+            let out = git_ok(&root, &args)?;
+            for item in out.split('\0').filter(|s| !s.is_empty()) {
+                in_head.insert(item.to_string());
             }
         }
+    }
+
+    let mut tracked = HashSet::new();
+    for chunk in chunk_paths(&refs) {
+        let mut args = vec!["ls-files", "-z", "--"];
+        args.extend_from_slice(chunk);
+        let out = git_ok(&root, &args)?;
+        for item in out.split('\0').filter(|s| !s.is_empty()) {
+            tracked.insert(item.to_string());
+        }
+    }
+
+    let mut restore_head: Vec<&str> = Vec::new();
+    let mut unstage_new: Vec<&str> = Vec::new();
+    let mut remove_disk: Vec<&str> = Vec::new();
+    for p in &norm_paths {
+        if in_head.contains(p) {
+            restore_head.push(p.as_str());
+        } else {
+            if tracked.contains(p) {
+                unstage_new.push(p.as_str());
+            }
+            remove_disk.push(p.as_str());
+        }
+    }
+
+    for chunk in chunk_paths(&unstage_new) {
+        let mut args = vec!["rm", "--cached", "-f", "-q", "--"];
+        args.extend_from_slice(chunk);
+        git_ok(&root, &args)?;
+    }
+
+    let mut candidate_dirs: HashSet<String> = HashSet::new();
+    for p in remove_disk {
+        let segs: Vec<&str> = p.split('/').collect();
+        let mut cur = root.clone();
+        let mut symlink_parent = false;
+        for seg in &segs[..segs.len().saturating_sub(1)] {
+            cur.push(seg);
+            match std::fs::symlink_metadata(&cur) {
+                Ok(m) if is_symlink_or_reparse(&m) => {
+                    symlink_parent = true;
+                    break;
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        if symlink_parent {
+            continue;
+        }
+        let full = root.join(p);
+        if let Ok(m) = std::fs::symlink_metadata(&full) {
+            if is_symlink_or_reparse(&m) {
+                std::fs::remove_file(&full).or_else(|_| std::fs::remove_dir(&full))?;
+            } else if m.is_file() {
+                remove_file_readonly_retry(&full)?;
+            }
+        }
+        let mut rel = p;
+        while let Some(idx) = rel.rfind('/') {
+            rel = &rel[..idx];
+            if !rel.is_empty() {
+                candidate_dirs.insert(rel.to_string());
+            }
+        }
+    }
+
+    let mut dirs_sorted: Vec<String> = candidate_dirs.into_iter().collect();
+    dirs_sorted.sort_by(|a, b| {
+        b.matches('/')
+            .count()
+            .cmp(&a.matches('/').count())
+            .then_with(|| b.len().cmp(&a.len()))
+    });
+    for rel_dir in dirs_sorted {
+        if rel_dir.is_empty() || rel_dir.split('/').any(|seg| seg == ".git") {
+            continue;
+        }
+        let d = root.join(&rel_dir);
+        if let Ok(m) = std::fs::symlink_metadata(&d) {
+            if m.is_dir() && !is_symlink_or_reparse(&m) {
+                let _ = std::fs::remove_dir(&d);
+            }
+        }
+    }
+
+    for chunk in chunk_paths(&restore_head) {
+        let mut args = vec!["checkout", "HEAD", "--"];
+        args.extend_from_slice(chunk);
+        git_ok(&root, &args)?;
     }
     Ok(())
 }
@@ -4435,5 +4598,94 @@ mod tests {
         let remain = git_ok(&repo, &["status", "--porcelain"]).unwrap();
         assert_eq!(remain.trim(), "A  other.txt");
         assert!(!repo.join("old.txt").exists() && repo.join("new.txt").exists());
+    }
+
+    #[test]
+    fn discard_batch_and_prune_empty_dirs() {
+        let d = tempfile::tempdir().unwrap();
+        let repo = d.path().join("repo");
+        std::fs::create_dir_all(repo.join("keep_dir")).unwrap();
+        let run = |a: &[&str]| assert!(git(&repo, a).unwrap().status.success(), "{a:?}");
+        run(&["init", "-q", "-b", "main"]);
+        run(&["config", "user.email", "t@t"]);
+        run(&["config", "user.name", "t"]);
+        run(&["config", "core.autocrlf", "false"]);
+        std::fs::write(repo.join("mod.txt"), "v1\n").unwrap();
+        std::fs::write(repo.join("staged_mod.txt"), "s1\n").unwrap();
+        std::fs::write(repo.join("staged_del.txt"), "bye\n").unwrap();
+        std::fs::write(repo.join("old_ren.txt"), "ren\n").unwrap();
+        std::fs::write(repo.join("keep_dir/tracked.txt"), "stay\n").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-qm", "init"]);
+
+        // Create every kind of uncommitted change
+        std::fs::write(repo.join("mod.txt"), "v2\n").unwrap();
+        std::fs::write(repo.join("staged_mod.txt"), "s2\n").unwrap();
+        run(&["add", "staged_mod.txt"]);
+        run(&["rm", "-q", "staged_del.txt"]);
+        run(&["mv", "old_ren.txt", "new_ren.txt"]);
+        std::fs::write(repo.join("staged_new_edited.txt"), "index\n").unwrap();
+        run(&["add", "staged_new_edited.txt"]);
+        std::fs::write(repo.join("staged_new_edited.txt"), "worktree\n").unwrap();
+
+        std::fs::create_dir_all(repo.join(".tmp-shots/sub")).unwrap();
+        std::fs::write(repo.join(".tmp-shots/sub/a.png"), "a").unwrap();
+        std::fs::write(repo.join(".tmp-shots/sub/b.png"), "b").unwrap();
+
+        std::fs::create_dir_all(repo.join("partial")).unwrap();
+        std::fs::write(repo.join("partial/keep.txt"), "keep").unwrap();
+        std::fs::write(repo.join("partial/drop.txt"), "drop").unwrap();
+
+        std::fs::write(repo.join("keep_dir/untracked.txt"), "u").unwrap();
+
+        let cwd = repo.to_string_lossy().to_string();
+        assert!(discard(&cwd, &[".git/config".into()]).is_err());
+        assert!(discard(&cwd, &["../escape".into()]).is_err());
+
+        discard(
+            &cwd,
+            &[
+                "mod.txt".into(),
+                "staged_mod.txt".into(),
+                "staged_del.txt".into(),
+                "new_ren.txt".into(),
+                "old_ren.txt".into(),
+                "staged_new_edited.txt".into(),
+                ".tmp-shots/sub/a.png".into(),
+                ".tmp-shots/sub/b.png".into(),
+                "partial/drop.txt".into(),
+                "keep_dir/untracked.txt".into(),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(std::fs::read_to_string(repo.join("mod.txt")).unwrap(), "v1\n");
+        assert_eq!(std::fs::read_to_string(repo.join("staged_mod.txt")).unwrap(), "s1\n");
+        assert_eq!(std::fs::read_to_string(repo.join("staged_del.txt")).unwrap(), "bye\n");
+        assert_eq!(std::fs::read_to_string(repo.join("old_ren.txt")).unwrap(), "ren\n");
+        assert!(!repo.join("new_ren.txt").exists());
+        assert!(!repo.join("staged_new_edited.txt").exists());
+        assert!(!repo.join(".tmp-shots/sub").exists());
+        assert!(!repo.join(".tmp-shots").exists());
+        assert!(repo.join("partial/keep.txt").exists() && !repo.join("partial/drop.txt").exists());
+        assert!(repo.join("keep_dir/tracked.txt").exists() && !repo.join("keep_dir/untracked.txt").exists());
+        assert_eq!(git_ok(&repo, &["status", "--porcelain"]).unwrap().trim(), "?? partial/");
+    }
+
+    #[test]
+    fn discard_unborn_head() {
+        let d = tempfile::tempdir().unwrap();
+        let repo = d.path().join("repo");
+        std::fs::create_dir_all(repo.join("nested/dir")).unwrap();
+        let run = |a: &[&str]| assert!(git(&repo, a).unwrap().status.success(), "{a:?}");
+        run(&["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("nested/dir/staged.txt"), "staged\n").unwrap();
+        run(&["add", "nested/dir/staged.txt"]);
+        std::fs::write(repo.join("nested/dir/untracked.txt"), "untracked\n").unwrap();
+
+        let cwd = repo.to_string_lossy().to_string();
+        discard(&cwd, &["nested/dir/staged.txt".into(), "nested/dir/untracked.txt".into()]).unwrap();
+        assert!(!repo.join("nested").exists());
+        assert!(git_ok(&repo, &["status", "--porcelain"]).unwrap().trim().is_empty());
     }
 }

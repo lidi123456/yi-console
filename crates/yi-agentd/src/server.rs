@@ -1519,7 +1519,11 @@ pub async fn dispatch(
         )?,
         FS_MKDIR => crate::fsapi::mkdir(s(&p, "path")?)?,
         FS_RENAME => crate::fsapi::rename(s(&p, "from")?, s(&p, "to")?)?,
-        FS_DELETE => crate::fsapi::delete(s(&p, "path")?)?,
+        FS_DELETE => {
+            let path = s(&p, "path")?.to_string();
+            let recursive = p["recursive"].as_bool().unwrap_or(false);
+            tokio::task::spawn_blocking(move || crate::fsapi::delete(&path, recursive)).await??
+        }
         FS_ROOTS => tokio::task::spawn_blocking(crate::fsapi::roots).await?,
         STATS_USAGE => {
             // The first time requires scanning Claude / Codex logs, so do it on a blocking thread

@@ -10233,6 +10233,31 @@ button.wp-commit-title .chev {
   color: var(--text);
 }
 
+/* Inline row action buttons (e.g. VS Code-style discard icon on hover in Changes view) */
+.wp-row-act {
+  flex: none;
+  width: 22px;
+  height: 22px;
+  border-radius: 5px;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-3);
+}
+.wp-row:hover .wp-row-act,
+.wp-row:focus-within .wp-row-act,
+.wp-tree:focus .wp-row.kfocus .wp-row-act {
+  display: inline-flex;
+}
+.wp-row-act:hover {
+  background: var(--side-active);
+  color: var(--text);
+}
+.wp-row-act.danger:hover {
+  background: var(--err-soft);
+  color: var(--err);
+}
+
 /* Collapse button for pending approval / AI question cards */
 .card-fold-btn {
   width: 24px;
@@ -10253,6 +10278,9 @@ button.wp-commit-title .chev {
 @media (hover: none) {
   .wp-row-more {
     display: inline-flex;
+  }
+  .wp-row .wp-row-act {
+    display: none !important;
   }
   /* Touch screens have no hover, so the close button of an unsaved file shows × in color directly */
   .wp-ftab-x.dirty svg {
@@ -16072,6 +16100,26 @@ button.wp-commit-title .chev {
   font-size: 10.5px;
   font-weight: 500;
   color: var(--text-3);
+}
+.wp-scope-right {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex: none;
+}
+.wp-scope-act {
+  width: 22px;
+  height: 22px;
+  border-radius: 5px;
+  color: var(--text-2);
+}
+.wp-scope-act:hover:not(:disabled) {
+  color: var(--err);
+  background: var(--err-soft);
+}
+.wp-scope-act:disabled {
+  opacity: 0.45;
+  cursor: default;
 }
 .wp-git-dock {
   flex: none;

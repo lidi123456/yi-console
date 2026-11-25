@@ -469,6 +469,7 @@ function Rows({
   dropDir,
   onDropOver,
   stats,
+  onDiscard,
   reviewBadges,
   reviewRelOf,
   reviewCleanCheck,
@@ -478,6 +479,7 @@ function Rows({
   scroller?: React.RefObject<HTMLElement | null>;
   /** Changes view: show lines added/removed to the right of file rows */
   stats?: boolean;
+  onDiscard?: (r: TreeRow) => void;
   selected?: string;
   /** Keyboard cursor (row key), separate from the opened file as in VS Code */
   focused?: string | null;
@@ -598,6 +600,20 @@ function Rows({
               }}
             >
               <Icon name="more" size={13} />
+            </button>
+          )}
+          {onDiscard && !r.loading && (
+            <button
+              type="button"
+              className="wp-row-act danger"
+              title={r.isDir ? tx('discardFolderChanges') : tx('discardFileChanges')}
+              aria-label={r.isDir ? tx('discardFolderChanges') : tx('discardFileChanges')}
+              onClick={(e) => {
+                e.stopPropagation();
+                onDiscard(r);
+              }}
+            >
+              <Icon name="rotate-l" size={13} />
             </button>
           )}
           {revBadge && revBadge.total > 0 && revTopSev ? (
@@ -777,6 +793,8 @@ export function FilePanel({
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
   // Opened files (tabs); the current file is file
   const [tabs, setTabs] = useState<string[]>([]);
+  const openTabsRef = useRef(tabs);
+  openTabsRef.current = tabs;
   // Native webviews (NativeWeb.tsx) stay parked while their tab is open, so switching tabs doesn't reload them
   const panelId = useRef(`${Math.random()}`).current;
   useLayoutEffect(() => registerWebTabs(panelId, tabs.filter(isWebTab).map((t) => `${hostId}|${t}`)), [tabs, hostId]); // eslint-disable-line react-hooks/exhaustive-deps
@@ -831,6 +849,7 @@ export function FilePanel({
   const [pushing, setPushing] = useState(false);
   const [fetching, setFetching] = useState(false);
   const [gitBusy, setGitBusy] = useState(false);
+  const [discarding, setDiscarding] = useState(false);
   const [view, setView] = useState<'all' | 'changes' | 'search'>(() => lsGet(viewKey, 'all'));
   const [showDiff, setShowDiff] = useState(false);
   // Default to Cursor-style single-file inline diff with the full file expanded
@@ -1250,7 +1269,8 @@ export function FilePanel({
 
   const refreshTree = () => {
     if (!root) return;
-    for (const d of [root, ...expanded]) load(d);
+    load(root);
+    for (const d of expandedRef.current) load(d, true);
     loadGit();
   };
 
@@ -2108,22 +2128,75 @@ export function FilePanel({
     }
   };
 
+  const isSameOrInside = (candidate: string, target: string) => {
+    const nc = norm(candidate);
+    const nt = norm(target);
+    return nc === nt || nc.startsWith(nt + '/');
+  };
+  const isUntrackedGit = (f: GitFile) => f.status === 'new' || f.status === '??';
+  const tabDiskPath = (t: string): string | null => {
+    if (isSideTab(t) || isReviewTab(t) || isCommitTab(t) || isUntitled(t)) return null;
+    if (isWebTab(t)) return webTabFile(t);
+    return t;
+  };
+  const closeRemovedTabs = async (matchPath: (absPath: string) => boolean) => {
+    const curTabs = openTabsRef.current;
+    const isMatchedTab = (t: string) => {
+      const dp = tabDiskPath(t);
+      return dp !== null && matchPath(dp);
+    };
+    const cur = fileRef.current;
+    const curPath = cur?.path;
+    const closingCur = !!curPath && isMatchedTab(curPath);
+    const rest = curTabs.filter((t) => !isMatchedTab(t));
+    if (rest.length !== curTabs.length) {
+      openTabsRef.current = rest;
+      setTabs(rest);
+    }
+    if (secondRef.current && matchPath(secondRef.current.path)) setSecond(null);
+    if (compareRef.current && matchPath(compareRef.current.path)) setCompare(null);
+    if (closingCur) {
+      const i = curTabs.indexOf(curPath);
+      const next = i >= 0 ? rest[Math.min(i, rest.length - 1)] : rest[rest.length - 1];
+      if (next) {
+        const nf = await readFile(next, true);
+        setFile(nf);
+        setShowDiff(false);
+        previewFor(next);
+      } else {
+        setFile(null);
+      }
+      setCompare(null);
+      setSaveState(null);
+    }
+  };
+
   const remove = async (path: string, isDir: boolean) => {
     const name = baseName(path);
     const ok = await askConfirm({
       title: isDir ? tx('deleteFolder', { name }) : tx('delete', { name }),
       message: isDir
-        ? tx('thisCannotBeUndoneEmpty', { path })
+        ? tx('thisCannotBeUndoneFolder', { path })
         : tx('thisCannotBeUndone', { path }),
       okText: tx('delete2'),
       danger: true,
     });
     if (!ok) return;
     try {
-      await rpc(hostId, 'fs.delete', { path });
-      if (file?.path === path) setFile(null);
-      setTabs((t) => t.filter((x) => x !== path));
-      await load(parentOf(path));
+      await rpc(hostId, 'fs.delete', isDir ? { path, recursive: true } : { path });
+      await closeRemovedTabs(isDir ? (p) => isSameOrInside(p, path) : (p) => norm(p) === norm(path));
+      if (isDir) {
+        setExpanded((x) => new Set([...x].filter((d) => !isSameOrInside(d, path))));
+        setKids((k) => {
+          const next = { ...k };
+          for (const key of Object.keys(next)) {
+            if (isSameOrInside(key, path)) delete next[key];
+          }
+          return next;
+        });
+      }
+      refreshTree();
+      if (diffScope === 'branch') loadBranchDiff();
     } catch (err) {
       errorToast(err);
     }
@@ -2156,31 +2229,101 @@ export function FilePanel({
   };
 
   // ---------- Git operations: discard, push, switch/create branch, switch worktree ----------
-  const doDiscard = async (rels: string[], label: string) => {
-    if (!rels.length) return;
+  const uncommittedInDir = (dirPath: string): GitFile[] => {
+    if (!git) return [];
+    const prefix = norm(dirPath) + '/';
+    const out: GitFile[] = [];
+    for (const [k, f] of git.files) {
+      if (k.startsWith(prefix)) out.push(f);
+    }
+    return out;
+  };
+  const discardPathsOf = (files: GitFile[]): string[] => {
+    const seen = new Set<string>();
+    const out: string[] = [];
+    for (const f of files) {
+      for (const p of f.oldPath ? [f.rel, f.oldPath] : [f.rel]) {
+        if (!seen.has(p)) {
+          seen.add(p);
+          out.push(p);
+        }
+      }
+    }
+    return out;
+  };
+  const doDiscardFiles = async (files: GitFile[], title: string) => {
+    if (!files.length || discarding) return;
+    const untrackedCount = files.filter(isUntrackedGit).length;
+    const trackedCount = files.length - untrackedCount;
+    const message =
+      untrackedCount === files.length
+        ? untrackedCount === 1
+          ? tx('discardUntrackedFileWarn')
+          : tx('discardUntrackedManyWarn', { n: untrackedCount })
+        : untrackedCount === 0
+          ? tx('discardTrackedWarn')
+          : tx('discardMixedWarn', { tracked: trackedCount, untracked: untrackedCount });
     const ok = await askConfirm({
-      title: tx('discardGitChangesTitle', { v: label }),
-      message: tx('discardGitChangesWarn'),
+      title,
+      message,
       okText: tx('discard'),
       danger: true,
     });
     if (!ok) return;
+    setDiscarding(true);
     try {
-      await rpc(hostId, 'git.discard', { cwd, paths: rels });
+      await rpc(hostId, 'git.discard', { cwd, paths: discardPathsOf(files) });
       toast(tx('discardedChanges'));
-      refreshTree();
-      const f = fileRef.current;
-      if (f && !f.web && !f.commit && !f.review && !f.untitled) {
-        const g = gitOf(f.path);
-        if (g && rels.includes(g.rel)) {
-          const next = await readFile(f.path, true);
-          if (next) setFile(next);
-          else closeTab(f.path);
+      const removedNorms = new Set(
+        files.filter((f) => isUntrackedGit(f) || f.status.startsWith('A') || !!f.oldPath).map((f) => norm(f.path)),
+      );
+      if (removedNorms.size) {
+        await closeRemovedTabs((p) => removedNorms.has(norm(p)));
+      }
+      const cur = fileRef.current;
+      if (cur && !cur.web && !cur.commit && !cur.review && !cur.side && !cur.untitled) {
+        const curNorm = norm(cur.path);
+        if (files.some((f) => norm(f.path) === curNorm && !removedNorms.has(curNorm))) {
+          const next = await readFile(cur.path, true);
+          if (next) {
+            setFile(next);
+            setShowDiff(false);
+            setSaveState(null);
+          } else {
+            await closeRemovedTabs((p) => norm(p) === curNorm);
+          }
         }
       }
+      refreshTree();
+      if (diffScope === 'branch') loadBranchDiff();
     } catch (e) {
       errorToast(e);
+    } finally {
+      setDiscarding(false);
     }
+  };
+  const discardFile = (f: GitFile) => void doDiscardFiles([f], tx('discardGitChangesTitle', { v: baseName(f.path) }));
+  const discardFolder = (dirPath: string, displayName?: string) => {
+    const files = uncommittedInDir(dirPath);
+    if (!files.length) return;
+    const label = displayName || baseName(dirPath);
+    const title =
+      files.length === 1
+        ? tx('discardFolderChangesSingleTitle', { v: label })
+        : tx('discardFolderChangesTitle', { v: label, n: files.length });
+    void doDiscardFiles(files, title);
+  };
+  const discardAllUncommitted = () => {
+    if (!git || !uncommittedKeys.length) return;
+    const files = uncommittedKeys.map((k) => git.files.get(k)).filter((f): f is GitFile => !!f);
+    if (!files.length) return;
+    if (files.length === 1) return discardFile(files[0]);
+    void doDiscardFiles(files, tx('discardAllChangesTitle', { n: files.length }));
+  };
+  const discardRow = (r: TreeRow) => {
+    if (r.isDir) return discardFolder(r.path, r.name);
+    const g = gitOf(r.path);
+    if (g) discardFile(g);
   };
 
   const refreshGitAll = (withDetails = true) => {
@@ -2765,6 +2908,7 @@ export function FilePanel({
     const dir = r.isDir ? r.path : parentOf(r.path);
     const canSide = !r.isDir && !!file && !file.web && !file.commit && !file.review && !file.side && file.path !== r.path && wide();
     const rowGit = !r.isDir ? gitOf(r.path) : undefined;
+    const dirGitFiles = r.isDir ? uncommittedInDir(r.path) : [];
     openMenu(ev, [
       r.isDir
         ? { label: r.expanded ? tx('collapse') : tx('expand'), icon: 'folder', run: () => toggle(r.path) }
@@ -2790,8 +2934,10 @@ export function FilePanel({
       { label: tx('newFile'), icon: 'plus', run: () => create(dir, 'file') },
       { label: tx('newFolder'), icon: 'folder', run: () => create(dir, 'dir') },
       ...(rowGit
-        ? ['-' as const, { label: tx('discardFileChanges'), icon: 'rotate-l', danger: true, run: () => void doDiscard(rowGit.oldPath ? [rowGit.rel, rowGit.oldPath] : [rowGit.rel], baseName(r.path)) }]
-        : []),
+        ? ['-' as const, { label: tx('discardFileChanges'), icon: 'rotate-l', danger: true, run: () => discardFile(rowGit) }]
+        : dirGitFiles.length > 0
+          ? ['-' as const, { label: tx('discardFolderChangesCount', { n: dirGitFiles.length }), icon: 'rotate-l', danger: true, run: () => discardFolder(r.path, r.name) }]
+          : []),
       '-',
       { label: tx('rename'), icon: 'edit', run: () => rename(r.path) },
       { label: tx('delete2'), icon: 'trash', danger: true, run: () => remove(r.path, r.isDir) },
@@ -3994,7 +4140,21 @@ export function FilePanel({
                   </button>
                 )}
               </div>
-              {totals && changed.length > 0 && <LineStat a={totals.a} d={totals.d} />}
+              <div className="wp-scope-right">
+                {totals && changed.length > 0 && <LineStat a={totals.a} d={totals.d} />}
+                {diffScope === 'uncommitted' && uncommittedKeys.length > 0 && (
+                  <button
+                    type="button"
+                    className="icon-btn wp-scope-act"
+                    title={tx('discardAllChanges')}
+                    aria-label={tx('discardAllChanges')}
+                    disabled={discarding}
+                    onClick={discardAllUncommitted}
+                  >
+                    <Icon name="rotate-l" size={13} />
+                  </button>
+                )}
+              </div>
             </div>
           )}
           {view === 'all' && (
@@ -4164,6 +4324,7 @@ export function FilePanel({
                     onToggle={toggleCollapsed}
                     onOpen={(r) => openFile(r.path, true)}
                     onMenu={rowMenu}
+                    onDiscard={diffScope === 'uncommitted' && git ? discardRow : undefined}
                     onDragRow={dragRow}
                     reviewBadges={activeReviewId ? fileIssueBadges : undefined}
                     reviewRelOf={activeReviewId ? reviewRelOf : undefined}
