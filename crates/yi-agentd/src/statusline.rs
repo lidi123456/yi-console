@@ -61,15 +61,25 @@ pub async fn query(hub: &Arc<Hub>, sid: &str, want_git: bool) -> Result<Value> {
     if let Some(g) = &git {
         out["git"] = g.clone();
     }
-    let cmd = if !st.command.trim().is_empty() {
-        Some((st.command.trim().to_string(), "settings", false))
+    let (cmd, payload_val) = if !st.command.trim().is_empty() {
+        let cmd_str = st.command.trim().to_string();
+        let info_c = info.clone();
+        let git_c = git.clone();
+        let p = tokio::task::spawn_blocking(move || payload(&info_c, git_c.as_ref())).await?;
+        (Some((cmd_str, "settings", false)), Some(p))
     } else if st.use_claude && info.tool == ToolKind::Claude {
-        claude_command(&info.cwd).map(|c| (c, "claude", true))
+        let info_c = info.clone();
+        let git_c = git.clone();
+        tokio::task::spawn_blocking(move || {
+            let cmd = claude_command(&info_c.cwd).map(|c| (c, "claude", true));
+            let p = cmd.as_ref().map(|_| payload(&info_c, git_c.as_ref()));
+            (cmd, p)
+        })
+        .await?
     } else {
-        None
+        (None, None)
     };
-    if let Some((cmd, source, bash)) = cmd {
-        let payload = payload(&info, git.as_ref());
+    if let (Some((cmd, source, bash)), Some(payload)) = (cmd, payload_val) {
         match run(&cmd, &info.cwd, &payload, bash).await {
             Ok(text) => out["command"] = json!({ "text": text, "source": source }),
             Err(e) => out["error"] = json!(format!("状态栏命令失败：{e}")),

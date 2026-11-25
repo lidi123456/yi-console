@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { getT } from '../i18n';
 import { errorToast, toast } from '../store';
 import { rpc } from '../transport';
@@ -42,6 +42,7 @@ interface Result {
 }
 
 interface Item {
+  key: string;
   path: string;
   line: number;
   col: number;
@@ -49,11 +50,18 @@ interface Item {
   text: string;
   rep?: string;
   hit: Hit;
+  pre: string;
+  mid: string;
+  post: string;
 }
+
+type GrepRow =
+  | { kind: 'head'; key: string; path: string; name: string; dir: string; closed: boolean; items: Item[] }
+  | { kind: 'hit'; key: string; path: string; item: Item };
 
 interface Undo {
   files: { abs: string; before: string; modified: number; size: number }[];
-  draft?: { before: string; after: string };
+  draft?: { path: string; rev: number; before: string; after: string };
 }
 
 interface ReplaceOut {
@@ -100,9 +108,11 @@ function useHistory(key: string, value: string, set: (v: string) => void) {
 export function GrepPanel({
   hostId,
   root,
+  visible = true,
   onOpen,
   openFiles,
   dirty,
+  getLiveDirty,
   includeRequest,
   queryRequest,
   onPreview,
@@ -111,19 +121,23 @@ export function GrepPanel({
 }: {
   hostId: string;
   root: string;
+  /** False while FilePanel is hidden via CSS (pauses F4 shortcuts and focus stealing) */
+  visible?: boolean;
   onOpen: (rel: string, line: number, col: number, len: number) => void;
   /** Open file tabs under root (relative paths), for "search only in open files" */
   openFiles: string[];
   /** The open file with unsaved edits: replacing in it changes the draft, as VS Code does with dirty editors */
   dirty: { rel: string; draft: string } | null;
+  /** Read current live editor draft synchronously (including unsynced edits within the 200ms debounce window) */
+  getLiveDirty?: () => { path: string; rel: string; rev: number; draft: string } | null;
   /** "Find in folder" from the tree: fill "files to include" */
   includeRequest: { value: string; n: number } | null;
   /** Jump from Peek References: populate query and flags */
   queryRequest?: { query: string; caseSensitive?: boolean; wholeWord?: boolean; regex?: boolean; n: number } | null;
   /** Show the file with its replacements applied as a diff */
   onPreview: (rel: string, line: number, col: number, len: number, after: string) => void;
-  /** Replace the unsaved draft of the open file; skipped when the draft is no longer `expect` */
-  onDraft: (next: string, expect?: string) => void;
+  /** Replace the unsaved draft of the open file; returns new rev or null if stale/changed */
+  onDraft: (next: string, expect: { path: string; rev: number; draft: string }) => number | null;
   /** Files written by replace or undo (absolute paths): refresh the tree, git status and open files */
   onReplaced: (abs: string[]) => void;
 }) {
@@ -149,6 +163,8 @@ export function GrepPanel({
   const [nonce, setNonce] = useState(0);
   const input = useRef<HTMLInputElement>(null);
   const list = useRef<HTMLDivElement>(null);
+  const rowsBoxRef = useRef<HTMLDivElement>(null);
+  const pendingScrollKeyRef = useRef<string | null>(null);
   const term = q.trim() ? q : '';
   const hq = useHistory('wp-grep-hist', q, setQ);
   const hr = useHistory('wp-grep-rep-hist', rep, setRep);
@@ -156,7 +172,9 @@ export function GrepPanel({
   const he = useHistory('wp-grep-exc-hist', exc, setExc);
   const openKey = openOnly ? openFiles.join('\n') : '';
 
-  useEffect(() => input.current?.focus(), []);
+  useEffect(() => {
+    if (visible) input.current?.focus();
+  }, [visible]);
 
   useEffect(() => {
     if (!includeRequest || includeRequest.n <= appliedInclude) return;
@@ -235,15 +253,24 @@ export function GrepPanel({
     };
   }, [hostId, root, term, cs, ww, re, inc, exc, openOnly, openKey, showRep, showRep && rep, showRep && pc, nonce]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // One item per match, grouped by file, without dismissed ones
+  // One item per match, grouped by file, without dismissed ones (precompute display segments once)
   const groups = useMemo(() => {
     const m = new Map<string, Item[]>();
     for (const h of res?.hits ?? []) {
       if (gone.has(h.path)) continue;
-      const raw: RawMatch[] = h.matches ?? [[h.offset + h.col, h.len, [...h.text].slice(h.col, h.col + h.len).join('')]];
+      const chars = [...h.text];
+      const raw: RawMatch[] = h.matches ?? [[h.offset + h.col, h.len, chars.slice(h.col, h.col + h.len).join('')]];
       for (const [col, len, text, r] of raw) {
-        const it = { path: h.path, line: h.line, col, len, text, rep: r, hit: h };
-        if (dismissed.has(keyOf(it))) continue;
+        const key = `${h.path}\n${h.line}\n${col}`;
+        if (dismissed.has(key)) continue;
+        const c = col - h.offset;
+        const inside = c >= 0 && c < chars.length;
+        // Keep only a short lead-in before the match so it stays visible in a narrow panel
+        const head = inside ? chars.slice(0, c).join('').replace(/^\s+/, '') : '';
+        const pre = !inside ? '…' : head.length > 16 ? '…' + head.slice(-14) : head;
+        const mid = inside ? chars.slice(c, c + len).join('') : text;
+        const post = inside ? chars.slice(c + len).join('') : '';
+        const it: Item = { key, path: h.path, line: h.line, col, len, text, rep: r, hit: h, pre, mid, post };
         if (!m.has(h.path)) m.set(h.path, []);
         m.get(h.path)!.push(it);
       }
@@ -251,6 +278,106 @@ export function GrepPanel({
     return [...m.entries()];
   }, [res, dismissed, gone]);
   const flat = useMemo(() => groups.flatMap(([, items]) => items), [groups]);
+  const flatRows = useMemo(() => {
+    const out: GrepRow[] = [];
+    for (const [path, items] of groups) {
+      const closed = folded.has(path);
+      out.push({ kind: 'head', key: `h:${path}`, path, name: base(path), dir: dirOf(path), closed, items });
+      if (!closed) {
+        for (const item of items) out.push({ kind: 'hit', key: item.key, path, item });
+      }
+    }
+    return out;
+  }, [groups, folded]);
+  const [rowHeights, setRowHeights] = useState(() =>
+    typeof window !== 'undefined' && window.matchMedia('(max-width: 760px)').matches ? { head: 34, hit: 32 } : { head: 26, hit: 24 },
+  );
+  const rowHeightsRef = useRef(rowHeights);
+  rowHeightsRef.current = rowHeights;
+  const offsets = useMemo(() => {
+    const arr = new Array<number>(flatRows.length + 1);
+    arr[0] = 0;
+    for (let i = 0; i < flatRows.length; i++) {
+      arr[i + 1] = arr[i] + (flatRows[i].kind === 'head' ? rowHeights.head : rowHeights.hit);
+    }
+    return arr;
+  }, [flatRows, rowHeights]);
+  const virtual = flatRows.length > 120;
+  const OVERSCAN = 20;
+  const [win, setWin] = useState<[number, number]>([0, 60]);
+
+  const scrollToRowIndex = useCallback(
+    (idx: number) => {
+      const el = list.current;
+      const box = rowsBoxRef.current;
+      if (!el || !box || idx < 0 || idx >= flatRows.length) return;
+      const boxTop = box.offsetTop;
+      const rowTop = boxTop + offsets[idx];
+      const rowBot = boxTop + offsets[idx + 1];
+      if (rowTop < el.scrollTop) el.scrollTop = rowTop;
+      else if (rowBot > el.scrollTop + el.clientHeight) el.scrollTop = rowBot - el.clientHeight;
+    },
+    [flatRows.length, offsets],
+  );
+
+  useLayoutEffect(() => {
+    const el = list.current;
+    const box = rowsBoxRef.current;
+    if (!virtual || !el || !box) return;
+    let raf = 0;
+    const findRow = (y: number) => {
+      let lo = 0;
+      let hi = flatRows.length;
+      while (lo < hi) {
+        const mid = (lo + hi) >> 1;
+        if (offsets[mid + 1] <= y) lo = mid + 1;
+        else hi = mid;
+      }
+      return lo;
+    };
+    const calc = () => {
+      const hEl = box.querySelector<HTMLElement>('.grep-head');
+      const mEl = box.querySelector<HTMLElement>('.grep-hit');
+      const nextHead = hEl?.offsetHeight || rowHeightsRef.current.head;
+      const nextHit = mEl?.offsetHeight || rowHeightsRef.current.hit;
+      if (nextHead !== rowHeightsRef.current.head || nextHit !== rowHeightsRef.current.hit) {
+        setRowHeights({ head: nextHead, hit: nextHit });
+        return;
+      }
+      const boxTop = box.offsetTop;
+      const viewTop = Math.max(0, el.scrollTop - boxTop);
+      const viewBot = Math.max(0, el.scrollTop + el.clientHeight - boxTop);
+      const from = Math.max(0, findRow(viewTop) - OVERSCAN);
+      const to = Math.min(flatRows.length, findRow(viewBot) + 1 + OVERSCAN);
+      setWin((p) => (p[0] === from && p[1] === to ? p : [from, to]));
+    };
+    const onScroll = () => {
+      if (raf) return;
+      raf = requestAnimationFrame(() => {
+        raf = 0;
+        calc();
+      });
+    };
+    calc();
+    el.addEventListener('scroll', onScroll, { passive: true });
+    const ro = new ResizeObserver(onScroll);
+    ro.observe(el);
+    return () => {
+      el.removeEventListener('scroll', onScroll);
+      ro.disconnect();
+      if (raf) cancelAnimationFrame(raf);
+    };
+  }, [virtual, flatRows.length, offsets]);
+
+  useLayoutEffect(() => {
+    const k = pendingScrollKeyRef.current;
+    if (!k) return;
+    const idx = flatRows.findIndex((r) => r.kind === 'hit' && r.key === k);
+    if (idx < 0) return;
+    pendingScrollKeyRef.current = null;
+    scrollToRowIndex(idx);
+  }, [flatRows, scrollToRowIndex]);
+
   const total = flat.length;
   const previewing = showRep && !!res?.withRep;
   const canReplace = previewing && total > 0 && !working && !busy;
@@ -284,9 +411,10 @@ export function GrepPanel({
     hr.push();
     const byFile = new Map<string, Item[]>();
     for (const i of items) byFile.set(i.path, [...(byFile.get(i.path) ?? []), i]);
-    const draftRel = dirty && byFile.has(dirty.rel) ? dirty.rel : null;
+    const liveDirty = getLiveDirty ? getLiveDirty() : null;
+    const draftTarget = liveDirty && byFile.has(liveDirty.rel) ? liveDirty : null;
     const files = [...byFile.entries()]
-      .filter(([p]) => p !== draftRel)
+      .filter(([p]) => p !== draftTarget?.rel)
       .map(([path, its]) => ({ path, stat: res.stat?.[path], matches: its.map((i) => [i.line, i.col]) }));
     setWorking(true);
     try {
@@ -306,14 +434,18 @@ export function GrepPanel({
         skipped.push(...r.skipped);
       }
       // The open file with unsaved edits: replace in the draft (every match in it, since the draft may differ from disk)
-      if (draftRel && dirty) {
-        const r = await rpc<ReplaceOut>(hostId, 'fs.replace', { ...opts(), dryRun: true, files: [{ path: draftRel, content: dirty.draft }] });
+      if (draftTarget) {
+        const r = await rpc<ReplaceOut>(hostId, 'fs.replace', { ...opts(), dryRun: true, files: [{ path: draftTarget.rel, content: draftTarget.draft }] });
         const f = r.files[0];
         if (f?.after != null && f.count) {
-          onDraft(f.after, dirty.draft);
-          undo.draft = { before: dirty.draft, after: f.after };
-          count += f.count;
-          nfiles++;
+          const appliedRev = onDraft(f.after, { path: draftTarget.path, rev: draftTarget.rev, draft: draftTarget.draft });
+          if (appliedRev != null) {
+            undo.draft = { path: draftTarget.path, rev: appliedRev, before: draftTarget.draft, after: f.after };
+            count += f.count;
+            nfiles++;
+          } else {
+            skipped.push({ path: draftTarget.rel, reason: tx('draftChanged') });
+          }
         }
       }
       if (written.length) onReplaced(written);
@@ -351,7 +483,9 @@ export function GrepPanel({
         failed++;
       }
     }
-    if (u.draft) onDraft(u.draft.before, u.draft.after);
+    if (u.draft) {
+      if (onDraft(u.draft.before, { path: u.draft.path, rev: u.draft.rev, draft: u.draft.after }) == null) failed++;
+    }
     if (back.length) onReplaced(back);
     toast(
       failed
@@ -379,7 +513,8 @@ export function GrepPanel({
     if (!previewing) return onOpen(it.path, it.line, it.col, it.len);
     // Preview: the file with this file's listed matches replaced, as a diff (VS Code's replace preview)
     const its = groups.find(([p]) => p === it.path)?.[1] ?? [it];
-    const draft = dirty?.rel === it.path ? dirty.draft : undefined;
+    const liveDirty = getLiveDirty?.();
+    const draft = liveDirty?.rel === it.path ? liveDirty.draft : dirty?.rel === it.path ? dirty.draft : undefined;
     rpc<ReplaceOut>(hostId, 'fs.replace', {
       ...opts(),
       dryRun: true,
@@ -401,9 +536,12 @@ export function GrepPanel({
     const n = flat[(i < 0 ? (d > 0 ? 0 : flat.length - 1) : i + d + flat.length) % flat.length];
     setFolded((f) => (f.has(n.path) ? new Set([...f].filter((p) => p !== n.path)) : f));
     open(n);
-    requestAnimationFrame(() => list.current?.querySelector(`[data-k="${CSS.escape(keyOf(n))}"]`)?.scrollIntoView({ block: 'nearest' }));
+    const idx = flatRows.findIndex((r) => r.kind === 'hit' && r.key === n.key);
+    if (idx >= 0) requestAnimationFrame(() => scrollToRowIndex(idx));
+    else pendingScrollKeyRef.current = n.key;
   };
   useEffect(() => {
+    if (!visible) return;
     const on = (e: KeyboardEvent) => {
       if (e.key !== 'F4' || e.ctrlKey || e.metaKey || e.altKey) return;
       e.preventDefault();
@@ -411,7 +549,7 @@ export function GrepPanel({
     };
     window.addEventListener('keydown', on);
     return () => window.removeEventListener('keydown', on);
-  }, []);
+  }, [visible]);
 
   const dismiss = (it: Item) => setDismissed((s) => new Set(s).add(keyOf(it)));
 
@@ -535,96 +673,99 @@ export function GrepPanel({
           </div>
         )}
         {!term && <div className="wp-tip">{tx('gitReposSkipGitignoreBinary')}</div>}
-        {groups.map(([path, items]) => {
-          const closed = folded.has(path);
-          return (
-            <div key={path} className="grep-file">
-              <div
-                className="wp-row grep-head"
-                title={path}
-                onClick={() =>
-                  setFolded((s) => {
-                    const n = new Set(s);
-                    if (n.has(path)) n.delete(path);
-                    else n.add(path);
-                    return n;
-                  })
-                }
-              >
-                <span className="wp-twist">
-                  <span className={`chev ${closed ? '' : 'open'}`}>
-                    <Icon name="chevron" size={12} />
-                  </span>
-                </span>
-                <FileIcon name={base(path)} />
-                <span className="truncate grep-name">{base(path)}</span>
-                <span className="truncate grep-dir">{dirOf(path)}</span>
-                <span className="grep-acts">
-                  {previewing && (
-                    <button
-                      className="icon-btn"
-                      title={tx('replaceAllInFile')}
-                      disabled={working}
-                      onClick={(e) => (e.stopPropagation(), replaceIn(items))}
-                    >
-                      <Icon name="check" size={12} />
-                    </button>
-                  )}
-                  <button className="icon-btn" title={tx('dismiss')} onClick={(e) => (e.stopPropagation(), setGone((g) => new Set(g).add(path)))}>
-                    <Icon name="x" size={12} />
-                  </button>
-                </span>
-                <span className="grep-n">{items.length}</span>
-              </div>
-              {!closed &&
-                items.map((it) => {
-                  const h = it.hit;
-                  const chars = [...h.text];
-                  const c = it.col - h.offset;
-                  const inside = c >= 0 && c < chars.length;
-                  // Keep only a short lead-in before the match so it stays visible in a narrow panel
-                  const head = inside ? chars.slice(0, c).join('').replace(/^\s+/, '') : '';
-                  const pre = !inside ? '…' : head.length > 16 ? '…' + head.slice(-14) : head;
-                  const mid = inside ? chars.slice(c, c + it.len).join('') : it.text;
-                  const post = inside ? chars.slice(c + it.len).join('') : '';
-                  const k = keyOf(it);
-                  return (
-                    <div
-                      key={k}
-                      data-k={k}
-                      className={`wp-row grep-hit ${cur === k ? 'sel' : ''}`}
-                      title={`${path}:${h.line}`}
-                      onClick={() => open(it)}
-                    >
-                      <span className="grep-line">{h.line}</span>
-                      <span className="truncate grep-text">
-                        {pre}
-                        {previewing ? (
-                          <>
-                            <del>{mid}</del>
-                            <ins>{it.rep ?? ''}</ins>
-                          </>
-                        ) : (
-                          <mark>{mid}</mark>
-                        )}
-                        {post}
+        {flatRows.length > 0 && (
+          <div
+            ref={rowsBoxRef}
+            style={
+              virtual
+                ? {
+                    paddingTop: offsets[Math.min(win[0], flatRows.length)],
+                    paddingBottom: offsets[flatRows.length] - offsets[Math.min(Math.max(win[1], win[0]), flatRows.length)],
+                  }
+                : undefined
+            }
+          >
+            {flatRows
+              .slice(
+                virtual ? Math.min(win[0], flatRows.length) : 0,
+                virtual ? Math.min(Math.max(win[1], win[0]), flatRows.length) : flatRows.length,
+              )
+              .map((row) =>
+                row.kind === 'head' ? (
+                  <div
+                    key={row.key}
+                    className="wp-row grep-head"
+                    title={row.path}
+                    onClick={() =>
+                      setFolded((s) => {
+                        const n = new Set(s);
+                        if (n.has(row.path)) n.delete(row.path);
+                        else n.add(row.path);
+                        return n;
+                      })
+                    }
+                  >
+                    <span className="wp-twist">
+                      <span className={`chev ${row.closed ? '' : 'open'}`}>
+                        <Icon name="chevron" size={12} />
                       </span>
-                      <span className="grep-acts">
-                        {previewing && (
-                          <button className="icon-btn" title={tx('replace')} disabled={working} onClick={(e) => (e.stopPropagation(), replaceIn([it]))}>
-                            <Icon name="check" size={12} />
-                          </button>
-                        )}
-                        <button className="icon-btn" title={tx('dismiss')} onClick={(e) => (e.stopPropagation(), dismiss(it))}>
-                          <Icon name="x" size={12} />
+                    </span>
+                    <FileIcon name={row.name} />
+                    <span className="truncate grep-name">{row.name}</span>
+                    <span className="truncate grep-dir">{row.dir}</span>
+                    <span className="grep-acts">
+                      {previewing && (
+                        <button
+                          className="icon-btn"
+                          title={tx('replaceAllInFile')}
+                          disabled={working}
+                          onClick={(e) => (e.stopPropagation(), replaceIn(row.items))}
+                        >
+                          <Icon name="check" size={12} />
                         </button>
-                      </span>
-                    </div>
-                  );
-                })}
-            </div>
-          );
-        })}
+                      )}
+                      <button className="icon-btn" title={tx('dismiss')} onClick={(e) => (e.stopPropagation(), setGone((g) => new Set(g).add(row.path)))}>
+                        <Icon name="x" size={12} />
+                      </button>
+                    </span>
+                    <span className="grep-n">{row.items.length}</span>
+                  </div>
+                ) : (
+                  <div
+                    key={row.key}
+                    data-k={row.key}
+                    className={`wp-row grep-hit ${cur === row.key ? 'sel' : ''}`}
+                    title={`${row.path}:${row.item.hit.line}`}
+                    onClick={() => open(row.item)}
+                  >
+                    <span className="grep-line">{row.item.hit.line}</span>
+                    <span className="truncate grep-text">
+                      {row.item.pre}
+                      {previewing ? (
+                        <>
+                          <del>{row.item.mid}</del>
+                          <ins>{row.item.rep ?? ''}</ins>
+                        </>
+                      ) : (
+                        <mark>{row.item.mid}</mark>
+                      )}
+                      {row.item.post}
+                    </span>
+                    <span className="grep-acts">
+                      {previewing && (
+                        <button className="icon-btn" title={tx('replace')} disabled={working} onClick={(e) => (e.stopPropagation(), replaceIn([row.item]))}>
+                          <Icon name="check" size={12} />
+                        </button>
+                      )}
+                      <button className="icon-btn" title={tx('dismiss')} onClick={(e) => (e.stopPropagation(), dismiss(row.item))}>
+                        <Icon name="x" size={12} />
+                      </button>
+                    </span>
+                  </div>
+                ),
+              )}
+          </div>
+        )}
         {res?.truncated && (
           <div className="wp-limit">{tx('tooManyResultsShowingThe', { total })}</div>
         )}

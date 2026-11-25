@@ -5,5 +5,8 @@
   "binaryFileCannotPreview": "二进制文件，无法预览",
   "fileIsLargeShowingThe": "… 文件过大，只显示前 1MB",
   "selectAFileToPreview": "选择文件预览",
-  "viewHistory": "查看历史会话"
+  "viewHistory": "查看历史会话",
+  "loadingDirectory": "正在加载目录…",
+  "loadingFile": "正在加载文件…",
+  "toggleWordWrap": "切换自动换行"
 }

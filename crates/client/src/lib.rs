@@ -6,6 +6,7 @@ pub mod ext;
 pub mod forward;
 pub mod hosts;
 pub mod localbin;
+pub mod localipc;
 pub mod preview;
 pub mod rpc;
 pub mod settings;

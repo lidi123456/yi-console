@@ -55,6 +55,18 @@ export function normalizeUrl(s: string): string {
 const LOOPBACK = new Set(['localhost', '127.0.0.1', '0.0.0.0', '[::1]', '::1']);
 
 const tokens = new Map<string, Promise<string>>();
+let cachedPreviewBase: string | null = null;
+async function previewBaseUrl(): Promise<string> {
+  if (cachedPreviewBase) return cachedPreviewBase;
+  if (isTauri) {
+    const { convertFileSrc } = await import('@tauri-apps/api/core');
+    cachedPreviewBase = convertFileSrc('', 'ahfs').replace(/\/?$/, '/');
+  } else {
+    cachedPreviewBase = `${location.origin}/fsv/`;
+  }
+  return cachedPreviewBase;
+}
+
 /** Preview URL for a file in a directory on the host */
 export async function previewUrl(hostId: string, root: string, abs: string): Promise<string> {
   const k = `${hostId}\n${root}`;
@@ -70,12 +82,25 @@ export async function previewUrl(hostId: string, root: string, abs: string): Pro
   const a = norm(abs);
   if (a !== r && !a.toLowerCase().startsWith(r.toLowerCase() + '/')) throw new Error(tx('onlyFilesInsideTheWorkspace'));
   const rel = a.slice(r.length + 1).split('/').map(encodeURIComponent).join('/');
-  let base = `${location.origin}/fsv/`;
-  if (isTauri) {
-    const { convertFileSrc } = await import('@tauri-apps/api/core');
-    base = convertFileSrc('', 'ahfs').replace(/\/?$/, '/');
-  }
+  const base = await previewBaseUrl();
   return `${base}${token}/${rel}`;
+}
+
+/** Streaming preview URL for a single file (images / PDFs), avoiding Base64/RPC overhead on local hosts */
+export async function previewFileUrl(
+  hostId: string,
+  path: string,
+  kind?: 'image' | 'pdf',
+): Promise<{ url: string; path: string; size?: number; modified?: number; mimeType?: string }> {
+  const r = await hubCall<{ token: string; path: string; size?: number; modified?: number; mimeType?: string }>('preview.file', {
+    id: hostId,
+    path,
+    kind,
+  });
+  const base = await previewBaseUrl();
+  const name = (r.path || path).split(/[\\/]/).pop() || (kind === 'pdf' ? 'file.pdf' : 'file');
+  const q = r.modified != null ? `?v=${r.modified}` : '';
+  return { ...r, url: `${base}${r.token}/${encodeURIComponent(name)}${q}` };
 }
 
 /** `back`: the original origin when `src` is a port forwarded to this machine, to map navigation back to it */

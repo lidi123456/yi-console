@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { useBack } from '../back';
 import { getT, trErr, useLang } from '../i18n';
-import { errorToast, getState, hostStatus, loadSession, navigate, openNewSession, skey, toast, useSessionData, useStore } from '../store';
+import { errorToast, getState, hostStatus, loadSession, navigate, openNewSession, skey, toast, useSessionData, useSessionDiffEvents, useStore } from '../store';
 import { isTauri, rpc } from '../transport';
 import {
   isHostSession,
@@ -38,7 +38,7 @@ import {
 } from '../reviewState';
 import { Icon, ToolBadge } from './Icon';
 import { askConfirm, askText, openMenu, type MenuItem } from './Overlay';
-import { CodeEditor, type EditorMenuCtx, type GotoTarget } from './CodeEditor';
+import { CodeEditor, type CodeEditorHandle, type EditorMenuCtx, type GotoTarget } from './CodeEditor';
 import { IS_MAC, type NavCoords, type NavTrigger } from './EditorCodeNav';
 import { CodeNavNotice, DefinitionPicker, PeekReferences } from './CodeNavOverlays';
 import { PaneDiff } from './DiffView';
@@ -49,7 +49,7 @@ import { openUrl } from './PortsView';
 import { QuickOpen, type QuickMode } from './QuickOpen';
 import { OPEN_CHANGES, OPEN_FILE, takeOpenChanges, takeOpenFiles, takeOpenTurn } from './SessionActions';
 import { DRAG_REF, isOtherSessionUpload } from '../dropFiles';
-import { BrowserPane, isWebTab, WEB_PREFIX, webTabFile, webTabTitle } from './Browser';
+import { BrowserPane, isWebTab, previewFileUrl, WEB_PREFIX, webTabFile, webTabTitle } from './Browser';
 import { AI_PREFIX, aiTabSession, AiBrowserPane, isAiTab, useAiBrowserBusy } from './AiBrowser';
 import { registerWebTabs } from './NativeWeb';
 import { canUseBrowser } from '../browserUse';
@@ -115,8 +115,10 @@ interface OpenFile {
   rev: number;
   /** File deleted in git: only the diff can be viewed */
   deleted?: boolean;
-  /** PDF: base64 */
+  /** PDF: base64 (remote fallback) */
   pdf?: string;
+  /** PDF: streaming URL on ahfs / /fsv/ */
+  pdfSrc?: string;
   /** Browser tab (path is web:url) */
   web?: boolean;
   /** A file in a commit or commit range (path is git:<hash>:<rel> or git:<base>..<end>:<rel>): read-only diff */
@@ -269,6 +271,10 @@ interface GitInfo {
   branch: string;
   /** Current HEAD commit (older yi-agentd doesn't send it) */
   head?: string | null;
+  ahead?: number | null;
+  behind?: number | null;
+  /** True when git.changes included current-branch ahead/behind (false on older daemons) */
+  hasTrack?: boolean;
   /** Keyed by norm(absolute path); rel is the path relative to the repo root (used for git operations) */
   files: Map<string, GitFile>;
   /** Directories containing changes */
@@ -462,6 +468,7 @@ function Rows({
   selected,
   focused,
   git,
+  loadingDirs,
   onToggle,
   onOpen,
   onMenu,
@@ -484,6 +491,8 @@ function Rows({
   /** Keyboard cursor (row key), separate from the opened file as in VS Code */
   focused?: string | null;
   git?: GitInfo | null;
+  /** Directories currently fetching children */
+  loadingDirs?: Set<string>;
   /** Start dragging a row (dropping into the input box inserts a reference) */
   onDragRow?: (e: React.DragEvent, r: TreeRow) => void;
   /** Directory currently being uploaded to (highlighted) */
@@ -501,27 +510,48 @@ function Rows({
   const virtual = !!scroller && rows.length > VIRTUAL_MIN;
   // Row height comes from CSS (taller on phones), measured from a rendered row
   const [rowH, setRowH] = useState(26);
+  const rowHRef = useRef(rowH);
+  rowHRef.current = rowH;
   const [win, setWin] = useState<[number, number]>([0, 2 * OVERSCAN]);
   /** Where the rows start inside the scroller (notices and totals may sit above them) */
   const offsetIn = (el: HTMLElement) => box.current!.getBoundingClientRect().top - el.getBoundingClientRect().top + el.scrollTop;
   useLayoutEffect(() => {
     const el = scroller?.current;
     if (!virtual || !el || !box.current) return;
+    let raf = 0;
+    const syncRowHeight = () => {
+      if (!box.current) return false;
+      const sample = box.current.querySelector<HTMLElement>('.wp-row');
+      const h = sample?.offsetHeight || rowHRef.current;
+      if (h !== rowHRef.current) {
+        setRowH(h);
+        return true;
+      }
+      return false;
+    };
     const update = () => {
       if (!box.current) return;
-      const h = box.current.querySelector<HTMLElement>('.wp-row')?.offsetHeight || rowH;
-      if (h !== rowH) return setRowH(h);
+      if (syncRowHeight()) return;
+      const h = rowHRef.current;
       const y = el.scrollTop - offsetIn(el);
       const from = Math.max(0, Math.floor(y / h) - OVERSCAN);
       const to = Math.min(rows.length, Math.ceil((y + el.clientHeight) / h) + OVERSCAN);
       setWin((w) => (w[0] === from && w[1] === to ? w : [from, to]));
     };
+    const onScroll = () => {
+      if (raf) return;
+      raf = requestAnimationFrame(() => {
+        raf = 0;
+        update();
+      });
+    };
     update();
-    el.addEventListener('scroll', update, { passive: true });
+    el.addEventListener('scroll', onScroll, { passive: true });
     const ro = new ResizeObserver(update);
     ro.observe(el);
     return () => {
-      el.removeEventListener('scroll', update);
+      if (raf) cancelAnimationFrame(raf);
+      el.removeEventListener('scroll', onScroll);
       ro.disconnect();
     };
   }, [virtual, rows.length, rowH, scroller]); // eslint-disable-line react-hooks/exhaustive-deps
@@ -579,7 +609,9 @@ function Rows({
         >
           {/* Same as VS Code's default icon theme: file icons sit in the chevron column, so directory and file names at the same level line up on the left */}
           <span className="wp-twist">
-            {r.isDir ? (
+            {r.loading || (r.isDir && loadingDirs?.has(r.path)) ? (
+              <span className="spinner mini" />
+            ) : r.isDir ? (
               <span className={`chev ${r.expanded ? 'open' : ''}`}>
                 <Icon name="chevron" size={13} />
               </span>
@@ -697,7 +729,7 @@ const SEARCH_LIMIT = 200;
 /** Last git status per host + directory (like VS Code's Source Control view): reopening the panel or switching back to a
  *  session shows it at once and refreshes in the background instead of starting from "Loading changes…".
  *  git: null = not a repo. In memory only */
-const gitCache = new Map<string, { git: GitInfo | null; sig: string; ignSig: string }>();
+const gitCache = new Map<string, { git: GitInfo | null; sig: string; ignSig: string; trackSig?: string }>();
 const gitKey = (hostId: string, cwd: string) => `${hostId}\n${cwd}`;
 /** Root path and top-level listing per host + directory + hidden-files setting. The Changes list and the tree are
  *  both laid out against the root, so without it a remounted panel stays blank until fs.list returns. In memory only */
@@ -715,6 +747,42 @@ interface BranchDiffInfo {
   files: Map<string, GitFile>;
 }
 
+const FILE_CACHE_MAX_ENTRIES = 12;
+const FILE_CACHE_MAX_BYTES = 6 * 1024 * 1024;
+const GIT_POLL_COOLDOWN_MS = 2000;
+const WT_POLL_COOLDOWN_MS = 30_000;
+const STALE_REOPEN_MS = 10_000;
+
+function visibleExpandedDirs(root: string, expanded: Set<string>): string[] {
+  const rootN = norm(root);
+  const normExp = new Set([...expanded].map(norm));
+  const out: string[] = [];
+  for (const dir of expanded) {
+    const dn = norm(dir);
+    if (!dn.startsWith(rootN + '/')) continue;
+    let ok = true;
+    let cur = dn;
+    while (cur.length > rootN.length) {
+      const slash = cur.lastIndexOf('/');
+      if (slash <= rootN.length) break;
+      const parent = cur.slice(0, slash);
+      if (!normExp.has(parent)) {
+        ok = false;
+        break;
+      }
+      cur = parent;
+    }
+    if (ok) out.push(dir);
+  }
+  return out;
+}
+
+const hasFileExt = (p: string) => {
+  const n = baseName(p);
+  const dot = n.lastIndexOf('.');
+  return dot > 0 && dot < n.length - 1 && /^[a-z0-9_-]{1,12}$/i.test(n.slice(dot + 1));
+};
+
 export function FilePanel({
   hostId,
   cwd,
@@ -722,6 +790,7 @@ export function FilePanel({
   onSwitchCwd,
   sessionId,
   status,
+  visible = true,
   fullscreen,
   onFullscreen,
   onClose,
@@ -737,6 +806,8 @@ export function FilePanel({
   sessionId: string;
   /** Session status: refresh the tree and open files when a turn ends */
   status: string;
+  /** False when kept mounted in the background via CSS display:none (Option 1A) */
+  visible?: boolean;
   fullscreen: boolean;
   onFullscreen: () => void;
   onClose: () => void;
@@ -774,6 +845,8 @@ export function FilePanel({
   const sessionKey = skey(hostId, sessionId);
   const treeOpenKey = `wp-tree-${sessionKey}`;
   const viewKey = `wp-view-${sessionKey}`;
+  const tabsKey = standalone ? `wp-open-s-${hostId}/${sessionId}` : `wp-open-${hostId}/${cwd}`;
+  const untitled = untitledStore(tabsKey);
   const [treeOpen, setTreeOpen] = useState(() => lsGet(treeOpenKey, true));
   const setTree = useCallback(
     (open: boolean) => {
@@ -801,6 +874,8 @@ export function FilePanel({
   // Later than the webviews' own unmount, which parks them (closing the panel, switching sessions keeps them)
   useEffect(() => () => void setTimeout(() => registerWebTabs(panelId, null), 0), []); // eslint-disable-line react-hooks/exhaustive-deps
   const [git, setGit] = useState<GitInfo | null>(() => gitCache.get(gitKey(hostId, cwd))?.git ?? null);
+  // Until git status comes back we don't know whether this is a repo, so the snippets recorded in the session can't be shown as a diff yet
+  const [gitReady, setGitReady] = useState(() => gitCache.has(gitKey(hostId, cwd)));
   const [worktrees, setWorktrees] = useState<WorktreeEntry[]>([]);
   const [wtDefaultBranch, setWtDefaultBranch] = useState<string | null>(null);
   const [newWorktree, setNewWorktree] = useState<WorktreeEntry | null>(null);
@@ -856,6 +931,22 @@ export function FilePanel({
   const [diffLayout, setDiffLayout] = useState<'split' | 'unified'>(() => lsGet('wp-diff-mode', 'unified'));
   const [diffCollapse, setDiffCollapse] = useState(() => lsGet('wp-diff-fold', false));
   const mergeRef = useRef<MergeDiffHandle>(null);
+  const codeRef = useRef<CodeEditorHandle>(null);
+  const [treeLoading, setTreeLoading] = useState(false);
+  const [loadingDirs, setLoadingDirs] = useState<Set<string>>(() => new Set());
+  const [gitLoading, setGitLoading] = useState(false);
+  const [openingPath, setOpeningPath] = useState<string | null>(null);
+  const fileCacheRef = useRef<Map<string, { file: OpenFile; bytes: number }>>(new Map());
+  const fileCacheBytesRef = useRef(0);
+  const treeGenRef = useRef(0);
+  const gitInFlightRef = useRef<Promise<void> | null>(null);
+  const lastGitFetchAtRef = useRef(0);
+  const lastWtFetchRef = useRef<{ scope: string; at: number }>({ scope: '', at: 0 });
+  const diffInFlightRef = useRef<Set<string>>(new Set());
+  const blobInFlightRef = useRef<Set<string>>(new Set());
+  const gitCacheGenRef = useRef(0);
+  const visibleRef = useRef(visible);
+  visibleRef.current = visible;
   // Make the editor jump to a line (search results, outline, : line number, context pills)
   const [goto, setGoto] = useState<GotoTarget | null>(null);
   const [quick, setQuick] = useState<QuickMode | null>(null);
@@ -881,6 +972,9 @@ export function FilePanel({
   compareRef.current = compare;
   const secondRef = useRef(second);
   secondRef.current = second;
+  const mergeEditableRef = useRef(false);
+  const nextFileRevRef = useRef(0);
+  const nextFileRev = () => (nextFileRevRef.current = Math.max(Date.now(), nextFileRevRef.current + 1));
   const noticeTimerRef = useRef<number | null>(null);
   const [navPicker, setNavPicker] = useState<{ symbol: string; locations: NavLocation[]; coords: NavCoords; origin: NavPoint } | null>(null);
   const [navPeek, setNavPeek] = useState<{
@@ -908,7 +1002,7 @@ export function FilePanel({
   const [uploading, setUploading] = useState(0);
   const isLocal = useStore((st) => st.hosts.find((h) => h.config.id === hostId)?.config.kind === 'local');
   const connected = useStore((st) => st.hosts.find((h) => h.config.id === hostId)?.status.status === 'connected');
-  useReviewStoreVersion();
+  const reviewVer = useReviewStoreVersion();
   const [reviewOnlyFilter, setReviewOnlyFilter] = useState(false);
   const [showInlineReviews, setShowInlineReviews] = useState(true);
   const [highlightedFindingId, setHighlightedFindingId] = useState<string | null>(null);
@@ -958,11 +1052,11 @@ export function FilePanel({
     };
   }, [hostId, sessionId]);
 
-  const sdata = useSessionData(skey(hostId, sessionId));
+  const sessionEvents = useSessionDiffEvents(skey(hostId, sessionId), gitReady && !git);
   // Files changed by tools in this session: norm(absolute path) -> each edit made to that file
   const touched = useMemo(() => {
     const m = new Map<string, FileDiff[]>();
-    for (const e of sdata.events) {
+    for (const e of sessionEvents) {
       if (e.kind !== 'tool_call' || !e.diffs?.length) continue;
       for (const d of e.diffs) {
         const abs = /^([a-zA-Z]:)?[\\/]/.test(d.path) ? d.path : join(root ?? cwd, d.path);
@@ -973,15 +1067,121 @@ export function FilePanel({
       }
     }
     return m;
-  }, [sdata.events, sdata.events.length, root, cwd]);
+  }, [sessionEvents, sessionEvents.length, root, cwd]);
 
   const dirty = !!file && file.draft !== file.content;
   const fileRef = useRef(file);
   fileRef.current = file;
 
+  const cacheKey = (p: string) => unverbatim(p);
+
+  const deleteCacheKey = useCallback((k: string) => {
+    const old = fileCacheRef.current.get(k);
+    if (!old) return;
+    fileCacheBytesRef.current = Math.max(0, fileCacheBytesRef.current - old.bytes);
+    fileCacheRef.current.delete(k);
+  }, []);
+
+  const dropCachedFile = useCallback(
+    (p: string) => {
+      const exact = cacheKey(p);
+      deleteCacheKey(exact);
+      const targetNorm = norm(p);
+      for (const k of [...fileCacheRef.current.keys()]) {
+        if (norm(k) === targetNorm) deleteCacheKey(k);
+      }
+    },
+    [deleteCacheKey],
+  );
+
+  const clearFileCache = useCallback(() => {
+    fileCacheRef.current.clear();
+    fileCacheBytesRef.current = 0;
+  }, []);
+
+  const putCachedFile = useCallback(
+    (f: OpenFile) => {
+      if (f.untitled || f.web || f.side || f.review || f.commit || f.deleted || f.truncated) return;
+      if (f.pdf && f.pdf.length > 2 * 1024 * 1024) return;
+      const bytes = (f.content.length + (f.pdf?.length ?? 0)) * 2 + (f.image?.length ?? 0) + (f.pdfSrc?.length ?? 0);
+      if (bytes > 2 * 1024 * 1024) return;
+      const k = cacheKey(f.path);
+      deleteCacheKey(k);
+      const cache = fileCacheRef.current;
+      while (cache.size >= FILE_CACHE_MAX_ENTRIES || fileCacheBytesRef.current + bytes > FILE_CACHE_MAX_BYTES) {
+        const oldest = cache.keys().next().value;
+        if (oldest === undefined) break;
+        deleteCacheKey(oldest);
+      }
+      cache.set(k, { file: { ...f, path: k, draft: f.content }, bytes });
+      fileCacheBytesRef.current += bytes;
+    },
+    [deleteCacheKey],
+  );
+
+  const getCachedFile = useCallback((p: string): OpenFile | null => {
+    const k = cacheKey(p);
+    const entry = fileCacheRef.current.get(k);
+    if (!entry || cacheKey(entry.file.path) !== k) return null;
+    fileCacheRef.current.delete(k);
+    fileCacheRef.current.set(k, entry);
+    return { ...entry.file, draft: entry.file.content, rev: nextFileRev() };
+  }, []);
+
+  const hasCachedFile = useCallback((p: string): boolean => {
+    const k = cacheKey(p);
+    const entry = fileCacheRef.current.get(k);
+    return !!entry && cacheKey(entry.file.path) === k;
+  }, []);
+
+  const updateFileDraft = useCallback(
+    (targetPath: string, targetRev: number, isUnt: boolean | undefined, draft: string) => {
+      if (isUnt) untitled.set(targetPath, draft);
+      if (fileRef.current && fileRef.current.path === targetPath && fileRef.current.rev === targetRev) {
+        fileRef.current = { ...fileRef.current, draft };
+      }
+      setFile((cur) => (cur && cur.path === targetPath && cur.rev === targetRev ? { ...cur, draft } : cur));
+    },
+    [untitled],
+  );
+
+  const flushActiveEditor = useCallback((): string | undefined => {
+    const cur = fileRef.current;
+    if (!cur) return undefined;
+    codeRef.current?.flush();
+    if (mergeEditableRef.current) mergeRef.current?.flush();
+    return fileRef.current?.draft;
+  }, []);
+
+  const hasUnsyncedEdits = useCallback(
+    () => !!codeRef.current?.isDirty() || (mergeEditableRef.current && !!mergeRef.current?.isDirty()),
+    [],
+  );
+
+  const getActiveEditorText = useCallback((cur: OpenFile): string => {
+    if (codeRef.current) return codeRef.current.getValue();
+    if (mergeEditableRef.current && mergeRef.current) return mergeRef.current.getValue();
+    return cur.draft;
+  }, []);
+
+  const openQuick = useCallback(
+    (m: QuickMode) => {
+      flushActiveEditor();
+      setQuick(m);
+    },
+    [flushActiveEditor],
+  );
+
   /** quiet: restoring remembered folders; one that no longer exists is just forgotten */
   const load = useCallback(
     async (dir: string, quiet = false) => {
+      if (!quiet) {
+        setLoadingDirs((s) => {
+          const n = new Set(s);
+          n.add(dir);
+          return n;
+        });
+      }
       try {
         const r = await rpc<{ path: string; entries: DirEntry[] }>(hostId, 'fs.list', { path: dir, showHidden: hidden });
         setKids((k) => ({ ...k, [dir]: r.entries }));
@@ -996,6 +1196,54 @@ export function FilePanel({
           });
         } else errorToast(e);
         return null;
+      } finally {
+        if (!quiet) {
+          setLoadingDirs((s) => {
+            if (!s.has(dir)) return s;
+            const n = new Set(s);
+            n.delete(dir);
+            return n;
+          });
+        }
+      }
+    },
+    [hostId, hidden],
+  );
+
+  const loadDirsBatched = useCallback(
+    async (dirs: string[], gen: number) => {
+      if (!dirs.length) return;
+      const CONCURRENCY = 4;
+      const batchKids: Record<string, DirEntry[]> = {};
+      const missing: string[] = [];
+      let idx = 0;
+      const worker = async () => {
+        while (idx < dirs.length && treeGenRef.current === gen) {
+          const d = dirs[idx++];
+          try {
+            const r = await rpc<{ path: string; entries: DirEntry[] }>(hostId, 'fs.list', { path: d, showHidden: hidden });
+            batchKids[d] = r.entries;
+          } catch {
+            missing.push(d);
+          }
+        }
+      };
+      await Promise.all(Array.from({ length: Math.min(CONCURRENCY, dirs.length) }, worker));
+      if (treeGenRef.current !== gen) return;
+      if (Object.keys(batchKids).length) {
+        setKids((k) => ({ ...k, ...batchKids }));
+      }
+      if (missing.length) {
+        const drop = new Set(missing);
+        setExpanded((x) => {
+          let changed = false;
+          const next = new Set<string>();
+          for (const d of x) {
+            if (drop.has(d)) changed = true;
+            else next.add(d);
+          }
+          return changed ? next : x;
+        });
       }
     },
     [hostId, hidden],
@@ -1003,6 +1251,8 @@ export function FilePanel({
 
   // Root directory: fs.list normalizes ~ and relative forms into absolute paths
   useEffect(() => {
+    const gen = ++treeGenRef.current;
+    clearFileCache();
     const key = rootKey(hostId, cwd, hidden);
     const c = rootCache.get(key);
     setKids(c ? { [c.path]: c.entries } : {});
@@ -1014,25 +1264,28 @@ export function FilePanel({
       want = new Set(lsGet<string[]>(expKey, []));
       setExpanded(want);
     }
+    setTreeLoading(true);
     rpc<{ path: string; entries: DirEntry[] }>(hostId, 'fs.list', { path: cwd, showHidden: hidden })
       .then((r) => {
+        if (treeGenRef.current !== gen) return;
         rootCache.set(key, { path: r.path, entries: r.entries });
         setRoot(r.path);
         setKids((k) => ({ ...k, [r.path]: r.entries }));
-        // Reload the remembered folders (also after toggling hidden files, which reset the listings above)
         const pre = norm(r.path) + '/';
         const stale = [...want].filter((d) => !norm(d).startsWith(pre));
-        for (const d of want) if (!stale.includes(d)) load(d, true);
         if (stale.length) setExpanded((x) => new Set([...x].filter((d) => !stale.includes(d))));
+        const toLoad = visibleExpandedDirs(r.path, want);
+        return loadDirsBatched(toLoad, gen);
       })
-      .catch(errorToast);
+      .catch(errorToast)
+      .finally(() => {
+        if (treeGenRef.current === gen) setTreeLoading(false);
+      });
   }, [hostId, cwd, hidden]); // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => {
     if (expLoaded.current === expKey) lsSet(expKey, [...expanded].slice(-300));
   }, [expanded, expKey]);
 
-  // Until git status comes back we don't know whether this is a repo, so the snippets recorded in the session can't be shown as a diff yet
-  const [gitReady, setGitReady] = useState(() => gitCache.has(gitKey(hostId, cwd)));
   // Diff of a single file (git.changes only lists statuses; the diff is fetched when the file is opened), keyed by norm(absolute path)
   const [fileDiffs, setFileDiffs] = useState<Record<string, string | null>>({});
   // Whole files at a revision for the full-file diff (git.blob), keyed by `rev\nrel`; null = couldn't be read
@@ -1043,12 +1296,14 @@ export function FilePanel({
   // Summary of the last git status: periodic refreshes leave the UI alone if nothing changed, so an open diff doesn't flicker
   const gitSig = useRef(gitCache.get(gitKey(hostId, cwd))?.sig ?? '');
   const gitIgnSig = useRef(gitCache.get(gitKey(hostId, cwd))?.ignSig ?? '');
+  const gitTrackSig = useRef(gitCache.get(gitKey(hostId, cwd))?.trackSig ?? '');
   /** quiet: background refresh (timer / window refocus); if the status didn't change, just quietly refetch the current file's diff */
   const loadWorktrees = useCallback(
     (details = false) => {
       const wantDetails = details || bwOpenRef.current;
       const scope = `${hostId}\n${cwd}`;
       const seq = ++wtReqSeq.current;
+      lastWtFetchRef.current = { scope, at: Date.now() };
       rpc<WorktreesResult>(hostId, 'git.worktrees', { cwd, ...(wantDetails ? { details: true } : {}) })
         .then((r) => {
           if (wtScopeRef.current !== scope || seq < wtAppliedSeq.current || (!wantDetails && seq < wtReqSeq.current)) {
@@ -1174,70 +1429,123 @@ export function FilePanel({
     [hostId, cwd],
   );
 
-  const loadGit = useCallback((quiet = false) => {
-    // Without diffs: in a big repo with many changed files, running git diff for each takes ages, so fetch only the file that gets opened
-    rpc<{
-      repo: string | null;
-      branch?: string;
-      head?: string | null;
-      total?: number | null;
-      files: { path: string; oldPath?: string; status: string; diff: string; added?: number | null; deleted?: number | null }[];
-      ignored?: string[];
-    }>(hostId, 'git.changes', { cwd, diff: false })
-      .then((r) => {
-        setGitReady(true);
-        if (r.repo) loadWorktrees();
-        const rawIgnored = r.ignored ?? [];
-        const sig = `${r.repo}|${r.branch}|${r.head}|${r.files.map((f) => `${f.status} ${f.oldPath ?? ''} ${f.path} ${f.added ?? ''}/${f.deleted ?? ''}`).join('|')}`;
-        const ignSig = rawIgnored.join('\0');
-        const filesChanged = !quiet || sig !== gitSig.current;
-        const ignChanged = !quiet || ignSig !== gitIgnSig.current;
-        if (!filesChanged && !ignChanged) return refreshCurDiff.current();
-        gitSig.current = sig;
-        gitIgnSig.current = ignSig;
-        if (filesChanged) {
-          setFileDiffs({});
-          setBlobs((m) => {
-            const key = gitKey(hostId, cwd);
-            staleBlobs.current = { key, blobs: staleBlobs.current.key === key ? { ...staleBlobs.current.blobs, ...m } : m };
-            return {};
-          });
-        }
-        if (!r.repo) {
-          gitCache.set(gitKey(hostId, cwd), { git: null, sig, ignSig });
-          setWorktrees([]);
-          setBranchDiff(null);
-          return setGit(null);
-        }
-        const files = new Map<string, GitFile>();
-        const dirs = new Set<string>();
-        for (const f of r.files) {
-          const abs = join(r.repo, f.path.split('/').join(sepOf(r.repo)));
-          const k = norm(abs);
-          files.set(k, { ...f, path: abs, rel: f.path });
-          for (let d = k.slice(0, k.lastIndexOf('/')); d.length > 1; d = d.slice(0, d.lastIndexOf('/'))) {
-            if (dirs.has(d)) break;
-            dirs.add(d);
+  const loadGit = useCallback(
+    (quiet = false) => {
+      if (quiet && (gitInFlightRef.current || Date.now() - lastGitFetchAtRef.current < GIT_POLL_COOLDOWN_MS)) {
+        return;
+      }
+      lastGitFetchAtRef.current = Date.now();
+      if (!quiet) setGitLoading(true);
+      // Without diffs: in a big repo with many changed files, running git diff for each takes ages, so fetch only the file that gets opened
+      const p = rpc<{
+        repo: string | null;
+        branch?: string;
+        head?: string | null;
+        ahead?: number | null;
+        behind?: number | null;
+        total?: number | null;
+        files: { path: string; oldPath?: string; status: string; diff: string; added?: number | null; deleted?: number | null }[];
+        ignored?: string[];
+      }>(hostId, 'git.changes', { cwd, diff: false })
+        .then((r) => {
+          setGitReady(true);
+          const rawIgnored = r.ignored ?? [];
+          const sig = `${r.repo}|${r.branch}|${r.head}|${r.files.map((f) => `${f.status} ${f.oldPath ?? ''} ${f.path} ${f.added ?? ''}/${f.deleted ?? ''}`).join('|')}`;
+          const ignSig = rawIgnored.join('\0');
+          const hasTrack = 'ahead' in r || 'behind' in r;
+          const trackSig = hasTrack ? `${r.ahead ?? ''}|${r.behind ?? ''}` : '';
+          const filesChanged = !quiet || sig !== gitSig.current;
+          const ignChanged = !quiet || ignSig !== gitIgnSig.current;
+          const trackChanged = !quiet || trackSig !== gitTrackSig.current;
+          const wtScope = `${hostId}\n${cwd}`;
+          if (
+            r.repo &&
+            (!quiet ||
+              filesChanged ||
+              lastWtFetchRef.current.scope !== wtScope ||
+              Date.now() - lastWtFetchRef.current.at >= WT_POLL_COOLDOWN_MS)
+          ) {
+            loadWorktrees(false);
           }
-        }
-        const ignoredFiles = new Set<string>();
-        const ignoredDirs = new Set<string>([norm(join(r.repo, '.git'))]);
-        const sep = sepOf(r.repo);
-        for (const p of rawIgnored) {
-          const isDir = p.endsWith('/');
-          const relPath = isDir ? p.slice(0, -1) : p;
-          const k = norm(join(r.repo, relPath.split('/').join(sep)));
-          if (isDir) ignoredDirs.add(k);
-          else ignoredFiles.add(k);
-        }
-        const info: GitInfo = { repo: r.repo, branch: r.branch ?? '', head: r.head, total: r.total, files, dirs, ignoredFiles, ignoredDirs };
-        gitCache.set(gitKey(hostId, cwd), { git: info, sig, ignSig });
-        setGit(info);
-        if (!filesChanged) refreshCurDiff.current();
-      })
-      .catch(() => (setGitReady(true), quiet || setGit(null)));
-  }, [hostId, cwd, loadWorktrees]);
+          if (!filesChanged && !ignChanged && !trackChanged) return refreshCurDiff.current();
+          gitSig.current = sig;
+          gitIgnSig.current = ignSig;
+          gitTrackSig.current = trackSig;
+          if (filesChanged) {
+            gitCacheGenRef.current += 1;
+            setFileDiffs({});
+            setBlobs((m) => {
+              const key = gitKey(hostId, cwd);
+              staleBlobs.current = { key, blobs: staleBlobs.current.key === key ? { ...staleBlobs.current.blobs, ...m } : m };
+              return {};
+            });
+          }
+          if (!r.repo) {
+            gitCache.set(gitKey(hostId, cwd), { git: null, sig, ignSig, trackSig });
+            setWorktrees([]);
+            setBranchDiff(null);
+            return setGit(null);
+          }
+          const files = new Map<string, GitFile>();
+          const dirs = new Set<string>();
+          for (const f of r.files) {
+            const abs = join(r.repo, f.path.split('/').join(sepOf(r.repo)));
+            const k = norm(abs);
+            files.set(k, { ...f, path: abs, rel: f.path });
+            for (let d = k.slice(0, k.lastIndexOf('/')); d.length > 1; d = d.slice(0, d.lastIndexOf('/'))) {
+              if (dirs.has(d)) break;
+              dirs.add(d);
+            }
+          }
+          const ignoredFiles = new Set<string>();
+          const ignoredDirs = new Set<string>([norm(join(r.repo, '.git'))]);
+          const sep = sepOf(r.repo);
+          for (const p of rawIgnored) {
+            const isDir = p.endsWith('/');
+            const relPath = isDir ? p.slice(0, -1) : p;
+            const k = norm(join(r.repo, relPath.split('/').join(sep)));
+            if (isDir) ignoredDirs.add(k);
+            else ignoredFiles.add(k);
+          }
+          const info: GitInfo = {
+            repo: r.repo,
+            branch: r.branch ?? '',
+            head: r.head,
+            ahead: r.ahead,
+            behind: r.behind,
+            hasTrack,
+            total: r.total,
+            files,
+            dirs,
+            ignoredFiles,
+            ignoredDirs,
+          };
+          gitCache.set(gitKey(hostId, cwd), { git: info, sig, ignSig, trackSig });
+          setGit(info);
+          if (!filesChanged) refreshCurDiff.current();
+        })
+        .catch(() => {
+          setGitReady(true);
+          if (!quiet) setGit(null);
+        })
+        .finally(() => {
+          if (gitInFlightRef.current === p) gitInFlightRef.current = null;
+          lastGitFetchAtRef.current = Date.now();
+          if (!quiet) setGitLoading(false);
+        });
+      gitInFlightRef.current = p;
+    },
+    [hostId, cwd, loadWorktrees],
+  );
   const refreshCurDiff = useRef(() => {});
+  const revalidateActiveRef = useRef<(cached: OpenFile, quiet?: boolean, reqPath?: string) => Promise<void>>(async () => {});
+  useEffect(() => {
+    gitCacheGenRef.current += 1;
+    diffInFlightRef.current.clear();
+    blobInFlightRef.current.clear();
+    setFileDiffs({});
+    setBlobs({});
+  }, [hostId, cwd]);
   // With a cached status this is a background refresh: nothing changes on screen unless the status did
   useEffect(() => loadGit(gitCache.has(gitKey(hostId, cwd))), [loadGit]);
   useEffect(() => {
@@ -1254,10 +1562,13 @@ export function FilePanel({
     }
   }, [git, diffScope, activeTurnCkpt?.baseRef, activeTurnCkpt?.endRef, activeTurnCkpt?.paths, loadTurnDiff]);
   useEffect(() => {
-    if (git) void loadBranches();
-  }, [git?.branch, commitOpen, reviewPreset, view, loadBranches]); // eslint-disable-line react-hooks/exhaustive-deps
+    if (git && (bwOpen || commitOpen || reviewPreset !== null || diffScope === 'branch' || (!git.hasTrack && !branchesInfo))) {
+      void loadBranches();
+    }
+  }, [git?.branch, git?.hasTrack, bwOpen, commitOpen, reviewPreset, diffScope, loadBranches]); // eslint-disable-line react-hooks/exhaustive-deps
   // Commits made by the AI in a terminal or files changed by other programs aren't caught by the end-of-turn refresh: check again when the window regains focus and every 10 s (while visible)
   useEffect(() => {
+    if (!visible) return;
     const tick = () => document.visibilityState === 'visible' && loadGit(true);
     const t = setInterval(tick, 10000);
     window.addEventListener('focus', tick);
@@ -1265,12 +1576,43 @@ export function FilePanel({
       clearInterval(t);
       window.removeEventListener('focus', tick);
     };
-  }, [loadGit]);
+  }, [loadGit, visible]);
+
+  const prevVisibleRef = useRef(visible);
+  useEffect(() => {
+    const was = prevVisibleRef.current;
+    prevVisibleRef.current = visible;
+    if (!was && visible) {
+      if (Date.now() - lastGitFetchAtRef.current > STALE_REOPEN_MS) {
+        loadGit(true);
+      }
+      const cur = fileRef.current;
+      if (
+        cur &&
+        cur.draft === cur.content &&
+        !hasUnsyncedEdits() &&
+        !cur.web &&
+        !cur.commit &&
+        !cur.review &&
+        !cur.side &&
+        !cur.untitled &&
+        !cur.deleted
+      ) {
+        void revalidateActiveRef.current(cur, true, cur.path);
+      }
+    }
+  }, [visible, loadGit, hasUnsyncedEdits]);
 
   const refreshTree = () => {
     if (!root) return;
-    load(root);
-    for (const d of expandedRef.current) load(d, true);
+    clearFileCache();
+    const gen = ++treeGenRef.current;
+    setTreeLoading(true);
+    load(root)
+      .then(() => loadDirsBatched(visibleExpandedDirs(root, expandedRef.current), gen))
+      .finally(() => {
+        if (treeGenRef.current === gen) setTreeLoading(false);
+      });
     loadGit();
   };
 
@@ -1306,19 +1648,21 @@ export function FilePanel({
     if (next.has(dir)) next.delete(dir);
     else {
       next.add(dir);
-      if (!kids[dir]) load(dir);
+      if (!kids[dir]) void load(dir);
+      const unloadedSubs = visibleExpandedDirs(dir, next).filter((d) => !kids[d]);
+      if (unloadedSubs.length) void loadDirsBatched(unloadedSubs, treeGenRef.current);
     }
     setExpanded(next);
   };
 
   // ---------- Opening and saving files ----------
 
-  const readFile = async (path: string, quiet = false): Promise<OpenFile | null> => {
-    if (isSideTab(path)) return { path, content: '', draft: '', binary: true, truncated: false, size: 0, modified: 0, rev: Date.now(), side: true };
-    if (isReviewTab(path)) return { path, content: '', draft: '', binary: true, truncated: false, size: 0, modified: 0, rev: Date.now(), review: true };
-    if (isWebTab(path)) return { path, content: '', draft: '', binary: true, truncated: false, size: 0, modified: 0, rev: Date.now(), web: true };
+  const readFileWithMeta = async (path: string, quiet = false, force = false): Promise<{ file: OpenFile; fromCache: boolean } | null> => {
+    if (isSideTab(path)) return { file: { path, content: '', draft: '', binary: true, truncated: false, size: 0, modified: 0, rev: nextFileRev(), side: true }, fromCache: false };
+    if (isReviewTab(path)) return { file: { path, content: '', draft: '', binary: true, truncated: false, size: 0, modified: 0, rev: nextFileRev(), review: true }, fromCache: false };
+    if (isWebTab(path)) return { file: { path, content: '', draft: '', binary: true, truncated: false, size: 0, modified: 0, rev: nextFileRev(), web: true }, fromCache: false };
     if (isUntitled(path))
-      return { path, content: '', draft: untitled.get(path) ?? '', binary: false, truncated: false, size: 0, modified: 0, rev: Date.now(), untitled: true };
+      return { file: { path, content: '', draft: untitled.get(path) ?? '', binary: false, truncated: false, size: 0, modified: 0, rev: nextFileRev(), untitled: true }, fromCache: false };
     const ct = parseCommitTab(path);
     if (ct) {
       try {
@@ -1333,7 +1677,7 @@ export function FilePanel({
           const f = r.files.find((x) => x.path === ct.rel);
           const rangeLabel = `${ct.baseHash.slice(0, 7)}..${ct.hash.slice(0, 7)}`;
           const commit = { hash: ct.hash, baseHash: ct.baseHash, rel: ct.rel, subject: rangeLabel, message: '', author: '', time: 0, status: f?.status ?? '', diff: f?.diff ?? '' };
-          return { path, content: '', draft: '', binary: true, truncated: false, size: 0, modified: 0, rev: Date.now(), commit };
+          return { file: { path, content: '', draft: '', binary: true, truncated: false, size: 0, modified: 0, rev: nextFileRev(), commit }, fromCache: false };
         }
         const r = await rpc<{ hash: string; author: string; time: number; message: string; files: { path: string; status: string; diff: string }[] }>(hostId, 'git.show', {
           cwd,
@@ -1342,33 +1686,227 @@ export function FilePanel({
         });
         const f = r.files.find((x) => x.path === ct.rel);
         const commit = { hash: r.hash, rel: ct.rel, subject: r.message.split('\n')[0], message: r.message, author: r.author, time: r.time, status: f?.status ?? '', diff: f?.diff ?? '' };
-        return { path, content: '', draft: '', binary: true, truncated: false, size: 0, modified: 0, rev: Date.now(), commit };
+        return { file: { path, content: '', draft: '', binary: true, truncated: false, size: 0, modified: 0, rev: nextFileRev(), commit }, fromCache: false };
       } catch (e) {
         if (!quiet) errorToast(e);
         return null;
       }
     }
+    if (!force) {
+      const hit = getCachedFile(path);
+      if (hit) return { file: hit, fromCache: true };
+    }
     const mime = IMAGE_MIME[extOf(path)];
     try {
+      let opened: OpenFile;
       if (mime) {
-        const r = await rpc<{ path: string; size: number; modified: number; base64: string }>(hostId, 'fs.read', { path, image: true });
-        return { ...r, content: '', draft: '', binary: true, truncated: false, image: `data:${mime};base64,${r.base64}`, rev: Date.now() };
+        if (isLocal) {
+          const r = await previewFileUrl(hostId, path, 'image');
+          opened = {
+            path: r.path || path,
+            size: r.size ?? 0,
+            modified: r.modified ?? 0,
+            content: '',
+            draft: '',
+            binary: true,
+            truncated: false,
+            image: r.url,
+            rev: nextFileRev(),
+          };
+        } else {
+          const r = await rpc<{ path: string; size: number; modified: number; base64: string }>(hostId, 'fs.read', { path, image: true });
+          opened = { ...r, content: '', draft: '', binary: true, truncated: false, image: `data:${mime};base64,${r.base64}`, rev: nextFileRev() };
+        }
+      } else if (extOf(path) === 'pdf') {
+        if (isLocal) {
+          const r = await previewFileUrl(hostId, path, 'pdf');
+          opened = {
+            path: r.path || path,
+            size: r.size ?? 0,
+            modified: r.modified ?? 0,
+            content: '',
+            draft: '',
+            binary: true,
+            truncated: false,
+            pdfSrc: r.url,
+            rev: nextFileRev(),
+          };
+        } else {
+          const r = await rpc<{ path: string; size: number; modified: number; base64: string }>(hostId, 'fs.read', { path, raw: true });
+          opened = { ...r, content: '', draft: '', binary: true, truncated: false, pdf: r.base64, rev: nextFileRev() };
+        }
+      } else {
+        const r = await rpc<Omit<OpenFile, 'draft' | 'rev'>>(hostId, 'fs.read', { path });
+        opened = { ...r, draft: r.content, rev: nextFileRev() };
       }
-      if (extOf(path) === 'pdf') {
-        const r = await rpc<{ path: string; size: number; modified: number; base64: string }>(hostId, 'fs.read', { path, raw: true });
-        return { ...r, content: '', draft: '', binary: true, truncated: false, pdf: r.base64, rev: Date.now() };
-      }
-      const r = await rpc<Omit<OpenFile, 'draft' | 'rev'>>(hostId, 'fs.read', { path });
-      return { ...r, draft: r.content, rev: Date.now() };
+      putCachedFile(opened);
+      return { file: opened, fromCache: false };
     } catch (e) {
       if (!quiet) errorToast(e);
       return null;
     }
   };
 
+  const readFile = async (path: string, quiet = false, force = false): Promise<OpenFile | null> =>
+    (await readFileWithMeta(path, quiet, force))?.file ?? null;
+
+  const revalidateFile = async (cached: OpenFile, reqPath?: string): Promise<OpenFile | 'unchanged'> => {
+    const targetPath = reqPath ?? cached.path;
+    if (isLocal && (cached.image || cached.pdfSrc)) {
+      const kind = cached.image ? 'image' : 'pdf';
+      const prevUrl = kind === 'image' ? cached.image : cached.pdfSrc;
+      const r = await previewFileUrl(hostId, targetPath, kind);
+      if (r.modified === cached.modified && r.size === cached.size && r.url === prevUrl) return 'unchanged';
+      const fresh: OpenFile =
+        kind === 'image'
+          ? {
+              path: r.path || targetPath,
+              size: r.size ?? 0,
+              modified: r.modified ?? 0,
+              content: '',
+              draft: '',
+              binary: true,
+              truncated: false,
+              image: r.url,
+              rev: nextFileRev(),
+            }
+          : {
+              path: r.path || targetPath,
+              size: r.size ?? 0,
+              modified: r.modified ?? 0,
+              content: '',
+              draft: '',
+              binary: true,
+              truncated: false,
+              pdfSrc: r.url,
+              rev: nextFileRev(),
+            };
+      putCachedFile(fresh);
+      return fresh;
+    }
+    const mime = cached.image ? IMAGE_MIME[extOf(targetPath)] : undefined;
+    if (cached.image && mime) {
+      const r = await rpc<{ unchanged?: boolean; path: string; size: number; modified: number; base64?: string }>(hostId, 'fs.read', {
+        path: targetPath,
+        image: true,
+        ifModified: cached.modified,
+        ifSize: cached.size,
+      });
+      if (r.unchanged) return 'unchanged';
+      const dataUrl = `data:${mime};base64,${r.base64 ?? ''}`;
+      if (r.modified === cached.modified && r.size === cached.size && dataUrl === cached.image) return 'unchanged';
+      const fresh: OpenFile = {
+        path: r.path || targetPath,
+        size: r.size,
+        modified: r.modified,
+        content: '',
+        draft: '',
+        binary: true,
+        truncated: false,
+        image: dataUrl,
+        rev: nextFileRev(),
+      };
+      putCachedFile(fresh);
+      return fresh;
+    }
+    if (cached.pdf) {
+      const r = await rpc<{ unchanged?: boolean; path: string; size: number; modified: number; base64?: string }>(hostId, 'fs.read', {
+        path: targetPath,
+        raw: true,
+        ifModified: cached.modified,
+        ifSize: cached.size,
+      });
+      if (r.unchanged) return 'unchanged';
+      const b64 = r.base64 ?? '';
+      if (r.modified === cached.modified && r.size === cached.size && b64 === cached.pdf) return 'unchanged';
+      const fresh: OpenFile = {
+        path: r.path || targetPath,
+        size: r.size,
+        modified: r.modified,
+        content: '',
+        draft: '',
+        binary: true,
+        truncated: false,
+        pdf: b64,
+        rev: nextFileRev(),
+      };
+      putCachedFile(fresh);
+      return fresh;
+    }
+    const r = await rpc<{ unchanged?: boolean } & Omit<OpenFile, 'draft' | 'rev'>>(hostId, 'fs.read', {
+      path: targetPath,
+      ifModified: cached.modified,
+      ifSize: cached.size,
+    });
+    if (r.unchanged) return 'unchanged';
+    if (
+      r.modified === cached.modified &&
+      r.size === cached.size &&
+      r.content === cached.content &&
+      r.binary === cached.binary &&
+      r.truncated === cached.truncated &&
+      !!r.notUtf8 === !!cached.notUtf8
+    ) {
+      return 'unchanged';
+    }
+    const fresh: OpenFile = { ...r, draft: r.content, rev: nextFileRev() };
+    putCachedFile(fresh);
+    return fresh;
+  };
+
+  const revalidateActiveCached = async (cached: OpenFile, quiet = false, reqPath?: string) => {
+    try {
+      const res = await revalidateFile(cached, reqPath);
+      if (res === 'unchanged') return;
+      const live = fileRef.current;
+      if (!live || live.path !== cached.path || live.rev !== cached.rev || live.draft !== live.content || hasUnsyncedEdits()) {
+        return;
+      }
+      fileRef.current = res;
+      setFile((cur) =>
+        cur && cur.path === cached.path && cur.rev === cached.rev && cur.draft === cur.content && !hasUnsyncedEdits() ? res : cur,
+      );
+      setSaveState(null);
+      setSaveError('');
+      loadGit(true);
+    } catch (e) {
+      dropCachedFile(reqPath ?? cached.path);
+      loadGit(true);
+      const live = fileRef.current;
+      if (!live || live.path !== cached.path || live.rev !== cached.rev || live.draft !== live.content || hasUnsyncedEdits()) {
+        return;
+      }
+      if (!quiet) errorToast(e);
+      const msg = String((e as Error)?.message ?? e);
+      if (!/(连接|超时|timeout|disconnect|未连接)/i.test(msg)) {
+        fileRef.current = null;
+        setFile((cur) =>
+          cur && cur.path === cached.path && cur.rev === cached.rev && cur.draft === cur.content && !hasUnsyncedEdits() ? null : cur,
+        );
+      }
+    }
+  };
+  revalidateActiveRef.current = revalidateActiveCached;
+
+  const readFileValidated = async (path: string, quiet = false): Promise<OpenFile | null> => {
+    const res = await readFileWithMeta(path, quiet, false);
+    if (!res) return null;
+    if (!res.fromCache) return res.file;
+    try {
+      const checked = await revalidateFile(res.file, path);
+      return checked === 'unchanged' ? res.file : checked;
+    } catch (e) {
+      dropCachedFile(path);
+      if (!quiet) errorToast(e);
+      return null;
+    }
+  };
+
   const confirmDiscard = async () => {
+    const latestDraft = flushActiveEditor();
     const cur = fileRef.current;
-    if (!cur || cur.draft === cur.content) return true;
+    const curDraft = latestDraft ?? cur?.draft ?? '';
+    if (!cur || curDraft === cur.content) return true;
     return askConfirm({
       title: tx('discardChangesTo', { v: nameOf(cur.path) }),
       message: tx('unsavedEditsWillBeDiscarded'),
@@ -1411,8 +1949,12 @@ export function FilePanel({
   const curDiffCacheKey = file && !file.web && !file.commit && !file.review && !file.side ? diffCacheKey(file.path) : '';
   const curGit = file ? diffGitOf(file.path) : undefined;
   useEffect(() => {
-    if (!curKey || !curGit || curGit.diff || curDiffCacheKey in fileDiffs) return;
+    if (!showDiff || !curKey || !curGit || curGit.diff || curDiffCacheKey in fileDiffs) return;
     const k = curDiffCacheKey;
+    const gen = gitCacheGenRef.current;
+    const inflightKey = `${gen}\n${hostId}\n${cwd}\n${k}`;
+    if (diffInFlightRef.current.has(inflightKey)) return;
+    diffInFlightRef.current.add(inflightKey);
     const req =
       diffScope === 'turn' && activeTurnCkpt?.endRef
         ? rpc<{ files: { path: string; diff: string }[] }>(hostId, 'git.refDiff', {
@@ -1427,15 +1969,29 @@ export function FilePanel({
               base: branchBase || undefined,
               paths: [curGit.rel],
             })
-          : rpc<{ files: { path: string; diff: string }[] }>(hostId, 'git.changes', { cwd, paths: [curGit.rel] });
+          : rpc<{ files: { path: string; diff: string }[] }>(hostId, 'git.changes', {
+              cwd,
+              paths: curGit.oldPath ? [curGit.rel, curGit.oldPath] : [curGit.rel],
+            });
     req
-      .then((r) => setFileDiffs((m) => ({ ...m, [k]: r.files.find((f) => f.path === curGit.rel)?.diff ?? '' })))
-      .catch(() => setFileDiffs((m) => ({ ...m, [k]: '' })));
-  }, [curKey, curDiffCacheKey, curGit, fileDiffs, diffScope, branchBase, activeTurnCkpt?.baseRef, activeTurnCkpt?.endRef]); // eslint-disable-line react-hooks/exhaustive-deps
+      .then((r) => {
+        if (gitCacheGenRef.current !== gen) return;
+        setFileDiffs((m) => ({ ...m, [k]: r.files.find((f) => f.path === curGit.rel)?.diff ?? '' }));
+      })
+      .catch(() => {
+        if (gitCacheGenRef.current !== gen) return;
+        setFileDiffs((m) => ({ ...m, [k]: '' }));
+      })
+      .finally(() => diffInFlightRef.current.delete(inflightKey));
+  }, [showDiff, curKey, curDiffCacheKey, curGit, fileDiffs, diffScope, branchBase, activeTurnCkpt?.baseRef, activeTurnCkpt?.endRef]); // eslint-disable-line react-hooks/exhaustive-deps
   // Status unchanged but the content may have changed again: refetch the current file's diff in the background and swap it in when it arrives, without showing "loading"
   refreshCurDiff.current = () => {
-    if (!curKey || !curGit || !(curDiffCacheKey in fileDiffs) || diffScope === 'turn') return;
+    if (!showDiff || !curKey || !curGit || !(curDiffCacheKey in fileDiffs) || diffScope === 'turn') return;
     const k = curDiffCacheKey;
+    const gen = gitCacheGenRef.current;
+    const inflightKey = `${gen}\n${hostId}\n${cwd}\n${k}`;
+    if (diffInFlightRef.current.has(inflightKey)) return;
+    diffInFlightRef.current.add(inflightKey);
     const req =
       diffScope === 'branch'
         ? rpc<{ files: { path: string; diff: string }[] }>(hostId, 'git.branchDiff', {
@@ -1443,13 +1999,18 @@ export function FilePanel({
             base: branchBase || undefined,
             paths: [curGit.rel],
           })
-        : rpc<{ files: { path: string; diff: string }[] }>(hostId, 'git.changes', { cwd, paths: [curGit.rel] });
+        : rpc<{ files: { path: string; diff: string }[] }>(hostId, 'git.changes', {
+            cwd,
+            paths: curGit.oldPath ? [curGit.rel, curGit.oldPath] : [curGit.rel],
+          });
     req
       .then((r) => {
+        if (gitCacheGenRef.current !== gen) return;
         const d = r.files.find((f) => f.path === curGit.rel)?.diff ?? '';
         setFileDiffs((m) => (m[k] === d ? m : { ...m, [k]: d }));
       })
-      .catch(() => {});
+      .catch(() => {})
+      .finally(() => diffInFlightRef.current.delete(inflightKey));
   };
   // The file no longer has changes (e.g. just committed): if we're still on "Changes", switch back to the file
   useEffect(() => {
@@ -1466,6 +2027,7 @@ export function FilePanel({
     setPreview(m === 'preview' && !at);
   };
   const pickMdMode = (m: 'source' | 'split' | 'preview') => {
+    flushActiveEditor();
     lsSet('wp-md-mode', m);
     setMdSplit(m === 'split');
     setPreview(m === 'preview');
@@ -1530,9 +2092,10 @@ export function FilePanel({
     path0: string,
     diff = false,
     at?: GotoTarget | { line: number; endLine?: number; col?: number; len?: number; side?: 'a' | 'b' | 'del-file' },
-    opts?: { skipHistory?: boolean; comparePath?: string },
+    opts?: { skipHistory?: boolean; comparePath?: string; quiet?: boolean },
   ): Promise<'opened' | 'cancelled' | 'failed'> => {
     const seq = ++openSeqRef.current;
+    setOpeningPath(null);
     const path = unverbatim(path0);
     const jump = () => at && setGoto({ ...at, n: Date.now() });
     const cur = fileRef.current;
@@ -1550,14 +2113,18 @@ export function FilePanel({
     if (cur?.path === path) {
       const canDiff = !!cur.commit || !!cur.deleted || !!opts?.comparePath || hasChange(path);
       if (opts?.comparePath) {
+        flushActiveEditor();
         if (norm(compareRef.current?.path ?? '') !== norm(opts.comparePath)) {
-          const cf = await readFile(opts.comparePath);
+          setOpeningPath(opts.comparePath);
+          const cf = await readFileValidated(opts.comparePath, !!opts?.quiet);
+          if (openSeqRef.current === seq) setOpeningPath(null);
           if (openSeqRef.current !== seq) return 'cancelled';
           if (!cf) return 'failed';
           setCompare({ path: cf.path, text: cf.content });
         }
         setShowDiff(false);
       } else if (diff && canDiff) {
+        flushActiveEditor();
         setCompare(null);
         setShowDiff(true);
       }
@@ -1567,7 +2134,10 @@ export function FilePanel({
         }
         curPosRef.current = { path, line: at.line, col: at.col ?? 0, side: at.side };
         if (!opts?.comparePath) {
-          if (!diff || !canDiff) setShowDiff(false);
+          if (!diff || !canDiff) {
+            flushActiveEditor();
+            setShowDiff(false);
+          }
           setCompare(null);
         }
         if (preview && !diff && !opts?.comparePath) previewFor(path, at);
@@ -1576,46 +2146,62 @@ export function FilePanel({
       if (window.matchMedia('(max-width: 760px)').matches) setTreeOpen(false);
       return 'opened';
     }
-    // An untitled tab keeps its text in memory when you switch away (it's written to untitled on every edit)
-    if (!cur?.untitled && !(await confirmDiscard())) return 'cancelled';
+    // An untitled tab keeps its text in memory when you switch away; flush debounced edits first
+    if (cur?.untitled) flushActiveEditor();
+    else if (!(await confirmDiscard())) return 'cancelled';
     if (openSeqRef.current !== seq) return 'cancelled';
     const g = diffGitOf(path);
-    const f: OpenFile | null =
-      g && gitMark(g.status)[0] === 'D'
-        ? { path, content: '', draft: '', binary: true, truncated: false, size: 0, modified: 0, rev: Date.now(), deleted: true }
-        : (await readFile(path)) ??
-          (diffScope === 'turn' && g
-            ? { path, content: '', draft: '', binary: false, truncated: false, size: 0, modified: 0, rev: Date.now(), deleted: true }
-            : null);
-    if (openSeqRef.current !== seq) return 'cancelled';
-    if (!f) return 'failed';
-    let nextCompare: { path: string; text: string; replace?: boolean } | null = null;
-    if (opts?.comparePath) {
-      const cf = await readFile(opts.comparePath);
+    const isDel = g && gitMark(g.status)[0] === 'D';
+    const isSpecial = isSideTab(path) || isReviewTab(path) || isWebTab(path) || isUntitled(path);
+    const cachedHit = !isDel && !isSpecial && !parseCommitTab(path) ? hasCachedFile(path) : false;
+    if (!cachedHit && !isDel && !isSpecial) setOpeningPath(path);
+    let f: OpenFile | null = null;
+    let openedFromCache = false;
+    try {
+      if (isDel) {
+        f = { path, content: '', draft: '', binary: true, truncated: false, size: 0, modified: 0, rev: nextFileRev(), deleted: true };
+      } else {
+        const res = await readFileWithMeta(path, !!opts?.quiet);
+        if (res) {
+          f = res.file;
+          openedFromCache = res.fromCache;
+        } else if (diffScope === 'turn' && g) {
+          f = { path, content: '', draft: '', binary: false, truncated: false, size: 0, modified: 0, rev: nextFileRev(), deleted: true };
+        }
+      }
       if (openSeqRef.current !== seq) return 'cancelled';
-      if (!cf) return 'failed';
-      nextCompare = { path: cf.path, text: cf.content };
+      if (!f) return 'failed';
+      let nextCompare: { path: string; text: string; replace?: boolean } | null = null;
+      if (opts?.comparePath) {
+        const cf = await readFileValidated(opts.comparePath, !!opts?.quiet);
+        if (openSeqRef.current !== seq) return 'cancelled';
+        if (!cf) return 'failed';
+        nextCompare = { path: cf.path, text: cf.content };
+      }
+      const willDiff = !nextCompare && (!!f.deleted || (diff && hasChange(path)) || !!f.commit);
+      if (!opts?.skipHistory && !navSteppingRef.current && !restoring.current && isNavTrackable(path) && !f.binary && !f.image && !f.pdf && !f.pdfSrc) {
+        recordNavJump(prevPoint, { path, line: at?.line ?? 1, col: at?.col ?? 0, diff: willDiff || !!nextCompare, side: at?.side, comparePath: nextCompare?.path });
+      }
+      curPosRef.current = { path, line: at?.line ?? 1, col: at?.col ?? 0, side: at?.side };
+      fileRef.current = f;
+      setFile(f);
+      setTabs((t) => (t.includes(path) ? t : [...t, path].slice(-30)));
+      // The live picture / side chat needs the room: hide the tree for this session
+      if (isAiTab(path) || isSideTab(path)) setTree(false);
+      setSaveState(null);
+      previewFor(path, at);
+      setCompare(nextCompare);
+      setGoto(at ? { ...at, n: Date.now() } : null);
+      setShowDiff(willDiff);
+      if (openedFromCache) void revalidateActiveCached(f, !!opts?.quiet, path);
+      if (window.matchMedia('(max-width: 760px)').matches) setTreeOpen(false);
+      return 'opened';
+    } finally {
+      if (openSeqRef.current === seq) setOpeningPath(null);
     }
-    const willDiff = !nextCompare && (!!f.deleted || (diff && hasChange(path)) || !!f.commit);
-    if (!opts?.skipHistory && !navSteppingRef.current && !restoring.current && isNavTrackable(path) && !f.binary && !f.image && !f.pdf) {
-      recordNavJump(prevPoint, { path, line: at?.line ?? 1, col: at?.col ?? 0, diff: willDiff || !!nextCompare, side: at?.side, comparePath: nextCompare?.path });
-    }
-    curPosRef.current = { path, line: at?.line ?? 1, col: at?.col ?? 0, side: at?.side };
-    fileRef.current = f;
-    setFile(f);
-    setTabs((t) => (t.includes(path) ? t : [...t, path].slice(-30)));
-    // The live picture / side chat needs the room: hide the tree for this session
-    if (isAiTab(path) || isSideTab(path)) setTree(false);
-    setSaveState(null);
-    previewFor(path, at);
-    setCompare(nextCompare);
-    setGoto(at ? { ...at, n: Date.now() } : null);
-    setShowDiff(willDiff);
-    if (window.matchMedia('(max-width: 760px)').matches) setTreeOpen(false);
-    return 'opened';
   };
-  const openFile = async (path0: string, diff = false, at?: { line: number; endLine?: number; col?: number; len?: number; side?: 'a' | 'b' | 'del-file' }): Promise<boolean> => {
-    const res = await openFileInternal(path0, diff, at);
+  const openFile = async (path0: string, diff = false, at?: { line: number; endLine?: number; col?: number; len?: number; side?: 'a' | 'b' | 'del-file' }, quiet = false): Promise<boolean> => {
+    const res = await openFileInternal(path0, diff, at, quiet ? { quiet: true } : undefined);
     return res !== 'cancelled';
   };
   // A file link or context pill in chat (SessionActions.openFileInPanel): taken on mount too, since a closed panel mounts after the event.
@@ -1655,8 +2241,11 @@ export function FilePanel({
     let cur = top;
     for (const part of dir.slice(top.length).split(/[\\/]/).filter(Boolean)) chain.push((cur = join(cur, part)));
     setKids((k) => ({ ...k, [chain[chain.length - 1] ?? top]: r.entries }));
+    const nextExpanded = new Set([...expandedRef.current, ...chain]);
     for (const d of chain.slice(0, -1)) if (!kids[d]) load(d, true);
-    setExpanded((x) => new Set([...x, ...chain]));
+    const unloadedSubs = visibleExpandedDirs(top, nextExpanded).filter((d) => d !== chain[chain.length - 1] && !kids[d]);
+    if (unloadedSubs.length) void loadDirsBatched(unloadedSubs, treeGenRef.current);
+    setExpanded(nextExpanded);
     setFilter('');
     pickView('all');
     setTree(true);
@@ -1684,10 +2273,22 @@ export function FilePanel({
             if (!active) return;
             const isVirtual =
               isWebTab(r.path) || isAiTab(r.path) || isSideTab(r.path) || isReviewTab(r.path) || isUntitled(r.path) || isCommitTab(r.path);
-            // A folder link: show it in the tree instead of trying to read it as a file
-            if (!r.line && !r.diff && !isVirtual && (await revealRef.current(r.path))) continue;
-            const ok = await openFileRef.current(r.path, !!r.diff, r.line ? { line: r.line, endLine: r.endLine } : undefined);
-            if (!ok) break;
+            const likelyFile = !/[\\/]$/.test(r.path) && hasFileExt(r.path);
+            if (!r.line && !r.diff && !isVirtual && !likelyFile && (await revealRef.current(r.path))) continue;
+            const res = await openFileInternalRef.current(
+              r.path,
+              !!r.diff,
+              r.line ? { line: r.line, endLine: r.endLine } : undefined,
+              likelyFile && !r.line && !r.diff && !isVirtual ? { quiet: true } : undefined,
+            );
+            if (res === 'cancelled') break;
+            if (res === 'failed' && likelyFile && !r.line && !r.diff && !isVirtual) {
+              if (!(await revealRef.current(r.path))) {
+                // Re-run loudly once to surface actual permission / missing-file toast if neither worked
+                await openFileInternalRef.current(r.path, false);
+                break;
+              }
+            }
           }
         });
     };
@@ -1840,11 +2441,17 @@ export function FilePanel({
     setTabs(rest);
     const next = rest[Math.min(i, rest.length - 1)];
     if (next) {
-      const f = await readFile(next);
+      const res = await readFileWithMeta(next);
+      const f = res?.file ?? null;
+      fileRef.current = f;
       setFile(f);
       setShowDiff(false);
       previewFor(next);
-    } else setFile(null);
+      if (res?.fromCache) void revalidateActiveCached(res.file, false, next);
+    } else {
+      fileRef.current = null;
+      setFile(null);
+    }
     setCompare(null);
     setSaveState(null);
   };
@@ -1863,10 +2470,13 @@ export function FilePanel({
     if (!(await confirmDiscard())) return;
     dropClosed();
     setTabs(keep);
-    const f = await readFile(t);
+    const res = await readFileWithMeta(t);
+    const f = res?.file ?? null;
+    fileRef.current = f;
     setFile(f);
     setShowDiff(false);
     previewFor(t);
+    if (res?.fromCache) void revalidateActiveCached(res.file, false, t);
     setCompare(null);
     setSaveState(null);
   };
@@ -1893,8 +2503,6 @@ export function FilePanel({
   useEffect(() => onFileOpen?.(paneShown), [paneShown]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Remember opened files (per host + working directory; Files sessions per session) and restore the tabs and current file next time the panel opens
-  const tabsKey = standalone ? `wp-open-s-${hostId}/${sessionId}` : `wp-open-${hostId}/${cwd}`;
-  const untitled = untitledStore(tabsKey);
   /** Tab title: untitled tabs are named after their first line, like VS Code */
   const nameOf = (t: string) => (isUntitled(t) ? untitledLabel(t, t === file?.path ? file.draft : untitled.get(t) ?? '') : baseName(t));
   /** Closing untitled tabs (other than the current one) that have text: ask first, since nothing is on disk */
@@ -1945,17 +2553,20 @@ export function FilePanel({
     const cur = saved.current && keep.includes(saved.current) ? saved.current : keep[keep.length - 1];
     if (!cur) return;
     restoring.current = true;
-    readFile(cur, true).then((f) => {
+    readFileWithMeta(cur, true).then((res) => {
       restoring.current = false;
+      const f = res?.file ?? null;
       // If the user (or a file link) already opened a file while restoring, keep it but still bring back the saved tabs
       if (fileRef.current) {
         if (f) setTabs((t) => [...keep.filter((x) => !t.includes(x)), ...t].slice(-30));
         return;
       }
       if (!f) return setTabs(keep.filter((t) => t !== cur));
+      fileRef.current = f;
       setTabs(keep);
       setFile(f);
       previewFor(cur);
+      if (res?.fromCache) void revalidateActiveCached(f, true, cur);
       // On phones a restored file normally takes the screen; not when the panel was opened for "Changes".
       // On desktop, auto-hide the tree when restoring an AI browser / side chat tab unless explicitly toggled for this session.
       if (!forChanges.current) {
@@ -1980,17 +2591,29 @@ export function FilePanel({
     setTabs(alive);
     if (file && dead.includes(file.path)) {
       const next = alive[alive.length - 1];
-      if (next) readFile(next, true).then((f) => setFile(f));
-      else setFile(null);
+      if (next) {
+        readFileWithMeta(next, true).then((res) => {
+          const f = res?.file ?? null;
+          fileRef.current = f;
+          setFile(f);
+          if (res?.fromCache && f) void revalidateActiveCached(f, true, next);
+        });
+      } else {
+        fileRef.current = null;
+        setFile(null);
+      }
     }
   }, [rawHostSessions, hostSessions]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const reload = async () => {
     if (!file) return;
-    const f = await readFile(file.path);
+    dropCachedFile(file.path);
+    const f = await readFile(file.path, false, true);
     if (f) {
+      fileRef.current = f;
       setFile(f);
       setSaveState(null);
+      setSaveError('');
       toast(tx('reloadedFromDisk', { v: baseName(f.path) }));
     }
   };
@@ -2023,11 +2646,32 @@ export function FilePanel({
         if (!ok) return setSaveState(null);
         await write(true);
       }
-      const nf = await readFile(path);
+      const nf = await readFile(path, false, true);
+      const sameOpen = fileRef.current?.path === f.path && fileRef.current.rev === f.rev;
+      const flushedDraft = sameOpen ? flushActiveEditor() : undefined;
+      const latestDraft = sameOpen ? (flushedDraft ?? fileRef.current?.draft ?? f.draft) : undefined;
+      const finalPath = nf ? unverbatim(nf.path) : path;
       untitled.delete(f.path);
-      setTabs((t) => [...new Set(t.map((x) => (x === f.path ? path : x)))]);
+      setTabs((t) => [...new Set(t.map((x) => (x === f.path ? finalPath : x)))]);
       // Stay in the editor even for Markdown / HTML (no switch to the preview)
-      if (nf) setFile((cur) => (cur?.path === f.path ? nf : cur));
+      if (nf) {
+        const savedFile = nf.path === finalPath ? nf : { ...nf, path: finalPath };
+        const curNow = fileRef.current;
+        const preservedDraft =
+          curNow?.path === f.path && curNow.rev === f.rev
+            ? (latestDraft !== undefined && latestDraft !== f.draft ? latestDraft : curNow.draft)
+            : undefined;
+        const nextF =
+          preservedDraft !== undefined && preservedDraft !== f.draft
+            ? { ...savedFile, draft: preservedDraft }
+            : savedFile;
+        if (curNow?.path === f.path && curNow.rev === f.rev) fileRef.current = nextF;
+        setFile((cur) => {
+          if (!cur || cur.path !== f.path || cur.rev !== f.rev) return cur;
+          const d = cur.draft !== f.draft ? cur.draft : preservedDraft;
+          return d !== undefined && d !== f.draft ? { ...savedFile, draft: d } : savedFile;
+        });
+      }
       setSaveState(null);
       refreshTree();
       toast(tx('saved', { v: baseName(path) }));
@@ -2038,26 +2682,41 @@ export function FilePanel({
   };
 
   const save = async (overwrite = false) => {
+    const latestDraft = flushActiveEditor();
     const f = fileRef.current;
+    const draftText = latestDraft ?? f?.draft ?? '';
     // As in VS Code, Ctrl+S on an untitled tab asks where to save it even when it's empty
-    if (f?.untitled) return saveState === 'saving' ? undefined : saveUntitled(f);
-    if (!f || f.draft === f.content || saveState === 'saving') return;
+    if (f?.untitled) return saveState === 'saving' ? undefined : saveUntitled({ ...f, draft: draftText });
+    if (!f || draftText === f.content || saveState === 'saving') return;
+    const targetPath = f.path;
+    const targetRev = f.rev;
     setSaveState('saving');
     try {
       const r = await rpc<{ modified: number; size: number }>(hostId, 'fs.write', {
-        path: f.path,
-        content: f.draft,
+        path: targetPath,
+        content: draftText,
         expectModified: overwrite ? undefined : f.modified,
         expectSize: overwrite ? undefined : f.size,
       });
-      setFile((cur) => (cur && cur.path === f.path ? { ...cur, content: f.draft, modified: r.modified, size: r.size } : cur));
-      setSaveState(null);
+      putCachedFile({ ...f, content: draftText, draft: draftText, modified: r.modified, size: r.size });
+      const live = fileRef.current;
+      if (live && live.path === targetPath && live.rev === targetRev) {
+        fileRef.current = { ...live, content: draftText, modified: r.modified, size: r.size };
+        setSaveState(null);
+      }
+      setFile((cur) =>
+        cur && cur.path === targetPath && cur.rev === targetRev
+          ? { ...cur, content: draftText, modified: r.modified, size: r.size }
+          : cur,
+      );
       loadGit(true);
-      toast(tx('saved', { v: baseName(f.path) }));
+      toast(tx('saved', { v: baseName(targetPath) }));
     } catch (e) {
       const msg = String((e as Error)?.message ?? e);
-      setSaveError(msg);
-      setSaveState(msg.includes('被修改过') ? 'conflict' : 'error');
+      if (fileRef.current?.path === targetPath && fileRef.current?.rev === targetRev) {
+        setSaveError(msg);
+        setSaveState(msg.includes('被修改过') ? 'conflict' : 'error');
+      }
       if (!msg.includes('被修改过')) errorToast(e);
     }
   };
@@ -2070,20 +2729,61 @@ export function FilePanel({
     if (!(was === 'running' || was === 'waiting-permission') || status === 'running') return;
     refreshTree();
     const f = fileRef.current;
-    if (f && f.draft === f.content && !f.image && !f.web && !f.commit && !f.untitled) {
+    if (f && f.draft === f.content && !hasUnsyncedEdits() && !f.image && !f.pdf && !f.pdfSrc && !f.web && !f.commit && !f.untitled) {
+      dropCachedFile(f.path);
       rpc<Omit<OpenFile, 'draft' | 'rev'>>(hostId, 'fs.read', { path: f.path })
         .then((r) => {
-          if (r.modified === f.modified) return;
-          setFile((cur) => (cur && cur.path === f.path && cur.draft === cur.content ? { ...r, draft: r.content, rev: Date.now() } : cur));
+          if (r.modified === f.modified && r.size === f.size && r.content === f.content) return;
+          const nextF = { ...r, draft: r.content, rev: nextFileRev() };
+          putCachedFile(nextF);
+          const live = fileRef.current;
+          if (!live || live.path !== f.path || live.rev !== f.rev || live.draft !== live.content || hasUnsyncedEdits()) {
+            return;
+          }
+          fileRef.current = nextF;
+          setFile((cur) =>
+            cur && cur.path === f.path && cur.rev === f.rev && cur.draft === cur.content && !hasUnsyncedEdits() ? nextF : cur,
+          );
         })
         .catch(() => {});
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [status]);
 
-  // An untitled tab's text stays in memory when the panel closes, so there's nothing to confirm for it
+  // An untitled tab's text stays in memory when the panel closes; flush debounced edits first
   const closePanel = async () => {
-    if (file?.untitled || (await confirmDiscard())) onClose();
+    const cur = fileRef.current;
+    if (cur?.untitled) {
+      flushActiveEditor();
+      onClose();
+      return;
+    }
+    const latestDraft = flushActiveEditor();
+    const afterFlush = fileRef.current;
+    const curDraft = latestDraft ?? afterFlush?.draft ?? '';
+    if (!afterFlush || curDraft === afterFlush.content) {
+      onClose();
+      return;
+    }
+    const targetPath = afterFlush.path;
+    const targetRev = afterFlush.rev;
+    const ok = await askConfirm({
+      title: tx('discardChangesTo', { v: nameOf(targetPath) }),
+      message: tx('unsavedEditsWillBeDiscarded'),
+      okText: tx('discard'),
+      danger: true,
+    });
+    if (!ok) return;
+    const nextRev = nextFileRev();
+    if (fileRef.current && fileRef.current.path === targetPath && fileRef.current.rev === targetRev) {
+      fileRef.current = { ...fileRef.current, draft: fileRef.current.content, rev: nextRev };
+      setSaveState(null);
+      setSaveError('');
+    }
+    setFile((c) =>
+      c && c.path === targetPath && c.rev === targetRev ? { ...c, draft: c.content, rev: nextRev } : c,
+    );
+    onClose();
   };
 
   // ---------- New, rename, delete ----------
@@ -2110,6 +2810,7 @@ export function FilePanel({
     const to = join(parentOf(path), name.trim());
     try {
       await rpc(hostId, 'fs.rename', { from: path, to });
+      clearFileCache();
       // A renamed folder moves everything inside it: open tabs (including HTML previews), the current file and expanded folders
       const sep = sepOf(path);
       const move = (p: string) => (p === path ? to : p.startsWith(path + sep) ? to + p.slice(path.length) : p);
@@ -2184,6 +2885,8 @@ export function FilePanel({
     if (!ok) return;
     try {
       await rpc(hostId, 'fs.delete', isDir ? { path, recursive: true } : { path });
+      if (isDir) clearFileCache();
+      else dropCachedFile(path);
       await closeRemovedTabs(isDir ? (p) => isSameOrInside(p, path) : (p) => norm(p) === norm(path));
       if (isDir) {
         setExpanded((x) => new Set([...x].filter((d) => !isSameOrInside(d, path))));
@@ -2274,6 +2977,7 @@ export function FilePanel({
     try {
       await rpc(hostId, 'git.discard', { cwd, paths: discardPathsOf(files) });
       toast(tx('discardedChanges'));
+      clearFileCache();
       const removedNorms = new Set(
         files.filter((f) => isUntrackedGit(f) || f.status.startsWith('A') || !!f.oldPath).map((f) => norm(f.path)),
       );
@@ -2284,8 +2988,9 @@ export function FilePanel({
       if (cur && !cur.web && !cur.commit && !cur.review && !cur.side && !cur.untitled) {
         const curNorm = norm(cur.path);
         if (files.some((f) => norm(f.path) === curNorm && !removedNorms.has(curNorm))) {
-          const next = await readFile(cur.path, true);
+          const next = await readFile(cur.path, true, true);
           if (next) {
+            fileRef.current = next;
             setFile(next);
             setShowDiff(false);
             setSaveState(null);
@@ -2334,6 +3039,7 @@ export function FilePanel({
   };
 
   const openCommit = (pushDefault = preferCommitPush) => {
+    if (!branchesInfo) void loadBranches();
     setCommitDefaultPush(pushDefault);
     setCommitOpen(true);
   };
@@ -2779,7 +3485,7 @@ export function FilePanel({
   const openSecond = async (path: string) => {
     if (!file) return openFile(path);
     if (path === file.path) return;
-    const f = await readFile(path);
+    const f = await readFileValidated(path);
     if (!f) return;
     setSecond(f);
     // Three columns is too cramped: collapse the tree first (not saved in settings); the top-right button reopens it
@@ -2788,9 +3494,10 @@ export function FilePanel({
   const compareWith = async (path: string) => {
     if (!file || path === file.path) return;
     if (file.binary) return toast(tx('currentFileIsNotText'));
-    const f = await readFile(path);
+    const f = await readFileValidated(path);
     if (!f) return;
     if (f.binary) return toast(tx('isNotATextFile', { v: baseName(path) }));
+    flushActiveEditor();
     setCompare({ path, text: f.content });
     setShowDiff(false);
   };
@@ -3319,7 +4026,7 @@ export function FilePanel({
       { label: tx('selectAll'), hint: `${mod}A`, run: c.selectAll },
       '-',
       { label: tx('find'), icon: 'search', hint: `${mod}F`, run: c.find },
-      { label: tx('goToLine'), hint: `${mod}G`, run: () => setQuick(':') },
+      { label: tx('goToLine'), hint: `${mod}G`, run: () => openQuick(':') },
       '-',
       ...(!standalone && (c.selection || onDisk)
         ? [
@@ -3353,8 +4060,8 @@ export function FilePanel({
     const r = e.currentTarget.getBoundingClientRect();
     const items: (MenuItem | '-')[] = file?.untitled
       ? [
-          { label: tx('goToSymbol'), icon: 'search', hint: `${navigator.platform.includes('Mac') ? '⌘' : 'Ctrl+'}Shift+O`, run: () => setQuick('@') },
-          { label: tx('goToLine'), hint: `${navigator.platform.includes('Mac') ? '⌘' : 'Ctrl+'}G`, run: () => setQuick(':') },
+          { label: tx('goToSymbol'), icon: 'search', hint: `${navigator.platform.includes('Mac') ? '⌘' : 'Ctrl+'}Shift+O`, run: () => openQuick('@') },
+          { label: tx('goToLine'), hint: `${navigator.platform.includes('Mac') ? '⌘' : 'Ctrl+'}G`, run: () => openQuick(':') },
           '-',
           { label: tx('saveAs'), icon: 'save', run: () => save() },
           { label: tx('copyFileContents'), icon: 'copy', run: () => copy(file.draft, tx('fileContentsCopied')) },
@@ -3363,8 +4070,8 @@ export function FilePanel({
         ]
       : file
       ? [
-          { label: tx('goToSymbol'), icon: 'search', hint: `${navigator.platform.includes('Mac') ? '⌘' : 'Ctrl+'}Shift+O`, run: () => setQuick('@') },
-          { label: tx('goToLine'), hint: `${navigator.platform.includes('Mac') ? '⌘' : 'Ctrl+'}G`, run: () => setQuick(':') },
+          { label: tx('goToSymbol'), icon: 'search', hint: `${navigator.platform.includes('Mac') ? '⌘' : 'Ctrl+'}Shift+O`, run: () => openQuick('@') },
+          { label: tx('goToLine'), hint: `${navigator.platform.includes('Mac') ? '⌘' : 'Ctrl+'}G`, run: () => openQuick(':') },
           '-',
           { label: tx('download'), icon: 'download', disabled: !!file.deleted, run: () => download(file.path) },
           ...nativeItems(file.path),
@@ -3394,6 +4101,7 @@ export function FilePanel({
 
   // ---------- Shortcuts: Ctrl+P quick open, Ctrl+Shift+O symbols, Ctrl+G go to line, Ctrl+Alt+N new untitled file, nav history ----------
   useEffect(() => {
+    if (!visible) return;
     const onKey = (e: KeyboardEvent) => {
       if (e.isComposing || e.keyCode === 229 || getState().palette) return;
       if (!IS_MAC && e.altKey && !e.ctrlKey && !e.metaKey && !e.shiftKey && (e.key === 'ArrowLeft' || e.key === 'ArrowRight')) {
@@ -3420,11 +4128,11 @@ export function FilePanel({
       const m: QuickMode | null = k === 'p' && !e.shiftKey ? '' : k === 'o' && e.shiftKey ? '@' : k === 'g' && !e.shiftKey ? ':' : null;
       if (m === null || (m !== '' && !fileRef.current)) return;
       e.preventDefault();
-      setQuick(m);
+      openQuick(m);
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, []);
+  }, [visible, openQuick]);
 
   const conflictMenu = (e: React.MouseEvent<HTMLElement>) => {
     const r = e.currentTarget.getBoundingClientRect();
@@ -3563,7 +4271,10 @@ export function FilePanel({
       answers,
     }).catch(errorToast);
   };
-  const activeDispositions = activeReviewId ? getAllDispositions(hostId, activeReviewId) : {};
+  const activeDispositions = useMemo(
+    () => (activeReviewId ? getAllDispositions(hostId, activeReviewId) : {}),
+    [hostId, activeReviewId, reviewVer], // eslint-disable-line react-hooks/exhaustive-deps
+  );
   const fileIssueBadges = useMemo(
     () =>
       activeReviewId
@@ -3647,8 +4358,8 @@ export function FilePanel({
   }, [diffScope, activeTurnCkpt, turnDiff]);
   const showTree = treeOpen || !file;
   // On mobile, after opening a file from the tree, back returns to the tree first; pressing again closes the whole file panel
-  useBack(!!file && !treeOpen && window.matchMedia('(max-width: 760px)').matches, () => setTreeOpen(true));
-  useBack(quick !== null, () => setQuick(null));
+  useBack(visible && !!file && !treeOpen && window.matchMedia('(max-width: 760px)').matches, () => setTreeOpen(true));
+  useBack(visible && quick !== null, () => setQuick(null));
   const fileDiff = file ? diffOf(file.path) : null;
   const fileSessionDiffs = file ? sessionDiffsOf(file.path) : [];
   const diffPending = !!curGit && !curGit.diff && !(curDiffCacheKey in fileDiffs);
@@ -3659,6 +4370,7 @@ export function FilePanel({
   const relOpen = (r: string) => (root ? join(root, r.split('/').join(sepOf(root))) : r);
   const layout: 'split' | 'unified' = diffLayout === 'split' && wide() ? 'split' : 'unified';
   const flipLayout = () => {
+    flushActiveEditor();
     const v = diffLayout === 'split' ? 'unified' : 'split';
     lsSet('wp-diff-mode', v);
     setDiffLayout(v);
@@ -3668,6 +4380,8 @@ export function FilePanel({
   // ---------- Full-file diff (VS Code style): both whole files, falling back to the hunk-only diff ----------
   /** Revisions to fetch for the current view: working tree vs HEAD/merge-base, turn checkpoint pair, or commit vs parent */
   const isTurnSnapshot = diffScope === 'turn' && !!activeTurnCkpt?.endRef;
+  mergeEditableRef.current =
+    !!file && viewing === 'diff' && !file.commit && !isTurnSnapshot && !file.deleted && !file.truncated && !file.notUtf8 && !file.binary;
   const diffBaseRev = isTurnSnapshot
     ? activeTurnCkpt!.baseRef
     : diffScope === 'branch' && branchDiff?.mergeBase
@@ -3685,15 +4399,26 @@ export function FilePanel({
           : [];
   const blobWant = blobSpecs.map(([r, p]) => blobKey(r, p)).join('|');
   useEffect(() => {
+    const gen = gitCacheGenRef.current;
     for (const [r, p] of blobSpecs) {
       const k = blobKey(r, p);
-      if (k in blobs) continue;
-      rpc<GitBlob>(hostId, 'git.blob', { cwd, path: p, rev: r })
-        .then((b) => setBlobs((m) => ({ ...m, [k]: b })))
+      const inflightKey = `${gen}\n${hostId}\n${cwd}\n${k}`;
+      if (k in blobs || blobInFlightRef.current.has(inflightKey)) continue;
+      blobInFlightRef.current.add(inflightKey);
+      const revArg = r === 'HEAD' && git?.head ? git.head : r;
+      rpc<GitBlob>(hostId, 'git.blob', { cwd, path: p, rev: revArg })
+        .then((b) => {
+          if (gitCacheGenRef.current !== gen) return;
+          setBlobs((m) => ({ ...m, [k]: b }));
+        })
         // Older yi-agentd without git.blob, or a read error: use the hunk-only diff
-        .catch(() => setBlobs((m) => ({ ...m, [k]: null })));
+        .catch(() => {
+          if (gitCacheGenRef.current !== gen) return;
+          setBlobs((m) => ({ ...m, [k]: null }));
+        })
+        .finally(() => blobInFlightRef.current.delete(inflightKey));
     }
-  }, [blobWant, blobs]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [hostId, cwd, blobWant, blobs, git?.head]); // eslint-disable-line react-hooks/exhaustive-deps
   const blobText = (b: GitBlob | null | undefined): string | null | undefined =>
     b === undefined ? undefined : !b || b.binary || b.tooLarge ? null : b.exists ? (b.text ?? '') : '';
   /** {a, b} for MergeDiff; undefined while loading; null to fall back to PaneDiff */
@@ -3712,6 +4437,7 @@ export function FilePanel({
     return file.commit || isTurnSnapshot ? { a: texts[0]!, b: texts[1]! } : { a: texts[0]!, b: file.deleted ? '' : file.draft };
   })();
   const flipCollapse = () => {
+    flushActiveEditor();
     lsSet('wp-diff-fold', !diffCollapse);
     setDiffCollapse(!diffCollapse);
   };
@@ -3827,7 +4553,7 @@ export function FilePanel({
         )}
         <MergeDiff
           ref={mergeRef}
-          docKey={file ? `${file.path}#${compare?.path ?? ''}#${diffBaseRev}#${diffEndRev}` : name}
+          docKey={file ? `${file.path}#${file.rev}#${compare?.path ?? ''}#${diffBaseRev}#${diffEndRev}` : name}
           a={f.a}
           b={f.b}
           filename={name}
@@ -3837,11 +4563,13 @@ export function FilePanel({
           readOnly={!editable}
           goto={goto}
           onChange={
-            editable
-              ? (draft) => {
-                  if (file?.untitled) untitled.set(file.path, draft);
-                  setFile((cur) => cur && { ...cur, draft });
-                }
+            editable && file
+              ? (() => {
+                  const targetPath = file.path;
+                  const targetRev = file.rev;
+                  const isUnt = !!file.untitled;
+                  return (draft) => updateFileDraft(targetPath, targetRev, isUnt, draft);
+                })()
               : undefined
           }
           onSave={editable ? () => save() : undefined}
@@ -3986,7 +4714,7 @@ export function FilePanel({
         <div className="grow" />
         {view !== 'changes' && (
           <>
-            <button className="icon-btn" title={tx('quickOpenP', { v: navigator.platform.includes('Mac') ? '⌘' : 'Ctrl+' })} onClick={() => setQuick('')}>
+            <button className="icon-btn" title={tx('quickOpenP', { v: navigator.platform.includes('Mac') ? '⌘' : 'Ctrl+' })} onClick={() => openQuick('')}>
               <Icon name="zoom" size={14} />
             </button>
             <button className="icon-btn" title={tx('new')} disabled={!root} onClick={newMenu}>
@@ -3995,14 +4723,14 @@ export function FilePanel({
           </>
         )}
         <button className="icon-btn" title={tx('refresh')} onClick={refreshTree}>
-          <Icon name="refresh" size={14} />
+          {treeLoading || (view === 'changes' && gitLoading) ? <span className="spinner mini" /> : <Icon name="refresh" size={14} />}
         </button>
       </div>
       {git && (() => {
         const curWt = worktrees.find((w) => w.isCurrent || norm(w.path) === norm(cwd));
         const curBr = branchesInfo?.branches.find((b) => b.current || (!!git.branch && b.name === git.branch));
-        const aheadCount = curBr?.ahead ?? curWt?.ahead ?? 0;
-        const behindCount = curBr?.behind ?? curWt?.behind ?? 0;
+        const aheadCount = git.hasTrack ? (git.ahead ?? 0) : (curBr?.ahead ?? curWt?.ahead ?? 0);
+        const behindCount = git.hasTrack ? (git.behind ?? 0) : (curBr?.behind ?? curWt?.behind ?? 0);
         const inLinkedWt = isOtherWorktree || (!!curWt && !curWt.isMain);
         const pullOnly = behindCount > 0 && aheadCount === 0;
         return (
@@ -4072,24 +4800,58 @@ export function FilePanel({
         <GrepPanel
           hostId={hostId}
           root={root}
+          visible={visible && view === 'search'}
           onOpen={(r, line, col, len) => openFile(relOpen(r), false, { line, col, len })}
           openFiles={tabs.filter((t) => !isWebTab(t) && !isReviewTab(t) && !isSideTab(t) && !parseCommitTab(t) && rel(t) !== t).map(rel)}
           dirty={file && dirty && !file.web && !file.commit && !file.review && !file.side && rel(file.path) !== file.path ? { rel: rel(file.path), draft: file.draft } : null}
+          getLiveDirty={() => {
+            const cur = fileRef.current;
+            if (!cur || cur.web || cur.commit || cur.review || cur.side || cur.untitled) return null;
+            const r = rel(cur.path);
+            if (r === cur.path) return null;
+            const liveDraft = getActiveEditorText(cur);
+            return liveDraft !== cur.content ? { path: cur.path, rel: r, rev: cur.rev, draft: liveDraft } : null;
+          }}
           includeRequest={grepInclude}
           queryRequest={grepQuery}
           onPreview={async (r, line, col, len, after) => {
             const abs = relOpen(r);
             await openFile(abs, false, { line, col, len });
-            if (norm(fileRef.current?.path ?? '') === norm(abs)) setCompare({ path: abs, text: after, replace: true });
+            if (norm(fileRef.current?.path ?? '') === norm(abs)) {
+              flushActiveEditor();
+              setCompare({ path: abs, text: after, replace: true });
+            }
           }}
-          onDraft={(next, expect) =>
-            setFile((cur) => (cur && !cur.web && !cur.commit && (expect == null || cur.draft === expect) ? { ...cur, draft: next, rev: Date.now() } : cur))
-          }
+          onDraft={(next, expect) => {
+            const curNow = fileRef.current;
+            if (!curNow || curNow.web || curNow.commit || curNow.review || curNow.side) return null;
+            if (curNow.path !== expect.path || curNow.rev !== expect.rev) return null;
+            const liveDraft = getActiveEditorText(curNow);
+            if (liveDraft !== expect.draft) return null;
+            if (hasUnsyncedEdits()) flushActiveEditor();
+            const nextRev = nextFileRev();
+            fileRef.current = { ...curNow, draft: next, rev: nextRev };
+            setFile((cur) =>
+              cur && cur.path === expect.path && cur.rev === expect.rev ? { ...cur, draft: next, rev: nextRev } : cur,
+            );
+            return nextRev;
+          }}
           onReplaced={(paths) => {
+            for (const p of paths) dropCachedFile(p);
             refreshTree();
             const f = fileRef.current;
-            if (!f || f.draft !== f.content || !paths.some((p) => norm(p) === norm(f.path))) return;
-            readFile(f.path, true).then((n) => n && setFile((cur) => (cur && cur.path === f.path && cur.draft === cur.content ? n : cur)));
+            if (!f || f.draft !== f.content || hasUnsyncedEdits() || !paths.some((p) => norm(p) === norm(f.path))) return;
+            readFile(f.path, true, true).then((n) => {
+              if (!n) return;
+              const live = fileRef.current;
+              if (!live || live.path !== f.path || live.rev !== f.rev || live.draft !== live.content || hasUnsyncedEdits()) {
+                return;
+              }
+              fileRef.current = n;
+              setFile((cur) =>
+                cur && cur.path === f.path && cur.rev === f.rev && cur.draft === cur.content && !hasUnsyncedEdits() ? n : cur,
+              );
+            });
           }}
         />
       ) : (
@@ -4102,7 +4864,10 @@ export function FilePanel({
                   role="tab"
                   aria-selected={diffScope === 'uncommitted'}
                   className={`wp-scope-tab ${diffScope === 'uncommitted' ? 'active' : ''}`}
-                  onClick={() => setDiffScope('uncommitted')}
+                  onClick={() => {
+                    flushActiveEditor();
+                    setDiffScope('uncommitted');
+                  }}
                 >
                   <span>{tx('diffScopeUncommitted')}</span>
                   {uncommittedKeys.length > 0 && <span className="wp-scope-cnt">{uncommittedKeys.length}</span>}
@@ -4115,7 +4880,10 @@ export function FilePanel({
                   title={diffScope === 'branch' ? tx('changeBaseBranch') : effBranchBase ? tx('diffScopeBranchVs', { base: effBranchBase }) : tx('diffScopeBranch')}
                   onClick={(e) => {
                     if (diffScope === 'branch') void openBaseBranchMenu(e);
-                    else setDiffScope('branch');
+                    else {
+                      flushActiveEditor();
+                      setDiffScope('branch');
+                    }
                   }}
                 >
                   <span className="truncate">
@@ -4132,7 +4900,10 @@ export function FilePanel({
                     title={diffScope === 'turn' ? tx('changeTurnCheckpoint') : tx('diffScopeTurnN', { n: activeTurnCkpt.turn })}
                     onClick={(e) => {
                       if (diffScope === 'turn' && turnCheckpoints.length > 1) openTurnMenu(e);
-                      else setDiffScope('turn');
+                      else {
+                        flushActiveEditor();
+                        setDiffScope('turn');
+                      }
                     }}
                   >
                     <span>{tx('diffScopeTurnN', { n: activeTurnCkpt.turn })}</span>
@@ -4235,7 +5006,10 @@ export function FilePanel({
               (!gitReady ||
                 (diffScope === 'branch' && branchDiffLoading && !branchDiff) ||
                 (diffScope === 'turn' && turnDiffLoading && !turnDiff)) ? (
-              <div className="wp-tip">{tx('readingChanges')}</div>
+              <div className="wp-tip wp-tip-loading">
+                <span className="spinner mini" />
+                <span>{tx('readingChanges')}</span>
+              </div>
             ) : view === 'changes' && (git || touched.size > 0) ? (
               <>
                 {!git && <div className="wp-limit">{tx('notAGitRepoFiles')}</div>}
@@ -4352,6 +5126,7 @@ export function FilePanel({
                   rows={rows}
                   scroller={treeBox}
                   git={git}
+                  loadingDirs={loadingDirs}
                   selected={file?.path}
                   focused={focusKey}
                   onToggle={(r) => toggle(r.path)}
@@ -4365,7 +5140,10 @@ export function FilePanel({
                 <div className="wp-tip">{tx('thisFolderIsEmpty')}</div>
               )
             ) : (
-              <div className="wp-tip">{tx('loading2')}</div>
+              <div className="wp-tip wp-tip-loading">
+                <span className="spinner mini" />
+                <span>{tx('loading2')}</span>
+              </div>
             )}
           </div>
           {/* Independent of git status: shows right away and loads on its own; hidden only once status says this isn't a repo */}
@@ -4383,8 +5161,8 @@ export function FilePanel({
           {view === 'changes' && git && (() => {
             const curWt = worktrees.find((w) => w.isCurrent || norm(w.path) === norm(cwd));
             const curBr = branchesInfo?.branches.find((b) => b.current || (!!git.branch && b.name === git.branch));
-            const aheadCount = curBr?.ahead ?? curWt?.ahead ?? 0;
-            const behindCount = curBr?.behind ?? curWt?.behind ?? 0;
+            const aheadCount = git.hasTrack ? (git.ahead ?? 0) : (curBr?.ahead ?? curWt?.ahead ?? 0);
+            const behindCount = git.hasTrack ? (git.behind ?? 0) : (curBr?.behind ?? curWt?.behind ?? 0);
             const canMergeMain = !!effDefaultBranch && !!git.branch && git.branch !== effDefaultBranch && git.branch !== 'HEAD';
             const busyDock = pushing || fetching || gitBusy;
 
@@ -4545,34 +5323,37 @@ export function FilePanel({
     </div>
   );
 
-  const editor = file && (
-    <CodeEditor
-      docKey={`${file.path}#${file.rev}`}
-      value={file.draft}
-      filename={baseName(file.path)}
-      readOnly={file.truncated || !!file.notUtf8}
-      wrap={wrap || (md && mdSplit && wide())}
-      goto={goto}
-      onChange={(draft) => {
-        if (file.untitled) untitled.set(file.path, draft);
-        setFile((cur) => cur && { ...cur, draft });
-      }}
-      onSave={() => save()}
-      menu={editorMenu(file.path)}
-      onToggleWrap={toggleWrap}
-      onNav={file.untitled ? undefined : (t) => void handleCodeNav(t, file.path, file.path, 'main')}
-      onCursorPos={(line, col) => {
-        curPosRef.current = { path: file.path, line, col, side: undefined };
-      }}
-      onAddSelection={
-        standalone
-          ? undefined
-          : (sel) => pushContextRef(file.path, { kind: 'code', fromLine: sel.fromLine, toLine: sel.toLine, content: sel.content })
-      }
-      scrollLine={md && mdSplit ? editorAt : null}
-      onTopLine={md && mdSplit ? (line, frac) => syncFrom.current === 'editor' && setPreviewAt({ line, frac, n: Date.now() }) : undefined}
-    />
-  );
+  const editor = file && (() => {
+    const targetPath = file.path;
+    const targetRev = file.rev;
+    const isUnt = !!file.untitled;
+    return (
+      <CodeEditor
+        ref={codeRef}
+        docKey={`${file.path}#${file.rev}`}
+        value={file.draft}
+        filename={baseName(file.path)}
+        readOnly={file.truncated || !!file.notUtf8}
+        wrap={wrap || (md && mdSplit && wide())}
+        goto={goto}
+        onChange={(draft) => updateFileDraft(targetPath, targetRev, isUnt, draft)}
+        onSave={() => save()}
+        menu={editorMenu(file.path)}
+        onToggleWrap={toggleWrap}
+        onNav={file.untitled ? undefined : (t) => void handleCodeNav(t, file.path, file.path, 'main')}
+        onCursorPos={(line, col) => {
+          curPosRef.current = { path: file.path, line, col, side: undefined };
+        }}
+        onAddSelection={
+          standalone
+            ? undefined
+            : (sel) => pushContextRef(file.path, { kind: 'code', fromLine: sel.fromLine, toLine: sel.toLine, content: sel.content })
+        }
+        scrollLine={md && mdSplit ? editorAt : null}
+        onTopLine={md && mdSplit ? (line, frac) => syncFrom.current === 'editor' && setPreviewAt({ line, frac, n: Date.now() }) : undefined}
+      />
+    );
+  })();
 
   const paneDiffActions = (refPath: string, commitHash?: string) => ({
     onAddHunk: standalone ? undefined : (h: { fromLine: number; toLine: number; added?: number; deleted?: number; content: string }) => pushContextRef(refPath, { kind: 'diff', ...h }, commitHash),
@@ -4652,7 +5433,7 @@ export function FilePanel({
     <BrowserPane hostId={hostId} root={root ?? cwd} tab={`${WEB_PREFIX}file:${file.path}`} reload={file.modified} onNavigate={(t) => openFile(t)} />
   ) : viewing === 'compare' && full ? (
     mergeView(full, baseName(file.path), {
-      editable: !file.truncated && !file.notUtf8 && !file.binary,
+      editable: false,
       refPath: file.path,
       pathA: file.path,
       pathB: compare!.path,
@@ -4701,8 +5482,8 @@ export function FilePanel({
     )
   ) : file.image ? (
     <ImageView key={`${file.path}#${file.rev}`} src={file.image} name={baseName(file.path)} size={fmtSize(file.size)} />
-  ) : file.pdf ? (
-    <PdfView base64={file.pdf} onDownload={() => download(file.path)} />
+  ) : file.pdf || file.pdfSrc ? (
+    <PdfView key={`${file.path}#${file.rev}`} src={file.pdfSrc} base64={file.pdf} onDownload={() => download(file.path)} />
   ) : file.binary ? (
     <div className="wp-empty">
       <div className="wp-empty-title">{tx('cannotPreviewThisFile')}</div>
@@ -4757,7 +5538,14 @@ export function FilePanel({
         </span>
         <span className="muted small">{tx('readOnly')}</span>
         <div className="grow" />
-        <button className="icon-btn" title={tx('compareWith', { v: baseName(file.path) })} onClick={() => setCompare({ path: second.path, text: second.content })}>
+        <button
+          className="icon-btn"
+          title={tx('compareWith', { v: baseName(file.path) })}
+          onClick={() => {
+            flushActiveEditor();
+            setCompare({ path: second.path, text: second.content });
+          }}
+        >
           <Icon name="compare" size={13} />
         </button>
         <button className="icon-btn" title={tx('editOnTheLeft')} onClick={() => (setSecond(null), openFile(second.path))}>
@@ -4823,7 +5611,7 @@ export function FilePanel({
 
   return (
     <aside
-      className={`file-panel ${fullscreen ? 'full' : ''} ${file || emptyPane ? '' : 'browse'} ${standalone ? 'standalone' : ''}`}
+      className={`file-panel ${fullscreen ? 'full' : ''} ${file || emptyPane ? '' : 'browse'} ${standalone ? 'standalone' : ''} ${visible ? '' : 'wp-hidden'}`}
       style={{ '--tree-w': `${treeW}px` } as React.CSSProperties}
       onMouseDown={(e) => {
         if (e.button === 3 || e.button === 4) e.preventDefault();
@@ -5182,7 +5970,7 @@ export function FilePanel({
             file.untitled ? (
               <span className="wp-untitled-title truncate">{nameOf(file.path)}</span>
             ) : (
-              <Breadcrumbs hostId={hostId} root={root ?? cwd} path={file.path} hidden={hidden} git={git} onOpen={openFile} dirty={dirty} />
+              <Breadcrumbs hostId={hostId} root={root ?? cwd} path={file.path} hidden={hidden} git={git} onOpen={openFile} dirty={dirty} visible={visible} />
             )
           )}
           <div className="wp-actions">
@@ -5214,10 +6002,10 @@ export function FilePanel({
             )}
             {hasChange(file.path) && !file.deleted && !compare && (
               <div className="seg wp-seg">
-                <button className={!showDiff ? 'active' : ''} onClick={() => setShowDiff(false)}>
+                <button className={!showDiff ? 'active' : ''} onClick={() => { flushActiveEditor(); setShowDiff(false); }}>
                   {tx('file')}
                 </button>
-                <button className={showDiff ? 'active' : ''} onClick={() => setShowDiff(true)} title={tx('changesSinceTheLastCommit')}>
+                <button className={showDiff ? 'active' : ''} onClick={() => { flushActiveEditor(); setShowDiff(true); }} title={tx('changesSinceTheLastCommit')}>
                   {tx('changes')}
                 </button>
               </div>
@@ -5230,12 +6018,12 @@ export function FilePanel({
             )}
             {(csv || html) && viewing === 'file' && (
               <div className="seg wp-seg">
-                <button className={!preview ? 'active' : ''} onClick={() => setPreview(false)}>
+                <button className={!preview ? 'active' : ''} onClick={() => { flushActiveEditor(); setPreview(false); }}>
                   {tx('source')}
                 </button>
                 <button
                   className={preview ? 'active' : ''}
-                  onClick={() => setPreview(true)}
+                  onClick={() => { flushActiveEditor(); setPreview(true); }}
                   title={html ? tx('showsTheSavedFileRefreshes') : undefined}
                 >
                   {csv ? tx('table') : tx('preview')}
@@ -5258,7 +6046,7 @@ export function FilePanel({
               </div>
             )}
             {viewing === 'file' && !file.binary && (!preview || md) && (
-              <button className="icon-btn" title={tx('outlineGoToAFunction', { v: navigator.platform.includes('Mac') ? '⌘' : 'Ctrl+' })} onClick={() => setQuick('@')}>
+              <button className="icon-btn" title={tx('outlineGoToAFunction', { v: navigator.platform.includes('Mac') ? '⌘' : 'Ctrl+' })} onClick={() => openQuick('@')}>
                 <Icon name="outline" size={14} />
               </button>
             )}
@@ -5281,6 +6069,12 @@ export function FilePanel({
               mainView
             )}
             <CodeNavNotice message={navNotice} />
+            {openingPath && (
+              <div className="wp-loading-overlay" role="status">
+                <span className="spinner" />
+                <span>{tx('openingFile', { name: baseName(openingPath) })}</span>
+              </div>
+            )}
           </div>
         )}
         {emptyPane && (
@@ -5294,6 +6088,12 @@ export function FilePanel({
             <div className="muted small">
               {tx('pToOpenAFile', { v: navigator.platform.includes('Mac') ? '⌘' : 'Ctrl+' })}
             </div>
+            {openingPath && (
+              <div className="wp-loading-overlay" role="status">
+                <span className="spinner" />
+                <span>{tx('openingFile', { name: baseName(openingPath) })}</span>
+              </div>
+            )}
           </div>
         )}
         {showTree && (
@@ -5322,6 +6122,7 @@ export function FilePanel({
           current={file && !file.binary ? { name: baseName(file.path), text: file.draft, lines: file.draft.split('\n').length } : null}
           onOpen={(r) => openFile(relOpen(r))}
           onGoto={(line) => {
+            flushActiveEditor();
             setShowDiff(false);
             setCompare(null);
             // Jumping via the outline in the Markdown preview: only scroll the preview, don't switch back to source
@@ -5463,6 +6264,7 @@ function Breadcrumbs({
   hidden,
   git,
   dirty,
+  visible = true,
   onOpen,
 }: {
   hostId: string;
@@ -5471,11 +6273,15 @@ function Breadcrumbs({
   hidden: boolean;
   git: GitInfo | null;
   dirty: boolean;
+  visible?: boolean;
   onOpen: (p: string) => void;
 }) {
   const box = useRef<HTMLDivElement>(null);
   const [pop, setPop] = useState<{ dir: string; x: number; y: number } | null>(null);
-  useBack(!!pop, () => setPop(null));
+  useBack(visible && !!pop, () => setPop(null));
+  useEffect(() => {
+    if (!visible) setPop(null);
+  }, [visible]);
   const nr = norm(root);
   const np = norm(path);
   const inRoot = np === nr || np.startsWith(nr + '/');
@@ -5590,12 +6396,16 @@ function DirPopover({
   return (
     <div className="wp-pop" ref={box} style={{ left: x, top: y }} role="tree" aria-label={tx('folderContents')}>
       {!kids[dir] ? (
-        <div className="wp-tip">{tx('loadingFiles')}</div>
+        <div className="wp-tip wp-tip-loading">
+          <span className="spinner mini" />
+          <span>{tx('loadingFiles')}</span>
+        </div>
       ) : rows.length === 0 ? (
         <div className="wp-tip">{tx('thisFolderIsEmpty')}</div>
       ) : (
         <Rows
           rows={rows}
+          scroller={box}
           git={git}
           selected={selected}
           onToggle={(r) => {

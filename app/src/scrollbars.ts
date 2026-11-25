@@ -49,13 +49,35 @@ function setHovered(next: Set<Element>) {
   hovered = next;
 }
 
+let pendingHoverTarget: EventTarget | null = null;
+let lastHoverTarget: EventTarget | null = null;
+let hoverRaf = 0;
+
 // Mouse only: touch screens keep the system's overlay scrollbars (the styles are scoped to fine pointers too)
 document.addEventListener(
   'pointerover',
   (e) => {
-    if (e.pointerType === 'mouse') setHovered(scrollablesFrom(e.target));
+    if (e.pointerType !== 'mouse' || e.target === lastHoverTarget) return;
+    pendingHoverTarget = e.target;
+    if (hoverRaf) return;
+    hoverRaf = requestAnimationFrame(() => {
+      hoverRaf = 0;
+      const target = pendingHoverTarget;
+      pendingHoverTarget = null;
+      if (target === lastHoverTarget) return;
+      lastHoverTarget = target;
+      setHovered(scrollablesFrom(target));
+    });
   },
   { capture: true, passive: true },
 );
 // Pointer left the window
-document.documentElement.addEventListener('pointerleave', () => setHovered(new Set()));
+document.documentElement.addEventListener('pointerleave', () => {
+  if (hoverRaf) {
+    cancelAnimationFrame(hoverRaf);
+    hoverRaf = 0;
+  }
+  pendingHoverTarget = null;
+  lastHoverTarget = null;
+  setHovered(new Set());
+});

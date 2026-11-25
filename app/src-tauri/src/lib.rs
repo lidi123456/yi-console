@@ -79,19 +79,28 @@ async fn save_file(app: tauri::AppHandle, name: String, data: String) -> Result<
     {
         use base64::Engine;
         use tauri_plugin_dialog::DialogExt;
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(data)
-            .map_err(|e| format!("数据有误: {e}"))?;
-        let mut dlg = app.dialog().file().set_file_name(&name);
-        if let Some(ext) = std::path::Path::new(&name).extension().and_then(|e| e.to_str()) {
-            dlg = dlg.add_filter(ext.to_uppercase(), &[ext]);
-        }
-        let Some(path) = dlg.blocking_save_file() else {
-            return Ok(false);
-        };
-        let path = path.into_path().map_err(|e| format!("{e}"))?;
-        std::fs::write(&path, bytes).map_err(|e| format!("保存失败: {e}"))?;
-        Ok(true)
+        let bytes = tauri::async_runtime::spawn_blocking(move || {
+            base64::engine::general_purpose::STANDARD
+                .decode(data)
+                .map_err(|e| format!("数据有误: {e}"))
+        })
+        .await
+        .map_err(|e| format!("保存失败: {e}"))??;
+        let saved = tauri::async_runtime::spawn_blocking(move || -> Result<bool, String> {
+            let mut dlg = app.dialog().file().set_file_name(&name);
+            if let Some(ext) = std::path::Path::new(&name).extension().and_then(|e| e.to_str()) {
+                dlg = dlg.add_filter(ext.to_uppercase(), &[ext]);
+            }
+            let Some(path) = dlg.blocking_save_file() else {
+                return Ok(false);
+            };
+            let path = path.into_path().map_err(|e| format!("{e}"))?;
+            std::fs::write(&path, bytes).map_err(|e| format!("保存失败: {e}"))?;
+            Ok(true)
+        })
+        .await
+        .map_err(|e| format!("保存失败: {e}"))??;
+        Ok(saved)
     }
     #[cfg(mobile)]
     {

@@ -165,6 +165,8 @@ export interface SessionData {
   hasMore: boolean;
   loadingOlder: boolean;
   version: number;
+  /** Incremented only when diff-bearing events (tool_call diffs, cleared, force reload) change */
+  diffVersion: number;
   /** Consumer of terminal output (attached by TerminalView); reset=true means clear the screen before writing the snapshot */
   term?: (data: Uint8Array, reset: boolean) => void;
   termBacklog: Uint8Array[];
@@ -193,6 +195,7 @@ export function getSession(key: string): SessionData {
       hasMore: false,
       loadingOlder: false,
       version: 0,
+      diffVersion: 0,
       termBacklog: [],
     };
     sessionData.set(key, d);
@@ -230,9 +233,27 @@ export function useSessionData(key: string): SessionData {
   return getSession(key);
 }
 
+const EMPTY_EVENTS: HubEvent[] = [];
+
+/** Subscribe only to session diff-bearing events / clears (avoids streaming text delta re-renders) */
+export function useSessionDiffEvents(key: string, enabled: boolean): HubEvent[] {
+  useSyncExternalStore(
+    (cb) => {
+      if (!enabled || !key) return () => {};
+      let s = sessionSubs.get(key);
+      if (!s) sessionSubs.set(key, (s = new Set()));
+      s.add(cb);
+      return () => s!.delete(cb);
+    },
+    () => (enabled && key ? getSession(key).diffVersion : -1),
+  );
+  return enabled && key ? getSession(key).events : EMPTY_EVENTS;
+}
+
 function addEvents(key: string, evs: HubEvent[]) {
   const d = getSession(key);
   let changed = false;
+  let diffChanged = false;
   const addedUsers: UserMessageSummary[] = [];
   for (const e of evs) {
     if (e.kind === 'assistant_delta') {
@@ -271,6 +292,7 @@ function addEvents(key: string, evs: HubEvent[]) {
         origin: e.origin,
       });
     }
+    if (e.kind === 'tool_call' && e.diffs?.length) diffChanged = true;
     d.events.push(e);
     changed = true;
   }
@@ -281,6 +303,7 @@ function addEvents(key: string, evs: HubEvent[]) {
     let cut = -1;
     for (let i = d.events.length - 1; i >= 0; i--) if (d.events[i].kind === 'cleared') { cut = i; break; }
     if (cut >= 0) {
+      diffChanged = true;
       const clearedAt = d.events[cut].seq;
       d.clearSeq = Math.max(d.clearSeq, clearedAt);
       for (const e of d.events.slice(0, cut + 1)) d.seqs.delete(e.seq);
@@ -296,6 +319,7 @@ function addEvents(key: string, evs: HubEvent[]) {
     if (addedUsers.length > 0) {
       d.userMessages = mergeUserMessages(d.userMessages, addedUsers, d.clearSeq);
     }
+    if (diffChanged) d.diffVersion++;
     bump(key);
   }
 }
@@ -412,6 +436,7 @@ export async function loadSession(hostId: string, sid: string, force = false) {
       d.clearSeq = 0;
       d.live.clear();
       d.liveThinking.clear();
+      d.diffVersion++;
     }
     addEvents(key, r.events);
     if (r.terminal !== undefined) writeTerm(key, b64(r.terminal), true);

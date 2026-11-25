@@ -121,6 +121,13 @@ export function SessionView({ hostId, sessionId, seq }: { hostId: string; sessio
   // Whether the file panel is open: remembered per session (like the bottom terminal), so opening it in one session doesn't open it in others
   const filesKey = `file-panel-${key}`;
   const [files, setFiles] = useState(() => lsGet(filesKey, false));
+  // Option 1A keep-alive: mount FilePanel on first open in this session and keep it mounted via CSS hidden until session unmount
+  const [filesMounted, setFilesMounted] = useState(() => lsGet(filesKey, false));
+  useEffect(() => {
+    const f = lsGet(filesKey, false);
+    setFiles(f);
+    setFilesMounted(f);
+  }, [filesKey]);
   // Active directory in the file panel (defaults to info.cwd; can switch to any detected git worktree of the same repo)
   const panelCwdKey = `file-panel-cwd-${key}`;
   const [panelCwd, setPanelCwd] = useState(() => lsGet(panelCwdKey, ''));
@@ -145,9 +152,10 @@ export function SessionView({ hostId, sessionId, seq }: { hostId: string; sessio
   };
   const activeFileCwd = panelCwd || info?.cwd || '';
   const toggleFiles = () => {
-    lsSet(filesKey, !files);
-    setFiles(!files);
-    setFileOpen(false);
+    const next = !files;
+    lsSet(filesKey, next);
+    setFiles(next);
+    if (next) setFilesMounted(true);
     setFull(false);
   };
   // "View changes" / a file link in a reply: open the file panel (which switches itself to "Changes" or opens the file)
@@ -157,6 +165,7 @@ export function SessionView({ hostId, sessionId, seq }: { hostId: string; sessio
       if (d.hostId !== hostId || d.sessionId !== sessionId) return;
       lsSet(filesKey, true);
       setFiles(true);
+      setFilesMounted(true);
       setFull(false);
     };
     window.addEventListener(OPEN_CHANGES, on);
@@ -199,8 +208,11 @@ export function SessionView({ hostId, sessionId, seq }: { hostId: string; sessio
       initialWidth: w0,
       min,
       max,
-      onMove: setPanelW,
-      onEnd: (w) => lsSet('file-panel-w', w),
+      onMove: (w) => split.current?.style.setProperty('--panel-w', `${w}px`),
+      onEnd: (w) => {
+        setPanelW(w);
+        lsSet('file-panel-w', w);
+      },
       cleanupRef: panelDragCleanupRef,
     });
   };
@@ -1036,9 +1048,10 @@ export function SessionView({ hostId, sessionId, seq }: { hostId: string; sessio
     </div>
       {!filesOnly && files && connected && full && <div className="panel-scrim hide-mobile" onClick={() => setFull(false)} title={t('exitFullscreen')} />}
       {!filesOnly && files && connected && !full && fileOpen && <div className="panel-resizer hide-mobile" onPointerDown={dragPanel} title={t('dragToResize')} />}
-      {!filesOnly && files && connected && (
+      {!filesOnly && filesMounted && connected && (
         <FilePanel
           key={`${hostId}/${sessionId}/${activeFileCwd}`}
+          visible={files}
           hostId={hostId}
           cwd={activeFileCwd}
           baseCwd={info.cwd}

@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Instant;
 
 const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
@@ -175,7 +175,11 @@ enum LangFamily {
 
 impl LangFamily {
     fn from_path(path: &str) -> Self {
-        let base = path.rsplit(['/', '\\']).next().unwrap_or(path);
+        let base = if cfg!(windows) {
+            path.rsplit(['/', '\\']).next().unwrap_or(path)
+        } else {
+            path.rsplit('/').next().unwrap_or(path)
+        };
         let ext = base.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase());
         match ext.as_deref() {
             Some("js" | "jsx" | "ts" | "tsx" | "mjs" | "cjs" | "mts" | "cts" | "vue" | "svelte") => Self::JsTs,
@@ -220,7 +224,7 @@ struct IndexedFile {
 
 #[derive(Default)]
 struct WorkspaceIndex {
-    files: HashMap<String, IndexedFile>,
+    files: HashMap<String, Arc<IndexedFile>>,
     by_name: HashMap<String, Vec<(String, usize)>>,
     last_used: u64,
 }
@@ -241,7 +245,35 @@ impl WorkspaceIndex {
 }
 
 static INDEX_CACHE: Mutex<Option<(u64, HashMap<String, WorkspaceIndex>)>> = Mutex::new(None);
+static WORKSPACE_UPDATE_LOCKS: OnceLock<Mutex<HashMap<String, Weak<Mutex<()>>>>> = OnceLock::new();
 static TSCONFIG_CACHE: Mutex<Option<HashMap<String, CachedTsConfig>>> = Mutex::new(None);
+
+fn workspace_cache_key(root_canon: &Path) -> String {
+    norm_slashes(&root_canon.display().to_string()).trim_end_matches('/').to_string()
+}
+
+fn workspace_update_lock(root_key: &str) -> Arc<Mutex<()>> {
+    let map_mutex = WORKSPACE_UPDATE_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut map = map_mutex.lock().unwrap_or_else(|e| e.into_inner());
+    map.retain(|_, w| w.strong_count() > 0);
+    if let Some(existing) = map.get(root_key).and_then(Weak::upgrade) {
+        return existing;
+    }
+    let lock = Arc::new(Mutex::new(()));
+    map.insert(root_key.to_string(), Arc::downgrade(&lock));
+    lock
+}
+
+fn path_strictly_under(root: &Path, candidate: &Path) -> bool {
+    let mut root_comps = root.components();
+    let mut cand_comps = candidate.components();
+    for rc in root_comps.by_ref() {
+        if cand_comps.next() != Some(rc) {
+            return false;
+        }
+    }
+    cand_comps.next().is_some()
+}
 
 #[derive(Clone)]
 struct CachedTsConfig {
@@ -266,7 +298,11 @@ fn expand_root(raw: &str) -> Result<PathBuf> {
 }
 
 fn norm_slashes(p: &str) -> String {
-    p.replace('\\', "/")
+    if cfg!(windows) {
+        p.replace('\\', "/")
+    } else {
+        p.to_string()
+    }
 }
 
 fn norm_cmp(p: &str) -> String {
@@ -279,11 +315,17 @@ fn norm_cmp(p: &str) -> String {
 }
 
 fn is_safe_rel(rel: &str) -> bool {
-    !rel.is_empty()
-        && !rel.starts_with('/')
-        && !rel.starts_with('\\')
-        && !rel.contains(':')
-        && rel.split(['/', '\\']).all(|seg| !seg.is_empty() && seg != "." && seg != "..")
+    if rel.is_empty() || rel.contains('\0') {
+        return false;
+    }
+    if cfg!(windows) {
+        !rel.starts_with('/')
+            && !rel.starts_with('\\')
+            && !rel.contains(':')
+            && rel.split(['/', '\\']).all(|seg| !seg.is_empty() && seg != "." && seg != "..")
+    } else {
+        !rel.starts_with('/') && rel.split('/').all(|seg| !seg.is_empty() && seg != "." && seg != "..")
+    }
 }
 
 fn canonical_contained_path(root_canon: &Path, candidate: &Path) -> Option<(PathBuf, String)> {
@@ -330,7 +372,12 @@ fn normalize_rel_path(root_canon: &Path, raw_root: Option<&Path>, path: &str) ->
 
 fn join_abs(root: &Path, rel: &str) -> String {
     let mut pb = root.to_path_buf();
+    #[cfg(windows)]
     for seg in rel.split(['/', '\\']).filter(|s| !s.is_empty() && *s != ".") {
+        pb.push(seg);
+    }
+    #[cfg(not(windows))]
+    for seg in rel.split('/').filter(|s| !s.is_empty() && *s != ".") {
         pb.push(seg);
     }
     crate::fsapi::strip_verbatim(&pb.display().to_string())
@@ -415,21 +462,221 @@ fn line_spans(text: &str) -> Vec<&str> {
     lines
 }
 
-fn read_text_file_raw(canon_path: &Path) -> Option<String> {
-    let meta = std::fs::metadata(canon_path).ok()?;
-    if !meta.is_file() || meta.len() > MAX_FILE_BYTES {
+fn read_text_from_file(mut file: std::fs::File) -> Option<String> {
+    use std::io::Read;
+    let mut buf = Vec::new();
+    file.by_ref().take(MAX_FILE_BYTES + 1).read_to_end(&mut buf).ok()?;
+    if buf.len() as u64 > MAX_FILE_BYTES {
         return None;
     }
-    let buf = std::fs::read(canon_path).ok()?;
     if buf.iter().take(8000).any(|&b| b == 0) {
         return None;
     }
     Some(String::from_utf8_lossy(&buf).into_owned())
 }
 
+#[cfg(unix)]
+fn unix_dir_open_flags() -> libc::c_int {
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
+    {
+        libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC
+    }
+    #[cfg(all(
+        not(any(target_os = "linux", target_os = "android", target_os = "freebsd")),
+        any(target_vendor = "apple", target_os = "netbsd", target_os = "solaris", target_os = "illumos")
+    ))]
+    {
+        libc::O_SEARCH | libc::O_DIRECTORY | libc::O_CLOEXEC
+    }
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_vendor = "apple",
+        target_os = "netbsd",
+        target_os = "solaris",
+        target_os = "illumos"
+    )))]
+    {
+        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC
+    }
+}
+
+#[cfg(unix)]
+struct DirHandle(std::os::unix::io::OwnedFd);
+
+#[cfg(unix)]
+impl DirHandle {
+    fn open_root(root_canon: &Path) -> Option<Self> {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
+        use std::path::Component;
+
+        if !root_canon.is_absolute() {
+            return None;
+        }
+        let dir_flags = unix_dir_open_flags();
+        let slash = std::ffi::CString::new("/").ok()?;
+        let root_fd = unsafe { libc::open(slash.as_ptr(), dir_flags) };
+        if root_fd < 0 {
+            return None;
+        }
+        let mut cur = unsafe { OwnedFd::from_raw_fd(root_fd) };
+        for comp in root_canon.components() {
+            match comp {
+                Component::RootDir => continue,
+                Component::Normal(seg) => {
+                    let cstr = std::ffi::CString::new(seg.as_bytes()).ok()?;
+                    let fd = unsafe {
+                        libc::openat(cur.as_raw_fd(), cstr.as_ptr(), dir_flags | libc::O_NOFOLLOW)
+                    };
+                    if fd < 0 {
+                        return None;
+                    }
+                    cur = unsafe { OwnedFd::from_raw_fd(fd) };
+                }
+                Component::CurDir | Component::ParentDir | Component::Prefix(_) => return None,
+            }
+        }
+        Some(Self(cur))
+    }
+
+    fn open_rel_nofollow(&self, rel: &str) -> std::result::Result<std::fs::File, Option<i32>> {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
+        use std::path::Component;
+
+        let mut comps: Vec<&std::ffi::OsStr> = Vec::new();
+        for comp in Path::new(rel).components() {
+            match comp {
+                Component::Normal(seg) => comps.push(seg),
+                Component::CurDir => continue,
+                Component::RootDir | Component::ParentDir | Component::Prefix(_) => return Err(None),
+            }
+        }
+        if comps.is_empty() {
+            return Err(None);
+        }
+        let dir_flags = unix_dir_open_flags() | libc::O_NOFOLLOW;
+        let mut dir_holder: Option<OwnedFd> = None;
+        for comp in &comps[..comps.len() - 1] {
+            let parent_fd = dir_holder.as_ref().map_or(self.0.as_raw_fd(), |f| f.as_raw_fd());
+            let cstr = std::ffi::CString::new(comp.as_bytes()).map_err(|_| None)?;
+            let fd = unsafe { libc::openat(parent_fd, cstr.as_ptr(), dir_flags) };
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error().raw_os_error());
+            }
+            dir_holder = Some(unsafe { OwnedFd::from_raw_fd(fd) });
+        }
+        let parent_fd = dir_holder.as_ref().map_or(self.0.as_raw_fd(), |f| f.as_raw_fd());
+        let last = std::ffi::CString::new(comps[comps.len() - 1].as_bytes()).map_err(|_| None)?;
+        let fd = unsafe {
+            libc::openat(
+                parent_fd,
+                last.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error().raw_os_error());
+        }
+        Ok(std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) }))
+    }
+
+    fn open_contained(&self, root_canon: &Path, rel: &str) -> Option<(std::fs::File, std::fs::Metadata)> {
+        let file = match self.open_rel_nofollow(rel) {
+            Ok(f) => f,
+            // Only retry once after resolving symlinks strictly inside root_canon, then re-open with O_NOFOLLOW
+            Err(Some(err)) if err == libc::ELOOP || err == libc::ENOTDIR => {
+                let (_, resolved_rel) = canonical_contained_path(root_canon, &root_canon.join(rel))?;
+                if !is_safe_rel(&resolved_rel) {
+                    return None;
+                }
+                self.open_rel_nofollow(&resolved_rel).ok()?
+            }
+            Err(_) => return None,
+        };
+        let meta = file.metadata().ok()?;
+        if !meta.is_file() || meta.len() > MAX_FILE_BYTES {
+            return None;
+        }
+        Some((file, meta))
+    }
+}
+
+#[cfg(windows)]
+fn handle_final_path(file: &std::fs::File) -> Option<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{GetFinalPathNameByHandleW, FILE_NAME_NORMALIZED};
+
+    let h = file.as_raw_handle() as _;
+    let mut buf = vec![0u16; 260];
+    loop {
+        let len = unsafe { GetFinalPathNameByHandleW(h, buf.as_mut_ptr(), buf.len() as u32, FILE_NAME_NORMALIZED) };
+        if len == 0 {
+            return None;
+        }
+        let len = len as usize;
+        if len < buf.len() {
+            return Some(PathBuf::from(std::ffi::OsString::from_wide(&buf[..len])));
+        }
+        buf.resize(len + 1, 0);
+    }
+}
+
+#[cfg(windows)]
+fn open_dir_handle(path: &Path) -> Option<std::fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
+
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
+        .ok()
+}
+
+#[cfg(windows)]
+struct DirHandle {
+    root_final: PathBuf,
+}
+
+#[cfg(windows)]
+impl DirHandle {
+    fn open_root(root_canon: &Path) -> Option<Self> {
+        let root_dir = open_dir_handle(root_canon)?;
+        let root_final = handle_final_path(&root_dir)?;
+        Some(Self { root_final })
+    }
+
+    fn open_contained(&self, root_canon: &Path, rel: &str) -> Option<(std::fs::File, std::fs::Metadata)> {
+        if !is_safe_rel(rel) {
+            return None;
+        }
+        let file = std::fs::File::open(root_canon.join(rel)).ok()?;
+        let final_path = handle_final_path(&file)?;
+        if !path_strictly_under(&self.root_final, &final_path) {
+            return None;
+        }
+        let meta = file.metadata().ok()?;
+        if !meta.is_file() || meta.len() > MAX_FILE_BYTES {
+            return None;
+        }
+        Some((file, meta))
+    }
+}
+
+fn read_contained_text_file_with(root_canon: &Path, dir: &DirHandle, candidate: &Path) -> Option<String> {
+    let (_, rel) = canonical_contained_path(root_canon, candidate)?;
+    let (file, _) = dir.open_contained(root_canon, &rel)?;
+    read_text_from_file(file)
+}
+
 fn read_contained_text_file(root_canon: &Path, candidate: &Path) -> Option<String> {
-    let (canon, _) = canonical_contained_path(root_canon, candidate)?;
-    read_text_file_raw(&canon)
+    let root_clean = canon_clean(root_canon).unwrap_or_else(|| root_canon.to_path_buf());
+    let dir = DirHandle::open_root(&root_clean)?;
+    read_contained_text_file_with(&root_clean, &dir, candidate)
 }
 
 fn utf16_len(s: &str) -> usize {
@@ -1840,27 +2087,34 @@ fn find_enclosing_container(lang: LangFamily, text: &str, target_line: usize) ->
 }
 
 fn update_workspace_index(root_dir: &Path) -> Vec<String> {
+    update_workspace_index_inner(root_dir, || {})
+}
+
+fn update_workspace_index_inner(root_dir: &Path, on_after_snapshot: impl FnOnce()) -> Vec<String> {
     let root_canon = canon_clean(root_dir).unwrap_or_else(|| root_dir.to_path_buf());
-    let root_key = norm_cmp(&root_canon.display().to_string());
+    let root_key = workspace_cache_key(&root_canon);
+    let ws_lock = workspace_update_lock(&root_key);
+    let _ws_guard = ws_lock.lock().unwrap_or_else(|e| e.into_inner());
+
+    // Snapshot indexed files (Arc handles) without holding INDEX_CACHE across filesystem checks or parsing
+    let existing: HashMap<String, Arc<IndexedFile>> = {
+        let mut guard = INDEX_CACHE.lock().unwrap();
+        let (_, cache) = guard.get_or_insert_with(|| (0, HashMap::new()));
+        cache
+            .get(&root_key)
+            .map(|ws| ws.files.clone())
+            .unwrap_or_default()
+    };
+    on_after_snapshot();
+
+    // Open root handle with O_NOFOLLOW traversal before enumerating/reading so a swapped root cannot be followed
+    let Some(root_handle) = DirHandle::open_root(&root_canon) else {
+        return crate::fsapi::file_list(&root_canon).as_ref().clone();
+    };
     let file_list = crate::fsapi::file_list(&root_canon);
     let started = Instant::now();
-
-    let mut guard = INDEX_CACHE.lock().unwrap();
-    let (seq, cache) = guard.get_or_insert_with(|| (0, HashMap::new()));
-    *seq += 1;
-    let now_seq = *seq;
-
-    if !cache.contains_key(&root_key) && cache.len() >= MAX_CACHED_WORKSPACES {
-        if let Some(oldest_k) = cache.iter().min_by_key(|(_, v)| v.last_used).map(|(k, _)| k.clone()) {
-            cache.remove(&oldest_k);
-        }
-    }
-
-    let ws = cache.entry(root_key).or_default();
-    ws.last_used = now_seq;
-
     let mut live_set = HashSet::with_capacity(file_list.len());
-    let mut changed = false;
+    let mut updated: Vec<(String, Arc<IndexedFile>)> = Vec::new();
 
     for rel in file_list.iter() {
         if !is_safe_rel(rel) || is_ignored_asset(rel) {
@@ -1870,34 +2124,54 @@ fn update_workspace_index(root_dir: &Path) -> Vec<String> {
         if lang == LangFamily::Other {
             continue;
         }
-        let full = root_canon.join(rel);
-        let Some((canon, _)) = canonical_contained_path(&root_canon, &full) else { continue };
+        let Some((file, meta)) = root_handle.open_contained(&root_canon, rel) else {
+            continue;
+        };
         if started.elapsed() > std::time::Duration::from_secs(6) {
-            if ws.files.contains_key(rel) {
+            if existing.contains_key(rel) {
                 live_set.insert(rel.clone());
             }
-            continue;
-        }
-        let Ok(meta) = std::fs::metadata(&canon) else { continue };
-        if !meta.is_file() || meta.len() > MAX_FILE_BYTES {
             continue;
         }
         live_set.insert(rel.clone());
         let mt = mtime_ms(&meta);
         let sz = meta.len();
-        if let Some(prev) = ws.files.get(rel) {
-            if prev.mtime == mt && prev.size == sz {
-                continue;
-            }
-        }
-        let Ok(buf) = std::fs::read(&canon) else { continue };
-        if buf.iter().take(8000).any(|&b| b == 0) {
+        if existing.get(rel).is_some_and(|prev| prev.mtime == mt && prev.size == sz) {
             continue;
         }
-        let text = String::from_utf8_lossy(&buf);
+        let Some(text) = read_text_from_file(file) else {
+            continue;
+        };
         let defs = extract_definitions(lang, &text);
-        ws.files.insert(rel.clone(), IndexedFile { mtime: mt, size: sz, lang, defs });
-        changed = true;
+        updated.push((rel.clone(), Arc::new(IndexedFile { mtime: mt, size: sz, lang, defs })));
+    }
+
+    let mut guard = INDEX_CACHE.lock().unwrap();
+    let (seq, cache) = guard.get_or_insert_with(|| (0, HashMap::new()));
+    *seq += 1;
+    let now_seq = *seq;
+
+    let was_evicted = !cache.contains_key(&root_key);
+    if was_evicted && cache.len() >= MAX_CACHED_WORKSPACES {
+        if let Some(oldest_k) = cache.iter().min_by_key(|(_, v)| v.last_used).map(|(k, _)| k.clone()) {
+            cache.remove(&oldest_k);
+        }
+    }
+
+    let ws = cache.entry(root_key).or_default();
+    ws.last_used = now_seq;
+
+    if was_evicted {
+        for (rel, indexed) in existing {
+            if live_set.contains(&rel) {
+                ws.files.entry(rel).or_insert(indexed);
+            }
+        }
+    }
+
+    let mut changed = !updated.is_empty();
+    for (rel, indexed) in updated {
+        ws.files.insert(rel, indexed);
     }
 
     let before_len = ws.files.len();
@@ -1906,7 +2180,7 @@ fn update_workspace_index(root_dir: &Path) -> Vec<String> {
         changed = true;
     }
 
-    if changed || (ws.by_name.is_empty() && !ws.files.is_empty()) {
+    if changed || was_evicted || (ws.by_name.is_empty() && !ws.files.is_empty()) {
         ws.rebuild_lookup();
     }
 
@@ -1914,7 +2188,8 @@ fn update_workspace_index(root_dir: &Path) -> Vec<String> {
 }
 
 fn query_index(root_dir: &Path, symbol: &str) -> Vec<(String, LangFamily, IndexedDef)> {
-    let root_key = norm_cmp(&root_dir.display().to_string());
+    let root_canon = canon_clean(root_dir).unwrap_or_else(|| root_dir.to_path_buf());
+    let root_key = workspace_cache_key(&root_canon);
     let guard = INDEX_CACHE.lock().unwrap();
     let Some((_, cache)) = guard.as_ref() else {
         return Vec::new();
@@ -2044,7 +2319,7 @@ fn load_tsconfig(root_dir: &Path, from_rel: &str) -> Option<CachedTsConfig> {
             }
         }
     }
-    let raw = std::fs::read_to_string(&cfg_path).ok()?;
+    let raw = read_contained_text_file(&root_canon, &cfg_path)?;
     let val: Value = serde_json::from_str(&strip_jsonc(&raw)).ok()?;
     let co = &val["compilerOptions"];
     let cfg_dir = cfg_path.parent().unwrap_or(&root_canon);
@@ -3159,6 +3434,9 @@ fn scan_references<F: Fn(&str) -> bool>(
     let step_utf8 = symbol.chars().next().map_or(1, char::len_utf8);
     let mut checks = 0usize;
 
+    let root_clean = canon_clean(root_dir).unwrap_or_else(|| root_dir.to_path_buf());
+    let root_handle = DirHandle::open_root(&root_clean);
+
     'files: for rel in candidates {
         if started.elapsed() > budget {
             truncated = true;
@@ -3169,11 +3447,13 @@ fn scan_references<F: Fn(&str) -> bool>(
             if let Some(ref draft) = req.content {
                 draft.clone()
             } else {
-                let Some(t) = read_contained_text_file(root_dir, &root_dir.join(rel)) else { continue };
+                let Some(ref dh) = root_handle else { continue };
+                let Some(t) = read_contained_text_file_with(&root_clean, dh, &root_clean.join(rel)) else { continue };
                 t
             }
         } else {
-            let Some(t) = read_contained_text_file(root_dir, &root_dir.join(rel)) else { continue };
+            let Some(ref dh) = root_handle else { continue };
+            let Some(t) = read_contained_text_file_with(&root_clean, dh, &root_clean.join(rel)) else { continue };
             t
         };
         if !text.contains(symbol) {
@@ -3693,5 +3973,267 @@ mod tests {
             })
             .unwrap();
         assert_eq!(esc_refs.total_hits, 0);
+    }
+
+    #[test]
+    fn handle_confined_open_blocks_escaped_file_and_dir_symlinks() {
+        let ws = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let root_canon = canon_clean(ws.path()).unwrap();
+        std::fs::create_dir_all(root_canon.join("src")).unwrap();
+        std::fs::write(root_canon.join("src/ok.ts"), "export const insideSym = 1;\n").unwrap();
+        std::fs::write(outside.path().join("outside.ts"), "export const leakFileSym = 9;\n").unwrap();
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(outside.path(), root_canon.join("ext_dir")).unwrap();
+            std::os::unix::fs::symlink(outside.path().join("outside.ts"), root_canon.join("src/leak.ts")).unwrap();
+            std::os::unix::fs::symlink(root_canon.join("src/ok.ts"), root_canon.join("src/in_link.ts")).unwrap();
+        }
+        #[cfg(windows)]
+        {
+            let _ = std::process::Command::new("cmd")
+                .args(["/c", "mklink", "/J"])
+                .arg(root_canon.join("ext_dir"))
+                .arg(outside.path())
+                .output();
+            let _ = std::os::windows::fs::symlink_file(
+                outside.path().join("outside.ts"),
+                root_canon.join("src/leak.ts"),
+            );
+        }
+
+        let dh = DirHandle::open_root(&root_canon).unwrap();
+        assert!(dh.open_contained(&root_canon, "src/ok.ts").is_some());
+        if root_canon.join("ext_dir/outside.ts").exists() {
+            assert!(dh.open_contained(&root_canon, "ext_dir/outside.ts").is_none());
+        }
+        if std::fs::symlink_metadata(root_canon.join("src/leak.ts")).is_ok() {
+            assert!(dh.open_contained(&root_canon, "src/leak.ts").is_none());
+        }
+        #[cfg(unix)]
+        assert!(dh.open_contained(&root_canon, "src/in_link.ts").is_some());
+
+        let files = update_workspace_index(&root_canon);
+        assert!(files.iter().any(|p| p == "src/ok.ts"));
+        let hits = query_index(&root_canon, "leakFileSym");
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn path_strictly_under_preserves_component_case() {
+        assert!(path_strictly_under(Path::new("/tmp/parent/repo"), Path::new("/tmp/parent/repo/src/a.ts")));
+        assert!(!path_strictly_under(Path::new("/tmp/parent/repo"), Path::new("/tmp/parent/repo")));
+        assert!(!path_strictly_under(Path::new("/tmp/parent/repo"), Path::new("/tmp/parent/REPO/secret.ts")));
+        assert!(!path_strictly_under(Path::new("/tmp/parent/repo"), Path::new("/tmp/parent/repo2/a.ts")));
+
+        #[cfg(windows)]
+        {
+            assert!(path_strictly_under(
+                Path::new(r"\\?\D:\parent\repo"),
+                Path::new(r"\\?\D:\parent\repo\src\a.ts"),
+            ));
+            assert!(!path_strictly_under(
+                Path::new(r"\\?\D:\parent\repo"),
+                Path::new(r"\\?\D:\parent\REPO\secret.ts"),
+            ));
+            assert!(!path_strictly_under(
+                Path::new(r"D:\parent\repo"),
+                Path::new(r"D:\parent\REPO\secret.ts"),
+            ));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_case_sensitive_sibling_dir_is_rejected() {
+        let base = tempfile::tempdir().unwrap();
+        let parent = base.path().join("cs_parent");
+        std::fs::create_dir_all(&parent).unwrap();
+        let cs_ok = std::process::Command::new("fsutil")
+            .args(["file", "setCaseSensitiveInfo"])
+            .arg(&parent)
+            .arg("enable")
+            .output()
+            .is_ok_and(|o| o.status.success());
+
+        let repo = parent.join("repo");
+        let sibling_upper = parent.join("REPO");
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        std::fs::write(repo.join("src/ok.ts"), "export const insideCaseSym = 1;\n").unwrap();
+
+        let distinct_case_dirs = cs_ok && std::fs::create_dir(&sibling_upper).is_ok();
+        let outside_dir = if distinct_case_dirs {
+            assert!(!repo.join("secret.ts").exists());
+            std::fs::write(sibling_upper.join("secret.ts"), "export const secretCaseSym = 9;\n").unwrap();
+            assert!(!repo.join("secret.ts").exists());
+            sibling_upper
+        } else {
+            eprintln!("note: fsutil case-sensitive directory unavailable on this host; verifying handle-based junction containment");
+            let fallback = base.path().join("outside");
+            std::fs::create_dir_all(&fallback).unwrap();
+            std::fs::write(fallback.join("secret.ts"), "export const secretCaseSym = 9;\n").unwrap();
+            fallback
+        };
+
+        let mklink_out = std::process::Command::new("cmd")
+            .args(["/c", "mklink", "/J"])
+            .arg(repo.join("ext"))
+            .arg(&outside_dir)
+            .output()
+            .unwrap();
+        assert!(mklink_out.status.success(), "mklink failed: {}", String::from_utf8_lossy(&mklink_out.stderr));
+
+        let repo_canon = canon_clean(&repo).unwrap();
+        let dh = DirHandle::open_root(&repo_canon).unwrap();
+        assert!(dh.open_contained(&repo_canon, "src/ok.ts").is_some());
+        assert!(dh.open_contained(&repo_canon, "ext/secret.ts").is_none());
+
+        update_workspace_index(&repo_canon);
+        assert!(!query_index(&repo_canon, "insideCaseSym").is_empty());
+        assert!(query_index(&repo_canon, "secretCaseSym").is_empty());
+    }
+
+    #[test]
+    fn concurrent_workspace_index_updates_preserve_newer_files() {
+        let ws = tempfile::tempdir().unwrap();
+        let root = canon_clean(ws.path()).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.ts"), "export const initialRaceSym = 1;\n").unwrap();
+
+        update_workspace_index(&root);
+        assert!(!query_index(&root, "initialRaceSym").is_empty());
+
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let root1 = root.clone();
+        let b1 = barrier.clone();
+        let t1 = std::thread::spawn(move || {
+            b1.wait();
+            for _ in 0..4 {
+                update_workspace_index(&root1);
+            }
+        });
+
+        let root2 = root.clone();
+        let b2 = barrier;
+        let t2 = std::thread::spawn(move || {
+            b2.wait();
+            std::fs::write(root2.join("src/a.ts"), "export const updatedAfterRaceSym = 3;\n").unwrap();
+            std::fs::write(root2.join("src/b.ts"), "export const addedRaceSym = 2;\n").unwrap();
+            crate::fsapi::invalidate_file_list_cache(&root2);
+            update_workspace_index(&root2);
+        });
+
+        t1.join().unwrap();
+        t2.join().unwrap();
+
+        assert!(query_index(&root, "initialRaceSym").is_empty());
+        assert!(!query_index(&root, "updatedAfterRaceSym").is_empty());
+        assert!(!query_index(&root, "addedRaceSym").is_empty());
+    }
+
+    #[test]
+    fn evicted_workspace_refresh_preserves_unchanged_definitions() {
+        let w1_tmp = tempfile::tempdir().unwrap();
+        let w1 = canon_clean(w1_tmp.path()).unwrap();
+        std::fs::create_dir_all(w1.join("src")).unwrap();
+        std::fs::write(w1.join("src/keep.ts"), "export const keepAfterEvictSym = 1;\n").unwrap();
+        std::fs::write(w1.join("src/change.ts"), "export const oldChangeSym = 1;\n").unwrap();
+
+        update_workspace_index(&w1);
+        assert!(!query_index(&w1, "keepAfterEvictSym").is_empty());
+        assert!(!query_index(&w1, "oldChangeSym").is_empty());
+
+        std::fs::write(w1.join("src/change.ts"), "export const newChangeSym = 200;\n").unwrap();
+        let mut other_tmps = Vec::new();
+        update_workspace_index_inner(&w1, || {
+            for i in 0..MAX_CACHED_WORKSPACES {
+                let d = tempfile::tempdir().unwrap();
+                let r = canon_clean(d.path()).unwrap();
+                std::fs::create_dir_all(r.join("src")).unwrap();
+                std::fs::write(r.join("src/d.ts"), format!("export const otherWs{i}Sym = {i};\n")).unwrap();
+                update_workspace_index(&r);
+                other_tmps.push(d);
+            }
+        });
+
+        assert!(query_index(&w1, "oldChangeSym").is_empty());
+        assert!(!query_index(&w1, "newChangeSym").is_empty());
+        assert!(!query_index(&w1, "keepAfterEvictSym").is_empty());
+        drop(other_tmps);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_open_root_rejects_symlink_component() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = canon_clean(tmp.path()).unwrap();
+        let real = base.join("real");
+        let sub = real.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let link_leaf = base.join("link_leaf");
+        let link_anc = base.join("link_anc");
+        std::os::unix::fs::symlink(&sub, &link_leaf).unwrap();
+        std::os::unix::fs::symlink(&real, &link_anc).unwrap();
+
+        assert!(DirHandle::open_root(&sub).is_some());
+        assert!(DirHandle::open_root(&link_leaf).is_none());
+        assert!(DirHandle::open_root(&link_anc.join("sub")).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_open_root_and_rel_allow_execute_only_dirs() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let base = canon_clean(tmp.path()).unwrap();
+        let anc = base.join("anc");
+        let repo = anc.join("repo");
+        let sub = repo.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let target = sub.join("a.ts");
+        std::fs::write(&target, "export const x = 1;\n").unwrap();
+
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o111)).unwrap();
+        std::fs::set_permissions(&anc, std::fs::Permissions::from_mode(0o111)).unwrap();
+
+        let root_handle = DirHandle::open_root(&repo);
+        let opened = root_handle
+            .as_ref()
+            .and_then(|h| h.open_contained(&repo, "sub/a.ts"));
+
+        std::fs::set_permissions(&anc, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(root_handle.is_some());
+        assert!(opened.is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_backslash_filename_is_preserved_not_split() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = canon_clean(tmp.path()).unwrap();
+        let nested_dir = root.join("src").join("a");
+        std::fs::create_dir_all(&nested_dir).unwrap();
+        std::fs::write(root.join("src").join(r"a\b.ts"), "export const backslashFileSym = 1;\n").unwrap();
+        std::fs::write(nested_dir.join("b.ts"), "export const nestedDecoySym = 2;\n").unwrap();
+
+        let rel_bs = normalize_rel_path(&root, None, r"src/a\b.ts");
+        assert_eq!(rel_bs, r"src/a\b.ts");
+        assert_eq!(join_abs(&root, &rel_bs), root.join("src").join(r"a\b.ts").display().to_string());
+
+        let handle = DirHandle::open_root(&root).unwrap();
+        let (file, _) = handle.open_contained(&root, r"src/a\b.ts").unwrap();
+        assert!(read_text_from_file(file).unwrap().contains("backslashFileSym"));
+
+        update_workspace_index(&root);
+        let bs_hits = query_index(&root, "backslashFileSym");
+        let decoy_hits = query_index(&root, "nestedDecoySym");
+        assert_eq!(bs_hits.len(), 1);
+        assert_eq!(bs_hits[0].0, r"src/a\b.ts");
+        assert_eq!(decoy_hits.len(), 1);
+        assert_eq!(decoy_hits[0].0, "src/a/b.ts");
     }
 }

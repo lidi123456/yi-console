@@ -16,5 +16,7 @@
   "flipHorizontal": "水平翻转",
   "fullScreen": "全屏查看",
   "csvSize": "{{rows}} 行 · {{cols}} 列",
-  "csvShown": " · 筛出 {{n}} 行"
+  "csvShown": " · 筛出 {{n}} 行",
+  "loadingPdf": "正在加载 PDF…",
+  "imageLoadFailed": "图片加载失败"
 }

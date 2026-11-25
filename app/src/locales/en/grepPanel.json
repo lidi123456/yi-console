@@ -4,6 +4,7 @@
   "filesNotReplaced": "{{length}} files not replaced: {{names}}",
   "undoneFilesChangedAfterThe": "Undone; {{failed}} files changed after the replace and were left as they are",
   "replaceUndone": "Replace undone",
+  "draftChanged": "Draft changed; please preview and replace again",
   "replaceAll": "Replace all?",
   "theListIsIncompleteOnly": "\nThe list is incomplete; only the results listed are replaced.",
   "replace": "Replace",

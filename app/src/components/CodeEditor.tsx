@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { forwardRef, useEffect, useImperativeHandle, useRef, useState } from 'react';
 import { getT, isEn, useLang } from '../i18n';
 import { Compartment, EditorState } from '@codemirror/state';
 import {
@@ -273,23 +273,13 @@ export function searchPhrases() {
   });
 }
 
-export function CodeEditor({
-  docKey,
-  value,
-  filename,
-  readOnly,
-  wrap,
-  onChange,
-  onSave,
-  goto,
-  onTopLine,
-  scrollLine,
-  menu,
-  onToggleWrap,
-  onAddSelection,
-  onNav,
-  onCursorPos,
-}: {
+export interface CodeEditorHandle {
+  getValue: () => string;
+  flush: () => string | undefined;
+  isDirty: () => boolean;
+}
+
+export interface CodeEditorProps {
   /** Changes when switching files (or re-reading from disk); the editor is rebuilt from scratch */
   docKey: string;
   value: string;
@@ -314,7 +304,25 @@ export function CodeEditor({
   onNav?: (t: NavTrigger) => void;
   /** Reports cursor line (1-based) and col (0-based) changes for navigation history */
   onCursorPos?: (line: number, col: number) => void;
-}) {
+}
+
+export const CodeEditor = forwardRef<CodeEditorHandle, CodeEditorProps>(function CodeEditor({
+  docKey,
+  value,
+  filename,
+  readOnly,
+  wrap,
+  onChange,
+  onSave,
+  goto,
+  onTopLine,
+  scrollLine,
+  menu,
+  onToggleWrap,
+  onAddSelection,
+  onNav,
+  onCursorPos,
+}, ref) {
   const host = useRef<HTMLDivElement>(null);
   const wrapRef = useRef<HTMLDivElement>(null);
   const [, lang] = useLang();
@@ -324,9 +332,46 @@ export function CodeEditor({
   const comp = useRef({ lang: new Compartment(), ro: new Compartment(), wrap: new Compartment(), phrases: new Compartment() });
   const filenameRef = useRef(filename);
   filenameRef.current = filename;
+  const eolRef = useRef<'\r\n' | '\n'>('\n');
+  const valueRef = useRef(value);
+  valueRef.current = value;
+  const dirtyRef = useRef(false);
+  const changeTimer = useRef<number | null>(null);
+  const chipRaf = useRef(0);
+  const committedRef = useRef({ docKey, onChange, readOnly });
+  if (committedRef.current.docKey === docKey) {
+    committedRef.current.onChange = onChange;
+    committedRef.current.readOnly = readOnly;
+  }
   // Callbacks go through a ref so the editor doesn't need rebuilding
   const cb = useRef({ onChange, onSave, onTopLine, onToggleWrap, onAddSelection, onNav, onCursorPos });
   cb.current = { onChange, onSave, onTopLine, onToggleWrap, onAddSelection, onNav, onCursorPos };
+
+  const flush = (): string | undefined => {
+    if (changeTimer.current !== null) {
+      window.clearTimeout(changeTimer.current);
+      changeTimer.current = null;
+    }
+    const v = view.current;
+    if (!v || !dirtyRef.current || committedRef.current.readOnly) return undefined;
+    dirtyRef.current = false;
+    const nextVal = v.state.doc.sliceString(0, v.state.doc.length, eolRef.current);
+    committedRef.current.onChange(nextVal);
+    return nextVal;
+  };
+
+  useImperativeHandle(
+    ref,
+    () => ({
+      getValue: () => {
+        const v = view.current;
+        return v ? v.state.doc.sliceString(0, v.state.doc.length, eolRef.current) : valueRef.current;
+      },
+      flush,
+      isDirty: () => dirtyRef.current && !committedRef.current.readOnly,
+    }),
+    [],
+  );
 
   const syncChip = () => {
     const v = view.current;
@@ -343,9 +388,24 @@ export function CodeEditor({
     setSelChip(measureSelectionChip(v, box));
   };
 
+  const scheduleSyncChip = () => {
+    if (chipRaf.current) return;
+    chipRaf.current = requestAnimationFrame(() => {
+      chipRaf.current = 0;
+      syncChip();
+    });
+  };
+
   useEffect(() => {
     const c = comp.current;
+    committedRef.current = { docKey, onChange, readOnly };
     const eol = detectEol(value);
+    eolRef.current = eol;
+    dirtyRef.current = false;
+    if (changeTimer.current !== null) {
+      window.clearTimeout(changeTimer.current);
+      changeTimer.current = null;
+    }
     const ind = detectIndent(value);
     setSelChip(null);
     const v = new EditorView({
@@ -371,7 +431,7 @@ export function CodeEditor({
           highlightSelectionMatches(),
           syntaxHighlighting(highlight),
           keymap.of([
-            { key: 'Mod-s', preventDefault: true, run: () => (cb.current.onSave(), true) },
+            { key: 'Mod-s', preventDefault: true, run: () => (flush(), cb.current.onSave(), true) },
             { key: 'Alt-z', preventDefault: true, run: () => (cb.current.onToggleWrap?.(), !!cb.current.onToggleWrap) },
             {
               key: 'Mod-l',
@@ -405,12 +465,19 @@ export function CodeEditor({
           c.ro.of([EditorState.readOnly.of(readOnly), EditorView.editable.of(!readOnly)]),
           c.wrap.of(wrap ? EditorView.lineWrapping : []),
           EditorView.updateListener.of((u) => {
-            if (u.docChanged) cb.current.onChange(u.state.doc.sliceString(0, u.state.doc.length, eol));
+            if (u.docChanged && !committedRef.current.readOnly) {
+              dirtyRef.current = true;
+              if (changeTimer.current !== null) window.clearTimeout(changeTimer.current);
+              changeTimer.current = window.setTimeout(() => {
+                changeTimer.current = null;
+                flush();
+              }, 200);
+            }
             if (u.transactions.some((tr) => tr.isUserEvent('select.search'))) {
               setSelChip(null);
               return;
             }
-            if (u.selectionSet || u.docChanged || u.geometryChanged) requestAnimationFrame(syncChip);
+            if (u.selectionSet || u.docChanged || u.geometryChanged) scheduleSyncChip();
           }),
         ],
       }),
@@ -418,7 +485,7 @@ export function CodeEditor({
     view.current = v;
     let alive = true;
     const onScroll = () => {
-      syncChip();
+      scheduleSyncChip();
       const f = cb.current.onTopLine;
       if (!f) return;
       const blk = v.lineBlockAtHeight(v.scrollDOM.scrollTop);
@@ -427,7 +494,7 @@ export function CodeEditor({
     const onUp = () => {
       if (!dragging.current) return;
       dragging.current = false;
-      requestAnimationFrame(syncChip);
+      scheduleSyncChip();
     };
     v.scrollDOM.addEventListener('scroll', onScroll, { passive: true });
     window.addEventListener('pointerup', onUp);
@@ -439,6 +506,11 @@ export function CodeEditor({
       .catch((e) => console.warn('加载语法高亮失败', filename, e));
     return () => {
       alive = false;
+      flush();
+      if (chipRaf.current) {
+        cancelAnimationFrame(chipRaf.current);
+        chipRaf.current = 0;
+      }
       window.removeEventListener('pointerup', onUp);
       window.removeEventListener('pointercancel', onUp);
       v.destroy();
@@ -525,4 +597,4 @@ export function CodeEditor({
       )}
     </div>
   );
-}
+});

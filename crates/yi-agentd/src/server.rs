@@ -271,8 +271,14 @@ where
                 Err(anyhow!("只能在本机打开文件"))
             } else if req.method == methods::FS_OPEN {
                 let p = &req.params;
-                match p["path"].as_str() {
-                    Some(path) => crate::fsapi::open_native(path, p["reveal"].as_bool().unwrap_or(false)),
+                match p["path"].as_str().map(str::to_string) {
+                    Some(path) => {
+                        let reveal = p["reveal"].as_bool().unwrap_or(false);
+                        match tokio::task::spawn_blocking(move || crate::fsapi::open_native(&path, reveal)).await {
+                            Ok(res) => res,
+                            Err(e) => Err(anyhow!("执行失败: {e}")),
+                        }
+                    }
                     None => Err(anyhow!("缺少参数 path")),
                 }
             } else {
@@ -293,7 +299,31 @@ where
                     }),
                 },
             };
-            let _ = tx.send(serde_json::to_string(&resp).unwrap());
+            let line = if matches!(
+                req.method.as_str(),
+                methods::SESSION_SUBSCRIBE
+                    | methods::SESSION_HISTORY
+                    | methods::SESSION_LIST
+                    | methods::FS_READ
+                    | methods::FS_LIST
+                    | methods::FS_GREP
+                    | methods::FS_SEARCH
+                    | methods::GIT_CHANGES
+                    | methods::GIT_SHOW
+                    | methods::GIT_BLOB
+                    | methods::GIT_BRANCH_DIFF
+                    | methods::GIT_REF_DIFF
+                    | methods::HISTORY_READ
+            ) {
+                tokio::task::spawn_blocking(move || serde_json::to_string(&resp).unwrap())
+                    .await
+                    .unwrap_or_default()
+            } else {
+                serde_json::to_string(&resp).unwrap()
+            };
+            if !line.is_empty() {
+                let _ = tx.send(line);
+            }
         });
     }
     forward.abort();
@@ -600,7 +630,11 @@ pub async fn dispatch(
             hub.memory_changed();
             serde_json::to_value(info)?
         }
-        SESSION_LIST => serde_json::to_value(hub.list())?,
+        SESSION_LIST => {
+            let hub2 = hub.clone();
+            let list = tokio::task::spawn_blocking(move || hub2.list()).await?;
+            serde_json::to_value(list)?
+        }
         SESSION_CREATE => {
             let params: CreateParams = serde_json::from_value(p)?;
             let hub2 = hub.clone();
@@ -612,37 +646,49 @@ pub async fn dispatch(
             let since = p["sinceSeq"].as_i64().unwrap_or(0);
             // Register the subscription before fetching the backlog; events in between may be duplicated, and clients dedupe by seq
             subs.lock().unwrap().insert(sid.clone());
-            let info = hub.subscription_info(&sid)?;
             // On first open, only the latest tail events may be requested; older ones are paged in with session.history
             let tail = p["tail"].as_u64().filter(|_| since == 0);
-            let mut r = match tail {
-                Some(n) => {
-                    let (events, more) = hub.backlog_tail(&sid, None, n as usize)?;
-                    json!({ "info": info, "events": events, "hasMore": more })
+            let hub2 = hub.clone();
+            tokio::task::spawn_blocking(move || -> Result<Value> {
+                let info = hub2.subscription_info(&sid)?;
+                let mut r = match tail {
+                    Some(n) => {
+                        let (events, more) = hub2.backlog_tail(&sid, None, n as usize)?;
+                        json!({ "info": info, "events": events, "hasMore": more })
+                    }
+                    None => json!({ "info": info, "events": hub2.backlog(&sid, since)? }),
+                };
+                if info.mode == SessionMode::Terminal {
+                    let snap = hub2.term_snapshot(&sid)?;
+                    r["terminal"] = json!(base64::engine::general_purpose::STANDARD.encode(snap));
                 }
-                None => json!({ "info": info, "events": hub.backlog(&sid, since)? }),
-            };
-            if info.mode == SessionMode::Terminal {
-                let snap = hub.term_snapshot(&sid)?;
-                r["terminal"] = json!(base64::engine::general_purpose::STANDARD.encode(snap));
-            }
-            r
+                Ok(r)
+            })
+            .await??
         }
         SESSION_STATUS_LINE => {
             let sid = s(&p, "sessionId")?;
             crate::statusline::query(hub, sid, p["git"].as_bool().unwrap_or(true)).await?
         }
         SESSION_HISTORY => {
-            let sid = s(&p, "sessionId")?;
+            let sid = s(&p, "sessionId")?.to_string();
             let before = p["beforeSeq"].as_i64();
             let limit = p["limit"].as_u64().unwrap_or(500) as usize;
-            let (events, more) = hub.backlog_tail(sid, before, limit)?;
-            json!({ "events": events, "hasMore": more })
+            let hub2 = hub.clone();
+            tokio::task::spawn_blocking(move || -> Result<Value> {
+                let (events, more) = hub2.backlog_tail(&sid, before, limit)?;
+                Ok(json!({ "events": events, "hasMore": more }))
+            })
+            .await??
         }
         SESSION_USER_MESSAGES => {
-            let sid = s(&p, "sessionId")?;
-            let items = hub.user_messages(sid)?;
-            json!({ "items": items })
+            let sid = s(&p, "sessionId")?.to_string();
+            let hub2 = hub.clone();
+            tokio::task::spawn_blocking(move || -> Result<Value> {
+                let items = hub2.user_messages(&sid)?;
+                Ok(json!({ "items": items }))
+            })
+            .await??
         }
         SESSION_UNSUBSCRIBE => {
             subs.lock().unwrap().remove(s(&p, "sessionId")?);
@@ -677,25 +723,41 @@ pub async fn dispatch(
             Value::Null
         }
         SESSION_SET_PERMISSION_MODE => {
-            hub.set_permission_mode(s(&p, "sessionId")?, s(&p, "mode")?)?;
+            let sid = s(&p, "sessionId")?.to_string();
+            let mode = s(&p, "mode")?.to_string();
+            let hub2 = hub.clone();
+            tokio::task::spawn_blocking(move || hub2.set_permission_mode(&sid, &mode)).await??;
             Value::Null
         }
-        SESSION_COMMANDS => serde_json::to_value(hub.session_commands(s(&p, "sessionId")?)?)?,
+        SESSION_COMMANDS => {
+            let sid = s(&p, "sessionId")?.to_string();
+            let hub2 = hub.clone();
+            let cmds = tokio::task::spawn_blocking(move || hub2.session_commands(&sid)).await??;
+            serde_json::to_value(cmds)?
+        }
         SESSION_SET_MODE => {
             let mode: SessionMode = serde_json::from_value(p["mode"].clone()).map_err(|_| anyhow!("未知模式"))?;
             hub.set_mode(s(&p, "sessionId")?, mode).await?;
             Value::Null
         }
         SESSION_AUTO_RESUME => {
-            hub.auto_resume_action(s(&p, "sessionId")?, s(&p, "action")?)?;
+            let sid = s(&p, "sessionId")?.to_string();
+            let action = s(&p, "action")?.to_string();
+            let hub2 = hub.clone();
+            tokio::task::spawn_blocking(move || hub2.auto_resume_action(&sid, &action)).await??;
             Value::Null
         }
         SETTINGS_UI_LANG => {
-            hub.set_ui_lang(s(&p, "lang")?)?;
+            let lang = s(&p, "lang")?.to_string();
+            let hub2 = hub.clone();
+            tokio::task::spawn_blocking(move || hub2.set_ui_lang(&lang)).await??;
             Value::Null
         }
         SESSION_PIN => {
-            hub.pin(s(&p, "sessionId")?, p["pinned"].as_bool().unwrap_or(true))?;
+            let sid = s(&p, "sessionId")?.to_string();
+            let pinned = p["pinned"].as_bool().unwrap_or(true);
+            let hub2 = hub.clone();
+            tokio::task::spawn_blocking(move || hub2.pin(&sid, pinned)).await??;
             Value::Null
         }
         SEARCH_MESSAGES => {
@@ -779,15 +841,25 @@ pub async fn dispatch(
             serde_json::to_value(info)?
         }
         SESSION_SET_CLIENT_MCP => {
+            let sid = s(&p, "sessionId")?.to_string();
             let list: Vec<ClientMcp> = serde_json::from_value(p["clientMcp"].clone()).map_err(|e| anyhow!("clientMcp 无效: {e}"))?;
-            serde_json::to_value(hub.set_client_mcp(s(&p, "sessionId")?, list)?)?
+            let hub2 = hub.clone();
+            let info = tokio::task::spawn_blocking(move || hub2.set_client_mcp(&sid, list)).await??;
+            serde_json::to_value(info)?
         }
         SESSION_SET_SYSTEM_PROMPT => {
-            serde_json::to_value(hub.set_system_prompt(s(&p, "sessionId")?, p["prompt"].as_str().map(str::to_string))?)?
+            let sid = s(&p, "sessionId")?.to_string();
+            let prompt = p["prompt"].as_str().map(str::to_string);
+            let hub2 = hub.clone();
+            let info = tokio::task::spawn_blocking(move || hub2.set_system_prompt(&sid, prompt)).await??;
+            serde_json::to_value(info)?
         }
         SESSION_SET_BOT => {
+            let sid = s(&p, "sessionId")?.to_string();
             let bot: Option<BotLink> = serde_json::from_value(p["bot"].clone()).map_err(|e| anyhow!("bot 无效: {e}"))?;
-            serde_json::to_value(hub.set_bot(s(&p, "sessionId")?, bot)?)?
+            let hub2 = hub.clone();
+            let info = tokio::task::spawn_blocking(move || hub2.set_bot(&sid, bot)).await??;
+            serde_json::to_value(info)?
         }
         // Handled in serve_conn, which knows the connection
         CLIENT_HELLO | CLIENT_MCP_RESULT | CLIENT_MCP_PROXY | CLIENTS_LIST | CLIENT_CALL | CLIENT_RESULT | CLIENT_EVENT => anyhow::bail!("只能在客户端连接上调用"),
@@ -1013,15 +1085,23 @@ pub async fn dispatch(
         }
         SESSION_ATTACH_FILE => {
             let sid = s(&p, "sessionId")?.to_string();
-            hub.info(&sid)?;
             let (name, data) = (s(&p, "name")?.to_string(), s(&p, "data")?.to_string());
-            tokio::task::spawn_blocking(move || crate::hub::attach_file(&sid, &name, &data)).await??
+            let hub2 = hub.clone();
+            tokio::task::spawn_blocking(move || -> Result<Value> {
+                hub2.info(&sid)?;
+                crate::hub::attach_file(&sid, &name, &data)
+            })
+            .await??
         }
         SESSION_ATTACH_APPEND => {
             let sid = s(&p, "sessionId")?.to_string();
-            hub.info(&sid)?;
             let (path, data) = (s(&p, "path")?.to_string(), s(&p, "data")?.to_string());
-            tokio::task::spawn_blocking(move || crate::hub::attach_append(&sid, &path, &data)).await??
+            let hub2 = hub.clone();
+            tokio::task::spawn_blocking(move || -> Result<Value> {
+                hub2.info(&sid)?;
+                crate::hub::attach_append(&sid, &path, &data)
+            })
+            .await??
         }
         SESSION_LOG_FILE => {
             let sid = s(&p, "sessionId")?.to_string();
@@ -1061,17 +1141,25 @@ pub async fn dispatch(
             let text = tokio::task::spawn_blocking(move || crate::session_mcp::reference_digest(&h, &sid)).await??;
             json!({ "text": text })
         }
-        SESSION_MODELS => hub.session_models(s(&p, "sessionId")?)?,
+        SESSION_MODELS => {
+            let sid = s(&p, "sessionId")?.to_string();
+            let hub2 = hub.clone();
+            tokio::task::spawn_blocking(move || hub2.session_models(&sid)).await??
+        }
         SESSION_SET_MODEL => {
-            hub.set_model(s(&p, "sessionId")?, p["model"].as_str().unwrap_or(""))?;
+            let sid = s(&p, "sessionId")?.to_string();
+            let model = p["model"].as_str().unwrap_or("").to_string();
+            let hub2 = hub.clone();
+            tokio::task::spawn_blocking(move || hub2.set_model(&sid, &model)).await??;
             Value::Null
         }
         PROXY_SET_HOSTS => {
             let hosts: Vec<yi_client::hosts::HostConfig> = serde_json::from_value(p["hosts"].clone())?;
-            crate::proxy::set_hosts(hosts, p["knownHosts"].as_str().unwrap_or(""))?;
+            let known_hosts = p["knownHosts"].as_str().unwrap_or("").to_string();
+            tokio::task::spawn_blocking(move || crate::proxy::set_hosts(hosts, &known_hosts)).await??;
             Value::Null
         }
-        PROXY_LIST => crate::proxy::list(),
+        PROXY_LIST => tokio::task::spawn_blocking(crate::proxy::list).await?,
         SESSION_CLEAR => {
             hub.clear(s(&p, "sessionId")?).await?;
             Value::Null
@@ -1083,15 +1171,25 @@ pub async fn dispatch(
             Value::Null
         }
         SESSION_STOP_TASK => {
-            hub.stop_task(s(&p, "sessionId")?, s(&p, "taskId")?)?;
+            let sid = s(&p, "sessionId")?.to_string();
+            let tid = s(&p, "taskId")?.to_string();
+            let hub2 = hub.clone();
+            tokio::task::spawn_blocking(move || hub2.stop_task(&sid, &tid)).await??;
             Value::Null
         }
         SESSION_SET_MODEL_CONFIG => {
-            hub.set_model_config(s(&p, "sessionId")?, s(&p, "configId")?, s(&p, "value")?)?;
+            let sid = s(&p, "sessionId")?.to_string();
+            let cid = s(&p, "configId")?.to_string();
+            let val = s(&p, "value")?.to_string();
+            let hub2 = hub.clone();
+            tokio::task::spawn_blocking(move || hub2.set_model_config(&sid, &cid, &val)).await??;
             Value::Null
         }
         SESSION_SET_EFFORT => {
-            hub.set_effort(s(&p, "sessionId")?, p["effort"].as_str().unwrap_or(""))?;
+            let sid = s(&p, "sessionId")?.to_string();
+            let effort = p["effort"].as_str().unwrap_or("").to_string();
+            let hub2 = hub.clone();
+            tokio::task::spawn_blocking(move || hub2.set_effort(&sid, &effort)).await??;
             Value::Null
         }
         TOOLS_MODELS => {
@@ -1311,8 +1409,13 @@ pub async fn dispatch(
         TOOLS_ACCOUNTS_REORDER => {
             let tool = ToolKind::parse(s(&p, "tool")?).ok_or_else(|| anyhow!("未知工具"))?;
             let ids: Vec<String> = serde_json::from_value(p["ids"].clone()).map_err(|_| anyhow!("缺少参数 ids"))?;
-            hub.accounts.reorder(tool, &ids)?;
-            hub.publish_accounts_updated(tool, None);
+            let hub2 = hub.clone();
+            tokio::task::spawn_blocking(move || -> Result<()> {
+                hub2.accounts.reorder(tool, &ids)?;
+                hub2.publish_accounts_updated(tool, None);
+                Ok(())
+            })
+            .await??;
             Value::Null
         }
         TOOLS_ACCOUNTS_TEST => {
@@ -1337,8 +1440,13 @@ pub async fn dispatch(
         TOOLS_ACCOUNTS_SET_POLICY => {
             let tool = ToolKind::parse(s(&p, "tool")?).ok_or_else(|| anyhow!("未知工具"))?;
             let auto_failover = p["autoFailover"].as_bool().ok_or_else(|| anyhow!("缺少参数 autoFailover"))?;
-            hub.accounts.set_policy(tool, auto_failover)?;
-            hub.publish_accounts_updated(tool, None);
+            let hub2 = hub.clone();
+            tokio::task::spawn_blocking(move || -> Result<()> {
+                hub2.accounts.set_policy(tool, auto_failover)?;
+                hub2.publish_accounts_updated(tool, None);
+                Ok(())
+            })
+            .await??;
             Value::Null
         }
         TOOLS_ACCOUNTS_LOGIN_START => {
@@ -1364,26 +1472,29 @@ pub async fn dispatch(
                 }
                 changed_hub.publish_accounts_updated(t, aid);
             });
-            let upd = hub.logins.start(req, &settings, emit, on_changed)?;
+            let hub2 = hub.clone();
+            let upd = tokio::task::spawn_blocking(move || hub2.logins.start(req, &settings, emit, on_changed)).await??;
             serde_json::to_value(upd)?
         }
         TOOLS_ACCOUNTS_LOGIN_INPUT => {
-            let job_id = s(&p, "jobId")?;
-            let input = p["input"].as_str().unwrap_or("");
+            let job_id = s(&p, "jobId")?.to_string();
+            let input = p["input"].as_str().unwrap_or("").to_string();
             let emit_hub = hub.clone();
             let emit: crate::account_login::LoginEmitFn = Arc::new(move |upd| {
                 emit_hub.publish(None, methods::EV_ACCOUNT_LOGIN, serde_json::to_value(&upd).unwrap_or(Value::Null));
             });
-            let upd = hub.logins.send_input(job_id, input, emit)?;
+            let hub2 = hub.clone();
+            let upd = tokio::task::spawn_blocking(move || hub2.logins.send_input(&job_id, &input, emit)).await??;
             serde_json::to_value(upd)?
         }
         TOOLS_ACCOUNTS_LOGIN_CANCEL => {
-            let job_id = s(&p, "jobId")?;
+            let job_id = s(&p, "jobId")?.to_string();
             let emit_hub = hub.clone();
             let emit: crate::account_login::LoginEmitFn = Arc::new(move |upd| {
                 emit_hub.publish(None, methods::EV_ACCOUNT_LOGIN, serde_json::to_value(&upd).unwrap_or(Value::Null));
             });
-            let upd = hub.logins.cancel(job_id, emit)?;
+            let hub2 = hub.clone();
+            let upd = tokio::task::spawn_blocking(move || hub2.logins.cancel(&job_id, emit)).await??;
             serde_json::to_value(upd)?
         }
         TOOLS_ACCOUNTS_EXPORT => {
@@ -1395,7 +1506,8 @@ pub async fn dispatch(
         TOOLS_ACCOUNTS_REVEAL => {
             let tool = ToolKind::parse(s(&p, "tool")?).ok_or_else(|| anyhow!("未知工具"))?;
             let account_id = s(&p, "accountId")?.to_string();
-            let cfg = hub.accounts.reveal_api_config(tool, &account_id)?;
+            let hub2 = hub.clone();
+            let cfg = tokio::task::spawn_blocking(move || hub2.accounts.reveal_api_config(tool, &account_id)).await??;
             serde_json::to_value(cfg)?
         }
         TOOLS_ACCOUNTS_IMPORT => {
@@ -1426,7 +1538,9 @@ pub async fn dispatch(
             Value::Null
         }
         SESSION_INTERRUPT => {
-            hub.interrupt(s(&p, "sessionId")?)?;
+            let sid = s(&p, "sessionId")?.to_string();
+            let hub2 = hub.clone();
+            tokio::task::spawn_blocking(move || hub2.interrupt(&sid)).await??;
             Value::Null
         }
         SESSION_PERMISSION => {
@@ -1441,15 +1555,22 @@ pub async fn dispatch(
             Value::Null
         }
         SESSION_KILL => {
-            hub.kill(s(&p, "sessionId")?)?;
+            let sid = s(&p, "sessionId")?.to_string();
+            let hub2 = hub.clone();
+            tokio::task::spawn_blocking(move || hub2.kill(&sid)).await??;
             Value::Null
         }
         SESSION_DELETE => {
-            hub.delete(s(&p, "sessionId")?)?;
+            let sid = s(&p, "sessionId")?.to_string();
+            let hub2 = hub.clone();
+            tokio::task::spawn_blocking(move || hub2.delete(&sid)).await??;
             Value::Null
         }
         SESSION_RENAME => {
-            hub.rename(s(&p, "sessionId")?, s(&p, "title")?)?;
+            let sid = s(&p, "sessionId")?.to_string();
+            let title = s(&p, "title")?.to_string();
+            let hub2 = hub.clone();
+            tokio::task::spawn_blocking(move || hub2.rename(&sid, &title)).await??;
             Value::Null
         }
         PTY_INPUT => {
@@ -1497,19 +1618,22 @@ pub async fn dispatch(
                 .collect();
             serde_json::to_value(events)?
         }
-        FS_LIST => crate::fsapi::list(
-            p["path"].as_str().unwrap_or("~"),
-            p["showHidden"].as_bool().unwrap_or(false),
-        )?,
+        FS_LIST => {
+            let path = p["path"].as_str().unwrap_or("~").to_string();
+            let show_hidden = p["showHidden"].as_bool().unwrap_or(false);
+            tokio::task::spawn_blocking(move || crate::fsapi::list(&path, show_hidden)).await??
+        }
         FS_READ if p["image"].as_bool() == Some(true) => {
             let path = s(&p, "path")?.to_string();
             let (strict, probe) = (p["strict"].as_bool() == Some(true), p["probe"].as_bool() == Some(true));
-            tokio::task::spawn_blocking(move || crate::fsapi::read_image(&path, strict, probe)).await??
+            let if_unchanged = p["ifModified"].as_i64().zip(p["ifSize"].as_u64());
+            tokio::task::spawn_blocking(move || crate::fsapi::read_image_if_changed(&path, strict, probe, if_unchanged)).await??
         }
         FS_READ if p["raw"].as_bool() == Some(true) => {
             let path = s(&p, "path")?.to_string();
             let root = p["root"].as_str().map(str::to_string);
-            tokio::task::spawn_blocking(move || crate::fsapi::read_raw(&path, root.as_deref())).await??
+            let if_unchanged = p["ifModified"].as_i64().zip(p["ifSize"].as_u64());
+            tokio::task::spawn_blocking(move || crate::fsapi::read_raw_if_changed(&path, root.as_deref(), if_unchanged)).await??
         }
         PORTS_LIST => tokio::task::spawn_blocking(crate::ports::list).await??,
         FS_GREP => {
@@ -1549,16 +1673,29 @@ pub async fn dispatch(
             let ow = p["overwrite"].as_bool().unwrap_or(false);
             tokio::task::spawn_blocking(move || crate::fsapi::upload(&path, &data, ow)).await??
         }
-        FS_READ => crate::fsapi::read(s(&p, "path")?, p["tail"].as_bool().unwrap_or(false))?,
-        FS_WRITE => crate::fsapi::write(
-            s(&p, "path")?,
-            p["content"].as_str().unwrap_or(""),
-            p["expectModified"].as_i64(),
-            p["expectSize"].as_u64(),
-            p["createOnly"].as_bool().unwrap_or(false),
-        )?,
-        FS_MKDIR => crate::fsapi::mkdir(s(&p, "path")?)?,
-        FS_RENAME => crate::fsapi::rename(s(&p, "from")?, s(&p, "to")?)?,
+        FS_READ => {
+            let path = s(&p, "path")?.to_string();
+            let tail = p["tail"].as_bool().unwrap_or(false);
+            let if_unchanged = p["ifModified"].as_i64().zip(p["ifSize"].as_u64());
+            tokio::task::spawn_blocking(move || crate::fsapi::read_if_changed(&path, tail, if_unchanged)).await??
+        }
+        FS_WRITE => {
+            let path = s(&p, "path")?.to_string();
+            let content = p["content"].as_str().unwrap_or("").to_string();
+            let expect_modified = p["expectModified"].as_i64();
+            let expect_size = p["expectSize"].as_u64();
+            let create_only = p["createOnly"].as_bool().unwrap_or(false);
+            tokio::task::spawn_blocking(move || crate::fsapi::write(&path, &content, expect_modified, expect_size, create_only)).await??
+        }
+        FS_MKDIR => {
+            let path = s(&p, "path")?.to_string();
+            tokio::task::spawn_blocking(move || crate::fsapi::mkdir(&path)).await??
+        }
+        FS_RENAME => {
+            let from = s(&p, "from")?.to_string();
+            let to = s(&p, "to")?.to_string();
+            tokio::task::spawn_blocking(move || crate::fsapi::rename(&from, &to)).await??
+        }
         FS_DELETE => {
             let path = s(&p, "path")?.to_string();
             let recursive = p["recursive"].as_bool().unwrap_or(false);
@@ -1573,15 +1710,9 @@ pub async fn dispatch(
         }
         SETTINGS_GET => serde_json::to_value(crate::mcp::redact(hub.settings.read().unwrap().clone()))?,
         SETTINGS_SET => {
-            let old = hub.settings.read().unwrap().clone();
-            let mut new: DaemonSettings = serde_json::from_value(p.clone())?;
-            if p.get("mcpServers").is_none() { new.mcp_servers = old.mcp_servers.clone(); }
-            if p.get("memory").is_none() { new.memory = old.memory.clone(); }
-            new.memory.write_policy = new.memory.normalized_policy().into();
-            crate::mcp::keep_secrets(&mut new, &old)?;
-            crate::mcp::validate(&new)?;
-            crate::settings::save(&new)?;
-            *hub.settings.write().unwrap() = new.clone();
+            let hub2 = hub.clone();
+            let p2 = p.clone();
+            let (old, new) = tokio::task::spawn_blocking(move || hub2.update_settings(p2)).await??;
             hub.mcp_settings_changed(&old, &new);
             hub.browsers.settings_changed(&old, &new);
             if old.memory != new.memory {
@@ -1590,19 +1721,30 @@ pub async fn dispatch(
             *TOOLS.lock().unwrap() = None;
             serde_json::to_value(crate::mcp::redact(new))?
         }
-        "relay.pairing" => crate::relay::pairing_info()?,
-        "relay.configure" => crate::relay::configure(
-            p["url"].as_str().unwrap_or(""),
-            p["fp"].as_str(),
-            p["invite"].as_str(),
-            p["enabled"].as_bool().unwrap_or(true),
-            p["link"].as_str(),
-        )?,
-        "relay.pairStart" => crate::relay::pair_start()?,
-        "relay.clients" => crate::relay::clients()?,
-        "relay.revoke" => crate::relay::revoke(s(&p, "id")?)?,
-        "relay.renameClient" => crate::relay::rename_client(s(&p, "id")?, s(&p, "name")?)?,
-        "relay.reset" => crate::relay::reset()?,
+        "relay.pairing" => tokio::task::spawn_blocking(crate::relay::pairing_info).await??,
+        "relay.configure" => {
+            let url = p["url"].as_str().unwrap_or("").to_string();
+            let fp = p["fp"].as_str().map(str::to_string);
+            let invite = p["invite"].as_str().map(str::to_string);
+            let enabled = p["enabled"].as_bool().unwrap_or(true);
+            let link = p["link"].as_str().map(str::to_string);
+            tokio::task::spawn_blocking(move || {
+                crate::relay::configure(&url, fp.as_deref(), invite.as_deref(), enabled, link.as_deref())
+            })
+            .await??
+        }
+        "relay.pairStart" => tokio::task::spawn_blocking(crate::relay::pair_start).await??,
+        "relay.clients" => tokio::task::spawn_blocking(crate::relay::clients).await??,
+        "relay.revoke" => {
+            let id = s(&p, "id")?.to_string();
+            tokio::task::spawn_blocking(move || crate::relay::revoke(&id)).await??
+        }
+        "relay.renameClient" => {
+            let id = s(&p, "id")?.to_string();
+            let name = s(&p, "name")?.to_string();
+            tokio::task::spawn_blocking(move || crate::relay::rename_client(&id, &name)).await??
+        }
+        "relay.reset" => tokio::task::spawn_blocking(crate::relay::reset).await??,
         "relay.invite" => crate::relay::invite().await?,
         DAEMON_SHUTDOWN => {
             hub.shutdown.notify_waiters();

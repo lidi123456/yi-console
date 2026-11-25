@@ -16,5 +16,7 @@
   "flipHorizontal": "Flip horizontal",
   "fullScreen": "Full screen",
   "csvSize": "{{rows}} rows · {{cols}} cols",
-  "csvShown": " · {{n}} shown"
+  "csvShown": " · {{n}} shown",
+  "loadingPdf": "Loading PDF…",
+  "imageLoadFailed": "Failed to load image"
 }

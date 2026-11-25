@@ -2046,7 +2046,7 @@ function ModernTurnFooter({
 
 const PAGE = 300;
 
-export function ChatView({
+export const ChatView = memo(function ChatView({
   events,
   live,
   liveThinking,
@@ -2132,7 +2132,7 @@ export function ChatView({
   const stick = useRef(true);
   const liveText = [...live.values()].join('').replace(INVISIBLE, '');
   const liveThought = [...(liveThinking?.values() ?? [])].join('');
-  const shown = items.slice(Math.max(0, items.length - limit));
+  const shown = useMemo(() => items.slice(Math.max(0, items.length - limit)), [items, limit]);
   const modern = useChatStyle() === 'modern';
   const blocks: (Block | MBlock)[] = useMemo(() => {
     // Task-type tool calls are shown by the task list instead; failed ones are shown as usual
@@ -2642,7 +2642,7 @@ export function ChatView({
     </DesktopCtx.Provider>
     </ImgContext.Provider>
   );
-}
+});
 
 /** Background-task finished notice: icon + status + one-line command (ellipsized if too long, click to see it all) */
 function BgTaskNote({ it }: { it: Extract<Item, { k: 'bgdone' }> }) {

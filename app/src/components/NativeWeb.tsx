@@ -49,12 +49,41 @@ function painted(cs: CSSStyleDeclaration) {
   return !clear(cs.backgroundColor) || cs.boxShadow !== 'none' || (cs.backdropFilter && cs.backdropFilter !== 'none') || (cs.borderStyle !== 'none' && parseFloat(cs.borderWidth) > 0 && !clear(cs.borderColor));
 }
 
+const OVERLAY_SEL =
+  '.modal-bg, .ctx-scrim, .ctx-menu, .palette-scrim, .palette, .pop, .wp-pop, .cref-pop, .toasts, .upgrade-bg, .upgrade-toast, .acc-drawer, .nav-picker, .nav-peek, [role="dialog"], [role="menu"], [role="listbox"]';
+
+function hasVisibleOverlay(el: HTMLElement, r: DOMRect): boolean {
+  const els = document.querySelectorAll(OVERLAY_SEL);
+  for (let i = 0; i < els.length; i++) {
+    const o = els[i];
+    if (o === el || o.contains(el) || el.contains(o)) continue;
+    const b = o.getBoundingClientRect();
+    if (b.width <= 0 || b.height <= 0) continue;
+    if (b.right > r.left && b.left < r.right && b.bottom > r.top && b.top < r.bottom) return true;
+  }
+  return false;
+}
+
 /**
  * What of the app lies over the placeholder: elementFromPoint on a grid, and for each hit the outermost
  * ancestor that paints something (so a transparent click-catching scrim, like the context menu's, doesn't count;
  * the menu inside it does). Rects are relative to the placeholder, in CSS px.
  */
 function coverOf(el: HTMLElement, r: DOMRect): Cover {
+  if (!hasVisibleOverlay(el, r)) {
+    let uncovered = true;
+    for (const fx of [0.1, 0.5, 0.9]) {
+      for (const fy of [0.1, 0.5, 0.9]) {
+        const hit = document.elementFromPoint(r.left + r.width * fx, r.top + r.height * fy);
+        if (hit && hit !== el && !el.contains(hit)) {
+          uncovered = false;
+          break;
+        }
+      }
+      if (!uncovered) break;
+    }
+    if (uncovered) return { full: false, holes: [] };
+  }
   const step = 28;
   const nx = Math.max(3, Math.min(40, Math.ceil(r.width / step)));
   const ny = Math.max(3, Math.min(40, Math.ceil(r.height / step)));

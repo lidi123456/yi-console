@@ -233,8 +233,11 @@ fn serve(foreground: bool) -> Result<()> {
     paths::ensure_base()?;
     log::init(foreground);
     tools::fix_path();
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get().clamp(4, 8))
+        .unwrap_or(4);
     let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
+        .worker_threads(workers)
         .enable_all()
         .build()?;
     rt.block_on(async {

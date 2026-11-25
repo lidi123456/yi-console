@@ -57,6 +57,16 @@ interface MatchSpan {
   to: number;
 }
 
+function sameSearchTerms(a: SearchQuery, b: SearchQuery): boolean {
+  return (
+    a.search === b.search &&
+    a.caseSensitive === b.caseSensitive &&
+    a.wholeWord === b.wholeWord &&
+    a.regexp === b.regexp &&
+    a.literal === b.literal
+  );
+}
+
 function collectMatches(view: EditorView, query: SearchQuery): { items: MatchSpan[]; capped: boolean } {
   if (!query.search || !query.valid) return { items: [], capped: false };
   const items: MatchSpan[] = [];
@@ -218,8 +228,14 @@ function createEditorSearchPanel(view: EditorView): Panel {
     return btn;
   };
 
-  const prevBtn = makeIconBtn('prev', PATH_UP, () => findPrevious(view));
-  const nextBtn = makeIconBtn('next', PATH_DOWN, () => findNext(view));
+  const prevBtn = makeIconBtn('prev', PATH_UP, () => {
+    flushPending(false);
+    findPrevious(view);
+  });
+  const nextBtn = makeIconBtn('next', PATH_DOWN, () => {
+    flushPending(false);
+    findNext(view);
+  });
   const closeBtn = makeIconBtn('close', PATH_CLOSE, () => closeSearchPanel(view));
   findActions.append(countEl, sepEl, prevBtn, nextBtn, closeBtn);
 
@@ -250,14 +266,20 @@ function createEditorSearchPanel(view: EditorView): Panel {
   replaceBtn.name = 'replace';
   replaceBtn.className = 'ed-rbtn';
   replaceBtn.addEventListener('mousedown', (e) => e.preventDefault());
-  replaceBtn.addEventListener('click', () => replaceNext(view));
+  replaceBtn.addEventListener('click', () => {
+    flushPending(true);
+    replaceNext(view);
+  });
 
   const replaceAllBtn = document.createElement('button');
   replaceAllBtn.type = 'button';
   replaceAllBtn.name = 'replaceAll';
   replaceAllBtn.className = 'ed-rbtn primary';
   replaceAllBtn.addEventListener('mousedown', (e) => e.preventDefault());
-  replaceAllBtn.addEventListener('click', () => replaceAll(view));
+  replaceAllBtn.addEventListener('click', () => {
+    flushPending(false);
+    replaceAll(view);
+  });
 
   replaceActions.append(replaceBtn, replaceAllBtn);
 
@@ -316,7 +338,7 @@ function createEditorSearchPanel(view: EditorView): Panel {
   }
 
   function refreshMatches(forceRecount = false) {
-    if (forceRecount || cachedDoc !== view.state.doc || !cachedQuery.eq(query)) {
+    if (forceRecount || cachedDoc !== view.state.doc || !sameSearchTerms(cachedQuery, query)) {
       cachedDoc = view.state.doc;
       cachedQuery = query;
       cachedMatches = collectMatches(view, query);
@@ -350,7 +372,23 @@ function createEditorSearchPanel(view: EditorView): Panel {
     replaceAllBtn.disabled = noMatches || view.state.readOnly;
   }
 
+  let inputTimer = 0;
+  let pendingJump = false;
+
+  function flushPending(allowJump = false) {
+    if (!inputTimer) return;
+    const jump = allowJump && pendingJump;
+    pendingJump = false;
+    commit(jump);
+  }
+
   function commit(jumpToMatch = false) {
+    const shouldJump = jumpToMatch || pendingJump;
+    pendingJump = false;
+    if (inputTimer) {
+      clearTimeout(inputTimer);
+      inputTimer = 0;
+    }
     const nextQuery = new SearchQuery({
       search: searchInput.value,
       caseSensitive,
@@ -369,24 +407,45 @@ function createEditorSearchPanel(view: EditorView): Panel {
       query = nextQuery;
       syncOptionStates();
       view.dispatch({ effects: setSearchQuery.of(nextQuery) });
-      if (jumpToMatch && searchChanged && nextQuery.search && nextQuery.valid) {
+      if (searchChanged && nextQuery.search && nextQuery.valid) {
         const res = collectMatches(view, nextQuery);
         cachedDoc = view.state.doc;
         cachedQuery = nextQuery;
         cachedMatches = res;
-        const hit = findFirstMatchAtOrAfter(res.items, searchAnchor);
-        if (hit) {
-          const sel = EditorSelection.single(hit.from, hit.to);
-          view.dispatch({
-            selection: sel,
-            effects: scrollMatchIntoView(hit),
-            userEvent: 'select.search',
-          });
+        if (shouldJump) {
+          const hit = findFirstMatchAtOrAfter(res.items, searchAnchor);
+          if (hit) {
+            const sel = EditorSelection.single(hit.from, hit.to);
+            view.dispatch({
+              selection: sel,
+              effects: scrollMatchIntoView(hit),
+              userEvent: 'select.search',
+            });
+          }
         }
       }
-      refreshMatches(true);
+      refreshMatches(false);
     } else {
       syncOptionStates();
+    }
+  }
+
+  function scheduleCommit(jumpToMatch: boolean) {
+    if (inputTimer) {
+      clearTimeout(inputTimer);
+      inputTimer = 0;
+    }
+    if (view.state.doc.length > 100_000) {
+      pendingJump = pendingJump || jumpToMatch;
+      inputTimer = window.setTimeout(() => {
+        inputTimer = 0;
+        const jump = pendingJump;
+        pendingJump = false;
+        commit(jump);
+      }, 120);
+    } else {
+      pendingJump = false;
+      commit(jumpToMatch);
     }
   }
 
@@ -407,7 +466,7 @@ function createEditorSearchPanel(view: EditorView): Panel {
   toggleBtn.addEventListener('mousedown', (e) => e.preventDefault());
   toggleBtn.addEventListener('click', () => setReplace(!replaceOpen, !replaceOpen));
 
-  searchInput.addEventListener('input', () => commit(true));
+  searchInput.addEventListener('input', () => scheduleCommit(true));
   replaceInput.addEventListener('input', () => commit(false));
 
   box.addEventListener('keydown', (e) => {
@@ -436,6 +495,13 @@ function createEditorSearchPanel(view: EditorView): Panel {
       }
     }
 
+    if (
+      inputTimer &&
+      (e.key === 'Enter' || e.key === 'F3' || ((e.ctrlKey || e.metaKey) && ['g', 'l'].includes(e.key.toLowerCase())))
+    ) {
+      flushPending(e.target === replaceInput && e.key === 'Enter' && !(e.altKey && (e.ctrlKey || e.metaKey)));
+    }
+
     if (runScopeHandlers(view, e, 'search-panel')) {
       e.preventDefault();
       return;
@@ -444,9 +510,11 @@ function createEditorSearchPanel(view: EditorView): Panel {
     if (e.key === 'Enter') {
       if (e.target === searchInput) {
         e.preventDefault();
+        flushPending(false);
         (e.shiftKey ? findPrevious : findNext)(view);
       } else if (e.target === replaceInput) {
         e.preventDefault();
+        flushPending(!(e.altKey && (e.ctrlKey || e.metaKey)));
         if (e.altKey && (e.ctrlKey || e.metaKey)) {
           replaceAll(view);
         } else {
@@ -467,12 +535,24 @@ function createEditorSearchPanel(view: EditorView): Panel {
       searchInput.focus();
       searchInput.select();
     },
+    destroy() {
+      if (inputTimer) {
+        clearTimeout(inputTimer);
+        inputTimer = 0;
+      }
+      pendingJump = false;
+    },
     update(u: ViewUpdate) {
       let queryUpdated = false;
       let wantReplace: boolean | null = null;
       for (const tr of u.transactions) {
         for (const eff of tr.effects) {
           if (eff.is(setSearchQuery) && !eff.value.eq(query)) {
+            if (inputTimer) {
+              clearTimeout(inputTimer);
+              inputTimer = 0;
+            }
+            pendingJump = false;
             query = eff.value;
             caseSensitive = query.caseSensitive;
             wholeWord = query.wholeWord;

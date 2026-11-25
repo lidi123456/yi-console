@@ -1247,10 +1247,39 @@ textarea {
 }
 
 .split-detail {
+  position: relative;
   flex: 1;
   min-width: 0;
   display: flex;
   flex-direction: column;
+}
+
+.files-loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 24px 12px;
+}
+
+.files-code-wrap {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  isolation: isolate;
+}
+
+.files-truncated {
+  padding: 6px 16px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-2);
+  font-size: 12px;
+}
+
+.detail-head .icon-btn.active {
+  background: var(--bg-3);
+  color: var(--text);
 }
 
 .detail-head {
@@ -2862,6 +2891,22 @@ textarea {
   overflow-y: auto;
   display: flex;
   flex-direction: column;
+}
+
+.dirpicker-inner {
+  display: flex;
+  flex-direction: column;
+}
+
+.dirpicker-loading {
+  flex: 1;
+  min-height: 120px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  color: var(--text-2);
+  font-size: 13px;
 }
 
 .dirpicker-list button {
@@ -5786,7 +5831,8 @@ button.md-rimg-ph:hover {
   color: var(--text);
 }
 
-.file-panel {
+.file-panel,
+.files-code-wrap {
   --hl-keyword: #cf222e;
   --hl-string: #0a3069;
   --hl-number: #0550ae;
@@ -5809,6 +5855,9 @@ button.md-rimg-ph:hover {
   --ed-find-opt-fg: #0969da;
   --ed-find-opt-ring: rgba(9, 105, 218, 0.32);
   --ed-find-shadow: 0 8px 24px rgba(31, 35, 40, 0.13), 0 1px 3px rgba(31, 35, 40, 0.06);
+}
+
+.file-panel {
   width: var(--panel-w, 640px);
   max-width: calc(100% - 360px);
   flex: none;
@@ -5820,8 +5869,13 @@ button.md-rimg-ph:hover {
   font-size: 13px;
 }
 
+.file-panel.wp-hidden {
+  display: none !important;
+}
+
 @media (prefers-color-scheme: dark) {
-  :root:not([data-theme='light']) .file-panel {
+  :root:not([data-theme='light']) .file-panel,
+  :root:not([data-theme='light']) .files-code-wrap {
     /* VS Code Dark+ token colors */
     --hl-keyword: #569cd6;
     --hl-string: #ce9178;
@@ -5848,7 +5902,8 @@ button.md-rimg-ph:hover {
   }
 }
 
-:root[data-theme='dark'] .file-panel {
+:root[data-theme='dark'] .file-panel,
+:root[data-theme='dark'] .files-code-wrap {
   /* VS Code Dark+ token colors */
   --hl-keyword: #569cd6;
   --hl-string: #ce9178;
@@ -6064,6 +6119,28 @@ button.wp-crumb:hover {
   position: relative;
   display: flex;
   flex-direction: column;
+}
+
+.wp-loading-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--text-2);
+  background: color-mix(in srgb, var(--bg) 78%, transparent);
+  backdrop-filter: blur(2px);
+  pointer-events: none;
+}
+
+.wp-tip-loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
 }
 
 .wp-code-wrap {
@@ -9235,6 +9312,23 @@ body.resizing .wp-merge-sash {
 }
 .csv tbody tr:hover td {
   background: var(--side-hover);
+}
+.csv tbody tr.csv-spacer td {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  line-height: 0;
+}
+.csv tbody tr.csv-spacer:hover td {
+  background: transparent;
+}
+.img-loading {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: none;
 }
 .csv .csv-n {
   position: sticky;

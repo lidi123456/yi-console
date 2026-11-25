@@ -492,5 +492,6 @@
   "navDefNotFound": "未找到 “{{v}}” 的定义",
   "navPathNotFound": "未找到目标文件：{{v}}",
   "navNoReferences": "未找到 “{{v}}” 的引用",
-  "navLoadingRefs": "正在查找引用…"
+  "navLoadingRefs": "正在查找引用…",
+  "openingFile": "正在打开 {{name}}…"
 }

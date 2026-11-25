@@ -49,6 +49,8 @@ struct HostConn {
 struct Bulk {
     /// Command that starts the bridge on the host; only set for SSH transports
     cmd: Option<String>,
+    /// Local host uses direct local IPC sockets/pipes for bulk requests once connected
+    local: bool,
     rpc: Option<Arc<RpcConn>>,
 }
 
@@ -61,6 +63,7 @@ const BULK_METHODS: &[&str] = &[
     "fs.read",
     "fs.grep",
     "nav.references",
+    "git.changes",
     "git.show",
     "git.blob",
     "git.branchDiff",
@@ -483,16 +486,61 @@ impl ClientHub {
                 let root = args["root"].as_str().filter(|s| !s.is_empty()).ok_or_else(|| anyhow!("缺少 root"))?;
                 json!({ "token": self.previews.token(&id, root) })
             }
+            // {id, path, kind?} -> {token, path, size?, modified?, mimeType?}: issues a streaming preview token for a file
+            "preview.file" => {
+                let id = id()?;
+                let raw_path = args["path"].as_str().filter(|s| !s.is_empty()).ok_or_else(|| anyhow!("缺少 path"))?;
+                let kind = args["kind"].as_str().unwrap_or("");
+                let h = self.host(&id)?;
+                let max_bytes = if kind == "image" { 10 * 1024 * 1024 } else { 50 * 1024 * 1024 };
+                if h.kind == HostKind::Local {
+                    let p = crate::localipc::expand_path(raw_path);
+                    let strict_image = kind == "image";
+                    let (resolved, size, modified, identity) = tokio::task::spawn_blocking(move || -> Result<(String, u64, i64, crate::preview::FileIdentity)> {
+                        let file = open_local_preview_file(&p)?;
+                        let meta = file.metadata()?;
+                        if !meta.is_file() {
+                            bail!("不是有效的文件");
+                        }
+                        let size = meta.len();
+                        if size > max_bytes {
+                            bail!(if strict_image { "图片超过 10MB，无法预览" } else { "文件超过 50MB，太大了" });
+                        }
+                        let identity = local_file_identity(&file, &meta)?;
+                        let modified = meta
+                            .modified()
+                            .ok()
+                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                            .map(|d| d.as_millis() as i64)
+                            .unwrap_or(0);
+                        Ok((p.display().to_string(), size, modified, identity))
+                    })
+                    .await??;
+                    let token = self.previews.file_token(&id, &resolved, Some(identity), max_bytes);
+                    json!({ "token": token, "path": resolved, "size": size, "modified": modified })
+                } else if kind == "image" {
+                    let r = self.rpc(&id, "fs.read", json!({ "path": raw_path, "image": true, "probe": true })).await?;
+                    if r["tooBig"].as_bool() == Some(true) {
+                        bail!("图片超过 10MB，无法预览");
+                    }
+                    let resolved = r["path"].as_str().unwrap_or(raw_path);
+                    let token = self.previews.file_token(&id, resolved, None, max_bytes);
+                    json!({ "token": token, "path": resolved, "size": r["size"], "mimeType": r["mimeType"] })
+                } else {
+                    let token = self.previews.file_token(&id, raw_path, None, max_bytes);
+                    json!({ "token": token, "path": raw_path })
+                }
+            }
             // Open a URL in the system default browser (http / https only)
             "url.open" => {
-                let url = args["url"].as_str().unwrap_or("");
+                let url = args["url"].as_str().unwrap_or("").to_string();
                 if !(url.starts_with("http://") || url.starts_with("https://")) {
                     bail!("只能打开 http / https 地址");
                 }
-                open_url(url)?;
+                tokio::task::spawn_blocking(move || open_url(&url)).await??;
                 Value::Null
             }
-            "hosts.importSshConfig" => json!(crate::sshconfig::load_default()),
+            "hosts.importSshConfig" => json!(tokio::task::spawn_blocking(crate::sshconfig::load_default).await?),
             "hosts.connect" => {
                 let id = id()?;
                 let (tx, rx) = oneshot::channel();
@@ -542,7 +590,7 @@ impl ClientHub {
                         json!(deploy::install_service(&s, &p).await?)
                     }
                     HostKind::Local => {
-                        let exe = self.local_yi_agentd()?;
+                        let exe = self.local_yi_agentd_async().await?;
                         let mut cmd = tokio::process::Command::new(exe);
                         cmd.arg("install");
                         #[cfg(windows)]
@@ -645,13 +693,25 @@ impl ClientHub {
         Ok(r)
     }
 
-    /// The SSH bulk channel, opened on first use. None for other transports or when it can't be opened (callers fall back to the main channel)
+    /// The bulk RPC channel (direct local IPC on Local hosts, extra SSH exec stream on SSH hosts), opened on first use.
     async fn bulk_rpc(&self, c: &HostConn) -> Option<Arc<RpcConn>> {
         let mut b = c.bulk.lock().await;
         if let Some(r) = b.rpc.as_ref().filter(|r| !r.is_closed()) {
             return Some(r.clone());
         }
-        b.rpc = None;
+        if let Some(stale) = b.rpc.take() {
+            stale.close();
+        }
+        if b.local {
+            let stream = tokio::time::timeout(Duration::from_secs(5), crate::localipc::connect())
+                .await
+                .ok()?
+                .ok()?;
+            let (r, w) = tokio::io::split(stream);
+            let rpc = RpcConn::start(r, w, Arc::new(|_| {}));
+            b.rpc = Some(rpc.clone());
+            return Some(rpc);
+        }
         let cmd = b.cmd.clone()?;
         let s = c.ssh.lock().unwrap().clone().filter(|s| !s.is_closed())?;
         let stream = tokio::time::timeout(Duration::from_secs(15), s.exec_stream(&cmd)).await.ok()?.ok()?;
@@ -692,8 +752,16 @@ impl ClientHub {
         let c = self.conn(id);
         c.stop.store(true, Ordering::SeqCst);
         c.kick.notify_waiters();
-        c.rpc.lock().unwrap().take();
-        *c.bulk.lock().await = Bulk::default();
+        if let Some(rpc) = c.rpc.lock().unwrap().take() {
+            rpc.close();
+        }
+        {
+            let mut b = c.bulk.lock().await;
+            if let Some(brpc) = b.rpc.take() {
+                brpc.close();
+            }
+            *b = Bulk::default();
+        }
         c.ssh.lock().unwrap().take();
         let child = c.child.lock().unwrap().take();
         if let Some(mut ch) = child {
@@ -728,8 +796,17 @@ impl ClientHub {
                             _ = rpc.wait_closed() => {}
                             _ = c.kick.notified() => {}
                         }
-                        c.rpc.lock().unwrap().take();
-                        *c.bulk.lock().await = Bulk::default();
+                        rpc.close();
+                        if let Some(old) = c.rpc.lock().unwrap().take() {
+                            old.close();
+                        }
+                        {
+                            let mut b = c.bulk.lock().await;
+                            if let Some(brpc) = b.rpc.take() {
+                                brpc.close();
+                            }
+                            *b = Bulk::default();
+                        }
                         c.ssh.lock().unwrap().take();
                         if c.stop.load(Ordering::SeqCst) {
                             break;
@@ -737,6 +814,13 @@ impl ClientHub {
                         self.set_status(&id, json!({"status":"disconnected","error":"连接中断，正在重连"}));
                     }
                     Err(e) => {
+                        {
+                            let mut b = c.bulk.lock().await;
+                            if let Some(brpc) = b.rpc.take() {
+                                brpc.close();
+                            }
+                            *b = Bulk::default();
+                        }
                         let msg = format!("{e:#}");
                         let code = fatal_code(&msg);
                         self.set_status(&id, json!({"status":"error","error":msg,"code":code}));
@@ -772,8 +856,16 @@ impl ClientHub {
             w,
             Arc::new(move |n: Notification| me.on_notify(&hid, &conn, n)),
         );
-        let hello = rpc.call("hello", json!({"client": "yi-console"})).await?;
-        *c.rpc.lock().unwrap() = Some(rpc.clone());
+        let hello = match rpc.call("hello", json!({"client": "yi-console"})).await {
+            Ok(v) => v,
+            Err(e) => {
+                rpc.close();
+                return Err(e);
+            }
+        };
+        if let Some(old) = c.rpc.lock().unwrap().replace(rpc.clone()) {
+            old.close();
+        }
         self.client_hello(&rpc).await;
         // The same version string can still be two different builds (builds from copied sources are all +dev, and uncommitted changes keep the commit hash), so compare the build time too
         let mismatch = hello["daemonVersion"].as_str() != Some(DAEMON_VERSION)
@@ -830,7 +922,7 @@ impl ClientHub {
             .filter(|h| shared.iter().any(|s| s.id == h.id) || jumps.contains(h.id.as_str()))
             .cloned()
             .collect();
-        let known = std::fs::read_to_string(&self.known.app_file).unwrap_or_default();
+        let known = tokio::fs::read_to_string(&self.known.app_file).await.unwrap_or_default();
         let _ = self
             .rpc(&local, yi_proto::methods::PROXY_SET_HOSTS, json!({"hosts": send, "knownHosts": known}))
             .await;
@@ -968,7 +1060,7 @@ impl ClientHub {
             if h.kind == HostKind::Local {
                 // Already synced on connect; confirm once more here
                 self.upgrade_event(id, "uploading", "正在准备新版 yi-agentd…", Some(1.0));
-                self.local_yi_agentd()?;
+                self.local_yi_agentd_async().await?;
             }
             if h.kind == HostKind::Ssh {
                 self.upgrade_event(id, "uploading", "正在检测远程平台…", Some(0.0));
@@ -1122,44 +1214,9 @@ impl ClientHub {
     }
 
     /// The yi-agentd used by the local daemon: first sync the one bundled in the installer to `~/.yi-console/bin`, then use that copy
-    fn local_yi_agentd(&self) -> Result<PathBuf> {
-        let bundled = self.bundled_yi_agentd()?;
-        if let Some(dir) = &self.yi_agentd_dir {
-            crate::localbin::sync_extras(dir);
-        }
-        crate::localbin::sync(&bundled).or_else(|e| {
-            // If the home directory isn't writable or similar, fall back to the bundled one
-            eprintln!("同步本机 yi-agentd 失败，直接使用安装包里的: {e:#}");
-            Ok(bundled)
-        })
-    }
-
-    fn bundled_yi_agentd(&self) -> Result<PathBuf> {
-        let exe = if cfg!(windows) { "yi-agentd.exe" } else { "yi-agentd" };
-        let os = match std::env::consts::OS {
-            "macos" => "macos",
-            o => o,
-        };
-        let mut cands = vec![];
-        if let Ok(p) = std::env::var("YI_CONSOLE_AGENTD") {
-            cands.push(PathBuf::from(p));
-        }
-        if let Some(d) = &self.yi_agentd_dir {
-            cands.push(d.join(exe));
-        }
-        // Tauri sidecars sit next to the main executable
-        if let Ok(me) = std::env::current_exe() {
-            if let Some(d) = me.parent() {
-                cands.push(d.join(exe));
-            }
-        }
-        if let Some(p) = deploy::local_binary(self.yi_agentd_dir.as_deref(), os, std::env::consts::ARCH) {
-            cands.push(p);
-        }
-        cands
-            .into_iter()
-            .find(|p| p.is_file())
-            .ok_or_else(|| anyhow!("找不到本机 yi-agentd（可设置环境变量 YI_CONSOLE_AGENTD）"))
+    async fn local_yi_agentd_async(&self) -> Result<PathBuf> {
+        let dir = self.yi_agentd_dir.clone();
+        tokio::task::spawn_blocking(move || local_yi_agentd_sync(dir.as_deref())).await?
     }
 
     async fn ssh_session(&self, h: &HostConfig) -> Result<Arc<SshSession>> {
@@ -1179,11 +1236,42 @@ impl ClientHub {
     /// Preview files: `<token>/<relative path>` -> (content, MIME). Both Tauri's ahfs protocol and yi-web's /fsv/ go through here
     pub async fn serve_preview(&self, url_path: &str) -> Result<(Vec<u8>, &'static str)> {
         use base64::Engine;
-        let (host, root, path) = self.previews.resolve(url_path)?;
-        let r = self.rpc(&host, "fs.read", json!({ "path": path, "raw": true, "root": root })).await?;
+        let resolved = self.previews.resolve(url_path)?;
+        if self.host(&resolved.host).is_ok_and(|h| h.kind == HostKind::Local) {
+            if resolved.is_file_token && resolved.identity.is_none() {
+                self.previews.invalidate_file_token(&resolved.token);
+                bail!("预览地址已失效");
+            }
+            let path_c = resolved.path.clone();
+            let root_c = resolved.root.clone();
+            let expected_id = resolved.identity;
+            let max_bytes = resolved.max_bytes.unwrap_or(50 * 1024 * 1024);
+            let res = tokio::task::spawn_blocking(move || {
+                read_local_preview(&path_c, root_c.as_deref(), expected_id, max_bytes)
+            })
+            .await?;
+            let data = match res {
+                Ok(d) => d,
+                Err(LocalPreviewErr::IdentityChanged) => {
+                    if resolved.is_file_token {
+                        self.previews.invalidate_file_token(&resolved.token);
+                    }
+                    bail!("预览地址已失效");
+                }
+                Err(LocalPreviewErr::Other(e)) => return Err(e),
+            };
+            return Ok((data, crate::preview::mime(&resolved.path)));
+        }
+        let r = self
+            .rpc(
+                &resolved.host,
+                "fs.read",
+                json!({ "path": resolved.path, "raw": true, "root": resolved.root }),
+            )
+            .await?;
         let b64 = r["base64"].as_str().ok_or_else(|| anyhow!("读取失败"))?;
         let data = base64::engine::general_purpose::STANDARD.decode(b64)?;
-        Ok((data, crate::preview::mime(&path)))
+        Ok((data, crate::preview::mime(&resolved.path)))
     }
 
     /// One port-forward connection: connects to 127.0.0.1:port on the host
@@ -1227,27 +1315,44 @@ impl ClientHub {
     }
 
     async fn open_transport(&self, h: &HostConfig, c: &HostConn) -> Result<(BoxR, BoxW)> {
-        *c.bulk.lock().await = Bulk::default();
+        {
+            let mut b = c.bulk.lock().await;
+            if let Some(brpc) = b.rpc.take() {
+                brpc.close();
+            }
+            *b = Bulk::default();
+        }
         match h.kind {
             HostKind::Local => {
                 if !self.local_supported {
                     bail!("当前设备不支持本机会话");
                 }
-                let exe = self.local_yi_agentd()?;
-                let mut cmd = tokio::process::Command::new(exe);
-                // --local: tells the daemon this is a local client (bridges started remotely over SSH don't pass it, so local-only methods are refused)
-                cmd.args(["bridge", "--local"])
-                    .stdin(std::process::Stdio::piped())
-                    .stdout(std::process::Stdio::piped())
-                    .stderr(std::process::Stdio::null())
-                    .kill_on_drop(true);
-                #[cfg(windows)]
-                cmd.creation_flags(0x0800_0000);
-                let mut child = cmd.spawn()?;
-                let r = child.stdout.take().unwrap();
-                let w = child.stdin.take().unwrap();
-                *c.child.lock().unwrap() = Some(child);
-                Ok((Box::new(r), Box::new(w)))
+                let exe = self.local_yi_agentd_async().await?;
+                match crate::localipc::connect().await {
+                    Ok(stream) => {
+                        c.bulk.lock().await.local = true;
+                        let (r, w) = tokio::io::split(stream);
+                        Ok((Box::new(r), Box::new(w)))
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => Err(anyhow!(e)),
+                    Err(_) => {
+                        let mut cmd = tokio::process::Command::new(exe);
+                        // --local: tells the daemon this is a local client (bridges started remotely over SSH don't pass it, so local-only methods are refused)
+                        cmd.args(["bridge", "--local"])
+                            .stdin(std::process::Stdio::piped())
+                            .stdout(std::process::Stdio::piped())
+                            .stderr(std::process::Stdio::null())
+                            .kill_on_drop(true);
+                        #[cfg(windows)]
+                        cmd.creation_flags(0x0800_0000);
+                        let mut child = cmd.spawn()?;
+                        let r = child.stdout.take().unwrap();
+                        let w = child.stdin.take().unwrap();
+                        *c.child.lock().unwrap() = Some(child);
+                        c.bulk.lock().await.local = true;
+                        Ok((Box::new(r), Box::new(w)))
+                    }
+                }
             }
             HostKind::Proxy => {
                 // Forwarded through that computer's yi-agentd: open a new relay connection whose first message says which host to reach; after that it's the target yi-agentd itself
@@ -1382,4 +1487,198 @@ pub fn device_name() -> String {
     }
     let h = gethostname::gethostname().to_string_lossy().to_string();
     if h.is_empty() || h == "localhost" { "未命名设备".into() } else { h }
+}
+
+fn local_yi_agentd_sync(yi_agentd_dir: Option<&std::path::Path>) -> Result<PathBuf> {
+    let bundled = bundled_yi_agentd_from(yi_agentd_dir)?;
+    if let Some(dir) = yi_agentd_dir {
+        crate::localbin::sync_extras(dir);
+    }
+    crate::localbin::sync(&bundled).or_else(|e| {
+        eprintln!("同步本机 yi-agentd 失败，直接使用安装包里的: {e:#}");
+        Ok(bundled)
+    })
+}
+
+fn bundled_yi_agentd_from(yi_agentd_dir: Option<&std::path::Path>) -> Result<PathBuf> {
+    let exe = if cfg!(windows) { "yi-agentd.exe" } else { "yi-agentd" };
+    let os = match std::env::consts::OS {
+        "macos" => "macos",
+        o => o,
+    };
+    let mut cands = vec![];
+    if let Ok(p) = std::env::var("YI_CONSOLE_AGENTD") {
+        cands.push(PathBuf::from(p));
+    }
+    if let Some(d) = yi_agentd_dir {
+        cands.push(d.join(exe));
+    }
+    if let Ok(me) = std::env::current_exe() {
+        if let Some(d) = me.parent() {
+            cands.push(d.join(exe));
+        }
+    }
+    if let Some(p) = deploy::local_binary(yi_agentd_dir, os, std::env::consts::ARCH) {
+        cands.push(p);
+    }
+    cands
+        .into_iter()
+        .find(|p| p.is_file())
+        .ok_or_else(|| anyhow!("找不到本机 yi-agentd（可设置环境变量 YI_CONSOLE_AGENTD）"))
+}
+
+#[derive(Debug)]
+enum LocalPreviewErr {
+    IdentityChanged,
+    Other(anyhow::Error),
+}
+
+fn open_local_preview_file(p: &std::path::Path) -> std::io::Result<std::fs::File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(p)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::File::open(p)
+    }
+}
+
+fn local_file_identity(file: &std::fs::File, meta: &std::fs::Metadata) -> Result<crate::preview::FileIdentity> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let _ = file;
+        Ok(crate::preview::FileIdentity {
+            dev: meta.dev(),
+            ino: meta.ino(),
+        })
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION};
+        let _ = meta;
+        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        let ok = unsafe { GetFileInformationByHandle(file.as_raw_handle() as _, &mut info) };
+        if ok == 0 {
+            bail!("获取本地文件标识失败: {}", std::io::Error::last_os_error());
+        }
+        Ok(crate::preview::FileIdentity {
+            dev: info.dwVolumeSerialNumber as u64,
+            ino: ((info.nFileIndexHigh as u64) << 32) | (info.nFileIndexLow as u64),
+        })
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (file, meta);
+        bail!("当前平台不支持校验本地预览文件标识")
+    }
+}
+
+fn read_local_preview(
+    path: &str,
+    root: Option<&str>,
+    expected_id: Option<crate::preview::FileIdentity>,
+    max_bytes: u64,
+) -> std::result::Result<Vec<u8>, LocalPreviewErr> {
+    use std::io::Read;
+    let mut p = crate::localipc::expand_path(path);
+    if let Some(root) = root {
+        let root = std::fs::canonicalize(crate::localipc::expand_path(root)).map_err(|e| LocalPreviewErr::Other(e.into()))?;
+        let real = std::fs::canonicalize(&p).map_err(|e| LocalPreviewErr::Other(e.into()))?;
+        if !real.starts_with(&root) {
+            return Err(LocalPreviewErr::Other(anyhow!("不能读取预览目录以外的文件")));
+        }
+        p = real;
+    }
+    let file = open_local_preview_file(&p).map_err(|e| {
+        if expected_id.is_some() && e.kind() == std::io::ErrorKind::NotFound {
+            LocalPreviewErr::IdentityChanged
+        } else {
+            LocalPreviewErr::Other(e.into())
+        }
+    })?;
+    let meta = file.metadata().map_err(|e| LocalPreviewErr::Other(e.into()))?;
+    if !meta.is_file() {
+        return Err(if expected_id.is_some() {
+            LocalPreviewErr::IdentityChanged
+        } else {
+            LocalPreviewErr::Other(anyhow!("不是有效的文件"))
+        });
+    }
+    if let Some(expected) = expected_id {
+        let actual = local_file_identity(&file, &meta).map_err(LocalPreviewErr::Other)?;
+        if actual != expected {
+            return Err(LocalPreviewErr::IdentityChanged);
+        }
+    }
+    if meta.len() > max_bytes {
+        return Err(LocalPreviewErr::Other(anyhow!("文件太大，超过限制")));
+    }
+    let mut buf = Vec::new();
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut buf)
+        .map_err(|e| LocalPreviewErr::Other(e.into()))?;
+    if buf.len() as u64 > max_bytes {
+        return Err(LocalPreviewErr::Other(anyhow!("文件太大，超过限制")));
+    }
+    Ok(buf)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{local_file_identity, open_local_preview_file, read_local_preview, LocalPreviewErr};
+
+    #[test]
+    fn local_preview_enforces_root_and_regular_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let site = dir.path().join("site");
+        let outside = dir.path().join("secret.txt");
+        std::fs::create_dir_all(&site).unwrap();
+        std::fs::write(&outside, "secret").unwrap();
+        std::fs::write(site.join("ok.txt"), "hello").unwrap();
+
+        assert_eq!(
+            read_local_preview(&site.join("ok.txt").display().to_string(), Some(&site.display().to_string()), None, 50 * 1024 * 1024).unwrap(),
+            b"hello"
+        );
+        assert!(read_local_preview(&outside.display().to_string(), Some(&site.display().to_string()), None, 50 * 1024 * 1024).is_err());
+        assert!(read_local_preview(&site.display().to_string(), None, None, 50 * 1024 * 1024).is_err());
+    }
+
+    #[test]
+    fn local_preview_rejects_replaced_file_and_enforces_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("a.txt");
+        let secret = dir.path().join("secret.txt");
+        std::fs::write(&target, "original").unwrap();
+        std::fs::write(&secret, "secret-data").unwrap();
+
+        let f = open_local_preview_file(&target).unwrap();
+        let meta = f.metadata().unwrap();
+        let id_a = local_file_identity(&f, &meta).unwrap();
+        drop(f);
+
+        assert_eq!(
+            read_local_preview(&target.display().to_string(), None, Some(id_a), 1024).unwrap(),
+            b"original"
+        );
+        assert!(matches!(
+            read_local_preview(&target.display().to_string(), None, Some(id_a), 4),
+            Err(LocalPreviewErr::Other(_))
+        ));
+
+        std::fs::remove_file(&target).unwrap();
+        std::fs::rename(&secret, &target).unwrap();
+
+        assert!(matches!(
+            read_local_preview(&target.display().to_string(), None, Some(id_a), 1024),
+            Err(LocalPreviewErr::IdentityChanged)
+        ));
+    }
 }

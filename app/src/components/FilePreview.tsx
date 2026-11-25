@@ -50,16 +50,153 @@ export function parseCsv(text: string, sep: string, maxRows: number): { rows: st
 }
 
 const MAX_ROWS = 5000;
+const CSV_CELL_MIN_W = 48;
+const CSV_CELL_MAX_W = 280;
+const CSV_CELL_CHROME_W = 24;
+
+let csvMeasureCtx: CanvasRenderingContext2D | null | undefined;
+function getCsvMeasureCtx(): CanvasRenderingContext2D | null {
+  if (csvMeasureCtx !== undefined) return csvMeasureCtx;
+  if (typeof document === 'undefined') {
+    csvMeasureCtx = null;
+    return null;
+  }
+  try {
+    csvMeasureCtx = document.createElement('canvas').getContext('2d');
+  } catch {
+    csvMeasureCtx = null;
+  }
+  return csvMeasureCtx;
+}
+
+function approxDisplayUnits(s: string): number {
+  let units = 0;
+  for (let i = 0; i < s.length; i++) {
+    units += s.charCodeAt(i) > 0x7f ? 1.85 : 1;
+    if (units >= 44) return units;
+  }
+  return units;
+}
+
+function measureCsvWidths(
+  head: string[],
+  rows: string[][],
+  cols: number,
+  fontFamily: string,
+): { rowNumW: number; colWidths: number[]; tableWidth: number } {
+  const rowNumW = Math.max(40, String(Math.max(rows.length, 1)).length * 8 + 22);
+  if (cols <= 0) return { rowNumW, colWidths: [], tableWidth: rowNumW };
+
+  const maxUnits = new Float64Array(cols);
+  const widestBody: string[] = new Array(cols).fill('');
+
+  for (let r = 0; r < rows.length; r++) {
+    const row = rows[r];
+    const n = Math.min(row.length, cols);
+    for (let c = 0; c < n; c++) {
+      if (maxUnits[c] >= 44) continue;
+      const val = row[c];
+      if (!val) continue;
+      const u = approxDisplayUnits(val);
+      if (u > maxUnits[c]) {
+        maxUnits[c] = u;
+        widestBody[c] = val;
+      }
+    }
+  }
+
+  const ctx = getCsvMeasureCtx();
+  const bodyFont = `400 12px ${fontFamily}`;
+  const headFont = `600 12px ${fontFamily}`;
+  const measureStr = (str: string, bold: boolean): number => {
+    if (!str) return 0;
+    if (ctx) {
+      ctx.font = bold ? headFont : bodyFont;
+      return ctx.measureText(str).width;
+    }
+    return approxDisplayUnits(str) * (bold ? 7.6 : 7.2);
+  };
+
+  const colWidths = new Array<number>(cols);
+  let tableWidth = rowNumW;
+  for (let c = 0; c < cols; c++) {
+    const hw = measureStr(head[c] ?? '', true);
+    const bw = measureStr(widestBody[c], false);
+    const w = Math.min(CSV_CELL_MAX_W, Math.max(CSV_CELL_MIN_W, Math.ceil(Math.max(hw, bw) + CSV_CELL_CHROME_W)));
+    colWidths[c] = w;
+    tableWidth += w;
+  }
+  return { rowNumW, colWidths, tableWidth };
+}
 
 export function CsvView({ text, tsv }: { text: string; tsv: boolean }) {
   const { rows, more } = useMemo(() => parseCsv(text, tsv ? '\t' : ',', MAX_ROWS), [text, tsv]);
   const [header, setHeader] = useState(true);
   const [q, setQ] = useState('');
-  const head = header ? rows[0] ?? [] : [];
-  const body = header ? rows.slice(1) : rows;
-  const cols = Math.max(0, ...rows.map((r) => r.length));
-  const ql = q.trim().toLowerCase();
-  const shown = ql ? body.filter((r) => r.some((c) => c.toLowerCase().includes(ql))) : body;
+  const dq = useDeferredValue(q);
+  const head = useMemo(() => (header ? rows[0] ?? [] : []), [header, rows]);
+  const body = useMemo(() => (header ? rows.slice(1) : rows), [header, rows]);
+  const cols = useMemo(() => Math.max(0, ...rows.map((r) => r.length)), [rows]);
+  const ql = dq.trim().toLowerCase();
+  const shown = useMemo(
+    () => (ql ? body.filter((r) => r.some((c) => c.toLowerCase().includes(ql))) : body),
+    [body, ql],
+  );
+  const fontFamily = useMemo(() => {
+    if (typeof window === 'undefined' || typeof document === 'undefined') return 'sans-serif';
+    return getComputedStyle(document.body).fontFamily || 'sans-serif';
+  }, []);
+  const { rowNumW, colWidths, tableWidth } = useMemo(
+    () => measureCsvWidths(head, shown, cols, fontFamily),
+    [head, shown, cols, fontFamily],
+  );
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const tbodyRef = useRef<HTMLTableSectionElement>(null);
+  const [rowH, setRowH] = useState(24);
+  const rowHRef = useRef(rowH);
+  rowHRef.current = rowH;
+  const virtual = shown.length > 120;
+  const OVERSCAN = 20;
+  const [win, setWin] = useState<[number, number]>([0, 60]);
+
+  useLayoutEffect(() => {
+    const el = scrollRef.current;
+    if (!virtual || !el) return;
+    let raf = 0;
+    const calc = () => {
+      const sample = tbodyRef.current?.querySelector<HTMLElement>('tr:not(.csv-spacer)');
+      const h = sample?.offsetHeight || rowHRef.current;
+      if (h !== rowHRef.current) setRowH(h);
+      const topOffset = tbodyRef.current?.offsetTop ?? 0;
+      const viewTop = Math.max(0, el.scrollTop - topOffset);
+      const viewBot = Math.max(0, el.scrollTop + el.clientHeight - topOffset);
+      const from = Math.max(0, Math.floor(viewTop / h) - OVERSCAN);
+      const to = Math.min(shown.length, Math.ceil(viewBot / h) + OVERSCAN);
+      setWin((p) => (p[0] === from && p[1] === to ? p : [from, to]));
+    };
+    const onScroll = () => {
+      if (raf) return;
+      raf = requestAnimationFrame(() => {
+        raf = 0;
+        calc();
+      });
+    };
+    calc();
+    el.addEventListener('scroll', onScroll, { passive: true });
+    const ro = new ResizeObserver(onScroll);
+    ro.observe(el);
+    return () => {
+      el.removeEventListener('scroll', onScroll);
+      ro.disconnect();
+      if (raf) cancelAnimationFrame(raf);
+    };
+  }, [virtual, shown.length, header]);
+
+  const from = virtual ? Math.min(win[0], shown.length) : 0;
+  const to = virtual ? Math.min(Math.max(win[1], from), shown.length) : shown.length;
+  const topPad = from * rowH;
+  const botPad = (shown.length - to) * rowH;
+
   return (
     <div className="csv">
       <div className="csv-bar">
@@ -73,8 +210,16 @@ export function CsvView({ text, tsv }: { text: string; tsv: boolean }) {
         <div className="grow" />
         <input className="csv-filter" value={q} placeholder={t('filterRows')} onChange={(e) => setQ(e.target.value)} />
       </div>
-      <div className="csv-scroll">
-        <table>
+      <div className="csv-scroll" ref={scrollRef}>
+        <table style={cols > 0 ? { tableLayout: 'fixed', width: tableWidth } : undefined}>
+          {cols > 0 && (
+            <colgroup>
+              <col style={{ width: rowNumW }} />
+              {colWidths.map((w, i) => (
+                <col key={i} style={{ width: w }} />
+              ))}
+            </colgroup>
+          )}
           {head.length > 0 && (
             <thead>
               <tr>
@@ -87,17 +232,30 @@ export function CsvView({ text, tsv }: { text: string; tsv: boolean }) {
               </tr>
             </thead>
           )}
-          <tbody>
-            {shown.map((r, i) => (
-              <tr key={i}>
-                <td className="csv-n">{i + 1}</td>
-                {Array.from({ length: cols }, (_, k) => (
-                  <td key={k} title={r[k]}>
-                    {r[k] ?? ''}
-                  </td>
-                ))}
+          <tbody ref={tbodyRef}>
+            {virtual && topPad > 0 && (
+              <tr className="csv-spacer" aria-hidden="true">
+                <td colSpan={cols + 1} style={{ height: topPad }} />
               </tr>
-            ))}
+            )}
+            {shown.slice(from, to).map((r, idx) => {
+              const i = from + idx;
+              return (
+                <tr key={i}>
+                  <td className="csv-n">{i + 1}</td>
+                  {Array.from({ length: cols }, (_, k) => (
+                    <td key={k} title={r[k]}>
+                      {r[k] ?? ''}
+                    </td>
+                  ))}
+                </tr>
+              );
+            })}
+            {virtual && botPad > 0 && (
+              <tr className="csv-spacer" aria-hidden="true">
+                <td colSpan={cols + 1} style={{ height: botPad }} />
+              </tr>
+            )}
           </tbody>
         </table>
         {more && <div className="muted small csv-more">{t('showingTheFirstRowsSwitch', { MAX_ROWS })}</div>}
@@ -107,25 +265,69 @@ export function CsvView({ text, tsv }: { text: string; tsv: boolean }) {
 }
 
 /** PDFs use the browser engine's built-in viewer (WebView2 / Chromium have one; unsupported systems show a download button) */
-export function PdfView({ base64, onDownload }: { base64: string; onDownload: () => void }) {
-  const url = useMemo(() => {
-    const bin = atob(base64);
-    const buf = new Uint8Array(bin.length);
-    for (let i = 0; i < bin.length; i++) buf[i] = bin.charCodeAt(i);
-    return URL.createObjectURL(new Blob([buf], { type: 'application/pdf' }));
-  }, [base64]);
-  useEffect(() => () => URL.revokeObjectURL(url), [url]);
+export function PdfView({ src, base64, onDownload }: { src?: string; base64?: string; onDownload: () => void }) {
   const supported = typeof navigator !== 'undefined' && (navigator as Navigator & { pdfViewerEnabled?: boolean }).pdfViewerEnabled !== false;
-  return supported ? (
-    <iframe className="wp-pdf" src={url} title={t('pdfPreview')} />
-  ) : (
-    <div className="wp-empty">
-      <div className="wp-empty-title">{t('pdfPreviewIsNotAvailable')}</div>
-      <button className="btn small" onClick={onDownload}>
-        {t('download')}
-      </button>
-    </div>
-  );
+  const [blobUrl, setBlobUrl] = useState<string | null>(null);
+  const [err, setErr] = useState(false);
+
+  useEffect(() => {
+    setBlobUrl(null);
+    setErr(false);
+    if (!supported || src || !base64) return;
+    let cancelled = false;
+    let created: string | null = null;
+    fetch(`data:application/pdf;base64,${base64}`)
+      .then((r) => r.blob())
+      .catch(
+        () =>
+          new Promise<Blob>((resolve, reject) => {
+            window.setTimeout(() => {
+              try {
+                const bin = atob(base64);
+                const buf = new Uint8Array(bin.length);
+                for (let i = 0; i < bin.length; i++) buf[i] = bin.charCodeAt(i);
+                resolve(new Blob([buf], { type: 'application/pdf' }));
+              } catch (e) {
+                reject(e);
+              }
+            }, 0);
+          }),
+      )
+      .then((blob) => {
+        if (cancelled) return;
+        const u = URL.createObjectURL(blob);
+        created = u;
+        setBlobUrl(u);
+      })
+      .catch(() => !cancelled && setErr(true));
+    return () => {
+      cancelled = true;
+      if (created) URL.revokeObjectURL(created);
+    };
+  }, [src, base64, supported]);
+
+  if (!supported || err) {
+    return (
+      <div className="wp-empty">
+        <div className="wp-empty-title">{t('pdfPreviewIsNotAvailable')}</div>
+        <button className="btn small" onClick={onDownload}>
+          {t('download')}
+        </button>
+      </div>
+    );
+  }
+  const url = src || blobUrl;
+  if (!url) {
+    return (
+      <div className="wp-empty">
+        <div className="muted small wp-tip-loading" role="status">
+          <span className="spinner mini" />
+          <span>{t('loadingPdf')}</span>
+        </div>
+      </div>
+    );
+  }
+  return <iframe className="wp-pdf" src={url} title={t('pdfPreview')} />;
 }
 
 // ---------- Markdown ----------
@@ -290,7 +492,7 @@ export function MdPreview({
       img.addEventListener(
         'load',
         () => {
-          fitTables(el);
+          if (el.querySelector('.md-table-wrap')) fitTables(el);
           measure();
         },
         { once: true },
@@ -298,21 +500,30 @@ export function MdPreview({
     }
   }, [html, lang]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Width changed (panel dragged, rewrapped): refit tables and re-measure anchors
+  // Width changed (panel dragged, rewrapped): refit tables and re-measure anchors (coalesced during drag)
   useEffect(() => {
     const el = box.current;
     if (!el) return;
     let prevW = el.clientWidth;
+    let timer = 0;
     const ro = new ResizeObserver(() => {
-      const nextW = el.clientWidth;
-      if (nextW && nextW !== prevW) {
-        prevW = nextW;
-        fitTables(el);
-      }
-      measure();
+      if (timer) window.clearTimeout(timer);
+      const delay = document.body.classList.contains('resizing') ? 90 : 32;
+      timer = window.setTimeout(() => {
+        timer = 0;
+        const nextW = el.clientWidth;
+        if (nextW && nextW !== prevW) {
+          prevW = nextW;
+          if (el.querySelector('.md-table-wrap')) fitTables(el);
+        }
+        measure();
+      }, delay);
     });
     ro.observe(el);
-    return () => ro.disconnect();
+    return () => {
+      ro.disconnect();
+      if (timer) window.clearTimeout(timer);
+    };
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   const scrollToLine = (L: number) => {
@@ -383,6 +594,7 @@ const clampScale = (v: number) => Math.min(16, Math.max(0.05, v));
 export function ImageView({ src, name, size }: { src: string; name: string; size: string }) {
   const box = useRef<HTMLDivElement>(null);
   const [nat, setNat] = useState<{ w: number; h: number } | null>(null);
+  const [err, setErr] = useState(false);
   const [boxSize, setBoxSize] = useState({ w: 0, h: 0 });
   // A null scale means "fit to window" and follows the panel size
   const [scale, setScale] = useState<number | null>(null);
@@ -391,6 +603,11 @@ export function ImageView({ src, name, size }: { src: string; name: string; size
   const [pos, setPos] = useState({ x: 0, y: 0 });
   const pointers = useRef(new Map<number, { x: number; y: number }>());
   const gesture = useRef<{ x: number; y: number; px: number; py: number; dist: number; s: number } | null>(null);
+
+  useEffect(() => {
+    setNat(null);
+    setErr(false);
+  }, [src]);
 
   useEffect(() => {
     const el = box.current;
@@ -479,19 +696,31 @@ export function ImageView({ src, name, size }: { src: string; name: string; size
         zoomTo(Math.max(1, fitScale * 2), cx, cy);
       } else fit();
     }}>
-      <img
-        src={src}
-        alt={t('imagePreview', { name })}
-        draggable={false}
-        onLoad={(e) => setNat({ w: e.currentTarget.naturalWidth, h: e.currentTarget.naturalHeight })}
-        style={{
-          width: nat?.w,
-          height: nat?.h,
-          visibility: nat ? 'visible' : 'hidden',
-          transform: `translate(-50%, -50%) translate(${pos.x}px, ${pos.y}px) rotate(${rot}deg) scale(${flip ? -s : s}, ${s})`,
-          imageRendering: s >= 3 ? 'pixelated' : undefined,
-        }}
-      />
+      {!nat && !err && (
+        <div className="img-loading" role="status">
+          <span className="spinner" />
+        </div>
+      )}
+      {err ? (
+        <div className="img-loading" role="alert">
+          <span className="muted small">{t('imageLoadFailed')}</span>
+        </div>
+      ) : (
+        <img
+          src={src}
+          alt={t('imagePreview', { name })}
+          draggable={false}
+          onLoad={(e) => setNat({ w: e.currentTarget.naturalWidth, h: e.currentTarget.naturalHeight })}
+          onError={() => setErr(true)}
+          style={{
+            width: nat?.w,
+            height: nat?.h,
+            visibility: nat ? 'visible' : 'hidden',
+            transform: `translate(-50%, -50%) translate(${pos.x}px, ${pos.y}px) rotate(${rot}deg) scale(${flip ? -s : s}, ${s})`,
+            imageRendering: s >= 3 ? 'pixelated' : undefined,
+          }}
+        />
+      )}
       <div className="iv-bar" onDoubleClick={(e) => e.stopPropagation()}>
         <button title={t('zoomOut')} onClick={() => zoomTo(s / 1.25)}>
           <Icon name="zoom-out" size={15} />

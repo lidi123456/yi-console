@@ -29,6 +29,13 @@ fn git_cmd(cwd: &Path, args: &[&str]) -> Command {
     // agent's git commit landing at the same moment would fail with "index.lock exists" (VS Code sets the same)
     cmd.env("GIT_OPTIONAL_LOCKS", "0");
     cmd.env("GIT_TERMINAL_PROMPT", "0");
+    // Treat paths after `--` as exact filenames rather than pathspec globs or magic signatures
+    // (`git check-ignore` does not support the literal pathspec magic).
+    if args.first() != Some(&"check-ignore") {
+        cmd.env("GIT_LITERAL_PATHSPECS", "1");
+    } else {
+        cmd.env_remove("GIT_LITERAL_PATHSPECS");
+    }
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -209,10 +216,18 @@ pub fn normalize_repo_rel(cwd: &str, raw: &str) -> Option<String> {
     Some(rel)
 }
 
-/// Paths must stay inside the repo, so things like ../ can't escape it
+/// Paths must stay inside the repo, so things like ../ or absolute paths can't escape it.
+/// Leading `-` filenames (e.g. `-draft.txt`) are allowed and always passed after `--` with GIT_LITERAL_PATHSPECS=1.
 pub(crate) fn check_paths(paths: &[String]) -> Result<()> {
+    use std::path::Component;
     for p in paths {
-        if p.is_empty() || p.starts_with('-') || Path::new(p).is_absolute() || p.split(['/', '\\']).any(|c| c == "..") {
+        if p.is_empty()
+            || p.contains('\0')
+            || p.starts_with(['/', '\\'])
+            || Path::new(p).is_absolute()
+            || Path::new(p).components().any(|c| matches!(c, Component::Prefix(_) | Component::RootDir | Component::ParentDir))
+            || p.split(['/', '\\']).any(|c| c == "..")
+        {
             bail!("路径无效: {p}");
         }
     }
@@ -224,9 +239,37 @@ pub fn changes(cwd: &str) -> Result<Value> {
     changes_with(cwd, true, None)
 }
 
+/// Expand requested paths with any staged rename/copy counterpart so `git status -- <paths>` still detects `R`/`C`.
+fn expand_staged_rename_paths(root: &Path, paths: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = paths.to_vec();
+    let Ok(diff) = git_ok(root, &["diff", "--cached", "--diff-filter=RC", "--name-status", "-M", "-z"]) else {
+        return out;
+    };
+    let mut it = diff.split('\0').filter(|s| !s.is_empty());
+    while let Some(status) = it.next() {
+        if !(status.starts_with('R') || status.starts_with('C')) {
+            continue;
+        }
+        let Some(old_path) = it.next() else { break };
+        let Some(new_path) = it.next() else { break };
+        if paths.iter().any(|p| p == old_path || p == new_path) {
+            if !out.iter().any(|p| p == old_path) {
+                out.push(old_path.to_string());
+            }
+            if !out.iter().any(|p| p == new_path) {
+                out.push(new_path.to_string());
+            }
+        }
+    }
+    out
+}
+
 /// with_diff=false only lists statuses without diffs (running git diff per file is slow in a big repo with many changes);
 /// if only is given, return just those paths (relative to the repo root), used to fetch one file's diff
 pub fn changes_with(cwd: &str, with_diff: bool, only: Option<&[String]>) -> Result<Value> {
+    if let Some(o) = only {
+        check_paths(o)?;
+    }
     let dir = crate::paths::expand(cwd);
     let Some(root) = repo_root(&dir) else {
         return Ok(json!({ "repo": null, "files": [], "ignored": [] }));
@@ -234,20 +277,46 @@ pub fn changes_with(cwd: &str, with_diff: bool, only: Option<&[String]>) -> Resu
     let branch = git_ok(&root, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap_or_default();
     // Current commit: the frontend refreshes the commit history when it changes (null in a repo with no commits yet)
     let head = git_ok(&root, &["rev-parse", "--verify", "-q", "HEAD"]).ok().map(|s| s.trim().to_string());
+    if only.is_some_and(|o| o.is_empty()) {
+        return Ok(json!({
+            "repo": root.display().to_string(),
+            "branch": branch.trim(),
+            "head": head,
+            "total": Value::Null,
+            "files": [],
+            "ignored": [],
+        }));
+    }
+    let expanded_only: Option<Vec<String>> = only
+        .filter(|p| !p.is_empty())
+        .map(|p| expand_staged_rename_paths(&root, p));
+    let effective_only = expanded_only.as_deref().or(only);
     // Include ignored entries only for full listings; --ignored=matching stops at ignored directory boundaries
     // (avoiding a walk into node_modules/target), falling back for very old git (< 2.16) that lacks it
-    let status = if only.is_none() {
-        git_ok(&root, &["status", "--porcelain=v1", "-z", "-uall", "--ignored=matching"])
-            .or_else(|_| git_ok(&root, &["status", "--porcelain=v1", "-z", "-uall"]))?
-    } else {
-        git_ok(&root, &["status", "--porcelain=v1", "-z", "-uall"])?
+    let status = match effective_only {
+        None => git_ok(&root, &["status", "--porcelain=v1", "-b", "-z", "-uall", "--ignored=matching"])
+            .or_else(|_| git_ok(&root, &["status", "--porcelain=v1", "-b", "-z", "-uall"]))?,
+        Some(paths) => {
+            let mut args = vec!["status", "--porcelain=v1", "-z", "-uall", "--"];
+            args.extend(paths.iter().map(String::as_str));
+            git_ok(&root, &args)?
+        }
     };
-    let stats = numstat(&root);
+    let stats = numstat(&root, effective_only);
+    let root_canon = root.canonicalize().ok();
     let mut files = vec![];
     let mut ignored = vec![];
+    let mut ahead: Option<u64> = None;
+    let mut behind: Option<u64> = None;
     let (mut total, mut counted) = (0usize, 0usize);
     let mut it = status.split('\0').filter(|s| !s.is_empty());
     while let Some(entry) = it.next() {
+        if entry.starts_with("## ") {
+            let (a, b) = parse_status_branch_track(entry);
+            ahead = a;
+            behind = b;
+            continue;
+        }
         if entry.len() < 4 {
             continue;
         }
@@ -285,7 +354,7 @@ pub fn changes_with(cwd: &str, with_diff: bool, only: Option<&[String]>) -> Resu
         let diff = if !with_diff {
             String::new()
         } else if untracked {
-            untracked_diff(&root, path)
+            untracked_diff(&root, root_canon.as_deref(), path)
         } else {
             let d = if let Some(ref old) = old_path {
                 git_ok(&root, &["diff", "HEAD", "-M", "--no-color", "--", old, path]).unwrap_or_default()
@@ -301,7 +370,7 @@ pub fn changes_with(cwd: &str, with_diff: bool, only: Option<&[String]>) -> Resu
         // Lines added / removed: null for binaries, files too large, and repos without HEAD
         let (added, deleted) = if untracked {
             counted += 1;
-            (if counted <= COUNT_MAX { count_lines(&root, path) } else { None }, Some(0))
+            (if counted <= COUNT_MAX { count_lines(&root, root_canon.as_deref(), path) } else { None }, Some(0))
         } else {
             stats.get(path).copied().unwrap_or((None, None))
         };
@@ -317,7 +386,7 @@ pub fn changes_with(cwd: &str, with_diff: bool, only: Option<&[String]>) -> Resu
         }
         files.push(item);
     }
-    Ok(json!({
+    let mut res = json!({
         "repo": root.display().to_string(),
         "branch": branch.trim(),
         "head": head,
@@ -326,14 +395,24 @@ pub fn changes_with(cwd: &str, with_diff: bool, only: Option<&[String]>) -> Resu
         "files": files,
         // Ignored paths relative to the repo root (directories end with '/')
         "ignored": ignored,
-    }))
+    });
+    if only.is_none() {
+        res["ahead"] = json!(ahead);
+        res["behind"] = json!(behind);
+    }
+    Ok(res)
 }
 
 /// Lines added/removed relative to HEAD for tracked files, computed in one git diff --numstat (no per-file diff runs);
 /// git reports "-" for binary files, recorded as None
-fn numstat(root: &Path) -> std::collections::HashMap<String, (Option<u64>, Option<u64>)> {
+fn numstat(root: &Path, only: Option<&[String]>) -> std::collections::HashMap<String, (Option<u64>, Option<u64>)> {
     let mut m = std::collections::HashMap::new();
-    let Ok(out) = git_ok(root, &["diff", "HEAD", "--numstat", "-z", "--no-renames"]) else {
+    let mut args = vec!["diff", "HEAD", "--numstat", "-z", "--no-renames"];
+    if let Some(paths) = only.filter(|p| !p.is_empty()) {
+        args.push("--");
+        args.extend(paths.iter().map(String::as_str));
+    }
+    let Ok(out) = git_ok(root, &args) else {
         return m;
     };
     for rec in out.split('\0').filter(|s| !s.is_empty()) {
@@ -347,7 +426,7 @@ fn numstat(root: &Path) -> std::collections::HashMap<String, (Option<u64>, Optio
 }
 
 /// Line count of a new file; symlinks count as 1 without following; not counted for files too large, binary, or outside the repo
-fn count_lines(root: &Path, rel: &str) -> Option<u64> {
+fn count_lines(root: &Path, can_root: Option<&Path>, rel: &str) -> Option<u64> {
     let full = root.join(rel);
     let meta = std::fs::symlink_metadata(&full).ok()?;
     if meta.file_type().is_symlink() {
@@ -356,9 +435,16 @@ fn count_lines(root: &Path, rel: &str) -> Option<u64> {
     if !meta.is_file() || meta.len() as usize > DIFF_MAX {
         return None;
     }
-    let can_root = root.canonicalize().ok()?;
+    let owned_root;
+    let can_root = match can_root {
+        Some(r) => r,
+        None => {
+            owned_root = root.canonicalize().ok()?;
+            &owned_root
+        }
+    };
     let can_full = full.canonicalize().ok()?;
-    if !can_full.starts_with(&can_root) {
+    if !can_full.starts_with(can_root) {
         return None;
     }
     let b = std::fs::read(&can_full).ok()?;
@@ -479,32 +565,42 @@ pub fn show(cwd: &str, hash: &str, only: Option<&[String]>) -> Result<Value> {
     let mut it = info.splitn(3, FS);
     let (author, time, message) = (it.next().unwrap_or(""), it.next().unwrap_or("0"), it.next().unwrap_or(""));
 
-    let mut stats = std::collections::HashMap::new();
-    for rec in git_ok(&root, &["diff", "--numstat", "-z", "--no-renames", &base, &full])?.split('\0').filter(|s| !s.is_empty()) {
-        let mut f = rec.splitn(3, '\t');
-        if let (Some(a), Some(d), Some(path)) = (f.next(), f.next(), f.next()) {
-            stats.insert(path.to_string(), (a.parse::<u64>().ok(), d.parse::<u64>().ok()));
-        }
-    }
-    let names = git_ok(&root, &["diff", "--name-status", "-z", "--no-renames", &base, &full])?;
     let mut files = vec![];
-    let mut parts = names.split('\0').filter(|s| !s.is_empty());
-    while let (Some(code), Some(path)) = (parts.next(), parts.next()) {
-        if only.is_some_and(|o| !o.iter().any(|x| x == path)) {
-            continue;
+    if !only.is_some_and(|o| o.is_empty()) {
+        let mut num_args = vec!["diff", "--numstat", "-z", "--no-renames", &base, &full];
+        let mut name_args = vec!["diff", "--name-status", "-z", "--no-renames", &base, &full];
+        if let Some(paths) = only.filter(|p| !p.is_empty()) {
+            num_args.push("--");
+            num_args.extend(paths.iter().map(String::as_str));
+            name_args.push("--");
+            name_args.extend(paths.iter().map(String::as_str));
         }
-        let diff = if only.is_some() {
-            let d = git_ok(&root, &["diff", "--no-color", &base, &full, "--", path]).unwrap_or_default();
-            if d.len() > DIFF_MAX {
-                String::new()
-            } else {
-                d
+        let mut stats = std::collections::HashMap::new();
+        for rec in git_ok(&root, &num_args)?.split('\0').filter(|s| !s.is_empty()) {
+            let mut f = rec.splitn(3, '\t');
+            if let (Some(a), Some(d), Some(path)) = (f.next(), f.next(), f.next()) {
+                stats.insert(path.to_string(), (a.parse::<u64>().ok(), d.parse::<u64>().ok()));
             }
-        } else {
-            String::new()
-        };
-        let (added, deleted) = stats.get(path).copied().unwrap_or((None, None));
-        files.push(json!({ "path": path, "status": code, "added": added, "deleted": deleted, "diff": diff }));
+        }
+        let names = git_ok(&root, &name_args)?;
+        let mut parts = names.split('\0').filter(|s| !s.is_empty());
+        while let (Some(code), Some(path)) = (parts.next(), parts.next()) {
+            if only.is_some_and(|o| !o.iter().any(|x| x == path)) {
+                continue;
+            }
+            let diff = if only.is_some() {
+                let d = git_ok(&root, &["diff", "--no-color", &base, &full, "--", path]).unwrap_or_default();
+                if d.len() > DIFF_MAX {
+                    String::new()
+                } else {
+                    d
+                }
+            } else {
+                String::new()
+            };
+            let (added, deleted) = stats.get(path).copied().unwrap_or((None, None));
+            files.push(json!({ "path": path, "status": code, "added": added, "deleted": deleted, "diff": diff }));
+        }
     }
     Ok(json!({
         "repo": root.display().to_string(),
@@ -1953,40 +2049,63 @@ pub fn worktrees_with(cwd: &str, details: bool) -> Result<Value> {
 
 /// Detect the repository's default branch name (origin/HEAD -> local main/master -> origin/main|master -> current branch)
 fn detect_default_branch(root: &Path) -> Option<String> {
-    if let Ok(sym) = git_ok(root, &["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"]) {
-        let sym = sym.trim();
+    let mut candidates: Vec<String> = Vec::with_capacity(5);
+    let sym = git_ok(root, &["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"])
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    if let Some(ref sym) = sym {
         let short = sym.strip_prefix("origin/").unwrap_or(sym);
         if !short.is_empty() {
-            if git(root, &["show-ref", "--verify", "--quiet", &format!("refs/heads/{short}")])
-                .is_ok_and(|o| o.status.success())
-            {
-                return Some(short.to_string());
-            }
-            if git(root, &["show-ref", "--verify", "--quiet", &format!("refs/remotes/{sym}")])
-                .is_ok_and(|o| o.status.success())
-            {
-                return Some(sym.to_string());
-            }
+            candidates.push(format!("refs/heads/{short}"));
+        }
+        candidates.push(format!("refs/remotes/{sym}"));
+    }
+    for cand in ["refs/heads/main", "refs/heads/master", "refs/remotes/origin/main", "refs/remotes/origin/master"] {
+        if !candidates.iter().any(|c| c == cand) {
+            candidates.push(cand.to_string());
         }
     }
-    for cand in ["main", "master"] {
-        if git(root, &["show-ref", "--verify", "--quiet", &format!("refs/heads/{cand}")])
-            .is_ok_and(|o| o.status.success())
-        {
-            return Some(cand.to_string());
-        }
-    }
-    for cand in ["origin/main", "origin/master"] {
-        if git(root, &["show-ref", "--verify", "--quiet", &format!("refs/remotes/{cand}")])
-            .is_ok_and(|o| o.status.success())
-        {
-            return Some(cand.to_string());
+    let mut args = vec!["for-each-ref", "--format=%(refname)"];
+    args.extend(candidates.iter().map(String::as_str));
+    if let Ok(out) = git_ok(root, &args) {
+        let present: std::collections::HashSet<&str> = out.lines().map(str::trim).filter(|s| !s.is_empty()).collect();
+        for full_ref in &candidates {
+            if present.contains(full_ref.as_str()) {
+                return Some(
+                    full_ref
+                        .strip_prefix("refs/heads/")
+                        .or_else(|| full_ref.strip_prefix("refs/remotes/"))
+                        .unwrap_or(full_ref)
+                        .to_string(),
+                );
+            }
         }
     }
     git_ok(root, &["symbolic-ref", "--quiet", "--short", "HEAD"])
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+}
+
+/// Parse ahead/behind counts from a `git status --porcelain=v1 -b -z` leading `## ...` record.
+/// Returns `(None, None)` when there is no upstream or upstream is `[gone]`, and `(Some(ahead), Some(behind))` when tracked.
+fn parse_status_branch_track(header: &str) -> (Option<u64>, Option<u64>) {
+    let Some(rest) = header.strip_prefix("## ") else {
+        return (None, None);
+    };
+    let Some((_, after_dots)) = rest.split_once("...") else {
+        return (None, None);
+    };
+    if let Some((_, bracket)) = after_dots.split_once(" [") {
+        let trimmed = bracket.trim_end_matches(']');
+        if trimmed.split(',').any(|p| p.trim() == "gone") {
+            return (None, None);
+        }
+        let (ahead, behind) = parse_track(trimmed);
+        return (Some(ahead.unwrap_or(0)), Some(behind.unwrap_or(0)));
+    }
+    (Some(0), Some(0))
 }
 
 /// Parse `[ahead 2, behind 1]` / `[ahead 3]` / `[behind 1]` from `%(upstream:track)`
@@ -2417,7 +2536,7 @@ pub fn branch_delete(cwd: &str, branch: &str, force: bool) -> Result<Value> {
 }
 
 /// Build a unified diff for an untracked file on disk (link target text for symlinks; empty for outside paths, binaries, or oversized files)
-fn untracked_diff(root: &Path, path: &str) -> String {
+fn untracked_diff(root: &Path, can_root: Option<&Path>, path: &str) -> String {
     let full = root.join(path);
     let Ok(meta) = std::fs::symlink_metadata(&full) else {
         return String::new();
@@ -2435,10 +2554,21 @@ fn untracked_diff(root: &Path, path: &str) -> String {
     if !meta.is_file() || meta.len() as usize > DIFF_MAX {
         return String::new();
     }
-    let (Ok(can_root), Ok(can_full)) = (root.canonicalize(), full.canonicalize()) else {
+    let owned_root;
+    let can_root = match can_root {
+        Some(r) => r,
+        None => {
+            let Ok(r) = root.canonicalize() else {
+                return String::new();
+            };
+            owned_root = r;
+            &owned_root
+        }
+    };
+    let Ok(can_full) = full.canonicalize() else {
         return String::new();
     };
-    if !can_full.starts_with(&can_root) {
+    if !can_full.starts_with(can_root) {
         return String::new();
     }
     match std::fs::read(&can_full) {
@@ -2491,9 +2621,31 @@ pub fn branch_diff(cwd: &str, base: Option<&str>, with_diff: bool, only: Option<
         return Ok(json!({ "repo": root.display().to_string(), "branch": branch, "base": chosen_base, "mergeBase": null, "files": [] }));
     };
     let merge_base = mb_raw.trim().to_string();
+    if only.is_some_and(|o| o.is_empty()) {
+        return Ok(json!({
+            "repo": root.display().to_string(),
+            "branch": branch,
+            "base": chosen_base,
+            "mergeBase": merge_base,
+            "total": Value::Null,
+            "files": [],
+        }));
+    }
+
+    let mut num_args = vec!["diff", "--numstat", "-z", "--no-renames", &merge_base];
+    let mut name_args = vec!["diff", "--name-status", "-z", "--no-renames", &merge_base];
+    let mut ls_args = vec!["ls-files", "--others", "--exclude-standard", "-z"];
+    if let Some(paths) = only.filter(|p| !p.is_empty()) {
+        num_args.push("--");
+        num_args.extend(paths.iter().map(String::as_str));
+        name_args.push("--");
+        name_args.extend(paths.iter().map(String::as_str));
+        ls_args.push("--");
+        ls_args.extend(paths.iter().map(String::as_str));
+    }
 
     let mut stats = std::collections::HashMap::new();
-    if let Ok(out) = git_ok(&root, &["diff", "--numstat", "-z", "--no-renames", &merge_base]) {
+    if let Ok(out) = git_ok(&root, &num_args) {
         for rec in out.split('\0').filter(|s| !s.is_empty()) {
             let mut it = rec.splitn(3, '\t');
             if let (Some(a), Some(d), Some(path)) = (it.next(), it.next(), it.next()) {
@@ -2504,14 +2656,14 @@ pub fn branch_diff(cwd: &str, base: Option<&str>, with_diff: bool, only: Option<
 
     let mut entries: Vec<(String, String, bool)> = Vec::new();
     let mut seen = std::collections::HashSet::new();
-    let names = git_ok(&root, &["diff", "--name-status", "-z", "--no-renames", &merge_base])?;
+    let names = git_ok(&root, &name_args)?;
     let mut parts = names.split('\0').filter(|s| !s.is_empty());
     while let (Some(code), Some(path)) = (parts.next(), parts.next()) {
         if seen.insert(path.to_string()) {
             entries.push((path.to_string(), code.to_string(), false));
         }
     }
-    if let Ok(untracked) = git_ok(&root, &["ls-files", "--others", "--exclude-standard", "-z"]) {
+    if let Ok(untracked) = git_ok(&root, &ls_args) {
         for path in untracked.split('\0').filter(|s| !s.is_empty()) {
             if seen.insert(path.to_string()) {
                 entries.push((path.to_string(), "new".to_string(), true));
@@ -2520,6 +2672,7 @@ pub fn branch_diff(cwd: &str, base: Option<&str>, with_diff: bool, only: Option<
     }
     entries.sort_by(|a, b| a.0.cmp(&b.0));
 
+    let root_canon = root.canonicalize().ok();
     let total = entries.len();
     let mut files = Vec::new();
     let mut counted = 0usize;
@@ -2530,14 +2683,14 @@ pub fn branch_diff(cwd: &str, base: Option<&str>, with_diff: bool, only: Option<
         let diff = if !with_diff {
             String::new()
         } else if is_untracked {
-            untracked_diff(&root, &path)
+            untracked_diff(&root, root_canon.as_deref(), &path)
         } else {
             let d = git_ok(&root, &["diff", &merge_base, "--no-color", "--", &path]).unwrap_or_default();
             if d.len() > DIFF_MAX { String::new() } else { d }
         };
         let (added, deleted) = if is_untracked {
             counted += 1;
-            (if counted <= COUNT_MAX { count_lines(&root, &path) } else { None }, Some(0))
+            (if counted <= COUNT_MAX { count_lines(&root, root_canon.as_deref(), &path) } else { None }, Some(0))
         } else {
             stats.get(&path).copied().unwrap_or((None, None))
         };
@@ -2781,6 +2934,7 @@ pub fn review_scope(cwd: &str, params: &Value) -> Result<Value> {
             let stats = parse_numstat_with_binary(&stats_out);
 
             let total = entries.len();
+            let root_canon = root.canonicalize().ok();
             let mut files = Vec::new();
             let mut counted = 0usize;
             for (path, old_path, st, is_untracked, is_staged) in entries {
@@ -2793,7 +2947,7 @@ pub fn review_scope(cwd: &str, params: &Value) -> Result<Value> {
                 let diff = if !with_diff {
                     String::new()
                 } else if is_untracked {
-                    untracked_diff(&root, &path)
+                    untracked_diff(&root, root_canon.as_deref(), &path)
                 } else {
                     let mut args = vec!["diff"];
                     if filter == "staged" || !has_head {
@@ -2986,6 +3140,7 @@ pub fn review_scope(cwd: &str, params: &Value) -> Result<Value> {
             entries.sort_by(|a, b| a.0.cmp(&b.0));
 
             let total = entries.len();
+            let root_canon = root.canonicalize().ok();
             let mut files = Vec::new();
             let mut counted = 0usize;
             for (path, code, is_untracked) in entries {
@@ -2995,7 +3150,7 @@ pub fn review_scope(cwd: &str, params: &Value) -> Result<Value> {
                 let diff = if !with_diff {
                     String::new()
                 } else if is_untracked {
-                    untracked_diff(&root, &path)
+                    untracked_diff(&root, root_canon.as_deref(), &path)
                 } else {
                     let d = git_ok(&root, &["diff", &merge_base, "--no-color", "--", &path]).unwrap_or_default();
                     if d.len() > DIFF_MAX { String::new() } else { d }
@@ -3518,8 +3673,27 @@ pub fn ref_diff(cwd: &str, base_ref: &str, end_ref: &str, with_diff: bool, only:
         return Ok(json!({ "repo": root.display().to_string(), "baseRef": base_ref, "endRef": end_ref, "missing": true, "files": [] }));
     }
 
+    if only.is_some_and(|o| o.is_empty()) {
+        return Ok(json!({
+            "repo": root.display().to_string(),
+            "baseRef": base_ref,
+            "endRef": end_ref,
+            "total": Value::Null,
+            "files": [],
+        }));
+    }
+
+    let mut num_args = vec!["diff", "--numstat", "-z", "--no-renames", base_ref, end_ref];
+    let mut name_args = vec!["diff", "--name-status", "-z", "--no-renames", base_ref, end_ref];
+    if let Some(paths) = only.filter(|p| !p.is_empty()) {
+        num_args.push("--");
+        num_args.extend(paths.iter().map(String::as_str));
+        name_args.push("--");
+        name_args.extend(paths.iter().map(String::as_str));
+    }
+
     let mut stats = std::collections::HashMap::new();
-    if let Ok(out) = git_ok(&root, &["diff", "--numstat", "-z", "--no-renames", base_ref, end_ref]) {
+    if let Ok(out) = git_ok(&root, &num_args) {
         for rec in out.split('\0').filter(|s| !s.is_empty()) {
             let mut it = rec.splitn(3, '\t');
             if let (Some(a), Some(d), Some(path)) = (it.next(), it.next(), it.next()) {
@@ -3529,7 +3703,7 @@ pub fn ref_diff(cwd: &str, base_ref: &str, end_ref: &str, with_diff: bool, only:
     }
 
     let mut entries: Vec<(String, String)> = Vec::new();
-    let names = git_ok(&root, &["diff", "--name-status", "-z", "--no-renames", base_ref, end_ref])?;
+    let names = git_ok(&root, &name_args)?;
     let mut parts = names.split('\0').filter(|s| !s.is_empty());
     while let (Some(code), Some(path)) = (parts.next(), parts.next()) {
         let mapped = if code == "A" { "new" } else { code };
@@ -4687,5 +4861,232 @@ mod tests {
         discard(&cwd, &["nested/dir/staged.txt".into(), "nested/dir/untracked.txt".into()]).unwrap();
         assert!(!repo.join("nested").exists());
         assert!(git_ok(&repo, &["status", "--porcelain"]).unwrap().trim().is_empty());
+    }
+
+    #[test]
+    fn only_pathspec_filters_changes_branch_ref_and_show() {
+        let d = tempfile::tempdir().unwrap();
+        let repo = d.path().join("repo");
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        let run = |dir: &Path, a: &[&str]| assert!(git(dir, a).unwrap().status.success(), "{a:?}");
+        run(&repo, &["init", "-q", "-b", "main"]);
+        run(&repo, &["config", "user.email", "t@t"]);
+        run(&repo, &["config", "user.name", "t"]);
+        std::fs::write(repo.join("src/a.txt"), "a1\n").unwrap();
+        std::fs::write(repo.join("src/b.txt"), "b1\n").unwrap();
+        run(&repo, &["add", "."]);
+        run(&repo, &["commit", "-qm", "init"]);
+
+        run(&repo, &["checkout", "-qb", "feat"]);
+        std::fs::write(repo.join("src/a.txt"), "a1\na2\n").unwrap();
+        std::fs::write(repo.join("src/b.txt"), "b1\nb2\n").unwrap();
+        run(&repo, &["add", "."]);
+        run(&repo, &["commit", "-qm", "feat changes"]);
+        let hash = git_ok(&repo, &["rev-parse", "HEAD"]).unwrap().trim().to_string();
+
+        std::fs::write(repo.join("src/a.txt"), "a1\na2\na3\n").unwrap();
+        std::fs::write(repo.join("src/b.txt"), "b1\nb2\nb3\n").unwrap();
+        std::fs::write(repo.join("src/new.txt"), "hello\n").unwrap();
+
+        let cwd = repo.to_string_lossy().to_string();
+        assert_eq!(detect_default_branch(&repo).as_deref(), Some("main"));
+
+        let ch_empty = changes_with(&cwd, true, Some(&[])).unwrap();
+        assert_eq!(ch_empty["files"].as_array().unwrap().len(), 0);
+
+        let ch_one = changes_with(&cwd, true, Some(&["src/new.txt".into()])).unwrap();
+        let ch_files = ch_one["files"].as_array().unwrap();
+        assert_eq!(ch_files.len(), 1);
+        assert_eq!(ch_files[0]["path"], "src/new.txt");
+        assert!(ch_files[0]["diff"].as_str().unwrap().contains("+hello"));
+
+        let bd_one = branch_diff(&cwd, Some("main"), true, Some(&["src/a.txt".into()])).unwrap();
+        let bd_files = bd_one["files"].as_array().unwrap();
+        assert_eq!(bd_files.len(), 1);
+        assert_eq!(bd_files[0]["path"], "src/a.txt");
+        assert!(bd_files[0]["diff"].as_str().unwrap().contains("+a3"));
+
+        let bd_empty = branch_diff(&cwd, Some("main"), true, Some(&[])).unwrap();
+        assert!(bd_empty["files"].as_array().unwrap().is_empty());
+
+        let sh_one = show(&cwd, &hash, Some(&["src/b.txt".into()])).unwrap();
+        let sh_files = sh_one["files"].as_array().unwrap();
+        assert_eq!(sh_files.len(), 1);
+        assert_eq!(sh_files[0]["path"], "src/b.txt");
+        assert!(sh_files[0]["diff"].as_str().unwrap().contains("+b2"));
+
+        let sh_empty = show(&cwd, &hash, Some(&[])).unwrap();
+        assert!(sh_empty["files"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn leading_dash_and_glob_like_filenames_work_across_git_ops() {
+        let d = tempfile::tempdir().unwrap();
+        let repo = d.path().join("repo");
+        std::fs::create_dir_all(repo.join("dir")).unwrap();
+        let run = |a: &[&str]| assert!(git(&repo, a).unwrap().status.success(), "{a:?}");
+        run(&["init", "-q", "-b", "main"]);
+        run(&["config", "user.email", "t@t"]);
+        run(&["config", "user.name", "t"]);
+        run(&["config", "core.autocrlf", "false"]);
+        std::fs::write(repo.join("-draft.txt"), "v1\n").unwrap();
+        std::fs::write(repo.join("dir/[id].txt"), "glob-like v1\n").unwrap();
+        run(&["add", "--", "-draft.txt", "dir/[id].txt"]);
+        run(&["commit", "-qm", "init special filenames"]);
+
+        run(&["checkout", "-qb", "feat"]);
+        std::fs::write(repo.join("-draft.txt"), "v2\n").unwrap();
+        std::fs::write(repo.join("dir/[id].txt"), "glob-like v2\n").unwrap();
+        run(&["add", "--", "-draft.txt", "dir/[id].txt"]);
+        run(&["commit", "-qm", "feat update"]);
+        let hash = git_ok(&repo, &["rev-parse", "HEAD"]).unwrap().trim().to_string();
+
+        std::fs::write(repo.join("-draft.txt"), "v3\n").unwrap();
+        std::fs::write(repo.join("-new.txt"), "new dash\n").unwrap();
+
+        let cwd = repo.to_string_lossy().to_string();
+        assert!(check_paths(&["".into()]).is_err());
+        assert!(check_paths(&["/etc/passwd".into()]).is_err());
+        assert!(check_paths(&["\\abs".into()]).is_err());
+        assert!(check_paths(&["../escape".into()]).is_err());
+        assert!(check_paths(&["a/../b".into()]).is_err());
+
+        let ch_dash = changes_with(&cwd, true, Some(&["-draft.txt".into()])).unwrap();
+        let ch_dash_files = ch_dash["files"].as_array().unwrap();
+        assert_eq!(ch_dash_files.len(), 1);
+        assert_eq!(ch_dash_files[0]["path"], "-draft.txt");
+        assert!(ch_dash_files[0]["diff"].as_str().unwrap().contains("+v3"));
+
+        let ch_new = changes_with(&cwd, true, Some(&["-new.txt".into()])).unwrap();
+        assert_eq!(ch_new["files"][0]["path"], "-new.txt");
+        assert!(ch_new["files"][0]["diff"].as_str().unwrap().contains("+new dash"));
+
+        let b = blob(&cwd, "-draft.txt", "HEAD").unwrap();
+        assert_eq!(b["text"], "v2\n");
+
+        let sh = show(&cwd, &hash, Some(&["-draft.txt".into(), "dir/[id].txt".into()])).unwrap();
+        let sh_paths: Vec<&str> = sh["files"].as_array().unwrap().iter().map(|f| f["path"].as_str().unwrap()).collect();
+        assert_eq!(sh_paths, vec!["-draft.txt", "dir/[id].txt"]);
+
+        let bd = branch_diff(&cwd, Some("main"), true, Some(&["-draft.txt".into()])).unwrap();
+        assert_eq!(bd["files"].as_array().unwrap().len(), 1);
+        assert!(bd["files"][0]["diff"].as_str().unwrap().contains("+v3"));
+
+        commit(&cwd, &["-new.txt".into()], "commit dash file").unwrap();
+        assert_eq!(blob(&cwd, "-new.txt", "HEAD").unwrap()["text"], "new dash\n");
+
+        discard(&cwd, &["-draft.txt".into()]).unwrap();
+        assert_eq!(std::fs::read_to_string(repo.join("-draft.txt")).unwrap(), "v2\n");
+    }
+
+    #[test]
+    fn changes_reports_upstream_ahead_behind() {
+        assert_eq!(parse_status_branch_track("## No commits yet on main"), (None, None));
+        assert_eq!(parse_status_branch_track("## HEAD (no branch)"), (None, None));
+        assert_eq!(parse_status_branch_track("## main"), (None, None));
+        assert_eq!(parse_status_branch_track("## main...origin/main"), (Some(0), Some(0)));
+        assert_eq!(parse_status_branch_track("## main...origin/main [ahead 2]"), (Some(2), Some(0)));
+        assert_eq!(parse_status_branch_track("## main...origin/main [behind 3]"), (Some(0), Some(3)));
+        assert_eq!(parse_status_branch_track("## main...origin/main [ahead 2, behind 3]"), (Some(2), Some(3)));
+        assert_eq!(parse_status_branch_track("## main...origin/main [gone]"), (None, None));
+        assert_eq!(parse_status_branch_track("## main...origin/main [ahead 1, gone]"), (None, None));
+
+        let tmp = tempfile::tempdir().unwrap();
+        let remote = tmp.path().join("remote.git");
+        let repo = tmp.path().join("repo");
+        let other = tmp.path().join("other");
+
+        let run_in = |dir: &Path, args: &[&str]| {
+            let out = std::process::Command::new("git").args(args).current_dir(dir).output().unwrap();
+            assert!(out.status.success(), "git {:?} failed: {}", args, String::from_utf8_lossy(&out.stderr));
+        };
+
+        std::fs::create_dir_all(&remote).unwrap();
+        run_in(&remote, &["init", "--bare", "-q", "-b", "main"]);
+        std::fs::create_dir_all(&repo).unwrap();
+        run_in(&repo, &["init", "-q", "-b", "main"]);
+        run_in(&repo, &["config", "user.email", "t@t"]);
+        run_in(&repo, &["config", "user.name", "t"]);
+        std::fs::write(repo.join("a.txt"), "v1\n").unwrap();
+        run_in(&repo, &["add", "a.txt"]);
+        run_in(&repo, &["commit", "-qm", "init"]);
+
+        let cwd = repo.to_string_lossy().to_string();
+        let no_upstream = changes_with(&cwd, false, None).unwrap();
+        assert!(no_upstream["ahead"].is_null());
+        assert!(no_upstream["behind"].is_null());
+
+        run_in(&repo, &["remote", "add", "origin", remote.to_str().unwrap()]);
+        run_in(&repo, &["push", "-q", "-u", "origin", "main"]);
+
+        let synced = changes_with(&cwd, false, None).unwrap();
+        assert_eq!(synced["ahead"], 0);
+        assert_eq!(synced["behind"], 0);
+
+        // Second clone pushes a remote commit while local also creates a divergent commit.
+        let clone_out = std::process::Command::new("git")
+            .args(["clone", "-q", remote.to_str().unwrap(), other.to_str().unwrap()])
+            .output()
+            .unwrap();
+        assert!(clone_out.status.success());
+        run_in(&other, &["config", "user.email", "t@t"]);
+        run_in(&other, &["config", "user.name", "t"]);
+        std::fs::write(other.join("b.txt"), "remote\n").unwrap();
+        run_in(&other, &["add", "b.txt"]);
+        run_in(&other, &["commit", "-qm", "remote commit"]);
+        run_in(&other, &["push", "-q", "origin", "main"]);
+
+        std::fs::write(repo.join("a.txt"), "local\n").unwrap();
+        run_in(&repo, &["add", "a.txt"]);
+        run_in(&repo, &["commit", "-qm", "local commit"]);
+        run_in(&repo, &["fetch", "-q", "origin"]);
+
+        let diverged = changes_with(&cwd, false, None).unwrap();
+        assert_eq!(diverged["ahead"], 1);
+        assert_eq!(diverged["behind"], 1);
+
+        run_in(&repo, &["reset", "--hard", "-q", "origin/main~1"]);
+        let behind_only = changes_with(&cwd, false, None).unwrap();
+        assert_eq!(behind_only["ahead"], 0);
+        assert_eq!(behind_only["behind"], 1);
+    }
+
+    #[test]
+    fn changes_with_single_path_preserves_rename_from_either_side() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git").args(args).current_dir(repo).output().unwrap();
+            assert!(out.status.success(), "git {:?} failed: {}", args, String::from_utf8_lossy(&out.stderr));
+        };
+        run(&["init", "-q", "-b", "main"]);
+        run(&["config", "user.email", "t@t"]);
+        run(&["config", "user.name", "t"]);
+        std::fs::write(repo.join("old.txt"), "hello\nworld\n").unwrap();
+        run(&["add", "old.txt"]);
+        run(&["commit", "-qm", "init"]);
+        run(&["mv", "old.txt", "new.txt"]);
+
+        let cwd = repo.to_string_lossy().to_string();
+        for side in ["new.txt", "old.txt"] {
+            let ch = changes_with(&cwd, true, Some(&[side.into()])).unwrap();
+            let files = ch["files"].as_array().unwrap();
+            assert_eq!(files.len(), 1, "side={side}: {files:?}");
+            assert_eq!(files[0]["path"], "new.txt");
+            assert_eq!(files[0]["oldPath"], "old.txt");
+            assert!(files[0]["status"].as_str().unwrap().contains('R'));
+            assert!(files[0]["diff"].as_str().unwrap().contains("rename from old.txt"));
+        }
+
+        // Also when renamed and modified in working tree
+        std::fs::write(repo.join("new.txt"), "hello\nworld\nmore\n").unwrap();
+        for side in ["new.txt", "old.txt"] {
+            let ch = changes_with(&cwd, true, Some(&[side.into()])).unwrap();
+            let files = ch["files"].as_array().unwrap();
+            assert_eq!(files.len(), 1, "modified side={side}: {files:?}");
+            assert_eq!(files[0]["path"], "new.txt");
+            assert_eq!(files[0]["oldPath"], "old.txt");
+            assert!(files[0]["diff"].as_str().unwrap().contains("+more"));
+        }
     }
 }

@@ -4,6 +4,7 @@
   "filesNotReplaced": "{{length}} 个文件没有替换：{{names}}",
   "undoneFilesChangedAfterThe": "已撤销，{{failed}} 个文件在替换后又被修改过，没有恢复",
   "replaceUndone": "已撤销替换",
+  "draftChanged": "草稿已修改，请重新预览替换",
   "replaceAll": "全部替换？",
   "theListIsIncompleteOnly": "\n结果没有列全，只替换列表里的这些。",
   "replace": "替换",

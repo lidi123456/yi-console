@@ -20,5 +20,11 @@ gethostname = "1"
 russh = { version = "0.65.1", default-features = false, features = ["ring", "flate2", "rsa"] }
 russh-sftp = "2"
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
+
 [dev-dependencies]
 tempfile = "3"

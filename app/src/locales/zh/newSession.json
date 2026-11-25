@@ -53,5 +53,6 @@
   "customWorktreeBranchTitle": "自定义 Worktree 分支名",
   "customWorktreeBranchPlaceholder": "留空则自动命名，例如 feat/my-feature",
   "menuRecommended": "推荐",
-  "menuAttachExisting": "接入已有：{{branch}}"
+  "menuAttachExisting": "接入已有：{{branch}}",
+  "loadingDirectory": "正在加载目录…"
 }

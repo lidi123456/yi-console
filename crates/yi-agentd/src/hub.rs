@@ -295,6 +295,7 @@ pub struct Hub {
     sessions: Mutex<HashMap<String, Arc<SessionRt>>>,
     pub bus: broadcast::Sender<Arc<Outbound>>,
     pub settings: RwLock<DaemonSettings>,
+    settings_write: Mutex<()>,
     pub shutdown: tokio::sync::Notify,
     pub desktop: crate::computer_use::Desktop,
     /// The AI browser (`yi_browser`), one Chrome per session that turned it on
@@ -404,6 +405,7 @@ impl Hub {
             sessions: Mutex::new(HashMap::new()),
             bus,
             settings: RwLock::new(settings),
+            settings_write: Mutex::new(()),
             shutdown: tokio::sync::Notify::new(),
             desktop: crate::computer_use::Desktop::new(),
             browsers: crate::browser::Browsers::new(),
@@ -439,6 +441,7 @@ impl Hub {
             sessions: Mutex::new(HashMap::new()),
             bus,
             settings: RwLock::new(settings),
+            settings_write: Mutex::new(()),
             shutdown: tokio::sync::Notify::new(),
             desktop: crate::computer_use::Desktop::new(),
             browsers: crate::browser::Browsers::new(),
@@ -3787,15 +3790,51 @@ impl Hub {
 
     /// Remember the client's UI language for the continue message
     pub fn set_ui_lang(&self, lang: &str) -> Result<()> {
+        self.set_ui_lang_with(lang, crate::settings::save)
+    }
+
+    fn set_ui_lang_with(&self, lang: &str, save: impl FnOnce(&DaemonSettings) -> Result<()>) -> Result<()> {
         if !matches!(lang, "zh" | "en") {
             bail!("未知语言: {lang}");
         }
-        let mut s = self.settings.write().unwrap();
-        if s.ui_lang.as_deref() != Some(lang) {
-            s.ui_lang = Some(lang.to_string());
-            crate::settings::save(&s)?;
+        let _guard = self.settings_write.lock().unwrap();
+        let mut next = self.settings.read().unwrap().clone();
+        if next.ui_lang.as_deref() != Some(lang) {
+            next.ui_lang = Some(lang.to_string());
+            save(&next)?;
+            *self.settings.write().unwrap() = next;
         }
         Ok(())
+    }
+
+    /// Validate, persist, and commit a settings update atomically with respect to concurrent settings/language writes.
+    pub fn update_settings(&self, p: Value) -> Result<(DaemonSettings, DaemonSettings)> {
+        self.update_settings_with(p, crate::settings::save)
+    }
+
+    fn update_settings_with(
+        &self,
+        p: Value,
+        save: impl FnOnce(&DaemonSettings) -> Result<()>,
+    ) -> Result<(DaemonSettings, DaemonSettings)> {
+        let _guard = self.settings_write.lock().unwrap();
+        let old = self.settings.read().unwrap().clone();
+        let mut new: DaemonSettings = serde_json::from_value(p.clone())?;
+        if p.get("mcpServers").is_none() {
+            new.mcp_servers = old.mcp_servers.clone();
+        }
+        if p.get("memory").is_none() {
+            new.memory = old.memory.clone();
+        }
+        if p.get("uiLang").is_none() {
+            new.ui_lang = old.ui_lang.clone();
+        }
+        new.memory.write_policy = new.memory.normalized_policy().into();
+        crate::mcp::keep_secrets(&mut new, &old)?;
+        crate::mcp::validate(&new)?;
+        save(&new)?;
+        *self.settings.write().unwrap() = new.clone();
+        Ok((old, new))
     }
 
     /// The turn cut off by a restart is being dealt with (a message goes out, or the user dismissed it)
@@ -8999,5 +9038,48 @@ mod attach_tests {
         let gone = a.replace("my_notes.txt", "gone.txt");
         assert!(super::attach_append("s1", &gone, "aGk=").is_err());
         let _ = std::fs::remove_dir_all(&home);
+    }
+}
+
+#[cfg(test)]
+mod settings_tests {
+    use super::*;
+
+    #[test]
+    fn concurrent_settings_and_ui_lang_updates_stay_consistent_with_disk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("settings.json");
+        let hub = Hub::new(crate::store::Store::open_memory().unwrap(), DaemonSettings::default());
+
+        let save_to = |s: &DaemonSettings| -> Result<()> {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            std::fs::write(&path, serde_json::to_string_pretty(s)?)?;
+            Ok(())
+        };
+
+        std::thread::scope(|scope| {
+            let h1 = &hub;
+            let s1 = &save_to;
+            scope.spawn(move || {
+                for i in 1..=10u32 {
+                    h1.update_settings_with(serde_json::json!({ "idleReleaseMinutes": i }), s1)
+                        .unwrap();
+                }
+            });
+            let h2 = &hub;
+            let s2 = &save_to;
+            scope.spawn(move || {
+                for i in 0..10u32 {
+                    let lang = if i % 2 == 0 { "en" } else { "zh" };
+                    h2.set_ui_lang_with(lang, s2).unwrap();
+                }
+            });
+        });
+
+        let disk: DaemonSettings = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let mem = hub.settings.read().unwrap().clone();
+        assert_eq!(serde_json::to_value(&disk).unwrap(), serde_json::to_value(&mem).unwrap());
+        assert_eq!(mem.idle_release_minutes, Some(10));
+        assert_eq!(mem.ui_lang.as_deref(), Some("zh"));
     }
 }

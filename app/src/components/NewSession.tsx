@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { useBack } from '../back';
 import { getT, useLang } from '../i18n';
 import { permModes } from '../perm';
@@ -36,8 +36,16 @@ export function DirPicker({
 }) {
   const [path, setPath] = useState(start || '~');
   const [list, setList] = useState<{ path: string; parent: string | null; entries: DirEntry[] } | null>(null);
+  const [loading, setLoading] = useState(true);
   const [err, setErr] = useState('');
   const drives = useDrives(hostId);
+  const reqRef = useRef(0);
+  const listRef = useRef<HTMLDivElement>(null);
+  const [rowH, setRowH] = useState(30);
+  const rowHRef = useRef(rowH);
+  rowHRef.current = rowH;
+  const [win, setWin] = useState<[number, number]>([0, 40]);
+
   useEffect(() => {
     setPath(start || '~');
   }, [hostId, start]);
@@ -52,18 +60,67 @@ export function DirPicker({
     return () => window.removeEventListener('keydown', onKey);
   }, [onClose]);
   useEffect(() => {
-    rpc(hostId, 'fs.list', { path })
+    const req = ++reqRef.current;
+    setLoading(true);
+    rpc<{ path: string; parent: string | null; entries: DirEntry[] }>(hostId, 'fs.list', { path })
       .then((r) => {
+        if (reqRef.current !== req) return;
         setList(r);
         setErr('');
+        setLoading(false);
       })
       .catch((e) => {
+        if (reqRef.current !== req) return;
         // If the start directory doesn't exist on this host, fall back to the home directory so there's still something to pick
         if (path !== '~' && !list) setPath('~');
-        else setErr(String(e.message ?? e));
+        else {
+          setErr(String(e.message ?? e));
+          setLoading(false);
+        }
       });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [hostId, path]);
+
+  const dirs = useMemo(() => (list?.entries ?? []).filter((e) => e.isDir), [list]);
+  const virtual = dirs.length > 120;
+
+  useLayoutEffect(() => {
+    const el = listRef.current;
+    if (!el) return;
+    el.scrollTop = 0;
+    setWin([0, 40]);
+  }, [list?.path]);
+
+  useLayoutEffect(() => {
+    const el = listRef.current;
+    if (!virtual || !el) return;
+    let raf = 0;
+    const calc = () => {
+      const sample = el.querySelector<HTMLElement>('.dirpicker-row');
+      const h = sample?.offsetHeight || rowHRef.current;
+      if (h !== rowHRef.current) setRowH(h);
+      const from = Math.max(0, Math.floor(el.scrollTop / h) - 12);
+      const to = Math.min(dirs.length, Math.ceil((el.scrollTop + (el.clientHeight || 320)) / h) + 12);
+      setWin((p) => (p[0] === from && p[1] === to ? p : [from, to]));
+    };
+    const onScroll = () => {
+      if (raf) return;
+      raf = requestAnimationFrame(() => {
+        raf = 0;
+        calc();
+      });
+    };
+    calc();
+    el.addEventListener('scroll', onScroll, { passive: true });
+    const ro = new ResizeObserver(onScroll);
+    ro.observe(el);
+    return () => {
+      el.removeEventListener('scroll', onScroll);
+      ro.disconnect();
+      if (raf) cancelAnimationFrame(raf);
+    };
+  }, [virtual, dirs.length]);
+
   // New folder in the current directory, then go into it so "Select this directory" picks it (like the native
   // folder dialogs; a nested name such as a/b creates both levels, as in VS Code)
   const newFolder = async () => {
@@ -78,13 +135,16 @@ export function DirPicker({
       setErr(String((e as Error).message ?? e));
     }
   };
+  const from = virtual ? Math.min(win[0], dirs.length) : 0;
+  const to = virtual ? Math.min(Math.max(win[1], from), dirs.length) : dirs.length;
   return (
     <div className="dirpicker">
       <div className="dirpicker-head">
-        <button className="icon-btn" disabled={!list?.parent} onClick={() => list?.parent && setPath(list.parent)} title={tx('up')}>
+        <button className="icon-btn" disabled={!list?.parent || loading} onClick={() => list?.parent && setPath(list.parent)} title={tx('up')}>
           <Icon name="up" size={16} />
         </button>
         <span className="mono truncate grow">{list?.path ?? path}</span>
+        {loading && <span className="spinner mini" aria-label={tx('loadingDirectory')} />}
         {drives.length > 1 && (
           <select value="" onChange={(e) => e.target.value && setPath(e.target.value)} title={tx('switchDrive')}>
             <option value="">{tx('drive')}</option>
@@ -100,14 +160,24 @@ export function DirPicker({
         </button>
       </div>
       {err && <div className="error-text">{err}</div>}
-      <div className="dirpicker-list">
-        {list?.entries
-          .filter((e) => e.isDir)
-          .map((e) => (
-            <button key={e.path} onClick={() => setPath(e.path)}>
-              <Icon name="folder" size={14} /> {e.name}
-            </button>
-          ))}
+      <div className="dirpicker-list" ref={listRef}>
+        {loading && !list ? (
+          <div className="dirpicker-loading" role="status">
+            <span className="spinner mini" />
+            <span>{tx('loadingDirectory')}</span>
+          </div>
+        ) : (
+          <div
+            className="dirpicker-inner"
+            style={virtual ? { paddingTop: from * rowH, paddingBottom: (dirs.length - to) * rowH } : undefined}
+          >
+            {dirs.slice(from, to).map((e) => (
+              <button key={e.path} className="dirpicker-row" onClick={() => setPath(e.path)}>
+                <Icon name="folder" size={14} /> <span className="truncate">{e.name}</span>
+              </button>
+            ))}
+          </div>
+        )}
       </div>
       <div className="row end">
         <button className="btn" onClick={onClose}>

@@ -4265,6 +4265,7 @@ dependencies = [
  "base64 0.22.1",
  "dirs",
  "gethostname",
+ "libc",
  "russh",
  "russh-sftp",
  "serde",
@@ -4272,6 +4273,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "uuid",
+ "windows-sys 0.61.2",
  "yi-link",
  "yi-proto",
 ]

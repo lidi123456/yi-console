@@ -51,7 +51,7 @@ const tx = getT('filePanel');
 // - Side-by-side ("split") aligns two CodeMirror editors with synced scrolling and a draggable divider.
 // - Hovering any diff hunk reveals a floating "Add to chat / Copy" bar; selecting lines reveals a floating "+ Add to chat (Ctrl+L)" button.
 
-const DIFF_CONFIG = { scanLimit: 500, timeout: 1000 };
+const DIFF_CONFIG = { scanLimit: 500, timeout: 300 };
 const COLLAPSE = { margin: 3, minSize: 4 };
 const CTX_LINES = 3;
 
@@ -480,12 +480,15 @@ type Live =
   | { kind: 'del-file'; view: EditorView };
 
 /** Purely deleted file (old side non-empty, new side empty) has no layout toggle in read-only mode */
-export const oneSided = (a: string, b: string) => norm(a) !== '' && norm(b) === '';
+export const oneSided = (a: string, b: string) => a.length > 0 && b.length === 0;
 const MIN_PANE = 120;
 
 export interface MergeDiffHandle {
   next(): void;
   prev(): void;
+  flush(): string | undefined;
+  getValue(): string;
+  isDirty(): boolean;
 }
 
 export const MergeDiff = forwardRef<
@@ -575,14 +578,45 @@ export const MergeDiff = forwardRef<
   const inlineItemsRef = useRef<InlineReviewPlacement[]>(inlineItems);
   inlineItemsRef.current = inlineItems;
 
-  useImperativeHandle(ref, () => ({
-    next: () => nav.current && goToNextChunk(nav.current),
-    prev: () => nav.current && goToPreviousChunk(nav.current),
-  }));
+  const allViews = (l: Live | null): EditorView[] => (!l ? [] : l.kind === 'split' ? [l.a, l.b] : [l.view]);
 
-  const same = norm(a) === norm(b);
+  const flush = (): string | undefined => {
+    if (changeTimer.current !== null) {
+      window.clearTimeout(changeTimer.current);
+      changeTimer.current = null;
+    }
+    const l = live.current;
+    const owner = committedRef.current;
+    if (!l || l.kind === 'del-file' || !dirtyRef.current || owner.readOnly || !owner.onChange) return undefined;
+    dirtyRef.current = false;
+    const v = l.kind === 'unified' ? l.view : l.b;
+    const nextVal = v.state.doc.sliceString(0, v.state.doc.length, eolRef.current);
+    lastEmittedBRef.current = nextVal;
+    pendingLocalBRef.current = { docKey: owner.docKey, value: nextVal };
+    owner.onChange(nextVal);
+    return nextVal;
+  };
+
+  useImperativeHandle(
+    ref,
+    () => ({
+      next: () => nav.current && goToNextChunk(nav.current),
+      prev: () => nav.current && goToPreviousChunk(nav.current),
+      flush,
+      getValue: () => {
+        const l = live.current;
+        if (!l || l.kind === 'del-file') return text.current.b;
+        const v = l.kind === 'unified' ? l.view : l.b;
+        return v.state.doc.sliceString(0, v.state.doc.length, eolRef.current);
+      },
+      isDirty: () => dirtyRef.current && !committedRef.current.readOnly && !!committedRef.current.onChange,
+    }),
+    [],
+  );
+
+  const same = useMemo(() => a === b || norm(a) === norm(b), [a, b]);
   const emptyReadOnly = readOnly && same;
-  const deletedFile = readOnly && norm(a) !== '' && norm(b) === '';
+  const deletedFile = readOnly && a.length > 0 && b.length === 0;
   const split = layout === 'split' && !deletedFile;
   const [ratio, setRatio] = useState(0.5);
   const [hoveredHunk, setHoveredHunk] = useState<{ index: number; top: number } | null>(null);
@@ -604,6 +638,31 @@ export const MergeDiff = forwardRef<
   text.current = { a, b };
   const live = useRef<Live | null>(null);
   const roComp = useRef(new Compartment());
+  const langComp = useRef(new Compartment());
+  const wrapComp = useRef(new Compartment());
+  const phrasesComp = useRef(new Compartment());
+  const eolRef = useRef<'\r\n' | '\n'>('\n');
+  const dirtyRef = useRef(false);
+  const changeTimer = useRef<number | null>(null);
+  const lastEmittedBRef = useRef<string | null>(null);
+  const pendingLocalBRef = useRef<{ docKey: string; value: string } | null>(null);
+  const builtTextRef = useRef<{ a: string; b: string } | null>(null);
+  const patchingRef = useRef(false);
+  const docKeyRef = useRef(docKey);
+  docKeyRef.current = docKey;
+  const committedRef = useRef({ docKey, onChange, readOnly });
+  if (committedRef.current.docKey === docKey) {
+    committedRef.current.onChange = onChange;
+    committedRef.current.readOnly = readOnly;
+  }
+  const selRaf = useRef(0);
+  const moveRaf = useRef(0);
+  const pendingMove = useRef<{ clientX: number; clientY: number; target: EventTarget | null } | null>(null);
+  const builtFilenameRef = useRef(filename);
+  const wrapRef = useRef(wrap);
+  wrapRef.current = wrap;
+  const readOnlyRef = useRef(readOnly);
+  readOnlyRef.current = readOnly;
   const filenameRef = useRef(filename);
   filenameRef.current = filename;
   const sideAFilenameRef = useRef(sideAFilename ?? filename);
@@ -756,25 +815,78 @@ export const MergeDiff = forwardRef<
     return extractChunkSnippet(l.a.state.doc, l.b.state.doc, chunks, idx);
   };
 
+  const scheduleSyncSelChip = () => {
+    if (selRaf.current) return;
+    selRaf.current = requestAnimationFrame(() => {
+      selRaf.current = 0;
+      syncSelChip();
+    });
+  };
+
   useEffect(() => {
     const el = host.current;
     if (emptyReadOnly || !el) return;
     let alive = true;
-    let destroy = () => {};
     setHoveredHunk(null);
     setSelChip(null);
-    const desc = LanguageDescription.matchFilename(languages, filename);
-    (desc ? desc.load().catch((e) => (console.warn('加载语法高亮失败', filename, e), null)) : Promise.resolve(null)).then((l) => {
-      if (alive) destroy = build(el, l ?? []);
-    });
+    committedRef.current = { docKey, onChange, readOnly };
+    builtFilenameRef.current = filenameRef.current;
+    const destroy = build(el);
+    const fname = filenameRef.current;
+    const desc = LanguageDescription.matchFilename(languages, fname);
+    if (desc) {
+      desc
+        .load()
+        .then((ext) => {
+          if (!alive) return;
+          const eff = langComp.current.reconfigure(ext);
+          for (const v of allViews(live.current)) v.dispatch({ effects: eff });
+        })
+        .catch((e) => console.warn('加载语法高亮失败', fname, e));
+    }
     return () => {
       alive = false;
+      flush();
+      if (moveRaf.current) {
+        cancelAnimationFrame(moveRaf.current);
+        moveRaf.current = 0;
+      }
+      if (selRaf.current) {
+        cancelAnimationFrame(selRaf.current);
+        selRaf.current = 0;
+      }
+      pendingMove.current = null;
       nav.current = null;
       live.current = null;
       destroy();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [docKey, filename, layout, collapse, wrap, lang, emptyReadOnly, deletedFile]);
+  }, [docKey, layout, collapse, emptyReadOnly, deletedFile]);
+
+  useEffect(() => {
+    if (filename === builtFilenameRef.current) return;
+    builtFilenameRef.current = filename;
+    let alive = true;
+    const desc = LanguageDescription.matchFilename(languages, filename);
+    (desc ? desc.load().catch((e) => (console.warn('加载语法高亮失败', filename, e), [] as Extension)) : Promise.resolve([] as Extension)).then((ext) => {
+      if (!alive) return;
+      const eff = langComp.current.reconfigure(ext);
+      for (const v of allViews(live.current)) v.dispatch({ effects: eff });
+    });
+    return () => {
+      alive = false;
+    };
+  }, [filename]);
+
+  useEffect(() => {
+    const eff = wrapComp.current.reconfigure(wrap ? EditorView.lineWrapping : []);
+    for (const v of allViews(live.current)) v.dispatch({ effects: eff });
+  }, [wrap]);
+
+  useEffect(() => {
+    const eff = phrasesComp.current.reconfigure(phrases());
+    for (const v of allViews(live.current)) v.dispatch({ effects: eff });
+  }, [lang]);
 
   useEffect(() => {
     const l = live.current;
@@ -789,14 +901,26 @@ export const MergeDiff = forwardRef<
   useEffect(() => {
     const l = live.current;
     if (!l) return;
-    if (l.kind === 'split') {
-      patchDoc(l.a, a);
-      patchDoc(l.b, b);
-    } else if (l.kind === 'unified') {
-      patchOriginal(l.view, a);
-      patchDoc(l.view, b);
-    } else {
-      patchDoc(l.view, a);
+    const prev = builtTextRef.current;
+    builtTextRef.current = { a, b };
+    if (prev && prev.a === a && prev.b === b) return;
+    const ownEdit = b === lastEmittedBRef.current;
+    if (ownEdit) lastEmittedBRef.current = null;
+    const aChanged = !prev || prev.a !== a;
+    const bChanged = !prev || prev.b !== b;
+    patchingRef.current = true;
+    try {
+      if (l.kind === 'split') {
+        if (aChanged) patchDoc(l.a, a);
+        if (bChanged && !ownEdit) patchDoc(l.b, b);
+      } else if (l.kind === 'unified') {
+        if (aChanged) patchOriginal(l.view, a);
+        if (bChanged && !ownEdit) patchDoc(l.view, b);
+      } else {
+        if (aChanged) patchDoc(l.view, a);
+      }
+    } finally {
+      patchingRef.current = false;
     }
   }, [a, b]);
 
@@ -819,15 +943,27 @@ export const MergeDiff = forwardRef<
     applyMergeGoto(l, goto);
   }, [goto?.n, docKey, layout]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const build = (el: HTMLElement, language: Extension): (() => void) => {
+  const build = (el: HTMLElement): (() => void) => {
     const { a, b } = text.current;
-    const eol = detectEol(b || a);
-    const ind = detectIndent(b || a);
+    builtTextRef.current = { a, b };
+    const curDocKey = docKeyRef.current;
+    const pending = pendingLocalBRef.current;
+    pendingLocalBRef.current = null;
+    const initB = pending && pending.docKey === curDocKey ? pending.value : b;
+    const eol = detectEol(initB || a);
+    eolRef.current = eol;
+    dirtyRef.current = false;
+    lastEmittedBRef.current = pending && pending.docKey === curDocKey ? initB : null;
+    if (changeTimer.current !== null) {
+      window.clearTimeout(changeTimer.current);
+      changeTimer.current = null;
+    }
+    const ind = detectIndent(initB || a);
 
     const commonKeys = [
       { key: 'Alt-F5', run: goToNextChunk },
       { key: 'Shift-Alt-F5', run: goToPreviousChunk },
-      { key: 'Mod-s', preventDefault: true, run: () => (cb.current.onSave?.(), !!cb.current.onSave) },
+      { key: 'Mod-s', preventDefault: true, run: () => (flush(), cb.current.onSave?.(), !!cb.current.onSave) },
       { key: 'Alt-z', preventDefault: true, run: () => (cb.current.onToggleWrap?.(), !!cb.current.onToggleWrap) },
       { key: 'Mod-l', preventDefault: true, run: () => triggerSelectionAdd() },
     ];
@@ -866,30 +1002,37 @@ export const MergeDiff = forwardRef<
       }),
       EditorState.tabSize.of(ind.tabSize),
       indentUnit.of(ind.unit),
-      editableSide ? roComp.current.of([EditorState.readOnly.of(readOnly), EditorView.editable.of(!readOnly)]) : EditorState.readOnly.of(true),
+      editableSide
+        ? roComp.current.of([EditorState.readOnly.of(readOnlyRef.current), EditorView.editable.of(!readOnlyRef.current)])
+        : EditorState.readOnly.of(true),
       theme,
       mergeTheme,
-      phrases(),
-      wrap ? EditorView.lineWrapping : [],
-      language,
+      phrasesComp.current.of(phrases()),
+      wrapComp.current.of(wrapRef.current ? EditorView.lineWrapping : []),
+      langComp.current.of([]),
       ...(selSide !== 'a' ? [inlineReviewsField] : []),
       EditorView.updateListener.of((u) => {
-        if (editableSide && u.docChanged && cb.current.onChange) {
-          cb.current.onChange(u.state.doc.sliceString(0, u.state.doc.length, eol));
+        if (editableSide && !patchingRef.current && u.docChanged && !committedRef.current.readOnly && committedRef.current.onChange) {
+          dirtyRef.current = true;
+          if (changeTimer.current !== null) window.clearTimeout(changeTimer.current);
+          changeTimer.current = window.setTimeout(() => {
+            changeTimer.current = null;
+            flush();
+          }, 200);
         }
         if (u.transactions.some((tr) => tr.isUserEvent('select.search'))) {
           setSelChip(null);
           return;
         }
         if (u.selectionSet && !u.state.selection.main.empty) activeSelSide.current = selSide;
-        if (u.selectionSet || u.docChanged || u.geometryChanged) requestAnimationFrame(syncSelChip);
+        if (u.selectionSet || u.docChanged || u.geometryChanged) scheduleSyncSelChip();
       }),
     ];
 
     const onUp = () => {
       if (!dragging.current) return;
       dragging.current = false;
-      requestAnimationFrame(syncSelChip);
+      scheduleSyncSelChip();
     };
     window.addEventListener('pointerup', onUp);
     window.addEventListener('pointercancel', onUp);
@@ -906,11 +1049,15 @@ export const MergeDiff = forwardRef<
           effects: setInlineReviewsEffect.of({ items: inlineItemsRef.current, mount: mountSlot, unmount: unmountSlot }),
         });
       }
-      const onSc = () => syncSelChip();
+      const onSc = () => scheduleSyncSelChip();
       const stopObserve = observeReviewViewport(v);
       v.scrollDOM.addEventListener('scroll', onSc, { passive: true });
       const delRaf = goto ? requestAnimationFrame(() => applyMergeGoto({ kind: 'del-file', view: v }, goto)) : null;
       return () => {
+        if (changeTimer.current !== null) {
+          window.clearTimeout(changeTimer.current);
+          changeTimer.current = null;
+        }
         if (delRaf != null) cancelAnimationFrame(delRaf);
         if (slotSyncRaf.current != null) {
           cancelAnimationFrame(slotSyncRaf.current);
@@ -931,7 +1078,7 @@ export const MergeDiff = forwardRef<
     if (layout === 'split') {
       const mv = new MergeView({
         a: { doc: norm(a), extensions: makeExt(false, 'a') },
-        b: { doc: norm(b), extensions: makeExt(true, 'b') },
+        b: { doc: norm(initB), extensions: makeExt(true, 'b') },
         parent: el,
         gutter: true,
         highlightChanges: false,
@@ -948,7 +1095,7 @@ export const MergeDiff = forwardRef<
       const unsync = syncScroll(mv.a, mv.b);
       const stopObserve = observeReviewViewport(mv.b);
       const onSc = () => {
-        syncSelChip();
+        scheduleSyncSelChip();
         setHoveredHunk(null);
       };
       mv.a.scrollDOM.addEventListener('scroll', onSc, { passive: true });
@@ -970,7 +1117,7 @@ export const MergeDiff = forwardRef<
       const v = new EditorView({
         parent: el,
         state: EditorState.create({
-          doc: norm(b),
+          doc: norm(initB),
           extensions: [
             ...makeExt(true, 'b'),
             unifiedMergeView({
@@ -995,7 +1142,7 @@ export const MergeDiff = forwardRef<
       }
       const stopObserve = observeReviewViewport(v);
       const onSc = () => {
-        syncSelChip();
+        scheduleSyncSelChip();
         setHoveredHunk(null);
       };
       v.scrollDOM.addEventListener('scroll', onSc, { passive: true });
@@ -1023,6 +1170,10 @@ export const MergeDiff = forwardRef<
       if (first) target.dispatch({ effects: EditorView.scrollIntoView(Math.min(first.fromB, target.state.doc.length), { y: 'start', yMargin: 48 }) });
     });
     return () => {
+      if (changeTimer.current !== null) {
+        window.clearTimeout(changeTimer.current);
+        changeTimer.current = null;
+      }
       cancelAnimationFrame(raf);
       window.removeEventListener('pointerup', onUp);
       window.removeEventListener('pointercancel', onUp);
@@ -1031,9 +1182,9 @@ export const MergeDiff = forwardRef<
   };
 
   /** Locate the diff chunk under the pointer and place the hunk action bar at its top-right */
-  const onPointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
+  const processPointerMove = (clientX: number, clientY: number, target: EventTarget | null) => {
     if (!onAddContext && !onAddReview && !onCopyHunk) return;
-    if ((e.target as Element | null)?.closest('.wp-hunk-bar, .cm-sel-act, .cm-sel-group, .wp-comment-pop, .wp-merge-sash, .ed-find, .cm-review-widget-slot')) return;
+    if ((target as Element | null)?.closest('.wp-hunk-bar, .cm-sel-act, .cm-sel-group, .wp-comment-pop, .wp-merge-sash, .ed-find, .cm-review-widget-slot')) return;
     const el = box.current;
     const l = live.current;
     if (!el || !l) return;
@@ -1052,17 +1203,19 @@ export const MergeDiff = forwardRef<
         return;
       }
       const sr = v.scrollDOM.getBoundingClientRect();
-      const delEl = (e.target as Element | null)?.closest?.<HTMLElement>('.cm-deletedChunk');
+      const delEl = (target as Element | null)?.closest?.<HTMLElement>('.cm-deletedChunk');
       let idx = -1;
+      let directDelNode: HTMLElement | undefined;
       if (delEl && v.contentDOM.contains(delEl)) {
         const pos = v.posAtDOM(delEl);
         idx = chunks.findIndex((ch) => ch.fromB === pos);
+        if (idx >= 0) directDelNode = delEl;
       }
       if (idx < 0) {
-        const docY = e.clientY - sr.top + v.scrollDOM.scrollTop;
+        const docY = clientY - sr.top + v.scrollDOM.scrollTop;
         const blk = v.lineBlockAtHeight(docY);
         idx = chunks.findIndex((ch) =>
-          ch.fromB < ch.toB ? blk.from <= ch.endB && blk.to >= ch.fromB : Math.abs(blk.from - ch.fromB) <= 1 && Math.abs(e.clientY - (blk.top - v.scrollDOM.scrollTop + sr.top)) < 24,
+          ch.fromB < ch.toB ? blk.from <= ch.endB && blk.to >= ch.fromB : Math.abs(blk.from - ch.fromB) <= 1 && Math.abs(clientY - (blk.top - v.scrollDOM.scrollTop + sr.top)) < 24,
         );
       }
       if (idx < 0) {
@@ -1070,9 +1223,11 @@ export const MergeDiff = forwardRef<
         return;
       }
       const ch = chunks[idx];
-      const delNode = [...v.contentDOM.querySelectorAll<HTMLElement>('.cm-deletedChunk')].find(
-        (d) => d.offsetHeight > 0 && v.posAtDOM(d) === ch.fromB,
-      );
+      const delNode =
+        directDelNode ??
+        [...v.contentDOM.querySelectorAll<HTMLElement>('.cm-deletedChunk')].find(
+          (d) => v.posAtDOM(d) === ch.fromB && d.getClientRects().length > 0,
+        );
       const delRect = delNode?.getBoundingClientRect();
       const docLen = v.state.doc.length;
       const bTop = v.lineBlockAt(Math.min(ch.fromB, docLen)).top - v.scrollDOM.scrollTop + (sr.top - boxRect.top);
@@ -1091,10 +1246,10 @@ export const MergeDiff = forwardRef<
       return;
     }
     const leftRect = l.a.scrollDOM.getBoundingClientRect();
-    const isLeft = e.clientX < leftRect.right;
+    const isLeft = clientX < leftRect.right;
     const sv = isLeft ? l.a : l.b;
     const sr = sv.scrollDOM.getBoundingClientRect();
-    const docY = e.clientY - sr.top + sv.scrollDOM.scrollTop;
+    const docY = clientY - sr.top + sv.scrollDOM.scrollTop;
     const blk = sv.lineBlockAtHeight(docY);
     const idx = chunks.findIndex((ch) =>
       isLeft
@@ -1114,6 +1269,18 @@ export const MergeDiff = forwardRef<
         : l.a.lineBlockAt(Math.min(ch.fromA, l.a.state.doc.length)).top - l.a.scrollDOM.scrollTop + (leftRect.top - boxRect.top);
     const top = Math.round(Math.max(6, rawTop + 2));
     setHoveredHunk((cur) => (cur?.index === idx && Math.abs(cur.top - top) < 2 ? cur : { index: idx, top }));
+  };
+
+  const onPointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (!onAddContext && !onAddReview && !onCopyHunk) return;
+    pendingMove.current = { clientX: e.clientX, clientY: e.clientY, target: e.target };
+    if (moveRaf.current) return;
+    moveRaf.current = requestAnimationFrame(() => {
+      moveRaf.current = 0;
+      const m = pendingMove.current;
+      pendingMove.current = null;
+      if (m) processPointerMove(m.clientX, m.clientY, m.target);
+    });
   };
 
   const drag = (e: React.PointerEvent<HTMLDivElement>) => {
@@ -1171,7 +1338,14 @@ export const MergeDiff = forwardRef<
       className={`wp-merge wp-merge-${split ? 'split' : 'unified'} ${deletedFile ? 'wp-merge-all-del' : ''}`}
       style={split ? ({ '--split': ratio } as React.CSSProperties) : undefined}
       onPointerMove={onPointerMove}
-      onPointerLeave={() => setHoveredHunk(null)}
+      onPointerLeave={() => {
+        if (moveRaf.current) {
+          cancelAnimationFrame(moveRaf.current);
+          moveRaf.current = 0;
+        }
+        pendingMove.current = null;
+        setHoveredHunk(null);
+      }}
       onPointerDown={(e) => {
         if (e.button === 0 && !isNavMod(e.nativeEvent) && !(e.target as Element | null)?.closest('.cm-sel-act, .cm-sel-group, .wp-comment-pop, .wp-hunk-bar, .wp-merge-sash, .ed-find, .cm-review-widget-slot')) {
           dragging.current = true;

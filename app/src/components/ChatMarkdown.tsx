@@ -74,14 +74,24 @@ export const ChatMarkdown = memo(function ChatMarkdown({
     const root = ref.current;
     if (!root) return;
     let prevW = root.clientWidth;
+    let timer = 0;
     const ro = new ResizeObserver(() => {
       const nextW = root.clientWidth;
       if (!nextW || nextW === prevW) return;
+      if (!root.querySelector('.md-table-wrap')) {
+        prevW = nextW;
+        return;
+      }
       prevW = nextW;
-      fitTables(root);
+      clearTimeout(timer);
+      // Coalesce panel drag frames so table colgroup widths only recompute once resizing settles
+      timer = window.setTimeout(() => fitTables(root), document.body.classList.contains('resizing') ? 90 : 32);
     });
     ro.observe(root);
-    return () => ro.disconnect();
+    return () => {
+      clearTimeout(timer);
+      ro.disconnect();
+    };
   }, []);
 
   useLayoutEffect(() => {

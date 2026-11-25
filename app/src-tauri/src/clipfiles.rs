@@ -6,8 +6,10 @@ use std::path::Path;
 
 /// Files copied to the clipboard (existing regular files only)
 #[tauri::command]
-pub fn clipboard_files() -> Vec<String> {
-    read().into_iter().filter(|p| Path::new(p).is_file()).collect()
+pub async fn clipboard_files() -> Vec<String> {
+    tauri::async_runtime::spawn_blocking(|| read().into_iter().filter(|p| Path::new(p).is_file()).collect())
+        .await
+        .unwrap_or_default()
 }
 
 #[cfg(windows)]
@@ -89,7 +91,7 @@ mod tests {
     #[test]
     #[ignore]
     fn clipboard_now() {
-        println!("CLIPBOARD_FILES={:?}", super::clipboard_files());
+        println!("CLIPBOARD_FILES={:?}", tauri::async_runtime::block_on(super::clipboard_files()));
     }
 
     #[test]

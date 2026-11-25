@@ -175,7 +175,19 @@ async fn ws(s: TcpStream, hub: Arc<ClientHub>, tx: broadcast::Sender<Value>) -> 
                 Ok(r) => json!({ "id": id, "result": r }),
                 Err(e) => json!({ "id": id, "error": format!("{e:#}") }),
             };
-            let _ = out.send(resp.to_string());
+            let line = if matches!(
+                cmd.as_str(),
+                "rpc"
+            ) {
+                tokio::task::spawn_blocking(move || resp.to_string())
+                    .await
+                    .unwrap_or_default()
+            } else {
+                resp.to_string()
+            };
+            if !line.is_empty() {
+                let _ = out.send(line);
+            }
         });
     }
     fwd.abort();
@@ -231,7 +243,7 @@ async fn serve_file(mut s: TcpStream, dist: &Path, path: &str) -> Result<()> {
         return http(s, 400, "text/plain", b"bad path".to_vec()).await;
     }
     let mut file = dist.join(if rel.is_empty() { "index.html" } else { rel });
-    if !file.is_file() {
+    if !tokio::fs::metadata(&file).await.is_ok_and(|m| m.is_file()) {
         // The frontend is a single-page app; unknown paths all return index.html
         file = dist.join("index.html");
     }

@@ -5,5 +5,8 @@
   "binaryFileCannotPreview": "Binary file, cannot preview",
   "fileIsLargeShowingThe": "… File is large; showing the first 1MB",
   "selectAFileToPreview": "Select a file to preview",
-  "viewHistory": "View history"
+  "viewHistory": "View history",
+  "loadingDirectory": "Loading folder…",
+  "loadingFile": "Loading file…",
+  "toggleWordWrap": "Toggle word wrap"
 }

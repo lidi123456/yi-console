@@ -24,14 +24,19 @@ pub fn list(path: &str, show_hidden: bool) -> Result<Value> {
             Ok(m) => m,
             Err(_) => continue,
         };
-        // Follow symlinks to decide whether it's a directory
-        let is_dir = std::fs::metadata(e.path()).map(|m| m.is_dir()).unwrap_or(meta.is_dir());
+        // Follow symlinks only when the entry itself is a symlink to avoid a redundant second stat per regular file
+        let target_meta = if meta.file_type().is_symlink() {
+            std::fs::metadata(e.path()).ok()
+        } else {
+            None
+        };
+        let eff = target_meta.as_ref().unwrap_or(&meta);
         entries.push(DirEntry {
             path: e.path().display().to_string(),
             name,
-            is_dir,
-            size: meta.len(),
-            modified: meta
+            is_dir: eff.is_dir(),
+            size: eff.len(),
+            modified: eff
                 .modified()
                 .ok()
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
@@ -39,11 +44,7 @@ pub fn list(path: &str, show_hidden: bool) -> Result<Value> {
                 .unwrap_or(0),
         });
     }
-    entries.sort_by(|a, b| {
-        b.is_dir
-            .cmp(&a.is_dir)
-            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-    });
+    entries.sort_by_cached_key(|a| (!a.is_dir, a.name.to_lowercase()));
     let path_str = strip_verbatim(&dir.display().to_string());
     Ok(json!({
         "path": path_str,
@@ -54,10 +55,24 @@ pub fn list(path: &str, show_hidden: bool) -> Result<Value> {
 
 /// Read a file; with tail true, read only the last part of files that are too large (for viewing logs)
 pub fn read(path: &str, tail: bool) -> Result<Value> {
+    read_if_changed(path, tail, None)
+}
+
+/// Conditional variant of `read`: returns `{"unchanged": true, ...}` when `(modified, size)` still matches disk.
+pub fn read_if_changed(path: &str, tail: bool, if_unchanged: Option<(i64, u64)>) -> Result<Value> {
     let p = crate::paths::expand(path);
     let meta = std::fs::metadata(&p)?;
     if meta.is_dir() {
         bail!("这是一个目录");
+    }
+    let mod_ms = mtime(&meta);
+    if if_unchanged == Some((mod_ms, meta.len())) {
+        return Ok(json!({
+            "unchanged": true,
+            "path": p.display().to_string(),
+            "size": meta.len(),
+            "modified": mod_ms,
+        }));
     }
     let mut buf = vec![];
     let mut f = std::fs::File::open(&p)?;
@@ -72,7 +87,7 @@ pub fn read(path: &str, tail: bool) -> Result<Value> {
     Ok(json!({
         "path": p.display().to_string(),
         "size": meta.len(),
-        "modified": mtime(&meta),
+        "modified": mod_ms,
         "truncated": meta.len() > MAX_READ,
         "binary": binary,
         "notUtf8": not_utf8,
@@ -85,6 +100,11 @@ pub fn read(path: &str, tail: bool) -> Result<Value> {
 /// the path comes from model output, and a reply containing `![](~/.ssh/id_rsa)` mustn't be able to read the private key.
 /// `probe` only returns size and type without reading the content, for asking the user before downloading from a remote host
 pub fn read_image(path: &str, strict: bool, probe: bool) -> Result<Value> {
+    read_image_if_changed(path, strict, probe, None)
+}
+
+/// Conditional variant of `read_image`: skips reading/encoding when `(modified, size)` still matches disk.
+pub fn read_image_if_changed(path: &str, strict: bool, probe: bool, if_unchanged: Option<(i64, u64)>) -> Result<Value> {
     use base64::Engine;
     let p = crate::paths::expand(path);
     let meta = std::fs::metadata(&p)?;
@@ -114,11 +134,20 @@ pub fn read_image(path: &str, strict: bool, probe: bool) -> Result<Value> {
     if too_big {
         bail!("图片超过 10MB，无法预览");
     }
+    let mod_ms = mtime(&meta);
+    if if_unchanged == Some((mod_ms, meta.len())) {
+        return Ok(json!({
+            "unchanged": true,
+            "path": p.display().to_string(),
+            "size": meta.len(),
+            "modified": mod_ms,
+        }));
+    }
     let buf = std::fs::read(&p)?;
     Ok(json!({
         "path": p.display().to_string(),
         "size": meta.len(),
-        "modified": mtime(&meta),
+        "modified": mod_ms,
         "mimeType": mime,
         "base64": base64::engine::general_purpose::STANDARD.encode(buf),
     }))
@@ -160,6 +189,11 @@ pub(crate) const MAX_RAW: u64 = 50 * 1024 * 1024;
 /// With root (web previews), only files inside root may be read: compare after resolving symlinks,
 /// so a link to ~/.ssh placed in a repo can't be read by the preview page's scripts
 pub fn read_raw(path: &str, root: Option<&str>) -> Result<Value> {
+    read_raw_if_changed(path, root, None)
+}
+
+/// Conditional variant of `read_raw`: skips reading/encoding when `(modified, size)` still matches disk.
+pub fn read_raw_if_changed(path: &str, root: Option<&str>, if_unchanged: Option<(i64, u64)>) -> Result<Value> {
     use base64::Engine;
     let mut p = crate::paths::expand(path);
     if let Some(root) = root {
@@ -178,11 +212,20 @@ pub fn read_raw(path: &str, root: Option<&str>) -> Result<Value> {
     if meta.len() > MAX_RAW {
         bail!("文件超过 50MB（{:.1}MB），太大了", meta.len() as f64 / 1048576.0);
     }
+    let mod_ms = mtime(&meta);
+    if if_unchanged == Some((mod_ms, meta.len())) {
+        return Ok(json!({
+            "unchanged": true,
+            "path": p.display().to_string(),
+            "size": meta.len(),
+            "modified": mod_ms,
+        }));
+    }
     let buf = std::fs::read(&p)?;
     Ok(json!({
         "path": p.display().to_string(),
         "size": meta.len(),
-        "modified": mtime(&meta),
+        "modified": mod_ms,
         "base64": base64::engine::general_purpose::STANDARD.encode(buf),
     }))
 }
@@ -388,6 +431,21 @@ impl Matcher {
                 !m.is_empty()
                     && (!self.whole_word
                         || (!line[..m.start()].chars().next_back().is_some_and(is_word) && !line[m.end()..].chars().next().is_some_and(is_word)))
+            })
+            .collect()
+    }
+
+    /// Fast match byte ranges without capture allocation when replacement templates aren't used
+    fn find_ranges(&self, line: &str) -> Vec<(usize, usize)> {
+        let is_word = |c: char| c.is_alphanumeric() || c == '_';
+        self.re
+            .find_iter(line)
+            .filter_map(|m| {
+                (!m.is_empty()
+                    && (!self.whole_word
+                        || (!line[..m.start()].chars().next_back().is_some_and(is_word)
+                            && !line[m.end()..].chars().next().is_some_and(is_word))))
+                .then_some((m.start(), m.end()))
             })
             .collect()
     }
@@ -600,24 +658,38 @@ pub fn grep(root: &str, query: &str, o: &GrepOpts, limit: usize) -> Result<Value
             continue;
         }
         let text = String::from_utf8_lossy(&buf);
+        // Only prefilter literal queries against the whole buffer: regex queries use per-line ^/$ after stripping \r
+        if !o.regex && !m.re.is_match(&text) {
+            continue;
+        }
         let mut any = false;
         for (i, (_, line)) in line_spans(&text).enumerate() {
-            let caps = m.find(line);
-            let Some(first) = caps.first() else { continue };
             let char_col = |b: usize| line[..b].chars().count();
-            let list: Vec<Value> = caps
-                .iter()
-                .map(|c| {
-                    let g = c.get(0).unwrap();
-                    let mut v = json!([char_col(g.start()), g.as_str().chars().count(), g.as_str()]);
-                    if m.replace.is_some() {
-                        v.as_array_mut().unwrap().push(json!(m.replacement(c)));
-                    }
-                    v
-                })
-                .collect();
-            let g = first.get(0).unwrap();
-            let ch = char_col(g.start());
+            let (first_start, first_end, list): (usize, usize, Vec<Value>) = if m.replace.is_some() {
+                let caps = m.find(line);
+                let Some(first) = caps.first() else { continue };
+                let g0 = first.get(0).unwrap();
+                let list = caps
+                    .iter()
+                    .map(|c| {
+                        let g = c.get(0).unwrap();
+                        json!([char_col(g.start()), g.as_str().chars().count(), g.as_str(), m.replacement(c)])
+                    })
+                    .collect();
+                (g0.start(), g0.end(), list)
+            } else {
+                let ranges = m.find_ranges(line);
+                let Some(&(fs, fe)) = ranges.first() else { continue };
+                let list = ranges
+                    .iter()
+                    .map(|&(s, e)| {
+                        let slice = &line[s..e];
+                        json!([char_col(s), slice.chars().count(), slice])
+                    })
+                    .collect();
+                (fs, fe, list)
+            };
+            let ch = char_col(first_start);
             // When the match is far into the line, cut off the beginning so the match stays visible
             let start = ch.saturating_sub(60);
             let shown: String = line.chars().skip(start).take(300).collect();
@@ -626,7 +698,7 @@ pub fn grep(root: &str, query: &str, o: &GrepOpts, limit: usize) -> Result<Value
                 "path": rel,
                 "line": i + 1,
                 "col": ch - start,
-                "len": g.as_str().chars().count().min(300usize.saturating_sub(ch - start)),
+                "len": line[first_start..first_end].chars().count().min(300usize.saturating_sub(ch - start)),
                 "offset": start,
                 "text": shown,
                 "matches": list,
@@ -964,30 +1036,147 @@ pub(crate) fn strip_verbatim(s: &str) -> String {
     }
 }
 
-/// Cache of file lists under a directory: (root, time fetched, relative paths)
-static FILE_CACHE: std::sync::Mutex<Option<(String, std::time::Instant, std::sync::Arc<Vec<String>>)>> =
+struct FileCacheEntry {
+    key: String,
+    fetched: std::time::Instant,
+    files: std::sync::Arc<Vec<String>>,
+}
+
+struct FileInFlight {
+    done: std::sync::Mutex<Option<std::sync::Arc<Vec<String>>>>,
+    cv: std::sync::Condvar,
+}
+
+struct InFlightGuard {
+    key: String,
+    slot: std::sync::Arc<FileInFlight>,
+    completed: bool,
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        if !self.completed {
+            if let Some(map) = FILE_INFLIGHT.lock().unwrap().as_mut() {
+                if map.get(&self.key).is_some_and(|s| std::sync::Arc::ptr_eq(s, &self.slot)) {
+                    map.remove(&self.key);
+                }
+            }
+            self.slot.cv.notify_all();
+        }
+    }
+}
+
+/// Bounded 8-entry LRU cache of file lists under directories
+static FILE_CACHE: std::sync::Mutex<Vec<FileCacheEntry>> = std::sync::Mutex::new(Vec::new());
+static FILE_INFLIGHT: std::sync::Mutex<Option<std::collections::HashMap<String, std::sync::Arc<FileInFlight>>>> =
     std::sync::Mutex::new(None);
 
+const FILE_CACHE_CAP: usize = 8;
+const FILE_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(20);
 const SKIP_DIRS: [&str; 9] = [".git", "node_modules", "target", "dist", "build", ".venv", "__pycache__", ".next", ".gradle"];
 const MAX_FILES: usize = 50_000;
+
+fn cached_file_list(key: &str) -> Option<std::sync::Arc<Vec<String>>> {
+    let mut cache = FILE_CACHE.lock().unwrap();
+    let idx = cache.iter().position(|e| e.key == key)?;
+    if cache[idx].fetched.elapsed() >= FILE_CACHE_TTL {
+        cache.remove(idx);
+        return None;
+    }
+    let entry = cache.remove(idx);
+    let files = entry.files.clone();
+    cache.push(entry);
+    Some(files)
+}
 
 /// List files under root (relative paths, /-separated). git repos use git ls-files (respecting .gitignore); otherwise walk the tree ourselves
 pub(crate) fn file_list(root: &std::path::Path) -> std::sync::Arc<Vec<String>> {
     let key = root.display().to_string();
-    if let Some((k, t, v)) = FILE_CACHE.lock().unwrap().as_ref() {
-        if *k == key && t.elapsed() < std::time::Duration::from_secs(20) {
-            return v.clone();
+    loop {
+        if let Some(hit) = cached_file_list(&key) {
+            return hit;
         }
+        let (slot, is_leader) = {
+            let mut inflight = FILE_INFLIGHT.lock().unwrap();
+            let map = inflight.get_or_insert_with(std::collections::HashMap::new);
+            if let Some(existing) = map.get(&key) {
+                (existing.clone(), false)
+            } else {
+                let s = std::sync::Arc::new(FileInFlight {
+                    done: std::sync::Mutex::new(None),
+                    cv: std::sync::Condvar::new(),
+                });
+                map.insert(key.clone(), s.clone());
+                (s, true)
+            }
+        };
+        if !is_leader {
+            let mut guard = slot.done.lock().unwrap();
+            while guard.is_none() {
+                // Stop waiting if leader cleaned up without storing a result (e.g. panic)
+                let still_running = FILE_INFLIGHT
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .and_then(|m| m.get(&key))
+                    .is_some_and(|s| std::sync::Arc::ptr_eq(s, &slot));
+                if !still_running {
+                    break;
+                }
+                guard = slot.cv.wait(guard).unwrap();
+            }
+            if let Some(files) = guard.as_ref() {
+                return files.clone();
+            }
+            continue;
+        }
+
+        let mut cleanup = InFlightGuard {
+            key: key.clone(),
+            slot: slot.clone(),
+            completed: false,
+        };
+        let list = std::sync::Arc::new(git_files(root).unwrap_or_else(|| walk_files(root)));
+        {
+            let mut cache = FILE_CACHE.lock().unwrap();
+            if let Some(idx) = cache.iter().position(|e| e.key == key) {
+                cache.remove(idx);
+            } else if cache.len() >= FILE_CACHE_CAP {
+                cache.remove(0);
+            }
+            cache.push(FileCacheEntry {
+                key: key.clone(),
+                fetched: std::time::Instant::now(),
+                files: list.clone(),
+            });
+        }
+        {
+            let mut done = slot.done.lock().unwrap();
+            *done = Some(list.clone());
+        }
+        if let Some(map) = FILE_INFLIGHT.lock().unwrap().as_mut() {
+            if map.get(&key).is_some_and(|s| std::sync::Arc::ptr_eq(s, &slot)) {
+                map.remove(&key);
+            }
+        }
+        cleanup.completed = true;
+        slot.cv.notify_all();
+        return list;
     }
-    let list = git_files(root).unwrap_or_else(|| walk_files(root));
-    let list = std::sync::Arc::new(list);
-    *FILE_CACHE.lock().unwrap() = Some((key, std::time::Instant::now(), list.clone()));
-    list
+}
+
+#[cfg(test)]
+pub(crate) fn invalidate_file_list_cache(root: &std::path::Path) {
+    let key = root.display().to_string();
+    FILE_CACHE.lock().unwrap().retain(|e| e.key != key);
 }
 
 fn git_files(root: &std::path::Path) -> Option<Vec<String>> {
     let mut cmd = std::process::Command::new("git");
-    cmd.args(["ls-files", "-co", "--exclude-standard", "-z"]).current_dir(root);
+    cmd.args(["ls-files", "-co", "--exclude-standard", "-z"])
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .current_dir(root);
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -1020,7 +1209,11 @@ fn walk_files(root: &std::path::Path) -> Vec<String> {
                     stack.push((e.path(), depth + 1));
                 }
             } else if let Ok(rel) = e.path().strip_prefix(root) {
-                out.push(rel.to_string_lossy().replace('\\', "/"));
+                #[cfg(windows)]
+                let rel_str = rel.to_string_lossy().replace('\\', "/");
+                #[cfg(not(windows))]
+                let rel_str = rel.to_string_lossy().into_owned();
+                out.push(rel_str);
                 if out.len() >= MAX_FILES {
                     return out;
                 }
@@ -1364,6 +1557,86 @@ mod tests {
             assert!(std::fs::symlink_metadata(&link).is_err());
             assert!(target.join("keep.txt").exists());
         }
+    }
+
+    #[test]
+    fn list_sorts_dirs_first_and_follows_symlink() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(d.path().join("z_dir")).unwrap();
+        std::fs::write(d.path().join("a_file.txt"), "hi").unwrap();
+        std::fs::write(d.path().join("B_file.txt"), "hello").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(d.path().join("z_dir"), d.path().join("a_link_dir")).unwrap();
+        let res = list(&d.path().display().to_string(), false).unwrap();
+        let entries = res["entries"].as_array().unwrap();
+        let names: Vec<(&str, bool)> = entries
+            .iter()
+            .map(|e| (e["name"].as_str().unwrap(), e["isDir"].as_bool().unwrap()))
+            .collect();
+        #[cfg(unix)]
+        assert_eq!(
+            names,
+            vec![("a_link_dir", true), ("z_dir", true), ("a_file.txt", false), ("B_file.txt", false)]
+        );
+        #[cfg(not(unix))]
+        assert_eq!(names, vec![("z_dir", true), ("a_file.txt", false), ("B_file.txt", false)]);
+    }
+
+    #[test]
+    fn grep_fast_path_and_replace() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("one.txt"), "alpha beta\nfoo bar foo\n").unwrap();
+        std::fs::write(d.path().join("two.txt"), "unrelated text\n").unwrap();
+        let root = d.path().display().to_string();
+        let o = GrepOpts { whole_word: true, ..Default::default() };
+        let res = grep(&root, "foo", &o, 50).unwrap();
+        let hits = res["hits"].as_array().unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0]["path"], "one.txt");
+        assert_eq!(hits[0]["matches"].as_array().unwrap().len(), 2);
+
+        let ro = GrepOpts { regex: true, replace: Some("$1_X".into()), ..Default::default() };
+        let rres = grep(&root, "(foo)", &ro, 50).unwrap();
+        let m = rres["hits"][0]["matches"].as_array().unwrap();
+        assert_eq!(m[0][3], "foo_X");
+    }
+
+    #[test]
+    fn grep_regex_line_anchors_lf_and_crlf() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("lf.txt"), "before\nfoo\nxfoo\nfoox\nafter\n").unwrap();
+        std::fs::write(d.path().join("crlf.txt"), "one\r\nfoo\r\nfoo \r\ntwo\r\n").unwrap();
+        let root = d.path().display().to_string();
+        let o = GrepOpts { regex: true, ..Default::default() };
+        let res = grep(&root, "^foo$", &o, 50).unwrap();
+        let hits = res["hits"].as_array().unwrap();
+        let mut got: Vec<(&str, u64)> = hits
+            .iter()
+            .map(|h| (h["path"].as_str().unwrap(), h["line"].as_u64().unwrap()))
+            .collect();
+        got.sort();
+        assert_eq!(got, vec![("crlf.txt", 2), ("lf.txt", 2)]);
+    }
+
+    #[test]
+    fn read_if_changed_short_circuits_on_matching_stat() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("doc.txt");
+        let ps = p.display().to_string();
+        std::fs::write(&p, "hello\n").unwrap();
+        let first = read_if_changed(&ps, false, None).unwrap();
+        assert_eq!(first["content"], "hello\n");
+        let modified = first["modified"].as_i64().unwrap();
+        let size = first["size"].as_u64().unwrap();
+
+        let same = read_if_changed(&ps, false, Some((modified, size))).unwrap();
+        assert_eq!(same["unchanged"], true);
+        assert!(same.get("content").is_none());
+
+        std::fs::write(&p, "hello world!\n").unwrap();
+        let changed = read_if_changed(&ps, false, Some((modified, size))).unwrap();
+        assert!(changed.get("unchanged").is_none());
+        assert_eq!(changed["content"], "hello world!\n");
     }
 }
 

@@ -240,12 +240,19 @@ function tagNowrapCode(table: HTMLTableElement) {
   }
 }
 
-const MAX_WIDTH_CACHE = 64;
-const widthCache = new Map<string, number[]>();
+interface TableMetrics {
+  headW: number[];
+  maxLineW: number[];
+  minTokenW: number[];
+  maxCellChars: number[];
+}
 
-function tableCacheKey(table: HTMLTableElement, availW: number): string {
+const MAX_MEASURE_CACHE = 64;
+const measureCache = new Map<string, TableMetrics>();
+
+function tableMeasureKey(table: HTMLTableElement): string {
   const cs = getComputedStyle(table);
-  let sig = `${availW}|${cs.fontSize}|${cs.fontFamily}|${table.rows.length}`;
+  let sig = `${cs.fontSize}|${cs.fontFamily}|${table.rows.length}`;
   for (const r of Array.from(table.rows)) {
     for (const c of Array.from(r.cells)) {
       const icons = c.querySelectorAll('.md-file-icon, img, .md-rimg').length;
@@ -255,8 +262,34 @@ function tableCacheKey(table: HTMLTableElement, availW: number): string {
   return sig;
 }
 
+function getTableMetrics(table: HTMLTableElement, hostRoot: HTMLElement): TableMetrics {
+  const key = tableMeasureKey(table);
+  const hit = measureCache.get(key);
+  if (hit) {
+    // Refresh LRU order
+    measureCache.delete(key);
+    measureCache.set(key, hit);
+    return hit;
+  }
+  const metrics = measureTableColumns(table, hostRoot);
+  if (measureCache.size >= MAX_MEASURE_CACHE) {
+    const oldest = measureCache.keys().next().value;
+    if (oldest !== undefined) measureCache.delete(oldest);
+  }
+  measureCache.set(key, metrics);
+  return metrics;
+}
+
 function applyColWidths(table: HTMLTableElement, widths: number[]) {
-  if (!widths.length) return;
+  const sig = widths.join(',');
+  if (table.dataset.yiWidths === sig) return;
+  table.dataset.yiWidths = sig;
+  table.querySelector('colgroup[data-yi-fit]')?.remove();
+  if (!widths.length) {
+    table.style.tableLayout = '';
+    table.style.width = '';
+    return;
+  }
   const colgroup = document.createElement('colgroup');
   colgroup.dataset.yiFit = '1';
   for (const w of widths) {
@@ -341,29 +374,18 @@ function measureTableColumns(
 export function fitTable(table: HTMLTableElement, availW: number, hostRoot: HTMLElement) {
   if (!table.rows.length || availW <= 40) return;
   tagNowrapCode(table);
-  table.querySelector('colgroup[data-yi-fit]')?.remove();
-  table.style.tableLayout = '';
-  table.style.width = '';
 
   // Skip fixed colgroup distribution when cells span columns/rows; CSS word-break + scroll wrapper still protects readability
-  if (table.querySelector('[colspan], [rowspan]')) return;
-
-  const cacheKey = tableCacheKey(table, availW);
-  const cached = widthCache.get(cacheKey);
-  if (cached !== undefined) {
-    applyColWidths(table, cached);
+  if (table.querySelector('[colspan], [rowspan]')) {
+    applyColWidths(table, []);
     return;
   }
 
-  const { headW, maxLineW, minTokenW, maxCellChars } = measureTableColumns(table, hostRoot);
+  const { headW, maxLineW, minTokenW, maxCellChars } = getTableMetrics(table, hostRoot);
   const cols = maxLineW.length;
   const sumMaxLine = maxLineW.reduce((a, b) => a + b, 0);
   if (sumMaxLine <= availW) {
-    if (widthCache.size >= MAX_WIDTH_CACHE) {
-      const oldest = widthCache.keys().next().value;
-      if (oldest !== undefined) widthCache.delete(oldest);
-    }
-    widthCache.set(cacheKey, []);
+    applyColWidths(table, []);
     return;
   }
 
@@ -406,11 +428,6 @@ export function fitTable(table: HTMLTableElement, availW: number, hostRoot: HTML
     }
   }
 
-  if (widthCache.size >= MAX_WIDTH_CACHE) {
-    const oldest = widthCache.keys().next().value;
-    if (oldest !== undefined) widthCache.delete(oldest);
-  }
-  widthCache.set(cacheKey, widths);
   applyColWidths(table, widths);
 }
 

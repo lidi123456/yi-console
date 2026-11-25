@@ -6,14 +6,43 @@
 //! symlinks pointing outside are rejected by yi-agentd),
 //! and the preview page sits in a sandboxed iframe without allow-same-origin, so it can't touch the app itself.
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{bail, Result};
 use std::collections::HashMap;
 use std::sync::Mutex;
+
+const MAX_FILE_TOKENS: usize = 128;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FileIdentity {
+    pub dev: u64,
+    pub ino: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolvedPreview {
+    pub host: String,
+    pub root: Option<String>,
+    pub path: String,
+    pub token: String,
+    pub is_file_token: bool,
+    pub identity: Option<FileIdentity>,
+    pub max_bytes: Option<u64>,
+}
+
+struct FileEntry {
+    token: String,
+    host: String,
+    path: String,
+    identity: Option<FileIdentity>,
+    max_bytes: u64,
+}
 
 #[derive(Default)]
 pub struct Previews {
     /// token -> (host id, root directory)
     roots: Mutex<HashMap<String, (String, String)>>,
+    /// Bounded LRU list of single-file tokens (for direct PDF/image streaming without directory exposure)
+    files: Mutex<Vec<FileEntry>>,
 }
 
 impl Previews {
@@ -28,30 +57,92 @@ impl Previews {
         t
     }
 
-    /// `<token>/<relative path>` (URL-encoded) -> (host id, root directory, absolute file path).
-    /// Only .. can be blocked here; where a symlink points is only known on the host, so yi-agentd checks against the root when reading
-    pub fn resolve(&self, url_path: &str) -> Result<(String, String, String)> {
+    /// Issue (or reuse) a single-file preview token in a bounded 128-entry LRU list
+    pub fn file_token(&self, host: &str, path: &str, identity: Option<FileIdentity>, max_bytes: u64) -> String {
+        let mut list = self.files.lock().unwrap();
+        if let Some(pos) = list.iter().position(|e| e.host == host && e.path == path) {
+            let entry = list.remove(pos);
+            if entry.identity == identity && entry.max_bytes == max_bytes {
+                let tok = entry.token.clone();
+                list.push(entry);
+                return tok;
+            }
+        }
+        if list.len() >= MAX_FILE_TOKENS {
+            list.remove(0);
+        }
+        let token = uuid::Uuid::new_v4().simple().to_string();
+        list.push(FileEntry {
+            token: token.clone(),
+            host: host.into(),
+            path: path.into(),
+            identity,
+            max_bytes,
+        });
+        token
+    }
+
+    /// Drop a single-file preview token when its underlying file identity no longer matches
+    pub fn invalidate_file_token(&self, token: &str) {
+        let mut list = self.files.lock().unwrap();
+        list.retain(|e| e.token != token);
+    }
+
+    /// `<token>/<relative path>` (URL-encoded) -> resolved target info.
+    /// Only .. can be blocked here for root tokens; symlink escapes are checked on the host (or locally when Local).
+    pub fn resolve(&self, url_path: &str) -> Result<ResolvedPreview> {
         let p = url_path.split(['?', '#']).next().unwrap_or("").trim_start_matches('/');
         let (tok, rest) = p.split_once('/').unwrap_or((p, ""));
-        let (host, root) = self.roots.lock().unwrap().get(tok).cloned().ok_or_else(|| anyhow!("预览地址已失效"))?;
-        let mut segs = Vec::new();
-        for s in rest.split('/') {
-            let s = pct_decode(s);
-            if s.is_empty() || s == "." {
-                continue;
+        if let Some((host, root)) = self.roots.lock().unwrap().get(tok).cloned() {
+            let mut segs = Vec::new();
+            for s in rest.split('/') {
+                let s = pct_decode(s);
+                if s.is_empty() || s == "." {
+                    continue;
+                }
+                if s == ".." || s.contains(['/', '\\']) || s.contains(':') {
+                    bail!("路径无效");
+                }
+                segs.push(s);
             }
-            if s == ".." || s.contains(['/', '\\']) || s.contains(':') {
-                bail!("路径无效");
+            if rest.is_empty() || rest.ends_with('/') {
+                segs.push("index.html".into());
             }
-            segs.push(s);
+            let sep = if root.contains('\\') && !root.contains('/') { "\\" } else { "/" };
+            let base = root.trim_end_matches(['/', '\\']);
+            let path = format!("{base}{sep}{}", segs.join(sep));
+            return Ok(ResolvedPreview {
+                host,
+                root: Some(root),
+                path,
+                token: tok.into(),
+                is_file_token: false,
+                identity: None,
+                max_bytes: None,
+            });
         }
-        if rest.is_empty() || rest.ends_with('/') {
-            segs.push("index.html".into());
+        let mut files = self.files.lock().unwrap();
+        if let Some(pos) = files.iter().position(|e| e.token == tok) {
+            for s in rest.split('/') {
+                let s = pct_decode(s);
+                if s == ".." || s.contains(['/', '\\']) {
+                    bail!("路径无效");
+                }
+            }
+            let entry = files.remove(pos);
+            let out = ResolvedPreview {
+                host: entry.host.clone(),
+                root: None,
+                path: entry.path.clone(),
+                token: entry.token.clone(),
+                is_file_token: true,
+                identity: entry.identity,
+                max_bytes: Some(entry.max_bytes),
+            };
+            files.push(entry);
+            return Ok(out);
         }
-        let sep = if root.contains('\\') && !root.contains('/') { "\\" } else { "/" };
-        let base = root.trim_end_matches(['/', '\\']);
-        let path = format!("{base}{sep}{}", segs.join(sep));
-        Ok((host, root, path))
+        bail!("预览地址已失效")
     }
 }
 
@@ -115,18 +206,48 @@ mod tests {
         let p = Previews::default();
         let t = p.token("h", "/repo/site");
         assert_eq!(p.token("h", "/repo/site"), t);
-        assert_eq!(p.resolve(&format!("{t}/css/a%20b.css?v=1")).unwrap(), ("h".into(), "/repo/site".into(), "/repo/site/css/a b.css".into()));
-        assert_eq!(p.resolve(&format!("/{t}/")).unwrap().2, "/repo/site/index.html");
-        assert_eq!(p.resolve(&format!("{t}/a+b%E4%B8%AD.html")).unwrap().2, "/repo/site/a+b中.html");
+        let r1 = p.resolve(&format!("{t}/css/a%20b.css?v=1")).unwrap();
+        assert_eq!((r1.host.as_str(), r1.root.as_deref(), r1.path.as_str(), r1.is_file_token), ("h", Some("/repo/site"), "/repo/site/css/a b.css", false));
+        assert_eq!(p.resolve(&format!("/{t}/")).unwrap().path, "/repo/site/index.html");
+        assert_eq!(p.resolve(&format!("{t}/a+b%E4%B8%AD.html")).unwrap().path, "/repo/site/a+b中.html");
         assert!(p.resolve(&format!("{t}/../etc/passwd")).is_err());
         assert!(p.resolve(&format!("{t}/%2e%2e/x")).is_err());
         assert!(p.resolve(&format!("{t}/a%2F..%2Fb")).is_err());
         assert!(p.resolve("nope/x.html").is_err());
         let w = p.token("h", r"C:\site");
-        assert_eq!(p.resolve(&format!("{w}/js/app.js")).unwrap().2, r"C:\site\js\app.js");
+        assert_eq!(p.resolve(&format!("{w}/js/app.js")).unwrap().path, r"C:\site\js\app.js");
         assert!(p.resolve(&format!("{w}/C%3A/x")).is_err());
         // % followed by multi-byte (CJK) characters must not panic
         assert_eq!(pct_decode("%a中"), "%a中");
         assert!(p.resolve(&format!("{t}/%中.html")).is_ok());
+    }
+
+    #[test]
+    fn resolves_file_tokens_and_evicts_lru() {
+        let p = Previews::default();
+        let id0 = FileIdentity { dev: 1, ino: 100 };
+        let id0_replaced = FileIdentity { dev: 1, ino: 200 };
+        let first = p.file_token("local", "/tmp/file-0.pdf", Some(id0), 50 * 1024 * 1024);
+        assert_eq!(p.file_token("local", "/tmp/file-0.pdf", Some(id0), 50 * 1024 * 1024), first);
+        let resolved = p.resolve(&format!("{first}/file-0.pdf?v=1")).unwrap();
+        assert_eq!(
+            (resolved.host.as_str(), resolved.root.as_deref(), resolved.path.as_str(), resolved.is_file_token, resolved.identity, resolved.max_bytes),
+            ("local", None, "/tmp/file-0.pdf", true, Some(id0), Some(50 * 1024 * 1024))
+        );
+
+        let replaced = p.file_token("local", "/tmp/file-0.pdf", Some(id0_replaced), 50 * 1024 * 1024);
+        assert_ne!(replaced, first);
+        assert!(p.resolve(&format!("{first}/file-0.pdf")).is_err());
+        assert_eq!(p.resolve(&format!("{replaced}/file-0.pdf")).unwrap().identity, Some(id0_replaced));
+
+        let temp = p.file_token("local", "/tmp/temp.pdf", Some(FileIdentity { dev: 1, ino: 300 }), 1024);
+        p.invalidate_file_token(&temp);
+        assert!(p.resolve(&format!("{temp}/temp.pdf")).is_err());
+
+        for i in 1..=MAX_FILE_TOKENS {
+            p.file_token("local", &format!("/tmp/file-{i}.pdf"), Some(FileIdentity { dev: 1, ino: 1000 + i as u64 }), 50 * 1024 * 1024);
+        }
+        // Replaced token for file-0 should now be evicted
+        assert!(p.resolve(&format!("{replaced}/file-0.pdf")).is_err());
     }
 }

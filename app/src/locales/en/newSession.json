@@ -53,5 +53,6 @@
   "customWorktreeBranchTitle": "Custom Worktree Branch Name",
   "customWorktreeBranchPlaceholder": "Leave empty to auto-name, e.g. feat/my-feature",
   "menuRecommended": "recommended",
-  "menuAttachExisting": "Attach existing: {{branch}}"
+  "menuAttachExisting": "Attach existing: {{branch}}",
+  "loadingDirectory": "Loading folder…"
 }
