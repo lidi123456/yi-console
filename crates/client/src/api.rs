@@ -60,6 +60,7 @@ const BULK_METHODS: &[&str] = &[
     "history.list",
     "fs.read",
     "fs.grep",
+    "nav.references",
     "git.show",
     "git.blob",
     "git.branchDiff",

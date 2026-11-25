@@ -12,6 +12,7 @@
 mod account_login;
 mod accounts;
 mod adapters;
+mod code_nav;
 mod fsapi;
 mod gitops;
 mod keyring;

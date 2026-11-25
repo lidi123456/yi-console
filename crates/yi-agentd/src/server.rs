@@ -949,6 +949,34 @@ pub async fn dispatch(
             let limit = p["limit"].as_u64().unwrap_or(30).min(200) as usize;
             tokio::task::spawn_blocking(move || crate::fsapi::search(&root, &q, limit)).await??
         }
+        NAV_DEFINITION => {
+            let req = crate::code_nav::DefRequest {
+                root: s(&p, "root")?.to_string(),
+                path: p["path"].as_str().unwrap_or("").to_string(),
+                line: p["line"].as_u64().unwrap_or(1).max(1) as usize,
+                col: p["col"].as_u64().unwrap_or(0) as usize,
+                symbol: p["symbol"].as_str().map(str::to_string),
+                kind: p["kind"].as_str().map(str::to_string),
+                path_text: p["pathText"].as_str().map(str::to_string),
+                container: p["container"].as_str().map(str::to_string),
+                content: p["content"].as_str().map(str::to_string),
+                limit: p["limit"].as_u64().unwrap_or(30).clamp(1, 100) as usize,
+            };
+            tokio::task::spawn_blocking(move || crate::code_nav::definition(req)).await??
+        }
+        NAV_REFERENCES => {
+            let req = crate::code_nav::RefRequest {
+                root: s(&p, "root")?.to_string(),
+                path: p["path"].as_str().unwrap_or("").to_string(),
+                line: p["line"].as_u64().unwrap_or(1).max(1) as usize,
+                col: p["col"].as_u64().unwrap_or(0) as usize,
+                symbol: s(&p, "symbol")?.to_string(),
+                include_declaration: p["includeDeclaration"].as_bool().unwrap_or(false),
+                context_lines: p["contextLines"].as_u64().unwrap_or(3).min(8) as usize,
+                limit: p["limit"].as_u64().unwrap_or(200).clamp(1, 500) as usize,
+            };
+            tokio::task::spawn_blocking(move || crate::code_nav::references(req)).await??
+        }
         SESSION_IMAGE => {
             let (sid, iid) = (s(&p, "sessionId")?.to_string(), s(&p, "imageId")?.to_string());
             let hub2 = hub.clone();
@@ -1633,6 +1661,61 @@ mod tests {
         assert_eq!(response["result"]["apiKey"], "sk-ant-plain-123");
         assert_eq!(response["result"]["authToken"], "tok-plain-456");
         assert_eq!(response["result"]["extraEnv"]["CUSTOM_SECRET"], "sec-789");
+        drop(reader);
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn nav_rpc_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("lib.ts"), "export function greetUser(name: string) { return name; }\n").unwrap();
+        std::fs::write(dir.path().join("app.ts"), "import { greetUser } from './lib';\ngreetUser('hi');\n").unwrap();
+        let hub = Hub::new(crate::store::Store::open_memory().unwrap(), DaemonSettings::default());
+        let (mut client, server) = tokio::io::duplex(8192);
+        let (r, w) = tokio::io::split(server);
+        let task = tokio::spawn(serve_conn(hub, r, w, "local"));
+
+        let def_req = json!({
+            "id": 1,
+            "method": methods::NAV_DEFINITION,
+            "params": {
+                "root": dir.path().display().to_string(),
+                "path": "app.ts",
+                "line": 2,
+                "col": 2,
+                "symbol": "greetUser",
+                "kind": "symbol"
+            }
+        });
+        client.write_all(format!("{def_req}\n").as_bytes()).await.unwrap();
+        let mut reader = BufReader::new(client);
+        let mut line = String::new();
+        tokio::time::timeout(std::time::Duration::from_secs(3), reader.read_line(&mut line)).await.unwrap().unwrap();
+        let def_resp: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(def_resp["id"], 1);
+        assert_eq!(def_resp["result"]["locations"][0]["path"], "lib.ts");
+        assert_eq!(def_resp["result"]["locations"][0]["line"], 1);
+
+        let mut client = reader.into_inner();
+        let ref_req = json!({
+            "id": 2,
+            "method": methods::NAV_REFERENCES,
+            "params": {
+                "root": dir.path().display().to_string(),
+                "path": "lib.ts",
+                "line": 1,
+                "col": 16,
+                "symbol": "greetUser",
+                "includeDeclaration": false
+            }
+        });
+        client.write_all(format!("{ref_req}\n").as_bytes()).await.unwrap();
+        let mut reader = BufReader::new(client);
+        line.clear();
+        tokio::time::timeout(std::time::Duration::from_secs(3), reader.read_line(&mut line)).await.unwrap().unwrap();
+        let ref_resp: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(ref_resp["id"], 2);
+        assert_eq!(ref_resp["result"]["totalHits"], 2);
         drop(reader);
         task.await.unwrap();
     }

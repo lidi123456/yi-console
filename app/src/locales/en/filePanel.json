@@ -468,5 +468,20 @@
   "cleanupMergedConfirmMsg": "Safely removes {{n}} clean merged worktree(s) and their local branches ({{skipped}} dirty/running skipped).",
   "cleanupMergedResultToast": "Cleaned up {{removed}} worktree(s)",
   "cleanupMergedResultWithSkippedToast": "Cleaned up {{removed}} worktree(s); skipped {{skipped}}",
-  "gitActionsMenuTip": "More Git commit & sync actions"
+  "gitActionsMenuTip": "More Git commit & sync actions",
+  "goToDefinition": "Go to Definition",
+  "findAllReferences": "Find All References",
+  "navBack": "Go Back ({{v}})",
+  "navForward": "Go Forward ({{v}})",
+  "navDefinitions": "Definitions",
+  "navReferences": "References",
+  "navRefSummary": "{{hits}} refs · {{files}} files",
+  "navRefSummaryTruncated": "{{hits}}+ refs · {{files}} files",
+  "navOpenInSearch": "Open in Search",
+  "navPickerHint": "↑↓ Select · Enter Jump · Esc Close",
+  "navPeekHint": "↑↓ Preview · Enter / Double-click Jump · Esc Close",
+  "navDefNotFound": "No definition found for \"{{v}}\"",
+  "navPathNotFound": "Target file not found: {{v}}",
+  "navNoReferences": "No references found for \"{{v}}\"",
+  "navLoadingRefs": "Finding references…"
 }

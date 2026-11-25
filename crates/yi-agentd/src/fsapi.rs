@@ -861,7 +861,7 @@ pub fn roots() -> Value {
 }
 
 /// Windows canonicalize adds a `\\?\` prefix; strip it for display
-fn strip_verbatim(s: &str) -> String {
+pub(crate) fn strip_verbatim(s: &str) -> String {
     match s.strip_prefix(r"\\?\") {
         // Only strip the prefix from drive-letter paths; \\?\UNC\server\share becomes \\server\share again
         Some(r) if r.as_bytes().get(1) == Some(&b':') => r.to_string(),
@@ -878,7 +878,7 @@ const SKIP_DIRS: [&str; 9] = [".git", "node_modules", "target", "dist", "build",
 const MAX_FILES: usize = 50_000;
 
 /// List files under root (relative paths, /-separated). git repos use git ls-files (respecting .gitignore); otherwise walk the tree ourselves
-fn file_list(root: &std::path::Path) -> std::sync::Arc<Vec<String>> {
+pub(crate) fn file_list(root: &std::path::Path) -> std::sync::Arc<Vec<String>> {
     let key = root.display().to_string();
     if let Some((k, t, v)) = FILE_CACHE.lock().unwrap().as_ref() {
         if *k == key && t.elapsed() < std::time::Duration::from_secs(20) {

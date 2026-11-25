@@ -38,6 +38,7 @@ import {
   type GotoTarget,
 } from './CodeEditor';
 import { editorSearchExtension, editorSearchKeymap } from './EditorSearchPanel';
+import { editorCodeNavExtension, isNavMod, type NavTrigger } from './EditorCodeNav';
 import { Icon } from './Icon';
 import type { MenuItem } from './Overlay';
 
@@ -513,6 +514,8 @@ export const MergeDiff = forwardRef<
     onCopyHunk?: (content: string) => void;
     inlineReviews?: InlineReviewPlacement[];
     renderInlineReview?: (id: string) => ReactNode;
+    onNav?: (t: NavTrigger) => void;
+    onCursorPos?: (line: number, col: number, side: 'a' | 'b' | 'del-file') => void;
   }
 >(function MergeDiff(
   {
@@ -534,6 +537,8 @@ export const MergeDiff = forwardRef<
     onCopyHunk,
     inlineReviews,
     renderInlineReview,
+    onNav,
+    onCursorPos,
   },
   ref,
 ) {
@@ -595,8 +600,10 @@ export const MergeDiff = forwardRef<
   text.current = { a, b };
   const live = useRef<Live | null>(null);
   const roComp = useRef(new Compartment());
-  const cb = useRef({ onChange, onSave, onToggleWrap, onAddContext, onAddReview, onCopyHunk, menu });
-  cb.current = { onChange, onSave, onToggleWrap, onAddContext, onAddReview, onCopyHunk, menu };
+  const filenameRef = useRef(filename);
+  filenameRef.current = filename;
+  const cb = useRef({ onChange, onSave, onToggleWrap, onAddContext, onAddReview, onCopyHunk, menu, onNav, onCursorPos });
+  cb.current = { onChange, onSave, onToggleWrap, onAddContext, onAddReview, onCopyHunk, menu, onNav, onCursorPos };
 
   const getActiveSelectionView = (): { view: EditorView; side: 'a' | 'b' | 'del-file' } | null => {
     const l = live.current;
@@ -798,6 +805,12 @@ export const MergeDiff = forwardRef<
         ...editorSearchKeymap,
       ]),
       editorSearchExtension(),
+      editorCodeNavExtension({
+        filename: () => filenameRef.current,
+        side: selSide,
+        onNav: (t) => cb.current.onNav?.(t),
+        onCursor: (l, c) => cb.current.onCursorPos?.(l, c, selSide),
+      }),
       EditorState.tabSize.of(ind.tabSize),
       indentUnit.of(ind.unit),
       editableSide ? roComp.current.of([EditorState.readOnly.of(readOnly), EditorView.editable.of(!readOnly)]) : EditorState.readOnly.of(true),
@@ -1080,12 +1093,16 @@ export const MergeDiff = forwardRef<
         : l.view;
     const side: 'a' | 'b' | 'del-file' = l.kind === 'del-file' ? 'del-file' : l.kind === 'split' && v === l.a ? 'a' : 'b';
     // "Add selection to chat" sends the same diff snippet as the floating button, deleted lines included
-    openEditorContextMenu(e, v, (ctx) =>
-      menu({
-        ...ctx,
-        oldSide: side === 'a' || side === 'del-file',
-        addSelection: cb.current.onAddContext && ctx.selection ? () => void triggerSelectionAdd({ view: v, side }) : undefined,
-      }),
+    openEditorContextMenu(
+      e,
+      v,
+      (ctx) =>
+        menu({
+          ...ctx,
+          oldSide: side === 'a' || side === 'del-file',
+          addSelection: cb.current.onAddContext && ctx.selection ? () => void triggerSelectionAdd({ view: v, side }) : undefined,
+        }),
+      cb.current.onNav ? { filename: filenameRef.current, side, onNav: (t) => cb.current.onNav?.(t) } : undefined,
     );
   };
 
@@ -1100,7 +1117,7 @@ export const MergeDiff = forwardRef<
       onPointerMove={onPointerMove}
       onPointerLeave={() => setHoveredHunk(null)}
       onPointerDown={(e) => {
-        if (e.button === 0 && !(e.target as Element | null)?.closest('.cm-sel-act, .cm-sel-group, .wp-comment-pop, .wp-hunk-bar, .wp-merge-sash, .ed-find, .cm-review-widget-slot')) {
+        if (e.button === 0 && !isNavMod(e.nativeEvent) && !(e.target as Element | null)?.closest('.cm-sel-act, .cm-sel-group, .wp-comment-pop, .wp-hunk-bar, .wp-merge-sash, .ed-find, .cm-review-widget-slot')) {
           dragging.current = true;
           setSelChip(null);
         }

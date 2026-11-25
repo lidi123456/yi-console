@@ -1522,6 +1522,14 @@ pub mod methods {
     pub const PORTS_LIST: &str = "ports.list";
     /// {root, query, limit} -> [{path, isDir}]: fuzzy-find files by name under a directory (for @ in the input box)
     pub const FS_SEARCH: &str = "fs.search";
+    /// {root, path?, line?, col?, symbol?, kind?, pathText?, container?, content?, limit?}
+    /// -> {provider, kind, query, atDefinition, locations:[{path, absPath, line, col, len, endLine?, kind, symbol, container?, preview, score, source}]}:
+    /// resolve symbol definition(s) or file/import path targets in the workspace
+    pub const NAV_DEFINITION: &str = "nav.definition";
+    /// {root, path?, line?, col?, symbol, includeDeclaration?, contextLines?, limit?}
+    /// -> {provider, symbol, truncated, totalFiles, totalHits, hits:[{path, absPath, line, col, len, text, isDefinition, contextStartLine, context}]}:
+    /// find symbol references with surrounding context lines
+    pub const NAV_REFERENCES: &str = "nav.references";
     /// {query, limit} -> [{sessionId, seq, ts, kind, snippet}]: search messages across all sessions
     pub const SEARCH_MESSAGES: &str = "search.messages";
     /// {cwd, diff?, paths?} -> {repo, branch, head, total?, files:[{path, status, diff}]}; diff=false skips diffs, paths returns only those files; at most 10000 files, total is set when more were left out

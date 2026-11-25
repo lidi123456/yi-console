@@ -22,6 +22,7 @@ import { detectEol, detectIndent } from '../textFormat';
 import { openMenu, type MenuItem } from './Overlay';
 import { readClipboard, writeClipboard } from '../clipboard';
 import { editorSearchExtension, editorSearchKeymap } from './EditorSearchPanel';
+import { editorCodeNavExtension, extractNavToken, isNavMod, triggerNavAtCursor, type NavTrigger } from './EditorCodeNav';
 import { Icon } from './Icon';
 
 const tx = getT('filePanel');
@@ -47,6 +48,11 @@ export interface EditorMenuCtx {
   addSelection?: () => void;
   /** Set by the diff view for the old (left) side: line numbers are the old file's, not the file on disk */
   oldSide?: boolean;
+  /** Code navigation actions at the right-clicked token */
+  canNav?: boolean;
+  canFindRefs?: boolean;
+  gotoDefinition?: () => void;
+  findReferences?: () => void;
 }
 
 export interface GotoTarget {
@@ -91,7 +97,12 @@ export function measureSelectionChip(v: EditorView, container: HTMLElement): { t
 }
 
 /** Build the right-click context menu state and dispatchers for a CodeMirror view */
-export function openEditorContextMenu(e: React.MouseEvent, v: EditorView, menu: (ctx: EditorMenuCtx) => (MenuItem | '-')[]) {
+export function openEditorContextMenu(
+  e: React.MouseEvent,
+  v: EditorView,
+  menu: (ctx: EditorMenuCtx) => (MenuItem | '-')[],
+  nav?: { filename: string; side?: 'a' | 'b' | 'del-file'; onNav: (t: NavTrigger) => void },
+) {
   // Like VS Code: right-clicking outside the selection moves the cursor there first, inside it keeps the selection
   const pos = v.posAtCoords({ x: e.clientX, y: e.clientY });
   if (pos != null && !v.state.selection.ranges.some((r) => r.from <= pos && pos <= r.to)) v.dispatch({ selection: { anchor: pos } });
@@ -104,6 +115,7 @@ export function openEditorContextMenu(e: React.MouseEvent, v: EditorView, menu: 
   const toLine = Math.max(fromLine, main.to > main.from && main.to === end.from ? end.number - 1 : end.number);
   const selectedLines = selection ? st.doc.sliceString(st.doc.line(fromLine).from, st.doc.line(toLine).to) : '';
   const ro = st.readOnly;
+  const navTok = nav ? extractNavToken(st, main.head, nav.filename) : null;
   const ctx: EditorMenuCtx = {
     selection,
     selectedLines,
@@ -128,6 +140,11 @@ export function openEditorContextMenu(e: React.MouseEvent, v: EditorView, menu: 
     find: () => openSearchPanel(v),
     foldAll: () => foldAll(v),
     unfoldAll: () => unfoldAll(v),
+    canNav: !!navTok,
+    canFindRefs: navTok?.kind === 'symbol',
+    gotoDefinition: nav && navTok ? () => void triggerNavAtCursor(v, 'definition', nav.filename, nav.onNav, nav.side) : undefined,
+    findReferences:
+      nav && navTok?.kind === 'symbol' ? () => void triggerNavAtCursor(v, 'references', nav.filename, nav.onNav, nav.side) : undefined,
   };
   openMenu(e, menu(ctx));
 }
@@ -269,6 +286,8 @@ export function CodeEditor({
   menu,
   onToggleWrap,
   onAddSelection,
+  onNav,
+  onCursorPos,
 }: {
   /** Changes when switching files (or re-reading from disk); the editor is rebuilt from scratch */
   docKey: string;
@@ -290,6 +309,10 @@ export function CodeEditor({
   onToggleWrap?: () => void;
   /** Add the selected code lines as context in the session composer (Ctrl/Cmd+L or floating button) */
   onAddSelection?: (sel: { fromLine: number; toLine: number; content: string }) => void;
+  /** Triggered on Ctrl/Cmd+Click, F12 (go to definition), or Shift+F12 (find references) */
+  onNav?: (t: NavTrigger) => void;
+  /** Reports cursor line (1-based) and col (0-based) changes for navigation history */
+  onCursorPos?: (line: number, col: number) => void;
 }) {
   const host = useRef<HTMLDivElement>(null);
   const wrapRef = useRef<HTMLDivElement>(null);
@@ -298,9 +321,11 @@ export function CodeEditor({
   const dragging = useRef(false);
   const [selChip, setSelChip] = useState<{ top: number; left: number } | null>(null);
   const comp = useRef({ lang: new Compartment(), ro: new Compartment(), wrap: new Compartment(), phrases: new Compartment() });
+  const filenameRef = useRef(filename);
+  filenameRef.current = filename;
   // Callbacks go through a ref so the editor doesn't need rebuilding
-  const cb = useRef({ onChange, onSave, onTopLine, onToggleWrap, onAddSelection });
-  cb.current = { onChange, onSave, onTopLine, onToggleWrap, onAddSelection };
+  const cb = useRef({ onChange, onSave, onTopLine, onToggleWrap, onAddSelection, onNav, onCursorPos });
+  cb.current = { onChange, onSave, onTopLine, onToggleWrap, onAddSelection, onNav, onCursorPos };
 
   const syncChip = () => {
     const v = view.current;
@@ -366,6 +391,11 @@ export function CodeEditor({
             indentWithTab,
           ]),
           editorSearchExtension(),
+          editorCodeNavExtension({
+            filename: () => filenameRef.current,
+            onNav: (t) => cb.current.onNav?.(t),
+            onCursor: (l, col) => cb.current.onCursorPos?.(l, col),
+          }),
           EditorState.tabSize.of(ind.tabSize),
           indentUnit.of(ind.unit),
           c.phrases.of(searchPhrases()),
@@ -453,13 +483,21 @@ export function CodeEditor({
       className="wp-code-wrap"
       ref={wrapRef}
       onPointerDown={(e) => {
-        if (e.button === 0 && !(e.target as Element | null)?.closest('.cm-sel-act, .ed-find')) {
+        if (e.button === 0 && !isNavMod(e.nativeEvent) && !(e.target as Element | null)?.closest('.cm-sel-act, .ed-find')) {
           dragging.current = true;
           setSelChip(null);
         }
       }}
       onContextMenu={(e) =>
-        view.current && menu && !(e.target as Element | null)?.closest('.cm-panels') && openEditorContextMenu(e, view.current, menu)
+        view.current &&
+        menu &&
+        !(e.target as Element | null)?.closest('.cm-panels') &&
+        openEditorContextMenu(
+          e,
+          view.current,
+          menu,
+          cb.current.onNav ? { filename: filenameRef.current, onNav: (t) => cb.current.onNav?.(t) } : undefined,
+        )
       }
     >
       <div className="wp-code" ref={host} />

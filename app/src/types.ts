@@ -847,3 +847,47 @@ export interface ClientSettings {
   proxy: { mode: string; url: string };
   notify: NotifyPrefs;
 }
+
+export interface NavLocation {
+  path: string;
+  absPath: string;
+  line: number;
+  col: number;
+  len: number;
+  endLine?: number | null;
+  kind: string;
+  symbol: string;
+  container?: string | null;
+  preview: string;
+  score: number;
+  source: 'import' | 'same-file' | 'index' | 'path' | string;
+}
+
+export interface NavDefinitionResult {
+  provider: string;
+  kind: 'symbol' | 'path' | string;
+  query: string;
+  atDefinition: boolean;
+  locations: NavLocation[];
+}
+
+export interface NavReferenceHit {
+  path: string;
+  absPath: string;
+  line: number;
+  col: number;
+  len: number;
+  text: string;
+  isDefinition: boolean;
+  contextStartLine: number;
+  context: string[];
+}
+
+export interface NavReferencesResult {
+  provider: string;
+  symbol: string;
+  truncated: boolean;
+  totalFiles: number;
+  totalHits: number;
+  hits: NavReferenceHit[];
+}

@@ -468,5 +468,20 @@
   "cleanupMergedConfirmMsg": "将安全移除这 {{n}} 个已合入且无未提交改动的 Worktree 及其本地分支（跳过 {{skipped}} 个存在改动或运行中的工作区）。",
   "cleanupMergedResultToast": "已清理 {{removed}} 个 Worktree",
   "cleanupMergedResultWithSkippedToast": "已清理 {{removed}} 个 Worktree，已跳过 {{skipped}} 个",
-  "gitActionsMenuTip": "更多 Git 提交与同步操作"
+  "gitActionsMenuTip": "更多 Git 提交与同步操作",
+  "goToDefinition": "转到定义",
+  "findAllReferences": "查找所有引用",
+  "navBack": "后退 ({{v}})",
+  "navForward": "前进 ({{v}})",
+  "navDefinitions": "定义",
+  "navReferences": "引用",
+  "navRefSummary": "{{hits}} 处引用 · {{files}} 个文件",
+  "navRefSummaryTruncated": "{{hits}}+ 处引用 · {{files}} 个文件",
+  "navOpenInSearch": "在搜索面板中打开",
+  "navPickerHint": "↑↓ 选择 · Enter 跳转 · Esc 关闭",
+  "navPeekHint": "↑↓ 切换并预览上下文 · Enter / 双击跳转 · 点击外部或 Esc 关闭",
+  "navDefNotFound": "未找到 “{{v}}” 的定义",
+  "navPathNotFound": "未找到目标文件：{{v}}",
+  "navNoReferences": "未找到 “{{v}}” 的引用",
+  "navLoadingRefs": "正在查找引用…"
 }

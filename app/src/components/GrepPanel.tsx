@@ -66,6 +66,7 @@ const dirOf = (p: string) => (p.includes('/') ? p.slice(0, p.lastIndexOf('/')) :
 const keyOf = (i: { path: string; line: number; col: number }) => `${i.path}\n${i.line}\n${i.col}`;
 /** "Find in folder" request already applied (kept across remounts so an old request isn't applied again) */
 let appliedInclude = 0;
+let appliedQuery = 0;
 
 /** Input history like VS Code's search inputs: Up / Down step through earlier entries */
 function useHistory(key: string, value: string, set: (v: string) => void) {
@@ -103,6 +104,7 @@ export function GrepPanel({
   openFiles,
   dirty,
   includeRequest,
+  queryRequest,
   onPreview,
   onDraft,
   onReplaced,
@@ -116,6 +118,8 @@ export function GrepPanel({
   dirty: { rel: string; draft: string } | null;
   /** "Find in folder" from the tree: fill "files to include" */
   includeRequest: { value: string; n: number } | null;
+  /** Jump from Peek References: populate query and flags */
+  queryRequest?: { query: string; caseSensitive?: boolean; wholeWord?: boolean; regex?: boolean; n: number } | null;
   /** Show the file with its replacements applied as a diff */
   onPreview: (rel: string, line: number, col: number, len: number, after: string) => void;
   /** Replace the unsaved draft of the open file; skipped when the draft is no longer `expect` */
@@ -160,6 +164,25 @@ export function GrepPanel({
     setInc(includeRequest.value);
     input.current?.focus();
   }, [includeRequest?.n]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    if (!queryRequest || queryRequest.n <= appliedQuery) return;
+    appliedQuery = queryRequest.n;
+    if (queryRequest.caseSensitive != null) {
+      lsSet('wp-grep-cs', queryRequest.caseSensitive);
+      setCs(queryRequest.caseSensitive);
+    }
+    if (queryRequest.wholeWord != null) {
+      lsSet('wp-grep-ww', queryRequest.wholeWord);
+      setWw(queryRequest.wholeWord);
+    }
+    if (queryRequest.regex != null) {
+      lsSet('wp-grep-re', queryRequest.regex);
+      setRe(queryRequest.regex);
+    }
+    setQ(queryRequest.query);
+    input.current?.focus();
+  }, [queryRequest?.n]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     lsSet('wp-grep-q', q);

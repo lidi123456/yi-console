@@ -3,10 +3,23 @@ import { useBack } from '../back';
 import { getT, trErr, useLang } from '../i18n';
 import { errorToast, getState, hostStatus, loadSession, navigate, openNewSession, skey, toast, useSessionData, useStore } from '../store';
 import { isTauri, rpc } from '../transport';
-import { isHostSession, normDirPath, TOOL_LABEL, type DirEntry, type FileDiff, type HubEvent, type QuestionAnswer } from '../types';
+import {
+  isHostSession,
+  normDirPath,
+  TOOL_LABEL,
+  type DirEntry,
+  type FileDiff,
+  type HubEvent,
+  type NavDefinitionResult,
+  type NavLocation,
+  type NavReferenceHit,
+  type NavReferencesResult,
+  type QuestionAnswer,
+} from '../types';
 import { fmtSize, lsGet, lsSet } from '../util';
 import { writeClipboard } from '../clipboard';
 import { addContextRefToChat } from '../contextRefs';
+import { outline } from '../outline';
 import {
   computeFileIssueBadges,
   extractFindingThreads,
@@ -26,10 +39,13 @@ import {
 import { Icon, ToolBadge } from './Icon';
 import { askConfirm, askText, openMenu, type MenuItem } from './Overlay';
 import { CodeEditor, type EditorMenuCtx, type GotoTarget } from './CodeEditor';
+import { IS_MAC, type NavCoords, type NavTrigger } from './EditorCodeNav';
+import { CodeNavNotice, DefinitionPicker, PeekReferences } from './CodeNavOverlays';
 import { PaneDiff } from './DiffView';
 import { MergeDiff, oneSided, type MergeDiffHandle } from './MergeDiff';
 import { CsvView, ImageView, MdPreview, PdfView } from './FilePreview';
 import { GrepPanel } from './GrepPanel';
+import { openUrl } from './PortsView';
 import { QuickOpen, type QuickMode } from './QuickOpen';
 import { OPEN_CHANGES, OPEN_FILE, takeOpenChanges, takeOpenFiles, takeOpenTurn } from './SessionActions';
 import { DRAG_REF, isOtherSessionUpload } from '../dropFiles';
@@ -752,6 +768,7 @@ export function FilePanel({
   );
   const [treeW, setTreeW] = useState(() => lsGet('wp-tree-w', TREE_DEFAULT));
   const bodyRef = useRef<HTMLDivElement>(null);
+  const mainRef = useRef<HTMLDivElement>(null);
   const sideRef = useRef<HTMLDivElement>(null);
   const dragCleanupRef = useRef<(() => void) | null>(null);
   useEffect(() => () => dragCleanupRef.current?.(), []);
@@ -828,6 +845,31 @@ export function FilePanel({
   const [compare, setCompare] = useState<{ path: string; text: string; replace?: boolean } | null>(null);
   // "Find in folder" from the tree: the search view fills "files to include" with it
   const [grepInclude, setGrepInclude] = useState<{ value: string; n: number } | null>(null);
+  // "Open in Search" from Peek References: populate query in GrepPanel
+  const [grepQuery, setGrepQuery] = useState<{ query: string; caseSensitive?: boolean; wholeWord?: boolean; regex?: boolean; n: number } | null>(null);
+  // Code navigation overlays & history stack (up to 50 locations)
+  type NavPoint = { path: string; line: number; col: number; diff?: boolean };
+  const navHistRef = useRef<{ entries: NavPoint[]; index: number }>({ entries: [], index: -1 });
+  const [navState, setNavState] = useState({ canBack: false, canForward: false });
+  const curPosRef = useRef<{ path: string; line: number; col: number }>({ path: '', line: 1, col: 0 });
+  const navSteppingRef = useRef(false);
+  const navReqIdRef = useRef(0);
+  const noticeTimerRef = useRef<number | null>(null);
+  const [navPicker, setNavPicker] = useState<{ symbol: string; locations: NavLocation[]; coords: NavCoords; origin: NavPoint } | null>(null);
+  const [navPeek, setNavPeek] = useState<{
+    symbol: string;
+    loading: boolean;
+    result: NavReferencesResult | null;
+    coords: NavCoords;
+    origin: NavPoint;
+  } | null>(null);
+  const [navNotice, setNavNotice] = useState<string | null>(null);
+  useEffect(
+    () => () => {
+      if (noticeTimerRef.current != null) window.clearTimeout(noticeTimerRef.current);
+    },
+    [],
+  );
   // Commit file tab: the title toggles the full commit details (there's no hover tooltip on phones)
   const [commitInfo, setCommitInfo] = useState(false);
   const [dropDir, setDropDir] = useState<string | null>(null);
@@ -1396,16 +1438,77 @@ export function FilePanel({
     setPreview(m === 'preview');
   };
 
+  const showNavNotice = useCallback((msg: string) => {
+    if (noticeTimerRef.current != null) window.clearTimeout(noticeTimerRef.current);
+    setNavNotice(msg);
+    noticeTimerRef.current = window.setTimeout(() => {
+      setNavNotice(null);
+      noticeTimerRef.current = null;
+    }, 1800);
+  }, []);
+
+  const syncNavState = useCallback(() => {
+    const h = navHistRef.current;
+    setNavState({ canBack: h.index > 0, canForward: h.index >= 0 && h.index < h.entries.length - 1 });
+  }, []);
+
+  const isNavTrackable = (p: string) => !isWebTab(p) && !isReviewTab(p) && !isSideTab(p) && !isUntitled(p);
+
+  const recordNavJump = useCallback(
+    (from: NavPoint | null, to: NavPoint) => {
+      if (!isNavTrackable(to.path)) return;
+      const h = navHistRef.current;
+      let entries = h.entries.slice(0, h.index + 1);
+      const samePoint = (a?: NavPoint, b?: NavPoint) =>
+        !!a && !!b && norm(a.path) === norm(b.path) && a.line === b.line && !!a.diff === !!b.diff;
+      if (from && isNavTrackable(from.path) && !samePoint(entries[entries.length - 1], from)) {
+        entries.push(from);
+      }
+      if (!samePoint(entries[entries.length - 1], to)) {
+        entries.push(to);
+      }
+      if (entries.length > 50) entries = entries.slice(entries.length - 50);
+      navHistRef.current = { entries, index: entries.length - 1 };
+      syncNavState();
+    },
+    [syncNavState],
+  );
+
+  useEffect(() => {
+    navHistRef.current = { entries: [], index: -1 };
+    syncNavState();
+    setNavPicker(null);
+    setNavPeek(null);
+  }, [hostId, cwd, syncNavState]);
+
+  useEffect(() => {
+    setNavPicker(null);
+    setNavPeek(null);
+  }, [file?.path]);
+
   /** diff: files opened from the changes list show the diff by default; line: jump to this line after opening.
    *  Returns false only when the user cancelled discarding unsaved edits. */
   const openFile = async (path0: string, diff = false, at?: { line: number; endLine?: number; col?: number; len?: number }): Promise<boolean> => {
     const path = unverbatim(path0);
     const jump = () => at && setGoto({ ...at, n: Date.now() });
     const cur = fileRef.current;
+    const prevPoint: NavPoint | null =
+      cur && isNavTrackable(cur.path)
+        ? {
+            path: cur.path,
+            line: norm(curPosRef.current.path) === norm(cur.path) ? curPosRef.current.line : 1,
+            col: norm(curPosRef.current.path) === norm(cur.path) ? curPosRef.current.col : 0,
+            diff: showDiff || !!cur.commit,
+          }
+        : null;
     if (cur?.path === path) {
       const canDiff = !!cur.commit || !!cur.deleted || hasChange(path);
       if (diff && canDiff) setShowDiff(true);
       if (at) {
+        if (!navSteppingRef.current && !restoring.current && prevPoint && prevPoint.line !== at.line) {
+          recordNavJump(prevPoint, { path, line: at.line, col: at.col ?? 0, diff: diff && canDiff });
+        }
+        curPosRef.current = { path, line: at.line, col: at.col ?? 0 };
         if (!diff || !canDiff) setShowDiff(false);
         if (preview) previewFor(path, at);
         setCompare(null);
@@ -1425,6 +1528,11 @@ export function FilePanel({
             ? { path, content: '', draft: '', binary: false, truncated: false, size: 0, modified: 0, rev: Date.now(), deleted: true }
             : null);
     if (!f) return true;
+    const willDiff = !!f.deleted || (diff && hasChange(path)) || !!f.commit;
+    if (!navSteppingRef.current && !restoring.current && isNavTrackable(path) && !f.binary && !f.image && !f.pdf) {
+      recordNavJump(prevPoint, { path, line: at?.line ?? 1, col: at?.col ?? 0, diff: willDiff });
+    }
+    curPosRef.current = { path, line: at?.line ?? 1, col: at?.col ?? 0 };
     fileRef.current = f;
     setFile(f);
     setTabs((t) => (t.includes(path) ? t : [...t, path].slice(-30)));
@@ -1434,7 +1542,7 @@ export function FilePanel({
     previewFor(path, at);
     setCompare(null);
     setGoto(at ? { ...at, n: Date.now() } : null);
-    setShowDiff(!!f.deleted || (diff && hasChange(path)));
+    setShowDiff(willDiff);
     if (window.matchMedia('(max-width: 760px)').matches) setTreeOpen(false);
     return true;
   };
@@ -2694,13 +2802,249 @@ export function FilePanel({
     );
     toast(tx('reviewCommentAdded'));
   };
+  const stepHistory = useCallback(async (delta: -1 | 1) => {
+    const h = navHistRef.current;
+    if (h.index < 0) return;
+    const curFile = fileRef.current;
+    if (curFile && h.entries[h.index] && norm(h.entries[h.index].path) === norm(curFile.path)) {
+      if (norm(curPosRef.current.path) === norm(curFile.path)) {
+        h.entries[h.index] = { ...h.entries[h.index], line: curPosRef.current.line, col: curPosRef.current.col };
+      }
+    }
+    const nextIdx = h.index + delta;
+    if (nextIdx < 0 || nextIdx >= h.entries.length) return;
+    const target = h.entries[nextIdx];
+    h.index = nextIdx;
+    syncNavState();
+    setNavPicker(null);
+    setNavPeek(null);
+    navSteppingRef.current = true;
+    try {
+      await openFileRef.current(target.path, !!target.diff, { line: target.line, col: target.col });
+    } finally {
+      navSteppingRef.current = false;
+    }
+  }, [syncNavState]);
+  const stepHistoryRef = useRef(stepHistory);
+  stepHistoryRef.current = stepHistory;
+
+  const jumpToNavTarget = useCallback(
+    (origin: NavPoint, targetAbsPath: string, line: number, col: number, len = 0) => {
+      recordNavJump(origin, { path: targetAbsPath, line, col, diff: false });
+      navSteppingRef.current = true;
+      void openFileRef.current(targetAbsPath, false, { line, col, len }).finally(() => {
+        navSteppingRef.current = false;
+      });
+    },
+    [recordNavJump],
+  );
+
+  const handleCodeNav = useCallback(
+    async (trigger: NavTrigger, navPath: string, originPath: string, isDiffView: boolean) => {
+      setNavPicker(null);
+      setNavPeek(null);
+      const reqId = ++navReqIdRef.current;
+
+      if (trigger.token.kind === 'url') {
+        openUrl(trigger.token.text);
+        return;
+      }
+
+      const workspaceRoot = root ?? cwd;
+      const origin: NavPoint = { path: originPath, line: trigger.token.line, col: trigger.token.col, diff: isDiffView };
+      const isUnknownMethod = (e: unknown) => {
+        const msg = String((e as Error)?.message ?? e).toLowerCase();
+        return msg.includes('未知方法') || msg.includes('unknown method');
+      };
+
+      const runReferences = async (symbol: string) => {
+        setNavPeek({ symbol, loading: true, result: null, coords: trigger.coords, origin });
+        try {
+          let res: NavReferencesResult;
+          try {
+            res = await rpc<NavReferencesResult>(hostId, 'nav.references', {
+              root: workspaceRoot,
+              path: navPath,
+              line: trigger.token.line,
+              col: trigger.token.col,
+              symbol,
+              includeDeclaration: false,
+              contextLines: 3,
+              limit: 200,
+            });
+          } catch (e) {
+            if (!isUnknownMethod(e)) throw e;
+            // Fallback for older daemons using existing fs.grep
+            const g = await rpc<{ hits: { path: string; line: number; col: number; len: number; offset: number; text: string; matches?: [number, number, string][] }[]; truncated: boolean; files: number }>(
+              hostId,
+              'fs.grep',
+              { root: workspaceRoot, query: symbol, caseSensitive: true, wholeWord: true, regex: false, limit: 200 },
+            );
+            const hits: NavReferenceHit[] = [];
+            for (const h of g.hits) {
+              const cols = h.matches?.length ? h.matches.map((m) => [m[0], m[1]] as const) : [[h.offset + h.col, h.len] as const];
+              for (const [c, l] of cols) {
+                hits.push({
+                  path: h.path,
+                  absPath: join(workspaceRoot, h.path.split('/').join(sepOf(workspaceRoot))),
+                  line: h.line,
+                  col: c,
+                  len: l,
+                  text: h.text,
+                  isDefinition: false,
+                  contextStartLine: h.line,
+                  context: [h.text],
+                });
+              }
+            }
+            res = {
+              provider: 'grep-fallback',
+              symbol,
+              truncated: g.truncated,
+              totalFiles: g.files,
+              totalHits: hits.length,
+              hits,
+            };
+          }
+          if (navReqIdRef.current !== reqId) return;
+          if (!res.hits.length) {
+            setNavPeek(null);
+            showNavNotice(tx('navNoReferences', { v: symbol }));
+            return;
+          }
+          setNavPeek({ symbol, loading: false, result: res, coords: trigger.coords, origin });
+        } catch (e) {
+          if (navReqIdRef.current !== reqId) return;
+          setNavPeek(null);
+          errorToast(e);
+        }
+      };
+
+      if (trigger.mode === 'references') {
+        await runReferences(trigger.token.text);
+        return;
+      }
+
+      try {
+        let res: NavDefinitionResult;
+        try {
+          res = await rpc<NavDefinitionResult>(hostId, 'nav.definition', {
+            root: workspaceRoot,
+            path: navPath,
+            line: trigger.token.line,
+            col: trigger.token.col,
+            symbol: trigger.token.kind === 'symbol' ? trigger.token.text : undefined,
+            kind: trigger.token.kind,
+            pathText: trigger.token.kind === 'path' ? trigger.token.text : undefined,
+            container: trigger.token.container,
+            content: trigger.content,
+            limit: 30,
+          });
+        } catch (e) {
+          if (!isUnknownMethod(e)) throw e;
+          // Graceful fallback for older daemons: current-buffer outline/line scan or fs.search
+          if (trigger.token.kind === 'path') {
+            const cleaned = trigger.token.text.replace(/^mod:/, '').replace(/:\d+(?::\d+)?$/, '');
+            const base = cleaned.slice(cleaned.lastIndexOf('/') + 1);
+            const found = await rpc<{ path: string; isDir: boolean }[]>(hostId, 'fs.search', { root: workspaceRoot, query: base, limit: 15 });
+            const locs: NavLocation[] = found
+              .filter((x) => !x.isDir)
+              .map((x) => ({
+                path: x.path,
+                absPath: join(workspaceRoot, x.path.split('/').join(sepOf(workspaceRoot))),
+                line: 1,
+                col: 0,
+                len: 0,
+                kind: 'file',
+                symbol: base,
+                preview: x.path,
+                score: 500,
+                source: 'path',
+              }));
+            res = { provider: 'fallback', kind: 'path', query: trigger.token.text, atDefinition: false, locations: locs };
+          } else {
+            const syms = outline(baseName(navPath), trigger.content).filter((s) => s.name === trigger.token.text);
+            const atDef = syms.some((s) => s.line === trigger.token.line);
+            const locs: NavLocation[] = syms
+              .filter((s) => !(atDef && s.line === trigger.token.line))
+              .map((s) => ({
+                path: rel(navPath),
+                absPath: navPath,
+                line: s.line,
+                col: 0,
+                len: s.name.length,
+                kind: s.kind,
+                symbol: s.name,
+                preview: trigger.content.split('\n')[s.line - 1]?.trim() ?? s.name,
+                score: 900,
+                source: 'same-file',
+              }));
+            res = { provider: 'fallback', kind: 'symbol', query: trigger.token.text, atDefinition: atDef, locations: locs };
+          }
+        }
+        if (navReqIdRef.current !== reqId) return;
+
+        if (res.atDefinition) {
+          if ((trigger.mode === 'click' || res.locations.length === 0) && trigger.token.kind === 'symbol') {
+            await runReferences(trigger.token.text);
+            return;
+          }
+          if (res.locations.length === 1) {
+            const loc = res.locations[0];
+            jumpToNavTarget(origin, loc.absPath, loc.line, loc.col, loc.len);
+            return;
+          }
+          if (res.locations.length > 1) {
+            setNavPicker({ symbol: trigger.token.text, locations: res.locations, coords: trigger.coords, origin });
+            return;
+          }
+        }
+
+        if (res.locations.length === 0) {
+          showNavNotice(
+            trigger.token.kind === 'path'
+              ? tx('navPathNotFound', { v: trigger.token.text })
+              : tx('navDefNotFound', { v: trigger.token.text }),
+          );
+          return;
+        }
+
+        const first = res.locations[0];
+        const secondLoc = res.locations[1];
+        const highConfidenceSingle =
+          res.locations.length === 1 ||
+          first.source === 'import' ||
+          (first.score >= 900 && (!secondLoc || first.score - secondLoc.score >= 120));
+        if (highConfidenceSingle) {
+          jumpToNavTarget(origin, first.absPath, first.line, first.col, first.len);
+          return;
+        }
+
+        setNavPicker({ symbol: trigger.token.text, locations: res.locations, coords: trigger.coords, origin });
+      } catch (e) {
+        if (navReqIdRef.current !== reqId) return;
+        errorToast(e);
+      }
+    },
+    [hostId, root, cwd, jumpToNavTarget, showNavNotice],
+  );
+
   /** Right-click menu inside the editor (VS Code's editor context menu, plus Cursor's "add selection to chat") */
   const editorMenu = (path: string, commitHash?: string) => (c: EditorMenuCtx): (MenuItem | '-')[] => {
-    const mod = navigator.platform.includes('Mac') ? '⌘' : 'Ctrl+';
+    const mod = IS_MAC ? '⌘' : 'Ctrl+';
     const onDisk = !isUntitled(path) && !commitHash;
     const displayPath = commitHash ? path : isUntitled(path) ? nameOf(path) : rel(path);
     const lines = c.fromLine === c.toLine ? `${c.fromLine}` : `${c.fromLine}-${c.toLine}`;
+    const navItems: (MenuItem | '-')[] =
+      !isUntitled(path)
+        ? [
+            { label: tx('goToDefinition'), icon: 'locate', hint: 'F12', disabled: !c.canNav, run: () => c.gotoDefinition?.() },
+            { label: tx('findAllReferences'), icon: 'search', hint: 'Shift+F12', disabled: !c.canFindRefs, run: () => c.findReferences?.() },
+            '-',
+          ]
+        : [];
     return [
+      ...navItems,
       { label: tx('cut'), icon: 'cut', hint: `${mod}X`, disabled: !c.selection || c.readOnly, run: c.cut },
       { label: tx('copy'), icon: 'copy', hint: `${mod}C`, disabled: !c.selection, run: c.copy },
       { label: tx('paste'), icon: 'paste', hint: `${mod}V`, disabled: c.readOnly, run: c.paste },
@@ -2780,10 +3124,22 @@ export function FilePanel({
     openMenu({ clientX: r.right - 220, clientY: r.bottom + 4 }, items);
   };
 
-  // ---------- Shortcuts: Ctrl+P quick open, Ctrl+Shift+O symbols, Ctrl+G go to line, Ctrl+Alt+N new untitled file ----------
+  // ---------- Shortcuts: Ctrl+P quick open, Ctrl+Shift+O symbols, Ctrl+G go to line, Ctrl+Alt+N new untitled file, nav history ----------
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.isComposing || e.keyCode === 229 || getState().palette) return;
+      if (!IS_MAC && e.altKey && !e.ctrlKey && !e.metaKey && !e.shiftKey && (e.key === 'ArrowLeft' || e.key === 'ArrowRight')) {
+        if (!fileRef.current) return;
+        e.preventDefault();
+        void stepHistoryRef.current(e.key === 'ArrowLeft' ? -1 : 1);
+        return;
+      }
+      if (IS_MAC && e.ctrlKey && !e.metaKey && !e.altKey && (e.key === '-' || e.key === '_' || e.code === 'Minus')) {
+        if (!fileRef.current) return;
+        e.preventDefault();
+        void stepHistoryRef.current(e.shiftKey ? 1 : -1);
+        return;
+      }
       if (!(e.ctrlKey || e.metaKey)) return;
       const k = e.key.toLowerCase();
       if (e.altKey) {
@@ -3208,6 +3564,10 @@ export function FilePanel({
           onSave={editable ? () => save() : undefined}
           onToggleWrap={toggleWrap}
           menu={editorMenu(refPath, commitHash)}
+          onNav={(t) => void handleCodeNav(t, refPath, file?.path ?? refPath, true)}
+          onCursorPos={(line, col, side) => {
+            if (side !== 'a') curPosRef.current = { path: file?.path ?? refPath, line, col };
+          }}
           onAddContext={standalone ? undefined : (snip) => pushContextRef(refPath, snip, commitHash)}
           onAddReview={standalone ? undefined : (snip, comment) => pushReviewComment(refPath, snip, comment, commitHash)}
           onCopyHunk={(content) => void copy(content, tx('diffCopied'))}
@@ -3426,6 +3786,7 @@ export function FilePanel({
           openFiles={tabs.filter((t) => !isWebTab(t) && !isReviewTab(t) && !isSideTab(t) && !parseCommitTab(t) && rel(t) !== t).map(rel)}
           dirty={file && dirty && !file.web && !file.commit && !file.review && !file.side && rel(file.path) !== file.path ? { rel: rel(file.path), draft: file.draft } : null}
           includeRequest={grepInclude}
+          queryRequest={grepQuery}
           onPreview={async (r, line, col, len, after) => {
             const abs = relOpen(r);
             await openFile(abs, false, { line, col, len });
@@ -3894,6 +4255,10 @@ export function FilePanel({
       onSave={() => save()}
       menu={editorMenu(file.path)}
       onToggleWrap={toggleWrap}
+      onNav={file.untitled ? undefined : (t) => void handleCodeNav(t, file.path, file.path, false)}
+      onCursorPos={(line, col) => {
+        curPosRef.current = { path: file.path, line, col };
+      }}
       onAddSelection={
         standalone
           ? undefined
@@ -4093,6 +4458,7 @@ export function FilePanel({
           onSave={() => {}}
           menu={editorMenu(second.path)}
           onToggleWrap={toggleWrap}
+          onNav={second.untitled ? undefined : (t) => void handleCodeNav(t, second.path, second.path, false)}
           onAddSelection={
             standalone
               ? undefined
@@ -4103,10 +4469,47 @@ export function FilePanel({
     </div>
   );
 
+  const navBtns = (
+    <>
+      <div className="wp-nav-btns">
+        <button
+          type="button"
+          className="icon-btn"
+          disabled={!navState.canBack}
+          title={tx('navBack', { v: IS_MAC ? 'Ctrl+-' : 'Alt+←' })}
+          aria-label={tx('navBack', { v: IS_MAC ? 'Ctrl+-' : 'Alt+←' })}
+          onClick={() => void stepHistory(-1)}
+        >
+          <Icon name="back" size={13} />
+        </button>
+        <button
+          type="button"
+          className="icon-btn"
+          disabled={!navState.canForward}
+          title={tx('navForward', { v: IS_MAC ? 'Ctrl+Shift+-' : 'Alt+→' })}
+          aria-label={tx('navForward', { v: IS_MAC ? 'Ctrl+Shift+-' : 'Alt+→' })}
+          onClick={() => void stepHistory(1)}
+        >
+          <Icon name="forward" size={13} />
+        </button>
+      </div>
+      <span className="wp-nav-sep" />
+    </>
+  );
+
   return (
     <aside
       className={`file-panel ${fullscreen ? 'full' : ''} ${file || emptyPane ? '' : 'browse'} ${standalone ? 'standalone' : ''}`}
       style={{ '--tree-w': `${treeW}px` } as React.CSSProperties}
+      onMouseDown={(e) => {
+        if (e.button === 3 || e.button === 4) e.preventDefault();
+      }}
+      onMouseUp={(e) => {
+        if (e.button === 3 || e.button === 4) {
+          e.preventDefault();
+          void stepHistory(e.button === 3 ? -1 : 1);
+        }
+      }}
     >
       {!file ? (
         <div className="wp-top">
@@ -4394,6 +4797,7 @@ export function FilePanel({
 
       {file?.commit && (
         <div className="wp-head">
+          {navBtns}
           {file.commit.baseHash ? (
             <div className="wp-commit-title truncate" title={tx('reviewRangeReadOnly')}>
               <span className="pd-tag">
@@ -4443,6 +4847,7 @@ export function FilePanel({
       )}
       {file && !file.web && !file.commit && !file.review && !file.side && (
         <div className="wp-head">
+          {navBtns}
           {compare ? (
             <div className="wp-compare-title truncate" title={`${file.path}\n${compare.path}`}>
               <span className="pd-tag del">{baseName(file.path)}</span>
@@ -4542,7 +4947,7 @@ export function FilePanel({
 
       <div className="wp-body" ref={bodyRef}>
         {file && (
-          <div className="wp-main">
+          <div className="wp-main" ref={mainRef}>
             {secondPane ? (
               <div className="wp-panes">
                 <div className="wp-pane">{mainView}</div>
@@ -4551,6 +4956,7 @@ export function FilePanel({
             ) : (
               mainView
             )}
+            <CodeNavNotice message={navNotice} />
           </div>
         )}
         {emptyPane && (
@@ -4684,6 +5090,40 @@ export function FilePanel({
           onFetch={() => void doFetch()}
           onCopyPath={(p) => void copy(p)}
           onClose={() => setBwOpen(false)}
+        />
+      )}
+      {navPicker && (
+        <DefinitionPicker
+          symbol={navPicker.symbol}
+          locations={navPicker.locations}
+          coords={navPicker.coords}
+          onPick={(loc) => {
+            const orig = navPicker.origin;
+            setNavPicker(null);
+            jumpToNavTarget(orig, loc.absPath, loc.line, loc.col, loc.len);
+          }}
+          onClose={() => setNavPicker(null)}
+        />
+      )}
+      {navPeek && (
+        <PeekReferences
+          symbol={navPeek.symbol}
+          loading={navPeek.loading}
+          result={navPeek.result}
+          coords={navPeek.coords}
+          containerWidth={mainRef.current?.clientWidth ?? 640}
+          onJump={(hit) => {
+            const orig = navPeek.origin;
+            setNavPeek(null);
+            jumpToNavTarget(orig, hit.absPath, hit.line, hit.col, hit.len);
+          }}
+          onOpenInSearch={(sym) => {
+            setNavPeek(null);
+            setGrepQuery({ query: sym, caseSensitive: true, wholeWord: true, regex: false, n: Date.now() });
+            pickView('search');
+            setTree(true);
+          }}
+          onClose={() => setNavPeek(null)}
         />
       )}
     </aside>
