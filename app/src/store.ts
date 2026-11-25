@@ -690,8 +690,18 @@ export function takeOpenFile(hostId: string, sessionId: string): OpenFileReq | u
   return next;
 }
 
-function enqueueOpenFiles(hostId: string, sessionId: string, reqs: OpenFileReq[]) {
+/** Side chats and review tabs have no file panel of their own; they live inside the parent's panel, so file and
+ *  "changes" requests from them go to the parent session (bottom terminals keep their own id) */
+export function panelSessionId(hostId: string, sessionId: string): string {
+  const info = sessionInfo(hostId, sessionId);
+  const parentId = info?.parentId;
+  if (!parentId || !(info?.sideChat || info?.review)) return sessionId;
+  return state.sessions[hostId]?.some((x) => x.id === parentId) ? parentId : sessionId;
+}
+
+function enqueueOpenFiles(hostId: string, targetId: string, reqs: OpenFileReq[]) {
   if (!reqs.length) return;
+  const sessionId = panelSessionId(hostId, targetId);
   const k = skey(hostId, sessionId);
   lsSet(`file-panel-${k}`, true);
   const q = pendingFiles.get(k) ?? [];

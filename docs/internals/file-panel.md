@@ -85,6 +85,7 @@ The session page's "workspace files" (`FilePanel.tsx`), also used standalone by 
 
 ## Side chat tabs
 
+- Side chats and review tabs have no file panel of their own: `enqueueOpenFiles` (behind `openFileInPanel` / `openFilesInPanel`) and `showChanges` map their session id to the parent's with `panelSessionId` in `store.ts`, so file links, context pills and `/diff` inside a side chat open in the parent's panel. Bottom terminal sessions keep their own id.
 - Side chats open in the right panel alongside code/diff/web tabs with tab key `side:<sessionId>` (`SideChatTab.tsx`, `isSideTab`). Opening a side chat hides the file tree (like `aiweb:`) so the conversation gets room; the tree can be toggled back anytime.
 - Multiple side chats can stay open in parallel tabs (running tabs show a blue status dot). Closing a side chat tab with no messages deletes its session automatically; closing a used one only closes the tab and leaves it reopenable from the parent session header's side chat menu.
 - When tabs are open, the inline `+` button next to the tabs creates a new untitled file directly, while the right-side `sideChat` button opens a menu for creating a new side chat (same tool or another installed AI tool) or a web tab (when no tabs are open yet, the `+` button offers all three).

@@ -1,5 +1,5 @@
 import { getT, isEn } from '../i18n';
-import { errorToast, getState, loadSession, navigate, openNewSession, skey, toast } from '../store';
+import { errorToast, getState, loadSession, navigate, openNewSession, panelSessionId, skey, toast } from '../store';
 import { rpc } from '../transport';
 import { isHostSession, sessionProjectDir, TOOL_LABEL, supportsAccountsTool, type HubEvent, type SessionInfo } from '../types';
 import { downloadText, isMobile, lsSet, safeFileName, sessionMarkdown, toB64 } from '../util';
@@ -26,7 +26,8 @@ export const takeOpenTurn = (hostId: string, sessionId: string): number | null =
 };
 
 /** View changes: go to the session page and open the "Changes" view of the file panel on the right */
-export function showChanges(hostId: string, sessionId: string) {
+export function showChanges(hostId: string, targetId: string) {
+  const sessionId = panelSessionId(hostId, targetId);
   const k = skey(hostId, sessionId);
   lsSet(`file-panel-${k}`, true);
   lsSet(`wp-tree-${k}`, true);
