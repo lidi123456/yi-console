@@ -971,6 +971,7 @@ pub async fn dispatch(
                 line: p["line"].as_u64().unwrap_or(1).max(1) as usize,
                 col: p["col"].as_u64().unwrap_or(0) as usize,
                 symbol: s(&p, "symbol")?.to_string(),
+                content: p["content"].as_str().map(str::to_string),
                 include_declaration: p["includeDeclaration"].as_bool().unwrap_or(false),
                 context_lines: p["contextLines"].as_u64().unwrap_or(3).min(8) as usize,
                 limit: p["limit"].as_u64().unwrap_or(200).clamp(1, 500) as usize,
@@ -1716,6 +1717,29 @@ mod tests {
         let ref_resp: Value = serde_json::from_str(&line).unwrap();
         assert_eq!(ref_resp["id"], 2);
         assert_eq!(ref_resp["result"]["totalHits"], 2);
+
+        // Unsaved draft content forwarded via NAV_REFERENCES
+        let mut client = reader.into_inner();
+        let draft_ref_req = json!({
+            "id": 3,
+            "method": methods::NAV_REFERENCES,
+            "params": {
+                "root": dir.path().display().to_string(),
+                "path": "lib.ts",
+                "line": 1,
+                "col": 16,
+                "symbol": "greetUser",
+                "content": "export function greetUser(name: string) { return name; }\ngreetUser('unsaved');\n",
+                "includeDeclaration": false
+            }
+        });
+        client.write_all(format!("{draft_ref_req}\n").as_bytes()).await.unwrap();
+        let mut reader = BufReader::new(client);
+        line.clear();
+        tokio::time::timeout(std::time::Duration::from_secs(3), reader.read_line(&mut line)).await.unwrap().unwrap();
+        let draft_resp: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(draft_resp["id"], 3);
+        assert_eq!(draft_resp["result"]["totalHits"], 3);
         drop(reader);
         task.await.unwrap();
     }

@@ -60,6 +60,7 @@ export interface GotoTarget {
   endLine?: number;
   col?: number;
   len?: number;
+  side?: 'a' | 'b' | 'del-file';
   n: number;
 }
 

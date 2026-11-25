@@ -137,11 +137,10 @@ export function DefinitionPicker({
 }
 
 function renderHighlightedLine(line: string, col: number, len: number, markClass: string) {
-  const chars = [...line];
-  if (col < 0 || len <= 0 || col >= chars.length) return line || ' ';
-  const pre = chars.slice(0, col).join('');
-  const mid = chars.slice(col, col + len).join('');
-  const post = chars.slice(col + len).join('');
+  if (col < 0 || len <= 0 || col >= line.length) return line || ' ';
+  const pre = line.slice(0, col);
+  const mid = line.slice(col, col + len);
+  const post = line.slice(col + len);
   return (
     <>
       {pre}
@@ -154,13 +153,13 @@ function renderHighlightedLine(line: string, col: number, len: number, markClass
 function renderSnippet(hit: NavReferenceHit) {
   const trimmed = hit.text.replace(/^\s+/, '');
   const leading = hit.text.length - trimmed.length;
-  const chars = [...trimmed];
   const c = hit.col - leading;
-  if (c < 0 || c >= chars.length) return trimmed;
-  const head = chars.slice(0, c).join('');
-  const pre = head.length > 18 ? '…' + head.slice(-16) : head;
-  const mid = chars.slice(c, c + hit.len).join('');
-  const post = chars.slice(c + hit.len).join('');
+  if (c < 0 || c >= trimmed.length) return trimmed;
+  const head = trimmed.slice(0, c);
+  const headChars = [...head];
+  const pre = headChars.length > 18 ? '…' + headChars.slice(-16).join('') : head;
+  const mid = trimmed.slice(c, c + hit.len);
+  const post = trimmed.slice(c + hit.len);
   return (
     <>
       {pre}

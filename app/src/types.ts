@@ -852,7 +852,9 @@ export interface NavLocation {
   path: string;
   absPath: string;
   line: number;
+  /** 0-based UTF-16 code-unit column within `line` */
   col: number;
+  /** Length in UTF-16 code units */
   len: number;
   endLine?: number | null;
   kind: string;
@@ -860,7 +862,7 @@ export interface NavLocation {
   container?: string | null;
   preview: string;
   score: number;
-  source: 'import' | 'same-file' | 'index' | 'path' | string;
+  source: 'import' | 'local' | 'same-file' | 'index' | 'path' | string;
 }
 
 export interface NavDefinitionResult {
@@ -875,7 +877,9 @@ export interface NavReferenceHit {
   path: string;
   absPath: string;
   line: number;
+  /** 0-based UTF-16 code-unit column within `line` */
   col: number;
+  /** Length in UTF-16 code units */
   len: number;
   text: string;
   isDefinition: boolean;

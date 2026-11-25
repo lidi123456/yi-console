@@ -514,6 +514,8 @@ export const MergeDiff = forwardRef<
     onCopyHunk?: (content: string) => void;
     inlineReviews?: InlineReviewPlacement[];
     renderInlineReview?: (id: string) => ReactNode;
+    sideAFilename?: string;
+    sideBFilename?: string;
     onNav?: (t: NavTrigger) => void;
     onCursorPos?: (line: number, col: number, side: 'a' | 'b' | 'del-file') => void;
   }
@@ -537,6 +539,8 @@ export const MergeDiff = forwardRef<
     onCopyHunk,
     inlineReviews,
     renderInlineReview,
+    sideAFilename,
+    sideBFilename,
     onNav,
     onCursorPos,
   },
@@ -602,8 +606,57 @@ export const MergeDiff = forwardRef<
   const roComp = useRef(new Compartment());
   const filenameRef = useRef(filename);
   filenameRef.current = filename;
+  const sideAFilenameRef = useRef(sideAFilename ?? filename);
+  sideAFilenameRef.current = sideAFilename ?? filename;
+  const sideBFilenameRef = useRef(sideBFilename ?? filename);
+  sideBFilenameRef.current = sideBFilename ?? filename;
   const cb = useRef({ onChange, onSave, onToggleWrap, onAddContext, onAddReview, onCopyHunk, menu, onNav, onCursorPos });
   cb.current = { onChange, onSave, onToggleWrap, onAddContext, onAddReview, onCopyHunk, menu, onNav, onCursorPos };
+
+  const applyMergeGoto = (l: Live, g: GotoTarget) => {
+    if (l.kind === 'del-file') {
+      applyGoto(l.view, g);
+      return;
+    }
+    if (l.kind === 'split') {
+      applyGoto(g.side === 'a' ? l.a : l.b, g);
+      return;
+    }
+    if (g.side === 'a') {
+      const v = l.view;
+      const docA = getOriginalDoc(v.state);
+      const docB = v.state.doc;
+      const chunks = getChunks(v.state)?.chunks ?? [];
+      let deltaLines = 0;
+      for (const ch of chunks) {
+        const hasA = ch.fromA < ch.toA && docA.length > 0;
+        const startA = hasA ? docA.lineAt(Math.min(ch.fromA, docA.length)).number : docA.length === 0 ? 1 : ch.fromA > docA.length ? docA.lines + 1 : docA.lineAt(ch.fromA).number;
+        const endA = hasA ? docA.lineAt(Math.min(ch.endA, docA.length)).number : startA - 1;
+        const lenA = hasA ? endA - startA + 1 : 0;
+        const hasB = ch.fromB < ch.toB && docB.length > 0;
+        const startB = hasB ? docB.lineAt(Math.min(ch.fromB, docB.length)).number : 0;
+        const endB = hasB ? docB.lineAt(Math.min(ch.endB, docB.length)).number : -1;
+        const lenB = hasB ? endB - startB + 1 : 0;
+        if (hasA && g.line >= startA && g.line <= endA) {
+          const anchorPos = Math.min(ch.fromB, docB.length);
+          v.dispatch({
+            selection: { anchor: anchorPos },
+            effects: EditorView.scrollIntoView(anchorPos, { y: 'center' }),
+          });
+          v.focus();
+          return;
+        }
+        if (g.line < startA) {
+          applyGoto(v, { ...g, line: Math.max(1, g.line + deltaLines) });
+          return;
+        }
+        deltaLines += lenB - lenA;
+      }
+      applyGoto(v, { ...g, line: Math.max(1, g.line + deltaLines) });
+      return;
+    }
+    applyGoto(l.view, g);
+  };
 
   const getActiveSelectionView = (): { view: EditorView; side: 'a' | 'b' | 'del-file' } | null => {
     const l = live.current;
@@ -763,8 +816,7 @@ export const MergeDiff = forwardRef<
   useEffect(() => {
     const l = live.current;
     if (!l || !goto) return;
-    const target = l.kind === 'split' ? l.b : l.view;
-    applyGoto(target, goto);
+    applyMergeGoto(l, goto);
   }, [goto?.n, docKey, layout]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const build = (el: HTMLElement, language: Extension): (() => void) => {
@@ -806,7 +858,8 @@ export const MergeDiff = forwardRef<
       ]),
       editorSearchExtension(),
       editorCodeNavExtension({
-        filename: () => filenameRef.current,
+        filename: () => (selSide === 'a' || selSide === 'del-file' ? sideAFilenameRef.current : sideBFilenameRef.current),
+        deletedChunkFilename: () => sideAFilenameRef.current,
         side: selSide,
         onNav: (t) => cb.current.onNav?.(t),
         onCursor: (l, c) => cb.current.onCursorPos?.(l, c, selSide),
@@ -856,7 +909,9 @@ export const MergeDiff = forwardRef<
       const onSc = () => syncSelChip();
       const stopObserve = observeReviewViewport(v);
       v.scrollDOM.addEventListener('scroll', onSc, { passive: true });
+      const delRaf = goto ? requestAnimationFrame(() => applyMergeGoto({ kind: 'del-file', view: v }, goto)) : null;
       return () => {
+        if (delRaf != null) cancelAnimationFrame(delRaf);
         if (slotSyncRaf.current != null) {
           cancelAnimationFrame(slotSyncRaf.current);
           slotSyncRaf.current = null;
@@ -960,8 +1015,8 @@ export const MergeDiff = forwardRef<
     const target = views[views.length - 1];
     nav.current = target;
     const raf = requestAnimationFrame(() => {
-      if (goto) {
-        applyGoto(target, goto);
+      if (goto && live.current) {
+        applyMergeGoto(live.current, goto);
         return;
       }
       const first = getChunks(target.state)?.chunks[0];
@@ -1092,6 +1147,7 @@ export const MergeDiff = forwardRef<
           : l.b
         : l.view;
     const side: 'a' | 'b' | 'del-file' = l.kind === 'del-file' ? 'del-file' : l.kind === 'split' && v === l.a ? 'a' : 'b';
+    const sideFilename = side === 'a' || side === 'del-file' ? sideAFilenameRef.current : sideBFilenameRef.current;
     // "Add selection to chat" sends the same diff snippet as the floating button, deleted lines included
     openEditorContextMenu(
       e,
@@ -1102,7 +1158,7 @@ export const MergeDiff = forwardRef<
           oldSide: side === 'a' || side === 'del-file',
           addSelection: cb.current.onAddContext && ctx.selection ? () => void triggerSelectionAdd({ view: v, side }) : undefined,
         }),
-      cb.current.onNav ? { filename: filenameRef.current, side, onNav: (t) => cb.current.onNav?.(t) } : undefined,
+      cb.current.onNav ? { filename: sideFilename, side, onNav: (t) => cb.current.onNav?.(t) } : undefined,
     );
   };
 

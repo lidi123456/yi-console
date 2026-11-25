@@ -368,6 +368,7 @@ export function triggerNavAtCursor(
 
 export function editorCodeNavExtension(opts: {
   filename: () => string;
+  deletedChunkFilename?: () => string;
   side?: 'a' | 'b' | 'del-file';
   onNav: (t: NavTrigger) => void;
   onCursor?: (line: number, col: number) => void;
@@ -451,7 +452,7 @@ export function editorCodeNavExtension(opts: {
 
         const delEl = targetEl?.closest?.<HTMLElement>('.cm-deletedChunk');
         if (delEl && this.view.contentDOM.contains(delEl)) {
-          const trig = tryDeletedChunkNav(this.view, e, delEl, opts.filename());
+          const trig = tryDeletedChunkNav(this.view, e, delEl, (opts.deletedChunkFilename ?? opts.filename)());
           if (trig) {
             e.preventDefault();
             e.stopPropagation();

@@ -23,6 +23,7 @@ pub struct DefRequest {
     pub path: String,
     #[serde(default = "default_line")]
     pub line: usize,
+    /// 0-based UTF-16 code-unit column within `line`.
     #[serde(default)]
     pub col: usize,
     pub symbol: Option<String>,
@@ -42,11 +43,12 @@ pub struct RefRequest {
     pub path: String,
     #[serde(default = "default_line")]
     pub line: usize,
+    /// 0-based UTF-16 code-unit column within `line`.
     #[serde(default)]
-    /// Reserved for future LSP position-based providers.
-    #[allow(dead_code)]
     pub col: usize,
     pub symbol: String,
+    #[serde(default)]
+    pub content: Option<String>,
     #[serde(default)]
     pub include_declaration: bool,
     #[serde(default = "default_ctx_lines")]
@@ -248,12 +250,15 @@ struct CachedTsConfig {
     paths: Vec<(String, Vec<String>)>,
 }
 
+fn canon_clean(p: &Path) -> Option<PathBuf> {
+    p.canonicalize()
+        .ok()
+        .map(|c| PathBuf::from(crate::fsapi::strip_verbatim(&c.display().to_string())))
+}
+
 fn expand_root(raw: &str) -> Result<PathBuf> {
     let p = crate::paths::expand(raw);
-    let canon = p
-        .canonicalize()
-        .map(|c| PathBuf::from(crate::fsapi::strip_verbatim(&c.display().to_string())))
-        .unwrap_or(p);
+    let canon = canon_clean(&p).unwrap_or(p);
     if !canon.is_dir() {
         bail!("目录不存在: {}", canon.display());
     }
@@ -273,22 +278,54 @@ fn norm_cmp(p: &str) -> String {
     }
 }
 
-fn normalize_rel_path(root: &Path, path: &str) -> String {
+fn is_safe_rel(rel: &str) -> bool {
+    !rel.is_empty()
+        && !rel.starts_with('/')
+        && !rel.starts_with('\\')
+        && !rel.contains(':')
+        && rel.split(['/', '\\']).all(|seg| !seg.is_empty() && seg != "." && seg != "..")
+}
+
+fn canonical_contained_path(root_canon: &Path, candidate: &Path) -> Option<(PathBuf, String)> {
+    let canon = canon_clean(candidate)?;
+    if !canon.is_file() || !canon.starts_with(root_canon) {
+        return None;
+    }
+    let rel = norm_slashes(&canon.strip_prefix(root_canon).ok()?.to_string_lossy());
+    Some((canon, rel))
+}
+
+fn normalize_rel_path(root_canon: &Path, raw_root: Option<&Path>, path: &str) -> String {
     if path.is_empty() {
         return String::new();
     }
-    let root_str = norm_slashes(&crate::fsapi::strip_verbatim(&root.display().to_string())).trim_end_matches('/').to_string();
-    let p_str = norm_slashes(&crate::fsapi::strip_verbatim(path));
-    let root_cmp = norm_cmp(&root_str);
+    let stripped = crate::fsapi::strip_verbatim(path);
+    let p_str = norm_slashes(&stripped);
     let p_cmp = norm_cmp(&p_str);
-    if p_cmp == root_cmp {
-        return String::new();
+    for base in [Some(root_canon), raw_root].into_iter().flatten() {
+        let root_str = norm_slashes(&crate::fsapi::strip_verbatim(&base.display().to_string()))
+            .trim_end_matches('/')
+            .to_string();
+        let root_cmp = norm_cmp(&root_str);
+        if p_cmp == root_cmp {
+            return String::new();
+        }
+        let prefix = format!("{root_cmp}/");
+        if p_cmp.starts_with(&prefix) && p_str.is_char_boundary(root_str.len() + 1) {
+            let rel = &p_str[root_str.len() + 1..];
+            return if is_safe_rel(rel) { rel.to_string() } else { String::new() };
+        }
     }
-    let prefix = format!("{root_cmp}/");
-    if p_cmp.starts_with(&prefix) && p_str.is_char_boundary(root_str.len() + 1) {
-        return p_str[root_str.len() + 1..].to_string();
+    let p_path = Path::new(&stripped);
+    if p_path.is_absolute() {
+        return canonical_contained_path(root_canon, p_path).map(|(_, rel)| rel).unwrap_or_default();
     }
-    p_str.trim_start_matches("./").trim_start_matches('/').to_string()
+    let rel = p_str.trim_start_matches("./");
+    if is_safe_rel(rel) {
+        rel.to_string()
+    } else {
+        String::new()
+    }
 }
 
 fn join_abs(root: &Path, rel: &str) -> String {
@@ -378,20 +415,29 @@ fn line_spans(text: &str) -> Vec<&str> {
     lines
 }
 
-fn read_text_file(path: &Path) -> Option<String> {
-    let meta = std::fs::metadata(path).ok()?;
+fn read_text_file_raw(canon_path: &Path) -> Option<String> {
+    let meta = std::fs::metadata(canon_path).ok()?;
     if !meta.is_file() || meta.len() > MAX_FILE_BYTES {
         return None;
     }
-    let buf = std::fs::read(path).ok()?;
+    let buf = std::fs::read(canon_path).ok()?;
     if buf.iter().take(8000).any(|&b| b == 0) {
         return None;
     }
     Some(String::from_utf8_lossy(&buf).into_owned())
 }
 
-fn char_col(line: &str, byte_idx: usize) -> usize {
-    line[..byte_idx].chars().count()
+fn read_contained_text_file(root_canon: &Path, candidate: &Path) -> Option<String> {
+    let (canon, _) = canonical_contained_path(root_canon, candidate)?;
+    read_text_file_raw(&canon)
+}
+
+fn utf16_len(s: &str) -> usize {
+    s.encode_utf16().count()
+}
+
+fn utf16_col(line: &str, byte_idx: usize) -> usize {
+    line[..byte_idx].encode_utf16().count()
 }
 
 /// Count net `{` minus `}` on a line while skipping strings and trailing `//` comments.
@@ -555,8 +601,8 @@ fn push_def(
     if name.is_empty() || is_control_kw(&name) {
         return;
     }
-    let col = char_col(line, m.start());
-    let len = name.chars().count();
+    let col = utf16_col(line, m.start());
+    let len = utf16_len(&name);
     out.push(IndexedDef {
         name,
         kind,
@@ -927,41 +973,775 @@ fn extract_definitions(lang: LangFamily, text: &str) -> Vec<IndexedDef> {
     out
 }
 
-/// Extract local declarations (`let`/`const`/`var`/params) in the current file up to `max_line`.
-fn extract_local_defs(lang: LangFamily, text: &str, symbol: &str, max_line: usize) -> Vec<IndexedDef> {
-    let mut out = Vec::new();
-    let esc = regex::escape(symbol);
-    let pat = match lang {
-        LangFamily::JsTs => format!(r"\b(?:const|let|var)\s+(?:\{{[^}}]*\b|\[\s*[^]]*\b)?({esc})\b"),
-        LangFamily::Rust => format!(r"\blet\s+(?:mut\s+)?(?:\([^)]*\b)?({esc})\b"),
-        LangFamily::Go => format!(r"\b({esc})\s*:="),
-        LangFamily::Python => format!(r"^\s*({esc})\s*(?::[^=]+)?="),
-        _ => return out,
-    };
-    let Ok(re) = Regex::new(&pat) else {
-        return out;
-    };
-    for (idx, line) in text.split('\n').map(|l| l.strip_suffix('\r').unwrap_or(l)).enumerate() {
-        let ln = idx + 1;
-        if ln > max_line {
-            break;
-        }
-        let trimmed = line.trim();
-        if trimmed.starts_with("//") || trimmed.starts_with('#') || is_import_line(lang, trimmed) {
+/// Record `(byte_offset, depth_after)` for every `{` and `}` on a single line outside strings and `//` comments.
+fn line_brace_trace(line: &str, base: i32) -> Vec<(usize, i32)> {
+    let bytes = line.as_bytes();
+    let mut i = 0usize;
+    let mut cur = base;
+    let mut quote: Option<u8> = None;
+    let mut trace = Vec::new();
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some(q) = quote {
+            if b == b'\\' {
+                i += 2;
+                continue;
+            }
+            if b == q {
+                quote = None;
+            }
+            i += 1;
             continue;
         }
-        if let Some(c) = re.captures(line) {
-            if let Some(m) = c.get(1) {
-                // Avoid flagging comparisons (`==`, `===`, `!=`, `<=`, `>=`) or property keys
-                let after = line[m.end()..].trim_start();
-                if lang == LangFamily::Python && (after.starts_with("==") || after.is_empty()) {
-                    continue;
+        if b == b'/' && bytes.get(i + 1) == Some(&b'/') {
+            break;
+        }
+        match b {
+            b'"' | b'\'' | b'`' => quote = Some(b),
+            b'{' => {
+                cur += 1;
+                trace.push((i, cur));
+            }
+            b'}' => {
+                cur -= 1;
+                trace.push((i, cur));
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    trace
+}
+
+fn brace_depth_at(trace: &[(usize, i32)], base: i32, byte_pos: usize) -> i32 {
+    let mut d = base;
+    for &(off, depth) in trace {
+        if off <= byte_pos {
+            d = depth;
+        } else {
+            break;
+        }
+    }
+    d
+}
+
+fn brace_min_depth_between(trace: &[(usize, i32)], start_depth: i32, from_byte: usize, to_byte: usize) -> i32 {
+    let mut min_d = start_depth;
+    for &(off, depth) in trace {
+        if off > from_byte && off <= to_byte {
+            min_d = min_d.min(depth);
+        }
+    }
+    min_d
+}
+
+fn utf16_col_to_byte(line: &str, target_col: usize) -> usize {
+    let mut acc = 0usize;
+    for (idx, ch) in line.char_indices() {
+        if acc >= target_col {
+            return idx;
+        }
+        acc += ch.len_utf16();
+    }
+    line.len()
+}
+
+fn contains_whole_word(text: &str, word: &str) -> bool {
+    let mut from = 0usize;
+    while let Some(pos) = text[from..].find(word) {
+        let s = from + pos;
+        let e = s + word.len();
+        let b_ok = !text[..s].chars().next_back().is_some_and(is_word_char);
+        let a_ok = !text[e..].chars().next().is_some_and(is_word_char);
+        if b_ok && a_ok {
+            return true;
+        }
+        from = s + word.chars().next().map_or(1, char::len_utf8);
+    }
+    false
+}
+
+/// Find matching `symbol` identifier spans declared in a pattern LHS (simple ident, `{ a, b: sym }`, `[a, sym]`, `(a, mut sym)`).
+fn collect_pattern_defs(
+    line: &str,
+    ln: usize,
+    seg_start: usize,
+    seg_end: usize,
+    symbol: &str,
+    _lang: LangFamily,
+    out: &mut Vec<(usize, usize, IndexedDef)>,
+) {
+    if seg_start >= seg_end || seg_end > line.len() {
+        return;
+    }
+    let slice = &line[seg_start..seg_end];
+    if !contains_whole_word(slice, symbol) {
+        return;
+    }
+    let bytes = line.as_bytes();
+    let mut i = seg_start;
+    let mut quote: Option<u8> = None;
+    let mut obj_depth = 0usize;
+    let mut seq_depth = 0usize;
+    let mut skip_default_depth: Option<usize> = None;
+    let mut expect_rust_type = false;
+
+    while i < seg_end {
+        let b = bytes[i];
+        if let Some(q) = quote {
+            if b == b'\\' {
+                i += 2;
+                continue;
+            }
+            if b == q {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        if matches!(b, b'"' | b'\'' | b'`') {
+            quote = Some(b);
+            i += 1;
+            continue;
+        }
+        let cur_depth = obj_depth + seq_depth;
+        if let Some(sd) = skip_default_depth {
+            match b {
+                b'{' | b'[' | b'(' => seq_depth += 1,
+                b'}' | b']' | b')' => {
+                    if cur_depth <= sd {
+                        skip_default_depth = None;
+                        if b == b'{' || b == b'}' {
+                            obj_depth = obj_depth.saturating_sub(1);
+                        } else {
+                            seq_depth = seq_depth.saturating_sub(1);
+                        }
+                    } else {
+                        seq_depth = seq_depth.saturating_sub(1);
+                    }
                 }
-                push_def(&mut out, ln, line, m, "const", None, false);
+                b',' if cur_depth == sd => skip_default_depth = None,
+                b';' => break,
+                _ => {}
+            }
+            i += 1;
+            continue;
+        }
+        if expect_rust_type {
+            match b {
+                b'=' => {
+                    expect_rust_type = false;
+                    skip_default_depth = Some(cur_depth);
+                }
+                b';' => break,
+                _ => {}
+            }
+            i += 1;
+            continue;
+        }
+
+        match b {
+            b'{' => obj_depth += 1,
+            b'}' => obj_depth = obj_depth.saturating_sub(1),
+            b'[' | b'(' => seq_depth += 1,
+            b']' | b')' => seq_depth = seq_depth.saturating_sub(1),
+            b'=' => skip_default_depth = Some(cur_depth),
+            b':' => {
+                if bytes.get(i + 1) == Some(&b'=') {
+                    // Go `:=` terminates the LHS target list
+                    break;
+                }
+                if cur_depth == 0 {
+                    // Top-level `: Type` annotation before `=`
+                    expect_rust_type = true;
+                }
+            }
+            b';' => break,
+            _ if b.is_ascii_alphabetic() || b == b'_' || b == b'$' => {
+                let start = i;
+                while i < seg_end {
+                    let ch = line[i..].chars().next().unwrap();
+                    if is_word_char(ch) {
+                        i += ch.len_utf8();
+                    } else {
+                        break;
+                    }
+                }
+                let word = &line[start..i];
+                if word == symbol {
+                    // Inside `{ origKey: alias }`, skip `origKey` immediately followed by single `:`
+                    let rest = line[i..seg_end].trim_start();
+                    let is_prop_key = obj_depth > 0 && rest.starts_with(':') && !rest.starts_with("::");
+                    if !is_prop_key && !matches!(word, "mut" | "ref" | "box" | "const" | "let" | "var" | "type") {
+                        out.push((
+                            start,
+                            i,
+                            IndexedDef {
+                                name: word.to_string(),
+                                kind: "const",
+                                line: ln,
+                                col: utf16_col(line, start),
+                                len: utf16_len(word),
+                                container: None,
+                                exported: false,
+                                preview: trunc_chars(line, MAX_PREVIEW_CHARS),
+                            },
+                        ));
+                    }
+                }
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+}
+
+/// Extract parameter declarations inside a `(params)` snippet matching `symbol`.
+fn collect_param_defs(
+    line: &str,
+    ln: usize,
+    params_start: usize,
+    params_end: usize,
+    lang: LangFamily,
+    symbol: &str,
+    out: &mut Vec<(usize, usize, IndexedDef)>,
+) {
+    if params_start >= params_end || params_end > line.len() {
+        return;
+    }
+    let seg = &line[params_start..params_end];
+    if !contains_whole_word(seg, symbol) {
+        return;
+    }
+    // Split top-level `,` parameters while ignoring strings and nested brackets.
+    let bytes = line.as_bytes();
+    let mut part_start = params_start;
+    let mut i = params_start;
+    let mut paren = 0i32;
+    let mut bracket = 0i32;
+    let mut brace = 0i32;
+    let mut angle = 0i32;
+    let mut quote: Option<u8> = None;
+    let mut slices = Vec::new();
+    while i < params_end {
+        let b = bytes[i];
+        if let Some(q) = quote {
+            if b == b'\\' {
+                i += 2;
+                continue;
+            }
+            if b == q {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        match b {
+            b'"' | b'\'' | b'`' => quote = Some(b),
+            b'(' => paren += 1,
+            b')' => paren = (paren - 1).max(0),
+            b'[' => bracket += 1,
+            b']' => bracket = (bracket - 1).max(0),
+            b'{' => brace += 1,
+            b'}' => brace = (brace - 1).max(0),
+            b'<' => angle += 1,
+            b'>' => angle = (angle - 1).max(0),
+            b',' if paren == 0 && bracket == 0 && brace == 0 && angle == 0 => {
+                slices.push((part_start, i));
+                part_start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    slices.push((part_start, params_end));
+
+    for (ps, pe) in slices {
+        let p = &line[ps..pe];
+        if !contains_whole_word(p, symbol) {
+            continue;
+        }
+        let mut s = ps;
+        while s < pe && bytes[s].is_ascii_whitespace() {
+            s += 1;
+        }
+        if s >= pe {
+            continue;
+        }
+        // Strip leading destructuring spread / mut / ref / modifiers
+        loop {
+            let cur = &line[s..pe];
+            if cur.starts_with("...") {
+                s += 3;
+            } else if let Some(kw) = ["mut ", "ref ", "public ", "private ", "protected ", "readonly ", "val ", "var "]
+                .iter()
+                .find(|k| cur.starts_with(*k))
+            {
+                s += kw.len();
+            } else {
+                break;
+            }
+            while s < pe && bytes[s].is_ascii_whitespace() {
+                s += 1;
+            }
+        }
+        if s >= pe {
+            continue;
+        }
+        if matches!(bytes[s], b'{' | b'[' | b'(') {
+            collect_pattern_defs(line, ln, s, pe, symbol, lang, out);
+            continue;
+        }
+        if matches!(lang, LangFamily::JsTs | LangFamily::Rust | LangFamily::Python)
+            || (lang == LangFamily::Jvm && line[s..pe].contains(':'))
+        {
+            // Name comes before `:` or `=`
+            let head_end = line[s..pe]
+                .find([':', '='])
+                .map_or(pe, |rel| s + rel);
+            let head = line[s..head_end].trim_end();
+            if head == symbol {
+                out.push((
+                    s,
+                    s + head.len(),
+                    IndexedDef {
+                        name: symbol.to_string(),
+                        kind: "const",
+                        line: ln,
+                        col: utf16_col(line, s),
+                        len: utf16_len(symbol),
+                        container: None,
+                        exported: false,
+                        preview: trunc_chars(line, MAX_PREVIEW_CHARS),
+                    },
+                ));
+            }
+        } else if lang == LangFamily::Go {
+            let trimmed = line[s..pe].trim();
+            if trimmed == symbol && pe < params_end {
+                // `func(a, b int)` shorthand where `a` precedes a comma
+                out.push((
+                    s,
+                    s + trimmed.len(),
+                    IndexedDef {
+                        name: symbol.to_string(),
+                        kind: "const",
+                        line: ln,
+                        col: utf16_col(line, s),
+                        len: utf16_len(symbol),
+                        container: None,
+                        exported: false,
+                        preview: trunc_chars(line, MAX_PREVIEW_CHARS),
+                    },
+                ));
+            } else if let Some((first, rest)) = trimmed.split_once(char::is_whitespace) {
+                if first == symbol && !rest.trim().is_empty() {
+                    out.push((
+                        s,
+                        s + first.len(),
+                        IndexedDef {
+                            name: symbol.to_string(),
+                            kind: "const",
+                            line: ln,
+                            col: utf16_col(line, s),
+                            len: utf16_len(symbol),
+                            container: None,
+                            exported: false,
+                            preview: trunc_chars(line, MAX_PREVIEW_CHARS),
+                        },
+                    ));
+                }
             }
         }
     }
-    out
+}
+
+/// Resolve lexically visible local variable and parameter declarations for `symbol` at `(target_line, target_col)`.
+/// Returned items are ordered innermost / nearest-preceding first as `(scope_depth, IndexedDef)`.
+fn resolve_visible_local_bindings(
+    lang: LangFamily,
+    text: &str,
+    symbol: &str,
+    target_line: usize,
+    target_col: usize,
+) -> Vec<(usize, IndexedDef)> {
+    if symbol.is_empty() || target_line == 0 {
+        return Vec::new();
+    }
+    let esc = regex::escape(symbol);
+
+    if lang == LangFamily::Python {
+        let assign_re = Regex::new(&format!(r"^\s*({esc})\s*(?::[^=]+)?=")).ok();
+        let def_re = Regex::new(r"^\s*(?:async\s+)?def\s+[A-Za-z_]\w*\s*\(([^)]*)\)").ok();
+        let as_re = Regex::new(&format!(r"\bas\s+({esc})\b")).ok();
+        let for_re = Regex::new(&format!(r"^\s*(?:async\s+)?for\s+(?:[A-Za-z_][\w,\s]*\b)?({esc})\b.*\bin\b")).ok();
+        let mut active: Vec<(usize, IndexedDef)> = Vec::new();
+        let mut py_triple: Option<&'static str> = None;
+
+        for (idx, line) in line_spans(text).into_iter().enumerate() {
+            let ln = idx + 1;
+            if ln > target_line {
+                break;
+            }
+            let trimmed = line.trim();
+            if let Some(delim) = py_triple {
+                if line.contains(delim) {
+                    py_triple = None;
+                }
+                continue;
+            }
+            if trimmed.starts_with("\"\"\"") {
+                if trimmed[3..].find("\"\"\"").is_none() {
+                    py_triple = Some("\"\"\"");
+                }
+                continue;
+            }
+            if trimmed.starts_with("'''") {
+                if trimmed[3..].find("'''").is_none() {
+                    py_triple = Some("'''");
+                }
+                continue;
+            }
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            let indent = line
+                .chars()
+                .take_while(|c| *c == ' ' || *c == '\t')
+                .map(|c| if c == '\t' { 4 } else { 1 })
+                .sum::<usize>();
+            let is_header = trimmed.starts_with("def ") || trimmed.starts_with("async def ") || trimmed.starts_with("class ");
+            active.retain(|(ind, _)| if is_header { *ind < indent } else { *ind <= indent });
+
+            let col_limit = if ln == target_line { target_col } else { usize::MAX };
+            if let Some(c) = def_re.as_ref().and_then(|r| r.captures(line)) {
+                if let Some(m) = c.get(1) {
+                    let mut pdefs = Vec::new();
+                    collect_param_defs(line, ln, m.start(), m.end(), lang, symbol, &mut pdefs);
+                    for (_, _, d) in pdefs {
+                        if d.col <= col_limit {
+                            active.push((indent + 1, d));
+                        }
+                    }
+                }
+            }
+            if ln < target_line || col_limit > 0 {
+                if let Some(c) = assign_re.as_ref().and_then(|r| r.captures(line)) {
+                    if let Some(m) = c.get(1) {
+                        if !line[m.end()..].trim_start().starts_with("==") {
+                            let col = utf16_col(line, m.start());
+                            if col <= col_limit {
+                                active.push((
+                                    indent,
+                                    IndexedDef {
+                                        name: symbol.to_string(),
+                                        kind: "const",
+                                        line: ln,
+                                        col,
+                                        len: utf16_len(symbol),
+                                        container: None,
+                                        exported: false,
+                                        preview: trunc_chars(line, MAX_PREVIEW_CHARS),
+                                    },
+                                ));
+                            }
+                        }
+                    }
+                }
+                for re in [for_re.as_ref(), as_re.as_ref()].into_iter().flatten() {
+                    if let Some(c) = re.captures(line) {
+                        if let Some(m) = c.get(1) {
+                            let col = utf16_col(line, m.start());
+                            if col <= col_limit {
+                                active.push((
+                                    indent + 1,
+                                    IndexedDef {
+                                        name: symbol.to_string(),
+                                        kind: "const",
+                                        line: ln,
+                                        col,
+                                        len: utf16_len(symbol),
+                                        container: None,
+                                        exported: false,
+                                        preview: trunc_chars(line, MAX_PREVIEW_CHARS),
+                                    },
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        active.sort_by(|a, b| (b.0, b.1.line, b.1.col).cmp(&(a.0, a.1.line, a.1.col)));
+        return active;
+    }
+
+    if !matches!(lang, LangFamily::JsTs | LangFamily::Rust | LangFamily::Go | LangFamily::Jvm | LangFamily::CStyle | LangFamily::Php) {
+        return Vec::new();
+    }
+
+    let r = rules();
+    let single_arrow_re = Regex::new(&format!(r"\b({esc})\s*=>")).ok();
+    let catch_re = Regex::new(&format!(r"\bcatch\s*\(\s*({esc})\b")).ok();
+    let rs_iflet_re = Regex::new(r"\b(?:if|while)\s+let\s+[^=]+=\s*[^;{]+\{").ok();
+    let rs_for_re = Regex::new(r"\bfor\s+(.+?)\s+in\b").ok();
+    let js_decl_re = Regex::new(r"\b(?:const|let|var)\s+").ok();
+    let rs_let_re = Regex::new(r"\blet\s+").ok();
+    let go_short_re = Regex::new(r"([A-Za-z_]\w*(?:\s*,\s*[A-Za-z_]\w*)*)\s*:=").ok();
+    let fn_paren_re = Regex::new(r"(?:function\s*(?:\*?\s*[A-Za-z_$][\w$]*)?|\bfn\s+[A-Za-z_]\w*(?:<[^>]*>)?|\bfunc\s*(?:\([^)]*\))?\s*(?:[A-Za-z_]\w*)?(?:\[[^\]]*\])?)\s*\(([^)]*)\)").ok();
+    let js_arrow_paren_re = Regex::new(r"\(([^)]*)\)\s*(?::[^=>{;]+)?=>").ok();
+    let js_method_paren_re = Regex::new(r"^\s+(?:(?:public|private|protected|static|async|override|readonly|get|set)\s+)*([A-Za-z_$][\w$]*)\s*(?:<[^>]*>)?\s*\(([^)]*)\)\s*(?::[^{;]+)?\{").ok();
+
+    struct ActiveLocal {
+        scope: i32,
+        def: IndexedDef,
+    }
+    let mut active: Vec<ActiveLocal> = Vec::new();
+    let mut in_block_comment = false;
+    let mut depth = 0i32;
+
+    for (idx, line) in line_spans(text).into_iter().enumerate() {
+        let ln = idx + 1;
+        if ln > target_line {
+            break;
+        }
+        let trimmed = line.trim();
+        if in_block_comment {
+            if let Some(end) = line.find("*/") {
+                in_block_comment = false;
+                let base = depth;
+                let trace = line_brace_trace(&line[end + 2..], base);
+                let lim = if ln == target_line {
+                    utf16_col_to_byte(line, target_col).saturating_sub(end + 2)
+                } else {
+                    line[end + 2..].len()
+                };
+                let min_d = brace_min_depth_between(&trace, base, 0, lim);
+                active.retain(|b| b.scope <= min_d);
+                depth = brace_depth_at(&trace, base, lim);
+            }
+            continue;
+        }
+        if trimmed.starts_with("/*") && !trimmed.contains("*/") {
+            in_block_comment = true;
+            continue;
+        }
+        if trimmed.is_empty() || trimmed.starts_with("//") || trimmed.starts_with('*') || is_import_line(lang, trimmed) {
+            continue;
+        }
+
+        let base = depth;
+        let trace = line_brace_trace(line, base);
+        let line_limit_byte = if ln == target_line {
+            utf16_col_to_byte(line, target_col)
+        } else {
+            line.len()
+        };
+
+        // Keep existing bindings only if brace depth has not dropped below their scope before the end/cursor.
+        let mut line_candidates: Vec<(i32, usize, IndexedDef)> = Vec::new();
+        if contains_whole_word(line, symbol) {
+            let mut found_spans: Vec<(usize, usize, IndexedDef)> = Vec::new();
+
+            // Nested function/fn declarations inside blocks
+            let nested_fn_match = match lang {
+                LangFamily::JsTs => r.js_fn.captures(line).and_then(|c| c.get(1)),
+                LangFamily::Rust => r.rs_fn.captures(line).and_then(|c| c.get(1)),
+                _ => None,
+            };
+            if let Some(m) = nested_fn_match {
+                let d_at = brace_depth_at(&trace, base, m.start());
+                if d_at > 0 && m.as_str() == symbol {
+                    line_candidates.push((
+                        d_at,
+                        m.end(),
+                        IndexedDef {
+                            name: symbol.to_string(),
+                            kind: "function",
+                            line: ln,
+                            col: utf16_col(line, m.start()),
+                            len: utf16_len(symbol),
+                            container: None,
+                            exported: false,
+                            preview: trunc_chars(line, MAX_PREVIEW_CHARS),
+                        },
+                    ));
+                }
+            }
+
+            // Parameters of function / fn / func / method / arrow definitions
+            if let Some(c) = fn_paren_re.as_ref().and_then(|re| re.captures(line)) {
+                if let Some(m) = c.get(1) {
+                    collect_param_defs(line, ln, m.start(), m.end(), lang, symbol, &mut found_spans);
+                }
+            }
+            if lang == LangFamily::JsTs {
+                if let Some(c) = js_arrow_paren_re.as_ref().and_then(|re| re.captures(line)) {
+                    if let Some(m) = c.get(1) {
+                        collect_param_defs(line, ln, m.start(), m.end(), lang, symbol, &mut found_spans);
+                    }
+                }
+                if let Some(c) = js_method_paren_re.as_ref().and_then(|re| re.captures(line)) {
+                    if let Some(m) = c.get(2) {
+                        collect_param_defs(line, ln, m.start(), m.end(), lang, symbol, &mut found_spans);
+                    }
+                }
+                if let Some(c) = single_arrow_re.as_ref().and_then(|re| re.captures(line)) {
+                    if let Some(m) = c.get(1) {
+                        found_spans.push((
+                            m.start(),
+                            m.end(),
+                            IndexedDef {
+                                name: symbol.to_string(),
+                                kind: "const",
+                                line: ln,
+                                col: utf16_col(line, m.start()),
+                                len: utf16_len(symbol),
+                                container: None,
+                                exported: false,
+                                preview: trunc_chars(line, MAX_PREVIEW_CHARS),
+                            },
+                        ));
+                    }
+                }
+            }
+            for (ps, pe, d) in found_spans.drain(..) {
+                // Bind parameters inside the body `{` scope (last unclosed `{` after `pe`), or inline on `target_line` for expression arrows.
+                let end_depth = brace_depth_at(&trace, base, line.len());
+                let body_brace = if end_depth > base {
+                    trace
+                        .iter()
+                        .rfind(|&&(off, bdepth)| off >= pe && bdepth == end_depth)
+                        .or_else(|| trace.iter().find(|&&(off, bdepth)| off >= pe && bdepth > base))
+                        .copied()
+                } else {
+                    trace.iter().rfind(|&&(off, bdepth)| off >= pe && bdepth > base).copied()
+                };
+                if let Some((off, bdepth)) = body_brace {
+                    line_candidates.push((bdepth, off, d));
+                } else if ln == target_line && lang == LangFamily::JsTs && line[pe..].contains("=>") {
+                    line_candidates.push((brace_depth_at(&trace, base, ps).max(1), pe, d));
+                }
+            }
+
+            // Catch binding (`catch (err) {`)
+            if let Some(c) = catch_re.as_ref().and_then(|re| re.captures(line)) {
+                if let Some(m) = c.get(1) {
+                    if let Some(&(off, bdepth)) = trace.iter().find(|&&(off, _)| off >= m.end()) {
+                        line_candidates.push((
+                            bdepth,
+                            off,
+                            IndexedDef {
+                                name: symbol.to_string(),
+                                kind: "const",
+                                line: ln,
+                                col: utf16_col(line, m.start()),
+                                len: utf16_len(symbol),
+                                container: None,
+                                exported: false,
+                                preview: trunc_chars(line, MAX_PREVIEW_CHARS),
+                            },
+                        ));
+                    }
+                }
+            }
+
+            // Variable / loop declarations
+            match lang {
+                LangFamily::JsTs => {
+                    if let Some(re) = js_decl_re.as_ref() {
+                        for m in re.find_iter(line) {
+                            let is_for_head = line[..m.start()].trim_end().ends_with('(') && line[..m.start()].contains("for");
+                            let end_lhs = line[m.end()..].find(['=', ';']).map_or(line.len(), |r| m.end() + r);
+                            let mut lhs_defs = Vec::new();
+                            collect_pattern_defs(line, ln, m.start(), end_lhs.max(m.end()), symbol, lang, &mut lhs_defs);
+                            for (ds, de, d) in lhs_defs {
+                                if is_for_head {
+                                    if let Some(&(off, bdepth)) = trace.iter().find(|&&(off, _)| off >= de) {
+                                        line_candidates.push((bdepth, off, d));
+                                        continue;
+                                    }
+                                }
+                                line_candidates.push((brace_depth_at(&trace, base, ds), de, d));
+                            }
+                        }
+                    }
+                }
+                LangFamily::Rust => {
+                    if let Some(re) = rs_let_re.as_ref() {
+                        for m in re.find_iter(line) {
+                            let is_ctrl = rs_iflet_re.as_ref().is_some_and(|ir| ir.is_match(line));
+                            let end_lhs = line[m.end()..].find(['=', ';']).map_or(line.len(), |r| m.end() + r);
+                            let mut lhs_defs = Vec::new();
+                            collect_pattern_defs(line, ln, m.end(), end_lhs, symbol, lang, &mut lhs_defs);
+                            for (ds, de, d) in lhs_defs {
+                                if is_ctrl {
+                                    if let Some(&(off, bdepth)) = trace.iter().find(|&&(off, _)| off >= de) {
+                                        line_candidates.push((bdepth, off, d));
+                                        continue;
+                                    }
+                                }
+                                line_candidates.push((brace_depth_at(&trace, base, ds), de, d));
+                            }
+                        }
+                    }
+                    if let Some(c) = rs_for_re.as_ref().and_then(|re| re.captures(line)) {
+                        if let Some(m) = c.get(1) {
+                            let mut lhs_defs = Vec::new();
+                            collect_pattern_defs(line, ln, m.start(), m.end(), symbol, lang, &mut lhs_defs);
+                            for (_, de, d) in lhs_defs {
+                                if let Some(&(off, bdepth)) = trace.iter().find(|&&(off, _)| off >= de) {
+                                    line_candidates.push((bdepth, off, d));
+                                }
+                            }
+                        }
+                    }
+                }
+                LangFamily::Go => {
+                    if let Some(re) = go_short_re.as_ref() {
+                        for c in re.captures_iter(line) {
+                            if let Some(m) = c.get(1) {
+                                let is_for = line[..m.start()].trim_start().starts_with("for ");
+                                let mut lhs_defs = Vec::new();
+                                collect_pattern_defs(line, ln, m.start(), m.end(), symbol, lang, &mut lhs_defs);
+                                for (ds, de, d) in lhs_defs {
+                                    if is_for {
+                                        if let Some(&(off, bdepth)) = trace.iter().find(|&&(off, _)| off >= de) {
+                                            line_candidates.push((bdepth, off, d));
+                                            continue;
+                                        }
+                                    }
+                                    line_candidates.push((brace_depth_at(&trace, base, ds), de, d));
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // First pop any existing bindings exited before `line_limit_byte`.
+        let min_existing = brace_min_depth_between(&trace, base, 0, line_limit_byte);
+        active.retain(|b| b.scope <= min_existing);
+
+        // Add candidates declared on this line whose scope remains live at `line_limit_byte`.
+        for (bind_scope, anchor_byte, def) in line_candidates {
+            if ln == target_line && def.col > target_col {
+                continue;
+            }
+            let min_after = brace_min_depth_between(&trace, bind_scope, anchor_byte, line_limit_byte);
+            if min_after >= bind_scope {
+                active.push(ActiveLocal { scope: bind_scope, def });
+            }
+        }
+
+        depth = brace_depth_at(&trace, base, line_limit_byte);
+    }
+
+    active.sort_by(|a, b| (b.scope, b.def.line, b.def.col).cmp(&(a.scope, a.def.line, a.def.col)));
+    active.into_iter().map(|b| (b.scope.max(0) as usize, b.def)).collect()
 }
 
 fn find_enclosing_container(lang: LangFamily, text: &str, target_line: usize) -> Option<String> {
@@ -1060,8 +1840,9 @@ fn find_enclosing_container(lang: LangFamily, text: &str, target_line: usize) ->
 }
 
 fn update_workspace_index(root_dir: &Path) -> Vec<String> {
-    let root_key = norm_cmp(&root_dir.display().to_string());
-    let file_list = crate::fsapi::file_list(root_dir);
+    let root_canon = canon_clean(root_dir).unwrap_or_else(|| root_dir.to_path_buf());
+    let root_key = norm_cmp(&root_canon.display().to_string());
+    let file_list = crate::fsapi::file_list(&root_canon);
     let started = Instant::now();
 
     let mut guard = INDEX_CACHE.lock().unwrap();
@@ -1082,19 +1863,22 @@ fn update_workspace_index(root_dir: &Path) -> Vec<String> {
     let mut changed = false;
 
     for rel in file_list.iter() {
-        if is_ignored_asset(rel) {
+        if !is_safe_rel(rel) || is_ignored_asset(rel) {
             continue;
         }
         let lang = LangFamily::from_path(rel);
         if lang == LangFamily::Other {
             continue;
         }
+        let full = root_canon.join(rel);
+        let Some((canon, _)) = canonical_contained_path(&root_canon, &full) else { continue };
         if started.elapsed() > std::time::Duration::from_secs(6) {
-            live_set.insert(rel.clone());
+            if ws.files.contains_key(rel) {
+                live_set.insert(rel.clone());
+            }
             continue;
         }
-        let full = root_dir.join(rel);
-        let Ok(meta) = std::fs::metadata(&full) else { continue };
+        let Ok(meta) = std::fs::metadata(&canon) else { continue };
         if !meta.is_file() || meta.len() > MAX_FILE_BYTES {
             continue;
         }
@@ -1106,7 +1890,7 @@ fn update_workspace_index(root_dir: &Path) -> Vec<String> {
                 continue;
             }
         }
-        let Ok(buf) = std::fs::read(&full) else { continue };
+        let Ok(buf) = std::fs::read(&canon) else { continue };
         if buf.iter().take(8000).any(|&b| b == 0) {
             continue;
         }
@@ -1221,22 +2005,26 @@ fn strip_jsonc(input: &str) -> String {
 }
 
 fn load_tsconfig(root_dir: &Path, from_rel: &str) -> Option<CachedTsConfig> {
+    let root_canon = canon_clean(root_dir).unwrap_or_else(|| root_dir.to_path_buf());
     let mut dir = if from_rel.is_empty() {
-        root_dir.to_path_buf()
+        root_canon.clone()
     } else {
-        let p = root_dir.join(from_rel);
-        p.parent().unwrap_or(root_dir).to_path_buf()
+        let p = root_canon.join(from_rel);
+        p.parent().unwrap_or(&root_canon).to_path_buf()
     };
     let mut found: Option<PathBuf> = None;
     loop {
+        if !dir.starts_with(&root_canon) {
+            break;
+        }
         for name in ["tsconfig.json", "jsconfig.json"] {
             let cand = dir.join(name);
-            if cand.is_file() {
-                found = Some(cand);
+            if let Some((canon, _)) = canonical_contained_path(&root_canon, &cand) {
+                found = Some(canon);
                 break;
             }
         }
-        if found.is_some() || norm_cmp(&dir.display().to_string()) == norm_cmp(&root_dir.display().to_string()) {
+        if found.is_some() || norm_cmp(&dir.display().to_string()) == norm_cmp(&root_canon.display().to_string()) {
             break;
         }
         if !dir.pop() {
@@ -1259,7 +2047,7 @@ fn load_tsconfig(root_dir: &Path, from_rel: &str) -> Option<CachedTsConfig> {
     let raw = std::fs::read_to_string(&cfg_path).ok()?;
     let val: Value = serde_json::from_str(&strip_jsonc(&raw)).ok()?;
     let co = &val["compilerOptions"];
-    let cfg_dir = cfg_path.parent().unwrap_or(root_dir);
+    let cfg_dir = cfg_path.parent().unwrap_or(&root_canon);
     let base_url = match co["baseUrl"].as_str() {
         Some(b) if !b.is_empty() => cfg_dir.join(b),
         _ => cfg_dir.to_path_buf(),
@@ -1308,40 +2096,45 @@ fn probe_js_file(base: &Path) -> Option<PathBuf> {
     None
 }
 
-fn check_contained_file(root_dir: &Path, candidate: &Path) -> Option<String> {
-    let canon = candidate.canonicalize().ok()?;
-    if !canon.is_file() {
-        return None;
-    }
-    let root_canon = root_dir.canonicalize().ok().unwrap_or_else(|| root_dir.to_path_buf());
-    if !canon.starts_with(&root_canon) {
-        return None;
-    }
-    let rel = canon.strip_prefix(&root_canon).ok()?;
-    Some(norm_slashes(&rel.to_string_lossy()))
+fn check_contained_file(root_canon: &Path, candidate: &Path) -> Option<String> {
+    canonical_contained_path(root_canon, candidate).map(|(_, rel)| rel)
 }
 
-fn resolve_import_specifier(root_dir: &Path, from_rel: &str, spec: &str, all_files: &[String]) -> Option<String> {
-    let clean = spec.trim().trim_matches(|c| matches!(c, '\'' | '"' | '`' | '<' | '>'));
-    if clean.is_empty() {
-        return None;
-    }
+fn rust_module_dir(root_dir: &Path, from_rel: &str) -> (PathBuf, bool) {
     let from_dir = if from_rel.is_empty() {
         root_dir.to_path_buf()
     } else {
         root_dir.join(from_rel).parent().unwrap_or(root_dir).to_path_buf()
     };
+    let stem = Path::new(from_rel).file_stem().and_then(|s| s.to_str()).unwrap_or("");
+    let parent_name = from_dir.file_name().and_then(|s| s.to_str()).unwrap_or("");
+    let is_dir_root = stem.is_empty()
+        || matches!(stem, "lib" | "main" | "mod")
+        || matches!(parent_name, "bin" | "tests" | "examples" | "benches");
+    if is_dir_root {
+        (from_dir, true)
+    } else {
+        (from_dir.join(stem), false)
+    }
+}
 
-    // Rust `mod foo;`
+fn resolve_import_specifier(root_dir: &Path, from_rel: &str, spec: &str, all_files: &[String]) -> Option<String> {
+    let root_canon = canon_clean(root_dir).unwrap_or_else(|| root_dir.to_path_buf());
+    let clean = spec.trim().trim_matches(|c| matches!(c, '\'' | '"' | '`' | '<' | '>'));
+    if clean.is_empty() {
+        return None;
+    }
+    let from_dir = if from_rel.is_empty() {
+        root_canon.clone()
+    } else {
+        root_canon.join(from_rel).parent().unwrap_or(&root_canon).to_path_buf()
+    };
+
+    // Rust `mod foo;`: probe only the source file's submodule directory (`src/a/foo.rs` or `src/a/foo/mod.rs` for `src/a.rs`).
     if let Some(mod_name) = clean.strip_prefix("mod:") {
-        let stem = Path::new(from_rel).file_stem().and_then(|s| s.to_str()).unwrap_or("");
-        let mut cands = vec![from_dir.join(format!("{mod_name}.rs")), from_dir.join(mod_name).join("mod.rs")];
-        if !stem.is_empty() && stem != "mod" && stem != "lib" && stem != "main" {
-            cands.push(from_dir.join(stem).join(format!("{mod_name}.rs")));
-            cands.push(from_dir.join(stem).join(mod_name).join("mod.rs"));
-        }
-        for c in cands {
-            if let Some(rel) = check_contained_file(root_dir, &c) {
+        let (mod_dir, _) = rust_module_dir(&root_canon, from_rel);
+        for c in [mod_dir.join(format!("{mod_name}.rs")), mod_dir.join(mod_name).join("mod.rs")] {
+            if let Some(rel) = check_contained_file(&root_canon, &c) {
                 return Some(rel);
             }
         }
@@ -1355,20 +2148,20 @@ fn resolve_import_specifier(root_dir: &Path, from_rel: &str, spec: &str, all_fil
     if clean.starts_with("./") || clean.starts_with("../") || clean == "." || clean == ".." {
         let joined = from_dir.join(clean);
         if let Some(found) = probe_js_file(&joined) {
-            if let Some(rel) = check_contained_file(root_dir, &found) {
+            if let Some(rel) = check_contained_file(&root_canon, &found) {
                 return Some(rel);
             }
         }
         for ext in [".py", "/__init__.py", ".rs", "/mod.rs"] {
             let cand = PathBuf::from(format!("{}{ext}", joined.to_string_lossy()));
-            if let Some(rel) = check_contained_file(root_dir, &cand) {
+            if let Some(rel) = check_contained_file(&root_canon, &cand) {
                 return Some(rel);
             }
         }
     }
 
     // tsconfig.json / jsconfig.json path aliases & baseUrl
-    if let Some(cfg) = load_tsconfig(root_dir, from_rel) {
+    if let Some(cfg) = load_tsconfig(&root_canon, from_rel) {
         for (pat, targets) in &cfg.paths {
             if let Some(star) = pat.find('*') {
                 let (pre, suf) = (&pat[..star], &pat[star + 1..]);
@@ -1377,7 +2170,7 @@ fn resolve_import_specifier(root_dir: &Path, from_rel: &str, spec: &str, all_fil
                     for tgt in targets {
                         let replaced = tgt.replace('*', captured);
                         if let Some(found) = probe_js_file(&cfg.base_url.join(replaced)) {
-                            if let Some(rel) = check_contained_file(root_dir, &found) {
+                            if let Some(rel) = check_contained_file(&root_canon, &found) {
                                 return Some(rel);
                             }
                         }
@@ -1386,7 +2179,7 @@ fn resolve_import_specifier(root_dir: &Path, from_rel: &str, spec: &str, all_fil
             } else if pat == clean {
                 for tgt in targets {
                     if let Some(found) = probe_js_file(&cfg.base_url.join(tgt)) {
-                        if let Some(rel) = check_contained_file(root_dir, &found) {
+                        if let Some(rel) = check_contained_file(&root_canon, &found) {
                             return Some(rel);
                         }
                     }
@@ -1394,43 +2187,47 @@ fn resolve_import_specifier(root_dir: &Path, from_rel: &str, spec: &str, all_fil
             }
         }
         if let Some(found) = probe_js_file(&cfg.base_url.join(clean)) {
-            if let Some(rel) = check_contained_file(root_dir, &found) {
+            if let Some(rel) = check_contained_file(&root_canon, &found) {
                 return Some(rel);
             }
         }
     }
 
     // Direct workspace-relative file or probe
-    let direct = root_dir.join(clean);
-    if let Some(rel) = check_contained_file(root_dir, &direct) {
+    let direct = root_canon.join(clean);
+    if let Some(rel) = check_contained_file(&root_canon, &direct) {
         return Some(rel);
     }
     if let Some(found) = probe_js_file(&direct) {
-        if let Some(rel) = check_contained_file(root_dir, &found) {
+        if let Some(rel) = check_contained_file(&root_canon, &found) {
             return Some(rel);
         }
     }
     let rel_from_dir = from_dir.join(clean);
-    if let Some(rel) = check_contained_file(root_dir, &rel_from_dir) {
+    if let Some(rel) = check_contained_file(&root_canon, &rel_from_dir) {
         return Some(rel);
     }
     if let Some(found) = probe_js_file(&rel_from_dir) {
-        if let Some(rel) = check_contained_file(root_dir, &found) {
+        if let Some(rel) = check_contained_file(&root_canon, &found) {
             return Some(rel);
         }
     }
 
-    // Suffix match in workspace file list (e.g. `docs/internals/file-panel.md` or `crates/proto/src/lib.rs`)
+    // Suffix match in workspace file list (re-verified through canonical containment check)
     let norm_q = norm_slashes(clean).trim_start_matches("./").trim_start_matches('/').to_string();
-    if !norm_q.is_empty() {
-        if let Some(exact) = all_files.iter().find(|f| norm_cmp(f) == norm_cmp(&norm_q)) {
-            return Some(exact.clone());
+    if is_safe_rel(&norm_q) {
+        for cand in all_files.iter().filter(|f| norm_cmp(f) == norm_cmp(&norm_q)) {
+            if let Some(rel) = check_contained_file(&root_canon, &root_canon.join(cand)) {
+                return Some(rel);
+            }
         }
         let suffix = format!("/{norm_q}");
         let mut matches: Vec<&String> = all_files.iter().filter(|f| norm_cmp(f).ends_with(&norm_cmp(&suffix))).collect();
         matches.sort_by_key(|f| f.len());
-        if let Some(best) = matches.first() {
-            return Some((*best).clone());
+        for best in matches {
+            if let Some(rel) = check_contained_file(&root_canon, &root_canon.join(best)) {
+                return Some(rel);
+            }
         }
     }
 
@@ -1466,24 +2263,37 @@ fn resolve_rust_mod_path(root_dir: &Path, from_rel: &str, segments: &[&str]) -> 
     if segments.is_empty() {
         return None;
     }
-    let from_dir = root_dir.join(from_rel).parent().unwrap_or(root_dir).to_path_buf();
+    let root_canon = canon_clean(root_dir).unwrap_or_else(|| root_dir.to_path_buf());
+    let (mod_dir, _) = rust_module_dir(&root_canon, from_rel);
+    let mut from_super = false;
     let (base, rest): (PathBuf, &[&str]) = match segments[0] {
-        "crate" => (find_crate_src_dir(root_dir, from_rel), &segments[1..]),
-        "self" => (from_dir, &segments[1..]),
+        "crate" => (find_crate_src_dir(&root_canon, from_rel), &segments[1..]),
+        "self" => (mod_dir, &segments[1..]),
         "super" => {
-            let mut d = from_dir;
+            from_super = true;
+            let mut d = mod_dir;
             let mut idx = 0;
             while idx < segments.len() && segments[idx] == "super" {
-                d = d.parent().unwrap_or(root_dir).to_path_buf();
+                d = d.parent().unwrap_or(&root_canon).to_path_buf();
                 idx += 1;
             }
             (d, &segments[idx..])
         }
-        _ => (from_dir, segments),
+        _ => (mod_dir, segments),
     };
     if rest.is_empty() {
         for entry in ["lib.rs", "main.rs", "mod.rs"] {
-            if let Some(r) = check_contained_file(root_dir, &base.join(entry)) {
+            if let Some(r) = check_contained_file(&root_canon, &base.join(entry)) {
+                return Some(r);
+            }
+        }
+        if from_super && norm_cmp(&base.display().to_string()) != norm_cmp(&root_canon.display().to_string()) {
+            if let Some(r) = check_contained_file(&root_canon, &base.with_extension("rs")) {
+                return Some(r);
+            }
+        }
+        if segments[0] == "self" && !from_rel.is_empty() {
+            if let Some(r) = check_contained_file(&root_canon, &root_canon.join(from_rel)) {
                 return Some(r);
             }
         }
@@ -1495,7 +2305,7 @@ fn resolve_rust_mod_path(root_dir: &Path, from_rel: &str, segments: &[&str]) -> 
     }
     let last = rest[rest.len() - 1];
     for cand in [cur.join(format!("{last}.rs")), cur.join(last).join("mod.rs")] {
-        if let Some(r) = check_contained_file(root_dir, &cand) {
+        if let Some(r) = check_contained_file(&root_canon, &cand) {
             return Some(r);
         }
     }
@@ -1507,6 +2317,7 @@ struct ImportTarget {
     spec: String,
     imported_name: String,
     is_star: bool,
+    is_default: bool,
 }
 
 fn find_js_import_for_symbol(text: &str, symbol: &str, container: Option<&str>) -> Vec<ImportTarget> {
@@ -1524,7 +2335,7 @@ fn find_js_import_for_symbol(text: &str, symbol: &str, container: Option<&str>) 
             let spec = c[3].to_string();
             if let Some(def_local) = c.get(1) {
                 if def_local.as_str() == symbol {
-                    out.push(ImportTarget { spec: spec.clone(), imported_name: symbol.to_string(), is_star: false });
+                    out.push(ImportTarget { spec: spec.clone(), imported_name: "default".into(), is_star: false, is_default: true });
                 }
             }
             for item in c[2].split(',') {
@@ -1534,19 +2345,30 @@ fn find_js_import_for_symbol(text: &str, symbol: &str, container: Option<&str>) 
                 }
                 if let Some((orig, alias)) = item.split_once(" as ") {
                     if alias.trim() == symbol {
-                        out.push(ImportTarget { spec: spec.clone(), imported_name: orig.trim().to_string(), is_star: false });
+                        let orig_name = orig.trim();
+                        out.push(ImportTarget {
+                            spec: spec.clone(),
+                            imported_name: orig_name.to_string(),
+                            is_star: false,
+                            is_default: orig_name == "default",
+                        });
                     }
                 } else if item == symbol {
-                    out.push(ImportTarget { spec: spec.clone(), imported_name: symbol.to_string(), is_star: false });
+                    out.push(ImportTarget { spec: spec.clone(), imported_name: symbol.to_string(), is_star: false, is_default: false });
                 }
             }
         } else if let Some(c) = def_re.captures(stmt) {
             if &c[1] == symbol {
-                out.push(ImportTarget { spec: c[2].to_string(), imported_name: symbol.to_string(), is_star: false });
+                out.push(ImportTarget { spec: c[2].to_string(), imported_name: "default".into(), is_star: false, is_default: true });
             }
         } else if let Some(c) = ns_re.captures(stmt) {
             if container == Some(&c[1]) {
-                out.push(ImportTarget { spec: c[2].to_string(), imported_name: symbol.to_string(), is_star: true });
+                out.push(ImportTarget {
+                    spec: c[2].to_string(),
+                    imported_name: symbol.to_string(),
+                    is_star: true,
+                    is_default: symbol == "default",
+                });
             }
         } else if let Some(c) = req_destr_re.captures(stmt) {
             let spec = c[2].to_string();
@@ -1554,15 +2376,21 @@ fn find_js_import_for_symbol(text: &str, symbol: &str, container: Option<&str>) 
                 let item = item.trim();
                 if let Some((orig, alias)) = item.split_once(':') {
                     if alias.trim() == symbol {
-                        out.push(ImportTarget { spec: spec.clone(), imported_name: orig.trim().to_string(), is_star: false });
+                        let orig_name = orig.trim();
+                        out.push(ImportTarget {
+                            spec: spec.clone(),
+                            imported_name: orig_name.to_string(),
+                            is_star: false,
+                            is_default: orig_name == "default",
+                        });
                     }
                 } else if item == symbol {
-                    out.push(ImportTarget { spec: spec.clone(), imported_name: symbol.to_string(), is_star: false });
+                    out.push(ImportTarget { spec: spec.clone(), imported_name: symbol.to_string(), is_star: false, is_default: false });
                 }
             }
         } else if let Some(c) = req_def_re.captures(stmt) {
             if &c[1] == symbol || container == Some(&c[1]) {
-                out.push(ImportTarget { spec: c[2].to_string(), imported_name: symbol.to_string(), is_star: false });
+                out.push(ImportTarget { spec: c[2].to_string(), imported_name: symbol.to_string(), is_star: false, is_default: false });
             }
         }
     }
@@ -1597,16 +2425,138 @@ fn collapse_js_imports(text: &str) -> Vec<String> {
     out
 }
 
-fn resolve_js_reexport_chain(
-    root_dir: &Path,
+fn read_js_target(root_canon: &Path, target_rel: &str, cur_rel: &str, cur_content: Option<&str>) -> Option<String> {
+    if let Some(draft) = cur_content {
+        if !cur_rel.is_empty() && norm_cmp(target_rel) == norm_cmp(cur_rel) {
+            return Some(draft.to_string());
+        }
+    }
+    read_contained_text_file(root_canon, &root_canon.join(target_rel))
+}
+
+fn find_js_default_export(
+    root_canon: &Path,
     target_rel: &str,
-    sym: &str,
+    text: &str,
+    defs: &[IndexedDef],
+    cur_rel: &str,
+    cur_content: Option<&str>,
     all_files: &[String],
     depth: u8,
 ) -> Option<(String, IndexedDef)> {
-    let text = read_text_file(&root_dir.join(target_rel))?;
+    let def_kw_re = Regex::new(r"^\s*export\s+(default)\b").unwrap();
+    let def_ident_re = Regex::new(r"^\s*export\s+default\s+([A-Za-z_$][\w$]*)\s*(?:;.*|//.*|/\*.*)?$").unwrap();
+    let local_as_def_re = Regex::new(r#"export\s+\{([^}]+)\}(?:\s*;|\s*$)"#).unwrap();
+
+    for (idx, line) in line_spans(text).into_iter().enumerate() {
+        let ln = idx + 1;
+        let Some(kw) = def_kw_re.captures(line).and_then(|c| c.get(1)) else {
+            continue;
+        };
+        if let Some(d) = defs.iter().find(|d| d.line == ln) {
+            return Some((target_rel.to_string(), d.clone()));
+        }
+        if let Some(ident_m) = def_ident_re.captures(line).and_then(|c| c.get(1)) {
+            let ident = ident_m.as_str();
+            if !matches!(ident, "function" | "class" | "async" | "abstract" | "new" | "true" | "false" | "null" | "undefined" | "typeof" | "await") {
+                if let Some(d) = defs.iter().find(|d| d.name == ident) {
+                    return Some((target_rel.to_string(), d.clone()));
+                }
+                if depth > 0 {
+                    for imp in find_js_import_for_symbol(text, ident, None) {
+                        if let Some(next_rel) = resolve_import_specifier(root_canon, target_rel, &imp.spec, all_files) {
+                            if let Some(found) = resolve_js_reexport_chain(
+                                root_canon,
+                                &next_rel,
+                                &imp.imported_name,
+                                cur_rel,
+                                cur_content,
+                                all_files,
+                                depth - 1,
+                            ) {
+                                return Some(found);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let kind = if line.contains("function") {
+            "function"
+        } else if line.contains("class") {
+            "class"
+        } else {
+            "const"
+        };
+        return Some((
+            target_rel.to_string(),
+            IndexedDef {
+                name: "default".into(),
+                kind,
+                line: ln,
+                col: utf16_col(line, kw.start()),
+                len: kw.as_str().len(),
+                container: None,
+                exported: true,
+                preview: trunc_chars(line, MAX_PREVIEW_CHARS),
+            },
+        ));
+    }
+
+    for line in line_spans(text) {
+        if line.contains(" from ") {
+            continue;
+        }
+        if let Some(c) = local_as_def_re.captures(line) {
+            for item in c[1].split(',') {
+                let item = item.trim().trim_start_matches("type ").trim();
+                if let Some((orig, alias)) = item.split_once(" as ") {
+                    if alias.trim() == "default" {
+                        let orig = orig.trim();
+                        if let Some(d) = defs.iter().find(|d| d.name == orig) {
+                            return Some((target_rel.to_string(), d.clone()));
+                        }
+                        if depth > 0 {
+                            for imp in find_js_import_for_symbol(text, orig, None) {
+                                if let Some(next_rel) = resolve_import_specifier(root_canon, target_rel, &imp.spec, all_files) {
+                                    if let Some(found) = resolve_js_reexport_chain(
+                                        root_canon,
+                                        &next_rel,
+                                        &imp.imported_name,
+                                        cur_rel,
+                                        cur_content,
+                                        all_files,
+                                        depth - 1,
+                                    ) {
+                                        return Some(found);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn resolve_js_reexport_chain(
+    root_canon: &Path,
+    target_rel: &str,
+    sym: &str,
+    cur_rel: &str,
+    cur_content: Option<&str>,
+    all_files: &[String],
+    depth: u8,
+) -> Option<(String, IndexedDef)> {
+    let text = read_js_target(root_canon, target_rel, cur_rel, cur_content)?;
     let defs = extract_definitions(LangFamily::JsTs, &text);
-    if let Some(d) = defs.into_iter().find(|d| d.name == sym) {
+    if sym == "default" {
+        if let Some(found) = find_js_default_export(root_canon, target_rel, &text, &defs, cur_rel, cur_content, all_files, depth) {
+            return Some(found);
+        }
+    } else if let Some(d) = defs.into_iter().find(|d| d.name == sym) {
         return Some((target_rel.to_string(), d));
     }
     if depth == 0 {
@@ -1626,18 +2576,22 @@ fn resolve_js_reexport_chain(
                 None
             };
             if let Some(orig_name) = orig {
-                if let Some(next_rel) = resolve_import_specifier(root_dir, target_rel, spec, all_files) {
-                    if let Some(found) = resolve_js_reexport_chain(root_dir, &next_rel, orig_name, all_files, depth - 1) {
+                if let Some(next_rel) = resolve_import_specifier(root_canon, target_rel, spec, all_files) {
+                    if let Some(found) =
+                        resolve_js_reexport_chain(root_canon, &next_rel, orig_name, cur_rel, cur_content, all_files, depth - 1)
+                    {
                         return Some(found);
                     }
                 }
             }
         }
     }
-    for c in re_star.captures_iter(&text) {
-        if let Some(next_rel) = resolve_import_specifier(root_dir, target_rel, &c[1], all_files) {
-            if let Some(found) = resolve_js_reexport_chain(root_dir, &next_rel, sym, all_files, depth - 1) {
-                return Some(found);
+    if sym != "default" {
+        for c in re_star.captures_iter(&text) {
+            if let Some(next_rel) = resolve_import_specifier(root_canon, target_rel, &c[1], all_files) {
+                if let Some(found) = resolve_js_reexport_chain(root_canon, &next_rel, sym, cur_rel, cur_content, all_files, depth - 1) {
+                    return Some(found);
+                }
             }
         }
     }
@@ -1771,10 +2725,20 @@ fn top_package(rel: &str) -> &str {
 }
 
 fn resolve_definition(provider: &str, req: &DefRequest) -> Result<NavDefinitionResult> {
+    let raw_root = crate::paths::expand(&req.root);
     let root_dir = expand_root(&req.root)?;
     let all_files = update_workspace_index(&root_dir);
-    let cur_rel = normalize_rel_path(&root_dir, &req.path);
+    let cur_rel = normalize_rel_path(&root_dir, Some(&raw_root), &req.path);
     let req_kind = req.kind.as_deref().unwrap_or("auto");
+
+    let read_target = |rel: &str| -> Option<String> {
+        if let Some(ref draft) = req.content {
+            if !cur_rel.is_empty() && norm_cmp(rel) == norm_cmp(&cur_rel) {
+                return Some(draft.clone());
+            }
+        }
+        read_contained_text_file(&root_dir, &root_dir.join(rel))
+    };
 
     if req_kind == "path" || (req_kind == "auto" && req.path_text.as_deref().is_some_and(|s| !s.trim().is_empty())) {
         let raw_path = req.path_text.as_deref().or(req.symbol.as_deref()).unwrap_or("").trim();
@@ -1782,7 +2746,7 @@ fn resolve_definition(provider: &str, req: &DefRequest) -> Result<NavDefinitionR
         let mut locations = Vec::new();
         if let Some(rel) = resolve_import_specifier(&root_dir, &cur_rel, &clean, &all_files) {
             let abs = join_abs(&root_dir, &rel);
-            let preview = read_text_file(&root_dir.join(&rel))
+            let preview = read_target(&rel)
                 .and_then(|t| line_spans(&t).get(target_line.saturating_sub(1)).map(|l| trunc_chars(l, MAX_PREVIEW_CHARS)))
                 .unwrap_or_else(|| rel.clone());
             locations.push(NavLocation {
@@ -1821,10 +2785,11 @@ fn resolve_definition(provider: &str, req: &DefRequest) -> Result<NavDefinitionR
     }
 
     let cur_lang = LangFamily::from_path(&cur_rel);
+    let has_draft_content = req.content.is_some();
     let cur_text = req
         .content
         .clone()
-        .or_else(|| (!cur_rel.is_empty()).then(|| read_text_file(&root_dir.join(&cur_rel))).flatten())
+        .or_else(|| (!cur_rel.is_empty()).then(|| read_contained_text_file(&root_dir, &root_dir.join(&cur_rel))).flatten())
         .unwrap_or_default();
 
     let cur_lines = line_spans(&cur_text);
@@ -1835,8 +2800,8 @@ fn resolve_definition(provider: &str, req: &DefRequest) -> Result<NavDefinitionR
     } else {
         Vec::new()
     };
-    let local_defs = if !cur_text.is_empty() {
-        extract_local_defs(cur_lang, &cur_text, symbol, req.line)
+    let local_defs = if !cur_text.is_empty() && !on_import_line {
+        resolve_visible_local_bindings(cur_lang, &cur_text, symbol, req.line, req.col)
     } else {
         Vec::new()
     };
@@ -1844,7 +2809,8 @@ fn resolve_definition(provider: &str, req: &DefRequest) -> Result<NavDefinitionR
     let overlaps_cursor = |d: &IndexedDef| {
         d.name == symbol && d.line == req.line && req.col >= d.col && req.col <= d.col + d.len
     };
-    let at_definition = !on_import_line && (cur_defs.iter().any(overlaps_cursor) || local_defs.iter().any(overlaps_cursor));
+    let at_definition = !on_import_line && (cur_defs.iter().any(overlaps_cursor) || local_defs.iter().any(|(_, d)| overlaps_cursor(d)));
+    let shadowed_by_local = !on_import_line && req.container.is_none() && local_defs.iter().any(|(sd, _)| *sd > 0);
 
     let effective_container: Option<String> = match req.container.as_deref() {
         Some("this" | "self" | "Self") if !cur_text.is_empty() => find_enclosing_container(cur_lang, &cur_text, req.line),
@@ -1864,15 +2830,47 @@ fn resolve_definition(provider: &str, req: &DefRequest) -> Result<NavDefinitionR
         }
     };
 
-    // 1. Import-tracked target in current file (highest confidence)
-    if !cur_text.is_empty() {
+    // 0. Inner-scope lexical binding shadows imports and workspace symbols.
+    if shadowed_by_local {
+        for (sd, def) in &local_defs {
+            if at_definition && overlaps_cursor(def) {
+                continue;
+            }
+            if *sd > 0 {
+                record_loc(NavLocation {
+                    path: cur_rel.clone(),
+                    abs_path: join_abs(&root_dir, &cur_rel),
+                    line: def.line,
+                    col: def.col,
+                    len: def.len,
+                    end_line: None,
+                    kind: def.kind.into(),
+                    symbol: def.name.clone(),
+                    container: def.container.clone(),
+                    preview: def.preview.clone(),
+                    score: 1050,
+                    source: "local".into(),
+                });
+                break;
+            }
+        }
+    }
+
+    // 1. Import-tracked target in current file (when not lexically shadowed by a local declaration)
+    if !cur_text.is_empty() && !shadowed_by_local {
         match cur_lang {
             LangFamily::JsTs => {
                 for imp in find_js_import_for_symbol(&cur_text, symbol, req.container.as_deref()) {
                     if let Some(target_rel) = resolve_import_specifier(&root_dir, &cur_rel, &imp.spec, &all_files) {
-                        if let Some((final_rel, def)) =
-                            resolve_js_reexport_chain(&root_dir, &target_rel, &imp.imported_name, &all_files, 2)
-                        {
+                        if let Some((final_rel, def)) = resolve_js_reexport_chain(
+                            &root_dir,
+                            &target_rel,
+                            &imp.imported_name,
+                            &cur_rel,
+                            req.content.as_deref(),
+                            &all_files,
+                            2,
+                        ) {
                             record_loc(NavLocation {
                                 abs_path: join_abs(&root_dir, &final_rel),
                                 path: final_rel,
@@ -1887,10 +2885,10 @@ fn resolve_definition(provider: &str, req: &DefRequest) -> Result<NavDefinitionR
                                 score: 1000,
                                 source: "import".into(),
                             });
-                        } else if imp.is_star || imp.imported_name == symbol {
-                            // Imported module resolved, fallback to top of module if symbol wasn't explicitly extracted
+                        } else if imp.is_star || imp.is_default || imp.imported_name == symbol {
+                            // Imported module resolved; fall back to line 1 of module if no export declaration matched.
                             let abs = join_abs(&root_dir, &target_rel);
-                            let preview = read_text_file(&root_dir.join(&target_rel))
+                            let preview = read_target(&target_rel)
                                 .and_then(|t| line_spans(&t).first().map(|l| trunc_chars(l, MAX_PREVIEW_CHARS)))
                                 .unwrap_or_else(|| target_rel.clone());
                             record_loc(NavLocation {
@@ -1901,7 +2899,7 @@ fn resolve_definition(provider: &str, req: &DefRequest) -> Result<NavDefinitionR
                                 len: 0,
                                 end_line: None,
                                 kind: "file".into(),
-                                symbol: imp.imported_name,
+                                symbol: symbol.to_string(),
                                 container: None,
                                 preview,
                                 score: 940,
@@ -1913,7 +2911,7 @@ fn resolve_definition(provider: &str, req: &DefRequest) -> Result<NavDefinitionR
             }
             LangFamily::Rust => {
                 for target_rel in find_rust_use_targets(&root_dir, &cur_rel, &cur_text, symbol, req.container.as_deref()) {
-                    if let Some(t) = read_text_file(&root_dir.join(&target_rel)) {
+                    if let Some(t) = read_target(&target_rel) {
                         for def in extract_definitions(LangFamily::Rust, &t).into_iter().filter(|d| d.name == symbol) {
                             record_loc(NavLocation {
                                 abs_path: join_abs(&root_dir, &target_rel),
@@ -1935,7 +2933,7 @@ fn resolve_definition(provider: &str, req: &DefRequest) -> Result<NavDefinitionR
             }
             LangFamily::Python => {
                 for (target_rel, orig_sym) in find_py_import_targets(&root_dir, &cur_rel, &cur_text, symbol, &all_files) {
-                    if let Some(t) = read_text_file(&root_dir.join(&target_rel)) {
+                    if let Some(t) = read_target(&target_rel) {
                         for def in extract_definitions(LangFamily::Python, &t).into_iter().filter(|d| d.name == orig_sym) {
                             record_loc(NavLocation {
                                 abs_path: join_abs(&root_dir, &target_rel),
@@ -1957,10 +2955,12 @@ fn resolve_definition(provider: &str, req: &DefRequest) -> Result<NavDefinitionR
             }
             _ => {}
         }
+    }
 
-        // 2. Same-file definitions & local bindings (excluding self when already on the definition site)
+    // 2. Same-file definitions & top-level local declarations
+    if !cur_text.is_empty() && !shadowed_by_local {
         for def in cur_defs.iter().filter(|d| d.name == symbol) {
-            if at_definition && def.line == req.line {
+            if at_definition && overlaps_cursor(def) {
                 continue;
             }
             record_loc(NavLocation {
@@ -1979,8 +2979,8 @@ fn resolve_definition(provider: &str, req: &DefRequest) -> Result<NavDefinitionR
             });
         }
         if !on_import_line {
-            for def in local_defs {
-                if at_definition && def.line == req.line {
+            for (_, def) in local_defs {
+                if at_definition && overlaps_cursor(&def) {
                     continue;
                 }
                 record_loc(NavLocation {
@@ -2001,64 +3001,69 @@ fn resolve_definition(provider: &str, req: &DefRequest) -> Result<NavDefinitionR
         }
     }
 
-    // 3. Workspace index matches
-    let caller_is_test = is_test_path(&cur_rel);
-    for (rel, lang, def) in query_index(&root_dir, symbol) {
-        if at_definition && norm_cmp(&rel) == norm_cmp(&cur_rel) && def.line == req.line {
-            continue;
-        }
-        let same_lang = cur_lang == LangFamily::Other || lang == cur_lang;
-        let mut score: i32 = if !same_lang {
-            300
-        } else if same_dir(&rel, &cur_rel) {
-            800
-        } else if !cur_rel.is_empty() && top_package(&rel) == top_package(&cur_rel) && def.exported {
-            720
-        } else if def.exported {
-            640
-        } else {
-            540
-        };
+    // 3. Workspace index matches (skipping the active unsaved buffer's stale disk entry & shadowed imports)
+    if !shadowed_by_local {
+        let caller_is_test = is_test_path(&cur_rel);
+        for (rel, lang, def) in query_index(&root_dir, symbol) {
+            if has_draft_content && !cur_rel.is_empty() && norm_cmp(&rel) == norm_cmp(&cur_rel) {
+                continue;
+            }
+            if at_definition && norm_cmp(&rel) == norm_cmp(&cur_rel) && overlaps_cursor(&def) {
+                continue;
+            }
+            let same_lang = cur_lang == LangFamily::Other || lang == cur_lang;
+            let mut score: i32 = if !same_lang {
+                300
+            } else if same_dir(&rel, &cur_rel) {
+                800
+            } else if !cur_rel.is_empty() && top_package(&rel) == top_package(&cur_rel) && def.exported {
+                720
+            } else if def.exported {
+                640
+            } else {
+                540
+            };
 
-        score += (shared_dir_depth(&rel, &cur_rel) as i32 * 8).min(30);
-        if !caller_is_test {
-            score += if is_test_path(&rel) { -35 } else { 35 };
-        }
-        if let Some(cont) = effective_container.as_deref() {
-            let c_low = cont.to_ascii_lowercase();
-            if let Some(dc) = def.container.as_deref() {
-                let dc_low = dc.to_ascii_lowercase();
-                if dc == cont {
-                    score += 240;
-                } else if dc_low == c_low || dc_low.ends_with(&c_low) || dc_low.contains(&c_low) {
-                    score += 150;
+            score += (shared_dir_depth(&rel, &cur_rel) as i32 * 8).min(30);
+            if !caller_is_test {
+                score += if is_test_path(&rel) { -35 } else { 35 };
+            }
+            if let Some(cont) = effective_container.as_deref() {
+                let c_low = cont.to_ascii_lowercase();
+                if let Some(dc) = def.container.as_deref() {
+                    let dc_low = dc.to_ascii_lowercase();
+                    if dc == cont {
+                        score += 240;
+                    } else if dc_low == c_low || dc_low.ends_with(&c_low) || dc_low.contains(&c_low) {
+                        score += 150;
+                    }
                 }
+                let stem = Path::new(&rel).file_stem().and_then(|s| s.to_str()).unwrap_or("");
+                if stem.eq_ignore_ascii_case(cont) {
+                    score += 220;
+                }
+                if def.kind == "method" {
+                    score += 40;
+                }
+            } else if matches!(def.kind, "function" | "class" | "struct" | "interface" | "type" | "enum") {
+                score += 20;
             }
-            let stem = Path::new(&rel).file_stem().and_then(|s| s.to_str()).unwrap_or("");
-            if stem.eq_ignore_ascii_case(cont) {
-                score += 220;
-            }
-            if def.kind == "method" {
-                score += 40;
-            }
-        } else if matches!(def.kind, "function" | "class" | "struct" | "interface" | "type" | "enum") {
-            score += 20;
-        }
 
-        record_loc(NavLocation {
-            abs_path: join_abs(&root_dir, &rel),
-            path: rel,
-            line: def.line,
-            col: def.col,
-            len: def.len,
-            end_line: None,
-            kind: def.kind.into(),
-            symbol: def.name,
-            container: def.container,
-            preview: def.preview,
-            score,
-            source: "index".into(),
-        });
+            record_loc(NavLocation {
+                abs_path: join_abs(&root_dir, &rel),
+                path: rel,
+                line: def.line,
+                col: def.col,
+                len: def.len,
+                end_line: None,
+                kind: def.kind.into(),
+                symbol: def.name,
+                container: def.container,
+                preview: def.preview,
+                score,
+                source: "index".into(),
+            });
+        }
     }
 
     let mut locations: Vec<NavLocation> = best_by_site.into_values().collect();
@@ -2074,23 +3079,8 @@ fn resolve_definition(provider: &str, req: &DefRequest) -> Result<NavDefinitionR
     })
 }
 
-fn find_whole_word_cols(line: &str, symbol: &str) -> Vec<usize> {
-    let mut cols = Vec::new();
-    let mut from = 0usize;
-    while let Some(pos) = line[from..].find(symbol) {
-        let start = from + pos;
-        let end = start + symbol.len();
-        let before_ok = !line[..start].chars().next_back().is_some_and(is_word_char);
-        let after_ok = !line[end..].chars().next().is_some_and(is_word_char);
-        if before_ok && after_ok {
-            cols.push(char_col(line, start));
-        }
-        from = start + symbol.chars().next().map_or(1, char::len_utf8);
-    }
-    cols
-}
-
 fn find_references(provider: &str, req: &RefRequest) -> Result<NavReferencesResult> {
+    let raw_root = crate::paths::expand(&req.root);
     let root_dir = expand_root(&req.root)?;
     let symbol = req.symbol.trim();
     if symbol.is_empty() {
@@ -2104,7 +3094,7 @@ fn find_references(provider: &str, req: &RefRequest) -> Result<NavReferencesResu
         });
     }
 
-    let cur_rel = normalize_rel_path(&root_dir, &req.path);
+    let cur_rel = normalize_rel_path(&root_dir, Some(&raw_root), &req.path);
     let target_lang = LangFamily::from_path(&cur_rel);
     let files = crate::fsapi::file_list(&root_dir);
     let lang_match = |rel: &str, allow_any: bool| -> bool {
@@ -2137,10 +3127,20 @@ fn scan_references<F: Fn(&str) -> bool>(
     files: &[String],
     filter: F,
 ) -> NavReferencesResult {
-    let mut candidates: Vec<&String> = files
+    let mut candidates: Vec<&str> = files
         .iter()
-        .filter(|rel| !is_ignored_asset(rel) && filter(rel))
+        .map(String::as_str)
+        .filter(|rel| is_safe_rel(rel) && !is_ignored_asset(rel) && filter(rel))
         .collect();
+    if req.content.is_some()
+        && !cur_rel.is_empty()
+        && is_safe_rel(cur_rel)
+        && !is_ignored_asset(cur_rel)
+        && filter(cur_rel)
+        && !candidates.iter().any(|r| norm_cmp(r) == norm_cmp(cur_rel))
+    {
+        candidates.push(cur_rel);
+    }
     candidates.sort_by(|a, b| {
         let a_cur = norm_cmp(a) == norm_cmp(cur_rel);
         let b_cur = norm_cmp(b) == norm_cmp(cur_rel);
@@ -2151,52 +3151,104 @@ fn scan_references<F: Fn(&str) -> bool>(
     });
 
     let started = Instant::now();
+    let budget = std::time::Duration::from_secs(8);
     let mut hits = Vec::new();
     let mut hit_files = HashSet::new();
     let mut truncated = false;
-    let sym_chars = symbol.chars().count();
+    let sym_utf16 = utf16_len(symbol);
+    let step_utf8 = symbol.chars().next().map_or(1, char::len_utf8);
+    let mut checks = 0usize;
 
     'files: for rel in candidates {
-        if started.elapsed() > std::time::Duration::from_secs(8) {
+        if started.elapsed() > budget {
             truncated = true;
             break;
         }
-        let Some(text) = read_text_file(&root_dir.join(rel)) else { continue };
+        let is_cur = !cur_rel.is_empty() && norm_cmp(rel) == norm_cmp(cur_rel);
+        let text: String = if is_cur {
+            if let Some(ref draft) = req.content {
+                draft.clone()
+            } else {
+                let Some(t) = read_contained_text_file(root_dir, &root_dir.join(rel)) else { continue };
+                t
+            }
+        } else {
+            let Some(t) = read_contained_text_file(root_dir, &root_dir.join(rel)) else { continue };
+            t
+        };
         if !text.contains(symbol) {
             continue;
         }
+
         let lang = LangFamily::from_path(rel);
-        let defs = extract_definitions(lang, &text);
-        let def_lines: HashSet<usize> = defs.iter().filter(|d| d.name == symbol).map(|d| d.line).collect();
+        let mut def_spans: HashMap<usize, Vec<(usize, usize)>> = HashMap::new();
+        for d in extract_definitions(lang, &text) {
+            if d.name == symbol {
+                def_spans.entry(d.line).or_default().push((d.col, d.col + d.len));
+            }
+        }
+        if is_cur {
+            for (_, d) in resolve_visible_local_bindings(lang, &text, symbol, req.line, req.col) {
+                def_spans.entry(d.line).or_default().push((d.col, d.col + d.len));
+            }
+        }
+
         let lines = line_spans(&text);
-        let is_cur = !cur_rel.is_empty() && norm_cmp(rel) == norm_cmp(cur_rel);
+        let mut abs_cached: Option<String> = None;
 
         for (i, line) in lines.iter().enumerate() {
             let ln = i + 1;
-            let cols = find_whole_word_cols(line, symbol);
-            if cols.is_empty() {
-                continue;
-            }
-            let is_def = def_lines.contains(&ln) && !is_import_line(lang, line.trim());
-            if !req.include_declaration && is_cur && ln == req.line && is_def {
-                continue;
-            }
-            let ctx_start = ln.saturating_sub(req.context_lines).max(1);
-            let ctx_end = (ln + req.context_lines).min(lines.len());
-            let context: Vec<String> = lines[ctx_start - 1..ctx_end].iter().map(|l| trunc_line(l, MAX_CONTEXT_CHARS)).collect();
-            for col in cols {
+            let line_is_import = is_import_line(lang, line.trim());
+            let line_def_spans = def_spans.get(&ln);
+            let mut from = 0usize;
+            let mut cursor_byte = 0usize;
+            let mut cursor_utf16 = 0usize;
+            let mut line_ctx: Option<(String, Vec<String>)> = None;
+
+            while let Some(pos) = line[from..].find(symbol) {
+                checks += 1;
+                if checks & 63 == 0 && started.elapsed() > budget {
+                    truncated = true;
+                    break 'files;
+                }
+                let start = from + pos;
+                let end = start + symbol.len();
+                let before_ok = !line[..start].chars().next_back().is_some_and(is_word_char);
+                let after_ok = !line[end..].chars().next().is_some_and(is_word_char);
+                if !(before_ok && after_ok) {
+                    from = start + step_utf8;
+                    continue;
+                }
+                from = end;
+                cursor_utf16 += utf16_len(&line[cursor_byte..start]);
+                cursor_byte = start;
+                let col = cursor_utf16;
+                let hit_end = col + sym_utf16;
+                let is_decl_hit = !line_is_import
+                    && line_def_spans.is_some_and(|spans| spans.iter().any(|&(s, e)| col == s && hit_end == e));
+                if !req.include_declaration && is_cur && ln == req.line && is_decl_hit {
+                    continue;
+                }
+                let (text_line, context) = line_ctx.get_or_insert_with(|| {
+                    let ctx_start = ln.saturating_sub(req.context_lines).max(1);
+                    let ctx_end = (ln + req.context_lines).min(lines.len());
+                    let ctx: Vec<String> = lines[ctx_start - 1..ctx_end].iter().map(|l| trunc_line(l, MAX_CONTEXT_CHARS)).collect();
+                    (trunc_line(line, MAX_CONTEXT_CHARS), ctx)
+                });
+                let abs = abs_cached.get_or_insert_with(|| join_abs(root_dir, rel)).clone();
+                let ctx_start = ln.saturating_sub(req.context_lines).max(1);
                 hits.push(NavReferenceHit {
-                    path: rel.clone(),
-                    abs_path: join_abs(root_dir, rel),
+                    path: rel.to_string(),
+                    abs_path: abs,
                     line: ln,
                     col,
-                    len: sym_chars,
-                    text: trunc_line(line, MAX_CONTEXT_CHARS),
-                    is_definition: is_def,
+                    len: sym_utf16,
+                    text: text_line.clone(),
+                    is_definition: is_decl_hit,
                     context_start_line: ctx_start,
                     context: context.clone(),
                 });
-                hit_files.insert(rel.clone());
+                hit_files.insert(rel.to_string());
                 if hits.len() >= req.limit {
                     truncated = true;
                     break 'files;
@@ -2368,6 +3420,7 @@ mod tests {
             line: 1,
             col: 16,
             symbol: "fooBar".into(),
+            content: None,
             include_declaration: false,
             context_lines: 1,
             limit: 50,
@@ -2390,5 +3443,255 @@ mod tests {
         std::fs::remove_file(root.join("src/a.ts")).unwrap();
         let after_del = BuiltinNavProvider.definition(&mk_req(root, "src/b.ts", 3, 0, Some("bazQux"))).unwrap();
         assert!(after_del.locations.is_empty());
+    }
+
+    #[test]
+    fn non_bmp_utf16_cols_draft_truth_and_per_hit_decl_filter() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let line1 = "export function emojiFn() { const s = \"🚀\"; return s.length + emojiFn(); }";
+        let line2 = "export function wrap() { const p = \"🚀\"; const localSym = 1; return localSym; }";
+        std::fs::write(root.join("src/emoji.ts"), format!("{line1}\n{line2}\n")).unwrap();
+
+        let decl_u16 = utf16_col(line1, line1.find("emojiFn").unwrap());
+        let call_u16 = utf16_col(line1, line1.rfind("emojiFn").unwrap());
+        // "🚀" takes 2 UTF-16 code units vs 1 code point, shifting call_u16 +1 vs char count
+        assert_eq!(call_u16, line1[..line1.rfind("emojiFn").unwrap()].chars().count() + 1);
+
+        let local_decl_byte = line2.find("localSym").unwrap();
+        let local_decl_u16 = utf16_col(line2, local_decl_byte);
+        let local_call_u16 = utf16_col(line2, line2.rfind("localSym").unwrap());
+        assert_eq!(local_decl_u16, line2[..local_decl_byte].chars().count() + 1);
+
+        let at_def = BuiltinNavProvider
+            .definition(&mk_req(root, "src/emoji.ts", 1, decl_u16, Some("emojiFn")))
+            .unwrap();
+        assert!(at_def.at_definition);
+
+        let at_local_def = BuiltinNavProvider
+            .definition(&mk_req(root, "src/emoji.ts", 2, local_decl_u16, Some("localSym")))
+            .unwrap();
+        assert!(at_local_def.at_definition);
+
+        let from_local_call = BuiltinNavProvider
+            .definition(&mk_req(root, "src/emoji.ts", 2, local_call_u16, Some("localSym")))
+            .unwrap();
+        assert!(!from_local_call.at_definition);
+        assert_eq!(from_local_call.locations[0].col, local_decl_u16);
+        assert_eq!(from_local_call.locations[0].len, 8);
+
+        let from_call = BuiltinNavProvider
+            .definition(&mk_req(root, "src/emoji.ts", 1, call_u16, Some("emojiFn")))
+            .unwrap();
+        assert!(!from_call.at_definition);
+        assert_eq!(from_call.locations[0].col, decl_u16);
+        assert_eq!(from_call.locations[0].len, 7);
+
+        // Include declaration = false must keep the recursive call on the same line, skipping only decl span
+        let refs = BuiltinNavProvider
+            .references(&RefRequest {
+                root: root.display().to_string(),
+                path: "src/emoji.ts".into(),
+                line: 1,
+                col: decl_u16,
+                symbol: "emojiFn".into(),
+                content: None,
+                include_declaration: false,
+                context_lines: 0,
+                limit: 50,
+            })
+            .unwrap();
+        assert_eq!(refs.total_hits, 1);
+        assert_eq!(refs.hits[0].col, call_u16);
+        assert_eq!(refs.hits[0].len, 7);
+        assert!(!refs.hits[0].is_definition);
+
+        // With include_declaration = true, only declaration span is marked `is_definition: true`
+        let refs_all = BuiltinNavProvider
+            .references(&RefRequest {
+                root: root.display().to_string(),
+                path: "src/emoji.ts".into(),
+                line: 1,
+                col: decl_u16,
+                symbol: "emojiFn".into(),
+                content: None,
+                include_declaration: true,
+                context_lines: 0,
+                limit: 50,
+            })
+            .unwrap();
+        assert_eq!(refs_all.total_hits, 2);
+        assert!(refs_all.hits[0].is_definition);
+        assert_eq!(refs_all.hits[0].col, decl_u16);
+        assert!(!refs_all.hits[1].is_definition);
+        assert_eq!(refs_all.hits[1].col, call_u16);
+
+        // Draft deletion hides disk definition, and draft references pick up unsaved buffer hits
+        let mut draft_req = mk_req(root, "src/emoji.ts", 1, call_u16, Some("emojiFn"));
+        draft_req.content = Some("export function otherFn() {}\notherFn();\n".into());
+        let deleted_def = BuiltinNavProvider.definition(&draft_req).unwrap();
+        assert!(deleted_def.locations.is_empty());
+
+        let draft_refs = BuiltinNavProvider
+            .references(&RefRequest {
+                root: root.display().to_string(),
+                path: "src/emoji.ts".into(),
+                line: 1,
+                col: 16,
+                symbol: "otherFn".into(),
+                content: draft_req.content.clone(),
+                include_declaration: false,
+                context_lines: 0,
+                limit: 50,
+            })
+            .unwrap();
+        assert_eq!(draft_refs.total_hits, 1);
+        assert_eq!(draft_refs.hits[0].line, 2);
+    }
+
+    #[test]
+    fn lexical_shadowing_default_import_and_rust_submod() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path();
+        std::fs::create_dir_all(root.join("src/a")).unwrap();
+        std::fs::write(root.join("Cargo.toml"), "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n").unwrap();
+
+        // Default export resolution (Foo exported as default, imported as Bar, plus unrelated Bar)
+        std::fs::write(
+            root.join("src/mod.ts"),
+            "export const Bar = 'unrelated';\nexport default function RealFoo() {\n  return 1;\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/reexport.ts"),
+            "export { default } from './mod';\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/consumer.ts"),
+            "import Bar from './reexport';\nfunction shadowFn(Bar: number) {\n  return Bar + 1;\n}\nfunction otherBlock() {\n  const innerOnly = 1;\n  return innerOnly;\n}\nfunction caller() {\n  const x = Bar();\n  return x + innerOnly;\n}\n",
+        )
+        .unwrap();
+
+        // Non-shadowed call to Bar resolves to RealFoo in src/mod.ts (NOT const Bar)
+        let def_bar = BuiltinNavProvider
+            .definition(&mk_req(root, "src/consumer.ts", 10, 12, Some("Bar")))
+            .unwrap();
+        assert_eq!(def_bar.locations[0].path, "src/mod.ts");
+        assert_eq!(def_bar.locations[0].line, 2);
+        assert_eq!(def_bar.locations[0].symbol, "RealFoo");
+
+        // Parameter `Bar` inside `shadowFn` shadows `import Bar from './reexport'`
+        let shadowed = BuiltinNavProvider
+            .definition(&mk_req(root, "src/consumer.ts", 3, 9, Some("Bar")))
+            .unwrap();
+        assert_eq!(shadowed.locations.len(), 1);
+        assert_eq!(shadowed.locations[0].path, "src/consumer.ts");
+        assert_eq!(shadowed.locations[0].line, 2);
+        assert_eq!(shadowed.locations[0].source, "local");
+
+        // Block-local `innerOnly` in `otherBlock` must NOT leak into `caller`
+        let leaked = BuiltinNavProvider
+            .definition(&mk_req(root, "src/consumer.ts", 11, 13, Some("innerOnly")))
+            .unwrap();
+        assert!(leaked.locations.is_empty());
+
+        // Rust submodule: `mod b;` inside `src/a.rs` resolves to `src/a/b.rs`, not sibling `src/b.rs`
+        std::fs::write(root.join("src/b.rs"), "pub fn b_top() {}\n").unwrap();
+        std::fs::write(root.join("src/a/b.rs"), "pub fn b_sub() {}\n").unwrap();
+        std::fs::write(
+            root.join("src/a.rs"),
+            "mod b;\nuse self::b::b_sub;\nuse super::b::b_top;\n",
+        )
+        .unwrap();
+
+        let mut mod_req = mk_req(root, "src/a.rs", 1, 4, None);
+        mod_req.kind = Some("path".into());
+        mod_req.path_text = Some("mod:b".into());
+        let mod_res = BuiltinNavProvider.definition(&mod_req).unwrap();
+        assert_eq!(mod_res.locations[0].path, "src/a/b.rs");
+
+        let sub_use = BuiltinNavProvider
+            .definition(&mk_req(root, "src/a.rs", 2, 14, Some("b_sub")))
+            .unwrap();
+        assert_eq!(sub_use.locations[0].path, "src/a/b.rs");
+
+        // Outside `src/a/b.rs`, `use super::a_sibling` / `use super::b::b_top`
+        std::fs::write(root.join("src/a/c.rs"), "use super::b::b_sub;\n").unwrap();
+        let sup_use = BuiltinNavProvider
+            .definition(&mk_req(root, "src/a/c.rs", 1, 14, Some("b_sub")))
+            .unwrap();
+        assert_eq!(sup_use.locations[0].path, "src/a/b.rs");
+    }
+
+    #[test]
+    fn dense_single_line_respects_limit_and_workspace_containment() {
+        let ws = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let root = ws.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(outside.path().join("secret.ts"), "export const secretSym = 42;\n").unwrap();
+
+        // Create symlink/junction from ws/ext -> outside when OS permits
+        #[cfg(unix)]
+        {
+            let _ = std::os::unix::fs::symlink(outside.path(), root.join("ext"));
+        }
+        #[cfg(windows)]
+        {
+            let _ = std::process::Command::new("cmd")
+                .args(["/c", "mklink", "/J"])
+                .arg(root.join("ext"))
+                .arg(outside.path())
+                .output();
+        }
+
+        // Dense line with 10,000 occurrences stops cleanly at limit=5
+        let dense = format!("const keep = {};\n", vec!["denseSym"; 10_000].join(" + "));
+        std::fs::write(root.join("src/dense.ts"), dense).unwrap();
+
+        let dense_refs = BuiltinNavProvider
+            .references(&RefRequest {
+                root: root.display().to_string(),
+                path: "src/dense.ts".into(),
+                line: 1,
+                col: 0,
+                symbol: "denseSym".into(),
+                content: None,
+                include_declaration: true,
+                context_lines: 0,
+                limit: 5,
+            })
+            .unwrap();
+        assert_eq!(dense_refs.hits.len(), 5);
+        assert!(dense_refs.truncated);
+
+        // Out-of-workspace files are never indexed, resolved via suffix/escape, or read by references
+        let esc_def = BuiltinNavProvider
+            .definition(&mk_req(root, "src/dense.ts", 1, 0, Some("secretSym")))
+            .unwrap();
+        assert!(esc_def.locations.is_empty());
+
+        let mut path_req = mk_req(root, "src/dense.ts", 1, 0, None);
+        path_req.kind = Some("path".into());
+        path_req.path_text = Some("ext/secret.ts".into());
+        let esc_path = BuiltinNavProvider.definition(&path_req).unwrap();
+        assert!(esc_path.locations.is_empty());
+
+        let esc_refs = BuiltinNavProvider
+            .references(&RefRequest {
+                root: root.display().to_string(),
+                path: "src/dense.ts".into(),
+                line: 1,
+                col: 0,
+                symbol: "secretSym".into(),
+                content: None,
+                include_declaration: true,
+                context_lines: 0,
+                limit: 20,
+            })
+            .unwrap();
+        assert_eq!(esc_refs.total_hits, 0);
     }
 }
