@@ -705,7 +705,9 @@ function LiveMarkdown({ text }: { text: string }) {
 function toolName(name: string, input?: unknown) {
   const n = name.toLowerCase();
   if (n === 'powershell') return 'PowerShell';
-  if (n === 'toolsearch' || n.startsWith('mcp__')) return name;
+  // MCP calls keep their own name: Claude's mcp__server__tool and Codex's server.tool (the substring guesses below
+  // would misread them, e.g. yi_review contains "view", memory_read contains "read")
+  if (n === 'toolsearch' || n.startsWith('mcp__') || /^[\w-]+\.[\w-]+$/.test(n)) return name;
   if (['bash', 'shell', 'execute', 'terminal', 'command'].some((x) => n.includes(x))) return 'Bash';
   if (n === 'write' || n === 'fs_write' || n === 'create' || n === 'write_file' || n === 'write_to_file') return 'Write';
   if (['edit', 'patch', 'notebook', 'str_replace', 'replace_file_content', 'sed_file'].some((x) => n.includes(x))) return 'Update';
@@ -737,7 +739,7 @@ function toolName(name: string, input?: unknown) {
 type ToolKind = 'bash' | 'read' | 'edit' | 'search' | 'other';
 function toolKind(shown: string, it: Item & { k: 'tool' }): ToolKind {
   if (shown === 'Bash' || shown === 'PowerShell') return 'bash';
-  if (shown === 'Read') return 'read';
+  if (shown === 'Read' || shown === 'ReviewDiff') return 'read';
   if (shown === 'Update' || shown === 'Write' || it.diffs.length > 0) return 'edit';
   if (shown === 'Grep' || shown === 'Glob' || shown === 'Search' || shown === 'LS') return 'search';
   return 'other';
@@ -830,13 +832,15 @@ function formatQuestionPrompt(input: unknown): { summary: string; detail: string
 /** Tools with no real name show their title as is. Only subagent / question titles (Antigravity's invoke_subagent /
  *  send_message / swarm / ask_question when a replay leaves the name out) are mapped, so other tools' titles stay as the tool wrote them */
 function isGenericTool(it: Item & { k: 'tool' }) {
-  if ((it.name !== 'other' && it.name !== 'think') || !it.title) return false;
+  if ((it.name !== 'other' && it.name !== 'think') || !it.title || reviewToolName(it)) return false;
   const mapped = toolName(it.title, it.input);
   return mapped !== 'Task' && mapped !== 'AskUserQuestion';
 }
 
 /** Name shown for a tool call; a generic one maps to Task when its title is a subagent tool */
 function shownToolName(it: Item & { k: 'tool' }) {
+  const review = reviewToolName(it);
+  if (review) return REVIEW_SHOWN[review];
   return isGenericTool(it) ? it.title : toolName((it.name === 'other' || it.name === 'think') && it.title ? it.title : it.name, it.input);
 }
 
@@ -850,6 +854,8 @@ const ARG_KEYS = ['command', 'pattern', 'query', 'file_path', 'notebook_path', '
 /** Key argument in parentheses: prefer common fields from the input (Cursor titles start out as just "Read File" / "Terminal"),
  *  then fall back to the title; if the title is a JSON blob, take the first short string */
 function toolArg(it: Item & { k: 'tool' }, shown: string, cwd?: string) {
+  const review = reviewToolName(it);
+  if (review) return reviewToolArg(it, review);
   if (shown === 'Task') {
     const sub = formatTaskPrompt(it.input).summary;
     if (sub) return sub.replace(/\s+/g, ' ');
@@ -1599,7 +1605,58 @@ function toolView(it: Item & { k: 'tool' }, cwd?: string) {
   if (memTool) return { shown, kind, arg: memoryToolArg(it), parsed, err, label: memoryToolLabel(memTool) };
   const sessTool = sessionToolName(it);
   if (sessTool) return { shown, kind, arg: sessionToolArg(it), parsed, err, label: sessionToolLabel(sessTool) };
+  if (shown === 'ReviewDiff') return { shown, kind, arg, parsed, err, label: t('reviewToolDiff') };
+  if (shown === 'ReviewScope') return { shown, kind, arg, parsed, err, label: t('reviewToolScope') };
   return { shown, kind, arg, parsed, err, label: generic ? it.title : toolUiLabel(shown) };
+}
+
+/** Shown names of the yi_review tools: reading and searching reuse Read / Grep, the diff and scope get their own */
+const REVIEW_SHOWN: Record<string, string> = {
+  review_read_file: 'Read',
+  review_grep: 'Grep',
+  review_diff: 'ReviewDiff',
+  review_scope: 'ReviewScope',
+};
+
+/** The yi_review read-only tool a row calls across Claude / Codex / ACP providers. Checked before the substring
+ *  guesses in `toolName`, which would read every `yi_review` name as Read because it contains "view" */
+function reviewToolName(it: Item & { k: 'tool' }): string | null {
+  const wrapped = (it.input as { toolName?: unknown } | null)?.toolName;
+  for (const s of [it.name, typeof wrapped === 'string' ? wrapped : '', it.title]) {
+    const m =
+      /^(?:mcp__yi_review__|yi_review\.|mcp_yi_review_|@yi_review\/)(review_(?:scope|diff|read_file|grep))$/.exec(s ?? '') ??
+      /^(review_(?:scope|diff|read_file|grep)) \(yi_review\)$/.exec(s ?? '');
+    if (m) return m[1];
+  }
+  return null;
+}
+
+/** Key argument of a yi_review call: the path (with line range or revision), the search pattern, or the diff page */
+function reviewToolArg(it: Item & { k: 'tool' }, tool: string): string {
+  const inp = (it.input as Record<string, unknown> | null) ?? {};
+  const inner = (inp.params as Record<string, unknown> | undefined) ?? inp;
+  const str = (k: string) => (typeof inner[k] === 'string' ? (inner[k] as string) : '');
+  const num = (k: string) => (typeof inner[k] === 'number' ? (inner[k] as number) : undefined);
+  switch (tool) {
+    case 'review_read_file': {
+      const start = num('startLine');
+      const end = num('endLine');
+      const range = start !== undefined || end !== undefined ? `:${start ?? 1}${end !== undefined ? `-${end}` : ''}` : '';
+      const rev = str('rev');
+      return `${str('path')}${range}${rev ? ` @${rev}` : ''}`;
+    }
+    case 'review_grep': {
+      const where = str('path') || str('glob');
+      return where ? `${str('pattern')} · ${where}` : str('pattern');
+    }
+    case 'review_diff': {
+      const target = str('path') || t('reviewToolAllChanges');
+      const offset = num('offset');
+      return offset ? `${target} · ${t('reviewToolFromOffset', { offset })}` : target;
+    }
+    default:
+      return '';
+  }
 }
 
 /** The yi_session read-only tool a row calls across Claude / Codex / ACP providers */

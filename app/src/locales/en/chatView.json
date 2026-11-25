@@ -114,5 +114,9 @@
   "turnFilesChanged_other": "{{count}} files",
   "bringBackThisReply": "Add to chat",
   "sessionToolRead": "Read related session",
-  "sessionToolList": "List related sessions"
+  "sessionToolList": "List related sessions",
+  "reviewToolDiff": "View diff",
+  "reviewToolScope": "View review scope",
+  "reviewToolAllChanges": "All changes",
+  "reviewToolFromOffset": "from character {{offset}}"
 }
