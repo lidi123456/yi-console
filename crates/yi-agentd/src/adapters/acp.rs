@@ -82,6 +82,8 @@ enum ElicitPropKind {
 #[derive(Default)]
 struct State {
     qoder_config_dir: Option<PathBuf>,
+    /// Qoder: a background-task wakeup still streaming after the prompt returned; see `qoder_wake_touch` / `qoder_wake_settle`
+    qoder_wake: Option<QoderWake>,
     /// The computer use notice still has to go out with the next prompt (once per launch)
     desktop_notice: bool,
     /// The same for the AI browser (yi_browser)
@@ -277,6 +279,15 @@ impl State {
         self.hidden.clear();
     }
 
+    /// Answering a wakeup's approval/question means work is about to resume: reset the quiet window so a long
+    /// wait for the user doesn't let the next settle tick close the turn before the tool starts output again
+    fn resume_wake_after_approval(&mut self) {
+        if let Some(w) = self.qoder_wake.as_mut() {
+            w.last = now_ms();
+            w.trailing_text = false;
+        }
+    }
+
     /// When replaying history that doesn't need recording, drop content events
     fn muted(&self) -> bool {
         self.loading && (!self.record_replay || (self.replay_skip > 0 && self.replay_users <= self.replay_skip))
@@ -437,6 +448,7 @@ pub async fn run(spec: StartSpec, em: Emitter, mut rx: mpsc::UnboundedReceiver<A
                 if let Some(dir) = &st.qoder_config_dir {
                     em.sync_qoder_plan(dir);
                 }
+                qoder_wake_settle(&mut st, &em);
             }
             cmd = rx.recv() => match cmd {
                 Some(AdapterCmd::Send(next)) => {
@@ -530,6 +542,13 @@ pub async fn run(spec: StartSpec, em: Emitter, mut rx: mpsc::UnboundedReceiver<A
                         em.watch_active(keep_watch);
                         em.event(EventBody::TurnEnd { stop_reason: Some("cancelled".into()), model: None });
                     }
+                    // A Qoder wakeup has no prompt in flight to cancel: close the reopened turn here
+                    if st.qoder_wake.take().is_some() {
+                        st.end_subagents();
+                        flush(&mut st, &em);
+                        em.watch_active(false);
+                        em.event(EventBody::TurnEnd { stop_reason: Some("cancelled".into()), model: None });
+                    }
                     if let Some(sid) = st.session_id.clone() {
                         for (rid, rpc_id) in st.perms.drain().chain(st.asks.drain()) {
                             let _ = p.send(&json!({"jsonrpc":"2.0","id":rpc_id,
@@ -544,6 +563,9 @@ pub async fn run(spec: StartSpec, em: Emitter, mut rx: mpsc::UnboundedReceiver<A
                     }
                 }
                 Some(AdapterCmd::Permission { request_id, option_id, answers }) => {
+                    let resolved = st.elicits.contains_key(&request_id)
+                        || st.asks.contains_key(&request_id)
+                        || st.perms.contains_key(&request_id);
                     if let Some(el) = st.elicits.remove(&request_id) {
                         let _ = p.send(&elicit_response(&el, &option_id, &answers)).await;
                         let resolved_answers = if option_id == "cancelled" { vec![] } else { answers };
@@ -567,6 +589,11 @@ pub async fn run(spec: StartSpec, em: Emitter, mut rx: mpsc::UnboundedReceiver<A
                         };
                         let _ = p.send(&json!({"jsonrpc":"2.0","id":rpc_id,"result":{"outcome":outcome}})).await;
                         em.event(EventBody::PermissionResolved { request_id, option_id, answers: vec![] });
+                    }
+                    // Answering a wakeup's approval means work is about to resume: reset the quiet window so a long
+                    // wait for the user doesn't let the next tick settle before the tool starts output again
+                    if resolved {
+                        st.resume_wake_after_approval();
                     }
                 }
                 Some(AdapterCmd::StopTask(task)) if st.is_antigravity => {
@@ -721,6 +748,14 @@ fn prompt(st: &mut State, em: &Emitter, p: &Prompt) -> Value {
 
 fn prompt_with_brain_dir(st: &mut State, em: &Emitter, p: &Prompt, brain_dir: Option<&std::path::Path>) -> Value {
     st.prompting = true;
+    // A real prompt now owns the turn: drop any reopened wakeup so it doesn't add a stray TurnEnd later
+    if st.qoder_wake.take().is_some() {
+        flush(st, em);
+        em.watch_active(false);
+        // The wake's foreground Agent / Task calls never reported a terminal status; left in `subagents` they
+        // would swallow this prompt's reply and hide its tool calls. Keep `hidden` so their late updates stay filtered.
+        st.subagents.clear();
+    }
     st.last_reply.clear();
     st.compact_manual = is_compact_command(&p.text);
     st.agy_compact = None;
@@ -2048,6 +2083,7 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Result<V
                     em.watch_active(true);
                 }
             } else {
+                qoder_wake_touch(st, em, &params["update"]);
                 update(st, em, &params["update"]);
             }
         }
@@ -2931,6 +2967,90 @@ fn login_hint(spec: &StartSpec, msg: &str) -> String {
     } else {
         msg.to_string()
     }
+}
+
+/// A Qoder wakeup that ends on a reply with nothing left open settles after this much silence
+const QODER_WAKE_REPLY_QUIET_MS: i64 = 5_000;
+/// Fallback silence before closing a Qoder wakeup that stopped mid-work (long model latency between steps)
+const QODER_WAKE_QUIET_MS: i64 = 45_000;
+/// A wakeup tool call that never reports a terminal status blocks settling only this long (finite fallback)
+const QODER_WAKE_OPEN_TOOL_CAP_MS: i64 = 120_000;
+
+/// Qoder's ACP bridge can return `end_turn` while a background task is still running, then keep streaming the
+/// task's wakeup as fresh updates with no second stopReason. Tracks that reopened stream so it can be closed.
+struct QoderWake {
+    /// Wall-clock ms of the last content update
+    last: i64,
+    /// The last content update was assistant text: a trailing reply with nothing open means the wakeup is done
+    trailing_text: bool,
+    /// Tool calls already open (or stuck) when the wakeup began: they belong to earlier turns and must not block settling
+    pre_open: HashSet<String>,
+}
+
+/// Reopen the turn on the first wakeup content update so the UI shows it running and the process isn't reaped
+/// as idle; `qoder_wake_settle` closes it once the stream goes quiet. Only Qoder (the config dir marks it).
+fn qoder_wake_touch(st: &mut State, em: &Emitter, u: &Value) {
+    if st.qoder_config_dir.is_none() || st.prompting || st.loading || st.session_id.is_none() {
+        return;
+    }
+    let kind = u["sessionUpdate"].as_str().unwrap_or("");
+    let trailing_text = match kind {
+        "agent_message_chunk" => true,
+        "agent_thought_chunk" | "tool_call" => false,
+        "tool_call_update" => {
+            // A late terminal update of an already-known tool is not new work: after an interrupt (or between
+            // wakeups) it must not reopen the session; while a wakeup is open it only refreshes the quiet timer
+            let terminal = matches!(u["status"].as_str(), Some("completed" | "failed"));
+            let known = st.tools.contains_key(u["toolCallId"].as_str().unwrap_or(""));
+            if terminal && known && st.qoder_wake.is_none() {
+                return;
+            }
+            false
+        }
+        _ => return,
+    };
+    if st.qoder_wake.is_none() {
+        em.status(SessionStatus::Running, None);
+        em.watch_active(true);
+        let pre_open = st.tools.iter().filter(|(_, t)| !t.done).map(|(id, _)| id.clone()).collect();
+        st.qoder_wake = Some(QoderWake { last: now_ms(), trailing_text, pre_open });
+    } else if let Some(w) = st.qoder_wake.as_mut() {
+        w.last = now_ms();
+        w.trailing_text = trailing_text;
+    }
+}
+
+/// Close a reopened Qoder wakeup once its stream is quiet and nothing is still open (tool calls opened by this
+/// wakeup, approvals, or a real prompt that now owns the turn). A trailing reply settles quickly; mid-work silence
+/// waits out the fallback. The last buffered segment is flushed first so the reply isn't lost to the TurnEnd.
+fn qoder_wake_settle(st: &mut State, em: &Emitter) {
+    let Some(w) = st.qoder_wake.as_ref() else { return };
+    let (last, trailing_text) = (w.last, w.trailing_text);
+    let pre_open = &w.pre_open;
+    if st.prompting || !st.queue.is_empty() {
+        return;
+    }
+    if !st.perms.is_empty() || !st.asks.is_empty() || !st.elicits.is_empty() {
+        return;
+    }
+    let open = st.tools.iter().any(|(id, t)| !t.done && !pre_open.contains(id));
+    let elapsed = now_ms() - last;
+    if open && elapsed < QODER_WAKE_OPEN_TOOL_CAP_MS {
+        return;
+    }
+    let quiet = if trailing_text { QODER_WAKE_REPLY_QUIET_MS } else { QODER_WAKE_QUIET_MS };
+    if elapsed < quiet {
+        return;
+    }
+    // Persist the last buffered reply before the TurnEnd clears the live buffer, then commit atomically:
+    // if a real user turn opened meanwhile it owns the session, so leave the wake for its prompt to take over
+    flush(st, em);
+    if !em.end_wake_turn() {
+        return;
+    }
+    st.qoder_wake = None;
+    st.end_subagents();
+    em.watch_active(false);
 }
 
 fn update(st: &mut State, em: &Emitter, u: &Value) {
@@ -5664,6 +5784,157 @@ mod tests {
         let mut st = State { perm: "default".into(), ..Default::default() };
         assert!(handle(&mut st, &super::model_config_tests::agy_test_spec(), &req, &em).unwrap().is_empty());
         hub.browsers.change("s", "stop").unwrap();
+    }
+
+    /// Qoder returns end_turn while a background task still runs, then streams the wakeup with no second
+    /// stopReason: the reopened turn must close on its own once the stream goes quiet.
+    #[test]
+    fn qoder_wakeup_reopens_and_settles() {
+        use super::*;
+        let (hub, em, _rx) = crate::hub::test_emitter();
+        let dir = tempfile::tempdir().unwrap();
+        let mut st = State {
+            qoder_config_dir: Some(dir.path().to_path_buf()),
+            session_id: Some("s".into()),
+            ..Default::default()
+        };
+        let spec = super::model_config_tests::agy_test_spec();
+        let note = |u: Value| json!({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":u}});
+        let chunk = |kind: &str, t: &str| json!({"sessionUpdate": kind, "content": {"type":"text","text":t}});
+
+        // The prompt returned end_turn while a background build was still running
+        em.event(EventBody::TurnEnd { stop_reason: Some("end_turn".into()), model: None });
+        assert_eq!(hub.info("s").unwrap().status, SessionStatus::Idle);
+
+        // Wakeup content reopens the turn and marks the watch active so the process isn't reaped as idle
+        handle(&mut st, &spec, &note(chunk("agent_thought_chunk", "build done, checking")), &em).unwrap();
+        assert_eq!(hub.info("s").unwrap().status, SessionStatus::Running);
+        assert!(crate::hub::test_watch_active(&hub, "s"));
+        assert!(st.qoder_wake.is_some());
+
+        // An open tool call keeps the wakeup open no matter how long the silence
+        handle(&mut st, &spec, &note(json!({"sessionUpdate":"tool_call","toolCallId":"t1","title":"Read x"})), &em).unwrap();
+        st.qoder_wake.as_mut().unwrap().last = now_ms() - 60_000;
+        qoder_wake_settle(&mut st, &em);
+        assert!(st.qoder_wake.is_some());
+        handle(&mut st, &spec, &note(json!({"sessionUpdate":"tool_call_update","toolCallId":"t1","status":"completed"})), &em).unwrap();
+
+        // Mid-work silence (last update was a tool, not a reply) waits out the longer fallback, then closes
+        st.qoder_wake.as_mut().unwrap().last = now_ms() - (QODER_WAKE_REPLY_QUIET_MS + 1);
+        qoder_wake_settle(&mut st, &em);
+        assert!(st.qoder_wake.is_some());
+        st.qoder_wake.as_mut().unwrap().last = now_ms() - (QODER_WAKE_QUIET_MS + 1);
+        qoder_wake_settle(&mut st, &em);
+        assert!(st.qoder_wake.is_none());
+        assert_eq!(hub.info("s").unwrap().status, SessionStatus::Idle);
+        assert!(!crate::hub::test_watch_active(&hub, "s"));
+
+        // A later wakeup that ends on a reply settles on the short quiet window
+        handle(&mut st, &spec, &note(chunk("agent_message_chunk", "All green.")), &em).unwrap();
+        assert_eq!(hub.info("s").unwrap().status, SessionStatus::Running);
+        st.qoder_wake.as_mut().unwrap().last = now_ms() - (QODER_WAKE_REPLY_QUIET_MS + 1);
+        qoder_wake_settle(&mut st, &em);
+        assert!(st.qoder_wake.is_none());
+        assert_eq!(hub.info("s").unwrap().status, SessionStatus::Idle);
+
+        let evs = hub.store.events_since("s", 0, 100).unwrap();
+        assert_eq!(evs.iter().filter(|e| matches!(e.body, EventBody::TurnEnd { .. })).count(), 3);
+        // The wakeup's last reply is persisted (flushed) before the closing TurnEnd, not lost to the live-buffer clear
+        let text_seq = evs.iter().find(|e| matches!(&e.body, EventBody::AssistantText { text, .. } if text == "All green.")).map(|e| e.seq);
+        let end_seq = evs.iter().filter(|e| matches!(e.body, EventBody::TurnEnd { .. })).last().map(|e| e.seq);
+        assert!(text_seq.is_some() && end_seq.is_some() && text_seq.unwrap() < end_seq.unwrap());
+    }
+
+    /// A stuck tool from an earlier turn must not block a later wakeup; a late terminal update after an interrupt
+    /// must not reopen the session; and a user turn delivered mid-settle keeps ownership of the session.
+    #[test]
+    fn qoder_wakeup_ignores_stale_tools_late_terminals_and_new_user_turns() {
+        use super::*;
+        let (hub, em, _rx) = crate::hub::test_emitter();
+        let dir = tempfile::tempdir().unwrap();
+        let mut st = State {
+            qoder_config_dir: Some(dir.path().to_path_buf()),
+            session_id: Some("s".into()),
+            ..Default::default()
+        };
+        let spec = super::model_config_tests::agy_test_spec();
+        let note = |u: Value| json!({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":u}});
+        let chunk = |kind: &str, t: &str| json!({"sessionUpdate": kind, "content": {"type":"text","text":t}});
+
+        // An earlier turn left a tool call without a terminal status
+        st.prompting = true;
+        handle(&mut st, &spec, &note(json!({"sessionUpdate":"tool_call","toolCallId":"old","title":"Read old"})), &em).unwrap();
+        st.prompting = false;
+        em.event(EventBody::TurnEnd { stop_reason: Some("end_turn".into()), model: None });
+
+        // A wakeup that is only a trailing reply still settles despite the stale open tool
+        handle(&mut st, &spec, &note(chunk("agent_message_chunk", "done")), &em).unwrap();
+        st.qoder_wake.as_mut().unwrap().last = now_ms() - (QODER_WAKE_REPLY_QUIET_MS + 1);
+        qoder_wake_settle(&mut st, &em);
+        assert!(st.qoder_wake.is_none(), "a stale open tool from an earlier turn must not block settling");
+        assert_eq!(hub.info("s").unwrap().status, SessionStatus::Idle);
+
+        // Interrupt clears the wakeup; a late terminal update of the known tool must not reopen it
+        handle(&mut st, &spec, &note(chunk("agent_thought_chunk", "working")), &em).unwrap();
+        assert_eq!(hub.info("s").unwrap().status, SessionStatus::Running);
+        st.qoder_wake = None;
+        em.watch_active(false);
+        em.event(EventBody::TurnEnd { stop_reason: Some("cancelled".into()), model: None });
+        handle(&mut st, &spec, &note(json!({"sessionUpdate":"tool_call_update","toolCallId":"old","status":"completed"})), &em).unwrap();
+        assert!(st.qoder_wake.is_none(), "a late terminal update of an old tool is not a new wakeup");
+        assert_eq!(hub.info("s").unwrap().status, SessionStatus::Idle);
+
+        // A user turn delivered while the wakeup settles keeps ownership: no synthetic TurnEnd ends it
+        handle(&mut st, &spec, &note(chunk("agent_message_chunk", "reply")), &em).unwrap();
+        st.qoder_wake.as_mut().unwrap().last = now_ms() - (QODER_WAKE_REPLY_QUIET_MS + 1);
+        crate::hub::test_set_open_turn(&hub, "s", now_ms());
+        qoder_wake_settle(&mut st, &em);
+        assert!(st.qoder_wake.is_some(), "an open user turn blocks the synthetic wakeup TurnEnd");
+        assert!(hub.info("s").unwrap().turn.as_ref().unwrap().ended_at.is_none());
+    }
+
+    /// Answering a wakeup's approval resets the quiet window, so a long wait for the user can't let the next
+    /// tick settle the turn before the approved tool resumes output.
+    #[test]
+    fn qoder_wakeup_approval_refreshes_quiet_window() {
+        use super::*;
+        let (hub, em, _rx) = crate::hub::test_emitter();
+        let dir = tempfile::tempdir().unwrap();
+        let mut st = State {
+            qoder_config_dir: Some(dir.path().to_path_buf()),
+            session_id: Some("s".into()),
+            ..Default::default()
+        };
+        let spec = super::model_config_tests::agy_test_spec();
+        let note = |u: Value| json!({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":u}});
+        handle(&mut st, &spec, &note(json!({"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"working"}})), &em).unwrap();
+        // The approval wait aged the wake past every quiet window and the open-tool cap
+        st.qoder_wake.as_mut().unwrap().last = now_ms() - (QODER_WAKE_OPEN_TOOL_CAP_MS + 1);
+        st.resume_wake_after_approval();
+        qoder_wake_settle(&mut st, &em);
+        assert!(st.qoder_wake.is_some(), "answering an approval resets the quiet window so the tool can resume");
+        assert_eq!(hub.info("s").unwrap().status, SessionStatus::Running);
+    }
+
+    /// A new prompt taking over a wakeup must drop the wake's foreground subagent filtering (or it swallows the
+    /// prompt's reply), while keeping the hidden tool ids so their late updates stay out of the new turn.
+    #[test]
+    fn qoder_new_prompt_clears_wake_subagents_but_keeps_hidden() {
+        use super::*;
+        let (_hub, em, _rx) = crate::hub::test_emitter();
+        let dir = tempfile::tempdir().unwrap();
+        let mut st = State {
+            qoder_config_dir: Some(dir.path().to_path_buf()),
+            session_id: Some("s".into()),
+            ..Default::default()
+        };
+        st.qoder_wake = Some(QoderWake { last: now_ms(), trailing_text: false, pre_open: std::collections::HashSet::new() });
+        st.subagents.insert("a1".into());
+        st.hidden.insert("h1".into());
+        let _ = prompt_with_brain_dir(&mut st, &em, &Prompt { text: "hi".into(), images: vec![] }, None);
+        assert!(st.qoder_wake.is_none());
+        assert!(st.subagents.is_empty(), "a new prompt must not inherit the wake's foreground subagent filtering");
+        assert!(st.hidden.contains("h1"), "late updates to the wake's hidden tool calls stay filtered");
     }
 
     /// Qoder streams its subagents' text, thinking and tool calls as the parent's own updates

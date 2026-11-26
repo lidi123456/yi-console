@@ -563,7 +563,7 @@ impl Hub {
         }
         drop(map);
         for id in interrupted {
-            self.emit_inner(&id, 0, EventBody::Interrupted { reason: "restart".into() }, false);
+            self.emit_inner(&id, 0, EventBody::Interrupted { reason: "restart".into() }, false, false);
         }
     }
 
@@ -4043,14 +4043,14 @@ impl Hub {
 
     /// Number, update session state, persist, broadcast. gen=0 means emitted by the hub itself (generation not checked)
     pub fn emit(&self, sid: &str, gen: u64, body: EventBody) {
-        let _ = self.emit_inner(sid, gen, body, true);
+        let _ = self.emit_inner(sid, gen, body, true, false);
     }
 
     fn emit_returning_seq(&self, sid: &str, gen: u64, body: EventBody) -> i64 {
-        self.emit_inner(sid, gen, body, true)
+        self.emit_inner(sid, gen, body, true, false)
     }
 
-    fn emit_inner(&self, sid: &str, gen: u64, mut body: EventBody, mut update_activity_time: bool) -> i64 {
+    fn emit_inner(&self, sid: &str, gen: u64, mut body: EventBody, mut update_activity_time: bool, wake: bool) -> i64 {
         let Some(rt) = self.alive(sid, gen) else {
             return 0;
         };
@@ -4189,6 +4189,11 @@ impl Hub {
                     }
                 }
                 EventBody::TurnEnd { stop_reason, .. } => {
+                    // A synthetic wakeup TurnEnd must not end a real user turn: begin_turn holds this same lock,
+                    // so checking here serializes the wake's settle with a prompt opening a turn (no check-then-emit gap)
+                    if wake && info.turn.as_ref().is_some_and(|t| t.ended_at.is_none()) {
+                        return 0;
+                    }
                     rt.live_text.lock().unwrap().clear();
                     if !matches!(info.status, SessionStatus::Exited | SessionStatus::Error) {
                         info.status = SessionStatus::Idle;
@@ -4429,6 +4434,7 @@ impl Hub {
                     answers: vec![],
                 },
                 false,
+                false,
             );
         }
         // The process is gone, and so are its background tasks and watches
@@ -4443,7 +4449,7 @@ impl Hub {
         if let Some(m) = &message {
             let tool = rt.info.lock().unwrap().tool;
             crate::warn!("{} 会话 {sid} 出错退出: {m}", tool.as_str());
-            self.emit_inner(sid, gen, EventBody::Error { message: m.clone() }, false);
+            self.emit_inner(sid, gen, EventBody::Error { message: m.clone() }, false, false);
         }
         self.emit(
             sid,
@@ -5892,6 +5898,11 @@ pub(crate) fn test_watch_active(hub: &Hub, id: &str) -> bool {
 }
 
 #[cfg(test)]
+pub(crate) fn test_set_open_turn(hub: &Hub, id: &str, started_at: i64) {
+    hub.get(id).unwrap().info.lock().unwrap().turn = Some(TurnInfo { started_at, ..Default::default() });
+}
+
+#[cfg(test)]
 pub(crate) fn test_emitter() -> (Arc<Hub>, Emitter, mpsc::UnboundedReceiver<AdapterCmd>) {
     // Accounts of its own: the host's (`Hub::new` reads ~/.yi-console) would decide which account lists belong to
     let dir = tempfile::tempdir().unwrap().keep();
@@ -6206,6 +6217,25 @@ impl Emitter {
         }
     }
 
+    /// Close a reopened Qoder wakeup atomically. A real user turn that opened (`begin_turn`, same info lock)
+    /// owns the session: abort without a TurnEnd or `after_turn`, leaving the wake for that prompt to take over.
+    /// Returns whether the closing TurnEnd was committed.
+    pub fn end_wake_turn(&self) -> bool {
+        let seq = self.hub.emit_inner(
+            &self.sid,
+            self.gen,
+            EventBody::TurnEnd { stop_reason: Some("end_turn".into()), model: None },
+            true,
+            true,
+        );
+        if seq == 0 {
+            return false;
+        }
+        self.hub.sync_worktree_branch_async(&self.sid);
+        self.hub.after_turn(&self.sid, self.gen, Some("end_turn"));
+        true
+    }
+
     pub fn title_if_empty(&self, title: &str) {
         let t = truncate(title, 80);
         let mut rename_wt = false;
@@ -6232,7 +6262,7 @@ impl Emitter {
 
     /// Record the events produced while cleaning up a process that is exiting.
     pub(crate) fn exit_cleanup_event(&self, body: EventBody) {
-        self.hub.emit_inner(&self.sid, self.gen, body, false);
+        self.hub.emit_inner(&self.sid, self.gen, body, false, false);
     }
 
     /// Pids in the process tree of a terminal-mode run (for matching Kiro's .lock files)
