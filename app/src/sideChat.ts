@@ -1,3 +1,4 @@
+import { getComposerSnapshot } from './composerState';
 import { addContextRefToChat, type ContextRefInput } from './contextRefs';
 import { getT } from './i18n';
 import { permModes } from './perm';
@@ -72,12 +73,31 @@ export async function startSideChat(opts: {
   return created;
 }
 
-/** Whether a side chat has ever had a user message (used to auto-delete unused side chats on tab close) */
+/** Whether a side chat has ever had a user message or an unsent draft (used to auto-delete unused side chats on tab close) */
 export function sideChatHasMessages(hostId: string, sideSid: string, info?: SessionInfo): boolean {
-  const data = getSession(skey(hostId, sideSid));
+  const key = skey(hostId, sideSid);
+  const data = getSession(key);
   if (data.events.some((e) => e.kind === 'user_message' || e.kind === 'assistant_text')) return true;
-  if (info && (info.lastSeq > 0 || info.turn != null || info.status === 'running')) return true;
-  return false;
+  // The user-message index covers the whole history even when only a recent event window is loaded
+  if (data.userMessages.length > 0) return true;
+  // /clear wipes events and the index but keeps the session: it was used
+  if (data.clearSeq > 0) return true;
+  const draft = getComposerSnapshot(key);
+  if (
+    draft.text.trim() ||
+    draft.imgs.length > 0 ||
+    draft.refs.length > 0 ||
+    draft.pendingUploads > 0 ||
+    draft.uploads.length > 0 ||
+    draft.sending ||
+    draft.waitSend
+  )
+    return true;
+  if (data.loaded && !data.hasMore) return false;
+  if (data.loaded && data.userMessagesLoaded && !data.userMessagesUnsupported) return false;
+  // Partial or unloaded history: startup status events bump lastSeq too, so it only proves
+  // "something happened", not "someone talked". Stay conservative and keep the confirmation.
+  return !!info && (info.lastSeq > 0 || info.turn != null || info.status === 'running');
 }
 
 /** Whether a side chat currently has an active turn or pending approval/question */

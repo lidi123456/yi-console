@@ -2384,9 +2384,14 @@ export function FilePanel({
     const ssid = sideTabSession(t);
     const s = hostSessions.find((x) => x.id === ssid);
     if (!s || s.review || getReviewMeta(ssid)) return;
-    if (!sideChatHasMessages(hostId, ssid, s)) {
-      rpc(hostId, 'session.delete', { sessionId: ssid }).catch(() => {});
-    }
+    if (sideChatHasMessages(hostId, ssid, s)) return;
+    // The client snapshot can lag a just-sent message (draft cleared, event not yet arrived):
+    // let the server's full message index veto the auto-delete; on any doubt keep the session
+    rpc<{ items?: unknown[] }>(hostId, 'session.userMessages', { sessionId: ssid })
+      .then((r) => {
+        if ((r.items ?? []).length === 0) return rpc(hostId, 'session.delete', { sessionId: ssid });
+      })
+      .catch(() => {});
   };
   const sideTabInfo = (t: string) => hostSessions.find((x) => x.id === sideTabSession(t));
   const sideTabLabel = (t: string) => sideChatTitle(sideTabInfo(t));
@@ -2590,18 +2595,35 @@ export function FilePanel({
     const alive = tabs.filter((t) => !dead.includes(t));
     setTabs(alive);
     if (file && dead.includes(file.path)) {
-      const next = alive[alive.length - 1];
-      if (next) {
-        readFileWithMeta(next, true).then((res) => {
+      // Fallback must not cancel or clobber a user open in flight, and must survive the user
+      // closing the fallback target meanwhile. A failed user open leaves the view on the dead
+      // tab, so only an actual view change (fileRef) ends the fallback — not the open seq.
+      const deadPath = file.path;
+      const stale = () => fileRef.current?.path !== deadPath;
+      // Seed from the pruned list: openTabsRef still holds the dead tabs until the next render
+      let list = alive;
+      void (async () => {
+        for (;;) {
+          if (stale()) return;
+          const target = list[list.length - 1];
+          if (!target) {
+            if (!stale()) {
+              fileRef.current = null;
+              setFile(null);
+            }
+            return;
+          }
+          const res = await readFileWithMeta(target, true);
+          if (stale()) return;
+          list = list.filter((t) => openTabsRef.current.includes(t));
+          if (!list.includes(target)) continue;
           const f = res?.file ?? null;
           fileRef.current = f;
           setFile(f);
-          if (res?.fromCache && f) void revalidateActiveCached(f, true, next);
-        });
-      } else {
-        fileRef.current = null;
-        setFile(null);
-      }
+          if (res?.fromCache && f) void revalidateActiveCached(f, true, target);
+          return;
+        }
+      })();
     }
   }, [rawHostSessions, hostSessions]); // eslint-disable-line react-hooks/exhaustive-deps
 

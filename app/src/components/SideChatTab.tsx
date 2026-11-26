@@ -84,6 +84,17 @@ export function SideChatsMenu({
   const confirmIdRef = useRef(confirmId);
   confirmIdRef.current = confirmId;
 
+  // Freeze row order while open: the store re-sorts sessions by updatedAt on every status
+  // change, which would otherwise slide a different delete button under the pointer
+  const orderRef = useRef<string[]>([]);
+  const ordered = useMemo(() => {
+    const byId = new Map(sideChats.map((s) => [s.id, s]));
+    const ids = orderRef.current.filter((id) => byId.has(id));
+    for (const s of sideChats) if (!ids.includes(s.id)) ids.push(s.id);
+    orderRef.current = ids;
+    return ids.map((id) => byId.get(id)!);
+  }, [sideChats]);
+
   // Keep the right edge aligned with the trigger button while clamping inside the viewport
   useLayoutEffect(() => {
     const el = menuRef.current;
@@ -117,6 +128,48 @@ export function SideChatsMenu({
   useBack(true, onClose);
   useBack(confirmId !== null, () => setConfirmId(null));
 
+  // Keyboard access: focus the menu on open, restore the trigger on close
+  useEffect(() => {
+    const prev = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    menuRef.current?.querySelector<HTMLElement>('button:not(:disabled)')?.focus();
+    return () => {
+      if (prev?.isConnected) prev.focus();
+    };
+  }, []);
+
+  // Entering inline confirm moves focus to its cancel button. Leaving only restores focus when
+  // the confirm controls were focused and got removed (focus fell to body); if the user already
+  // navigated elsewhere, leave their focus alone.
+  const prevConfirmRef = useRef<string | null>(null);
+  useEffect(() => {
+    const prev = prevConfirmRef.current;
+    prevConfirmRef.current = confirmId;
+    if (confirmId) {
+      menuRef.current?.querySelector<HTMLElement>('.scm-row.confirming .scm-cancel-btn')?.focus();
+    } else if (prev && (!document.activeElement || document.activeElement === document.body)) {
+      const rowDel = menuRef.current?.querySelector<HTMLElement>(
+        `.scm-row[data-sid="${CSS.escape(prev)}"] .scm-del:not(:disabled)`,
+      );
+      (rowDel ?? menuRef.current?.querySelector<HTMLElement>('button:not(:disabled)'))?.focus();
+    }
+  }, [confirmId]);
+
+  const onMenuKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return;
+    const btns = [...(menuRef.current?.querySelectorAll<HTMLElement>('button:not(:disabled)') ?? [])];
+    if (!btns.length) return;
+    e.preventDefault();
+    const i = btns.indexOf(document.activeElement as HTMLElement);
+    btns[e.key === 'ArrowDown' ? (i + 1) % btns.length : (i - 1 + btns.length) % btns.length]?.focus();
+  };
+
+  // A quick delete disables/removes the focused trash button without touching confirmId:
+  // recover focus so arrow-key navigation keeps working across consecutive deletes
+  useEffect(() => {
+    if (document.activeElement && document.activeElement !== document.body) return;
+    menuRef.current?.querySelector<HTMLElement>('button:not(:disabled)')?.focus();
+  }, [deletingIds, sideChats]);
+
   useEffect(() => {
     const close = () => onCloseRef.current();
     const onWheel = (e: WheelEvent) => {
@@ -143,11 +196,18 @@ export function SideChatsMenu({
     };
   }, []);
 
-  const performDelete = async (sc: SessionInfo) => {
+  const performDelete = async (sc: SessionInfo, onlyIfUnused = false) => {
     if (!connected || deletingIds.includes(sc.id)) return;
     setDeletingIds((prev) => (prev.includes(sc.id) ? prev : [...prev, sc.id]));
     setConfirmId((cur) => (cur === sc.id ? null : cur));
     try {
+      if (onlyIfUnused) {
+        // The client snapshot can lag a just-sent message: the server's full index has the final say
+        const used = await rpc<{ items?: unknown[] }>(hostId, 'session.userMessages', { sessionId: sc.id })
+          .then((r) => (r.items ?? []).length > 0)
+          .catch(() => false);
+        if (used) return;
+      }
       await deleteSideChatSession(hostId, parent.id, sc);
     } finally {
       setDeletingIds((prev) => prev.filter((id) => id !== sc.id));
@@ -158,7 +218,7 @@ export function SideChatsMenu({
     if (!connected || deletingIds.includes(sc.id)) return;
     const isReview = !!(sc.review || getReviewMeta(sc.id));
     if (!sideChatNeedsDeleteConfirm(hostId, sc, isReview)) {
-      void performDelete(sc);
+      void performDelete(sc, true);
     } else {
       setConfirmId(sc.id);
     }
@@ -181,8 +241,9 @@ export function SideChatsMenu({
         role="menu"
         style={pos}
         onMouseDown={(e) => e.stopPropagation()}
+        onKeyDown={onMenuKeyDown}
       >
-        {sideChats.map((sc) => {
+        {ordered.map((sc) => {
           const label = sideChatTitle(sc);
           const hint = sideChatMenuHint(sc, label);
           const isReview = !!(sc.review || getReviewMeta(sc.id));
@@ -194,6 +255,7 @@ export function SideChatsMenu({
           return (
             <div
               key={sc.id}
+              data-sid={sc.id}
               className={`scm-row ${confirming ? 'confirming' : ''} ${deleting ? 'deleting' : ''}`}
             >
               <button

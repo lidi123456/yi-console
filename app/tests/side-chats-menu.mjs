@@ -72,6 +72,17 @@ try {
     await menu.waitFor();
     assert.equal(await menu.locator('.scm-row').count(), 3);
 
+    // Focus moves into the menu on open, and live re-sorting must not move rows under the pointer
+    await page.waitForFunction(() => !!document.activeElement?.closest('.side-chats-menu'));
+    await page.evaluate(() => window.fixtureReorderSideChats(['sc-empty-3', 'sc-used-2', 'sc-review-1']));
+    assert.deepEqual(
+      await page.evaluate(() => [...document.querySelectorAll('.side-chats-menu .scm-row')].map((r) => r.getAttribute('data-sid'))),
+      ['sc-review-1', 'sc-used-2', 'sc-empty-3'],
+      'row order stays frozen while the menu is open',
+    );
+    // Restore the underlying store order so later reopen-based steps keep their row indices
+    await page.evaluate(() => window.fixtureReorderSideChats(['sc-review-1', 'sc-used-2', 'sc-empty-3']));
+
     // Review hint deduplicates tool/scope and shows 运行中
     const reviewRow = menu.locator('.scm-row').nth(0);
     const reviewHint = await reviewRow.locator('.ctx-hint').innerText();
@@ -96,6 +107,7 @@ try {
     await usedRow.locator('.scm-del').click();
     await usedRow.locator('.scm-confirm-btn').waitFor();
     assert.equal((await usedRow.locator('.scm-confirm-btn').innerText()).trim(), '确认删除');
+    await page.waitForFunction(() => document.activeElement?.classList.contains('scm-cancel-btn'));
     await saveShot(page, '02-side-menu-inline-confirm.png');
 
     // Cancel via ×
@@ -142,6 +154,45 @@ try {
     assert.equal(await page.evaluate(() => window.fixtureGetActiveReviewId()), null, 'active review id cleared');
     deletes = await page.evaluate(() => window.fixtureCalls.filter((c) => c.method === 'session.delete').map((c) => c.params.sessionId));
     assert.deepEqual(deletes, ['sc-empty-3', 'sc-used-2', 'sc-review-1']);
+
+    // 1b. Keyboard-only consecutive deletes: focus must survive each quick delete
+    await page.evaluate(() => window.fixtureReset());
+    await trigger.focus();
+    await page.keyboard.press('Enter');
+    await menu.waitFor();
+    await page.waitForFunction(() => !!document.activeElement?.closest('.side-chats-menu'));
+    // Buttons: [r1-main, r1-del, r2-main, r2-del, r3-main, r3-del, new, ...tools]; land on empty row's trash
+    for (let i = 0; i < 5; i++) await page.keyboard.press('ArrowDown');
+    assert.equal(
+      await page.evaluate(() => document.activeElement?.closest('.scm-row')?.getAttribute('data-sid')),
+      'sc-empty-3',
+    );
+    assert.equal(await page.evaluate(() => document.activeElement?.classList.contains('scm-del')), true);
+    await page.keyboard.press('Enter');
+    await page.waitForFunction(() => document.querySelectorAll('.side-chats-menu .scm-row').length === 2);
+    await page.waitForFunction(() => !!document.activeElement?.closest('.side-chats-menu'), null, { timeout: 3000 });
+    // 2 rows left; from first button, 3x ArrowDown reaches used row's trash
+    for (let i = 0; i < 3; i++) await page.keyboard.press('ArrowDown');
+    assert.equal(
+      await page.evaluate(() => document.activeElement?.closest('.scm-row')?.getAttribute('data-sid')),
+      'sc-used-2',
+    );
+    await page.keyboard.press('Enter');
+    await page.waitForFunction(() => document.activeElement?.classList.contains('scm-cancel-btn'));
+    await page.keyboard.press('ArrowUp');
+    assert.equal(await page.evaluate(() => document.activeElement?.classList.contains('scm-confirm-btn')), true);
+    await page.keyboard.press('Enter');
+    await page.waitForFunction(() => document.querySelectorAll('.side-chats-menu .scm-row').length === 1);
+    await page.waitForFunction(() => !!document.activeElement?.closest('.side-chats-menu'), null, { timeout: 3000 });
+    await page.keyboard.press('Escape');
+    await menu.waitFor({ state: 'hidden' });
+    assert.equal(
+      await page.evaluate(() => document.activeElement?.classList.contains('head-side-btn')),
+      true,
+      'closing via Escape restores focus to the trigger',
+    );
+    deletes = await page.evaluate(() => window.fixtureCalls.filter((c) => c.method === 'session.delete').map((c) => c.params.sessionId));
+    assert.deepEqual(deletes, ['sc-empty-3', 'sc-used-2']);
 
     // 2. Dark mode screenshot
     await page.evaluate(() => {

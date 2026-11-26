@@ -172,6 +172,13 @@ Object.assign(window, {
   fixtureSetTheme: setTheme,
   fixtureSetLang: setLangPref,
   fixtureGetActiveReviewId: () => getActiveReviewId('local', 'main-1'),
+  fixtureReorderSideChats: (ids: string[]) =>
+    setState((s) => {
+      const list = s.sessions.local ?? [];
+      const byId = new Map(list.map((x) => [x.id, x]));
+      const rest = list.filter((x) => !ids.includes(x.id));
+      return { sessions: { ...s.sessions, local: [...rest, ...ids.map((id) => byId.get(id)!).filter(Boolean)] } };
+    }),
 });
 
 function Fixture() {
