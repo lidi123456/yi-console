@@ -77,5 +77,8 @@
   "revokeReadAccessMessage": "After revoking, the AI in this session can no longer read \"{{title}}\". Anything it has already read stays in its context.",
   "revoke": "Revoke",
   "readAccessRevoked": "Read access revoked",
-  "readAccessStillInherited": "This session's own grant is revoked, but its main session also granted access, so it can still read it. Revoke it in the main session to remove access."
+  "readAccessStillInherited": "This session's own grant is revoked, but its main session also granted access, so it can still read it. Revoke it in the main session to remove access.",
+  "openSideChat": "Open Side Chat",
+  "openParentSession": "Open Main Session",
+  "deleteSideChat": "Delete Side Chat"
 }

@@ -2,15 +2,16 @@ import { useEffect, useMemo, useState } from 'react';
 import { getT, isEn } from '../i18n';
 import { hubCall, rpc } from '../transport';
 import { errorToast, navigate, openNewSession, setState, toast, useStore, type HostEntry } from '../store';
-import { isHostSession, sessionProjectDir, type SessionInfo } from '../types';
+import { isHostSession, isSideChatSession, sessionProjectDir, type SessionInfo } from '../types';
 import { basename, clock, fuzzyScore, lsGet, lsSet } from '../util';
 import { openMenu, type MenuItem } from './Overlay';
 import { writeClipboard } from '../clipboard';
 import { deleteDirSessions, openTerminal, renameSession, sessionMenu } from './SessionActions';
+import { sideChatTitle } from '../sideChat';
 import { Icon, ToolBadge } from './Icon';
 import { MOD } from './Palette';
 import { BotsSections } from './BotsSection';
-import { needsAttention } from '../overview';
+import { countAttentionSessions, sideActiveStatus, type SideActiveKind } from '../overview';
 
 const tx = getT('sidebar');
 
@@ -79,12 +80,92 @@ function shortAgo(ms: number): string {
   return `${t.getMonth() + 1}/${t.getDate()}`;
 }
 
-function SessionRow({ hostId, s, active, showDir }: { hostId: string; s: SessionInfo; active: boolean; showDir?: boolean }) {
+const SIDE_PRIO: Record<SideActiveKind, number> = { attn: 0, busy: 1, err: 2, wait: 3 };
+
+interface SideSummary {
+  cls: SideActiveKind | null;
+  pending: number;
+  waitAt?: number;
+  active: { s: SessionInfo; kind: SideActiveKind }[];
+}
+
+function summarizeActiveSides(sides: readonly SessionInfo[] | undefined, now: number): SideSummary {
+  if (!sides?.length) return { cls: null, pending: 0, active: [] };
+  const active: { s: SessionInfo; kind: SideActiveKind }[] = [];
+  let pending = 0;
+  let waitAt: number | undefined;
+  for (const s of sides) {
+    const kind = sideActiveStatus(s, now);
+    if (!kind) continue;
+    active.push({ s, kind });
+    pending += s.pendingPermissions;
+    if (s.autoResume && (waitAt === undefined || s.autoResume.at < waitAt)) waitAt = s.autoResume.at;
+  }
+  if (!active.length) return { cls: null, pending: 0, active: [] };
+  active.sort((a, b) => SIDE_PRIO[a.kind] - SIDE_PRIO[b.kind] || b.s.updatedAt - a.s.updatedAt);
+  return { cls: active[0].kind, pending, waitAt, active };
+}
+
+function sideStatusLabel(s: SessionInfo, kind: SideActiveKind): string {
+  switch (kind) {
+    case 'attn':
+      return s.restartInterrupted && !s.pendingPermissions && s.status !== 'waiting-permission'
+        ? tx('sideChatRestartInterrupted')
+        : tx('waitingForApproval');
+    case 'busy':
+      return tx('running');
+    case 'err':
+      return tx('error');
+    case 'wait':
+      return tx('sideChatWaitingLimit', { v: clock(s.autoResume!.at) });
+  }
+}
+
+function groupSummaryTitle(kind: SideActiveKind): string {
+  switch (kind) {
+    case 'attn':
+      return tx('sessionWaitingForApproval');
+    case 'busy':
+      return tx('sessionRunning');
+    case 'err':
+      return tx('sessionError');
+    case 'wait':
+      return tx('sessionWaitingLimit');
+  }
+}
+
+function GroupSummaryMark({ kind }: { kind: SideActiveKind }) {
+  if (kind === 'wait') {
+    return (
+      <span className="row-wait" title={groupSummaryTitle(kind)}>
+        <Icon name="clock" size={11} />
+      </span>
+    );
+  }
+  return <span className={`sdot sdot-${kind}`} title={groupSummaryTitle(kind)} />;
+}
+
+function SessionRow({
+  hostId,
+  s,
+  active,
+  showDir,
+  sides,
+  now,
+}: {
+  hostId: string;
+  s: SessionInfo;
+  active: boolean;
+  showDir?: boolean;
+  sides?: SessionInfo[];
+  now: number;
+}) {
   const cls = sessionStatusClass(s);
   const wt = s.worktree;
   const wtBranch = wt ? wt.branch.replace(/^yi\//, '') : '';
-  // Only show states that need attention: awaiting approval, running, error; otherwise show the time
-  const status =
+  const side = summarizeActiveSides(sides, now);
+  // Only show states that need attention: awaiting approval, running, error, auto-resume; otherwise show the time
+  const mainStatus =
     s.pendingPermissions > 0 ? (
       <span className="pill pill-attn">{s.pendingPermissions}</span>
     ) : cls === 'attn' || cls === 'busy' || cls === 'err' ? (
@@ -94,9 +175,25 @@ function SessionRow({ hostId, s, active, showDir }: { hostId: string; s: Session
         <Icon name="clock" size={11} />
         {clock(s.autoResume.at)}
       </span>
-    ) : (
-      <span className="row-time">{shortAgo(s.updatedAt)}</span>
-    );
+    ) : null;
+  const sideStatus =
+    side.pending > 0 ? (
+      <span className="pill pill-attn pill-side">{side.pending}</span>
+    ) : side.cls === 'attn' || side.cls === 'busy' || side.cls === 'err' ? (
+      <span className={`sdot sdot-${side.cls} sdot-side`} />
+    ) : side.cls === 'wait' && side.waitAt ? (
+      <span className="row-time row-wait row-wait-side">
+        <Icon name="clock" size={11} />
+        {clock(side.waitAt)}
+      </span>
+    ) : null;
+  const sideTip = side.active
+    .map(({ s: sc, kind }) =>
+      sc.review
+        ? tx('reviewSideTooltipLine', { title: sideChatTitle(sc), status: sideStatusLabel(sc, kind) })
+        : tx('sideChatTooltipLine', { title: sideChatTitle(sc), status: sideStatusLabel(sc, kind) }),
+    )
+    .join('\n');
   const mainLine = (
     <>
       <span className="row-badge">
@@ -112,7 +209,11 @@ function SessionRow({ hostId, s, active, showDir }: { hostId: string; s: Session
         {showDir && <span className="row-dir"> · {basename(sessionProjectDir(s))}</span>}
       </span>
       {(s.queued?.length ?? 0) > 0 && <span className="pill" title={tx('queuedMessages')}>{s.queued!.length}</span>}
-      <span className="row-end">{status}</span>
+      <span className="row-end">
+        {mainStatus}
+        {sideStatus}
+        {!mainStatus && !sideStatus && <span className="row-time">{shortAgo(s.updatedAt)}</span>}
+      </span>
     </>
   );
   return (
@@ -127,7 +228,7 @@ function SessionRow({ hostId, s, active, showDir }: { hostId: string; s: Session
             renameSession(hostId, s);
           }
         }}
-        title={`${s.title || tx('newSession')}\n${s.cwd}\n${s.tool === 'files' ? tx('files') : s.autoResume ? tx('usageLimitReachedContinuesAt', { v: clock(s.autoResume.at) }) : statusText(cls)}${s.mode === 'terminal' ? tx('terminalMode') : ''}${s.mode === 'terminal' && cls !== 'off' && cls !== 'err' ? tx('notStoppedAutomaticallyStopThe') : ''}`}
+        title={`${s.title || tx('newSession')}\n${s.cwd}\n${s.tool === 'files' ? tx('files') : s.autoResume ? tx('usageLimitReachedContinuesAt', { v: clock(s.autoResume.at) }) : statusText(cls)}${s.mode === 'terminal' ? tx('terminalMode') : ''}${s.mode === 'terminal' && cls !== 'off' && cls !== 'err' ? tx('notStoppedAutomaticallyStopThe') : ''}${sideTip ? `\n${sideTip}` : ''}`}
       >
         {wt ? (
           <>
@@ -256,6 +357,8 @@ function OldList({
   showDir,
   hostId,
   isActive,
+  sideByParent,
+  now,
 }: {
   k: string;
   old: SessionInfo[];
@@ -264,13 +367,15 @@ function OldList({
   showDir?: boolean;
   hostId: string;
   isActive: (s: SessionInfo) => boolean;
+  sideByParent: Map<string, SessionInfo[]>;
+  now: number;
 }) {
   if (old.length === 0) return null;
   const rows = open ? old : old.filter(isActive);
   return (
     <>
       {rows.map((s) => (
-        <SessionRow key={s.id} hostId={hostId} s={s} active={isActive(s)} showDir={showDir} />
+        <SessionRow key={s.id} hostId={hostId} s={s} active={isActive(s)} showDir={showDir} sides={sideByParent.get(s.id)} now={now} />
       ))}
       <button
         className="old-toggle"
@@ -317,13 +422,25 @@ function HostBlock({ h, filter }: { h: HostEntry; filter: string }) {
   const connected = h.status.status === 'connected';
 
   const q = filter.trim();
-  const { pinned, groups, flat, matched } = useMemo(() => {
+  const { pinned, groups, flat, matched, sideByParent } = useMemo(() => {
+    const sideByParent = new Map<string, SessionInfo[]>();
+    for (const s of sessions ?? []) {
+      if (!isSideChatSession(s)) continue;
+      let list = sideByParent.get(s.parentId!);
+      if (!list) sideByParent.set(s.parentId!, (list = []));
+      list.push(s);
+    }
     const all = (sessions ?? []).filter((s) => listed(s) && (!q || fuzzyScore(`${s.title} ${sessionProjectDir(s)} ${s.worktree?.branch ?? ''}`, q) >= 0));
     const pinned = all.filter((s) => s.pinned);
     const rest = all.filter((s) => !s.pinned);
-    // Only ended sessions idle past the threshold; never while searching
+    // Only ended sessions idle past the threshold; never while searching or while a side chat is active
     const staleMs = staleDays * 86400_000;
-    const isOld = (s: SessionInfo) => !q && staleMs > 0 && (s.status === 'exited' || s.status === 'error') && now - s.updatedAt > staleMs;
+    const isOld = (s: SessionInfo) =>
+      !q &&
+      staleMs > 0 &&
+      (s.status === 'exited' || s.status === 'error') &&
+      now - s.updatedAt > staleMs &&
+      summarizeActiveSides(sideByParent.get(s.id), now).cls === null;
     const split = (list: SessionInfo[]) => ({ recent: list.filter((s) => !isOld(s)), old: list.filter(isOld) });
     // Sessions arrive newest first, so directories with only old sessions naturally end up at the bottom
     const m = new Map<string, SessionInfo[]>();
@@ -333,13 +450,26 @@ function HostBlock({ h, filter }: { h: HostEntry; filter: string }) {
       m.get(dir)!.push(s);
     }
     const groups = [...m.entries()].map(([cwd, list]) => ({ cwd, list, ...split(list) }));
-    return { pinned, groups, flat: split(rest), matched: all.length };
+    return { pinned, groups, flat: split(rest), matched: all.length, sideByParent };
   }, [sessions, q, staleDays, now]);
 
+  const summarizeGroup = (list: SessionInfo[]): SideActiveKind | null => {
+    let best: SideActiveKind | null = null;
+    const pick = (k: SideActiveKind | null) => {
+      if (k && (!best || SIDE_PRIO[k] < SIDE_PRIO[best])) best = k;
+    };
+    for (const s of list) {
+      pick(sideActiveStatus(s, now));
+      pick(summarizeActiveSides(sideByParent.get(s.id), now).cls);
+      if (best === 'attn') return 'attn';
+    }
+    return best;
+  };
+
   const allFolded = groups.length > 0 && groups.every((g) => folded.includes(g.cwd));
-  const total = (sessions ?? []).filter(listed).length;
-  const hostCls = (sessions ?? []).filter(listed).map(sessionStatusClass);
-  const hostSum = hostCls.includes('attn') ? 'attn' : hostCls.includes('busy') ? 'busy' : null;
+  const hostSessions = (sessions ?? []).filter(listed);
+  const total = hostSessions.length;
+  const hostSum = summarizeGroup(hostSessions);
 
   const toggle = () => {
     lsSet(`collapse-${id}`, !collapsed);
@@ -380,7 +510,7 @@ function HostBlock({ h, filter }: { h: HostEntry; filter: string }) {
           {collapsed && !q && (
             <span className="project-count">
               {total}
-              {hostSum && <span className={`sdot sdot-${hostSum}`} />}
+              {hostSum && <GroupSummaryMark kind={hostSum} />}
             </span>
           )}
           <span className={`chev ${collapsed ? '' : 'open'}`}>
@@ -436,7 +566,7 @@ function HostBlock({ h, filter }: { h: HostEntry; filter: string }) {
             <div className="project">
               <div className="project-name">{tx('pinned')}</div>
               {pinned.map((s) => (
-                <SessionRow key={s.id} hostId={id} s={s} active={isActive(s)} showDir />
+                <SessionRow key={s.id} hostId={id} s={s} active={isActive(s)} showDir sides={sideByParent.get(s.id)} now={now} />
               ))}
             </div>
           )}
@@ -444,16 +574,15 @@ function HostBlock({ h, filter }: { h: HostEntry; filter: string }) {
             <div className="project">
               {pinned.length > 0 && flat.recent.length + flat.old.length > 0 && <div className="project-name">{tx('recent')}</div>}
               {flat.recent.map((s) => (
-                <SessionRow key={s.id} hostId={id} s={s} active={isActive(s)} showDir />
+                <SessionRow key={s.id} hostId={id} s={s} active={isActive(s)} showDir sides={sideByParent.get(s.id)} now={now} />
               ))}
-              <OldList k="" old={flat.old} open={showOld.includes('')} onToggle={toggleOld} showDir hostId={id} isActive={isActive} />
+              <OldList k="" old={flat.old} open={showOld.includes('')} onToggle={toggleOld} showDir hostId={id} isActive={isActive} sideByParent={sideByParent} now={now} />
             </div>
           ) : (
             groups.map(({ cwd, list, recent, old }) => {
               // Expand everything while searching; when collapsed, still show the currently open session
               const isFolded = !q && folded.includes(cwd);
-              const cls = list.map(sessionStatusClass);
-              const sum = cls.includes('attn') ? 'attn' : cls.includes('busy') ? 'busy' : null;
+              const sum = summarizeGroup(list);
               return (
                 <div className="project dir-group" key={cwd}>
                   <div className="project-head">
@@ -481,24 +610,19 @@ function HostBlock({ h, filter }: { h: HostEntry; filter: string }) {
                       {isFolded && (
                         <span className="project-count">
                           {list.length}
-                          {sum && (
-                            <span
-                              className={`sdot sdot-${sum}`}
-                              title={sum === 'attn' ? tx('sessionWaitingForApproval') : tx('sessionRunning')}
-                            />
-                          )}
+                          {sum && <GroupSummaryMark kind={sum} />}
                         </span>
                       )}
                     </button>
                   </div>
                   {isFolded ? (
-                    list.filter(isActive).map((s) => <SessionRow key={s.id} hostId={id} s={s} active />)
+                    list.filter(isActive).map((s) => <SessionRow key={s.id} hostId={id} s={s} active sides={sideByParent.get(s.id)} now={now} />)
                   ) : (
                     <>
                       {recent.map((s) => (
-                        <SessionRow key={s.id} hostId={id} s={s} active={isActive(s)} />
+                        <SessionRow key={s.id} hostId={id} s={s} active={isActive(s)} sides={sideByParent.get(s.id)} now={now} />
                       ))}
-                      <OldList k={cwd} old={old} open={showOld.includes(cwd)} onToggle={toggleOld} hostId={id} isActive={isActive} />
+                      <OldList k={cwd} old={old} open={showOld.includes(cwd)} onToggle={toggleOld} hostId={id} isActive={isActive} sideByParent={sideByParent} now={now} />
                     </>
                   )}
                 </div>
@@ -518,13 +642,13 @@ export function Sidebar() {
   const hosts = useStore((s) => s.hosts);
   const view = useStore((s) => s.view);
   const open = useStore((s) => s.sidebarOpen);
-  // Same rule as the overview's "Needs you" column: ordinary top-level host sessions
-  const attn = useStore((s) => {
-    const now = Date.now();
-    let n = 0;
-    for (const h of s.hosts) for (const x of s.sessions[h.config.id] ?? []) if (isHostSession(x) && needsAttention(x, now)) n++;
-    return n;
-  });
+  // Same rule as the overview's "Needs you" column: top-level host sessions plus valid side chats
+  const attn = useStore((s) =>
+    countAttentionSessions(
+      s.sessions,
+      s.hosts.map((h) => h.config.id),
+    ),
+  );
   const transport = useStore((s) => s.transport);
   const firstConnected = hosts.find((h) => h.status.status === 'connected')?.config.id;
   const [filter, setFilter] = useState('');

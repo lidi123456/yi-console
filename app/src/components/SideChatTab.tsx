@@ -373,12 +373,14 @@ export function SideChatPane({
   hostId,
   parentSessionId,
   sideSessionId,
+  visible = true,
   onOpenFile,
   onDeleted,
 }: {
   hostId: string;
   parentSessionId: string;
   sideSessionId: string;
+  visible?: boolean;
   onOpenFile?: (relPath: string, line?: number) => void;
   onDeleted: () => void;
 }) {
@@ -391,6 +393,7 @@ export function SideChatPane({
         hostId={hostId}
         reviewSessionId={sideSessionId}
         parentSessionId={parentSessionId}
+        visible={visible}
         onOpenFile={onOpenFile}
         onDeleted={onDeleted}
       />
@@ -402,6 +405,7 @@ export function SideChatPane({
       hostId={hostId}
       parentSessionId={parentSessionId}
       sideSessionId={sideSessionId}
+      visible={visible}
       onDeleted={onDeleted}
     />
   );
@@ -411,11 +415,13 @@ function RegularSideChatPane({
   hostId,
   parentSessionId,
   sideSessionId,
+  visible = true,
   onDeleted,
 }: {
   hostId: string;
   parentSessionId: string;
   sideSessionId: string;
+  visible?: boolean;
   onDeleted: () => void;
 }) {
   useLang();
@@ -429,7 +435,7 @@ function RegularSideChatPane({
     if (connected && hasInfo) loadSession(hostId, sideSessionId).catch(errorToast);
   }, [hostId, sideSessionId, connected, hasInfo, data.loaded]);
 
-  useEffect(() => (hasInfo ? registerVisibleChildSession(hostId, sideSessionId) : undefined), [hostId, sideSessionId, hasInfo]);
+  useEffect(() => (hasInfo && visible ? registerVisibleChildSession(hostId, sideSessionId) : undefined), [hostId, sideSessionId, hasInfo, visible]);
 
   const pending = useMemo(() => {
     const open = new Map<string, any>();

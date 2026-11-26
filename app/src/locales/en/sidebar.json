@@ -51,6 +51,8 @@
   "newSessionIn": "New session in {{v}}",
   "sessionWaitingForApproval": "Session waiting for approval",
   "sessionRunning": "Session running",
+  "sessionError": "Session exited with an error",
+  "sessionWaitingLimit": "Session waiting for usage limit reset",
   "noSessionsYetClickTo": "No sessions yet. Click + to create one or resume from history.",
   "dragToResizeDoubleClick": "Drag to resize, double-click to reset",
   "connectToAHostFirst": "Connect to a host first",
@@ -65,5 +67,9 @@
   "hosts": "Hosts",
   "preferencesAppearanceLanguageNotificationsProxy": "Preferences (Appearance, Language, Notifications, Proxy)",
   "sessionsNeedYou": "Sessions waiting for you: {{n}}",
-  "worktreeTempBranch": "{{branch}} · temp"
+  "worktreeTempBranch": "{{branch}} · temp",
+  "sideChatTooltipLine": "Side chat: {{title}} ({{status}})",
+  "reviewSideTooltipLine": "AI review: {{title}} ({{status}})",
+  "sideChatWaitingLimit": "usage limit reached, continues at {{v}}",
+  "sideChatRestartInterrupted": "cut off by restart"
 }

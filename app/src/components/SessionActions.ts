@@ -18,6 +18,7 @@ export const OPEN_CHANGES = 'yi-console:open-changes';
  *  The event alone isn't enough: a panel that was closed mounts only after the event fired, so it takes the request here */
 const pendingChanges = new Set<string>();
 const pendingTurns = new Map<string, number>();
+const pendingChangesCwd = new Map<string, string>();
 export const takeOpenChanges = (hostId: string, sessionId: string) => pendingChanges.delete(skey(hostId, sessionId));
 export const takeOpenTurn = (hostId: string, sessionId: string): number | null => {
   const k = skey(hostId, sessionId);
@@ -25,18 +26,28 @@ export const takeOpenTurn = (hostId: string, sessionId: string): number | null =
   pendingTurns.delete(k);
   return t ?? null;
 };
+export const takeOpenChangesCwd = (hostId: string, sessionId: string): string | null => {
+  const k = skey(hostId, sessionId);
+  const cwd = pendingChangesCwd.get(k);
+  pendingChangesCwd.delete(k);
+  return cwd ?? null;
+};
 
-/** View changes: go to the session page and open the "Changes" view of the file panel on the right */
-export function showChanges(hostId: string, targetId: string) {
+/** View changes: go to the session page and open the "Changes" view of the file panel on the right.
+ *  When `cwd` is given (e.g. from Overview's ProjectPanel or a side chat card), treat it as a one-shot navigation
+ *  override instead of persisting it onto the parent session's file-panel directory preference. */
+export function showChanges(hostId: string, targetId: string, cwd?: string) {
   const sessionId = panelSessionId(hostId, targetId);
   const k = skey(hostId, sessionId);
   lsSet(`file-panel-${k}`, true);
   lsSet(`wp-tree-${k}`, true);
   lsSet(`wp-view-${k}`, 'changes');
+  if (cwd) pendingChangesCwd.set(k, cwd);
+  else pendingChangesCwd.delete(k);
   pendingChanges.add(k);
   pendingTurns.delete(k);
   navigate({ kind: 'session', hostId, sessionId });
-  setTimeout(() => window.dispatchEvent(new CustomEvent(OPEN_CHANGES, { detail: { hostId, sessionId } })), 0);
+  setTimeout(() => window.dispatchEvent(new CustomEvent(OPEN_CHANGES, { detail: { hostId, sessionId, cwd } })), 0);
 }
 
 /** Open the file panel on the "Changes" view scoped to a specific completed turn's checkpoint diff */
@@ -566,5 +577,22 @@ export function sessionMenu(
       ? [{ label: tx('reload'), icon: 'refresh', run: () => loadSession(hostId, sid, true).catch(errorToast) }]
       : []),
     { label: tx('deleteSession2'), icon: 'trash', danger: true, run: () => deleteSession(hostId, info) },
+  ];
+}
+
+/** Context menu for a side chat / AI review card on the Overview page */
+export function sideSessionMenu(hostId: string, side: SessionInfo, parent: SessionInfo): (MenuItem | '-')[] {
+  const alive = side.status !== 'exited' && side.status !== 'error';
+  return [
+    { label: tx('openSideChat'), icon: side.review ? 'sparkles' : 'sideChat', run: () => navigate({ kind: 'session', hostId, sessionId: side.id }) },
+    { label: tx('openParentSession'), icon: 'chat', run: () => navigate({ kind: 'session', hostId, sessionId: parent.id }) },
+    { label: tx('rename'), icon: 'edit', run: () => renameSession(hostId, side) },
+    '-',
+    { label: tx('copyAsMarkdown'), icon: 'copy', run: () => exportSession(hostId, side, 'copy') },
+    { label: tx('exportMarkdownFile'), icon: 'download', run: () => exportSession(hostId, side, 'download') },
+    ...idItems(side),
+    '-',
+    ...(alive ? [{ label: tx('stopProcess'), icon: 'power', run: () => call(hostId, side.id, 'session.kill', {}, tx('stopped')) }] : []),
+    { label: tx('deleteSideChat'), icon: 'trash', danger: true, run: () => deleteSession(hostId, side) },
   ];
 }

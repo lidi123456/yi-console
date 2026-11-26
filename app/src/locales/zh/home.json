@@ -111,5 +111,8 @@
   "rejected": "已拒绝：{{v}}",
   "draftSavedTextOnly": "已存为草稿（只存文字，图片和文件没有存）",
   "viewSessions": "按会话",
-  "viewBots": "按 Bot"
+  "viewBots": "按 Bot",
+  "sideChatBadge": "旁路",
+  "reviewBadge": "AI 审阅",
+  "reviewTagShort": "审阅"
 }

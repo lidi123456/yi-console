@@ -51,6 +51,8 @@
   "newSessionIn": "在 {{v}} 新建会话",
   "sessionWaitingForApproval": "有会话等待审批",
   "sessionRunning": "有会话在运行",
+  "sessionError": "有会话出错",
+  "sessionWaitingLimit": "有会话等待额度恢复",
   "noSessionsYetClickTo": "还没有会话，点 + 新建，或从历史里继续",
   "dragToResizeDoubleClick": "拖动调整宽度，双击还原",
   "connectToAHostFirst": "先连上一台主机",
@@ -65,5 +67,9 @@
   "hosts": "主机管理",
   "preferencesAppearanceLanguageNotificationsProxy": "系统设置（外观、语言、通知、网络代理）",
   "sessionsNeedYou": "{{n}} 个会话需要你处理",
-  "worktreeTempBranch": "{{branch}} · 临时分支"
+  "worktreeTempBranch": "{{branch}} · 临时分支",
+  "sideChatTooltipLine": "旁路：{{title}}（{{status}}）",
+  "reviewSideTooltipLine": "AI 审阅：{{title}}（{{status}}）",
+  "sideChatWaitingLimit": "额度用尽，{{v}} 自动继续",
+  "sideChatRestartInterrupted": "重启中断"
 }

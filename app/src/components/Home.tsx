@@ -1,16 +1,17 @@
 import { memo, useMemo, useState } from 'react';
 import { getT, useLang } from '../i18n';
-import { markSeen, needsAttention, projKey, relPath, unseenTurn, useNow, useSeenVersion } from '../overview';
+import { findSideChatParent, markSeen, needsAttention, projKey, relPath, unseenTurn, useNow, useSeenVersion } from '../overview';
 import { permLabel } from '../perm';
+import { sideChatTitle } from '../sideChat';
 import { errorToast, navigate, openNewSession, useStore } from '../store';
 import { rpc } from '../transport';
 import type { HostEntry } from '../store';
-import { isHostSession, type SessionInfo } from '../types';
+import { isHostSession, sessionProjectDir, type SessionInfo } from '../types';
 import { basename, fmtTokens, lsGet, lsSet, shortPath, timeAgo } from '../util';
 import { Icon, ToolBadge } from './Icon';
 import { FeedPanel, ProjectPanel, QuickStart, QuotaDialog, WeekPanel } from './OverviewPanels';
 import { openMenu } from './Overlay';
-import { sessionMenu, showChanges } from './SessionActions';
+import { sessionMenu, showChanges, sideSessionMenu } from './SessionActions';
 import { BotBoard } from './BotBoard';
 import { useBots } from '../bots';
 
@@ -22,6 +23,8 @@ export interface Item {
   hostName: string;
   home?: string;
   s: SessionInfo;
+  /** Present when `s` is a hidden side chat / AI review child session */
+  parent?: SessionInfo;
 }
 
 type Col = 'attn' | 'run' | 'review' | 'rest';
@@ -29,15 +32,16 @@ const COLS: Col[] = ['attn', 'run', 'review', 'rest'];
 /** Compact rows shown in the last column before "Show all" */
 const REST_SHOWN = 6;
 
-function colOf(x: Item): Col {
+function colOf(x: Item): Col | null {
   const s = x.s;
-  if (s.tool === 'files') return 'rest';
+  if (s.tool === 'files') return x.parent ? null : 'rest';
   if (needsAttention(s)) return 'attn';
   // Terminal sessions stay "running" as long as their process lives, so they don't get a column of their own
-  if (s.mode !== 'structured') return 'rest';
+  if (s.mode !== 'structured') return x.parent ? null : 'rest';
   if (s.status === 'running' || s.status === 'starting' || s.autoResume) return 'run';
   if (unseenTurn(x.hostId, s)) return 'review';
-  return 'rest';
+  // Idle / already-seen side chats stay out of the "Other" column
+  return x.parent ? null : 'rest';
 }
 
 const open = (x: Item) => navigate({ kind: 'session', hostId: x.hostId, sessionId: x.s.id });
@@ -115,20 +119,38 @@ async function interrupted(x: Item, action: 'continue' | 'dismiss') {
 /** Card shell: the whole card opens the session; buttons inside stop the click */
 function Card({ x, edge, children, multi }: { x: Item; edge: string; children: React.ReactNode; multi: boolean }) {
   const s = x.s;
+  const title = x.parent ? sideChatTitle(s) : s.title || t('newSession');
+  const parentTitle = x.parent ? x.parent.title || t('newSession') : '';
   return (
     <div
-      className={`ov-card ov-e-${edge}`}
+      className={`ov-card ov-e-${edge}${x.parent ? ' ov-card-side' : ''}`}
       role="button"
       tabIndex={0}
       onClick={() => open(x)}
-      onContextMenu={(e) => openMenu(e, sessionMenu(x.hostId, s))}
+      onContextMenu={(e) => openMenu(e, x.parent ? sideSessionMenu(x.hostId, s, x.parent) : sessionMenu(x.hostId, s))}
       onKeyDown={(e) => e.key === 'Enter' && e.target === e.currentTarget && open(x)}
     >
       <div className="ov-card-top">
         <ToolBadge tool={s.tool} size={22} />
         <div className="min0 grow">
-          <div className="ov-card-title">{s.title || t('newSession')}</div>
+          <div className="ov-card-title">
+            {x.parent && (
+              <span className={`ov-side-tag${s.review ? ' is-review' : ''}`}>
+                <Icon name={s.review ? 'sparkles' : 'sideChat'} size={10} />
+                {s.review ? t('reviewBadge') : t('sideChatBadge')}
+              </span>
+            )}
+            {title}
+          </div>
           <div className="ov-meta">
+            {x.parent && (
+              <>
+                <span className="ov-parent-ref truncate" title={parentTitle}>
+                  ← {parentTitle}
+                </span>
+                <span className="ov-sep">·</span>
+              </>
+            )}
             {multi && (
               <>
                 <span className="truncate">{x.hostName}</span>
@@ -155,8 +177,9 @@ const AttnCard = memo(function AttnCard({ x, multi }: { x: Item; multi: boolean 
   const err = s.status === 'error' && !s.pendingPermissions && !s.restartInterrupted;
   const allow = p?.options?.find((o) => o.kind === 'allow_once') ?? p?.options?.find((o) => o.kind.startsWith('allow'));
   const reject = p?.options?.find((o) => o.kind === 'reject_once') ?? p?.options?.find((o) => o.kind.startsWith('reject'));
-  // Answer from the card only when this is the only request and a plain approval
-  const inline = p && !p.question && s.pendingPermissions === 1 && allow && reject ? { p, allow, reject } : null;
+  // Answer from the card only when this is the only request, a plain approval, and not a read-only AI review side chat
+  // (AI review approvals must open in the review pane so full arguments and original option labels are visible)
+  const inline = !s.review && p && !p.question && s.pendingPermissions === 1 && allow && reject ? { p, allow, reject } : null;
   const more = Math.max(0, s.pendingPermissions - 1);
   return (
     <Card x={x} edge={err ? 'err' : 'attn'} multi={multi}>
@@ -281,7 +304,7 @@ const ReviewCard = memo(function ReviewCard({ x, multi }: { x: Item; multi: bool
   const s = x.s;
   const turn = s.turn!;
   const files = turn.filesChanged ?? 0;
-  const read = () => markSeen([{ hostId: x.hostId, sessionId: s.id }]);
+  const read = () => markSeen([{ hostId: x.hostId, sessionId: s.id, endedAt: turn.endedAt }]);
   return (
     <Card x={x} edge="ok" multi={multi}>
       {turn.rejected && (
@@ -303,7 +326,7 @@ const ReviewCard = memo(function ReviewCard({ x, multi }: { x: Item; multi: bool
           {t('markRead')}
         </button>
         {files > 0 ? (
-          <button className="btn small primary" onClick={() => showChanges(x.hostId, s.id)}>
+          <button className="btn small primary" onClick={() => showChanges(x.hostId, x.parent ? x.parent.id : s.id, x.parent ? s.cwd : undefined)}>
             {t('viewChanges')}
           </button>
         ) : (
@@ -352,7 +375,7 @@ function Column({
         {colTitle(col)}
         <span className="ov-n">{items.length}</span>
         {col === 'review' && items.length > 0 && (
-          <button className="ov-col-act" onClick={() => markSeen(items.map((x) => ({ hostId: x.hostId, sessionId: x.s.id })))}>
+          <button className="ov-col-act" onClick={() => markSeen(items.map((x) => ({ hostId: x.hostId, sessionId: x.s.id, endedAt: x.s.turn?.endedAt })))}>
             {t('markAllRead')}
           </button>
         )}
@@ -430,26 +453,41 @@ export function Home() {
     lsSet('yi-console-ov-bots', v);
   };
 
-  const all = useMemo(() => {
-    const out: Item[] = [];
+  const { hostItems, all } = useMemo(() => {
+    const hostItems: Item[] = [];
+    const all: Item[] = [];
     for (const h of hosts) {
       const home = h.status.hello?.home;
-      for (const s of sessions[h.config.id] ?? []) if (isHostSession(s)) out.push({ hostId: h.config.id, hostName: h.config.name, home, s });
+      const list = sessions[h.config.id] ?? [];
+      for (const s of list) {
+        if (isHostSession(s)) {
+          const item: Item = { hostId: h.config.id, hostName: h.config.name, home, s };
+          hostItems.push(item);
+          all.push(item);
+          continue;
+        }
+        const parent = findSideChatParent(list, s);
+        if (parent) {
+          all.push({ hostId: h.config.id, hostName: h.config.name, home, s, parent });
+        }
+      }
     }
-    return out;
+    return { hostItems, all };
   }, [hosts, sessions]);
 
   const counts = useMemo(() => {
     const c: Record<string, number> = {};
-    for (const x of all) c[x.hostId] = (c[x.hostId] ?? 0) + 1;
+    for (const x of hostItems) c[x.hostId] = (c[x.hostId] ?? 0) + 1;
     return c;
-  }, [all]);
+  }, [hostItems]);
 
   const cols = useMemo(() => {
     const by: Record<Col, Item[]> = { attn: [], run: [], review: [], rest: [] };
     for (const x of all) {
-      if (filter && projKey(x.hostId, x.s.cwd) !== filter) continue;
-      by[colOf(x)].push(x);
+      const dir = sessionProjectDir(x.parent ?? x.s);
+      if (filter && projKey(x.hostId, dir) !== filter) continue;
+      const c = colOf(x);
+      if (c) by[c].push(x);
     }
     // Oldest request first: it has waited longest. The rest newest first (the list arrives sorted that way)
     by.attn.sort((a, b) => (a.s.pending?.at ?? a.s.updatedAt) - (b.s.pending?.at ?? b.s.updatedAt));
@@ -468,10 +506,11 @@ export function Home() {
   const shownTab = tab ?? COLS.find((c) => cols[c].length > 0) ?? 'attn';
   const filterName = useMemo(() => {
     if (!filter) return '';
-    const x = all.find((i) => projKey(i.hostId, i.s.cwd) === filter);
-    return x ? (multi ? `${basename(x.s.cwd)} · ${x.hostName}` : basename(x.s.cwd)) : '';
+    const x = hostItems.find((i) => projKey(i.hostId, sessionProjectDir(i.s)) === filter);
+    const dir = x ? sessionProjectDir(x.s) : '';
+    return x ? (multi ? `${basename(dir)} · ${x.hostName}` : basename(dir)) : '';
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [filter, all, multi, lang]);
+  }, [filter, hostItems, multi, lang]);
 
   return (
     <>
@@ -548,9 +587,9 @@ export function Home() {
       </>
       )}
 
-      {all.length > 0 && (
+      {hostItems.length > 0 && (
         <div className="ov-lower">
-          <ProjectPanel items={all} filter={filter} setFilter={setFilter} multi={multi} />
+          <ProjectPanel items={hostItems} filter={filter} setFilter={setFilter} multi={multi} />
           <div className="ov-lower-r">
             <FeedPanel items={all} now={now} />
             <WeekPanel hosts={connected} />

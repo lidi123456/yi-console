@@ -1634,12 +1634,14 @@ export function ReviewSidePane({
   hostId,
   reviewSessionId,
   parentSessionId,
+  visible = true,
   onOpenFile,
   onDeleted,
 }: {
   hostId: string;
   reviewSessionId: string;
   parentSessionId: string;
+  visible?: boolean;
   onOpenFile?: (relPath: string, line?: number) => void;
   onDeleted?: () => void;
 }) {
@@ -1666,7 +1668,7 @@ export function ReviewSidePane({
     setActiveReviewId(hostId, parentSessionId, reviewSessionId);
   }, [hostId, parentSessionId, reviewSessionId]);
 
-  useEffect(() => registerVisibleChildSession(hostId, reviewSessionId), [hostId, reviewSessionId]);
+  useEffect(() => (visible ? registerVisibleChildSession(hostId, reviewSessionId) : undefined), [hostId, reviewSessionId, visible]);
 
   const busy = info?.status === 'running' || info?.status === 'starting';
   const tool: ToolKind = inMemMeta?.tool ?? info?.tool ?? 'claude';

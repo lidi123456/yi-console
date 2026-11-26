@@ -77,5 +77,8 @@
   "revokeReadAccessMessage": "撤销后，这个会话的 AI 不能再读取「{{title}}」。之前已经读到的内容不会从它的上下文里消失。",
   "revoke": "撤销",
   "readAccessRevoked": "已撤销读取权限",
-  "readAccessStillInherited": "已撤销这个会话自己的授权，但主会话也授权过这个会话，所以仍然可以读取。要完全撤销，请在主会话里撤销。"
+  "readAccessStillInherited": "已撤销这个会话自己的授权，但主会话也授权过这个会话，所以仍然可以读取。要完全撤销，请在主会话里撤销。",
+  "openSideChat": "打开旁路",
+  "openParentSession": "打开主会话",
+  "deleteSideChat": "删除旁路对话"
 }

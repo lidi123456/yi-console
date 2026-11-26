@@ -7,9 +7,9 @@ import { useSyncExternalStore } from 'react';
 import { getLang, getT, onLangChange, trErr } from './i18n';
 import { fmtAt } from './limit';
 import { hubCall, onHubEvent, rpc, isTauri } from './transport';
-import { markSeen, recordChange } from './overview';
+import { markSeen, recordChange, seedSideChatBaseline, unseenTurn } from './overview';
 import { dropRemoteHost, findBot, mapHost, refreshBots, refreshRemote, refreshRemoteHost, remoteKey, sourceOf } from './bots';
-import { isHostSession, type AccountLoginUpdate, type ClientSettings, type HostConfig, type HostStatus, type HubEvent, type NotifyPrefs, type SessionInfo, type Snippet, type ToolInfo, type ToolJob, type ToolKind, type UserMessageSummary } from './types';
+import { isHostSession, isSideChatSession, type AccountLoginUpdate, type ClientSettings, type HostConfig, type HostStatus, type HubEvent, type NotifyPrefs, type SessionInfo, type Snippet, type ToolInfo, type ToolJob, type ToolKind, type UserMessageSummary } from './types';
 
 const t = getT('store');
 
@@ -520,8 +520,16 @@ function reportLang(hostId: string) {
 export async function refreshSessions(hostId: string) {
   try {
     const list = await rpc<SessionInfo[]>(hostId, 'session.list');
+    seedSideChatBaseline(hostId, list);
     const before = new Map((state.sessions[hostId] ?? []).map((x) => [x.id, x]));
-    for (const x of list) recordChange(hostId, before.get(x.id), x);
+    const seenNow: { hostId: string; sessionId: string; endedAt: number }[] = [];
+    for (const x of list) {
+      recordChange(hostId, before.get(x.id), x, list);
+      if (isSideChatSession(x) && isChildSessionVisible(hostId, x.id) && x.turn?.endedAt && unseenTurn(hostId, x)) {
+        seenNow.push({ hostId, sessionId: x.id, endedAt: x.turn.endedAt });
+      }
+    }
+    if (seenNow.length) markSeen(seenNow);
     setState((s) => ({ sessions: { ...s.sessions, [hostId]: list } }));
   } catch {
     /* host not connected */
@@ -529,7 +537,11 @@ export async function refreshSessions(hostId: string) {
 }
 
 function upsertSession(hostId: string, info: SessionInfo) {
-  recordChange(hostId, state.sessions[hostId]?.find((x) => x.id === info.id), info);
+  const curList = state.sessions[hostId] ?? [];
+  recordChange(hostId, curList.find((x) => x.id === info.id), info, curList);
+  if (isSideChatSession(info) && isChildSessionVisible(hostId, info.id) && info.turn?.endedAt && unseenTurn(hostId, info)) {
+    markSeen([{ hostId, sessionId: info.id, endedAt: info.turn.endedAt }]);
+  }
   setState((s) => {
     const list = [...(s.sessions[hostId] ?? [])];
     const i = list.findIndex((x) => x.id === info.id);
@@ -768,6 +780,10 @@ const visibleChildSessions = new Map<string, number>();
 export function registerVisibleChildSession(hostId: string, childSessionId: string): () => void {
   const k = skey(hostId, childSessionId);
   visibleChildSessions.set(k, (visibleChildSessions.get(k) ?? 0) + 1);
+  const info = sessionInfo(hostId, childSessionId);
+  if (info?.turn?.endedAt) {
+    markSeen([{ hostId, sessionId: childSessionId, endedAt: info.turn.endedAt }]);
+  }
   return () => {
     const n = (visibleChildSessions.get(k) ?? 0) - 1;
     if (n > 0) visibleChildSessions.set(k, n);
@@ -955,7 +971,14 @@ export function replaceView(view: View) {
 
 function show(view: View) {
   // A turn that ended while its session was open, or that the user opens now, has been seen (overview board)
-  markSeen([state.view, view].flatMap((v) => (v.kind === 'session' ? [{ hostId: v.hostId, sessionId: v.sessionId }] : [])));
+  markSeen(
+    [state.view, view].flatMap((v) => {
+      if (v.kind !== 'session') return [];
+      const info = sessionInfo(v.hostId, v.sessionId);
+      if (info) return info.turn?.endedAt ? [{ hostId: v.hostId, sessionId: v.sessionId, endedAt: info.turn.endedAt }] : [];
+      return [{ hostId: v.hostId, sessionId: v.sessionId }];
+    }),
+  );
   setState({ view, sidebarOpen: false, palette: false });
   try {
     const { seq: _seq, ...keep } = view as View & { seq?: number };

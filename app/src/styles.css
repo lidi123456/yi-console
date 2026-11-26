@@ -7150,7 +7150,25 @@ body.resizing .side-resizer::after {
   display: inline-flex;
   align-items: center;
   justify-content: flex-end;
+  gap: 5px;
   min-width: 14px;
+}
+
+/* Side chat active dot in the parent row's status slot: crisp halo matching the top-bar side dot */
+.sdot-side.sdot-busy {
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--unread) 24%, transparent);
+}
+
+.sdot-side.sdot-attn {
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--warn) 26%, transparent);
+}
+
+.sdot-side.sdot-err {
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--err) 24%, transparent);
+}
+
+.session-row .pill-side {
+  box-shadow: 0 0 0 1.5px var(--shell-bg);
 }
 
 .row-time {
@@ -12339,6 +12357,30 @@ button.wp-commit-title .chev {
   word-break: break-word;
 }
 
+.ov-side-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 0 5px;
+  margin-right: 5px;
+  border-radius: 5px;
+  font-size: 10.5px;
+  font-weight: 600;
+  line-height: 17px;
+  vertical-align: 1px;
+  background: color-mix(in srgb, var(--link) 12%, transparent);
+  color: var(--link);
+}
+
+.ov-side-tag.is-review {
+  background: color-mix(in srgb, var(--c-cursor) 14%, transparent);
+  color: color-mix(in srgb, var(--c-cursor) 88%, var(--text));
+}
+
+.ov-parent-ref {
+  color: var(--text-2);
+}
+
 .ov-meta {
   display: flex;
   align-items: center;
@@ -12692,6 +12734,24 @@ button.wp-commit-title .chev {
 
 .ov-feed li:hover {
   background: var(--bg-2);
+}
+
+.ov-feed-tag {
+  display: inline-block;
+  padding: 0 4px;
+  margin-right: 5px;
+  border-radius: 4px;
+  font-size: 10.5px;
+  font-weight: 600;
+  line-height: 16px;
+  vertical-align: 1px;
+  background: color-mix(in srgb, var(--link) 12%, transparent);
+  color: var(--link);
+}
+
+.ov-feed-tag.is-review {
+  background: color-mix(in srgb, var(--c-cursor) 14%, transparent);
+  color: color-mix(in srgb, var(--c-cursor) 88%, var(--text));
 }
 
 .ov-feed-title {

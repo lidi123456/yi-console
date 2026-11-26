@@ -114,5 +114,8 @@
   "rejected": "Rejected: {{v}}",
   "draftSavedTextOnly": "Saved as a draft (text only; images and files were not kept)",
   "viewSessions": "Sessions",
-  "viewBots": "Bots"
+  "viewBots": "Bots",
+  "sideChatBadge": "Side",
+  "reviewBadge": "AI Review",
+  "reviewTagShort": "Review"
 }

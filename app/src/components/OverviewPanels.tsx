@@ -9,6 +9,7 @@ import { addDraft, projKey, removeDraft, useDrafts, useFeed, usePageVisible, typ
 import { permLabel, permModes } from '../perm';
 import { errorToast, navigate, openNewSession, toast, useStore, type HostEntry } from '../store';
 import { setComposerText } from '../composerState';
+import { sideChatTitle } from '../sideChat';
 import { rpc } from '../transport';
 import { isHostSession, sessionProjectDir, TOOL_LABEL, type GitStatus, type SessionInfo, type ToolKind, type Usage } from '../types';
 import { basename, clock, fmtTokens, isMobile, lsGet, lsSet, shortPath, timeAgo } from '../util';
@@ -555,6 +556,8 @@ interface Project {
   lastEnd: number;
   /** Most recently updated session there (opens "Changes") */
   latest: Item;
+  /** Most recently updated session directly in `cwd` (non-worktree), if any */
+  direct?: Item;
 }
 
 const gitCache = new Map<string, { at: number; lastEnd: number; v: GitStatus | null }>();
@@ -575,16 +578,20 @@ export function ProjectPanel({
   const projects = useMemo(() => {
     const by = new Map<string, Project>();
     for (const x of items) {
-      const key = projKey(x.hostId, x.s.cwd);
+      const dir = sessionProjectDir(x.s);
+      const key = projKey(x.hostId, dir);
       let p = by.get(key);
       if (!p) {
-        p = { key, hostId: x.hostId, hostName: x.hostName, home: x.home, cwd: x.s.cwd, tools: [], last: 0, lastEnd: 0, latest: x };
+        p = { key, hostId: x.hostId, hostName: x.hostName, home: x.home, cwd: dir, tools: [], last: 0, lastEnd: 0, latest: x };
         by.set(key, p);
       }
       if (!p.tools.includes(x.s.tool)) p.tools.push(x.s.tool);
       if (x.s.updatedAt > p.last) {
         p.last = x.s.updatedAt;
         p.latest = x;
+      }
+      if (x.s.cwd === dir && (!p.direct || x.s.updatedAt > p.direct.s.updatedAt)) {
+        p.direct = x;
       }
       p.lastEnd = Math.max(p.lastEnd, x.s.turn?.endedAt ?? 0);
     }
@@ -664,7 +671,7 @@ export function ProjectPanel({
             </div>
             <div className="ov-proj-acts" onClick={(e) => e.stopPropagation()}>
               {!!g?.v?.changed && (
-                <button className="btn small" onClick={() => showChanges(p.hostId, p.latest.s.id)}>
+                <button className="btn small" onClick={() => showChanges(p.hostId, (p.direct ?? p.latest).s.id, p.cwd)}>
                   {t('changes')}
                 </button>
               )}
@@ -727,13 +734,27 @@ export function FeedPanel({ items }: { items: Item[]; now: number }) {
           {list.map((f) => {
             const x = byKey.get(`${f.hostId}::${f.sessionId}`)!;
             const [cls, icon] = FEED_ICON[f.kind];
+            const title = x.parent ? sideChatTitle(x.s) : x.s.title || t('newSession');
+            const parentTitle = x.parent ? x.parent.title || t('newSession') : undefined;
             return (
-              <li key={f.id} role="button" tabIndex={0} onClick={() => navigate({ kind: 'session', hostId: f.hostId, sessionId: f.sessionId })}>
+              <li
+                key={f.id}
+                role="button"
+                tabIndex={0}
+                title={parentTitle ? `← ${parentTitle}` : undefined}
+                onClick={() => navigate({ kind: 'session', hostId: f.hostId, sessionId: f.sessionId })}
+                onKeyDown={(e) => e.key === 'Enter' && navigate({ kind: 'session', hostId: f.hostId, sessionId: f.sessionId })}
+              >
                 <span className={`ov-ic ${cls}`}>
                   <Icon name={icon} size={11} />
                 </span>
                 <span className="min0">
-                  <b className="ov-feed-title">{x.s.title || t('newSession')}</b> <span className="ov-feed-s">{feedText(f)}</span>
+                  {x.parent && (
+                    <span className={`ov-feed-tag${x.s.review ? ' is-review' : ''}`}>
+                      {x.s.review ? t('reviewTagShort') : t('sideChatBadge')}
+                    </span>
+                  )}
+                  <b className="ov-feed-title">{title}</b> <span className="ov-feed-s">{feedText(f)}</span>
                 </span>
                 <span className="ov-feed-w">{timeAgo(f.at)}</span>
               </li>

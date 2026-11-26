@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { useBack } from '../back';
 import { getT, trErr, useLang } from '../i18n';
+import { usePageVisible } from '../overview';
 import { errorToast, getState, hostStatus, loadSession, navigate, openNewSession, skey, toast, useSessionData, useSessionDiffEvents, useStore } from '../store';
 import { isTauri, rpc } from '../transport';
 import {
@@ -4393,8 +4394,33 @@ export function FilePanel({
     if (first) void openFileRef.current(first.path, true);
   }, [diffScope, activeTurnCkpt, turnDiff]);
   const showTree = treeOpen || !file;
+  const pageVisible = usePageVisible();
+  const [narrowViewport, setNarrowViewport] = useState(() =>
+    typeof window !== 'undefined' && typeof window.matchMedia === 'function'
+      ? window.matchMedia('(max-width: 760px)').matches
+      : false,
+  );
+  useEffect(() => {
+    if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return;
+    const mq = window.matchMedia('(max-width: 760px)');
+    const onChange = () => setNarrowViewport(mq.matches);
+    onChange();
+    mq.addEventListener('change', onChange);
+    return () => mq.removeEventListener('change', onChange);
+  }, []);
+  const pendingReviewOpenRef = useRef<{ reviewSid: string; relPath: string; line?: number; targetCwd: string } | null>(null);
+  const openReviewFileRef = useRef<(reviewSid: string, relPath: string, line?: number) => void>(() => {});
+  useEffect(() => {
+    const req = pendingReviewOpenRef.current;
+    if (!req || norm(cwd) !== norm(req.targetCwd)) return;
+    const cachedGit = gitCache.get(gitKey(hostId, cwd))?.git ?? null;
+    const matchesCwd = (g: GitInfo | null) => !!g && (norm(cwd) === norm(g.repo) || norm(cwd).startsWith(norm(g.repo) + '/'));
+    if (!matchesCwd(git) && !matchesCwd(cachedGit) && (gitLoading || gitInFlightRef.current !== null)) return;
+    pendingReviewOpenRef.current = null;
+    openReviewFileRef.current(req.reviewSid, req.relPath, req.line);
+  }, [hostId, cwd, git, gitLoading]);
   // On mobile, after opening a file from the tree, back returns to the tree first; pressing again closes the whole file panel
-  useBack(visible && !!file && !treeOpen && window.matchMedia('(max-width: 760px)').matches, () => setTreeOpen(true));
+  useBack(visible && !!file && !treeOpen && narrowViewport, () => setTreeOpen(true));
   useBack(visible && quick !== null, () => setQuick(null));
   const fileDiff = file ? diffOf(file.path) : null;
   const fileSessionDiffs = file ? sessionDiffsOf(file.path) : [];
@@ -5398,7 +5424,15 @@ export function FilePanel({
 
   const openReviewFile = (reviewSid: string, relPath: string, line?: number) => {
     const cleanRel = relPath.replace(/\\/g, '/').replace(/^\.\//, '');
-    const rmeta = resolveReviewMeta(hostSessions.find((x) => x.id === reviewSid), getReviewMeta(reviewSid));
+    const reviewInfo = hostSessions.find((x) => x.id === reviewSid);
+    const inMem = getReviewMeta(reviewSid);
+    const rmeta = resolveReviewMeta(reviewInfo, inMem);
+    const reviewCwd = reviewInfo?.cwd || inMem?.cwd;
+    if (reviewCwd && norm(reviewCwd) !== norm(cwd) && onSwitchCwd) {
+      pendingReviewOpenRef.current = { reviewSid, relPath: cleanRel, line, targetCwd: reviewCwd };
+      onSwitchCwd(reviewCwd);
+      return;
+    }
     if (rmeta?.scope === 'commits' && rmeta.commits?.length === 1) {
       void openFile(commitTab(rmeta.commits[0], cleanRel), true, line ? { line } : undefined);
       return;
@@ -5413,9 +5447,18 @@ export function FilePanel({
       setBranchBase(rmeta.base);
       setDiffScope('branch');
     }
-    const abs = git ? join(git.repo, cleanRel.split('/').join(sepOf(git.repo))) : relOpen(cleanRel);
+    const cachedGit = gitCache.get(gitKey(hostId, cwd))?.git ?? null;
+    const matchesCwd = (g: GitInfo | null) => !!g && (norm(cwd) === norm(g.repo) || norm(cwd).startsWith(norm(g.repo) + '/'));
+    const effGit = matchesCwd(git) ? git : matchesCwd(cachedGit) ? cachedGit : null;
+    const baseRoot = reviewCwd && norm(reviewCwd) !== norm(cwd) ? reviewCwd : effGit ? effGit.repo : reviewCwd || root || cwd;
+    const abs = baseRoot ? join(baseRoot, cleanRel.split('/').join(sepOf(baseRoot))) : relOpen(cleanRel);
     void openFile(abs, true, line ? { line } : undefined);
   };
+  openReviewFileRef.current = openReviewFile;
+
+  // Side chat / review content is actually visible only when the panel is open, the page is foregrounded,
+  // and the mobile file tree overlay isn't covering the editor column.
+  const sidePaneVisible = visible && pageVisible && !(narrowViewport && showTree);
 
   // Content of the editor column: file / changes / compare / review / side chat
   const mainView = !file ? null : file.side ? (
@@ -5424,6 +5467,7 @@ export function FilePanel({
       hostId={hostId}
       parentSessionId={sessionId}
       sideSessionId={sideTabSession(file.path)}
+      visible={sidePaneVisible}
       onOpenFile={(relPath, line) => openReviewFile(sideTabSession(file.path), relPath, line)}
       onDeleted={() => void closeTab(file.path)}
     />

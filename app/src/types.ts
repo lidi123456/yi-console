@@ -134,6 +134,11 @@ export function isHostSession(s: SessionInfo): boolean {
   return !s.parentId && !s.bot;
 }
 
+/** Hidden child side chat or AI code review session attached to a parent session */
+export function isSideChatSession(s: SessionInfo): boolean {
+  return !!s.parentId && !s.bot && (!!s.sideChat || !!s.review);
+}
+
 /** Main repository directory for grouping a session (resolves a bound worktree back to its main repository) */
 export function sessionProjectDir(s: SessionInfo): string {
   return s.worktree?.repoRoot || s.cwd;

@@ -7,12 +7,13 @@ import { useBack } from '../back';
 import { getT, isEn, useLang } from '../i18n';
 import { errorToast, getState, hostStatus, loadOlder, loadSession, loadUserMessages, navigate, replaceView, setState, skey, toast, useSessionData, useStore } from '../store';
 import { rpc } from '../transport';
-import { isHostSession, TOOL_LABEL, supportsAccountsTool, type QuestionAnswer, type ToolAccountsSummary } from '../types';
+import { countPendingApprovalSessions } from '../overview';
+import { TOOL_LABEL, supportsAccountsTool, type QuestionAnswer, type ToolAccountsSummary } from '../types';
 import { fmtUsage, isMobile, lsGet, lsSet, shortPath, STATUS_LABEL } from '../util';
 import { openAccountManager } from './AccountManagerModal';
 import { openMenu } from './Overlay';
 import { writeClipboard } from '../clipboard';
-import { exportSession, OPEN_CHANGES, OPEN_FILE, openFileInPanel, openFilesInPanel, renameSession, renameWorktreeBranch, sessionMenu, showChanges, showTurnDiff } from './SessionActions';
+import { exportSession, OPEN_CHANGES, OPEN_FILE, openFileInPanel, openFilesInPanel, renameSession, renameWorktreeBranch, sessionMenu, showChanges, showTurnDiff, takeOpenChangesCwd } from './SessionActions';
 import { AI_PREFIX } from './AiBrowser';
 import { beginWidthDrag, FilePanel } from './FilePanel';
 import { SideChatsMenu, sideTabPath, startSideChat } from './SideChatTab';
@@ -86,9 +87,7 @@ export function SessionView({ hostId, sessionId, seq }: { hostId: string; sessio
   useEffect(() => {
     setChatDrag(false);
   }, [key, connected]);
-  const attn = useStore((s) =>
-    Object.values(s.sessions).reduce((n, l) => n + l.filter((x) => isHostSession(x) && x.pendingPermissions > 0).length, 0),
-  );
+  const attn = useStore((s) => countPendingApprovalSessions(s.sessions));
   const home = hostStatus(hostId).hello?.home;
   const desktopRevision = useMemo(() => data.events.reduce((seq, event) => event.kind === 'computer_use' && event.status === 'control' ? event.seq : seq, 0), [data.events, data.events.length]);
   const browserRevision = useMemo(() => data.events.reduce((seq, event) => event.kind === 'browser_use' ? event.seq : seq, 0), [data.events, data.events.length]);
@@ -131,9 +130,12 @@ export function SessionView({ hostId, sessionId, seq }: { hostId: string; sessio
   // Active directory in the file panel (defaults to info.cwd; can switch to any detected git worktree of the same repo)
   const panelCwdKey = `file-panel-cwd-${key}`;
   const [panelCwd, setPanelCwd] = useState(() => lsGet(panelCwdKey, ''));
+  // One-shot directory override from Overview's ProjectPanel / side chat "View changes" (never persisted to localStorage)
+  const [tempPanelCwd, setTempPanelCwd] = useState(() => takeOpenChangesCwd(hostId, sessionId) ?? '');
   const prevInfoCwd = useRef(info?.cwd);
   useEffect(() => {
     setPanelCwd(lsGet(panelCwdKey, ''));
+    setTempPanelCwd(takeOpenChangesCwd(hostId, sessionId) ?? '');
     prevInfoCwd.current = info?.cwd;
   }, [panelCwdKey]); // eslint-disable-line react-hooks/exhaustive-deps
   // Auto-follow the session's active workspace when a worktree is entered or changed
@@ -142,6 +144,7 @@ export function SessionView({ hostId, sessionId, seq }: { hostId: string; sessio
     if (prevInfoCwd.current && prevInfoCwd.current !== info.cwd) {
       lsSet(panelCwdKey, '');
       setPanelCwd('');
+      setTempPanelCwd('');
     }
     prevInfoCwd.current = info.cwd;
   }, [info?.cwd, panelCwdKey]);
@@ -149,8 +152,9 @@ export function SessionView({ hostId, sessionId, seq }: { hostId: string; sessio
     const val = !next || next === info?.cwd ? '' : next;
     lsSet(panelCwdKey, val);
     setPanelCwd(val);
+    setTempPanelCwd('');
   };
-  const activeFileCwd = panelCwd || info?.cwd || '';
+  const activeFileCwd = tempPanelCwd || panelCwd || info?.cwd || '';
   const toggleFiles = () => {
     const next = !files;
     lsSet(filesKey, next);
@@ -161,8 +165,14 @@ export function SessionView({ hostId, sessionId, seq }: { hostId: string; sessio
   // "View changes" / a file link in a reply: open the file panel (which switches itself to "Changes" or opens the file)
   useEffect(() => {
     const on = (e: Event) => {
-      const d = (e as CustomEvent<{ hostId: string; sessionId: string }>).detail;
+      const d = (e as CustomEvent<{ hostId: string; sessionId: string; cwd?: string }>).detail;
       if (d.hostId !== hostId || d.sessionId !== sessionId) return;
+      if (e.type === OPEN_CHANGES) {
+        const oneShot = takeOpenChangesCwd(hostId, sessionId) ?? d.cwd ?? '';
+        setTempPanelCwd(oneShot && oneShot !== info?.cwd ? oneShot : '');
+      } else {
+        setTempPanelCwd('');
+      }
       lsSet(filesKey, true);
       setFiles(true);
       setFilesMounted(true);
@@ -174,7 +184,7 @@ export function SessionView({ hostId, sessionId, seq }: { hostId: string; sessio
       window.removeEventListener(OPEN_CHANGES, on);
       window.removeEventListener(OPEN_FILE, on);
     };
-  }, [hostId, sessionId, filesKey]);
+  }, [hostId, sessionId, filesKey, info?.cwd]);
   // Bottom terminal panel: toggle remembered per session, so opening it in one session doesn't pop up a terminal in others
   const termKey = `term-panel-${key}`;
   const [, bumpTerm] = useState(0);

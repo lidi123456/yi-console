@@ -2,7 +2,7 @@
 // seen, drafts of sessions to start later, and the recent activity feed. Kept out of store.ts, which only feeds it
 // (`markSeen` on navigation, `recordChange` on session.updated).
 import { useEffect, useState, useSyncExternalStore } from 'react';
-import { isHostSession, type SessionInfo, type ToolKind } from './types';
+import { isHostSession, isSideChatSession, type SessionInfo, type ToolKind } from './types';
 import { lsGet, lsSet } from './util';
 
 const key = (hostId: string, sid: string) => `${hostId}::${sid}`;
@@ -34,9 +34,12 @@ function signal() {
 // ---------- Seen turns ("To review" column) ----------
 
 const SEEN_KEY = 'ov-seen';
+const SIDE_INIT_KEY = 'ov-seen-side-hosts';
 const SEEN_MAX = 400;
 const seenSig = signal();
 let seen: Record<string, number> = lsGet(SEEN_KEY, {});
+/** Hosts whose existing side chats have been baselined on first sync (avoids client/host clock skew on upgrade) */
+let sideHostInit: Record<string, boolean> = lsGet(SIDE_INIT_KEY, {});
 /** Turns that ended before this device first ran this version count as seen, so old sessions don't flood the column */
 const since: number = (() => {
   const v = lsGet<number>('ov-seen-since', 0);
@@ -46,10 +49,19 @@ const since: number = (() => {
   return now;
 })();
 
-export function markSeen(items: { hostId: string; sessionId: string }[]) {
+export function markSeen(items: { hostId: string; sessionId: string; endedAt?: number }[]) {
   if (!items.length) return;
   const now = Date.now();
-  for (const it of items) seen[key(it.hostId, it.sessionId)] = now;
+  let changed = false;
+  for (const it of items) {
+    const k = key(it.hostId, it.sessionId);
+    const val = Math.max(seen[k] ?? 0, it.endedAt ?? now);
+    if (seen[k] !== val) {
+      seen[k] = val;
+      changed = true;
+    }
+  }
+  if (!changed) return;
   const keys = Object.keys(seen);
   if (keys.length > SEEN_MAX) {
     keys.sort((a, b) => seen[a] - seen[b]);
@@ -59,16 +71,37 @@ export function markSeen(items: { hostId: string; sessionId: string }[]) {
   seenSig.bump();
 }
 
+/** Snapshot already-finished side chats on a host's first sync so historical side chats don't flood "To review"
+ *  and unseen detection compares remote turn timestamps only against recorded remote timestamps (no clock skew). */
+export function seedSideChatBaseline(hostId: string, sessions: readonly SessionInfo[]) {
+  if (sideHostInit[hostId]) return;
+  const items: { hostId: string; sessionId: string; endedAt: number }[] = [];
+  for (const s of sessions) {
+    if (isSideChatSession(s) && s.turn?.endedAt) {
+      items.push({ hostId, sessionId: s.id, endedAt: s.turn.endedAt });
+    }
+  }
+  sideHostInit = { ...sideHostInit, [hostId]: true };
+  lsSet(SIDE_INIT_KEY, sideHostInit);
+  if (items.length) markSeen(items);
+  else seenSig.bump();
+}
+
 /** The last turn ended and the session wasn't opened on this device since */
 export function unseenTurn(hostId: string, s: SessionInfo): boolean {
   const end = s.turn?.endedAt;
-  return !!end && end > Math.max(since, seen[key(hostId, s.id)] ?? 0);
+  if (!end) return false;
+  if (isSideChatSession(s)) {
+    if (!sideHostInit[hostId]) return false;
+    return end > (seen[key(hostId, s.id)] ?? 0);
+  }
+  return end > Math.max(since, seen[key(hostId, s.id)] ?? 0);
 }
 
 export const useSeenVersion = seenSig.use;
 
 /** An error older than this no longer asks for attention */
-const ERROR_FRESH_MS = 24 * 3600 * 1000;
+export const ERROR_FRESH_MS = 24 * 3600 * 1000;
 
 /** The session waits for the user: an approval or question, a turn cut off by a restart, or a recent error.
  *  Drives the overview's first column and the count on the sidebar's Overview entry. */
@@ -78,11 +111,61 @@ export function needsAttention(s: SessionInfo, now = Date.now()): boolean {
   return s.status === 'error' && now - (s.lastProcessErrorAt ?? s.updatedAt) < ERROR_FRESH_MS;
 }
 
+export type SideActiveKind = 'attn' | 'busy' | 'err' | 'wait';
+
+/** Find the top-level host parent of a side chat / AI review child session, if still present */
+export function findSideChatParent(sessions: readonly SessionInfo[] | undefined, s: SessionInfo): SessionInfo | undefined {
+  if (!isSideChatSession(s) || !sessions) return undefined;
+  const p = sessions.find((x) => x.id === s.parentId);
+  return p && isHostSession(p) ? p : undefined;
+}
+
+/** True for ordinary top-level host sessions and valid side chats attached to them (excludes bottom terminals and Bot tasks) */
+export function isOverviewSession(sessions: readonly SessionInfo[] | undefined, s: SessionInfo): boolean {
+  return isHostSession(s) || !!findSideChatParent(sessions, s);
+}
+
+/** Active sidebar status for a side chat (running, waiting for approval/question/restart, fresh error, or auto-resume) */
+export function sideActiveStatus(s: SessionInfo, now = Date.now()): SideActiveKind | null {
+  if (s.tool === 'files') return null;
+  if (s.pendingPermissions > 0 || s.status === 'waiting-permission' || s.restartInterrupted) return 'attn';
+  if (s.status === 'running' || s.status === 'starting') return 'busy';
+  if (s.status === 'error' && now - (s.lastProcessErrorAt ?? s.updatedAt) < ERROR_FRESH_MS) return 'err';
+  if (s.autoResume) return 'wait';
+  return null;
+}
+
+/** Count of host sessions and valid side chats currently needing user attention */
+export function countAttentionSessions(
+  sessionsByHost: Record<string, SessionInfo[]>,
+  hostIds?: readonly string[],
+  now = Date.now(),
+): number {
+  let n = 0;
+  for (const id of hostIds ?? Object.keys(sessionsByHost)) {
+    const list = sessionsByHost[id] ?? [];
+    for (const x of list) if (isOverviewSession(list, x) && needsAttention(x, now)) n++;
+  }
+  return n;
+}
+
+/** Count of host sessions and valid side chats with pending permission requests (app title & mobile menu badge) */
+export function countPendingApprovalSessions(sessionsByHost: Record<string, SessionInfo[]>): number {
+  let n = 0;
+  for (const list of Object.values(sessionsByHost)) {
+    for (const x of list) if (isOverviewSession(list, x) && x.pendingPermissions > 0) n++;
+  }
+  return n;
+}
+
 // localStorage is shared between windows: pick up what another window marked
 if (typeof window !== 'undefined') {
   window.addEventListener('storage', (e) => {
     if (e.key === SEEN_KEY) {
       seen = lsGet(SEEN_KEY, {});
+      seenSig.bump();
+    } else if (e.key === SIDE_INIT_KEY) {
+      sideHostInit = lsGet(SIDE_INIT_KEY, {});
       seenSig.bump();
     } else if (e.key === DRAFTS_KEY) {
       drafts = lsGet(DRAFTS_KEY, []);
@@ -162,8 +245,8 @@ const push = (it: Omit<FeedItem, 'id' | 'at'>) => {
 
 /** Called for every session.updated with the info held before it. Only changes after the app started are recorded:
  *  the feed is in memory, so it starts empty on every launch */
-export function recordChange(hostId: string, prev: SessionInfo | undefined, next: SessionInfo) {
-  if (!prev || !isHostSession(next)) return;
+export function recordChange(hostId: string, prev: SessionInfo | undefined, next: SessionInfo, sessions?: readonly SessionInfo[]) {
+  if (!prev || !isOverviewSession(sessions, next)) return;
   const base = { hostId, sessionId: next.id };
   if (next.pending && next.pending.requestId !== prev.pending?.requestId) {
     const p = next.pending;
