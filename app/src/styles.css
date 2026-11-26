@@ -10306,6 +10306,132 @@ button.wp-commit-title .chev {
   font-weight: 500;
 }
 
+/* Header side-chats menu with inline quick-delete & in-place confirmation */
+.ctx-menu.side-chats-menu {
+  min-width: min(300px, calc(100vw - 16px));
+  max-width: min(360px, calc(100vw - 16px));
+}
+.scm-row {
+  display: flex;
+  align-items: center;
+  height: 30px;
+  border-radius: 6px;
+  padding: 0 4px 0 0;
+  min-width: 0;
+  transition: background 0.1s;
+}
+.scm-row:hover {
+  background: var(--bg-3);
+}
+.scm-row.confirming,
+.scm-row.confirming:hover {
+  background: color-mix(in srgb, var(--err) 7%, var(--panel));
+}
+.scm-row.deleting {
+  opacity: 0.55;
+  pointer-events: none;
+}
+.ctx-menu.side-chats-menu .scm-main {
+  flex: 1;
+  min-width: 0;
+  height: 100%;
+  padding: 0 6px 0 8px;
+  background: transparent;
+}
+.ctx-menu.side-chats-menu .scm-main:hover:not(:disabled) {
+  background: transparent;
+}
+.ctx-menu.side-chats-menu .scm-main .ctx-hint {
+  margin-left: 8px;
+  max-width: 48%;
+  display: inline-flex;
+  align-items: center;
+}
+.ctx-menu.side-chats-menu .ctx-hint.scm-hint-running {
+  color: var(--link);
+}
+.ctx-menu.side-chats-menu .ctx-hint.scm-hint-attn {
+  color: var(--warn);
+}
+.scm-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  flex: none;
+  margin-right: 4px;
+}
+.scm-dot.running {
+  background: var(--link);
+}
+.scm-dot.attn {
+  background: var(--warn);
+}
+.scm-del-sep {
+  display: none;
+}
+.ctx-menu.side-chats-menu .scm-del {
+  flex: none;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  justify-content: center;
+  gap: 0;
+  border-radius: 5px;
+  color: var(--text-3);
+  opacity: 0.45;
+  transition: opacity 0.12s, background 0.12s, color 0.12s;
+}
+.scm-row:hover .scm-del,
+.scm-row:focus-within .scm-del {
+  opacity: 0.88;
+  color: var(--text-2);
+}
+.ctx-menu.side-chats-menu .scm-del:hover:not(:disabled) {
+  opacity: 1;
+  background: var(--err-soft);
+  color: var(--err);
+}
+.scm-row.confirming .ctx-icon {
+  color: var(--err);
+}
+.scm-confirm-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  flex: none;
+  margin-left: 6px;
+}
+.ctx-menu.side-chats-menu .scm-confirm-btn {
+  height: 22px;
+  padding: 0 8px;
+  border-radius: 5px;
+  background: var(--err);
+  color: #fff;
+  font-size: 11.5px;
+  font-weight: 500;
+  gap: 0;
+  flex: none;
+}
+.ctx-menu.side-chats-menu .scm-confirm-btn:hover:not(:disabled) {
+  background: var(--err);
+  filter: brightness(0.92);
+}
+.ctx-menu.side-chats-menu .scm-cancel-btn {
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  justify-content: center;
+  gap: 0;
+  border-radius: 5px;
+  color: var(--text-2);
+  background: var(--bg-3);
+  flex: none;
+}
+.ctx-menu.side-chats-menu .scm-cancel-btn:hover:not(:disabled) {
+  background: var(--border);
+  color: var(--text);
+}
+
 /* Terminal padding goes on .xterm rather than the container: under global border-box, FitAddon reads the container height including padding,
    overcounts a line or two, and the last line ends up under the status bar; FitAddon does subtract .xterm's own padding */
 .term {
@@ -10438,6 +10564,40 @@ button.wp-commit-title .chev {
   }
   .ctx-menu button {
     min-height: 36px;
+  }
+  .scm-row {
+    min-height: 38px;
+    height: auto;
+  }
+  .ctx-menu.side-chats-menu .scm-main {
+    min-height: 38px;
+  }
+  .scm-del-sep {
+    display: block;
+    width: 1px;
+    height: 16px;
+    background: var(--border);
+    margin: 0 3px 0 4px;
+    flex: none;
+  }
+  .ctx-menu.side-chats-menu .scm-del {
+    width: 30px;
+    height: 30px;
+    min-height: 30px;
+    opacity: 0.82;
+    color: var(--text-2);
+    border-radius: 7px;
+  }
+  .ctx-menu.side-chats-menu .scm-confirm-btn {
+    height: 28px;
+    min-height: 28px;
+    padding: 0 10px;
+    font-size: 12px;
+  }
+  .ctx-menu.side-chats-menu .scm-cancel-btn {
+    width: 28px;
+    height: 28px;
+    min-height: 28px;
   }
   .tmux-scroll {
     width: 14px;

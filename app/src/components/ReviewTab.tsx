@@ -8,6 +8,7 @@ import {
   extractFindingThreads,
   extractReviewSnapshot,
   formatFindingFollowUp,
+  getActiveReviewId,
   getAllDispositions,
   getFindingDisposition,
   parseReviewIssues,
@@ -1737,7 +1738,9 @@ export function ReviewSidePane({
 
   const remove = async () => {
     if (!info) {
-      setActiveReviewId(hostId, parentSessionId, null);
+      if (getActiveReviewId(hostId, parentSessionId) === reviewSessionId) {
+        setActiveReviewId(hostId, parentSessionId, null);
+      }
       onDeleted?.();
       return;
     }
@@ -1754,7 +1757,9 @@ export function ReviewSidePane({
       return;
     }
     deleteReviewMeta(reviewSessionId);
-    setActiveReviewId(hostId, parentSessionId, null);
+    if (getActiveReviewId(hostId, parentSessionId) === reviewSessionId) {
+      setActiveReviewId(hostId, parentSessionId, null);
+    }
     onDeleted?.();
   };
 

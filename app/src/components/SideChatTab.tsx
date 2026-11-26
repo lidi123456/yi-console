@@ -1,19 +1,311 @@
-import { useEffect, useMemo } from 'react';
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
+import { useBack } from '../back';
 import { getT, useLang } from '../i18n';
-import { bringSideChatToMain, deriveSideTitle, sideChatTitle } from '../sideChat';
+import { getActiveReviewId, setActiveReviewId } from '../reviewState';
+import {
+  bringSideChatToMain,
+  deriveSideTitle,
+  isSideChatBusy,
+  sideChatMenuHint,
+  sideChatNeedsDeleteConfirm,
+  sideChatTitle,
+  sideChatTools,
+} from '../sideChat';
 import { errorToast, loadOlder, loadSession, registerVisibleChildSession, skey, useSessionData, useStore } from '../store';
 import { rpc } from '../transport';
-import { TOOL_LABEL, type QuestionAnswer } from '../types';
+import { TOOL_LABEL, type QuestionAnswer, type SessionInfo, type ToolKind } from '../types';
 import { AsyncAskCard, ChatView, openAsyncAsk, PermissionCard } from './ChatView';
 import { Composer, startReeditToComposer } from './Composer';
 import { Icon, ToolBadge } from './Icon';
 import { askConfirm, askText } from './Overlay';
-import { getReviewMeta, ReviewSidePane } from './ReviewTab';
+import { deleteReviewMeta, getReviewMeta, ReviewSidePane } from './ReviewTab';
 import { StatusLine } from './StatusLine';
 
 export * from '../sideChat';
 
 const tx = getT('filePanel');
+const tsv = getT('sessionView');
+
+/** Permanently delete a side chat (or review side chat) and clear any client-side review tracking attached to it */
+export async function deleteSideChatSession(
+  hostId: string,
+  parentSessionId: string,
+  info: SessionInfo,
+): Promise<boolean> {
+  try {
+    await rpc(hostId, 'session.delete', { sessionId: info.id });
+  } catch (err) {
+    errorToast(err);
+    return false;
+  }
+  if (info.review || getReviewMeta(info.id)) {
+    deleteReviewMeta(info.id);
+    if (getActiveReviewId(hostId, parentSessionId) === info.id) {
+      setActiveReviewId(hostId, parentSessionId, null);
+    }
+  }
+  return true;
+}
+
+export interface SideChatsMenuProps {
+  hostId: string;
+  parent: SessionInfo;
+  sideChats: SessionInfo[];
+  connected: boolean;
+  anchor: { right: number; bottom: number };
+  onClose: () => void;
+  onOpenSideChat: (sc: SessionInfo) => void;
+  onCreateSideChat: (tool?: ToolKind) => void;
+}
+
+/** Reactive dropdown menu for topbar "Side · N": supports opening, creating, and inline quick-deleting side chats */
+export function SideChatsMenu({
+  hostId,
+  parent,
+  sideChats,
+  connected,
+  anchor,
+  onClose,
+  onOpenSideChat,
+  onCreateSideChat,
+}: SideChatsMenuProps) {
+  useLang();
+  const menuRef = useRef<HTMLDivElement>(null);
+  const [confirmId, setConfirmId] = useState<string | null>(null);
+  const [deletingIds, setDeletingIds] = useState<string[]>([]);
+  const [pos, setPos] = useState(() => ({
+    left: Math.max(4, anchor.right - 340),
+    top: anchor.bottom,
+  }));
+
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
+  const confirmIdRef = useRef(confirmId);
+  confirmIdRef.current = confirmId;
+
+  // Keep the right edge aligned with the trigger button while clamping inside the viewport
+  useLayoutEffect(() => {
+    const el = menuRef.current;
+    if (!el) return;
+    const r = el.getBoundingClientRect();
+    setPos({
+      left: Math.max(4, Math.min(anchor.right - r.width, window.innerWidth - r.width - 4)),
+      top: Math.max(4, Math.min(anchor.bottom, window.innerHeight - r.height - 4)),
+    });
+  }, [anchor.right, anchor.bottom, sideChats.length, confirmId]);
+
+  useEffect(() => {
+    if (sideChats.length === 0) onCloseRef.current();
+  }, [sideChats.length]);
+
+  useEffect(() => {
+    if (confirmId && !sideChats.some((s) => s.id === confirmId)) setConfirmId(null);
+  }, [sideChats, confirmId]);
+
+  // Auto-dismiss pending inline confirmation after inactivity
+  useEffect(() => {
+    if (!confirmId) return;
+    const id = confirmId;
+    const timer = window.setTimeout(() => {
+      setConfirmId((cur) => (cur === id ? null : cur));
+    }, 3500);
+    return () => window.clearTimeout(timer);
+  }, [confirmId]);
+
+  // LIFO back-button order: cancel inline confirm first, then close the menu
+  useBack(true, onClose);
+  useBack(confirmId !== null, () => setConfirmId(null));
+
+  useEffect(() => {
+    const close = () => onCloseRef.current();
+    const onWheel = (e: WheelEvent) => {
+      if (menuRef.current && e.target instanceof Node && menuRef.current.contains(e.target)) return;
+      close();
+    };
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.isComposing || e.keyCode === 229) return;
+      if (e.key !== 'Escape') return;
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      if (confirmIdRef.current) setConfirmId(null);
+      else close();
+    };
+    window.addEventListener('blur', close);
+    window.addEventListener('resize', close);
+    window.addEventListener('keydown', onKeyDown, true);
+    window.addEventListener('wheel', onWheel, { passive: true });
+    return () => {
+      window.removeEventListener('blur', close);
+      window.removeEventListener('resize', close);
+      window.removeEventListener('keydown', onKeyDown, true);
+      window.removeEventListener('wheel', onWheel);
+    };
+  }, []);
+
+  const performDelete = async (sc: SessionInfo) => {
+    if (!connected || deletingIds.includes(sc.id)) return;
+    setDeletingIds((prev) => (prev.includes(sc.id) ? prev : [...prev, sc.id]));
+    setConfirmId((cur) => (cur === sc.id ? null : cur));
+    try {
+      await deleteSideChatSession(hostId, parent.id, sc);
+    } finally {
+      setDeletingIds((prev) => prev.filter((id) => id !== sc.id));
+    }
+  };
+
+  const onTrashClick = (sc: SessionInfo) => {
+    if (!connected || deletingIds.includes(sc.id)) return;
+    const isReview = !!(sc.review || getReviewMeta(sc.id));
+    if (!sideChatNeedsDeleteConfirm(hostId, sc, isReview)) {
+      void performDelete(sc);
+    } else {
+      setConfirmId(sc.id);
+    }
+  };
+
+  const otherTools = sideChatTools(hostId).filter((tk) => tk !== parent.tool);
+
+  return createPortal(
+    <div
+      className="ctx-scrim"
+      onMouseDown={onClose}
+      onContextMenu={(e) => {
+        e.preventDefault();
+        onClose();
+      }}
+    >
+      <div
+        ref={menuRef}
+        className="ctx-menu side-chats-menu"
+        role="menu"
+        style={pos}
+        onMouseDown={(e) => e.stopPropagation()}
+      >
+        {sideChats.map((sc) => {
+          const label = sideChatTitle(sc);
+          const hint = sideChatMenuHint(sc, label);
+          const isReview = !!(sc.review || getReviewMeta(sc.id));
+          const busy = isSideChatBusy(sc);
+          const attn = sc.pendingPermissions > 0 || sc.status === 'waiting-permission';
+          const running = sc.status === 'running' || sc.status === 'starting';
+          const confirming = confirmId === sc.id;
+          const deleting = deletingIds.includes(sc.id);
+          return (
+            <div
+              key={sc.id}
+              className={`scm-row ${confirming ? 'confirming' : ''} ${deleting ? 'deleting' : ''}`}
+            >
+              <button
+                type="button"
+                className="scm-main"
+                role="menuitem"
+                disabled={deleting}
+                title={hint ? `${label}  ${hint}` : label}
+                onMouseDown={(e) => e.preventDefault()}
+                onClick={() => {
+                  if (confirming) {
+                    setConfirmId(null);
+                    return;
+                  }
+                  onClose();
+                  onOpenSideChat(sc);
+                }}
+              >
+                <span className="ctx-icon">
+                  <Icon name={isReview ? 'sparkles' : 'sideChat'} size={14} />
+                </span>
+                <span className="grow">{label}</span>
+                {!confirming && hint && (
+                  <span
+                    className={`ctx-hint ${attn ? 'scm-hint-attn' : running ? 'scm-hint-running' : ''}`}
+                  >
+                    {(attn || running) && <span className={`scm-dot ${attn ? 'attn' : 'running'}`} />}
+                    {hint}
+                  </span>
+                )}
+              </button>
+              {confirming ? (
+                <div className="scm-confirm-group">
+                  <button
+                    type="button"
+                    className="scm-confirm-btn"
+                    disabled={!connected || deleting}
+                    onMouseDown={(e) => e.preventDefault()}
+                    onClick={() => void performDelete(sc)}
+                  >
+                    {busy ? tsv('stopAndDeleteSideChat') : tsv('confirmDeleteSideChat')}
+                  </button>
+                  <button
+                    type="button"
+                    className="scm-cancel-btn"
+                    title={tsv('cancelDeleteSideChat')}
+                    aria-label={tsv('cancelDeleteSideChat')}
+                    onMouseDown={(e) => e.preventDefault()}
+                    onClick={() => setConfirmId(null)}
+                  >
+                    <Icon name="x" size={11} />
+                  </button>
+                </div>
+              ) : (
+                <>
+                  <span className="scm-del-sep" aria-hidden="true" />
+                  <button
+                    type="button"
+                    className="scm-del"
+                    disabled={!connected || deleting}
+                    title={deleting ? tsv('deletingSideChat') : tsv('deleteSideChat')}
+                    aria-label={tsv('deleteSideChat')}
+                    onMouseDown={(e) => e.preventDefault()}
+                    onClick={() => onTrashClick(sc)}
+                  >
+                    <Icon name="trash" size={13} />
+                  </button>
+                </>
+              )}
+            </div>
+          );
+        })}
+        <div className="ctx-sep" />
+        <button
+          type="button"
+          role="menuitem"
+          disabled={!connected}
+          onMouseDown={(e) => e.preventDefault()}
+          onClick={() => {
+            onClose();
+            onCreateSideChat();
+          }}
+        >
+          <span className="ctx-icon">
+            <Icon name="plus" size={14} />
+          </span>
+          <span className="grow">{tsv('newSideChat')}</span>
+          <span className="ctx-hint">{TOOL_LABEL[parent.tool]}</span>
+        </button>
+        {otherTools.map((tk) => (
+          <button
+            key={tk}
+            type="button"
+            role="menuitem"
+            disabled={!connected}
+            onMouseDown={(e) => e.preventDefault()}
+            onClick={() => {
+              onClose();
+              onCreateSideChat(tk);
+            }}
+          >
+            <span className="ctx-icon">
+              <Icon name="sideChat" size={14} />
+            </span>
+            <span className="grow">{tsv('newSideChatWithTool', { tool: TOOL_LABEL[tk] })}</span>
+          </button>
+        ))}
+      </div>
+    </div>,
+    document.body,
+  );
+}
 
 export function SideChatPane({
   hostId,
@@ -139,12 +431,7 @@ function RegularSideChatPane({
       });
       if (!ok) return;
     }
-    try {
-      await rpc(hostId, 'session.delete', { sessionId: sideSessionId });
-    } catch (err) {
-      errorToast(err);
-      return;
-    }
+    if (!(await deleteSideChatSession(hostId, parentSessionId, info))) return;
     onDeleted();
   };
 

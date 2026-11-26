@@ -15,7 +15,7 @@ import { writeClipboard } from '../clipboard';
 import { exportSession, OPEN_CHANGES, OPEN_FILE, openFileInPanel, openFilesInPanel, renameSession, renameWorktreeBranch, sessionMenu, showChanges, showTurnDiff } from './SessionActions';
 import { AI_PREFIX } from './AiBrowser';
 import { beginWidthDrag, FilePanel } from './FilePanel';
-import { sideChatTitle, sideChatTools, sideTabPath, startSideChat } from './SideChatTab';
+import { SideChatsMenu, sideTabPath, startSideChat } from './SideChatTab';
 import { TermPanel } from './TermPanel';
 import { AsyncAskCard, ChatView, openAsyncAsk, PermissionCard, setChatStyle, useChatStyle } from './ChatView';
 import { PlanDock } from './PlanDock';
@@ -192,6 +192,7 @@ export function SessionView({ hostId, sessionId, seq }: { hostId: string; sessio
   // A file is open in the panel: wider and resizable; with only the tree it's a narrow column
   const [fileOpen, setFileOpen] = useState(false);
   const [startingSide, setStartingSide] = useState(false);
+  const [sideMenuAnchor, setSideMenuAnchor] = useState<{ right: number; bottom: number } | null>(null);
   const [usage, setUsage] = useState(false);
   const [memoryOpen, setMemoryOpen] = useState(false);
   const [recovering, setRecovering] = useState(false);
@@ -292,7 +293,12 @@ export function SessionView({ hostId, sessionId, seq }: { hostId: string; sessio
     setJumpReq(null);
     setJumpingSeq(null);
     setPromptScroll({ activeSeq: null, stickyVisible: false });
+    setSideMenuAnchor(null);
   }, [key]);
+
+  useEffect(() => {
+    if (!isChatMode || sideChats.length === 0) setSideMenuAnchor(null);
+  }, [isChatMode, sideChats.length]);
 
   useEffect(() => () => clearHoverTimer(), []);
 
@@ -673,42 +679,38 @@ export function SessionView({ hostId, sessionId, seq }: { hostId: string; sessio
         </div>
         <div className="head-toolbar">
           {sideChats.length > 0 && isChatMode && (
-            <button
-              type="button"
-              className={`head-side-btn ${files ? 'open' : ''}`}
-              title={t('sideChatsMenuTip')}
-              onClick={(e) => {
-                const r = e.currentTarget.getBoundingClientRect();
-                const otherTools = sideChatTools(hostId).filter((tk) => tk !== info.tool);
-                openMenu(
-                  { clientX: r.right - 260, clientY: r.bottom + 4 },
-                  [
-                    ...sideChats.map((sc) => ({
-                      label: sideChatTitle(sc),
-                      icon: sc.review ? 'sparkles' : 'sideChat',
-                      hint: [TOOL_LABEL[sc.tool], sc.review?.scopeLabel, STATUS_LABEL[sc.status]].filter(Boolean).join(' · '),
-                      run: () => openFileInPanel(hostId, sessionId, sideTabPath(sc.id)),
-                    })),
-                    '-' as const,
-                    {
-                      label: t('newSideChat'),
-                      icon: 'plus',
-                      hint: TOOL_LABEL[info.tool],
-                      run: () => void startSideChat({ hostId, parent: info }).catch(errorToast),
-                    },
-                    ...otherTools.map((tk) => ({
-                      label: t('newSideChatWithTool', { tool: TOOL_LABEL[tk] }),
-                      icon: 'sideChat',
-                      run: () => void startSideChat({ hostId, parent: info, tool: tk }).catch(errorToast),
-                    })),
-                  ],
-                );
-              }}
-            >
-              {attnSideCount > 0 ? <span className="wp-side-dot attn" /> : liveSideCount > 0 ? <span className="wp-side-dot running" /> : <Icon name="sideChat" size={13} />}
-              <span>{t('sideChatsCount', { count: sideChats.length })}</span>
-              <Icon name="down" size={11} />
-            </button>
+            <>
+              <button
+                type="button"
+                className={`head-side-btn ${files || sideMenuAnchor ? 'open' : ''}`}
+                aria-expanded={!!sideMenuAnchor}
+                title={t('sideChatsMenuTip')}
+                onClick={(e) => {
+                  if (sideMenuAnchor) {
+                    setSideMenuAnchor(null);
+                    return;
+                  }
+                  const r = e.currentTarget.getBoundingClientRect();
+                  setSideMenuAnchor({ right: r.right, bottom: r.bottom + 4 });
+                }}
+              >
+                {attnSideCount > 0 ? <span className="wp-side-dot attn" /> : liveSideCount > 0 ? <span className="wp-side-dot running" /> : <Icon name="sideChat" size={13} />}
+                <span>{t('sideChatsCount', { count: sideChats.length })}</span>
+                <Icon name="down" size={11} />
+              </button>
+              {sideMenuAnchor && (
+                <SideChatsMenu
+                  hostId={hostId}
+                  parent={info}
+                  sideChats={sideChats}
+                  connected={connected}
+                  anchor={sideMenuAnchor}
+                  onClose={() => setSideMenuAnchor(null)}
+                  onOpenSideChat={(sc) => openFileInPanel(hostId, sessionId, sideTabPath(sc.id))}
+                  onCreateSideChat={(tool) => void startSideChat({ hostId, parent: info, tool }).catch(errorToast)}
+                />
+              )}
+            </>
           )}
           {info.tool !== 'shell' && !filesOnly && (
             <div className="head-group hide-mobile">

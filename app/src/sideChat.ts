@@ -3,7 +3,8 @@ import { getT } from './i18n';
 import { permModes } from './perm';
 import { getSession, hostStatus, loadSession, skey, toast } from './store';
 import { rpc } from './transport';
-import type { HubEvent, SessionInfo, ToolKind } from './types';
+import { TOOL_LABEL, type HubEvent, type SessionInfo, type ToolKind } from './types';
+import { STATUS_LABEL } from './util';
 import { openFileInPanel } from './components/SessionActions';
 
 const tx = getT('filePanel');
@@ -77,6 +78,35 @@ export function sideChatHasMessages(hostId: string, sideSid: string, info?: Sess
   if (data.events.some((e) => e.kind === 'user_message' || e.kind === 'assistant_text')) return true;
   if (info && (info.lastSeq > 0 || info.turn != null || info.status === 'running')) return true;
   return false;
+}
+
+/** Whether a side chat currently has an active turn or pending approval/question */
+export function isSideChatBusy(info: Pick<SessionInfo, 'status' | 'pendingPermissions'>): boolean {
+  return (
+    info.status === 'running' ||
+    info.status === 'starting' ||
+    info.status === 'waiting-permission' ||
+    info.pendingPermissions > 0
+  );
+}
+
+/** Whether deleting a side chat from the header menu should require inline confirmation */
+export function sideChatNeedsDeleteConfirm(hostId: string, info: SessionInfo, isReview: boolean): boolean {
+  return isReview || isSideChatBusy(info) || sideChatHasMessages(hostId, info.id, info);
+}
+
+/** Build the compact right-side hint for a side chat item without repeating tool/scope already shown in the title */
+export function sideChatMenuHint(info: SessionInfo, label: string): string {
+  const toolLabel = TOOL_LABEL[info.tool];
+  const scope = info.review?.scopeLabel;
+  const status = STATUS_LABEL[info.status];
+  return [
+    toolLabel && !label.includes(toolLabel) ? toolLabel : null,
+    scope && !label.includes(scope) ? scope : null,
+    status,
+  ]
+    .filter(Boolean)
+    .join(' · ');
 }
 
 /** Extract a concise 1-line summary from markdown text for the context pill */
