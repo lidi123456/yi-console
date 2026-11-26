@@ -22,10 +22,15 @@ import { detectEol, detectIndent } from '../textFormat';
 import { openMenu, type MenuItem } from './Overlay';
 import { readClipboard, writeClipboard } from '../clipboard';
 import { editorSearchExtension, editorSearchKeymap } from './EditorSearchPanel';
-import { editorCodeNavExtension, extractNavToken, isNavMod, triggerNavAtCursor, type NavTrigger } from './EditorCodeNav';
+import { editorCodeNavExtension, extractNavToken, IS_MAC, isNavMod, triggerNavAtCursor, type NavTrigger } from './EditorCodeNav';
 import { Icon } from './Icon';
 
 const tx = getT('filePanel');
+
+/** Drop Alt-ArrowLeft/Right on non-Mac so app back/forward (Alt+←/→) and file history (Alt+Shift+←/→) don't also move the cursor */
+export const editorDefaultKeymap = IS_MAC
+  ? defaultKeymap
+  : defaultKeymap.filter((b) => b.key !== 'Alt-ArrowLeft' && b.key !== 'Alt-ArrowRight');
 
 /** What the right-click menu of the editor can act on (built by the caller, see FilePanel's editorMenu) */
 export interface EditorMenuCtx {
@@ -445,7 +450,7 @@ export const CodeEditor = forwardRef<CodeEditorHandle, CodeEditorProps>(function
               },
             },
             ...closeBracketsKeymap,
-            ...defaultKeymap,
+            ...editorDefaultKeymap,
             ...historyKeymap,
             ...editorSearchKeymap,
             ...foldKeymap,

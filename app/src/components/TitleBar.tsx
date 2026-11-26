@@ -57,10 +57,10 @@ export function TitleBar() {
         >
           <Icon name="sidebar" size={16} />
         </button>
-        <button title={t('backAlt')} disabled={!canBack} onClick={goBack}>
+        <button title={t('backAlt', { key: isMac ? '⌘[' : 'Alt+←' })} disabled={!canBack} onClick={goBack}>
           <Icon name="back" size={16} />
         </button>
-        <button title={t('forwardAlt')} disabled={!canForward} onClick={goForward}>
+        <button title={t('forwardAlt', { key: isMac ? '⌘]' : 'Alt+→' })} disabled={!canForward} onClick={goForward}>
           <Icon name="forward" size={16} />
         </button>
       </div>

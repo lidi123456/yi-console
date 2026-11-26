@@ -4102,20 +4102,30 @@ export function FilePanel({
   // ---------- Shortcuts: Ctrl+P quick open, Ctrl+Shift+O symbols, Ctrl+G go to line, Ctrl+Alt+N new untitled file, nav history ----------
   useEffect(() => {
     if (!visible) return;
-    const onKey = (e: KeyboardEvent) => {
-      if (e.isComposing || e.keyCode === 229 || getState().palette) return;
-      if (!IS_MAC && e.altKey && !e.ctrlKey && !e.metaKey && !e.shiftKey && (e.key === 'ArrowLeft' || e.key === 'ArrowRight')) {
-        if (!fileRef.current) return;
+    const isNavigableFile = (f: OpenFile | null) => !!f && !f.web && !f.review && !f.side;
+    // Capture phase so code/file history runs before CodeMirror (selectSyntaxLeft/Right) and never leaks to outer page nav
+    const onNavKey = (e: KeyboardEvent) => {
+      if (e.defaultPrevented || e.isComposing || e.keyCode === 229 || getState().palette) return;
+      // Never hijack keys meant for focused terminals (e.g. bottom TermPanel) or modal/menu overlays
+      const target = e.target instanceof Element ? e.target : document.activeElement;
+      if (target?.closest('.xterm, .term, .modal-bg, .ctx-menu')) return;
+      if (!IS_MAC && e.altKey && e.shiftKey && !e.ctrlKey && !e.metaKey && (e.key === 'ArrowLeft' || e.key === 'ArrowRight')) {
+        if (!isNavigableFile(fileRef.current)) return;
         e.preventDefault();
+        e.stopPropagation();
         void stepHistoryRef.current(e.key === 'ArrowLeft' ? -1 : 1);
         return;
       }
-      if (IS_MAC && e.ctrlKey && !e.metaKey && !e.altKey && (e.key === '-' || e.key === '_' || e.code === 'Minus')) {
-        if (!fileRef.current) return;
+      const useCode = e.key === 'Unidentified' || e.key === 'Process' || (e.key.length === 1 && e.key.charCodeAt(0) > 127);
+      if (IS_MAC && e.ctrlKey && !e.metaKey && !e.altKey && (e.key === '-' || e.key === '_' || (useCode && e.code === 'Minus'))) {
+        if (!isNavigableFile(fileRef.current)) return;
         e.preventDefault();
+        e.stopPropagation();
         void stepHistoryRef.current(e.shiftKey ? 1 : -1);
-        return;
       }
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.isComposing || e.keyCode === 229 || getState().palette) return;
       if (!(e.ctrlKey || e.metaKey)) return;
       const k = e.key.toLowerCase();
       if (e.altKey) {
@@ -4130,8 +4140,12 @@ export function FilePanel({
       e.preventDefault();
       openQuick(m);
     };
+    window.addEventListener('keydown', onNavKey, true);
     window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
+    return () => {
+      window.removeEventListener('keydown', onNavKey, true);
+      window.removeEventListener('keydown', onKey);
+    };
   }, [visible, openQuick]);
 
   const conflictMenu = (e: React.MouseEvent<HTMLElement>) => {
@@ -5581,6 +5595,9 @@ export function FilePanel({
     </div>
   );
 
+  const hasFileNav = !!file && !file.web && !file.review && !file.side;
+  const navBackKey = IS_MAC ? 'Ctrl+-' : 'Alt+Shift+←';
+  const navForwardKey = IS_MAC ? 'Ctrl+Shift+-' : 'Alt+Shift+→';
   const navBtns = (
     <>
       <div className="wp-nav-btns">
@@ -5588,8 +5605,8 @@ export function FilePanel({
           type="button"
           className="icon-btn"
           disabled={!navState.canBack}
-          title={tx('navBack', { v: IS_MAC ? 'Ctrl+-' : 'Alt+←' })}
-          aria-label={tx('navBack', { v: IS_MAC ? 'Ctrl+-' : 'Alt+←' })}
+          title={tx('navBack', { v: navBackKey })}
+          aria-label={tx('navBack', { v: navBackKey })}
           onClick={() => void stepHistory(-1)}
         >
           <Icon name="back" size={13} />
@@ -5598,8 +5615,8 @@ export function FilePanel({
           type="button"
           className="icon-btn"
           disabled={!navState.canForward}
-          title={tx('navForward', { v: IS_MAC ? 'Ctrl+Shift+-' : 'Alt+→' })}
-          aria-label={tx('navForward', { v: IS_MAC ? 'Ctrl+Shift+-' : 'Alt+→' })}
+          title={tx('navForward', { v: navForwardKey })}
+          aria-label={tx('navForward', { v: navForwardKey })}
           onClick={() => void stepHistory(1)}
         >
           <Icon name="forward" size={13} />
@@ -5614,11 +5631,15 @@ export function FilePanel({
       className={`file-panel ${fullscreen ? 'full' : ''} ${file || emptyPane ? '' : 'browse'} ${standalone ? 'standalone' : ''} ${visible ? '' : 'wp-hidden'}`}
       style={{ '--tree-w': `${treeW}px` } as React.CSSProperties}
       onMouseDown={(e) => {
-        if (e.button === 3 || e.button === 4) e.preventDefault();
+        if (hasFileNav && (e.button === 3 || e.button === 4)) {
+          e.preventDefault();
+          e.nativeEvent.stopPropagation();
+        }
       }}
       onMouseUp={(e) => {
-        if (e.button === 3 || e.button === 4) {
+        if (hasFileNav && (e.button === 3 || e.button === 4)) {
           e.preventDefault();
+          e.nativeEvent.stopPropagation();
           void stepHistory(e.button === 3 ? -1 : 1);
         }
       }}

@@ -3,8 +3,8 @@
   "restore": "Restore",
   "maximize": "Maximize",
   "close": "Close",
-  "backAlt": "Back (Alt+←)",
-  "forwardAlt": "Forward (Alt+→)",
+  "backAlt": "Back ({{key}})",
+  "forwardAlt": "Forward ({{key}})",
   "showSidebar": "Show Sidebar ({{mod}}+B)",
   "hideSidebar": "Hide Sidebar ({{mod}}+B)"
 }

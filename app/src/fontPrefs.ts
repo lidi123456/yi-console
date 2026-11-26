@@ -110,16 +110,22 @@ export function setFontPrefs(p: Partial<FontPrefs>) {
 export function initFontPrefs() {
   apply();
   if (!canZoom) return;
-  // Ctrl/Cmd + = / - / 0, like VS Code's zoom in / out / reset. Capture phase, so the terminal and editor don't get them first
+  const isMac = /Mac|iPhone|iPad/.test(navigator.platform);
+  // Cmd (macOS) / Ctrl (Win/Linux) + = / - / 0, like VS Code's zoom in / out / reset.
+  // Capture phase so the terminal and editor don't get them first; platform-scoped so macOS Ctrl+- stays free for file history.
   window.addEventListener(
     'keydown',
     (e) => {
-      if (!(e.ctrlKey || e.metaKey) || e.altKey) return;
+      const mod = isMac ? e.metaKey && !e.ctrlKey : e.ctrlKey && !e.metaKey;
+      if (!mod || e.altKey) return;
+      // Only fall back to physical key codes when e.key isn't printable ASCII (e.g. IME/non-Latin),
+      // so layouts like Dvorak (where physical Minus/Equal produce '['/']') don't trigger zoom on Cmd+[ / Cmd+].
+      const useCode = e.key === 'Unidentified' || e.key === 'Process' || (e.key.length === 1 && e.key.charCodeAt(0) > 127);
       const z = getFontPrefs().zoom;
       let next: number;
-      if (e.code === 'Equal' || e.code === 'NumpadAdd' || e.key === '+' || e.key === '=') next = z + 1;
-      else if (e.code === 'Minus' || e.code === 'NumpadSubtract' || e.key === '-') next = z - 1;
-      else if (e.code === 'Digit0' || e.code === 'Numpad0') next = 0;
+      if (e.key === '+' || e.key === '=' || e.code === 'NumpadAdd' || (useCode && e.code === 'Equal')) next = z + 1;
+      else if (!e.shiftKey && (e.key === '-' || e.code === 'NumpadSubtract' || (useCode && e.code === 'Minus'))) next = z - 1;
+      else if (!e.shiftKey && (e.key === '0' || e.code === 'Numpad0' || (useCode && e.code === 'Digit0'))) next = 0;
       else return;
       e.preventDefault();
       e.stopPropagation();

@@ -29,7 +29,8 @@ export function getShortcuts(): [string, string][] {
     [`${MOD}+N`, t('shortcuts.newSession')],
     ['Alt+↑ / Alt+↓', t('shortcuts.switchSession')],
     ['Alt+Shift+↑ / ↓', t('shortcuts.switchPrompt')],
-    ['Alt+← / Alt+→', t('shortcuts.backForward')],
+    [isMac ? '⌘[ / ⌘]' : 'Alt+← / Alt+→', t('shortcuts.backForward')],
+    [isMac ? 'Ctrl+- / Ctrl+Shift+-' : 'Alt+Shift+← / →', t('shortcuts.fileBackForward')],
     [`${MOD}+B`, t('shortcuts.sidebar')],
     ['F2', t('shortcuts.rename')],
     ['Esc', t('shortcuts.interrupt')],
@@ -63,6 +64,7 @@ function stepSession(d: 1 | -1) {
 export function useShortcuts() {
   useEffect(() => {
     const f = (e: KeyboardEvent) => {
+      if (e.isComposing || e.keyCode === 229) return;
       const mod = isMac ? e.metaKey : e.ctrlKey;
       const k = e.key.toLowerCase();
       if (mod && !e.shiftKey && k === 'k') {
@@ -77,9 +79,24 @@ export function useShortcuts() {
       } else if (e.altKey && !mod && !e.shiftKey && (e.key === 'ArrowUp' || e.key === 'ArrowDown')) {
         e.preventDefault();
         stepSession(e.key === 'ArrowUp' ? -1 : 1);
-      } else if (e.altKey && !mod && (e.key === 'ArrowLeft' || e.key === 'ArrowRight')) {
+      } else if (!isMac && e.altKey && !e.ctrlKey && !e.metaKey && !e.shiftKey && (e.key === 'ArrowLeft' || e.key === 'ArrowRight')) {
         e.preventDefault();
         if (e.key === 'ArrowLeft') goBack();
+        else goForward();
+      } else if (
+        isMac &&
+        !e.defaultPrevented &&
+        e.metaKey &&
+        !e.ctrlKey &&
+        !e.altKey &&
+        !e.shiftKey &&
+        (e.key === '[' ||
+          e.key === ']' ||
+          ((e.key === 'Unidentified' || e.key === 'Process' || (e.key.length === 1 && e.key.charCodeAt(0) > 127)) &&
+            (e.code === 'BracketLeft' || e.code === 'BracketRight')))
+      ) {
+        e.preventDefault();
+        if (e.key === '[' || e.code === 'BracketLeft') goBack();
         else goForward();
       } else if (mod && !e.shiftKey && k === 'b') {
         e.preventDefault();
@@ -93,8 +110,9 @@ export function useShortcuts() {
         }
       }
     };
-    // Mouse side buttons for back / forward
+    // Mouse side buttons for back / forward (skipped if FilePanel already consumed the click)
     const m = (e: MouseEvent) => {
+      if (e.defaultPrevented) return;
       if (e.button === 3 || e.button === 4) {
         e.preventDefault();
         if (e.button === 3) goBack();
@@ -231,7 +249,7 @@ export function Palette() {
           ))}
         </div>
         <div className="palette-foot hide-mobile">
-          {getShortcuts().slice(0, 5).map(([k, d]) => (
+          {getShortcuts().slice(0, 7).map(([k, d]) => (
             <span key={k}>
               <kbd>{k}</kbd> {d.split(/（|\(/)[0].trim()}
             </span>

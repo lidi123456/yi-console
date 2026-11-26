@@ -7,6 +7,7 @@
     "switchSession": "Previous / Next session",
     "switchPrompt": "Previous / Next prompt (in session)",
     "backForward": "Back / Forward",
+    "fileBackForward": "File Back / Forward",
     "sidebar": "Toggle Sidebar",
     "rename": "Rename current session",
     "interrupt": "Interrupt current turn (in input)",

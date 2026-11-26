@@ -2319,6 +2319,7 @@ export default interface Resources {
     },
     "shortcuts": {
       "backForward": "后退 / 前进",
+      "fileBackForward": "文件内后退 / 前进",
       "interrupt": "中断当前回合（输入框里）",
       "mention": "引用文件",
       "newSession": "新建会话（浏览器里用 Alt+N）",
@@ -2891,9 +2892,9 @@ export default interface Resources {
     "switchToLightTheme": "换成亮色"
   },
   "titleBar": {
-    "backAlt": "后退（Alt+←）",
+    "backAlt": "后退（{{key}}）",
     "close": "关闭",
-    "forwardAlt": "前进（Alt+→）",
+    "forwardAlt": "前进（{{key}}）",
     "hideSidebar": "收起侧边栏（{{mod}}+B）",
     "maximize": "最大化",
     "minimize": "最小化",

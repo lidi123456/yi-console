@@ -19,7 +19,7 @@ import {
   WidgetType,
 } from '@codemirror/view';
 import { closeBrackets, closeBracketsKeymap } from '@codemirror/autocomplete';
-import { defaultKeymap, history, historyKeymap, indentWithTab } from '@codemirror/commands';
+import { history, historyKeymap, indentWithTab } from '@codemirror/commands';
 import { bracketMatching, foldGutter, foldKeymap, indentOnInput, indentUnit, LanguageDescription, syntaxHighlighting } from '@codemirror/language';
 import { highlightSelectionMatches, searchPanelOpen } from '@codemirror/search';
 import { languages } from '@codemirror/language-data';
@@ -28,6 +28,7 @@ import { getT, isEn, useLang } from '../i18n';
 import { detectEol, detectIndent } from '../textFormat';
 import {
   applyGoto,
+  editorDefaultKeymap,
   foldMarker,
    highlight,
   measureSelectionChip,
@@ -989,7 +990,7 @@ export const MergeDiff = forwardRef<
       syntaxHighlighting(highlight),
       keymap.of([
         ...commonKeys,
-        ...(editableSide ? [...closeBracketsKeymap, ...defaultKeymap, ...historyKeymap, ...foldKeymap, indentWithTab] : defaultKeymap),
+        ...(editableSide ? [...closeBracketsKeymap, ...editorDefaultKeymap, ...historyKeymap, ...foldKeymap, indentWithTab] : editorDefaultKeymap),
         ...editorSearchKeymap,
       ]),
       editorSearchExtension(),

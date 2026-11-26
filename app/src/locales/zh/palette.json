@@ -7,6 +7,7 @@
     "switchSession": "上一个 / 下一个会话",
     "switchPrompt": "上一条 / 下一条提问（会话内）",
     "backForward": "后退 / 前进",
+    "fileBackForward": "文件内后退 / 前进",
     "sidebar": "收起 / 展开侧边栏",
     "rename": "重命名当前会话",
     "interrupt": "中断当前回合（输入框里）",
