@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { getT, trErr, useLang } from '../i18n';
-import { errorToast, setHostTools, setToolJob, useStore } from '../store';
+import { errorToast, setHostTools, setToolJob, toast, useStore } from '../store';
 import { rpc } from '../transport';
 import { TOOL_LABEL, supportsAccountsTool, type ToolInfo, type ToolJob, type ToolLatest } from '../types';
 import { lsGet, lsSet } from '../util';
@@ -65,6 +65,25 @@ export function HostTools({ hostId, tools }: { hostId: string; tools: ToolInfo[]
       await rpc(hostId, 'tools.update', { tool: kind });
     } catch (e) {
       errorToast(e);
+    }
+  };
+  const [refreshingModels, setRefreshingModels] = useState<Set<string>>(() => new Set());
+  const refreshModels = async (kind: ToolInfo['kind']) => {
+    setRefreshingModels((s) => new Set(s).add(kind));
+    try {
+      const r = await rpc<{ models: unknown[]; added: number; changed: boolean } | unknown[]>(hostId, 'tools.models', { tool: kind, refresh: true });
+      // An older daemon ignores `refresh` and answers with its saved list
+      if (Array.isArray(r)) throw new Error(tx('needsNewerDaemonForModels'));
+      const tool = TOOL_LABEL[kind];
+      toast(r.added > 0
+        ? tx('modelsRefreshed', { tool, n: r.models.length, m: r.added })
+        : r.changed
+          ? tx('modelsRefreshedChanged', { tool, n: r.models.length })
+          : tx('modelsRefreshedNoChange', { tool, n: r.models.length }));
+    } catch (e) {
+      errorToast(e);
+    } finally {
+      setRefreshingModels((s) => { const next = new Set(s); next.delete(kind); return next; });
     }
   };
   // A finished upgrade changes the installed version: look up again so "update available" goes away
@@ -159,6 +178,13 @@ export function HostTools({ hostId, tools }: { hostId: string; tools: ToolInfo[]
               {!!job?.output?.length && (
                 <button className="btn small" onClick={() => setOpen(open === t.kind ? null : t.kind)}>
                   {showLog ? tx('hideOutput') : tx('showOutput')}
+                </button>
+              )}
+              {t.available && (
+                <button className="btn small" disabled={refreshingModels.has(t.kind)} title={tx('refreshModelsHint')}
+                  onClick={() => void refreshModels(t.kind)}>
+                  {refreshingModels.has(t.kind) ? <span className="spinner" aria-hidden="true" /> : <Icon name="refresh" size={14} />}{' '}
+                  {refreshingModels.has(t.kind) ? tx('refreshingModels') : tx('refreshModels')}
                 </button>
               )}
               {supportsAccountsTool(t.kind) && (

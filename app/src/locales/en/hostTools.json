@@ -19,5 +19,12 @@
   "summaryWithUpdates": "{{n}} installed · {{m}} with updates",
   "accounts": "Accounts",
   "accountsCount": "Accounts ({{n}})",
-  "manageAccounts": "Manage accounts and API keys for this tool"
+  "manageAccounts": "Manage accounts and API keys for this tool",
+  "refreshModels": "Refresh models",
+  "refreshingModels": "Refreshing models…",
+  "refreshModelsHint": "Read this tool's models again; running sessions are updated too",
+  "modelsRefreshed": "{{tool}}: models refreshed, {{n}} in total, {{m}} new",
+  "modelsRefreshedNoChange": "{{tool}}: models refreshed, {{n}} in total, no change",
+  "needsNewerDaemonForModels": "Upgrade yi-agentd on this host to refresh models",
+  "modelsRefreshedChanged": "{{tool}}: models refreshed, {{n}} in total, the list has changed"
 }

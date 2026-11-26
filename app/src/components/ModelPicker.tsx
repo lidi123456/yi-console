@@ -186,6 +186,15 @@ export function ModelPicker({ hostId, info }: { hostId: string; info: SessionInf
     load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [hostId, info.id, info.model]);
+  const refresh = useCallback(async () => {
+    const before = new Set((models ?? []).map((m) => m.id));
+    const r = await rpc<{ current: string | null; models: ModelOption[]; refreshed?: boolean }>(hostId, 'session.models', { sessionId: info.id, refresh: true });
+    setModels(r.models);
+    // An older daemon ignores `refresh` and answers with the list it already had
+    if (!r.refreshed) throw new Error(t('needsNewerDaemonForModels'));
+    // Removed models or changed thinking levels count as a change too
+    return { added: r.models.filter((m) => !before.has(m.id)).length, changed: JSON.stringify(r.models) !== JSON.stringify(models ?? []) };
+  }, [hostId, info.id, models]);
   return (
     <ModelMenu
       tool={info.tool}
@@ -193,6 +202,7 @@ export function ModelPicker({ hostId, info }: { hostId: string; info: SessionInf
       effort={info.effort ?? ''}
       models={models}
       onOpen={load}
+      onRefresh={refresh}
       openEvent
       openEventSessionId={info.id}
       openEventIgnoreGeneric={!!info.sideChat}
@@ -227,6 +237,7 @@ export function ModelMenu({
   onEffort,
   onConfig,
   onCustom,
+  onRefresh,
 }: {
   tool: ToolKind;
   model: string | null | undefined;
@@ -253,8 +264,25 @@ export function ModelMenu({
   onConfig?: (configId: string, value: string) => unknown;
   /** Adds an "Other (type a model)" entry to the model list */
   onCustom?: () => void;
+  /** Shows a refresh button next to the search box: asks the tool for its model list again */
+  onRefresh?: () => Promise<{ added: number; changed: boolean }>;
 }) {
   const [open, setOpen] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
+  const [refreshNote, setRefreshNote] = useState<string | null>(null);
+  const refresh = async () => {
+    if (!onRefresh || refreshing) return;
+    setRefreshing(true);
+    setRefreshNote(null);
+    try {
+      const { added, changed } = await onRefresh();
+      setRefreshNote(added > 0 ? t('modelsRefreshedAdded', { n: added }) : changed ? t('modelsRefreshedChanged') : t('modelsRefreshedNoChange'));
+    } catch (error) {
+      errorToast(error);
+    } finally {
+      setRefreshing(false);
+    }
+  };
   const [mobile, setMobile] = useState(isMobile);
   const [section, setSection] = useState<PickerSection | null>(null);
   const [q, setQ] = useState('');
@@ -269,6 +297,7 @@ export function ModelMenu({
     setOpen(false);
     setSection(null);
     setQ('');
+    setRefreshNote(null);
     if (focus) buttonRef.current?.focus();
   }, []);
   const back = useCallback(() => {
@@ -389,8 +418,18 @@ export function ModelMenu({
   );
   const modelList = (
     <>
-      <input className="model-search" aria-label={t('searchModels')} autoFocus={!sheet} value={q}
-        onChange={(event) => setQ(event.target.value)} placeholder={t('searchModels')} />
+      <div className="model-search-row">
+        <input className="model-search" aria-label={t('searchModels')} autoFocus={!sheet} value={q}
+          onChange={(event) => setQ(event.target.value)} placeholder={t('searchModels')} />
+        {onRefresh && (
+          <button className="icon-btn model-refresh" aria-label={t('refreshModels')} title={t('refreshModels')}
+            aria-busy={refreshing} disabled={refreshing} onClick={() => void refresh()}>
+            {refreshing ? <span className="spinner" aria-hidden="true" /> : <Icon name="refresh" size={15} />}
+          </button>
+        )}
+      </div>
+      {refreshing && <div className="muted small pad-x" role="status">{t('refreshingModels')}</div>}
+      {!refreshing && refreshNote && <div className="muted small pad-x" role="status">{refreshNote}</div>}
       {models === null && <div className="muted small pad-x">{t('loading')}</div>}
       {models?.length === 0 && <div className="muted small pad-x">{t('noModelsReportedYetTry')}</div>}
       {models && models.length > 0 && list.length === 0 && <div className="muted small pad-x">{t('noMatchingModels')}</div>}

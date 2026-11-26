@@ -16,6 +16,12 @@ use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
 
 const TIMEOUT: Duration = Duration::from_secs(30);
+/// A model list on its own (the refresh buttons, the new session page): Cursor's session/new alone can take 30 s,
+/// and someone is waiting for exactly this answer
+const MODELS_TIMEOUT: Duration = Duration::from_secs(90);
+/// Every attempt of one model query together (`Hub::refresh_models` retries Cursor); the client waits 120 s for
+/// `tools.models` / `session.models`, which leaves time to end the process
+pub const MODELS_BUDGET: Duration = Duration::from_secs(100);
 /// How long quota results are cached, to avoid restarting processes on every page switch
 const QUOTA_TTL_MS: i64 = 60_000;
 
@@ -196,10 +202,12 @@ async fn codex(settings: &DaemonSettings, penv: &ProbeEnv, want_quota: bool) -> 
     let mut out = Probe::default();
     let (mut account, mut limits) = (Value::Null, Value::Null);
     let mut requires_auth = false;
+    let mut models_error = None;
     let mut waiting = 0;
     let init = json!({"id":1,"method":"initialize",
         "params":{"clientInfo":{"name":crate::adapters::codex::CLIENT_NAME,"title":"Yi Console","version":DAEMON_VERSION}}});
-    converse_env(ToolKind::Codex, settings, penv, &["app-server"], vec![init], |v| {
+    let timeout = if want_quota { TIMEOUT } else { MODELS_TIMEOUT };
+    converse_in_env(ToolKind::Codex, settings, penv, &["app-server"], &probe_dir(), timeout, vec![init], |v| {
         let Some(id) = v["id"].as_u64().filter(|_| v.get("method").is_none()) else {
             return Step::Wait;
         };
@@ -223,7 +231,10 @@ async fn codex(settings: &DaemonSettings, penv: &ProbeEnv, want_quota: bool) -> 
                 requires_auth = r["requiresOpenaiAuth"].as_bool().unwrap_or(false);
             }
             3 => limits = r["rateLimits"].clone(),
-            4 => out.models = adapters::codex::parse_models(r),
+            4 => match v.get("error") {
+                Some(e) => models_error = Some(e["message"].as_str().map(str::to_string).unwrap_or_else(|| e.to_string())),
+                None => out.models = adapters::codex::parse_models(r),
+            },
             _ => return Step::Wait,
         }
         waiting -= 1;
@@ -241,6 +252,9 @@ async fn codex(settings: &DaemonSettings, penv: &ProbeEnv, want_quota: bool) -> 
     }
     if want_quota {
         out.quota = Some(codex_quota(&account, &limits));
+    } else if let Some(e) = models_error {
+        // Only a model query fails on it; a quota check still has its quota
+        bail!("Codex 读取模型列表失败: {e}");
     }
     Ok(out)
 }
@@ -289,7 +303,8 @@ async fn acp(tool: ToolKind, settings: &DaemonSettings, penv: &ProbeEnv, want_qu
     // Every session Qoder creates shows up in its history, so delete it after asking
     let delete = tool == ToolKind::Qoder;
     let explicit_auth = penv.auth_method.clone();
-    converse_env(tool, settings, penv, &[adapters::acp::acp_arg(tool)], vec![init], |v| {
+    let timeout = if want_quota { TIMEOUT } else { MODELS_TIMEOUT };
+    converse_in_env(tool, settings, penv, &[adapters::acp::acp_arg(tool)], &probe_dir(), timeout, vec![init], |v| {
         let Some(id) = v["id"].as_u64().filter(|_| v.get("method").is_none()) else {
             return Step::Wait;
         };
@@ -2022,17 +2037,43 @@ fn enrich_quota(mut v: Value, tool: ToolKind, penv: &ProbeEnv, at: i64) -> Value
     v
 }
 
-pub async fn models(hub: &Arc<Hub>, tool: ToolKind, settings: &DaemonSettings) -> Result<Vec<ModelOption>> {
-    let resolved = hub.accounts.resolve(tool, None);
-    if tool == ToolKind::Cursor {
-        if let Some(res) = &resolved {
-            if res.auth_kind == AccountAuthKind::Oauth {
-                hub.accounts.ensure_cursor_oauth_host_clean(&res.id)?;
-            }
+/// The tool's models from a short-lived process on `account`, already resolved by the caller (`Hub::model_account`)
+/// so the answer is saved for the account it came from; `None` = the system login
+pub async fn models(hub: &Arc<Hub>, tool: ToolKind, settings: &DaemonSettings, account: Option<&str>) -> Result<Vec<ModelOption>> {
+    let resolved = match account {
+        Some(id) => Some(hub.accounts.resolve_exact(tool, id).ok_or_else(|| anyhow!("账号 {id} 不存在"))?),
+        None => None,
+    };
+    let host_active = resolved.as_ref().filter(|r| r.isolation == AccountIsolation::HostActive).map(|r| r.id.clone());
+    if let Some(res) = &resolved {
+        // A system-wide account that isn't the active one has no credentials of its own here: the process would
+        // read the active account's (and Cursor's cleanup below would put this one's snapshot on the host)
+        if host_active.is_some() && hub.accounts.active_account_id(tool).as_deref() != Some(res.id.as_str()) {
+            bail!("{} 是系统级单活账号，切换为当前账号后才能读取它的模型列表", res.label);
+        }
+        if tool == ToolKind::Cursor && res.auth_kind == AccountAuthKind::Oauth && !hub.has_running_host_session(ToolKind::Cursor) {
+            hub.accounts.ensure_cursor_oauth_host_clean(&res.id)?;
         }
     }
+    // The process reads the host's credentials whenever it likes: they must be this account's the whole time.
+    // Every write of them bumps the epoch (also a switch away and back), and a sign-in may be writing them too
+    let host_changed = |epoch: u64| {
+        host_active.as_deref().is_some_and(|id| {
+            hub.accounts.active_account_id(tool).as_deref() != Some(id)
+                || hub.accounts.host_epoch(tool) != epoch
+                || hub.logins.login_running(tool)
+        })
+    };
+    let epoch = hub.accounts.host_epoch(tool);
+    if host_changed(epoch) {
+        bail!("{} 正在切换账号或登录，完成后再读取模型列表", tool.as_str());
+    }
     let penv = resolved.as_ref().map(ProbeEnv::from_resolved).unwrap_or_default();
-    Ok(run_with_env(tool, settings, &penv, false).await?.models)
+    let models = run_with_env(tool, settings, &penv, false).await?.models;
+    if host_changed(epoch) {
+        bail!("读取模型列表期间切换了当前账号，结果已丢弃，请重试");
+    }
+    Ok(models)
 }
 
 /// Account quota: {tool, accountId?, accountLabel?, account:{email,plan}, windows:[{label,usedPercent,resetsAt,detail?}], note?, fetchedAt}
@@ -2117,7 +2158,7 @@ pub async fn quota(
         }
     };
     if !p.models.is_empty() {
-        hub.remember_models(tool, &p.models);
+        hub.remember_models_for(tool, effective_id.as_deref(), &p.models);
     }
     let raw_v = p
         .quota

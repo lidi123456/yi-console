@@ -105,8 +105,10 @@ struct State {
     can_resume: bool,
     /// Model switch requested before the session was created
     want_model: Option<String>,
-    /// Model being switched to; recorded on the session once it succeeds
+    /// Target of the `session/set_model` in flight. One at a time, so answers can't arrive out of order
     switching: Option<String>,
+    /// The latest pick made while a switch was in flight; sent once that one answers (earlier picks are skipped)
+    queued_model: Option<String>,
     /// Cursor's parameterized picker is negotiated per process. Config changes run in order before prompts.
     parameterized: bool,
     config_options: Vec<ModelConfigOption>,
@@ -120,6 +122,9 @@ struct State {
     model_retried: bool,
     /// The model switch failed twice; tried again before the next prompt
     model_failed: Option<String>,
+    /// The model the tool confirmed it is on (`session/new`, then each successful `session/set_model`); a failed
+    /// switch puts the session back on it. Cursor's parameterized sessions use `config_model` instead
+    model_current: Option<String>,
     /// The model was switched before the session existed, so the parameters saved at launch belong to the old one
     spec_params_stale: bool,
     seg: Option<(Seg, String, String)>,
@@ -397,6 +402,7 @@ pub async fn run(spec: StartSpec, em: Emitter, mut rx: mpsc::UnboundedReceiver<A
                     Ok(outs) => for out in outs { let _ = p.send(&out).await; },
                     Err(msg) => { fatal = Some(msg); killed = true; break; }
                 }
+                if let Some(m) = next_model(&mut st) { let _ = p.send(&m).await; }
                 if let Some(m) = next_config(&mut st) { let _ = p.send(&m).await; }
                 if let Some(m) = next_effort(&mut st) { let _ = p.send(&m).await; }
                 if st.ready_to_prompt() && !st.queue.is_empty() {
@@ -462,8 +468,7 @@ pub async fn run(spec: StartSpec, em: Emitter, mut rx: mpsc::UnboundedReceiver<A
                         if st.parameterized {
                             st.config_queue.push(("model".into(), base_model(&model).into()));
                             if let Some(m) = next_config(&mut st) { let _ = p.send(&m).await; }
-                        } else {
-                            let m = set_model(&mut st, &model);
+                        } else if let Some(m) = request_model(&mut st, model) {
                             let _ = p.send(&m).await;
                         }
                     } else {
@@ -591,7 +596,8 @@ pub fn client_capabilities(tool: ToolKind) -> Value {
 }
 
 fn config_pending(st: &State) -> bool {
-    !st.config_queue.is_empty() || st.pending.values().any(|p| matches!(p, Pending::SetModel | Pending::SetConfig | Pending::SetEffort))
+    !st.config_queue.is_empty() || st.queued_model.is_some()
+        || st.pending.values().any(|p| matches!(p, Pending::SetModel | Pending::SetConfig | Pending::SetEffort))
 }
 
 /// Antigravity: record the `thought_level` option from a configOptions list (absent: the model has no levels)
@@ -850,6 +856,25 @@ fn set_model(st: &mut State, model: &str) -> Value {
         "session/set_model",
         json!({"sessionId":sid,"modelId":model}),
     )
+}
+
+/// A model picked by the user: sent now, or after the switch in flight answers (only the latest pick is kept)
+fn request_model(st: &mut State, model: String) -> Option<Value> {
+    if st.switching.is_some() {
+        st.queued_model = Some(model);
+        return None;
+    }
+    st.queued_model = None;
+    Some(set_model(st, &model))
+}
+
+/// The pick that waited for the previous switch to answer
+fn next_model(st: &mut State) -> Option<Value> {
+    if st.switching.is_some() || st.session_id.is_none() {
+        return None;
+    }
+    let model = st.queued_model.take()?;
+    Some(set_model(st, &model))
 }
 
 fn extract_agy_user_text(raw: &str) -> String {
@@ -1397,11 +1422,21 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Result<V
                     Ok(out)
                 }
                 Pending::SetModel => {
-                    st.switching = None;
+                    let target = st.switching.take().unwrap_or_default();
+                    // The user picked again meanwhile: that pick goes next and decides the model
+                    if st.queued_model.is_some() {
+                        return Ok(out);
+                    }
                     if spec.tool == ToolKind::Cursor { em.model_config_settled(); }
-                    em.event(EventBody::Error {
-                        message: format!("切换模型失败: {msg}"),
-                    });
+                    // The process stays on its model: show that one again, the session would otherwise claim the new
+                    // one. Only while the session still names the rejected model: a newer pick may be on its way here
+                    let message = match st.model_current.clone().filter(|c| *c != target) {
+                        Some(current) if em.model_replaced(&target, &current) => {
+                            format!("切换模型失败，仍在使用 {current}（刚刷新出的模型可能要停止进程后再发消息才能用）: {msg}")
+                        }
+                        _ => format!("切换模型失败: {msg}"),
+                    };
+                    em.event(EventBody::Error { message });
                     Ok(out)
                 }
                 Pending::SetEffort => {
@@ -1414,6 +1449,11 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Result<V
                 Pending::SetConfig => {
                     let (id, value) = st.config_inflight.take().unwrap_or_default();
                     if id == "model" {
+                        // The user picked again meanwhile (`SetModel` queued that pick): this one is simply dropped
+                        if st.config_queue.iter().any(|(k, _)| k == "model") {
+                            st.model_retried = false;
+                            return Ok(out);
+                        }
                         // Cursor asks its server for the model list on every switch and reports a failed request as
                         // "Invalid model value", so one retry usually goes through
                         if !st.model_retried {
@@ -1424,9 +1464,28 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Result<V
                         st.model_retried = false;
                         // The queued parameters were for that model; they go again with the next attempt
                         st.config_queue.retain(|(k, _)| k == "model");
-                        st.model_failed = Some(value);
-                        em.model_config_settled();
-                        em.event(EventBody::Error { message: format!("切换模型失败，发下一条消息时会再试: {msg}") });
+                        match st.config_model.clone().filter(|c| *c != value) {
+                            // Cursor stays on another model: the session goes back to it, with its parameters, and
+                            // nothing is retried behind the user's back (the session no longer names the new model)
+                            Some(current) => {
+                                st.config_queue.clear();
+                                st.wanted.clear();
+                                // Cursor's own values for its model: the session's were picked for the rejected one.
+                                // Not when the session names another model by now: that pick is on its way here
+                                let message = if em.model_config_restored(&value, &current, st.config_options.clone()) {
+                                    format!("切换模型失败，仍在使用 {current}（刚刷新出的模型可能要停止进程后再发消息才能用）: {msg}")
+                                } else {
+                                    format!("切换模型失败: {msg}")
+                                };
+                                em.event(EventBody::Error { message });
+                            }
+                            // Switching to the model Cursor is already on only reads its parameters: try again later
+                            None => {
+                                em.model_config_settled();
+                                st.model_failed = Some(value);
+                                em.event(EventBody::Error { message: format!("切换模型失败，发下一条消息时会再试: {msg}") });
+                            }
+                        }
                     } else {
                         st.wanted.retain(|(k, _)| *k != id);
                         let actual = st.config_options.iter().find(|o| o.id == id).map(|o| o.current_value.clone()).unwrap_or_default();
@@ -1573,6 +1632,7 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Result<V
                             }
                         }
                     }
+                    st.model_current = current.clone();
                     match (want.filter(|w| listed(w)), &current) {
                         (Some(w), c) if c.as_deref() != Some(w.as_str()) => out.push(set_model(st, &w)),
                         (_, Some(c)) => em.model(c),
@@ -1763,6 +1823,7 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Result<V
             }
             Pending::SetModel => {
                 if let Some(m) = st.switching.take() {
+                    st.model_current = Some(m.clone());
                     if st.is_antigravity {
                         st.agy_model = Some(m.clone());
                         read_thought_level(st, r);
@@ -1770,7 +1831,11 @@ fn handle(st: &mut State, spec: &StartSpec, v: &Value, em: &Emitter) -> Result<V
                             st.effort = None;
                         }
                     }
-                    em.model(&m);
+                    // The session already names it (the hub records a pick before sending it); a newer pick, queued
+                    // here or still on its way, keeps the session on that one
+                    if st.queued_model.is_none() {
+                        em.model_replaced(&m, &m);
+                    }
                 }
                 if spec.tool == ToolKind::Cursor { em.model_config_settled(); }
             }
@@ -5871,7 +5936,7 @@ mod model_config_tests {
             replay_skip: 0, model: Some(model.into()), effort: None, model_config_options: vec![],
             permission_mode: "default".into(), command: None, program: "cursor-agent".into(), extra_args: vec![],
             mcp_servers: vec![], mcp_fingerprint: String::new(), allow_mcp: vec![], system_prompt: None, system_notice: false, memory_prompt: None, memory_notice: false, cols: 80, rows: 24, tmux: None, session_id: None,
-            env: Default::default(), env_unset: vec![], data_dir: None, auth_method: None, account_handoff: None, fork_session: false, fork_fallback_handoff: None, read_only_review: false,
+            env: Default::default(), env_unset: vec![], account_id: None, data_dir: None, auth_method: None, account_handoff: None, fork_session: false, fork_fallback_handoff: None, read_only_review: false,
         }
     }
 
@@ -5962,6 +6027,176 @@ mod model_config_tests {
         }
     }
 
+    fn session_model(hub: &std::sync::Arc<crate::hub::Hub>) -> Option<String> {
+        hub.session_models("s").unwrap()["current"].as_str().map(str::to_string)
+    }
+
+    #[test]
+    fn a_rejected_model_switch_puts_the_session_back_on_the_tools_model() {
+        let (hub, em, _rx) = crate::hub::test_emitter();
+        let spec = StartSpec { tool: ToolKind::Kiro, model: None, program: "kiro-cli".into(), ..cursor_spec("") };
+        let mut st = State { session_id: Some("ext".into()), model_current: Some("claude-old".into()), ..Default::default() };
+        // The hub already recorded the user's pick before the process answers
+        em.model("claude-new");
+        let req = set_model(&mut st, "claude-new");
+        let fail = json!({"id":req["id"],"error":{"code":-32602,"message":"Invalid params","data":{"message":"unknown model"}}});
+        handle(&mut st, &spec, &fail, &em).unwrap();
+        assert_eq!(session_model(&hub).as_deref(), Some("claude-old"));
+        // A later successful switch is what the session goes back to next time
+        em.model("claude-other");
+        let req = set_model(&mut st, "claude-other");
+        handle(&mut st, &spec, &json!({"id":req["id"],"result":{}}), &em).unwrap();
+        assert_eq!(st.model_current.as_deref(), Some("claude-other"));
+        assert_eq!(session_model(&hub).as_deref(), Some("claude-other"));
+    }
+
+    #[test]
+    fn cursor_rolls_back_a_switch_to_another_model_instead_of_retrying_it() {
+        let (hub, em, _rx) = crate::hub::test_emitter();
+        crate::hub::test_set_tool(&hub, "s", ToolKind::Cursor);
+        let spec = cursor_spec("gpt-6");
+        let mut st = State { is_cursor: true, parameterized: true, session_id: Some("ext".into()),
+            config_model: Some("gpt-6".into()), ..Default::default() };
+        em.model("grok-9");
+        st.config_queue.push(("model".into(), "grok-9".into()));
+        let fail = |id: &Value| json!({"id":id,"error":{"code":-32602,"message":"Invalid params","data":{"message":"Invalid model value: grok-9"}}});
+        let switch = next_config(&mut st).unwrap();
+        handle(&mut st, &spec, &fail(&switch["id"]), &em).unwrap();
+        let again = next_config(&mut st).unwrap();
+        handle(&mut st, &spec, &fail(&again["id"]), &em).unwrap();
+        assert_eq!(session_model(&hub).as_deref(), Some("gpt-6"));
+        assert!(st.model_failed.is_none(), "the next prompt must not switch to a model the session no longer names");
+        assert!(st.config_queue.is_empty());
+    }
+
+    #[test]
+    fn a_failed_cursor_switch_leaves_a_newer_pick_alone() {
+        let (hub, em, _rx) = crate::hub::test_emitter();
+        crate::hub::test_set_tool(&hub, "s", ToolKind::Cursor);
+        let spec = cursor_spec("gpt-6");
+        let mut st = State { is_cursor: true, parameterized: true, session_id: Some("ext".into()),
+            config_model: Some("gpt-6".into()), ..Default::default() };
+        st.config_queue.push(("model".into(), "grok-9".into()));
+        let switch = next_config(&mut st).unwrap();
+        // The user picks another model while that switch is in flight (what `SetModel` does)
+        em.model("claude-9");
+        st.config_queue.clear();
+        st.config_queue.push(("model".into(), "claude-9".into()));
+        let fail = json!({"id":switch["id"],"error":{"code":-32602,"message":"Invalid params","data":{"message":"Invalid model value: grok-9"}}});
+        handle(&mut st, &spec, &fail, &em).unwrap();
+        assert_eq!(session_model(&hub).as_deref(), Some("claude-9"));
+        assert_eq!(next_config(&mut st).unwrap()["params"]["value"], "claude-9");
+    }
+
+    #[test]
+    fn a_cursor_rollback_shows_the_values_cursor_runs_with() {
+        let (hub, em, _rx) = crate::hub::test_emitter();
+        crate::hub::test_set_tool(&hub, "s", ToolKind::Cursor);
+        let spec = cursor_spec("gpt-6");
+        let option = |value: &str| ModelConfigOption { id: "reasoning".into(), name: "Reasoning".into(), description: String::new(),
+            category: "thought_level".into(), current_value: value.into(),
+            options: ["low", "high"].iter().map(|v| ModelConfigValue { value: (*v).into(), name: (*v).into() }).collect() };
+        let mut st = State { is_cursor: true, parameterized: true, session_id: Some("ext".into()),
+            config_model: Some("gpt-6".into()), config_options: vec![option("low")], ..Default::default() };
+        // The session already carries the rejected model and the value picked for it
+        crate::hub::test_set_model(&hub, "s", "grok-9", vec![option("high")]);
+        st.config_queue.push(("model".into(), "grok-9".into()));
+        let fail = |id: &Value| json!({"id":id,"error":{"code":-32602,"message":"Invalid params","data":{"message":"Invalid model value: grok-9"}}});
+        let switch = next_config(&mut st).unwrap();
+        handle(&mut st, &spec, &fail(&switch["id"]), &em).unwrap();
+        let again = next_config(&mut st).unwrap();
+        handle(&mut st, &spec, &fail(&again["id"]), &em).unwrap();
+        let info = crate::hub::test_info(&hub, "s");
+        assert_eq!(info.model.as_deref(), Some("gpt-6"));
+        assert_eq!(info.model_config_options[0].current_value, "low");
+    }
+
+    fn kiro_spec() -> StartSpec {
+        StartSpec { tool: ToolKind::Kiro, model: None, program: "kiro-cli".into(), ..cursor_spec("") }
+    }
+
+    #[test]
+    fn model_switches_go_one_at_a_time_and_only_the_latest_pick_waits() {
+        let (hub, em, _rx) = crate::hub::test_emitter();
+        let spec = kiro_spec();
+        let mut st = State { session_id: Some("ext".into()), model_current: Some("m0".into()), ..Default::default() };
+        // The hub records each pick before handing it to the adapter
+        em.model("m-a");
+        let a = request_model(&mut st, "m-a".into()).unwrap();
+        em.model("m-b");
+        assert!(request_model(&mut st, "m-b".into()).is_none(), "waits for the switch in flight");
+        em.model("m-c");
+        assert!(request_model(&mut st, "m-c".into()).is_none());
+        assert!(config_pending(&st), "no prompt goes before the queued switch");
+        // A answers: the process is on A, the session keeps naming the latest pick
+        handle(&mut st, &spec, &json!({"id":a["id"],"result":{}}), &em).unwrap();
+        assert_eq!(st.model_current.as_deref(), Some("m-a"));
+        assert_eq!(session_model(&hub).as_deref(), Some("m-c"));
+        let c = next_model(&mut st).unwrap();
+        assert_eq!(c["params"]["modelId"], "m-c", "B was skipped");
+        assert!(next_model(&mut st).is_none());
+        // C is rejected: back to the model the process confirmed
+        handle(&mut st, &spec, &json!({"id":c["id"],"error":{"code":-32602,"message":"unknown model"}}), &em).unwrap();
+        assert_eq!(session_model(&hub).as_deref(), Some("m-a"));
+    }
+
+    #[test]
+    fn a_rejected_switch_leaves_a_pick_still_on_its_way_alone() {
+        let (hub, em, _rx) = crate::hub::test_emitter();
+        let spec = kiro_spec();
+        let mut st = State { session_id: Some("ext".into()), model_current: Some("m0".into()), ..Default::default() };
+        em.model("m-a");
+        let a = request_model(&mut st, "m-a".into()).unwrap();
+        // The hub recorded B; its command hasn't reached the adapter yet
+        em.model("m-b");
+        handle(&mut st, &spec, &json!({"id":a["id"],"error":{"code":-32602,"message":"unknown model"}}), &em).unwrap();
+        assert_eq!(session_model(&hub).as_deref(), Some("m-b"));
+        // Nor does A's success take the session off B
+        em.model("m-c");
+        let c = request_model(&mut st, "m-c".into()).unwrap();
+        em.model("m-d");
+        handle(&mut st, &spec, &json!({"id":c["id"],"result":{}}), &em).unwrap();
+        assert_eq!(session_model(&hub).as_deref(), Some("m-d"));
+    }
+
+    #[test]
+    fn a_cursor_rollback_leaves_a_pick_still_on_its_way_alone() {
+        let (hub, em, _rx) = crate::hub::test_emitter();
+        crate::hub::test_set_tool(&hub, "s", ToolKind::Cursor);
+        let spec = cursor_spec("gpt-6");
+        let mut st = State { is_cursor: true, parameterized: true, session_id: Some("ext".into()),
+            config_model: Some("gpt-6".into()), ..Default::default() };
+        em.model("grok-9");
+        st.config_queue.push(("model".into(), "grok-9".into()));
+        let fail = |id: &Value| json!({"id":id,"error":{"code":-32602,"message":"Invalid params","data":{"message":"Invalid model value: grok-9"}}});
+        let switch = next_config(&mut st).unwrap();
+        handle(&mut st, &spec, &fail(&switch["id"]), &em).unwrap();
+        let again = next_config(&mut st).unwrap();
+        // The hub recorded another pick before the adapter queued it
+        em.model("claude-9");
+        handle(&mut st, &spec, &fail(&again["id"]), &em).unwrap();
+        assert_eq!(session_model(&hub).as_deref(), Some("claude-9"));
+    }
+
+    #[test]
+    fn a_cursor_rollback_without_reported_values_caches_nothing() {
+        let (hub, em, _rx) = crate::hub::test_emitter();
+        crate::hub::test_set_tool(&hub, "s", ToolKind::Cursor);
+        let spec = cursor_spec("gpt-6");
+        // session/new listed only the model: no values for gpt-6 yet
+        let mut st = State { is_cursor: true, parameterized: true, session_id: Some("ext".into()),
+            config_model: Some("gpt-6".into()), ..Default::default() };
+        em.model("grok-9");
+        st.config_queue.push(("model".into(), "grok-9".into()));
+        let fail = |id: &Value| json!({"id":id,"error":{"code":-32602,"message":"Invalid params","data":{"message":"Invalid model value: grok-9"}}});
+        let switch = next_config(&mut st).unwrap();
+        handle(&mut st, &spec, &fail(&switch["id"]), &em).unwrap();
+        let again = next_config(&mut st).unwrap();
+        handle(&mut st, &spec, &fail(&again["id"]), &em).unwrap();
+        assert_eq!(session_model(&hub).as_deref(), Some("gpt-6"));
+        assert!(hub.store.model_config("gpt-6").unwrap().is_none(), "an unknown parameter list is not cached as empty");
+    }
+
     #[test]
     fn cursor_start_switches_explicitly_and_retries_a_failed_switch() {
         let (hub, em, _rx) = crate::hub::test_emitter();
@@ -6007,10 +6242,10 @@ mod model_config_tests {
         // A short answer (Cursor's own model request failed) neither replaces the saved list nor limits the session
         let many: Vec<_> = (0..32).map(|i| ModelOption { id: format!("m{i}"), name: format!("M{i}"), description: String::new(),
             resolved: String::new(), efforts: vec![], default_effort: String::new() }).collect();
-        hub.remember_models(ToolKind::Cursor, &many);
+        hub.remember_models_for(ToolKind::Cursor, None, &many);
         crate::hub::test_set_tool(&hub, "s", ToolKind::Cursor);
         _em.models(parse_models(&r));
-        assert_eq!(hub.cached_models(ToolKind::Cursor).len(), 32);
+        assert_eq!(hub.cached_models(ToolKind::Cursor, None).len(), 32);
         assert_eq!(hub.session_models("s").unwrap()["models"].as_array().unwrap().len(), 32);
     }
 
@@ -6210,6 +6445,7 @@ mod model_config_tests {
             tmux: None,
             env: std::collections::BTreeMap::new(),
             env_unset: vec![],
+            account_id: None,
             data_dir: None,
             auth_method: None,
             account_handoff: None,
@@ -6432,6 +6668,7 @@ mod model_config_tests {
             session_id: None,
             env: Default::default(),
             env_unset: vec![],
+            account_id: None,
             data_dir: None,
             auth_method: None,
             account_handoff: None,

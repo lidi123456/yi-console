@@ -2556,6 +2556,22 @@ textarea {
   font-size: inherit;
 }
 
+.model-search-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.model-search-row .model-search {
+  flex: 1;
+}
+
+.model-refresh {
+  flex: none;
+  width: 30px;
+  height: 30px;
+}
+
 .model-settings .model-setting-row {
   display: flex;
   align-items: center;

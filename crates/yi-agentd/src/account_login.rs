@@ -398,8 +398,15 @@ impl LoginManager {
 
     fn restore_host_keyring(&self, job: &LoginJob) {
         if let Some(entries) = job.keyring_backup.lock().unwrap().take() {
+            self.accounts.bump_host_epoch(job.tool);
             let _ = crate::keyring::restore_tool(job.tool, &entries);
+            self.accounts.bump_host_epoch(job.tool);
         }
+    }
+
+    /// A sign-in of `tool` is running: for a system-wide tool its CLI may be writing the host's credentials
+    pub fn login_running(&self, tool: ToolKind) -> bool {
+        self.jobs.lock().unwrap().values().any(|j| j.tool == tool && j.state.lock().unwrap().running)
     }
 
     fn resolve_env(&self, job: &LoginJob) -> (Vec<(&'static str, String)>, Vec<&'static str>) {

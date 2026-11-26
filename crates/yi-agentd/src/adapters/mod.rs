@@ -184,6 +184,8 @@ pub struct StartSpec {
     pub env: std::collections::BTreeMap<String, String>,
     /// Conflicting environment variables to unset for the spawned process
     pub env_unset: Vec<String>,
+    /// The account `env` was built from (`None` = the system login): what the process's reports belong to
+    pub account_id: Option<String>,
     /// Profile-local data/config directory when isolated
     #[allow(dead_code)]
     pub data_dir: Option<PathBuf>,

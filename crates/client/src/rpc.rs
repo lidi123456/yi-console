@@ -146,7 +146,9 @@ impl RpcConn {
 
     pub async fn call(&self, method: &str, params: Value) -> Result<Value> {
         let timeout = match method {
-            "history.list" | "history.read" | "session.history" | "session.create" | "hello" | "tools.detect" => 120,
+            // Model lists may start the tool to ask it (`probe::MODELS_BUDGET`, 100 s)
+            "history.list" | "history.read" | "session.history" | "session.create" | "hello" | "tools.detect"
+            | "tools.models" | "session.models" => 120,
             _ => 60,
         };
         self.call_timeout(method, params, Duration::from_secs(timeout)).await

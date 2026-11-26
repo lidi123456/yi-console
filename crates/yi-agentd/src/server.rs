@@ -1143,8 +1143,12 @@ pub async fn dispatch(
         }
         SESSION_MODELS => {
             let sid = s(&p, "sessionId")?.to_string();
-            let hub2 = hub.clone();
-            tokio::task::spawn_blocking(move || hub2.session_models(&sid)).await??
+            if p["refresh"].as_bool() == Some(true) {
+                hub.refresh_session_models(&sid).await?
+            } else {
+                let hub2 = hub.clone();
+                tokio::task::spawn_blocking(move || hub2.session_models(&sid)).await??
+            }
         }
         SESSION_SET_MODEL => {
             let sid = s(&p, "sessionId")?.to_string();
@@ -1194,13 +1198,21 @@ pub async fn dispatch(
         }
         TOOLS_MODELS => {
             let tool = ToolKind::parse(s(&p, "tool")?).ok_or_else(|| anyhow!("未知工具"))?;
-            let cached = hub.cached_models(tool);
-            if cached.is_empty() {
-                // This tool hasn't been used yet: start a temporary process to ask
+            // The new session page's account, the tool's active one when absent; resolved once, so reading, probing
+            // and saving all use the same account even if the active one changes meanwhile
+            let account = hub.model_account(tool, p["accountId"].as_str().filter(|s| !s.is_empty()));
+            let cached = hub.saved_or_fallback(tool, account.as_deref());
+            if p["refresh"].as_bool() == Some(true) {
+                // The host settings' refresh button: `added` counts ids the saved list lacked, `changed` is any difference
+                let models = hub.refresh_models(tool, account).await?;
+                let added = models.iter().filter(|m| !cached.iter().any(|c| c.id == m.id)).count();
+                json!({ "models": models, "added": added, "changed": models != cached })
+            } else if !hub.has_saved_models(tool, account.as_deref()) {
+                // This tool hasn't been used on this account yet: start a temporary process to ask
                 let settings = hub.settings.read().unwrap().clone();
-                let models = crate::probe::models(hub, tool, &settings).await.unwrap_or_default();
-                hub.remember_models(tool, &models);
-                serde_json::to_value(models)?
+                let models = crate::probe::models(hub, tool, &settings, account.as_deref()).await.unwrap_or_default();
+                hub.remember_models_for(tool, account.as_deref(), &models);
+                serde_json::to_value(if models.is_empty() { cached } else { hub.saved_or_fallback(tool, account.as_deref()) })?
             } else {
                 serde_json::to_value(cached)?
             }

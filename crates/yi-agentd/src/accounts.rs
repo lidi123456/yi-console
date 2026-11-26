@@ -253,6 +253,9 @@ pub struct AccountManager {
     data: Mutex<AccountsFile>,
     runtime: Mutex<HashMap<(ToolKind, String), (AccountState, Option<String>)>>,
     host_lock: Mutex<()>,
+    /// Per tool, bumped before and after every write of the host's live credentials: a reader that saw the same
+    /// value before and after knows they weren't replaced meanwhile
+    host_epoch: Mutex<HashMap<ToolKind, u64>>,
     /// Host environment as seen by tests (None: the real one, `tools::host_env_var`)
     test_env: Mutex<Option<HashMap<String, String>>>,
 }
@@ -274,6 +277,7 @@ impl AccountManager {
             data: Mutex::new(data),
             runtime: Mutex::new(HashMap::new()),
             host_lock: Mutex::new(()),
+            host_epoch: Mutex::new(HashMap::new()),
             test_env: Mutex::new(None),
         }
     }
@@ -857,6 +861,17 @@ impl AccountManager {
             }
         };
         Some(self.build_resolved(&acc))
+    }
+
+    /// The id `resolve` would pick, without building the launch environment (which may write profile files)
+    pub fn resolve_id(&self, tool: ToolKind, requested_account_id: Option<&str>) -> Option<String> {
+        if !tool.supports_accounts() {
+            return None;
+        }
+        let g = self.data.lock().unwrap();
+        let td = g.tools.get(tool.as_str())?;
+        let id = requested_account_id.or(td.active_account_id.as_deref())?;
+        td.accounts.iter().find(|a| a.id == id).map(|a| a.id.clone())
     }
 
     pub fn resolve_exact(&self, tool: ToolKind, account_id: &str) -> Option<ResolvedAccount> {
@@ -2253,7 +2268,23 @@ impl AccountManager {
         Ok(())
     }
 
+    /// See `host_epoch`
+    pub fn host_epoch(&self, tool: ToolKind) -> u64 {
+        self.host_epoch.lock().unwrap().get(&tool).copied().unwrap_or(0)
+    }
+
+    pub fn bump_host_epoch(&self, tool: ToolKind) {
+        *self.host_epoch.lock().unwrap().entry(tool).or_insert(0) += 1;
+    }
+
     fn restore_host_snapshot_unlocked(&self, tool: ToolKind, snap: &SnapshotBundle) -> Result<()> {
+        self.bump_host_epoch(tool);
+        let r = self.write_host_snapshot_unlocked(tool, snap);
+        self.bump_host_epoch(tool);
+        r
+    }
+
+    fn write_host_snapshot_unlocked(&self, tool: ToolKind, snap: &SnapshotBundle) -> Result<()> {
         // The database first: it's the step that can fail (locked), before any file is touched
         self.restore_db_rows(tool, &snap.db_rows)?;
         for (rel, abs) in self.host_auth_paths(tool) {
@@ -4721,5 +4752,21 @@ mod tests {
         assert!(oauth_text.contains("\"model_provider\":\"openai\""), "{oauth_text}");
         assert!(oauth_text.contains("\"model_provider_id\":\"openai\""), "{oauth_text}");
         assert!(oauth_text.contains("\"type\":\"extra\""), "{oauth_text}");
+    }
+}
+
+
+#[cfg(test)]
+mod host_epoch_tests {
+    use super::*;
+
+    #[test]
+    fn writing_host_credentials_moves_the_epoch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let m = AccountManager::with_dirs(tmp.path().join("base"), tmp.path().join("home"));
+        let before = m.host_epoch(ToolKind::Antigravity);
+        let _ = m.restore_host_snapshot(ToolKind::Antigravity, &SnapshotBundle::default());
+        assert_ne!(m.host_epoch(ToolKind::Antigravity), before);
+        assert_eq!(m.host_epoch(ToolKind::Claude), 0, "per tool");
     }
 }

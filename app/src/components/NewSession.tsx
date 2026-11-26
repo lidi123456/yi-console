@@ -344,18 +344,20 @@ export function NewSessionPage({ params }: { params: NewSessionParams }) {
     };
   }, [hostId, tool, connected, bot]);
 
-  // The tool's available models: returned directly if yi-agentd has them cached, otherwise it starts the tool once to ask (a few seconds)
+  // The tool's available models on the chosen account: returned directly if yi-agentd has them saved, otherwise it
+  // starts the tool once to ask (a few seconds)
+  const modelAccount = !bot && accountId ? accountId : undefined;
   useEffect(() => {
     setModels(null);
     if (!hostId || !aiTool || !connected) return;
     let alive = true;
-    rpc<ModelOption[]>(hostId, 'tools.models', { tool })
+    rpc<ModelOption[]>(hostId, 'tools.models', { tool, accountId: modelAccount })
       .then((m) => alive && setModels(m))
       .catch(() => alive && setModels([]));
     return () => {
       alive = false;
     };
-  }, [hostId, tool, aiTool, connected]);
+  }, [hostId, tool, aiTool, connected, modelAccount]);
 
   // Cursor model parameters: cached by the host, else read from Cursor once (a few seconds). The directory only helps
   // Cursor start, so changing it doesn't ask again

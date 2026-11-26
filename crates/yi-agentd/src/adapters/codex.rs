@@ -1564,6 +1564,7 @@ mod tests {
             session_id: None,
             env: Default::default(),
             env_unset: vec![],
+            account_id: None,
             data_dir: None,
             auth_method: None,
             account_handoff: None,

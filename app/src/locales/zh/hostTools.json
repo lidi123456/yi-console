@@ -19,5 +19,12 @@
   "summaryWithUpdates": "已安装 {{n}} 个 · {{m}} 个有新版本",
   "accounts": "账号",
   "accountsCount": "账号 ({{n}})",
-  "manageAccounts": "管理此工具的账号与 API Key"
+  "manageAccounts": "管理此工具的账号与 API Key",
+  "refreshModels": "刷新模型",
+  "refreshingModels": "正在刷新模型…",
+  "refreshModelsHint": "重新读取这个工具的可选模型，正在运行的会话也会更新",
+  "modelsRefreshed": "{{tool}}：已刷新模型，共 {{n}} 个，新增 {{m}} 个",
+  "modelsRefreshedNoChange": "{{tool}}：已刷新模型，共 {{n}} 个，没有变化",
+  "needsNewerDaemonForModels": "升级这台主机的 yi-agentd 后才能刷新模型",
+  "modelsRefreshedChanged": "{{tool}}：已刷新模型，共 {{n}} 个，列表有变化"
 }

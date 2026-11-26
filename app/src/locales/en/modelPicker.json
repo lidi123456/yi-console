@@ -20,5 +20,11 @@
   "backToModelSettings": "Back to model settings",
   "noMatchingModels": "No matching models",
   "loadingModelParameters": "Reading this model’s parameters…",
-  "otherModel": "Other (type a model)…"
+  "otherModel": "Other (type a model)…",
+  "refreshModels": "Refresh model list",
+  "refreshingModels": "Asking the tool for its models again…",
+  "modelsRefreshedAdded": "Refreshed: {{n}} new models",
+  "modelsRefreshedNoChange": "Refreshed: the model list hasn't changed",
+  "needsNewerDaemonForModels": "Upgrade yi-agentd on this host to refresh models",
+  "modelsRefreshedChanged": "Refreshed: the model list has changed"
 }

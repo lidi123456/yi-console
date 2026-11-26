@@ -20,5 +20,11 @@
   "backToModelSettings": "返回模型设置",
   "noMatchingModels": "没有匹配的模型",
   "loadingModelParameters": "正在读取这个模型的参数…",
-  "otherModel": "其他（手动输入）…"
+  "otherModel": "其他（手动输入）…",
+  "refreshModels": "刷新模型列表",
+  "refreshingModels": "正在向工具重新读取模型…",
+  "modelsRefreshedAdded": "已刷新，新增 {{n}} 个模型",
+  "modelsRefreshedNoChange": "已刷新，模型列表没有变化",
+  "needsNewerDaemonForModels": "升级这台主机的 yi-agentd 后才能刷新模型",
+  "modelsRefreshedChanged": "已刷新，模型列表有变化"
 }

@@ -96,6 +96,23 @@ pub fn attach_append(sid: &str, path: &str, data: &str) -> Result<serde_json::Va
     Ok(json!({ "path": path, "size": len + bytes.len() as u64 }))
 }
 
+/// The models a session's process reported, and the session's account then: after an account switch the list no
+/// longer applies (the next process reports the new account's)
+#[derive(Default)]
+struct SessionModels {
+    account: Option<String>,
+    list: Vec<ModelOption>,
+}
+
+/// `models.json` key: `codex` for the system login (and lists saved before they were kept per account),
+/// `codex#<account id>` for an account
+fn models_key(tool: ToolKind, account: Option<&str>) -> String {
+    match account {
+        Some(id) => format!("{}#{id}", tool.as_str()),
+        None => tool.as_str().to_string(),
+    }
+}
+
 fn models_path() -> PathBuf {
     // Tests must never read or overwrite the real model lists
     #[cfg(test)]
@@ -120,7 +137,7 @@ struct SessionRt {
     /// Incremented on every adapter start; late events from an old adapter are dropped by generation
     generation: Mutex<u64>,
     /// Models the tool reported on this start
-    models: Mutex<Vec<ModelOption>>,
+    models: Mutex<SessionModels>,
     /// Last reply segment of this turn; its beginning goes into the turn-finished notification
     last_text: Mutex<String>,
     /// In-progress streaming assistant deltas `(message_id, accumulated_text)`, cleared once finalized or turn ends
@@ -135,6 +152,9 @@ struct SessionRt {
     interrupted: Mutex<bool>,
     /// Permission mode when the current process started
     launched_mode: Mutex<String>,
+    /// The account the current process's environment was built from (`StartSpec.account_id`; `None` = the system
+    /// login): what that process's reports belong to
+    launched_account: Mutex<Option<String>>,
     mcp_fingerprint: Mutex<String>,
     /// The appended system prompt changed: ACP tools get it again with the next launch's first prompt
     prompt_dirty: Mutex<bool>,
@@ -484,7 +504,8 @@ impl Hub {
                     info.model = info.model.as_deref().map(|m| base_model(m).to_string());
                 }
             }
-            let clean_effort = sanitize_effort(info.tool, info.model.as_deref(), info.effort.clone(), &self.cached_models(info.tool));
+            let clean_effort = sanitize_effort(info.tool, info.model.as_deref(), info.effort.clone(),
+                &self.cached_models(info.tool, info.account_id.as_deref()));
             if info.effort != clean_effort {
                 info.effort = clean_effort;
                 let _ = self.store.save_session(&info);
@@ -960,7 +981,7 @@ impl Hub {
             }
         }
         let model = p.model.as_deref().map(|m| if cursor { base_model(m) } else { m }).filter(|m| !m.is_empty()).map(str::to_string);
-        let effort = sanitize_effort(tool, model.as_deref(), p.effort.clone(), &self.cached_models(tool));
+        let effort = sanitize_effort(tool, model.as_deref(), p.effort.clone(), &self.cached_models(tool, account_id.as_deref()));
         let info = SessionInfo {
             id,
             tool,
@@ -1285,8 +1306,8 @@ impl Hub {
             .unwrap()
             .get(&info.id)
             .cloned()
-            .map(|rt| self.models_for(&rt, info.tool))
-            .unwrap_or_else(|| self.cached_models(info.tool));
+            .map(|rt| self.models_for(&rt))
+            .unwrap_or_else(|| self.cached_models(info.tool, info.account_id.as_deref()));
         let effort = sanitize_effort(info.tool, info.model.as_deref(), info.effort.clone(), &models);
         Ok(StartSpec {
             tool: info.tool,
@@ -1320,6 +1341,7 @@ impl Hub {
                 .map(|_| crate::tmux::session_name(&info.id)),
             env: resolved.as_ref().map(|r| r.env.clone()).unwrap_or_default(),
             env_unset: resolved.as_ref().map(|r| r.env_unset.clone()).unwrap_or_default(),
+            account_id: resolved.as_ref().map(|r| r.id.clone()),
             data_dir: resolved.as_ref().and_then(|r| r.data_dir.clone()),
             auth_method: resolved.as_ref().and_then(|r| r.auth_method.clone()),
             account_handoff,
@@ -1380,6 +1402,7 @@ impl Hub {
             let (tx, rx) = mpsc::unbounded_channel();
             *cmd_slot = Some(tx.clone());
             *rt.launched_mode.lock().unwrap() = spec.permission_mode.clone();
+            *rt.launched_account.lock().unwrap() = spec.account_id.clone();
             *rt.mcp_fingerprint.lock().unwrap() = spec.mcp_fingerprint.clone();
             *rt.restart_pending.lock().unwrap() = false;
             rt.watch_active.store(false, std::sync::atomic::Ordering::Relaxed);
@@ -1792,8 +1815,7 @@ impl Hub {
     pub fn set_model(self: &Arc<Self>, id: &str, model: &str) -> Result<()> {
         let rt = self.get(id)?;
         let running = self.running_tx(&rt);
-        let tool = rt.info.lock().unwrap().tool;
-        let models = self.models_for(&rt, tool);
+        let models = self.models_for(&rt);
         let (info, discover, carried, effort_cleared) = {
             let mut i = rt.info.lock().unwrap();
             if i.mode == SessionMode::Terminal {
@@ -2040,8 +2062,7 @@ impl Hub {
 
     pub fn set_effort(&self, id: &str, effort: &str) -> Result<()> {
         let rt = self.get(id)?;
-        let tool = rt.info.lock().unwrap().tool;
-        let models = self.models_for(&rt, tool);
+        let models = self.models_for(&rt);
         let info = {
             let mut i = rt.info.lock().unwrap();
             if i.mode == SessionMode::Terminal {
@@ -2108,43 +2129,173 @@ impl Hub {
                 self.discover_model_config(&model, &info.cwd, info.account_id.clone());
             }
         }
-        let models = self.models_for(&rt, info.tool);
+        let models = self.models_for(&rt);
         Ok(json!({ "current": info.model, "models": models }))
     }
 
-    fn models_for(&self, rt: &SessionRt, tool: ToolKind) -> Vec<ModelOption> {
-        let models = rt.models.lock().unwrap().clone();
-        if models.is_empty() {
-            self.cached_models(tool)
-        } else {
-            models
+    /// The session's own list (while it is still on the account that reported it), else the saved one for its tool
+    /// and account. Locks `rt.info`: callers must not hold it
+    fn models_for(&self, rt: &SessionRt) -> Vec<ModelOption> {
+        let (tool, account_id) = {
+            let i = rt.info.lock().unwrap();
+            (i.tool, i.account_id.clone())
+        };
+        // The account a launch now would use: the session's, or the active one when it names none (or a deleted one)
+        let account = self.model_account(tool, account_id.as_deref());
+        {
+            let own = rt.models.lock().unwrap();
+            if !own.list.is_empty() && own.account == account {
+                return own.list.clone();
+            }
         }
+        self.saved_or_fallback(tool, account.as_deref())
     }
 
-    pub fn cached_models(&self, tool: ToolKind) -> Vec<ModelOption> {
-        self.tool_models
-            .lock()
-            .unwrap()
-            .get(tool.as_str())
-            .cloned()
+    /// The account a model list belongs to: `requested` (the active one when `None`); `None` = the system login
+    pub fn model_account(&self, tool: ToolKind, requested: Option<&str>) -> Option<String> {
+        self.accounts.resolve_id(tool, requested)
+    }
+
+    /// Saved list of `tool` on `account` (resolved), exactly
+    pub fn saved_models(&self, tool: ToolKind, account: Option<&str>) -> Option<Vec<ModelOption>> {
+        self.tool_models.lock().unwrap().get(&models_key(tool, account)).cloned()
+    }
+
+    /// Saved list on `account` (resolved). An account that hasn't reported one yet gets the system login's list,
+    /// which is also where lists saved before they were kept per account are
+    pub fn saved_or_fallback(&self, tool: ToolKind, account: Option<&str>) -> Vec<ModelOption> {
+        self.saved_models(tool, account)
+            .or_else(|| account.and_then(|_| self.saved_models(tool, None)))
             .unwrap_or_default()
     }
 
-    pub fn remember_models(&self, tool: ToolKind, models: &[ModelOption]) {
+    /// Saved list of `tool` on the `requested` account (the active one when `None`), see `saved_or_fallback`
+    pub fn cached_models(&self, tool: ToolKind, requested: Option<&str>) -> Vec<ModelOption> {
+        self.saved_or_fallback(tool, self.model_account(tool, requested).as_deref())
+    }
+
+    /// Whether `account` (resolved) has a list of its own
+    pub fn has_saved_models(&self, tool: ToolKind, account: Option<&str>) -> bool {
+        self.saved_models(tool, account).is_some()
+    }
+
+    /// Save what the tool reported on `account` (resolved; `None` = the system login)
+    /// Returns false when nothing was saved: an empty list, or a Cursor list cut short against what is saved
+    pub fn remember_models_for(&self, tool: ToolKind, account: Option<&str>, models: &[ModelOption]) -> bool {
         if models.is_empty() {
-            return;
+            return false;
         }
+        // One lock for the check and the write, so a concurrent full list can't be replaced by a short one checked
+        // against an older state. Only this account's own list says a list was cut short: another account (or the
+        // system login) may simply offer more models
         let mut m = self.tool_models.lock().unwrap();
-        if m.get(tool.as_str()).map(|v| v.as_slice()) == Some(models) {
-            return;
+        let key = models_key(tool, account);
+        if let Some(previous) = m.get(&key) {
+            if short_cursor_list(tool, models, previous) {
+                return false;
+            }
+            if previous.as_slice() == models {
+                return true;
+            }
         }
-        if m.get(tool.as_str()).is_some_and(|saved| short_cursor_list(tool, models, saved)) {
-            return;
-        }
-        m.insert(tool.as_str().to_string(), models.to_vec());
+        m.insert(key, models.to_vec());
         if let Ok(b) = serde_json::to_vec(&*m) {
             let _ = std::fs::write(models_path(), b);
         }
+        true
+    }
+
+    /// The user asked for the model list again: a short-lived process of the tool reports it (running processes
+    /// report theirs only when they start). Updates the saved list and the sessions of this tool on the same
+    /// account, running ones included, and returns the saved list. `probed_account` is resolved by the caller
+    /// before anything else (`model_account`): the active account may change while the probe runs
+    pub async fn refresh_models(self: &Arc<Self>, tool: ToolKind, probed_account: Option<String>) -> Result<Vec<ModelOption>> {
+        if !tool.has_process() {
+            bail!("这个工具没有模型可选");
+        }
+        let settings = self.settings.read().unwrap().clone();
+        let started = std::time::Instant::now();
+        // Cursor asks its server for the list on every session/new; when that request fails it lists nothing or a
+        // few models (`short_cursor_list`), measured against this account's own saved list
+        let saved = self.saved_models(tool, probed_account.as_deref()).unwrap_or_default();
+        let incomplete = |m: &[ModelOption]| m.is_empty() || short_cursor_list(tool, m, &saved);
+        let mut models = crate::probe::models(self, tool, &settings, probed_account.as_deref()).await?;
+        // Usually a passing failure: one more try, within what is left of the budget (dropping the probe ends its process)
+        let left = crate::probe::MODELS_BUDGET.saturating_sub(started.elapsed());
+        if tool == ToolKind::Cursor && incomplete(&models) && left >= std::time::Duration::from_secs(20) {
+            let again = crate::probe::models(self, tool, &settings, probed_account.as_deref());
+            models = tokio::time::timeout(left, again).await.map_err(|_| anyhow!("查询 cursor 超时"))??;
+        }
+        if models.is_empty() {
+            bail!("{} 没有返回模型列表", tool.as_str());
+        }
+        // Reported as a failure, not as "no change": the saved list is kept
+        if incomplete(&models) {
+            bail!("Cursor 返回的模型列表不完整（{} 个，原来有 {} 个），已保留原来的列表，请稍后再试", models.len(), saved.len());
+        }
+        Ok(self.apply_refreshed_models(tool, probed_account.as_deref(), &models))
+    }
+
+    /// Save a list `probed_account` (already resolved; `None` = the tool has no account) reported, and hand it to
+    /// the sessions of `tool` that resolve to that account now; returns the saved list
+    fn apply_refreshed_models(&self, tool: ToolKind, probed_account: Option<&str>, models: &[ModelOption]) -> Vec<ModelOption> {
+        self.remember_models_for(tool, probed_account, models);
+        // A cut-short Cursor list is not saved (see `short_cursor_list`), the saved one stays in effect
+        let effective = self.saved_or_fallback(tool, probed_account);
+        let sessions: Vec<_> = self.sessions.lock().unwrap().values().cloned().collect();
+        for rt in sessions {
+            // Checked and changed under the session's lock: an account switch in between would otherwise get
+            // this account's list
+            let mut cleared_on = None;
+            self.set_info_any(&rt, |i| {
+                if i.tool != tool || self.model_account(tool, i.account_id.as_deref()).as_deref() != probed_account {
+                    return false;
+                }
+                {
+                    // Sessions without a list of their own already read the saved one
+                    let mut own = rt.models.lock().unwrap();
+                    if !own.list.is_empty() {
+                        *own = SessionModels { account: probed_account.map(str::to_string), list: effective.clone() };
+                    }
+                }
+                let next_effort = sanitize_effort(i.tool, i.model.as_deref(), i.effort.clone(), &effective);
+                if i.effort == next_effort {
+                    return false;
+                }
+                if next_effort.is_none() {
+                    cleared_on = Some(*rt.generation.lock().unwrap());
+                }
+                i.effort = next_effort;
+                true
+            });
+            // The running adapter still holds the old level; tell it, as `set_model` does. Only the process that ran
+            // when the check passed: a later one starts with the session's (already cleared) level
+            if let Some(gen) = cleared_on {
+                let cmd = rt.cmd.lock().unwrap();
+                if *rt.generation.lock().unwrap() == gen {
+                    if let Some(tx) = cmd.as_ref().filter(|t| !t.is_closed()) {
+                        let _ = tx.send(AdapterCmd::SetEffort(String::new()));
+                    }
+                }
+            }
+        }
+        effective
+    }
+
+    /// `refresh_models` for the session's tool and account, answering like `session_models`
+    pub async fn refresh_session_models(self: &Arc<Self>, id: &str) -> Result<Value> {
+        let rt = self.get(id)?;
+        let (tool, account_id) = {
+            let i = rt.info.lock().unwrap();
+            (i.tool, i.account_id.clone())
+        };
+        self.refresh_models(tool, self.model_account(tool, account_id.as_deref())).await?;
+        let hub = self.clone();
+        let id = id.to_string();
+        let mut v = tokio::task::spawn_blocking(move || hub.session_models(&id)).await??;
+        // Older daemons ignore `refresh` and answer the same shape; this tells the client a refresh happened
+        v["refreshed"] = json!(true);
+        Ok(v)
     }
 
     /// Restart an exited session (without sending a message), to view an ACP tool's history or reopen a terminal
@@ -5360,7 +5511,7 @@ fn new_rt(info: SessionInfo) -> SessionRt {
         term: Mutex::new(VecDeque::new()),
         pending: Mutex::new(HashSet::new()),
         generation: Mutex::new(0),
-        models: Mutex::new(vec![]),
+        models: Mutex::new(SessionModels::default()),
         last_text: Mutex::new(String::new()),
         live_text: Mutex::new(Vec::new()),
         side_context_pending: Mutex::new(false),
@@ -5368,6 +5519,7 @@ fn new_rt(info: SessionInfo) -> SessionRt {
         queue: Mutex::new(VecDeque::new()),
         interrupted: Mutex::new(false),
         launched_mode: Mutex::new(String::new()),
+        launched_account: Mutex::new(None),
         mcp_fingerprint: Mutex::new(mcp_fingerprint(&[], false)),
         prompt_dirty: Mutex::new(false),
         restart_pending: Mutex::new(false),
@@ -5702,6 +5854,19 @@ pub(crate) fn test_set_tool(hub: &Hub, id: &str, tool: ToolKind) {
 }
 
 #[cfg(test)]
+pub(crate) fn test_info(hub: &Hub, id: &str) -> SessionInfo {
+    hub.get(id).unwrap().info.lock().unwrap().clone()
+}
+
+#[cfg(test)]
+pub(crate) fn test_set_model(hub: &Hub, id: &str, model: &str, options: Vec<ModelConfigOption>) {
+    let rt = hub.get(id).unwrap();
+    let mut i = rt.info.lock().unwrap();
+    i.model = Some(model.into());
+    i.model_config_options = options;
+}
+
+#[cfg(test)]
 pub(crate) fn test_set_permission_mode(hub: &Hub, id: &str, mode: &str) {
     hub.get(id).unwrap().info.lock().unwrap().permission_mode = Some(mode.into());
 }
@@ -5728,7 +5893,10 @@ pub(crate) fn test_watch_active(hub: &Hub, id: &str) -> bool {
 
 #[cfg(test)]
 pub(crate) fn test_emitter() -> (Arc<Hub>, Emitter, mpsc::UnboundedReceiver<AdapterCmd>) {
-    let hub = Hub::new(Store::open_memory().unwrap(), DaemonSettings::default());
+    // Accounts of its own: the host's (`Hub::new` reads ~/.yi-console) would decide which account lists belong to
+    let dir = tempfile::tempdir().unwrap().keep();
+    let accounts = Arc::new(crate::accounts::AccountManager::with_dirs(dir.join("base"), dir.join("home")));
+    let hub = Hub::with_accounts(Store::open_memory().unwrap(), DaemonSettings::default(), accounts);
     let rx = tests::live(&hub, "s", SessionMode::Structured, SessionStatus::Running, 0);
     let em = Emitter { hub: hub.clone(), sid: "s".into(), gen: 0 };
     (hub, em, rx)
@@ -5857,8 +6025,7 @@ impl Emitter {
         let Some(rt) = self.hub.alive(&self.sid, self.gen) else {
             return;
         };
-        let tool = rt.info.lock().unwrap().tool;
-        let models = self.hub.models_for(&rt, tool);
+        let models = self.hub.models_for(&rt);
         let m = model.to_string();
         self.hub.set_info(&self.sid, self.gen, |i| {
             let next_effort = sanitize_effort(i.tool, Some(m.as_str()), i.effort.clone(), &models);
@@ -5871,16 +6038,55 @@ impl Emitter {
         });
     }
 
+    /// A switch to `expected` ended with the process on `model` (`expected` itself once confirmed, the previous model
+    /// when rejected). Recorded only while the session still names `expected`: the hub records a pick before the
+    /// adapter sees it, so another name is a newer pick on its way. Returns whether it was recorded
+    pub fn model_replaced(&self, expected: &str, model: &str) -> bool {
+        let Some(rt) = self.hub.alive(&self.sid, self.gen) else {
+            return false;
+        };
+        let models = self.hub.models_for(&rt);
+        let mut applied = false;
+        self.hub.set_info(&self.sid, self.gen, |i| {
+            if i.model.as_deref().unwrap_or("") != expected {
+                return false;
+            }
+            applied = true;
+            let next = Some(model.to_string()).filter(|m| !m.is_empty());
+            let next_effort = sanitize_effort(i.tool, next.as_deref(), i.effort.clone(), &models);
+            if i.model == next && i.effort == next_effort {
+                return false;
+            }
+            i.model = next;
+            i.effort = next_effort;
+            true
+        });
+        applied
+    }
+
     /// Models the tool reported
     pub fn models(&self, models: Vec<ModelOption>) {
         let Some(rt) = self.hub.alive(&self.sid, self.gen) else {
             return;
         };
-        let tool = rt.info.lock().unwrap().tool;
-        self.hub.remember_models(tool, &models);
-        let saved = self.hub.cached_models(tool);
-        let effective = if short_cursor_list(tool, &models, &saved) { saved } else { models };
-        *rt.models.lock().unwrap() = effective.clone();
+        // A process that outlives an account switch (it ends after its turn) still reports for the account it
+        // started on: saved there, and kept off the session, which now belongs to another account
+        // The account the launch environment was built from (`StartSpec.account_id`, `None` = the system login)
+        let launched = rt.launched_account.lock().unwrap().clone();
+        let (tool, current) = {
+            let i = rt.info.lock().unwrap();
+            (i.tool, i.account_id.clone())
+        };
+        let effective = if self.hub.remember_models_for(tool, launched.as_deref(), &models) {
+            models
+        } else {
+            // A cut-short Cursor list: the account's saved one stays in effect
+            self.hub.saved_models(tool, launched.as_deref()).filter(|_| tool == ToolKind::Cursor).unwrap_or(models)
+        };
+        *rt.models.lock().unwrap() = SessionModels { account: launched.clone(), list: effective.clone() };
+        if self.hub.model_account(tool, current.as_deref()) != launched {
+            return;
+        }
         self.hub.set_info(&self.sid, self.gen, |i| {
             let next_effort = sanitize_effort(i.tool, i.model.as_deref(), i.effort.clone(), &effective);
             if i.effort == next_effort {
@@ -5917,6 +6123,33 @@ impl Emitter {
             true
         });
         self.hub.model_config_known(model, None);
+    }
+
+    /// Cursor rejected a switch: the session goes back to the model it is on, with the values Cursor reported for
+    /// it (not merged with the session's, which were chosen for the rejected model)
+    /// Only while the session still names `failed`: the hub records a pick before the adapter sees it, so another
+    /// name is a newer pick on its way. Returns whether the session went back
+    pub fn model_config_restored(&self, failed: &str, model: &str, options: Vec<ModelConfigOption>) -> bool {
+        if self.hub.alive(&self.sid, self.gen).is_none() { return false; }
+        // No values reported (session/new may list only the model) is not "this model has no parameters": nothing
+        // is cached, and the session shows what the cache already knows
+        let options = if options.is_empty() {
+            self.hub.stored_config(model).unwrap_or_default()
+        } else {
+            self.hub.save_config(model, &options);
+            options
+        };
+        let mut applied = false;
+        self.hub.set_info(&self.sid, self.gen, |i| {
+            if i.model.as_deref().map(base_model) != Some(failed) { return false; }
+            applied = true;
+            i.model = Some(model.to_string());
+            i.model_config_options = options;
+            i.model_config_pending = false;
+            true
+        });
+        self.hub.model_config_known(model, None);
+        applied
     }
 
     /// No parameters are coming (switch failed, or this Cursor has no parameterized picker)
@@ -6510,6 +6743,195 @@ mod tests {
     }
 
     /// Insert a session with a "running process" into the hub; returns a receiver showing which commands it gets
+    #[test]
+    fn model_lists_are_kept_per_account() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (base, home) = (tmp.path().join("yi-base"), tmp.path().join("home"));
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        let accounts = Arc::new(crate::accounts::AccountManager::with_dirs(base, home));
+        let hub = Hub::with_accounts(crate::store::Store::open_memory().unwrap(), Default::default(), accounts.clone());
+        let opt = |id: &str| ModelOption { id: id.into(), name: id.into(), description: String::new(), resolved: String::new(),
+            efforts: vec![], default_effort: String::new() };
+        // A list saved before lists were per account (or by the system login) is what accounts start from
+        hub.remember_models_for(ToolKind::Claude, None, &[opt("legacy")]);
+        let key = |label: &str| accounts.save(crate::accounts::SaveAccountRequest {
+            tool: ToolKind::Claude, id: None, label: Some(label.into()), auth_kind: Some(AccountAuthKind::ApiKey),
+            allow_auto_failover: None, priority: None,
+            api_config: Some(ApiKeyConfig { api_key: format!("sk-ant-{label}"), ..Default::default() }),
+            verified_identity: None, activate: false,
+        }).unwrap();
+        let (a, b) = (key("a"), key("b"));
+        assert_eq!(hub.cached_models(ToolKind::Claude, Some(&a.id))[0].id, "legacy");
+        assert!(!hub.has_saved_models(ToolKind::Claude, Some(&a.id)));
+        hub.remember_models_for(ToolKind::Claude, Some(&a.id), &[opt("only-a")]);
+        assert_eq!(hub.cached_models(ToolKind::Claude, Some(&a.id))[0].id, "only-a");
+        assert_eq!(hub.cached_models(ToolKind::Claude, Some(&b.id))[0].id, "legacy");
+
+        // A running session on account B keeps its list when account A is refreshed
+        let _rx = live(&hub, "on-b", SessionMode::Structured, SessionStatus::Running, 0);
+        {
+            let rt = hub.get("on-b").unwrap();
+            rt.info.lock().unwrap().tool = ToolKind::Claude;
+            rt.info.lock().unwrap().account_id = Some(b.id.clone());
+            *rt.models.lock().unwrap() = SessionModels { account: Some(b.id.clone()), list: vec![opt("b-start")] };
+        }
+        hub.apply_refreshed_models(ToolKind::Claude, Some(&a.id), &[opt("only-a"), opt("a-new")]);
+        assert_eq!(hub.cached_models(ToolKind::Claude, Some(&a.id)).len(), 2);
+        let on_b: Vec<_> = hub.models_for(&hub.get("on-b").unwrap()).into_iter().map(|m| m.id).collect();
+        assert_eq!(on_b, ["b-start"]);
+        hub.apply_refreshed_models(ToolKind::Claude, Some(&b.id), &[opt("b-new")]);
+        let on_b: Vec<_> = hub.models_for(&hub.get("on-b").unwrap()).into_iter().map(|m| m.id).collect();
+        assert_eq!(on_b, ["b-new"]);
+    }
+
+    fn claude_key_hub() -> (Arc<Hub>, Arc<crate::accounts::AccountManager>, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let (base, home) = (tmp.path().join("yi-base"), tmp.path().join("home"));
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        let accounts = Arc::new(crate::accounts::AccountManager::with_dirs(base, home));
+        let hub = Hub::with_accounts(Store::open_memory().unwrap(), Default::default(), accounts.clone());
+        (hub, accounts, tmp)
+    }
+
+    fn claude_key(accounts: &crate::accounts::AccountManager, label: &str, activate: bool) -> String {
+        accounts.save(crate::accounts::SaveAccountRequest {
+            tool: ToolKind::Claude, id: None, label: Some(label.into()), auth_kind: Some(AccountAuthKind::ApiKey),
+            allow_auto_failover: None, priority: None,
+            api_config: Some(ApiKeyConfig { api_key: format!("sk-ant-{label}"), ..Default::default() }),
+            verified_identity: None, activate,
+        }).unwrap().id
+    }
+
+    #[test]
+    fn a_session_drops_its_model_list_when_its_account_changes() {
+        let (hub, accounts, _tmp) = claude_key_hub();
+        let (a, b) = (claude_key(&accounts, "a", false), claude_key(&accounts, "b", false));
+        let opt = |id: &str| ModelOption { id: id.into(), name: id.into(), description: String::new(), resolved: String::new(),
+            efforts: vec![], default_effort: String::new() };
+        let _rx = live(&hub, "s", SessionMode::Structured, SessionStatus::Running, 0);
+        {
+            let rt = hub.get("s").unwrap();
+            rt.info.lock().unwrap().tool = ToolKind::Claude;
+            rt.info.lock().unwrap().account_id = Some(a.clone());
+            *rt.launched_account.lock().unwrap() = Some(a.clone());
+        }
+        Emitter { hub: hub.clone(), sid: "s".into(), gen: 0 }.models(vec![opt("from-a")]);
+        hub.remember_models_for(ToolKind::Claude, Some(&b), &[opt("from-b")]);
+        let ids = || hub.models_for(&hub.get("s").unwrap()).into_iter().map(|m| m.id).collect::<Vec<_>>();
+        assert_eq!(ids(), ["from-a"]);
+        // Switched to account B (the process restarts later): B's list, not the old process's
+        hub.get("s").unwrap().info.lock().unwrap().account_id = Some(b.clone());
+        assert_eq!(ids(), ["from-b"]);
+    }
+
+    #[test]
+    fn a_system_login_process_saves_for_the_system_login_after_an_account_becomes_active() {
+        let (hub, accounts, _tmp) = claude_key_hub();
+        let opt = |id: &str| ModelOption { id: id.into(), name: id.into(), description: String::new(), resolved: String::new(),
+            efforts: vec![], default_effort: String::new() };
+        let _rx = live(&hub, "s", SessionMode::Structured, SessionStatus::Running, 0);
+        hub.get("s").unwrap().info.lock().unwrap().tool = ToolKind::Claude;
+        // Launched with no account (launched_account None); the first account is made active before it reports
+        let a = claude_key(&accounts, "a", true);
+        Emitter { hub: hub.clone(), sid: "s".into(), gen: 0 }.models(vec![opt("system")]);
+        assert_eq!(hub.saved_models(ToolKind::Claude, None).unwrap()[0].id, "system");
+        assert!(hub.saved_models(ToolKind::Claude, Some(&a)).is_none());
+    }
+
+    #[test]
+    fn a_cut_short_cursor_list_never_replaces_a_full_one() {
+        let (hub, _em, _rx) = test_emitter();
+        let opt = |id: String| ModelOption { id: id.clone(), name: id, description: String::new(), resolved: String::new(),
+            efforts: vec![], default_effort: String::new() };
+        let full: Vec<_> = (0..12).map(|i| opt(format!("m{i}"))).collect();
+        assert!(hub.remember_models_for(ToolKind::Cursor, Some("acc"), &full));
+        assert!(!hub.remember_models_for(ToolKind::Cursor, Some("acc"), &[opt("auto".into())]));
+        assert!(hub.remember_models_for(ToolKind::Cursor, Some("acc"), &full), "the same list again counts as saved");
+        assert_eq!(hub.saved_models(ToolKind::Cursor, Some("acc")).unwrap().len(), 12);
+    }
+
+    #[test]
+    fn a_refresh_also_checks_the_thinking_level_of_sessions_reading_the_saved_list() {
+        let (hub, _em, mut rx) = test_emitter();
+        test_set_tool(&hub, "s", ToolKind::Codex);
+        let opt = |id: &str, efforts: &[&str]| ModelOption { id: id.into(), name: id.into(), description: String::new(),
+            resolved: String::new(), efforts: efforts.iter().map(|e| e.to_string()).collect(), default_effort: String::new() };
+        {
+            let rt = hub.get("s").unwrap();
+            let mut i = rt.info.lock().unwrap();
+            i.model = Some("gpt".into());
+            i.effort = Some("high".into());
+        }
+        hub.apply_refreshed_models(ToolKind::Codex, None, &[opt("gpt", &["low"])]);
+        assert_eq!(hub.get("s").unwrap().info.lock().unwrap().effort, None);
+        assert!(std::iter::from_fn(|| rx.try_recv().ok()).any(|c| matches!(c, AdapterCmd::SetEffort(ref e) if e.is_empty())));
+    }
+
+    #[tokio::test]
+    async fn an_inactive_system_wide_account_is_not_probed_for_models() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (base, home) = (tmp.path().join("yi-base"), tmp.path().join("home"));
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        let accounts = Arc::new(crate::accounts::AccountManager::with_dirs(base, home));
+        let hub = Hub::with_accounts(Store::open_memory().unwrap(), Default::default(), accounts.clone());
+        let snap = |token: &str| crate::accounts::SnapshotBundle {
+            files: [(".gemini/antigravity-cli/antigravity-oauth-token".into(), token.into())].into_iter().collect(),
+            ..Default::default()
+        };
+        let _a = accounts.save_oauth_from_dir(ToolKind::Antigravity, None, Some("Google A"), None, Some(snap("eyJ0b2tlbiI6ImEifQ==")), true).unwrap();
+        let b = accounts.save_oauth_from_dir(ToolKind::Antigravity, None, Some("Google B"), None, Some(snap("eyJ0b2tlbiI6ImIifQ==")), false).unwrap();
+        let err = crate::probe::models(&hub, ToolKind::Antigravity, &Default::default(), Some(&b.id)).await.unwrap_err();
+        assert!(err.to_string().contains("系统级单活账号"), "{err}");
+    }
+
+    #[test]
+    fn an_old_process_reports_models_for_the_account_it_started_on() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (base, home) = (tmp.path().join("yi-base"), tmp.path().join("home"));
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        let accounts = Arc::new(crate::accounts::AccountManager::with_dirs(base, home));
+        let hub = Hub::with_accounts(Store::open_memory().unwrap(), Default::default(), accounts.clone());
+        let key = |label: &str| accounts.save(crate::accounts::SaveAccountRequest {
+            tool: ToolKind::Claude, id: None, label: Some(label.into()), auth_kind: Some(AccountAuthKind::ApiKey),
+            allow_auto_failover: None, priority: None,
+            api_config: Some(ApiKeyConfig { api_key: format!("sk-ant-{label}"), ..Default::default() }),
+            verified_identity: None, activate: false,
+        }).unwrap();
+        let (a, b) = (key("a"), key("b"));
+        let opt = |id: &str| ModelOption { id: id.into(), name: id.into(), description: String::new(), resolved: String::new(),
+            efforts: vec![], default_effort: String::new() };
+        let _rx = live(&hub, "s", SessionMode::Structured, SessionStatus::Running, 0);
+        {
+            let rt = hub.get("s").unwrap();
+            rt.info.lock().unwrap().tool = ToolKind::Claude;
+            *rt.launched_account.lock().unwrap() = Some(a.id.clone());
+            // Switched to B while A's process finishes its turn
+            rt.info.lock().unwrap().account_id = Some(b.id.clone());
+        }
+        let em = Emitter { hub: hub.clone(), sid: "s".into(), gen: 0 };
+        em.models(vec![opt("from-a")]);
+        assert_eq!(hub.saved_models(ToolKind::Claude, Some(&a.id)).unwrap()[0].id, "from-a");
+        assert!(hub.saved_models(ToolKind::Claude, Some(&b.id)).is_none());
+        assert!(hub.models_for(&hub.get("s").unwrap()).is_empty());
+    }
+
+    #[test]
+    fn an_accounts_first_cursor_list_is_saved_even_when_the_system_list_is_longer() {
+        let (hub, _em, _rx) = test_emitter();
+        let opt = |id: String| ModelOption { id: id.clone(), name: id, description: String::new(), resolved: String::new(),
+            efforts: vec![], default_effort: String::new() };
+        hub.remember_models_for(ToolKind::Cursor, None, &(0..30).map(|i| opt(format!("m{i}"))).collect::<Vec<_>>());
+        hub.remember_models_for(ToolKind::Cursor, Some("acc"), &(0..10).map(|i| opt(format!("m{i}"))).collect::<Vec<_>>());
+        assert_eq!(hub.saved_models(ToolKind::Cursor, Some("acc")).unwrap().len(), 10);
+        // Now that the account has its own list, a cut-short one is still ignored
+        hub.remember_models_for(ToolKind::Cursor, Some("acc"), &[opt("auto".into())]);
+        assert_eq!(hub.saved_models(ToolKind::Cursor, Some("acc")).unwrap().len(), 10);
+    }
+
     pub(super) fn live(hub: &Hub, id: &str, mode: SessionMode, status: SessionStatus, updated_at: i64) -> mpsc::UnboundedReceiver<AdapterCmd> {
         let info = SessionInfo {
             id: id.into(),
@@ -7434,6 +7856,7 @@ mod tests {
             memory_notice: false,
             env: Default::default(),
             env_unset: vec![],
+            account_id: None,
             data_dir: None,
             auth_method: None,
             account_handoff: None,
@@ -9081,5 +9504,63 @@ mod settings_tests {
         assert_eq!(serde_json::to_value(&disk).unwrap(), serde_json::to_value(&mem).unwrap());
         assert_eq!(mem.idle_release_minutes, Some(10));
         assert_eq!(mem.ui_lang.as_deref(), Some("zh"));
+    }
+
+    fn model(id: &str) -> ModelOption {
+        ModelOption { id: id.into(), name: id.into(), description: String::new(), resolved: String::new(),
+            efforts: vec![], default_effort: String::new() }
+    }
+
+    fn session_model_ids(hub: &Arc<Hub>, sid: &str) -> Vec<String> {
+        hub.session_models(sid).unwrap()["models"].as_array().unwrap().iter()
+            .map(|m| m["id"].as_str().unwrap().to_string()).collect()
+    }
+
+    #[test]
+    fn refreshed_models_reach_a_running_session() {
+        let (hub, em, _rx) = test_emitter();
+        test_set_tool(&hub, "s", ToolKind::Codex);
+        // The process reported its list when it started; later lists only come from a refresh
+        em.models(vec![model("gpt-old")]);
+        assert_eq!(session_model_ids(&hub, "s"), ["gpt-old"]);
+        let saved = hub.apply_refreshed_models(ToolKind::Codex, None, &[model("gpt-old"), model("gpt-new")]);
+        assert_eq!(saved.len(), 2);
+        assert_eq!(session_model_ids(&hub, "s"), ["gpt-old", "gpt-new"]);
+        assert_eq!(hub.cached_models(ToolKind::Codex, None).len(), 2);
+        // Another tool's refresh leaves this session alone
+        hub.apply_refreshed_models(ToolKind::Claude, None, &[model("opus")]);
+        assert_eq!(session_model_ids(&hub, "s"), ["gpt-old", "gpt-new"]);
+    }
+
+    #[test]
+    fn a_refresh_that_drops_the_thinking_level_tells_the_running_adapter() {
+        let (hub, em, mut rx) = test_emitter();
+        test_set_tool(&hub, "s", ToolKind::Codex);
+        let with_high = ModelOption { efforts: vec!["high".into()], ..model("gpt") };
+        em.models(vec![with_high]);
+        {
+            let rt = hub.get("s").unwrap();
+            let mut i = rt.info.lock().unwrap();
+            i.model = Some("gpt".into());
+            i.effort = Some("high".into());
+        }
+        while rx.try_recv().is_ok() {}
+        hub.apply_refreshed_models(ToolKind::Codex, None, &[ModelOption { efforts: vec!["low".into()], ..model("gpt") }]);
+        assert_eq!(hub.get("s").unwrap().info.lock().unwrap().effort, None);
+        let mut sent = vec![];
+        while let Ok(cmd) = rx.try_recv() { sent.push(format!("{cmd:?}")); }
+        assert!(sent.iter().any(|c| c == "SetEffort(\"\")"), "{sent:?}");
+    }
+
+    #[test]
+    fn a_cut_short_cursor_refresh_keeps_the_saved_list() {
+        let (hub, em, _rx) = test_emitter();
+        test_set_tool(&hub, "s", ToolKind::Cursor);
+        let many: Vec<_> = (0..10).map(|i| model(&format!("m{i}"))).collect();
+        em.models(many.clone());
+        let saved = hub.apply_refreshed_models(ToolKind::Cursor, None, &[model("auto")]);
+        // The saved list may also hold other tests' Cursor models (they share the test models file)
+        assert!(saved.len() >= 10);
+        assert_eq!(session_model_ids(&hub, "s"), saved.iter().map(|m| m.id.clone()).collect::<Vec<_>>());
     }
 }

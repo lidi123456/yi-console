@@ -1038,6 +1038,7 @@ mod tests {
             tmux: None,
             env: std::collections::BTreeMap::new(),
             env_unset: vec![],
+            account_id: None,
             data_dir,
             auth_method: None,
             account_handoff: None,
