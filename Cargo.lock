@@ -4193,7 +4193,7 @@ dependencies = [
 
 [[package]]
 name = "yi-agentd"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -4221,7 +4221,7 @@ dependencies = [
 
 [[package]]
 name = "yi-bots"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -4244,7 +4244,7 @@ dependencies = [
 
 [[package]]
 name = "yi-browser"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -4259,7 +4259,7 @@ dependencies = [
 
 [[package]]
 name = "yi-client"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -4280,7 +4280,7 @@ dependencies = [
 
 [[package]]
 name = "yi-link"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -4300,7 +4300,7 @@ dependencies = [
 
 [[package]]
 name = "yi-proto"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -4308,7 +4308,7 @@ dependencies = [
 
 [[package]]
 name = "yi-relay"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "futures-util",
@@ -4324,7 +4324,7 @@ dependencies = [
 
 [[package]]
 name = "yi-web"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "dirs",
